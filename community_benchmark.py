@@ -251,7 +251,13 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
     return all_questions
 
 
-async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_types: bool = False) -> None:
+async def benchmark_forecast_bot(
+    mode: str,
+    number_of_questions: int = 2,
+    mixed_types: bool = False,
+    include_models: list[str] | None = None,
+    exclude_models: list[str] | None = None,
+) -> None:
     """
     Run a benchmark that compares your forecasts against the community prediction.
     Ideally 100+ questions for meaningful error bars, but can use e.g. just a few for smoke testing or 30 for a quick run.
@@ -329,13 +335,8 @@ async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_
         # Shared research cache for all bots to avoid duplicate API calls
         research_cache: dict[int, str] = {}
 
-        # Define individual model configurations -- for sanity checking, can use these free models
-
+        # Define individual model configurations
         # Cheapies; avoid free models due to rate limits (very slow)
-        GeneralLlm(
-            model="openrouter/deepseek/deepseek-r1-0528",
-            **MODEL_CONFIG,
-        )
         ds_v3p1_model = GeneralLlm(
             model="openrouter/deepseek/deepseek-chat-v3.1",
             **MODEL_CONFIG,
@@ -349,18 +350,23 @@ async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_
             model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
             **MODEL_CONFIG,
         )
-        GeneralLlm(
+        # Need to ignore linter error for unused variables below
+        glm_model = GeneralLlm(
             model="openrouter/z-ai/glm-4.5",
             **MODEL_CONFIG,
         )
-        build_llm_with_openrouter_fallback(
+        r1_0528_model = GeneralLlm(
+            model="openrouter/deepseek/deepseek-r1-0528",
+            **MODEL_CONFIG,
+        )
+        claude_model = build_llm_with_openrouter_fallback(
             model="openrouter/anthropic/claude-sonnet-4",
             reasoning={"max_tokens": 4000},
             **MODEL_CONFIG,
         )
-        build_llm_with_openrouter_fallback(
+        gpt5_model = build_llm_with_openrouter_fallback(
             model="openrouter/openai/gpt-5",
-            reasoning_effort="high",
+            reasoning={"effort": "high"},
             **MODEL_CONFIG,
         )
         GeneralLlm(
@@ -368,9 +374,9 @@ async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_
             reasoning={"max_tokens": 8000},
             **MODEL_CONFIG,
         )
-        build_llm_with_openrouter_fallback(
+        o3_model = build_llm_with_openrouter_fallback(
             model="openrouter/openai/o3",
-            reasoning_effort="high",
+            reasoning={"effort": "high"},
             **MODEL_CONFIG,
         )
         GeneralLlm(
@@ -386,22 +392,26 @@ async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_
             {"name": "deepseek-3.1", "forecaster": ds_v3p1_model},
             {"name": "kimi-k2", "forecaster": kimi_k2_model},
             # Additional models - comment for cost control during development:
-            # {"name": "glm-4.5", "forecaster": glm_model},
-            # {"name": "r1-0528", "forecaster": r1_0528_model},
-            # {"name": "claude-sonnet-4", "forecaster": claude_model},
-            # {"name": "gpt-5", "forecaster": gpt5_model},
-            # {"name": "gemini-2.5-pro", "forecaster": gemini_model},
-            # {"name": "o3", "forecaster": o3_model},
-            # {"name": "grok-4", "forecaster": grok_model},
+            {"name": "glm-4.5", "forecaster": glm_model},
+            {"name": "r1-0528", "forecaster": r1_0528_model},
+            {
+                "name": "claude-sonnet-4",
+                "forecaster": claude_model,
+            },  # Sonnet 4 is reasonably strong and cheaper than you'd expect due to short reasoning traces
+            {"name": "gpt-5", "forecaster": gpt5_model},
+            {"name": "o3", "forecaster": o3_model},
+            # Deprioritized:
+            # {"name": "gemini-2.5-pro", "forecaster": gemini_model},  # Gemini 2.5 Pro is weak and pricey on this task
+            # {"name": "grok-4", "forecaster": grok_model},  # Grok is strong here, typically competitive with o3/gpt5, but I don't want to pay for it
         ]
 
         # Stacking model configurations - these will aggregate predictions from ALL base models
         stacking_models = [
             {"name": "stack-qwen3", "stacker": qwen3_model},
             # Additional stackers - comment for cost control during development:
-            # {"name": "stack-o3", "stacker": o3_model},
-            # {"name": "stack-claude4", "stacker": claude_model},
-            # {"name": "stack-gpt5", "stacker": gpt5_model},
+            {"name": "stack-o3", "stacker": o3_model},
+            {"name": "stack-claude4", "stacker": claude_model},
+            {"name": "stack-gpt5", "stacker": gpt5_model},
         ]
 
         # Generate individual model bots - ensembles generated by CorrelationAnalyzer.find_optimal_ensembles()
@@ -532,6 +542,25 @@ async def benchmark_forecast_bot(mode: str, number_of_questions: int = 2, mixed_
             analyzer = CorrelationAnalyzer()
             analyzer.add_benchmark_results(benchmarks)
 
+            # Optional model filtering prior to report/ensembles
+            if include_models and exclude_models:
+                logger.warning("Both include and exclude provided; include takes precedence, excludes still applied.")
+            if include_models or exclude_models:
+                summary = analyzer.filter_models_inplace(include=include_models, exclude=exclude_models)
+                try:
+                    logger.info("Model filters applied:")
+                    if include_models:
+                        logger.info(f"  include tokens: {include_models}")
+                        if summary.get("unmatched_includes"):
+                            logger.info(f"  unmatched include tokens: {summary['unmatched_includes']}")
+                    if exclude_models:
+                        logger.info(f"  exclude tokens: {exclude_models}")
+                        if summary.get("unmatched_excludes"):
+                            logger.info(f"  unmatched exclude tokens: {summary['unmatched_excludes']}")
+                    logger.info(f"  remaining models: {analyzer.get_model_names()}")
+                except Exception:
+                    pass
+
             # Generate and log correlation report
             report = analyzer.generate_correlation_report("benchmarks/correlation_analysis.md")
             logger.info("\n" + "=" * 50)
@@ -653,6 +682,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Use mixed question types with 50/25/25 distribution (binary/numeric/multiple-choice)",
     )
+    parser.add_argument(
+        "--exclude-models",
+        nargs="*",
+        default=None,
+        help=(
+            "Exclude models by substring match (case-insensitive). " "Example: --exclude-models grok-4 gemini-2.5-pro"
+        ),
+    )
+    parser.add_argument(
+        "--include-models",
+        nargs="*",
+        default=None,
+        help=(
+            "Only include models matching these substrings (case-insensitive). "
+            "Mutually exclusive with --exclude-models."
+        ),
+    )
     args = parser.parse_args()
     mode: Literal["run", "custom", "display"] = args.mode
-    asyncio.run(benchmark_forecast_bot(mode, args.num_questions, args.mixed))
+    asyncio.run(
+        benchmark_forecast_bot(
+            mode,
+            args.num_questions,
+            args.mixed,
+            include_models=args.include_models,
+            exclude_models=args.exclude_models,
+        )
+    )
