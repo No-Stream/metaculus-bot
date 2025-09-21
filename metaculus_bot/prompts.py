@@ -267,14 +267,14 @@ def numeric_prompt(
             - Status quo nudge sanity check.
             - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
 
-        OUTPUT FORMAT: 
+        Prediction: 
+        [Reminders:
         - Floating point numbers in the base unit
         - Must be last lines, nothing after
-        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
+        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.)
+        Example:]
 
-        __Example:__
-
-        Percentile 2.5: 8.0
+        Percentile 2.5: 1.2
         Percentile 5: 10.1
         Percentile 10: 12.3
         Percentile 20: 23.4
@@ -284,7 +284,7 @@ def numeric_prompt(
         Percentile 80: 67.8
         Percentile 90: 78.9
         Percentile 95: 89.0
-        Percentile 97.5: 93.0
+        Percentile 97.5: 123.4
         """
     )
 
