@@ -32,7 +32,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
             You should consider current prediction markets when possible but not be beholden to them.
-            Historically, LLMs like you have overestimated probabilities, and the percentage of positive resolutions on Metaculus is 35%. (This should slightly influence your calibration, but it is NOT a base rate.)
+            Historically, LLMs like you have been overconfident about probabilities, and the percentage of positive resolutions on Metaculus is 35%. (This may slightly influence your calibration, but it is NOT a base rate.)
 
             Your Metaculus question is:
             {question.question_text}
@@ -52,7 +52,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             Today is {_today_str()}.
 
-            ── Analysis Template ──
+            ── Analysis Template (Should be reproduced in your answer!) ──
             1) Source analysis
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
                • Separate facts from opinions. Give more weight to opinions from identifiable experts/entities.
@@ -99,7 +99,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
         Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
-        over-confidence and make sure your probabilities sum to **100 %**.
+        over-confidence and make sure your probabilities sum to **100%**.
         Please consider news, research, and prediction markets, but you are not beholden to them.
 
         ── Question ──────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         Today's date: {_today_str()}
 
-        ── Analysis Template ──
+        ── Analysis Template (Should be reproduced in your answer!) ──
         (1) Source analysis
             • Summarize key sources; note recency, credibility, and scope.
             • Separate fact vs opinion; favor opinions from identifiable experts/entities.
@@ -218,7 +218,7 @@ def numeric_prompt(
         {lower_bound_message}
         {upper_bound_message}
 
-        -- Analysis Template --
+        -- Analysis Template (Should be reproduced in your answer!) --
         (1) Source analysis
             - Summarize key sources; note recency, credibility, and scope.
             - Separate fact and opinion. Prefer opinions from identifiable experts and entities.
