@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+
 
 def _make_forecaster():
     from main import TemplateForecaster
@@ -52,7 +54,7 @@ class DummyLLM:
 
 class TestNumericCDFSmoothing:
     def test_cluster_spread_basic(self, caplog):
-        f = _make_forecaster()
+        _make_forecaster()
         q = _make_question()
 
         # 8 declared percentiles with a middle cluster (identical values)
@@ -69,7 +71,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = f._apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, q)
 
         vals = [p.value for p in adjusted]
         # Strictly increasing
@@ -78,7 +80,7 @@ class TestNumericCDFSmoothing:
         assert any("Cluster spread applied" in rec.message for rec in caplog.records)
 
     def test_count_like_spread_uses_larger_delta(self, caplog):
-        f = _make_forecaster()
+        _make_forecaster()
         q = _make_question(lower=0.0, upper=100.0)
 
         # All values very close to integers (count-like)
@@ -95,7 +97,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = f._apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, q)
 
         vals = [p.value for p in adjusted]
         # Strictly increasing after adjustment
@@ -106,7 +108,7 @@ class TestNumericCDFSmoothing:
         assert any("Cluster spread applied" in rec.message for rec in caplog.records)
 
     def test_bound_adjacent_cluster(self, caplog):
-        f = _make_forecaster()
+        _make_forecaster()
         # Closed upper bound; cluster near upper
         q = _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0)
         raw = [
@@ -122,7 +124,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = f._apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, q)
         vals = [p.value for p in adjusted]
         assert all(q.lower_bound <= v <= q.upper_bound for v in vals)
         assert all(b > a for a, b in zip(vals, vals[1:])), vals

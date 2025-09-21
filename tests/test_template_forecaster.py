@@ -112,7 +112,7 @@ async def test_template_forecaster_init_forecasters_not_list():
         "parser": "mock_parser_model",
         "researcher": "mock_researcher_model",
     }
-    with patch("main.logger.warning") as mock_warning:
+    with patch("metaculus_bot.llm_setup.logger.warning") as mock_warning:
         bot = TemplateForecaster(llms=llms_config)
         mock_warning.assert_called_once_with("'forecasters' key in llms must be a list of GeneralLlm objects.")
         assert not bot._forecaster_llms

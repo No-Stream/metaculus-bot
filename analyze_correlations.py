@@ -139,9 +139,7 @@ def main():
         "--exclude-models",
         nargs="*",
         default=None,
-        help=(
-            "Exclude models by substring match (case-insensitive). " "Example: --exclude-models grok-4 gemini-2.5-pro"
-        ),
+        help=("Exclude models by substring match (case-insensitive). Example: --exclude-models grok-4 gemini-2.5-pro"),
     )
     parser.add_argument(
         "--include-models",
@@ -305,7 +303,7 @@ def main():
         for qtype in ["binary", "numeric", "multiple_choice"]:
             s = per_report_summary.get(qtype, {})
             print(
-                f"{qtype:16} n={s.get('n',0):4d} | mean={s.get('mean', float('nan')):7.2f} | "
+                f"{qtype:16} n={s.get('n', 0):4d} | mean={s.get('mean', float('nan')):7.2f} | "
                 f"mean|score|={s.get('mean_abs', float('nan')):7.2f} | min={s.get('min', float('nan')):7.2f} | max={s.get('max', float('nan')):7.2f}"
             )
 
@@ -318,7 +316,7 @@ def main():
             for qtype in ["binary", "numeric", "multiple_choice"]:
                 s = per_question_summary.get(qtype, {})
                 print(
-                    f"{qtype:16} n={s.get('n',0):4d} | mean={s.get('mean', float('nan')):7.2f} | "
+                    f"{qtype:16} n={s.get('n', 0):4d} | mean={s.get('mean', float('nan')):7.2f} | "
                     f"mean|score|={s.get('mean_abs', float('nan')):7.2f} | min={s.get('min', float('nan')):7.2f} | max={s.get('max', float('nan')):7.2f}"
                 )
 
@@ -504,7 +502,7 @@ def main():
                             s.add(qid)
                 inter_base = set.intersection(*(qsets[m] for m in base_models)) if base_models else set()
                 print(
-                    f"\n{idx+1}. {' + '.join(base_models)} ({agg.upper()})  | baseline={base_score:.2f} | Q={len(inter_base)}"
+                    f"\n{idx + 1}. {' + '.join(base_models)} ({agg.upper()})  | baseline={base_score:.2f} | Q={len(inter_base)}"
                 )
 
                 # Per-type split for baseline

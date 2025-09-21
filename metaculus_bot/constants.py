@@ -8,14 +8,10 @@ need to be shared across modules.
 import os
 from typing import Tuple
 
-# Load .env early so ASKNEWS_* values are read correctly at import time in local runs
-try:  # pragma: no cover - best-effort convenience for local dev
-    from dotenv import load_dotenv
+from metaculus_bot.config import load_environment
 
-    load_dotenv()
-    load_dotenv(".env.local", override=True)
-except Exception:
-    pass
+# Load .env early so ASKNEWS_* values are read correctly at import time in local runs
+load_environment()
 
 # Concurrency tuning for research providers (e.g., AskNews, Exa)
 # Start conservatively for AskNews; adjust after observing rate limits.

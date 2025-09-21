@@ -32,7 +32,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
             You should consider current prediction markets when possible but not be beholden to them.
-            Historically, LLMs like you have overestimated probabilities, and the percentage of positive resolutions on Metaculus is 35%. (This should slightly influence your calibration, but it is NOT a base rate.)
+            Historically, LLMs like you have been overconfident about probabilities, and the percentage of positive resolutions on Metaculus is 35%. (This may slightly influence your calibration, but it is NOT a base rate.)
 
             Your Metaculus question is:
             {question.question_text}
@@ -52,7 +52,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             Today is {_today_str()}.
 
-            ── Analysis Template ──
+            ── Analysis Template (Should be reproduced in your answer!) ──
             1) Source analysis
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
                • Separate facts from opinions. Give more weight to opinions from identifiable experts/entities.
@@ -99,7 +99,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
         Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
-        over-confidence and make sure your probabilities sum to **100 %**.
+        over-confidence and make sure your probabilities sum to **100%**.
         Please consider news, research, and prediction markets, but you are not beholden to them.
 
         ── Question ──────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         Today's date: {_today_str()}
 
-        ── Analysis Template ──
+        ── Analysis Template (Should be reproduced in your answer!) ──
         (1) Source analysis
             • Summarize key sources; note recency, credibility, and scope.
             • Separate fact vs opinion; favor opinions from identifiable experts/entities.
@@ -218,7 +218,7 @@ def numeric_prompt(
         {lower_bound_message}
         {upper_bound_message}
 
-        -- Analysis Template --
+        -- Analysis Template (Should be reproduced in your answer!) --
         (1) Source analysis
             - Summarize key sources; note recency, credibility, and scope.
             - Separate fact and opinion. Prefer opinions from identifiable experts and entities.
@@ -267,14 +267,14 @@ def numeric_prompt(
             - Status quo nudge sanity check.
             - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
 
-        OUTPUT FORMAT: 
+        Prediction: 
+        [Reminders:
         - Floating point numbers in the base unit
         - Must be last lines, nothing after
-        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
+        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.)
+        Example:]
 
-        __Example:__
-
-        Percentile 2.5: 8.0
+        Percentile 2.5: 1.2
         Percentile 5: 10.1
         Percentile 10: 12.3
         Percentile 20: 23.4
@@ -284,7 +284,7 @@ def numeric_prompt(
         Percentile 80: 67.8
         Percentile 90: 78.9
         Percentile 95: 89.0
-        Percentile 97.5: 93.0
+        Percentile 97.5: 123.4
         """
     )
 

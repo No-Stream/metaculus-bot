@@ -305,51 +305,76 @@ def test_mixed_question_types_distribution(mock_get_questions_filter):
 
 def test_individual_model_bot_generation():
     """Test that the new individual model configuration generates the expected bots."""
-    from forecasting_tools import GeneralLlm
-
-    # Simulate the individual model configuration logic from community_benchmark.py
-    MODEL_CONFIG = {
-        "temperature": 0.0,
-        "top_p": 0.9,
-        "max_tokens": 16000,
-        "stream": False,
-        "timeout": 240,
-        "allowed_tries": 3,
-    }
-
-    # Define individual models (same as in community_benchmark.py)
-    qwen3_model = GeneralLlm(
-        model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-        **MODEL_CONFIG,
-    )
-    glm_model = GeneralLlm(
-        model="openrouter/z-ai/glm-4.5",
-        **MODEL_CONFIG,
+    from metaculus_bot.benchmark.bot_factory import (
+        BENCHMARK_BOT_CONFIG,
+        DEFAULT_HELPER_LLMS,
+        INDIVIDUAL_MODEL_SPECS,
+        STACKING_MODEL_SPECS,
+        create_individual_bots,
+        create_stacking_bots,
     )
 
-    # Individual model configurations for benchmarking
-    individual_models = [
-        {"name": "qwen3-235b", "forecaster": qwen3_model},
-        {"name": "glm-4.5", "forecaster": glm_model},
-    ]
+    research_cache: dict[int, str] = {}
 
-    # Expected bot names: just individual models (ensembles generated post-hoc)
-    expected_bot_names = [
-        "qwen3-235b",  # Single model
-        "glm-4.5",  # Single model
-    ]
+    individual_bots = create_individual_bots(
+        INDIVIDUAL_MODEL_SPECS,
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
 
-    # Verify the logic produces the expected number and types of configurations
-    generated_names = []
-    for model_config in individual_models:
-        generated_names.append(model_config["name"])
+    stacking_bots = create_stacking_bots(
+        STACKING_MODEL_SPECS,
+        [spec["forecaster"] for spec in INDIVIDUAL_MODEL_SPECS],
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
 
-    # Verify we get the expected bot names
-    assert sorted(generated_names) == sorted(expected_bot_names)
-    assert len(generated_names) == 2
+    expected_individual_names = [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS]
+    expected_stacking_names = [spec["name"] for spec in STACKING_MODEL_SPECS]
 
-    # Verify this matches the new approach: only individual models
-    assert len(generated_names) == len(individual_models)
+    assert [bot.name for bot in individual_bots] == expected_individual_names
+    assert [bot.name for bot in stacking_bots] == expected_stacking_names
+
+
+def test_benchmark_config_constants_remain_unchanged_after_bot_creation():
+    """Ensure helper constants are stable when used to create bots."""
+    from metaculus_bot.benchmark.bot_factory import (
+        BENCHMARK_BOT_CONFIG,
+        DEFAULT_HELPER_LLMS,
+        INDIVIDUAL_MODEL_SPECS,
+        STACKING_MODEL_SPECS,
+        create_individual_bots,
+        create_stacking_bots,
+    )
+
+    individual_names_before = [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS]
+    stacking_names_before = [spec["name"] for spec in STACKING_MODEL_SPECS]
+
+    research_cache: dict[int, str] = {}
+
+    create_individual_bots(
+        INDIVIDUAL_MODEL_SPECS,
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    create_stacking_bots(
+        STACKING_MODEL_SPECS,
+        [spec["forecaster"] for spec in INDIVIDUAL_MODEL_SPECS],
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    assert [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS] == individual_names_before
+    assert [spec["name"] for spec in STACKING_MODEL_SPECS] == stacking_names_before
 
 
 @patch("community_benchmark.MetaculusApi.get_questions_matching_filter")

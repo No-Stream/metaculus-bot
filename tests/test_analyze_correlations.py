@@ -4,6 +4,7 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -185,20 +186,64 @@ def test_argument_parsing():
     assert args.verbose is True
 
 
+def _make_report(question_id: int, score: float, cost: float = 0.25) -> SimpleNamespace:
+    question = SimpleNamespace(
+        id_of_question=question_id,
+        page_url=f"https://example.com/{question_id}",
+    )
+    return SimpleNamespace(
+        question=question,
+        expected_baseline_score=score,
+        price_estimate=cost,
+        prediction=None,
+        errors=[],
+    )
+
+
+def _make_benchmark(name: str, model_label: str, scores: list[float]) -> SimpleNamespace:
+    reports = [_make_report(1000 + idx, score) for idx, score in enumerate(scores)]
+    return SimpleNamespace(
+        forecast_bot_class_name="TemplateForecaster",
+        name=name,
+        num_input_questions=len(reports),
+        timestamp=datetime.now().isoformat(),
+        time_taken_in_minutes=5.0,
+        total_cost=sum(r.price_estimate for r in reports),
+        average_expected_baseline_score=sum(scores) / len(scores) if scores else 0.0,
+        forecast_bot_config={
+            "llms": {
+                "default": {"model": model_label},
+                "forecasters": [{"model": model_label}],
+            }
+        },
+        forecast_reports=reports,
+        failed_report_errors=[],
+        git_commit_hash="abc123",
+        code="# mock",
+    )
+
+
 @patch("analyze_correlations.CorrelationAnalyzer")
 @patch("analyze_correlations.load_benchmarks_from_path")
 def test_main_function_flow(mock_load, mock_analyzer_class):
     """Test main function flow without actual file operations."""
     import analyze_correlations
 
-    # Mock the loading
-    mock_benchmarks = [Mock(), Mock()]  # Two mock benchmarks
+    # Mock the loading with realistic benchmark objects
+    mock_benchmarks = [
+        _make_benchmark("Bot A", "model-a", [12.0, -5.0, 3.5]),
+        _make_benchmark("Bot B", "model-b", [10.0, -2.5, 4.0]),
+    ]
     mock_load.return_value = mock_benchmarks
 
     # Mock the analyzer
     mock_analyzer = Mock()
     mock_analyzer.generate_correlation_report.return_value = "Mock report"
     mock_analyzer.find_optimal_ensembles.return_value = []
+    mock_analyzer.filter_models_inplace.return_value = {}
+    mock_analyzer._get_question_type.side_effect = lambda report: "binary"
+    mock_analyzer._is_stacking_benchmark.return_value = False
+    mock_analyzer.benchmarks = mock_benchmarks
 
     # Mock correlation matrix with proper get_least_correlated_pairs return value
     mock_corr_matrix = Mock()

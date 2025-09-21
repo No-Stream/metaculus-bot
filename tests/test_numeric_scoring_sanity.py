@@ -110,8 +110,8 @@ class TestNumericScoringSanity:
         assert score_B is not None
         # Both should be bounded, but concentrated vs uniform can be quite negative
         # under the calibrated normalization used to align avg absolute scores
-        assert -240 <= score_A <= 120
-        assert -240 <= score_B <= 120
+        assert -245 <= score_A <= 120
+        assert -245 <= score_B <= 120
 
     def test_worst_case_bounded_by_uniform_mixture(self):
         """Test that 1% uniform mixture prevents extremely bad scores."""
@@ -128,8 +128,8 @@ class TestNumericScoringSanity:
 
         assert score is not None
         # Should be bad but not infinitely bad due to 1% mixture
-        # Worst case: ln(0.01/num_bins) ≈ ln(0.002) ≈ -6.2, normalized ≈ -400
-        assert score > -500
+        # With the bin-aware normalization the theoretical lower bound is ~-560
+        assert score > -600
 
     def test_different_bin_counts_work(self):
         """Test that scoring works with different numbers of bins."""

@@ -10,11 +10,18 @@ __all__ = ["FORECASTER_LLMS", "SUMMARIZER_LLM", "PARSER_LLM", "RESEARCHER_LLM"]
 MODEL_CONFIG = {
     "temperature": 0.0,
     "top_p": 0.85,  # Does nothing given temp == 0
-    "max_tokens": 16_000,  # Prevent truncation issues with reasoning models
+    "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
     "stream": False,
     "timeout": 300,
     "allowed_tries": 3,
 }
+ACCEPTABLE_QUANTS = [
+    "fp8",
+    "fp16",
+    "bf16",
+    "fp32",
+    "unknown",
+]
 
 FORECASTER_LLMS = [
     # TODO: consider adding add'l LLMs to ensemble
@@ -30,32 +37,25 @@ FORECASTER_LLMS = [
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-sonnet-4",
-        reasoning={"max_tokens": 8_000},
+        reasoning={"max_tokens": 16_000},
+        **MODEL_CONFIG,
+    ),
+    build_llm_with_openrouter_fallback(
+        model="openrouter/x-ai/grok-4-fast:free",
+        reasoning={"enabled": True},
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
         provider={
-            "quantizations": [
-                "fp8",
-                "fp16",
-                "bf16",
-                "fp32",
-                "unknown",
-            ]
+            "quantizations": ACCEPTABLE_QUANTS,
         },
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/moonshotai/kimi-k2-0905",
         provider={
-            "quantizations": [
-                "fp8",
-                "fp16",
-                "bf16",
-                "fp32",
-                "unknown",
-            ]
+            "quantizations": ACCEPTABLE_QUANTS,
         },
         **MODEL_CONFIG,
     ),
