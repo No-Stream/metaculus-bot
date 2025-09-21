@@ -1,9 +1,9 @@
 import asyncio
 import logging
+import os
 import random
 from typing import Any, Coroutine, Sequence, cast
 
-from dotenv import load_dotenv
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryPrediction,
     BinaryQuestion,
@@ -26,69 +26,33 @@ from forecasting_tools.data_models.questions import DateQuestion
 from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
-    aggregate_binary_median,
-    aggregate_multiple_choice_mean,
-    aggregate_multiple_choice_median,
+    combine_binary_predictions,
+    combine_multiple_choice_predictions,
+    combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
-from metaculus_bot.bounds_clamping import (
-    calculate_bounds_buffer,
-    clamp_values_to_bounds,
-    log_cluster_spreading_summary,
-    log_corrections_summary,
-    log_heavy_clamping_diagnostics,
-)
-from metaculus_bot.cluster_processing import (
-    apply_cluster_spreading,
-    apply_jitter_for_duplicates,
-    compute_cluster_parameters,
-    detect_count_like_pattern,
-    ensure_strictly_increasing_bounded,
-)
+from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
 )
+from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.mc_processing import build_mc_prediction
-from metaculus_bot.numeric_config import (
-    PCHIP_CDF_POINTS,
-    TAIL_WIDEN_K_TAIL,
-    TAIL_WIDEN_SPAN_FLOOR_GAMMA,
-    TAIL_WIDEN_TAIL_START,
-    TAIL_WIDENING_ENABLE,
-)
-from metaculus_bot.numeric_diagnostics import log_final_prediction, log_pchip_fallback, validate_cdf_construction
-from metaculus_bot.numeric_utils import (
-    aggregate_binary_mean,
-    aggregate_numeric,
-    bound_messages,
-)
-from metaculus_bot.numeric_validation import (
-    check_discrete_question_properties,
-    detect_unit_mismatch,
-    filter_to_standard_percentiles,
-    sort_percentiles_by_value,
-    validate_percentile_count_and_values,
-)
-from metaculus_bot.pchip_processing import (
-    create_fallback_numeric_distribution,
-    create_pchip_numeric_distribution,
-    generate_pchip_cdf_with_smoothing,
-    log_pchip_summary,
-    reset_pchip_stats,
-)
+from metaculus_bot.numeric_diagnostics import log_final_prediction
+from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric_utils import bound_messages
+from metaculus_bot.numeric_validation import detect_unit_mismatch
+from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.research_providers import ResearchCallable, choose_provider_with_name
 from metaculus_bot.simple_types import OptionProbability
-from metaculus_bot.tail_widening import widen_declared_percentiles
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-load_dotenv()
-load_dotenv(".env.local", override=True)
+load_environment()
 
 # --- Numeric CDF smoothing constants centralized in metaculus_bot.constants ---
 
@@ -114,54 +78,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacking_fallback_on_failure: bool = True,
         stacking_randomize_order: bool = True,
     ) -> None:
-        # Validate and normalize llm configs BEFORE calling super().__init__ to avoid defaulting/warnings.
-        if llms is None:
-            raise ValueError("Either 'forecasters' or a 'default' LLM must be provided.")
-
-        normalized_llms: dict[str, str | GeneralLlm | list[GeneralLlm]] = dict(llms)
-
-        # Setup optional forecasters list; if valid, override default and count.
-        self._forecaster_llms: list[GeneralLlm] = []
-        if "forecasters" in normalized_llms:
-            value = normalized_llms["forecasters"]
-            if isinstance(value, list) and all(isinstance(x, GeneralLlm) for x in value):
-                if value:
-                    self._forecaster_llms = list(value)
-                    # Ensure default points at first forecaster
-                    normalized_llms["default"] = self._forecaster_llms[0]
-                    predictions_per_research_report = len(self._forecaster_llms)
-            else:
-                logger.warning("'forecasters' key in llms must be a list of GeneralLlm objects.")
-            # Remove 'forecasters' before delegating to base to avoid spurious warnings.
-            normalized_llms.pop("forecasters", None)
-
-        # Setup optional stacker LLM for stacking aggregation
-        self._stacker_llm: GeneralLlm | None = None
-        if "stacker" in normalized_llms:
-            value = normalized_llms["stacker"]
-            if isinstance(value, GeneralLlm):
-                self._stacker_llm = value
-            else:
-                logger.warning("'stacker' key in llms must be a GeneralLlm object.")
-            # Remove 'stacker' before delegating to base to avoid spurious warnings.
-            normalized_llms.pop("stacker", None)
-
-        # Fail fast if critical LLM purposes are missing. We require parser and researcher explicitly.
-        required_keys = {"default", "parser", "researcher", "summarizer"}
-        missing = sorted(k for k in required_keys if k not in normalized_llms)
-        if missing:
-            raise ValueError(
-                f"Missing required LLM purposes: {', '.join(missing)}. Provide these in the 'llms' config."
-            )
-
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
         self.aggregation_strategy: AggregationStrategy = aggregation_strategy
 
-        # For stacking bots, use the stacker model as default for better display names
-        # This fixes the issue where all stackers show the same first forecaster model name
-        if self.aggregation_strategy == AggregationStrategy.STACKING and self._stacker_llm and self._forecaster_llms:
-            normalized_llms["default"] = self._stacker_llm
+        setup = prepare_llm_config(
+            llms=llms,
+            aggregation_strategy=self.aggregation_strategy,
+            predictions_per_report=predictions_per_research_report,
+        )
+
+        self._forecaster_llms: list[GeneralLlm] = setup.forecaster_llms
+        self._stacker_llm: GeneralLlm | None = setup.stacker_llm
+        normalized_llms: dict[str, str | GeneralLlm] = setup.normalized_llms
+        predictions_per_research_report = setup.predictions_per_report
+
         self._custom_research_provider: ResearchCallable | None = research_provider
         self.research_provider: ResearchCallable | None = research_provider  # For framework config access
         if max_questions_per_run is not None and max_questions_per_run <= 0:
@@ -311,12 +242,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self._stack_meta_reasoning[question.id_of_question] = meta_text
 
             # Use same validation and processing logic as base numeric forecasting
-            from metaculus_bot.numeric_validation import sort_percentiles_by_value, validate_percentile_count_and_values
+            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
 
-            validate_percentile_count_and_values(perc_list)
-            percentile_list = sort_percentiles_by_value(perc_list)
-
-            # Unit mismatch guard (bail without posting if triggered)
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:
                 from metaculus_bot.exceptions import UnitMismatchError
@@ -329,26 +256,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
                 )
 
-            percentile_list = self._apply_jitter_and_clamp(percentile_list, question)
-            percentile_list = self._maybe_widen_tails(percentile_list, question)
-
-            from metaculus_bot.numeric_validation import check_discrete_question_properties
-
-            is_discrete, should_force_zero_point_none = check_discrete_question_properties(question, PCHIP_CDF_POINTS)
-            zero_point = getattr(question, "zero_point", None)
-            if should_force_zero_point_none:
-                zero_point = None
-
-            try:
-                pchip_cdf, smoothing_applied, aggressive_enforcement_used = generate_pchip_cdf_with_smoothing(
-                    percentile_list, question, zero_point
-                )
-                prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
-            except Exception as e:
-                log_pchip_fallback(question, e)
-                prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
-
-            validate_cdf_construction(prediction, question)
+            prediction = build_numeric_distribution(percentile_list, question, zero_point)
             log_final_prediction(prediction, question)
             logger.info(f"Stacked numeric prediction for {getattr(question, 'page_url', '<unknown>')}")
             return prediction
@@ -356,75 +264,81 @@ class TemplateForecaster(CompactLoggingForecastBot):
             raise ValueError(f"Unsupported question type for stacking: {type(question)}")
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        # Check cache first (only during benchmarking)
-        if self.is_benchmarking and self.research_cache and question.id_of_question in self.research_cache:
-            cache_key = question.id_of_question
-            cached_research = self.research_cache[cache_key]
+        cache_key, cached = self._lookup_research_cache(question)
+        if cached is not None:
             logger.info(f"Using cached research for question {cache_key}")
-            return cached_research
+            return cached
 
         async with self._concurrency_limiter:
-            # Double-check cache in case another instance cached it while we were waiting
-            if self.is_benchmarking and self.research_cache and question.id_of_question in self.research_cache:
-                cache_key = question.id_of_question
-                cached_research = self.research_cache[cache_key]
+            cache_key, cached = self._lookup_research_cache(question)
+            if cached is not None:
                 logger.info(f"Using cached research for question {cache_key} (double-check)")
-                return cached_research
+                return cached
 
-            # Determine provider each call unless a custom one was supplied.
-            if self._custom_research_provider is not None:
-                provider = self._custom_research_provider
-                provider_name = "custom"
-            else:
-                default_llm = self.get_llm("default", "llm") if hasattr(self, "get_llm") else None  # type: ignore[attr-defined]
-                provider, provider_name = choose_provider_with_name(
-                    default_llm,
-                    exa_callback=self._call_exa_smart_searcher,
-                    perplexity_callback=self._call_perplexity,
-                    openrouter_callback=lambda q: self._call_perplexity(q, use_open_router=True),
-                    is_benchmarking=self.is_benchmarking,
-                )
-
+            provider, provider_name = self._select_research_provider()
             logger.info(f"Using research provider: {provider_name}")
-            try:
-                research = await provider(question.question_text)
-            except Exception as e:
-                # Optional fallback when primary provider (often AskNews) fails (e.g., 429s)
-                if self.allow_research_fallback and provider_name == "asknews":
-                    logger.warning(f"Primary research provider '{provider_name}' failed with {type(e).__name__}: {e}")
-                    fallback_research: str | None = None
-                    try:
-                        import os
+            research = await self._fetch_research_with_fallback(question.question_text, provider, provider_name)
 
-                        if os.getenv("OPENROUTER_API_KEY"):
-                            logger.info("Falling back to openrouter/perplexity for research")
-                            fallback_research = await self._call_perplexity(
-                                question.question_text, use_open_router=True
-                            )
-                        elif os.getenv("PERPLEXITY_API_KEY"):
-                            logger.info("Falling back to Perplexity for research")
-                            fallback_research = await self._call_perplexity(
-                                question.question_text, use_open_router=False
-                            )
-                        elif os.getenv("EXA_API_KEY") and hasattr(self, "_call_exa_smart_searcher"):
-                            logger.info("Falling back to Exa search for research")
-                            fallback_research = await self._call_exa_smart_searcher(question.question_text)
-                    except Exception as fe:
-                        logger.warning(f"Fallback research provider also failed: {type(fe).__name__}: {fe}")
-                    if fallback_research is None:
-                        raise
-                    research = fallback_research
-                else:
-                    raise
-
-            # Cache the result if we're in benchmarking mode
-            if self.is_benchmarking and self.research_cache is not None:
-                cache_key = question.id_of_question
-                self.research_cache[cache_key] = research
-                logger.info(f"Cached research for question {cache_key}")
-
+            self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
+        cache_key = getattr(question, "id_of_question", None)
+        if not self.is_benchmarking or self.research_cache is None or cache_key is None:
+            return cache_key, None
+        return cache_key, self.research_cache.get(cache_key)
+
+    def _store_research_cache(self, cache_key: int | None, research: str) -> None:
+        if not self.is_benchmarking or self.research_cache is None or cache_key is None:
+            return
+        self.research_cache[cache_key] = research
+        logger.info(f"Cached research for question {cache_key}")
+
+    def _select_research_provider(self) -> tuple[ResearchCallable, str]:
+        if self._custom_research_provider is not None:
+            return self._custom_research_provider, "custom"
+
+        default_llm = self.get_llm("default", "llm") if hasattr(self, "get_llm") else None  # type: ignore[attr-defined]
+        provider, provider_name = choose_provider_with_name(
+            default_llm,
+            exa_callback=self._call_exa_smart_searcher,
+            perplexity_callback=self._call_perplexity,
+            openrouter_callback=lambda q: self._call_perplexity(q, use_open_router=True),
+            is_benchmarking=self.is_benchmarking,
+        )
+        return provider, provider_name
+
+    async def _fetch_research_with_fallback(
+        self,
+        question_text: str,
+        provider: ResearchCallable,
+        provider_name: str,
+    ) -> str:
+        try:
+            return await provider(question_text)
+        except Exception as exc:
+            if self.allow_research_fallback and provider_name == "asknews":
+                logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
+                fallback = await self._attempt_research_fallback(question_text)
+                if fallback is not None:
+                    return fallback
+            raise
+
+    async def _attempt_research_fallback(self, question_text: str) -> str | None:
+        try:
+            if os.getenv("OPENROUTER_API_KEY"):
+                logger.info("Falling back to openrouter/perplexity for research")
+                return await self._call_perplexity(question_text, use_open_router=True)
+            if os.getenv("PERPLEXITY_API_KEY"):
+                logger.info("Falling back to Perplexity for research")
+                return await self._call_perplexity(question_text, use_open_router=False)
+            if os.getenv("EXA_API_KEY") and hasattr(self, "_call_exa_smart_searcher"):
+                logger.info("Falling back to Exa search for research")
+                return await self._call_exa_smart_searcher(question_text)
+        except Exception as fallback_exc:
+            logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
+        return None
 
     # Override _research_and_make_predictions to support multiple LLMs
     async def _research_and_make_predictions(
@@ -612,18 +526,25 @@ class TemplateForecaster(CompactLoggingForecastBot):
             first = predictions[0]
             if isinstance(first, (int, float)):
                 values = [float(p) for p in predictions]  # type: ignore[list-item]
-                result = aggregate_binary_mean(values)
+                result = combine_binary_predictions(values, AggregationStrategy.MEAN)
                 logger.info("STACKING base combine: binary mean of %s = %.3f", values, result)
                 return result  # type: ignore[return-value]
             if isinstance(first, PredictedOptionList):
                 mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                aggregated = aggregate_multiple_choice_mean(mc_preds)
+                aggregated = combine_multiple_choice_predictions(
+                    mc_preds,
+                    AggregationStrategy.MEAN,
+                )
                 summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
                 logger.info("STACKING base combine: MC mean aggregation | %s", summary)
                 return aggregated  # type: ignore[return-value]
             if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
                 numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-                aggregated = await aggregate_numeric(numeric_preds, question, "mean")
+                aggregated = await combine_numeric_predictions(
+                    numeric_preds,
+                    question,
+                    AggregationStrategy.MEAN,
+                )
                 logger.info(
                     "STACKING base combine: numeric mean aggregation | CDF points=%d",
                     len(getattr(aggregated, "cdf", [])),
@@ -678,38 +599,44 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info("Aggregating %s predictions with %s", qtype, self.aggregation_strategy.value)
 
         # Binary aggregation - strategy-based dispatch
-        if isinstance(predictions[0], (int, float)):
+        first_prediction = predictions[0]
+        if isinstance(first_prediction, (int, float)):
             float_preds = [float(p) for p in predictions]  # type: ignore[list-item]
-
+            result = combine_binary_predictions(float_preds, self.aggregation_strategy)
             if self.aggregation_strategy == AggregationStrategy.MEAN:
-                result = aggregate_binary_mean(float_preds)
                 logger.info(
                     "Binary question ensembling: mean of %s = %.3f (rounded)",
                     float_preds,
                     result,
                 )
-                return result  # type: ignore[return-value]
             elif self.aggregation_strategy == AggregationStrategy.MEDIAN:
-                result = aggregate_binary_median(float_preds)
                 logger.info(
                     "Binary question ensembling: median of %s = %.3f",
                     float_preds,
                     result,
                 )
-                return result  # type: ignore[return-value]
             else:
-                raise ValueError(f"Unsupported aggregation strategy for binary questions: {self.aggregation_strategy}")
+                logger.info(
+                    "Binary question ensembling: %s of %s = %.3f",
+                    self.aggregation_strategy.value,
+                    float_preds,
+                    result,
+                )
+            return result  # type: ignore[return-value]
 
         # Numeric aggregation - convert strategy to string for existing function
-        if isinstance(predictions[0], NumericDistribution) and isinstance(question, NumericQuestion):
+        if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            strategy_str = self.aggregation_strategy.value  # Convert enum to string
-            aggregated = await aggregate_numeric(numeric_preds, question, strategy_str)
+            aggregated = await combine_numeric_predictions(
+                numeric_preds,
+                question,
+                self.aggregation_strategy,
+            )
             lb = getattr(question, "lower_bound", None)
             ub = getattr(question, "upper_bound", None)
             logger.info(
                 "Numeric aggregation=%s | preserved bounds [%s, %s] | CDF points=%d",
-                strategy_str,
+                self.aggregation_strategy.value,
                 lb,
                 ub,
                 len(getattr(aggregated, "cdf", [])),
@@ -717,23 +644,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return aggregated  # type: ignore[return-value]
 
         # Multiple choice aggregation - strategy-based dispatch
-        if isinstance(predictions[0], PredictedOptionList):
+        if isinstance(first_prediction, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-
-            if self.aggregation_strategy == AggregationStrategy.MEAN:
-                aggregated = aggregate_multiple_choice_mean(mc_preds)
-                summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
-                logger.info("MC mean aggregation; renormalized to 1.0 | %s", summary)
-                return aggregated  # type: ignore[return-value]
-            elif self.aggregation_strategy == AggregationStrategy.MEDIAN:
-                aggregated = aggregate_multiple_choice_median(mc_preds)
-                summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
-                logger.info("MC median aggregation; renormalized to 1.0 | %s", summary)
-                return aggregated  # type: ignore[return-value]
-            else:
-                raise ValueError(
-                    f"Unsupported aggregation strategy for multiple choice questions: {self.aggregation_strategy}"
-                )
+            aggregated = combine_multiple_choice_predictions(mc_preds, self.aggregation_strategy)
+            summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
+            logger.info(
+                "MC %s aggregation; renormalized to 1.0 | %s",
+                self.aggregation_strategy.value,
+                summary,
+            )
+            return aggregated  # type: ignore[return-value]
 
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
@@ -892,44 +812,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             model=self.get_llm("parser", "llm"),
             additional_instructions=parse_notes,
         )
+        sanitized_percentiles, zero_point = sanitize_percentiles(percentile_list, question)
 
-        # Filter to the standard set in case the parser emitted extras
-
-        percentile_list = filter_to_standard_percentiles(percentile_list)
-
-        # Validate we have exactly 11 percentiles with the expected set {2.5,5,10,20,40,50,60,80,90,95,97.5}
-        validate_percentile_count_and_values(percentile_list)
-
-        # Sort percentiles by percentile value to ensure proper order
-        percentile_list = sort_percentiles_by_value(percentile_list)
-
-        # Apply jitter/clamp then optional tail widening
-        percentile_list = self._apply_jitter_and_clamp(percentile_list, question)
-        percentile_list = self._maybe_widen_tails(percentile_list, question)
-
-        # For discrete questions, force zero_point to None to avoid log-scaling
-        is_discrete, should_force_zero_point_none = check_discrete_question_properties(question, PCHIP_CDF_POINTS)
-        zero_point = getattr(question, "zero_point", None)
-
-        if should_force_zero_point_none:
-            zero_point = None
-
-        # Generate PCHIP CDF with validation and smoothing
-        try:
-            pchip_cdf, smoothing_applied, aggressive_enforcement_used = generate_pchip_cdf_with_smoothing(
-                percentile_list, question, zero_point
-            )
-            prediction = create_pchip_numeric_distribution(pchip_cdf, percentile_list, question, zero_point)
-        except Exception as e:
-            log_pchip_fallback(question, e)
-            prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
-
-        # Validate CDF construction for non-PCHIP distributions
-        validate_cdf_construction(prediction, question)
+        prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 
         # Unit mismatch guard (bail without posting if triggered) — run late to avoid disrupting
         # diagnostic tests that exercise fallback and CDF validation paths.
-        mismatch, reason = detect_unit_mismatch(percentile_list, question)
+        mismatch, reason = detect_unit_mismatch(sanitized_percentiles, question)
         if mismatch:
             from metaculus_bot.exceptions import UnitMismatchError
 
@@ -938,85 +827,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 f"URL {getattr(question, 'page_url', '<unknown>')} | reason={reason}. Withholding prediction."
             )
             raise UnitMismatchError(
-                f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
+                f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in sanitized_percentiles]}"
             )
 
         # Log final prediction
         log_final_prediction(prediction, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    def _apply_jitter_and_clamp(self, percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
-        """Apply jitter to ensure strictly increasing percentiles and clamp values to bounds.
-
-        Enhancements:
-        - Detect clusters of near-equal declared values and spread them minimally and symmetrically.
-        - Preserve cluster intent while ensuring strictly increasing sequence before CDF construction.
-        """
-        import logging
-
-        logging.getLogger(__name__)
-
-        # Calculate buffer for bounds clamping
-        range_size = question.upper_bound - question.lower_bound
-        buffer = calculate_bounds_buffer(question)
-
-        # Extract values
-        values = [p.value for p in percentile_list]
-        modified_values = list(values)  # Copy for modifications
-
-        # Detect count-like patterns (all near integers)
-        count_like = detect_count_like_pattern(values)
-
-        # Compute cluster detection and spreading parameters
-        span = (max(values) - min(values)) if values else 0.0
-        value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
-
-        # Compute pre-spread min delta for logging
-        pre_deltas = [b - a for a, b in zip(values, values[1:])]
-        min(pre_deltas) if pre_deltas else float("inf")
-
-        # Apply cluster spreading to ensure strictly increasing values
-        modified_values, clusters_applied = apply_cluster_spreading(
-            modified_values, question, value_eps, spread_delta, range_size
-        )
-
-        # Apply jitter for any remaining duplicates
-        modified_values = apply_jitter_for_duplicates(modified_values, question, range_size, percentile_list)
-
-        # Clamp values to bounds if they violate by small amounts
-        modified_values, corrections_made = clamp_values_to_bounds(modified_values, percentile_list, question, buffer)
-
-        # Log diagnostics and warnings
-        log_cluster_spreading_summary(
-            modified_values,
-            values,
-            question,
-            clusters_applied,
-            spread_delta,
-            count_like,
-        )
-        log_corrections_summary(modified_values, values, question, corrections_made)
-        log_heavy_clamping_diagnostics(modified_values, values, question, buffer)
-
-        # Final pass to ensure strictly increasing values within bounds
-        modified_values = ensure_strictly_increasing_bounded(modified_values, question, range_size)
-
-        # Create new percentile list with corrected values
-        return [Percentile(value=v, percentile=p.percentile) for v, p in zip(modified_values, percentile_list)]
-
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
         return bound_messages(question)
-
-    def _maybe_widen_tails(self, percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
-        if not TAIL_WIDENING_ENABLE:
-            return percentile_list
-        return widen_declared_percentiles(
-            percentile_list,
-            question,
-            k_tail=TAIL_WIDEN_K_TAIL,
-            tail_start=TAIL_WIDEN_TAIL_START,
-            span_floor_gamma=TAIL_WIDEN_SPAN_FLOOR_GAMMA,
-        )
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         try:

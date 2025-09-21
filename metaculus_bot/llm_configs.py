@@ -15,6 +15,13 @@ MODEL_CONFIG = {
     "timeout": 300,
     "allowed_tries": 3,
 }
+ACCEPTABLE_QUANTS = [
+    "fp8",
+    "fp16",
+    "bf16",
+    "fp32",
+    "unknown",
+]
 
 FORECASTER_LLMS = [
     # TODO: consider adding add'l LLMs to ensemble
@@ -30,32 +37,25 @@ FORECASTER_LLMS = [
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-sonnet-4",
-        reasoning={"max_tokens": 8_000},
+        reasoning={"max_tokens": 12_000},
+        **MODEL_CONFIG,
+    ),
+    build_llm_with_openrouter_fallback(
+        model="openrouter/x-ai/grok-4-fast:free",
+        reasoning={"enabled": True},
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
         provider={
-            "quantizations": [
-                "fp8",
-                "fp16",
-                "bf16",
-                "fp32",
-                "unknown",
-            ]
+            "quantizations": ACCEPTABLE_QUANTS,
         },
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/moonshotai/kimi-k2-0905",
         provider={
-            "quantizations": [
-                "fp8",
-                "fp16",
-                "bf16",
-                "fp32",
-                "unknown",
-            ]
+            "quantizations": ACCEPTABLE_QUANTS,
         },
         **MODEL_CONFIG,
     ),

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import atexit
 import logging
+import os
 import random
 import sys
 import time
@@ -15,22 +16,28 @@ from typing import Literal
 
 import aiohttp
 import typeguard
-from dotenv import load_dotenv
 from forecasting_tools import (
     ApiFilter,
     Benchmarker,
     ForecastBot,
-    GeneralLlm,
     MetaculusApi,
     MonetaryCostManager,
     run_benchmark_streamlit_page,
 )
 from tqdm import tqdm
 
-from main import TemplateForecaster
-from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.benchmark.bot_factory import (
+    BENCHMARK_BOT_CONFIG,
+    DEFAULT_HELPER_LLMS,
+    INDIVIDUAL_MODEL_SPECS,
+    STACKING_MODEL_SPECS,
+    create_individual_bots,
+    create_stacking_bots,
+)
 from metaculus_bot.benchmark.heartbeat import install_benchmarker_heartbeat
 from metaculus_bot.benchmark.logging import log_benchmarker_headline_note, log_bot_lineup, log_stacking_summaries
+from metaculus_bot.benchmark.logging_setup import configure_benchmark_logging
+from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BENCHMARK_BATCH_SIZE,
     FETCH_PACING_SECONDS,
@@ -38,8 +45,6 @@ from metaculus_bot.constants import (
     HEARTBEAT_INTERVAL,
     TYPE_MIX,
 )
-from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 from metaculus_bot.scoring_patches import (
     apply_scoring_patches,
     log_score_scale_validation,
@@ -49,8 +54,7 @@ from metaculus_bot.scoring_patches import (
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-load_dotenv(".env.local", override=True)
+load_environment()
 
 
 # Quick mitigation for occasional "Unclosed client session" warnings from aiohttp when
@@ -297,33 +301,6 @@ async def benchmark_forecast_bot(
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
-    # Shared configuration for all benchmark bots
-    BENCHMARK_BOT_CONFIG = {
-        "research_reports_per_question": 1,
-        "predictions_per_research_report": 1,  # Ignored when forecasters present
-        "use_research_summary_to_forecast": False,
-        "publish_reports_to_metaculus": False,  # Don't publish during benchmarking
-        "folder_to_save_reports_to": None,
-        "skip_previously_forecasted_questions": False,
-        "research_provider": None,  # Use default provider selection
-        "max_questions_per_run": None,  # No limit for benchmarking
-        "is_benchmarking": True,  # Exclude prediction markets to avoid data leakage
-        "allow_research_fallback": False,  # Ensure AskNews runs; do not fallback in benchmark
-    }
-    MODEL_CONFIG = {
-        "temperature": 0.0,
-        "top_p": 0.9,
-        "max_tokens": 16_000,  # Prevent truncation issues with reasoning models
-        "stream": False,
-        "timeout": 240,
-        "allowed_tries": 3,
-    }
-    DEFAULT_HELPER_LLMS = {
-        "summarizer": SUMMARIZER_LLM,
-        "parser": PARSER_LLM,
-        "researcher": RESEARCHER_LLM,
-    }
-
     # Apply scoring patches for mixed question types and reset counters
     apply_scoring_patches()
     reset_scoring_path_stats()
@@ -334,139 +311,37 @@ async def benchmark_forecast_bot(
 
         # Shared research cache for all bots to avoid duplicate API calls
         research_cache: dict[int, str] = {}
-
-        # Define individual model configurations
-        # Cheapies; avoid free models due to rate limits (very slow)
-        ds_v3p1_model = GeneralLlm(
-            model="openrouter/deepseek/deepseek-chat-v3.1",
-            **MODEL_CONFIG,
-        )
-        kimi_k2_model = GeneralLlm(
-            model="openrouter/moonshotai/kimi-k2-0905",
-            **MODEL_CONFIG,
-        )
-
-        qwen3_model = GeneralLlm(
-            model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-            **MODEL_CONFIG,
-        )
-        # Need to ignore linter error for unused variables below
-        glm_model = GeneralLlm(
-            model="openrouter/z-ai/glm-4.5",
-            **MODEL_CONFIG,
-        )
-        r1_0528_model = GeneralLlm(
-            model="openrouter/deepseek/deepseek-r1-0528",
-            **MODEL_CONFIG,
-        )
-        claude_model = build_llm_with_openrouter_fallback(
-            model="openrouter/anthropic/claude-sonnet-4",
-            reasoning={"max_tokens": 4000},
-            **MODEL_CONFIG,
-        )
-        gpt5_model = build_llm_with_openrouter_fallback(
-            model="openrouter/openai/gpt-5",
-            reasoning={"effort": "high"},
-            **MODEL_CONFIG,
-        )
-        GeneralLlm(
-            model="openrouter/google/gemini-2.5-pro",
-            reasoning={"max_tokens": 8000},
-            **MODEL_CONFIG,
-        )
-        o3_model = build_llm_with_openrouter_fallback(
-            model="openrouter/openai/o3",
-            reasoning={"effort": "high"},
-            **MODEL_CONFIG,
-        )
-        GeneralLlm(
-            model="openrouter/x-ai/grok-4",
-            reasoning={"effort": "high"},
-            **MODEL_CONFIG,
-        )
-
-        # Individual model configurations for benchmarking
-        # Test each model separately - ensembles will be generated post-hoc by analyze_correlations.py
-        individual_models = [
-            {"name": "qwen3-235b", "forecaster": qwen3_model},
-            {"name": "deepseek-3.1", "forecaster": ds_v3p1_model},
-            {"name": "kimi-k2", "forecaster": kimi_k2_model},
-            # Additional models - comment for cost control during development:
-            {"name": "glm-4.5", "forecaster": glm_model},
-            {"name": "r1-0528", "forecaster": r1_0528_model},
-            {
-                "name": "claude-sonnet-4",
-                "forecaster": claude_model,
-            },  # Sonnet 4 is reasonably strong and cheaper than you'd expect due to short reasoning traces
-            {"name": "gpt-5", "forecaster": gpt5_model},
-            {"name": "o3", "forecaster": o3_model},
-            # Deprioritized:
-            # {"name": "gemini-2.5-pro", "forecaster": gemini_model},  # Gemini 2.5 Pro is weak and pricey on this task
-            # {"name": "grok-4", "forecaster": grok_model},  # Grok is strong here, typically competitive with o3/gpt5, but I don't want to pay for it
-        ]
-
-        # Stacking model configurations - these will aggregate predictions from ALL base models
-        stacking_models = [
-            {"name": "stack-qwen3", "stacker": qwen3_model},
-            # Additional stackers - comment for cost control during development:
-            {"name": "stack-o3", "stacker": o3_model},
-            {"name": "stack-claude4", "stacker": claude_model},
-            {"name": "stack-gpt5", "stacker": gpt5_model},
-        ]
-
-        # Generate individual model bots - ensembles generated by CorrelationAnalyzer.find_optimal_ensembles()
-        bots = []
-        for model_config in individual_models:
-            bot = TemplateForecaster(
-                **BENCHMARK_BOT_CONFIG,
-                aggregation_strategy=AggregationStrategy.MEAN,  # Default, not used for single models
-                llms={
-                    "forecasters": [model_config["forecaster"]],
-                    **DEFAULT_HELPER_LLMS,
-                },
-                max_concurrent_research=batch_size,
-                research_cache=research_cache,
-            )
-            bot.name = model_config["name"]
-            bots.append(bot)
-
-        # Generate stacking bots - each gets ALL base model forecasters as input
-        base_forecasters = [config["forecaster"] for config in individual_models]
+        individual_specs = INDIVIDUAL_MODEL_SPECS
+        base_forecasters = [spec["forecaster"] for spec in individual_specs]
         if len(base_forecasters) < 2:
             logger.warning(
                 "STACKING configuration: fewer than 2 base forecasters (%d). Stacking quality may suffer.",
                 len(base_forecasters),
             )
-        stacking_bots: list[TemplateForecaster] = []
-        for stacker_config in stacking_models:
-            stacking_bot = TemplateForecaster(
-                **BENCHMARK_BOT_CONFIG,
-                aggregation_strategy=AggregationStrategy.STACKING,
-                llms={
-                    "forecasters": base_forecasters,  # All base models
-                    "stacker": stacker_config["stacker"],  # The stacking model
-                    **DEFAULT_HELPER_LLMS,
-                },
-                max_concurrent_research=batch_size,
-                research_cache=research_cache,
-                stacking_fallback_on_failure=False,  # Fail in benchmarking
-                stacking_randomize_order=True,  # Avoid position bias
-            )
-            stacking_bot.name = stacker_config["name"]
-            # Benchmark-time validations and warnings
-            try:
-                if getattr(stacking_bot, "research_reports_per_question", 1) != 1:
-                    logger.warning(
-                        "STACKING benchmark: research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
-                        getattr(stacking_bot, "research_reports_per_question", 1),
-                    )
-            except Exception:
-                pass
-            bots.append(stacking_bot)
-            stacking_bots.append(stacking_bot)
+
+        stacking_specs = STACKING_MODEL_SPECS
+
+        bots = create_individual_bots(
+            individual_specs,
+            DEFAULT_HELPER_LLMS,
+            BENCHMARK_BOT_CONFIG,
+            batch_size=batch_size,
+            research_cache=research_cache,
+        )
+
+        stacking_bots = create_stacking_bots(
+            stacking_specs,
+            list(base_forecasters),
+            DEFAULT_HELPER_LLMS,
+            BENCHMARK_BOT_CONFIG,
+            batch_size=batch_size,
+            research_cache=research_cache,
+        )
+
+        bots.extend(stacking_bots)
 
         logger.info(
-            f"Created {len(bots)} total bots for benchmarking: {len(individual_models)} individual models + {len(stacking_models)} stacking models. "
+            f"Created {len(bots)} total bots for benchmarking: {len(individual_specs)} individual models + {len(stacking_specs)} stacking models. "
             f"Traditional ensembles will be generated post-hoc by correlation analysis."
         )
         bots = typeguard.check_type(bots, list[ForecastBot])
@@ -474,7 +349,7 @@ async def benchmark_forecast_bot(
         # Log progress info
         total_predictions = len(bots) * len(questions)
         logger.info(
-            f"🚀 Starting benchmark: {len(bots)} bots × {len(questions)} questions = {total_predictions} total predictions"
+            f"🚀 Starting benchmark: {len(bots)} bots x {len(questions)} questions = {total_predictions} total predictions"
         )
         sys.stdout.flush()  # Ensure this critical message appears immediately
 
@@ -605,62 +480,9 @@ async def benchmark_forecast_bot(
 
 if __name__ == "__main__":
     # Force unbuffered output for real-time logging in long-running processes
-    import os
-
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    # Create custom handler that properly flushes after each log
-    class FlushingStreamHandler(logging.StreamHandler):
-        def emit(self, record):
-            super().emit(record)
-            self.flush()
-
-    console_handler = FlushingStreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-
-    file_handler = logging.FileHandler(f"benchmarks/log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
-    file_handler.setLevel(logging.INFO)
-
-    # Set formatter
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-
-    # Enable forecasting-tools logging for progress visibility
-    forecasting_logger = logging.getLogger("forecasting_tools")
-    forecasting_logger.setLevel(logging.INFO)
-    forecasting_logger.propagate = True
-
-    # Enable our main modules
-    main_logger = logging.getLogger("__main__")
-    main_logger.setLevel(logging.INFO)
-
-    # Suppress noisy third-party loggers but keep errors visible
-    for noisy_logger in ["LiteLLM", "httpx", "httpcore", "urllib3", "aiohttp"]:
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
-        logging.getLogger(noisy_logger).propagate = False
-
-    # Enhanced logging monkey patch for all levels to ensure flushing
-    for level_name in ["debug", "info", "warning", "error", "critical"]:
-        original_method = getattr(logging.Logger, level_name)
-
-        def make_flushing_method(orig_method):
-            def flushing_method(self, message, *args, **kwargs):
-                result = orig_method(self, message, *args, **kwargs)
-                sys.stdout.flush()
-                sys.stderr.flush()  # Also flush stderr for warnings/errors
-                return result
-
-            return flushing_method
-
-        setattr(logging.Logger, level_name, make_flushing_method(original_method))
+    configure_benchmark_logging()
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Benchmark a list of bots")
@@ -686,9 +508,7 @@ if __name__ == "__main__":
         "--exclude-models",
         nargs="*",
         default=None,
-        help=(
-            "Exclude models by substring match (case-insensitive). " "Example: --exclude-models grok-4 gemini-2.5-pro"
-        ),
+        help=("Exclude models by substring match (case-insensitive). Example: --exclude-models grok-4 gemini-2.5-pro"),
     )
     parser.add_argument(
         "--include-models",

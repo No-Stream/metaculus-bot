@@ -702,7 +702,7 @@ class TestStackingBenchmarkConfiguration:
 
     def test_benchmark_stacking_configuration(self):
         """Test that stacking bots are properly configured for benchmarking."""
-        from community_benchmark import TemplateForecaster as BenchmarkForecaster
+        from main import TemplateForecaster as BenchmarkForecaster
         from metaculus_bot.aggregation_strategies import AggregationStrategy
 
         # Test configuration similar to what's used in community_benchmark.py

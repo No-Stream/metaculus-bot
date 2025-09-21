@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+
 
 def _make_forecaster():
     from main import TemplateForecaster
@@ -205,7 +207,7 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
 
 
 def test_lower_bound_adjacent_cluster(caplog):
-    f = _make_forecaster()
+    _make_forecaster()
     # Closed lower bound; cluster near lower
     q = _make_question(
         open_upper_bound=False,
@@ -229,7 +231,7 @@ def test_lower_bound_adjacent_cluster(caplog):
 
     caplog.clear()
     caplog.set_level("WARNING")
-    adjusted = f._apply_jitter_and_clamp(raw, q)
+    adjusted = apply_jitter_and_clamp(raw, q)
 
     vals = [p.value for p in adjusted]
     assert all(q.lower_bound <= v <= q.upper_bound for v in vals)

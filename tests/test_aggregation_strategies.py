@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 from forecasting_tools.data_models.multiple_choice_report import (
     PredictedOption,
@@ -9,6 +11,9 @@ from metaculus_bot.aggregation_strategies import (
     aggregate_binary_median,
     aggregate_multiple_choice_mean,
     aggregate_multiple_choice_median,
+    combine_binary_predictions,
+    combine_multiple_choice_predictions,
+    combine_numeric_predictions,
 )
 
 
@@ -142,3 +147,61 @@ def test_aggregation_strategy_enum():
     assert "mean" in strategies
     assert "median" in strategies
     assert "stacking" in strategies
+
+
+def test_combine_binary_predictions_mean_and_median():
+    probs = [0.2, 0.3, 0.4]
+    assert combine_binary_predictions(probs, AggregationStrategy.MEAN) == pytest.approx(0.3)
+    assert combine_binary_predictions(probs, AggregationStrategy.MEDIAN) == pytest.approx(0.3)
+
+    with pytest.raises(ValueError):
+        combine_binary_predictions(probs, AggregationStrategy.STACKING)
+
+
+def test_combine_multiple_choice_predictions_dispatch():
+    pred1 = PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name="A", probability=0.6),
+            PredictedOption(option_name="B", probability=0.4),
+        ]
+    )
+    pred2 = PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name="A", probability=0.8),
+            PredictedOption(option_name="B", probability=0.2),
+        ]
+    )
+
+    mean_result = combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEAN)
+    assert {opt.option_name: opt.probability for opt in mean_result.predicted_options}["A"] == pytest.approx(0.7)
+
+    median_result = combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEDIAN)
+    assert {opt.option_name: opt.probability for opt in median_result.predicted_options}["A"] == pytest.approx(0.7)
+
+    with pytest.raises(ValueError):
+        combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.STACKING)
+
+
+@pytest.mark.asyncio
+async def test_combine_numeric_predictions_dispatch(monkeypatch):
+    predictions = ["pred1", "pred2"]
+    question = "question"
+
+    fake_aggregate = AsyncMock(return_value="result")
+    monkeypatch.setattr(
+        "metaculus_bot.aggregation_strategies.aggregate_numeric",
+        fake_aggregate,
+    )
+
+    result = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEDIAN)
+    fake_aggregate.assert_awaited_once_with(predictions, question, "median")
+    assert result == "result"
+
+    fake_aggregate.reset_mock()
+    fake_aggregate.return_value = "mean_result"
+    result_mean = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEAN)
+    fake_aggregate.assert_awaited_once_with(predictions, question, "mean")
+    assert result_mean == "mean_result"
+
+    with pytest.raises(ValueError):
+        await combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)

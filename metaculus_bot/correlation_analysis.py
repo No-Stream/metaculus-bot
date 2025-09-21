@@ -626,33 +626,7 @@ class CorrelationAnalyzer:
         """Extract a clean model name from a model path like 'openrouter/deepseek/deepseek-r1-0528:free'."""
         # Split by '/' and take the last part, then split by ':' to remove variant suffixes
         model_name = model_path.split("/")[-1].split(":")[0]
-
-        # Map to our standard naming conventions
-        if "deepseek-r1-0528" in model_name:
-            return "r1-0528"
-        elif "qwen3-coder" in model_name:
-            return "qwen3-coder"
-        elif "glm-4.5-air" in model_name:
-            return "glm-4.5-air"
-        elif "qwen3-235b" in model_name:
-            return "qwen3-235b"
-        elif "glm-4.5" in model_name and "air" not in model_name:
-            return "glm-4.5"
-        elif "deepseek" in model_name and "r1" in model_name:
-            return "deepseek-r1"
-        elif "claude-sonnet-4" in model_name:
-            return "claude-sonnet-4"
-        elif "gpt-5" in model_name:
-            return "gpt-5"
-        elif "gemini-2.5-pro" in model_name:
-            return "gemini-2.5-pro"
-        elif "o3" in model_name:
-            return "o3"
-        elif "grok-4" in model_name:
-            return "grok-4"
-        else:
-            # Fallback: use the model name as-is
-            return model_name
+        return model_name
 
     def _extract_prediction_value(self, report) -> float:
         """Convert prediction to float for correlation analysis.
