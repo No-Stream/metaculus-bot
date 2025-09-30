@@ -36,7 +36,7 @@ FORECASTER_LLMS = [
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-sonnet-4",
+        model="openrouter/anthropic/claude-sonnet-4.5",
         reasoning={"max_tokens": 16_000},
         **MODEL_CONFIG,
     ),
