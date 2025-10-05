@@ -22,9 +22,8 @@ def _today_str() -> str:
 
 
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
-    """Return the forecasting prompt for binary questions with strengthened
-    evidence handling, outside→inside anchoring, and a brief checklist.
-    The final output format remains unchanged (last line: "Probability: ZZ%").
+    """
+    Return the forecasting prompt for binary questions.
     """
 
     return clean_indents(
@@ -32,7 +31,6 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
             You should consider current prediction markets when possible but not be beholden to them.
-            Historically, LLMs like you have been overconfident about probabilities, and the percentage of positive resolutions on Metaculus is 35%. (This may slightly influence your calibration, but it is NOT a base rate.)
 
             Your Metaculus question is:
             {question.question_text}
@@ -51,8 +49,9 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             {research}
 
             Today is {_today_str()}.
+            Reproduce the following analysis template in your answer:
 
-            ── Analysis Template (Should be reproduced in your answer!) ──
+            ── Analysis Template ──
             1) Source analysis
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
                • Separate facts from opinions. Give more weight to opinions from identifiable experts/entities.
@@ -88,7 +87,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
             • Status-quo nudge sanity check.
 
-            The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"
+            [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
             """
     )
@@ -119,8 +118,9 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         {research}
 
         Today's date: {_today_str()}
+        Reproduce the following analysis template in your answer:
 
-        ── Analysis Template (Should be reproduced in your answer!) ──
+        ── Analysis Template ──
         (1) Source analysis
             • Summarize key sources; note recency, credibility, and scope.
             • Separate fact vs opinion; favor opinions from identifiable experts/entities.
@@ -163,8 +163,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         • Top 3-5 evidence items + quick factual validity check.
         • Blind-spot statement; status-quo nudge sanity check.
 
-        **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
-        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
+        [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
+        Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
 
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
         Option_A: NN%
@@ -218,7 +218,9 @@ def numeric_prompt(
         {lower_bound_message}
         {upper_bound_message}
 
-        -- Analysis Template (Should be reproduced in your answer!) --
+        Reproduce the following analysis template in your answer:
+
+        -- Analysis Template ──
         (1) Source analysis
             - Summarize key sources; note recency, credibility, and scope.
             - Separate fact and opinion. Prefer opinions from identifiable experts and entities.
