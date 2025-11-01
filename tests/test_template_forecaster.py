@@ -1,15 +1,12 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from forecasting_tools import (
-    BinaryQuestion,
-    GeneralLlm,
-    MetaculusQuestion,
-    ReasonedPrediction,
-)
+from forecasting_tools import BinaryQuestion, GeneralLlm, MetaculusQuestion, ReasonedPrediction
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
 from main import TemplateForecaster
+from metaculus_bot.comment_trimming import TRIM_NOTICE
+from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 
 
 @pytest.fixture
@@ -362,3 +359,31 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
         mock_struct.assert_called_once()
         assert result.prediction_value is not None
         assert "mock reasoning" in result.reasoning
+
+
+def test_format_methods_trim_long_outputs():
+    llms_config = {
+        "default": GeneralLlm(model="test_default"),
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+    }
+    bot = TemplateForecaster(llms=llms_config)
+
+    long_research_body = "Line\n" + "A" * (REPORT_SECTION_CHAR_LIMIT + 500)
+    long_reasoning = "Reasoning\n" + "B" * (REPORT_SECTION_CHAR_LIMIT + 800)
+    research_with_predictions = ResearchWithPredictions(
+        research_report=f"# Deep Dive\n{long_research_body}",
+        summary_report="Summary",
+        predictions=[ReasonedPrediction(prediction_value=0.5, reasoning=long_reasoning)],
+    )
+
+    formatted_research = bot._format_main_research(1, research_with_predictions)
+    assert formatted_research.startswith("## Report 1 Research")
+    assert TRIM_NOTICE in formatted_research
+    assert len(formatted_research) <= REPORT_SECTION_CHAR_LIMIT
+
+    formatted_rationales = bot._format_forecaster_rationales(1, research_with_predictions)
+    assert formatted_rationales.startswith("## R1: Forecaster 1 Reasoning")
+    assert TRIM_NOTICE in formatted_rationales
+    assert len(formatted_rationales) <= REPORT_SECTION_CHAR_LIMIT

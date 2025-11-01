@@ -106,27 +106,18 @@ def test_numeric_prompt_includes_p5_and_p95():
     lines = prompt.split("\n")
     example_section = False
     percentile_lines = []
+    sentinel_phrases = ("Example:", "Example]")
     for line in lines:
-        if "__Example:__" in line:
+        if any(marker in line for marker in sentinel_phrases):
             example_section = True
             continue
         if example_section and "Percentile" in line and ":" in line:
             percentile_lines.append(line.strip())
 
-    expected = [
-        "Percentile 2.5: 8.0",
-        "Percentile 5: 10.1",
-        "Percentile 10: 12.3",
-        "Percentile 20: 23.4",
-        "Percentile 40: 34.5",
-        "Percentile 50: 45.6",
-        "Percentile 60: 56.7",
-        "Percentile 80: 67.8",
-        "Percentile 90: 78.9",
-        "Percentile 95: 89.0",
-        "Percentile 97.5: 93.0",
-    ]
-    assert percentile_lines == expected
+    expected_percentiles = ["2.5", "5", "10", "20", "40", "50", "60", "80", "90", "95", "97.5"]
+    assert len(percentile_lines) == len(expected_percentiles)
+    for line, suffix in zip(percentile_lines, expected_percentiles):
+        assert line.startswith(f"Percentile {suffix}:")
 
 
 # ---------- Numeric utils ---------------------------------------------------

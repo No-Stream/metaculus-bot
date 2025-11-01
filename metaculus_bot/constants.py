@@ -22,6 +22,10 @@ DEFAULT_MAX_CONCURRENT_RESEARCH: int = 1
 # Keep this modest to balance concurrency and rate limits.
 BENCHMARK_BATCH_SIZE: int = 4
 
+# Metaculus comment safety limits
+REPORT_SECTION_CHAR_LIMIT: int = 49_999
+COMMENT_CHAR_LIMIT: int = 149_999
+
 # Optional environment variable to force research provider selection.
 # Accepted values (case-insensitive): "auto", "asknews", "exa", "perplexity", "openrouter"
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
