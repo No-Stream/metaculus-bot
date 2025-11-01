@@ -430,22 +430,20 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = super()._format_and_expand_research_summary(report_number, report_type, predicted_research)
         return trim_section(text, f"report_{report_number}_summary")
 
-    @classmethod
     def _format_main_research(
-        cls,
+        self,
         report_number: int,
         predicted_research: ResearchWithPredictions,
     ) -> str:
         text = super()._format_main_research(report_number, predicted_research)
         return trim_section(text, f"report_{report_number}_research")
 
-    @classmethod
     def _format_forecaster_rationales(
-        cls,
+        self,
         report_number: int,
         collection: ResearchWithPredictions,
     ) -> str:
-        text = super()._format_forecaster_rationales(report_number, collection)
+        text = super()._format_forecaster_rationales(report_number, collection).lstrip()
         return trim_section(text, f"report_{report_number}_rationales")
 
     def _create_unified_explanation(
