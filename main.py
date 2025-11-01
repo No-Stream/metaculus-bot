@@ -31,12 +31,9 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
+from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
-from metaculus_bot.constants import (
-    BINARY_PROB_MAX,
-    BINARY_PROB_MIN,
-    DEFAULT_MAX_CONCURRENT_RESEARCH,
-)
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, DEFAULT_MAX_CONCURRENT_RESEARCH
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_diagnostics import log_final_prediction
@@ -53,8 +50,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 load_environment()
-
-# --- Numeric CDF smoothing constants centralized in metaculus_bot.constants ---
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -171,12 +166,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
             bot_name = getattr(self, "name", "Bot")
             logger.info(f"📊 {bot_name}: Processing {len(questions)} questions...")
 
-        # Reset PCHIP statistics for this run
         reset_pchip_stats()
 
         results = await super().forecast_questions(questions, return_exceptions)
 
-        # Log PCHIP summary at end of run
         log_pchip_summary()
 
         return results
@@ -426,6 +419,51 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 errors=errors,
                 predictions=valid_predictions,
             )
+
+    @classmethod
+    def _format_and_expand_research_summary(
+        cls,
+        report_number: int,
+        report_type: type[ForecastReport],
+        predicted_research: ResearchWithPredictions,
+    ) -> str:
+        text = super()._format_and_expand_research_summary(report_number, report_type, predicted_research)
+        return trim_section(text, f"report_{report_number}_summary")
+
+    @classmethod
+    def _format_main_research(
+        cls,
+        report_number: int,
+        predicted_research: ResearchWithPredictions,
+    ) -> str:
+        text = super()._format_main_research(report_number, predicted_research)
+        return trim_section(text, f"report_{report_number}_research")
+
+    @classmethod
+    def _format_forecaster_rationales(
+        cls,
+        report_number: int,
+        collection: ResearchWithPredictions,
+    ) -> str:
+        text = super()._format_forecaster_rationales(report_number, collection)
+        return trim_section(text, f"report_{report_number}_rationales")
+
+    def _create_unified_explanation(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections: list[ResearchWithPredictions],
+        aggregated_prediction: PredictionTypes,
+        final_cost: float,
+        time_spent_in_minutes: float,
+    ) -> str:
+        base_text = super()._create_unified_explanation(
+            question,
+            research_prediction_collections,
+            aggregated_prediction,
+            final_cost,
+            time_spent_in_minutes,
+        )
+        return trim_comment(base_text)
 
     async def _make_prediction(
         self,
