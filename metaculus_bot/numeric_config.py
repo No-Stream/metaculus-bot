@@ -7,6 +7,8 @@ These constants control various aspects of the numeric prediction processing pip
 
 from typing import List
 
+from metaculus_bot.constants import NUM_MAX_STEP
+
 # --- Percentile Processing Constants ---
 
 # Number of standard percentiles expected in a complete distribution
@@ -40,7 +42,7 @@ PCHIP_CDF_POINTS: int = 201
 MIN_CDF_PROB_STEP: float = 5e-5
 
 # Maximum allowable step size in probability space
-MAX_CDF_PROB_STEP: float = 0.59
+MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
 # Smoothing factor for CDF ramp correction (higher = more aggressive smoothing)
 CDF_RAMP_K_FACTOR: float = 3.0
@@ -90,7 +92,7 @@ LARGE_CORRECTION_THRESHOLD: float = 0.1
 MAX_DIAGNOSTIC_PERCENTILES: int = 5
 
 # Threshold for detecting and warning about extreme probability steps
-EXTREME_STEP_THRESHOLD: float = 0.5
+EXTREME_STEP_THRESHOLD: float = NUM_MAX_STEP * 0.9
 
 # --- PCHIP Fallback Configuration ---
 

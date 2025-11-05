@@ -80,7 +80,7 @@ MC_PROB_MAX: float = 0.995
 NUM_VALUE_EPSILON_MULT: float = 1e-9
 NUM_SPREAD_DELTA_MULT: float = 1e-6
 NUM_MIN_PROB_STEP: float = 5e-5
-NUM_MAX_STEP: float = 0.59
+NUM_MAX_STEP: float = 0.2
 NUM_RAMP_K_FACTOR: float = 3.0
 
 # --- Benchmark driver tuning ---

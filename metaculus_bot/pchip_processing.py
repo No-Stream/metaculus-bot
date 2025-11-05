@@ -17,6 +17,7 @@ from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_
 from metaculus_bot.numeric_config import (
     PCHIP_CDF_POINTS,
 )
+from metaculus_bot.pchip_cdf import _safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -155,17 +156,26 @@ def _apply_ramp_smoothing(pchip_cdf: List[float], question: NumericQuestion) -> 
     if min_delta_before < NUM_MIN_PROB_STEP:
         # Apply ramp smoothing
         ramp = np.linspace(0.0, NUM_MIN_PROB_STEP * NUM_RAMP_K_FACTOR, len(pchip_cdf))
-        pchip_cdf[:] = np.maximum.accumulate(np.array(pchip_cdf) + ramp).tolist()
+        smoothed = np.maximum.accumulate(np.array(pchip_cdf) + ramp)
 
         # Re-pin endpoints to respect open/closed bounds semantics
         if not question.open_lower_bound:
-            pchip_cdf[0] = 0.0
+            smoothed[0] = 0.0
         else:
-            pchip_cdf[0] = max(pchip_cdf[0], 0.001)
+            smoothed[0] = max(smoothed[0], 0.001)
         if not question.open_upper_bound:
-            pchip_cdf[-1] = 1.0
+            smoothed[-1] = 1.0
         else:
-            pchip_cdf[-1] = min(pchip_cdf[-1], 0.999)
+            smoothed[-1] = min(smoothed[-1], 0.999)
+
+        # Enforce max-step constraint post-smoothing
+        smoothed = _safe_cdf_bounds(
+            smoothed,
+            open_lower=question.open_lower_bound,
+            open_upper=question.open_upper_bound,
+            min_step=NUM_MIN_PROB_STEP,
+        )
+        pchip_cdf[:] = smoothed.tolist()
 
         # Log the smoothing
         diffs_after = np.diff(pchip_cdf)
@@ -215,7 +225,7 @@ def _validate_pchip_cdf(pchip_cdf: List[float], question: NumericQuestion) -> No
     # Check maximum step requirement
     max_step = np.max(np.diff(pchip_cdf))
     if max_step > NUM_MAX_STEP + 1e-6:
-        raise ValueError(f"PCHIP CDF violates maximum step requirement: {max_step:.8f} > 0.59")
+        raise ValueError(f"PCHIP CDF violates maximum step requirement: {max_step:.8f} > {NUM_MAX_STEP:.8f}")
 
     # Check boundary conditions
     if not question.open_lower_bound and abs(pchip_cdf[0]) > 1e-6:
