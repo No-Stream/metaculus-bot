@@ -11,31 +11,100 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+from metaculus_bot.constants import NUM_MAX_STEP
+
 logger = logging.getLogger(__name__)
+
+
+def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.ndarray:
+    """
+    Redistribute probability mass so that no single step exceeds max_step while
+    preserving the original total mass and monotonicity.
+    """
+    if cdf.size <= 1:
+        return cdf
+
+    steps = np.diff(cdf)
+    if not np.any(steps > max_step + 1e-12):
+        return cdf
+
+    original_total = float(steps.sum())
+    steps = np.clip(steps, 0.0, max_step)
+    deficit = original_total - float(steps.sum())
+
+    iteration = 0
+    max_iterations = max(5, steps.size * 5)
+
+    while deficit > 1e-12 and iteration < max_iterations:
+        slack = max_step - steps
+        positive_slack = slack > 1e-12
+        if not np.any(positive_slack):
+            # No room left to redistribute
+            break
+
+        allocation = np.zeros_like(steps)
+        slack_sum = float(slack[positive_slack].sum())
+        if slack_sum <= 1e-18:
+            break
+
+        allocation[positive_slack] = deficit * slack[positive_slack] / slack_sum
+        allocation = np.minimum(allocation, slack)
+
+        steps += allocation
+        deficit = original_total - float(steps.sum())
+        iteration += 1
+
+    if deficit > 1e-8:
+        raise RuntimeError(
+            f"Failed to redistribute CDF probability mass within max step constraint "
+            f"(remaining deficit={deficit:.12f}, iterations={iteration}, max_step={max_step})"
+        )
+
+    new_cdf = np.empty_like(cdf)
+    new_cdf[0] = cdf[0]
+    new_cdf[1:] = cdf[0] + np.cumsum(steps)
+    return new_cdf
 
 
 def _safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool, min_step: float) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
     • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
-    • No single step may exceed 0.59
+    • No single step may exceed 0.2
     """
+    # Work on a copy to avoid mutating callers unexpectedly
+    cdf = cdf.copy()
+
     # Pin tails to legal open-bound limits
     if open_lower:
         cdf[0] = max(cdf[0], 0.001)
     if open_upper:
         cdf[-1] = min(cdf[-1], 0.999)
 
-    # Enforce the 0.59 maximum step rule
-    big_jumps = np.where(np.diff(cdf) > 0.59)[0]
-    for idx in big_jumps:
-        excess = cdf[idx + 1] - cdf[idx] - 0.59
-        # Spread the excess evenly over the remaining points
-        span = len(cdf) - idx - 1
-        if span > 0:
-            cdf[idx + 1 :] -= excess * np.linspace(1, 0, span)
-        # Re-monotonise
-        cdf[idx + 1 :] = np.maximum.accumulate(cdf[idx + 1 :])
+    # Enforce the maximum step rule iteratively
+    pre_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
+    if pre_max_step > NUM_MAX_STEP + 1e-12:
+        cdf = _redistribute_excess_probability(cdf, NUM_MAX_STEP)
+        post_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
+        logger.debug(
+            "CDF max-step redistribution applied | pre_max_step=%.8f | post_max_step=%.8f | max_step=%.8f",
+            pre_max_step,
+            post_max_step,
+            NUM_MAX_STEP,
+        )
+
+    # Ensure monotonicity and clamp to legal probability range
+    np.maximum.accumulate(cdf, out=cdf)
+    np.clip(cdf, 0.0, 1.0, out=cdf)
+
+    # Re-apply open bounds in case redistribution nudged them
+    if open_lower:
+        cdf[0] = max(cdf[0], 0.001)
+    if open_upper:
+        cdf[-1] = min(cdf[-1], 0.999)
+
+    if cdf.size > 1:
+        np.maximum.accumulate(cdf, out=cdf)
 
     return cdf
 

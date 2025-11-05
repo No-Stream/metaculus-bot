@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.constants import NUM_MAX_STEP
+
 
 class TestPchipValidation:
     """Test our custom PCHIP CDF validation logic."""
@@ -181,7 +183,7 @@ class TestPchipValidation:
         question = self.create_mock_question()
 
         # Create CDF with max step violation
-        cdf = [0.0] * 100 + [0.8] + [1.0] * 100  # Jump of 0.8 > 0.59
+        cdf = [0.0] * 100 + [NUM_MAX_STEP + 0.05] + [1.0] * 100  # Jump above NUM_MAX_STEP
         mock_generate.return_value = cdf
         mock_format.return_value = {}
 
