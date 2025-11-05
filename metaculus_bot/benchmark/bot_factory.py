@@ -63,7 +63,7 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         **MODEL_CONFIG,
     ),
     "grok-4-fast": GeneralLlm(
-        model="openrouter/x-ai/grok-4-fast:free",
+        model="openrouter/x-ai/grok-4-fast",
         reasoning={"enabled": True},
         **MODEL_CONFIG,
     ),
@@ -87,10 +87,10 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
 INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     MappingProxyType({"name": "qwen3-235b", "forecaster": MODEL_CATALOG["qwen3-235b"]}),
     MappingProxyType({"name": "deepseek-3.1", "forecaster": MODEL_CATALOG["deepseek-3.1"]}),
-    MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
+    # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
     # MappingProxyType({"name": "glm-4.5", "forecaster": MODEL_CATALOG["glm-4.5"]}),
-    MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
-    MappingProxyType({"name": "grok-4-fast", "forecaster": MODEL_CATALOG["grok-4-fast"]}),
+    # MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
+    # MappingProxyType({"name": "grok-4-fast", "forecaster": MODEL_CATALOG["grok-4-fast"]}),
     # MappingProxyType({"name": "claude-sonnet-4", "forecaster": MODEL_CATALOG["claude-sonnet-4"]}),
     MappingProxyType({"name": "gpt-5", "forecaster": MODEL_CATALOG["gpt-5"]}),
     # MappingProxyType({"name": "o3", "forecaster": MODEL_CATALOG["o3"]}),
