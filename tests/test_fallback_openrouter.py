@@ -12,7 +12,7 @@ from metaculus_bot.fallback_openrouter import (
 
 class TestPredicates:
     def test_is_openrouter_openai_or_anthropic(self) -> None:
-        assert is_openrouter_openai_or_anthropic("openrouter/openai/gpt-5") is True
+        assert is_openrouter_openai_or_anthropic("openrouter/openai/gpt-5.1") is True
         assert is_openrouter_openai_or_anthropic("openrouter/anthropic/claude-sonnet-4") is True
         assert is_openrouter_openai_or_anthropic("openrouter/google/gemini-2.5-pro") is False
         assert is_openrouter_openai_or_anthropic("perplexity/sonar") is False
@@ -41,7 +41,7 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_primary_success_no_fallback(self) -> None:
         llm = FallbackOpenRouterLlm(
-            model="openrouter/openai/gpt-5",
+            model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
             secondary_api_key="general",
             temperature=0,
@@ -80,7 +80,7 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_no_fallback_on_403(self) -> None:
         llm = FallbackOpenRouterLlm(
-            model="openrouter/openai/gpt-5",
+            model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
             secondary_api_key="general",
             temperature=0,
@@ -97,7 +97,7 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_no_secondary_key_configured(self) -> None:
         llm = FallbackOpenRouterLlm(
-            model="openrouter/openai/gpt-5",
+            model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
             secondary_api_key=None,
             temperature=0,
@@ -116,13 +116,13 @@ class TestBuilder:
     def test_builder_returns_wrapper_when_both_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
-        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5")
+        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1")
         assert isinstance(llm, FallbackOpenRouterLlm)
 
     def test_builder_plain_when_only_general(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
-        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5")
+        llm = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5.1")
         # Not wrapper, should be a GeneralLlm
         from forecasting_tools import GeneralLlm as GL
 

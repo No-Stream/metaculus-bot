@@ -780,12 +780,12 @@ class CorrelationAnalyzer:
             num_questions = len(benchmark.forecast_reports)
 
             # Fix unrealistic costs for premium models and free models
-            if model_name in ["gpt-5", "o3"] and total_cost < 0.10:
+            if model_name in ["gpt-5.1", "o3"] and total_cost < 0.10:
                 # Estimate based on average reasoning length and known pricing
                 avg_reasoning_length = self._estimate_avg_reasoning_length(benchmark)
                 estimated_tokens = (avg_reasoning_length * 0.3) + 1000  # chars*0.3 + base prompt
 
-                if model_name == "gpt-5":
+                if model_name == "gpt-5.1":
                     total_cost = num_questions * (
                         estimated_tokens * 1.25 / 1_000_000
                     )  # $1.25 input + conservative output

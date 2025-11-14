@@ -31,7 +31,7 @@ class TestApiKeyUtils:
         monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "general_key")
 
-        result = get_openrouter_api_key("openrouter/openai/gpt-5")
+        result = get_openrouter_api_key("openrouter/openai/gpt-5.1")
         assert result == "general_key"
 
     def test_non_openrouter_model_uses_general_key(self, monkeypatch):
@@ -47,5 +47,5 @@ class TestApiKeyUtils:
         monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-        result = get_openrouter_api_key("openrouter/openai/gpt-5")
+        result = get_openrouter_api_key("openrouter/openai/gpt-5.1")
         assert result is None

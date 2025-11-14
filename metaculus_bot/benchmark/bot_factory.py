@@ -72,8 +72,8 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         reasoning={"max_tokens": 8_000},
         **MODEL_CONFIG,
     ),
-    "gpt-5": build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5",
+    "gpt-5.1": build_llm_with_openrouter_fallback(
+        model="openrouter/openai/gpt-5.1",
         reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
@@ -92,7 +92,7 @@ INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     # MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
     # MappingProxyType({"name": "grok-4-fast", "forecaster": MODEL_CATALOG["grok-4-fast"]}),
     # MappingProxyType({"name": "claude-sonnet-4", "forecaster": MODEL_CATALOG["claude-sonnet-4"]}),
-    MappingProxyType({"name": "gpt-5", "forecaster": MODEL_CATALOG["gpt-5"]}),
+    MappingProxyType({"name": "gpt-5.1", "forecaster": MODEL_CATALOG["gpt-5.1"]}),
     # MappingProxyType({"name": "o3", "forecaster": MODEL_CATALOG["o3"]}),
 )
 
@@ -100,7 +100,7 @@ STACKING_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     # MappingProxyType({"name": "stack-qwen3", "stacker": MODEL_CATALOG["qwen3-235b"]}),
     # MappingProxyType({"name": "stack-o3", "stacker": MODEL_CATALOG["o3"]}),
     # MappingProxyType({"name": "stack-claude4", "stacker": MODEL_CATALOG["claude-sonnet-4"]}),
-    # MappingProxyType({"name": "stack-gpt5", "stacker": MODEL_CATALOG["gpt-5"]}),
+    # MappingProxyType({"name": "stack-gpt5.1", "stacker": MODEL_CATALOG["gpt-5.1"]}),
 )
 
 
