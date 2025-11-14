@@ -70,7 +70,7 @@ bot = TemplateBot(
         "default": GeneralLlm(model="openrouter/google/gemini-2.5-pro", temperature=0),
         "summarizer": "openrouter/google/gemini-2.5-flash",
         "parser": "openrouter/google/gemini-2.5-flash",
-        "researcher": "openrouter/openai/gpt-5",
+        "researcher": "openrouter/openai/gpt-5.1",
     }
 )
 

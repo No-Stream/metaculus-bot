@@ -29,7 +29,7 @@ def create_mock_benchmark(model_name: str, total_cost: float, num_questions: int
     reports = []
     for i, question in enumerate(questions):
         # Create realistic reasoning length for premium models (real usage ~12,000 chars)
-        if model_name in ["gpt-5", "o3"]:
+        if model_name in ["gpt-5.1", "o3"]:
             reasoning_text = "Mock detailed reasoning analysis. " * 300  # ~12,000 chars
         else:
             reasoning_text = "Mock reasoning text. " * 10  # ~200 chars
@@ -65,7 +65,7 @@ def create_mock_benchmark(model_name: str, total_cost: float, num_questions: int
     # Mock the average_expected_baseline_score property since it's read-only and calculated from reports
     # Use a reasonable baseline score based on the model name (vary by model for diversity)
     model_score_base = {
-        "gpt-5": 18.0,
+        "gpt-5.1": 18.0,
         "o3": 17.0,
         "gpt-4o": 16.0,
         "claude-3-5-sonnet": 15.0,
@@ -171,7 +171,7 @@ def test_cost_adjustment_for_premium_models():
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [
-        create_mock_benchmark("gpt-5", 0.01, 2),  # Unrealistically low cost
+        create_mock_benchmark("gpt-5.1", 0.01, 2),  # Unrealistically low cost
         create_mock_benchmark("o3", 0.02, 2),  # Unrealistically low cost
         create_mock_benchmark("gpt-4o", 0.50, 2),  # Realistic cost
     ]
@@ -181,9 +181,9 @@ def test_cost_adjustment_for_premium_models():
 
     # Premium models should have adjusted costs based on realistic reasoning length
     # With ~12,000 chars: estimated_tokens = (12000 * 0.3) + 1000 = 4600
-    # gpt-5: 2 questions * (4600 * $1.25/M) = ~$0.0115
+    # gpt-5.1: 2 questions * (4600 * $1.25/M) = ~$0.0115
     # o3: 2 questions * (4600 * $2.0/M) = ~$0.0184
-    assert model_stats["gpt-5"]["total_cost"] > 0.01  # Should be ~0.0115
+    assert model_stats["gpt-5.1"]["total_cost"] > 0.01  # Should be ~0.0115
     assert model_stats["o3"]["total_cost"] > 0.015  # Should be ~0.0184
 
     # Non-premium model should keep original cost

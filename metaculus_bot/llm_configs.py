@@ -26,7 +26,7 @@ ACCEPTABLE_QUANTS = [
 FORECASTER_LLMS = [
     # TODO: consider adding add'l LLMs to ensemble
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5",
+        model="openrouter/openai/gpt-5.1",
         reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
@@ -67,5 +67,5 @@ PARSER_LLM: str = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5-mi
 # Researcher is only used by the base bot when internal research is invoked.
 # Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
 RESEARCHER_LLM = build_llm_with_openrouter_fallback(
-    model="openrouter/openai/gpt-5",
+    model="openrouter/openai/gpt-5.1",
 )
