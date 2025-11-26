@@ -42,7 +42,7 @@ FORECASTER_LLMS = [
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/x-ai/grok-4-fast",
-        reasoning={"enabled": True},
+        reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
