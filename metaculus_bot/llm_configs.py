@@ -9,7 +9,7 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 __all__ = ["FORECASTER_LLMS", "SUMMARIZER_LLM", "PARSER_LLM", "RESEARCHER_LLM"]
 MODEL_CONFIG = {
     "temperature": 0.3,
-    "top_p": 0.9,  # Does nothing given temp == 0
+    "top_p": 0.9,
     "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
     "stream": False,
     "timeout": 300,
