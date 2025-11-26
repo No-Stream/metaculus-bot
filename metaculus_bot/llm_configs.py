@@ -8,8 +8,16 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = ["FORECASTER_LLMS", "SUMMARIZER_LLM", "PARSER_LLM", "RESEARCHER_LLM"]
 MODEL_CONFIG = {
+    "temperature": 0.3,
+    "top_p": 0.9,
+    "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
+    "stream": False,
+    "timeout": 300,
+    "allowed_tries": 3,
+}
+DETERMINISTIC_MODEL_CONFIG = {
     "temperature": 0.0,
-    "top_p": 0.85,  # Does nothing given temp == 0
+    "top_p": 0.9,
     "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
     "stream": False,
     "timeout": 300,
@@ -42,7 +50,7 @@ FORECASTER_LLMS = [
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/x-ai/grok-4-fast",
-        reasoning={"enabled": True},
+        reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
@@ -63,7 +71,11 @@ FORECASTER_LLMS = [
 
 SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5-mini")
 # Parser should be a reliable, low-latency model for structure extraction
-PARSER_LLM: str = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5-mini")
+PARSER_LLM: str = build_llm_with_openrouter_fallback(
+    "openrouter/openai/gpt-5-mini",
+    reasoning={"effort": "low"},
+    **DETERMINISTIC_MODEL_CONFIG,
+)
 # Researcher is only used by the base bot when internal research is invoked.
 # Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
 RESEARCHER_LLM = build_llm_with_openrouter_fallback(
