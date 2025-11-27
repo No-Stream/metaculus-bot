@@ -8,9 +8,18 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = ["FORECASTER_LLMS", "SUMMARIZER_LLM", "PARSER_LLM", "RESEARCHER_LLM"]
 MODEL_CONFIG = {
-    "temperature": 0.3,
-    "top_p": 0.9,
+    "temperature": 1.0,  # standard for recent reasoning models
+    "top_p": 0.95,
     "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
+    "stream": False,
+    "timeout": 300,
+    "allowed_tries": 3,
+}
+QWEN_CONFIG = {  # developer recommends this for qwen models
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 32_000,
     "stream": False,
     "timeout": 300,
     "allowed_tries": 3,
@@ -58,14 +67,14 @@ FORECASTER_LLMS = [
         provider={
             "quantizations": ACCEPTABLE_QUANTS,
         },
-        **MODEL_CONFIG,
+        **QWEN_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/moonshotai/kimi-k2-0905",
         provider={
             "quantizations": ACCEPTABLE_QUANTS,
         },
-        **MODEL_CONFIG,
+        **QWEN_CONFIG,  # non thinking model but has similar optimal params to qwen3-235b thinking model
     ),
 ]
 
