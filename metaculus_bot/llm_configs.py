@@ -42,7 +42,7 @@ ACCEPTABLE_QUANTS = [
 FORECASTER_LLMS = [
     # TODO: consider adding add'l LLMs to ensemble
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.1",
+        model="openrouter/openai/gpt-5.2",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
@@ -52,7 +52,7 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-sonnet-4.5",
+        model="openrouter/anthropic/claude-opus-4.5",
         reasoning={"max_tokens": 16_000},
         **REASONING_MODEL_CONFIG,
     ),
@@ -75,6 +75,10 @@ FORECASTER_LLMS = [
         },
         **QWEN_CONFIG,  # non thinking model but has similar optimal params to qwen3-235b thinking model
     ),
+    build_llm_with_openrouter_fallback(
+        model="openrouter/google/gemini-3-pro-preview",
+        **REASONING_MODEL_CONFIG,
+    ),
 ]
 
 SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5-mini")
@@ -87,5 +91,5 @@ PARSER_LLM: str = build_llm_with_openrouter_fallback(
 # Researcher is only used by the base bot when internal research is invoked.
 # Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
 RESEARCHER_LLM = build_llm_with_openrouter_fallback(
-    model="openrouter/openai/gpt-5.1",
+    model="openrouter/google/gemini-3-flash-preview",
 )
