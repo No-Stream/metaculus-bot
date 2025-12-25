@@ -242,6 +242,72 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
     return _fetch
 
 
+def _native_search_provider(
+    model_slug: str | None = None,
+    is_benchmarking: bool = False,
+) -> ResearchCallable:
+    """Research provider using models with native web search capability via OpenRouter :online suffix."""
+
+    async def _fetch(question_text: str) -> str:  # noqa: D401
+        from metaculus_bot.constants import (
+            NATIVE_SEARCH_DEFAULT_MODEL,
+            NATIVE_SEARCH_MAX_TOKENS,
+            NATIVE_SEARCH_MODEL_ENV,
+            NATIVE_SEARCH_TEMPERATURE,
+            NATIVE_SEARCH_TIMEOUT,
+            NATIVE_SEARCH_TOP_P,
+        )
+
+        # Determine model - append :online suffix for native search
+        base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
+        model_with_search = f"openrouter/{base_model}:online"
+
+        llm = GeneralLlm(
+            model=model_with_search,
+            temperature=NATIVE_SEARCH_TEMPERATURE,
+            top_p=NATIVE_SEARCH_TOP_P,
+            max_tokens=NATIVE_SEARCH_MAX_TOKENS,
+            timeout=NATIVE_SEARCH_TIMEOUT,
+        )
+
+        # Exclude prediction markets when benchmarking to avoid data leakage
+        prediction_markets_instruction = (
+            "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
+        )
+
+        prompt = f"""You are a research assistant gathering factual information for a forecaster.
+
+TASK: Search the web to find relevant facts, data, and expert opinions about the question below.
+
+GUIDELINES:
+- Search thoroughly - make multiple searches if needed to fill gaps
+- Be factual and unbiased - report what you find, not what you think
+- Include inline citations [source name](url) for all factual claims
+- If you cannot find reliable information on something, say so explicitly
+- DO NOT hallucinate sources - only cite what you actually found
+- DO NOT make predictions or forecasts yourself
+- It's OK to have a short response if there isn't much reliable information
+
+FOCUS AREAS:
+- Recent news and developments
+- Historical context and trends
+- Statistical data and metrics
+- Expert opinions and analysis
+- Official statements and announcements{prediction_markets_instruction}
+
+QUESTION:
+{question_text}
+
+Provide a factual research summary with citations:"""
+
+        logger.info(f"NativeSearch: Calling {model_with_search} for research")
+        result = await llm.invoke(prompt)
+        logger.info(f"NativeSearch: Got {len(result)} chars from {model_with_search}")
+        return result
+
+    return _fetch
+
+
 # ---------------------------------------------------------------------------
 # Strategy selector
 # ---------------------------------------------------------------------------

@@ -33,7 +33,13 @@ from metaculus_bot.aggregation_strategies import (
 from metaculus_bot.api_key_utils import get_openrouter_api_key
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, DEFAULT_MAX_CONCURRENT_RESEARCH
+from metaculus_bot.constants import (
+    BINARY_PROB_MAX,
+    BINARY_PROB_MIN,
+    DEFAULT_MAX_CONCURRENT_RESEARCH,
+    NATIVE_SEARCH_ENABLED_ENV,
+    NATIVE_SEARCH_MODEL_ENV,
+)
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_diagnostics import log_final_prediction
@@ -42,7 +48,11 @@ from metaculus_bot.numeric_utils import bound_messages
 from metaculus_bot.numeric_validation import detect_unit_mismatch
 from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
-from metaculus_bot.research_providers import ResearchCallable, choose_provider_with_name
+from metaculus_bot.research_providers import (
+    ResearchCallable,
+    _native_search_provider,
+    choose_provider_with_name,
+)
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
@@ -268,9 +278,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 logger.info(f"Using cached research for question {cache_key} (double-check)")
                 return cached
 
-            provider, provider_name = self._select_research_provider()
-            logger.info(f"Using research provider: {provider_name}")
-            research = await self._fetch_research_with_fallback(question.question_text, provider, provider_name)
+            providers = self._select_research_providers()
+            provider_names = [name for _, name in providers]
+            logger.info(f"Using research providers: {provider_names}")
+
+            research = await self._run_providers_parallel(question.question_text, providers)
 
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
@@ -301,6 +313,75 @@ class TemplateForecaster(CompactLoggingForecastBot):
             is_benchmarking=self.is_benchmarking,
         )
         return provider, provider_name
+
+    def _select_research_providers(self) -> list[tuple[ResearchCallable, str]]:
+        """Return list of research providers to run in parallel."""
+        providers: list[tuple[ResearchCallable, str]] = []
+
+        # Primary provider (existing logic)
+        primary, primary_name = self._select_research_provider()
+        if primary_name != "none":
+            providers.append((primary, primary_name))
+
+        # Native search if enabled
+        if os.getenv(NATIVE_SEARCH_ENABLED_ENV, "").lower() in ("true", "1", "yes"):
+            model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
+            providers.append(
+                (
+                    _native_search_provider(model, is_benchmarking=self.is_benchmarking),
+                    "native_search",
+                )
+            )
+
+        if not providers:
+
+            async def _empty(_: str) -> str:
+                return ""
+
+            providers.append((_empty, "none"))
+
+        return providers
+
+    async def _run_providers_parallel(
+        self,
+        question_text: str,
+        providers: list[tuple[ResearchCallable, str]],
+    ) -> str:
+        """Run multiple research providers in parallel and combine results."""
+
+        async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
+            try:
+                if name == "asknews" and self.allow_research_fallback:
+                    return (await self._fetch_research_with_fallback(question_text, provider, name), name)
+                return (await provider(question_text), name)
+            except Exception as e:
+                logger.warning(f"Research provider {name} failed: {e}")
+                return ("", name)
+
+        tasks = [_run_one(p, n) for p, n in providers]
+        results = await asyncio.gather(*tasks)
+
+        # Combine non-empty results with headers
+        combined_parts = []
+        for result, name in results:
+            if result and result.strip():
+                header = self._provider_header(name)
+                combined_parts.append(f"{header}\n{result}")
+
+        return "\n\n---\n\n".join(combined_parts) if combined_parts else ""
+
+    @staticmethod
+    def _provider_header(name: str) -> str:
+        """Human-readable header for each provider's output."""
+        headers = {
+            "asknews": "## News Articles (AskNews)",
+            "native_search": "## Web Research (Native Search)",
+            "exa": "## Web Research (Exa)",
+            "perplexity": "## Web Research (Perplexity)",
+            "openrouter": "## Web Research (OpenRouter)",
+            "custom": "## Research (Custom)",
+        }
+        return headers.get(name, f"## Research ({name})")
 
     async def _fetch_research_with_fallback(
         self,

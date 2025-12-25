@@ -55,13 +55,15 @@ async def test_research_cache_enabled_in_benchmarking_mode(mock_question, test_l
 
     # First call should hit provider and cache result
     result1 = await bot.run_research(mock_question)
-    assert result1 == "Cached research result"
-    assert shared_cache[12345] == "Cached research result"
+    # Research now includes provider header
+    assert "Cached research result" in result1
+    assert "## Research (Custom)" in result1
+    assert "Cached research result" in shared_cache[12345]
     assert mock_provider.call_count == 1
 
     # Second call should use cache, not hit provider
     result2 = await bot.run_research(mock_question)
-    assert result2 == "Cached research result"
+    assert "Cached research result" in result2
     assert mock_provider.call_count == 1  # Should not increase
 
 
@@ -88,12 +90,12 @@ async def test_research_cache_shared_between_bots(mock_question, test_llms):
 
     # First bot caches result
     result1 = await bot1.run_research(mock_question)
-    assert result1 == "Shared research"
+    assert "Shared research" in result1
     assert bot1._custom_research_provider.call_count == 1
 
     # Second bot should use cached result, not call its provider
     result2 = await bot2.run_research(mock_question)
-    assert result2 == "Shared research"  # Should get cached result
+    assert "Shared research" in result2  # Should get cached result
     assert bot2._custom_research_provider.call_count == 0  # Should not be called
 
 
@@ -112,12 +114,12 @@ async def test_research_cache_disabled_in_non_benchmarking_mode(mock_question, t
 
     # First call
     result1 = await bot.run_research(mock_question)
-    assert result1 == "Non-cached research"
+    assert "Non-cached research" in result1
     assert bot._custom_research_provider.call_count == 1
 
     # Second call should hit provider again, not use cache
     result2 = await bot.run_research(mock_question)
-    assert result2 == "Non-cached research"
+    assert "Non-cached research" in result2
     assert bot._custom_research_provider.call_count == 2  # Should increase
 
 
@@ -134,7 +136,7 @@ async def test_research_cache_disabled_when_cache_is_none(mock_question, test_ll
 
     # Should work normally without caching
     result = await bot.run_research(mock_question)
-    assert result == "No cache research"
+    assert "No cache research" in result
     assert bot._custom_research_provider.call_count == 1
 
 
@@ -174,8 +176,8 @@ async def test_research_cache_different_questions_separate_cache_entries(test_ll
     result2 = await bot.run_research(question2)
 
     # Should have separate cache entries
-    assert result1 == "Research for Q1"
-    assert result2 == "Research for Q2"
-    assert shared_cache[11111] == "Research for Q1"
-    assert shared_cache[22222] == "Research for Q2"
+    assert "Research for Q1" in result1
+    assert "Research for Q2" in result2
+    assert "Research for Q1" in shared_cache[11111]
+    assert "Research for Q2" in shared_cache[22222]
     assert len(shared_cache) == 2

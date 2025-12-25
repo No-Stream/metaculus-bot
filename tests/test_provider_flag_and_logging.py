@@ -10,11 +10,11 @@ from main import TemplateForecaster
 @pytest.mark.asyncio
 async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
     # Force AskNews via env flag and provide required creds
-    mock_os_getenv.side_effect = lambda x: {
+    mock_os_getenv.side_effect = lambda x, default=None: {
         "RESEARCH_PROVIDER": "asknews",
         "ASKNEWS_CLIENT_ID": "client",
         "ASKNEWS_SECRET": "secret",
-    }.get(x)
+    }.get(x, default)
 
     bot = TemplateForecaster(
         llms={
@@ -34,8 +34,9 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
         mock_sdk.news.search_news.return_value = mock_response
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
-        # Since no articles are returned, it should return "No articles were found for this query.\n\n"
+        # Since no articles are returned, it should return the message with provider header
         with caplog.at_level(logging.INFO):
             res = await bot.run_research(q)
-        assert res == "No articles were found for this query.\n\n"
-        assert any("Using research provider: asknews" in rec.message for rec in caplog.records)
+        assert "No articles were found for this query." in res
+        assert "## News Articles (AskNews)" in res
+        assert any("Using research providers:" in rec.message for rec in caplog.records)
