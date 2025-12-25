@@ -271,13 +271,18 @@ def _native_search_provider(
         )
 
         # Exclude prediction markets when benchmarking to avoid data leakage
-        prediction_markets_instruction = (
-            "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
-        )
+        if is_benchmarking:
+            prediction_markets_instruction = ""
+            benchmarking_warning = """
+IMPORTANT: This is a model benchmarking run. DO NOT search for or include prediction market
+odds, forecasts, or betting lines - this would constitute data leakage."""
+        else:
+            prediction_markets_instruction = "\n- Prediction market odds and forecasts (if available)"
+            benchmarking_warning = ""
 
         prompt = f"""You are a research assistant gathering factual information for a forecaster.
 
-TASK: Search the web to find relevant facts, data, and expert opinions about the question below.
+TASK: Search the web to find relevant facts, data, and expert opinions about the question below.{benchmarking_warning}
 
 GUIDELINES:
 - Search thoroughly - make multiple searches if needed to fill gaps
