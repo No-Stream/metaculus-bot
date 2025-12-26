@@ -55,24 +55,6 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         model="openrouter/moonshotai/kimi-k2-thinking",
         **MODEL_CONFIG,
     ),
-    "glm-4.5": GeneralLlm(
-        model="openrouter/z-ai/glm-4.5",
-        **MODEL_CONFIG,
-    ),
-    "r1-0528": GeneralLlm(
-        model="openrouter/deepseek/deepseek-r1-0528",
-        **MODEL_CONFIG,
-    ),
-    "grok-4-fast": GeneralLlm(
-        model="openrouter/x-ai/grok-4-fast",
-        reasoning={"enabled": True},
-        **MODEL_CONFIG,
-    ),
-    "claude-sonnet-4": build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-sonnet-4",
-        reasoning={"max_tokens": 8_000},
-        **MODEL_CONFIG,
-    ),
     "gpt-5.1": build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.1",
         reasoning={"effort": "high"},
@@ -112,18 +94,26 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
     #     reasoning={"max_tokens": 16_000},
     #     **MODEL_CONFIG,
     # ),
+    # "glm-4.7": GeneralLlm(
+    #     model="openrouter/z-ai/glm-4.7",
+    #     **MODEL_CONFIG,
+    # ),
 }
 
 INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     MappingProxyType({"name": "qwen3-235b", "forecaster": MODEL_CATALOG["qwen3-235b"]}),
     MappingProxyType({"name": "deepseek-3.2", "forecaster": MODEL_CATALOG["deepseek-3.2"]}),
-    # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
-    # MappingProxyType({"name": "glm-4.5", "forecaster": MODEL_CATALOG["glm-4.5"]}),
-    # MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
-    # MappingProxyType({"name": "grok-4-fast", "forecaster": MODEL_CATALOG["grok-4-fast"]}),
-    # MappingProxyType({"name": "claude-sonnet-4", "forecaster": MODEL_CATALOG["claude-sonnet-4"]}),
     MappingProxyType({"name": "gpt-5.1", "forecaster": MODEL_CATALOG["gpt-5.1"]}),
     # MappingProxyType({"name": "o3", "forecaster": MODEL_CATALOG["o3"]}),
+    # --- Models below are for future testing ---
+    # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
+    # MappingProxyType({"name": "gpt-5.2", "forecaster": MODEL_CATALOG["gpt-5.2"]}),
+    # MappingProxyType({"name": "gemini-3-pro", "forecaster": MODEL_CATALOG["gemini-3-pro"]}),
+    # MappingProxyType({"name": "gemini-3-flash", "forecaster": MODEL_CATALOG["gemini-3-flash"]}),
+    # MappingProxyType({"name": "claude-opus-4.5", "forecaster": MODEL_CATALOG["claude-opus-4.5"]}),
+    # MappingProxyType({"name": "grok-4.1-fast", "forecaster": MODEL_CATALOG["grok-4.1-fast"]}),
+    # MappingProxyType({"name": "claude-sonnet-4.5", "forecaster": MODEL_CATALOG["claude-sonnet-4.5"]}),
+    # MappingProxyType({"name": "glm-4.7", "forecaster": MODEL_CATALOG["glm-4.7"]}),
 )
 
 STACKING_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
