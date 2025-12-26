@@ -94,6 +94,9 @@ NATIVE_SEARCH_TEMPERATURE: float = 0.3
 NATIVE_SEARCH_TOP_P: float = 0.9
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
 NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
+# Native search web options (passed to OpenRouter plugins)
+NATIVE_SEARCH_MAX_RESULTS: int = 20
+NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60

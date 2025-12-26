@@ -250,7 +250,9 @@ def _native_search_provider(
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
         from metaculus_bot.constants import (
+            NATIVE_SEARCH_CONTEXT_SIZE,
             NATIVE_SEARCH_DEFAULT_MODEL,
+            NATIVE_SEARCH_MAX_RESULTS,
             NATIVE_SEARCH_MAX_TOKENS,
             NATIVE_SEARCH_MODEL_ENV,
             NATIVE_SEARCH_TEMPERATURE,
@@ -268,6 +270,14 @@ def _native_search_provider(
             top_p=NATIVE_SEARCH_TOP_P,
             max_tokens=NATIVE_SEARCH_MAX_TOKENS,
             timeout=NATIVE_SEARCH_TIMEOUT,
+            plugins=[
+                {
+                    "id": "web",
+                    "max_results": NATIVE_SEARCH_MAX_RESULTS,
+                    "engine": "native",
+                }
+            ],
+            web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
         )
 
         # Exclude prediction markets when benchmarking to avoid data leakage
