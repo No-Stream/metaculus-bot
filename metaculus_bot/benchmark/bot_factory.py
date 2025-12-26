@@ -41,17 +41,18 @@ DEFAULT_HELPER_LLMS: Dict[str, GeneralLlm] = {
 }
 
 
+# TODO: add various models from note e.g. gpt 5.2, g3 pro/flash, etc.
 MODEL_CATALOG: Dict[str, GeneralLlm] = {
     "qwen3-235b": GeneralLlm(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
         **MODEL_CONFIG,
     ),
-    "deepseek-3.1": GeneralLlm(
-        model="openrouter/deepseek/deepseek-chat-v3.1",
+    "deepseek-3.2": GeneralLlm(
+        model="openrouter/deepseek/deepseek-chat-v3.2",
         **MODEL_CONFIG,
     ),
     "kimi-k2": GeneralLlm(
-        model="openrouter/moonshotai/kimi-k2-0905",
+        model="openrouter/moonshotai/kimi-k2-thinking",
         **MODEL_CONFIG,
     ),
     "glm-4.5": GeneralLlm(
@@ -82,11 +83,40 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
+    # --- Models below are defined for future testing ---
+    # "gpt-5.2": build_llm_with_openrouter_fallback(
+    #     model="openrouter/openai/gpt-5.2",
+    #     reasoning={"effort": "high"},
+    #     **MODEL_CONFIG,
+    # ),
+    # "gemini-3-pro": GeneralLlm(
+    #     model="openrouter/google/gemini-3-pro-preview",
+    #     **MODEL_CONFIG,
+    # ),
+    # "gemini-3-flash": GeneralLlm(
+    #     model="openrouter/google/gemini-3-flash-preview",
+    #     **MODEL_CONFIG,
+    # ),
+    # "claude-opus-4.5": build_llm_with_openrouter_fallback(
+    #     model="openrouter/anthropic/claude-opus-4.5",
+    #     reasoning={"max_tokens": 16_000},
+    #     **MODEL_CONFIG,
+    # ),
+    # "grok-4.1-fast": build_llm_with_openrouter_fallback(
+    #     model="openrouter/x-ai/grok-4.1-fast",
+    #     reasoning={"effort": "high"},
+    #     **MODEL_CONFIG,
+    # ),
+    # "claude-sonnet-4.5": build_llm_with_openrouter_fallback(
+    #     model="openrouter/anthropic/claude-sonnet-4.5",
+    #     reasoning={"max_tokens": 16_000},
+    #     **MODEL_CONFIG,
+    # ),
 }
 
 INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     MappingProxyType({"name": "qwen3-235b", "forecaster": MODEL_CATALOG["qwen3-235b"]}),
-    MappingProxyType({"name": "deepseek-3.1", "forecaster": MODEL_CATALOG["deepseek-3.1"]}),
+    MappingProxyType({"name": "deepseek-3.2", "forecaster": MODEL_CATALOG["deepseek-3.2"]}),
     # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
     # MappingProxyType({"name": "glm-4.5", "forecaster": MODEL_CATALOG["glm-4.5"]}),
     # MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
