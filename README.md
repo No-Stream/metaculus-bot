@@ -1,3 +1,5 @@
+~below description by claude. it's a metaculus forecasting competition bot.~
+
 # Metaculus Forecasting Bot
 
 An advanced forecasting bot for Metaculus that leverages ensemble learning with multiple state-of-the-art LLMs and comprehensive research integration to predict future events.
