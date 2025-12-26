@@ -13,9 +13,9 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 MODEL_CONFIG: Dict[str, Any] = {
-    "temperature": 0.0,
-    "top_p": 0.9,
-    "max_tokens": 16_000,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 32_000,
     "stream": False,
     "timeout": 480,  # 8 minutes - reasoning models (o3, gpt-5.1) need extra time
     "allowed_tries": 3,
