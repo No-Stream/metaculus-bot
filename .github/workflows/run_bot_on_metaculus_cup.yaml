@@ -68,3 +68,6 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_MAX_CONCURRENCY: '1'
           ASKNEWS_MAX_RPS: '0.2'
+          # Native search runs in parallel with AskNews using Grok's web search
+          NATIVE_SEARCH_ENABLED: 'true'
+          NATIVE_SEARCH_MODEL: 'x-ai/grok-4.1-fast'

@@ -83,6 +83,18 @@ NUM_MIN_PROB_STEP: float = 5e-5
 NUM_MAX_STEP: float = 0.2
 NUM_RAMP_K_FACTOR: float = 3.0
 
+# --- Native Search Provider ---
+# Environment variable names
+NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
+NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
+# Default model for native search (without openrouter/ prefix or :online suffix)
+NATIVE_SEARCH_DEFAULT_MODEL: str = "x-ai/grok-4.1-fast"
+# LLM parameters for native search (lower temp for factual grounding)
+NATIVE_SEARCH_TEMPERATURE: float = 0.3
+NATIVE_SEARCH_TOP_P: float = 0.9
+NATIVE_SEARCH_MAX_TOKENS: int = 16_000
+NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
+
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60
 FETCH_RETRY_BACKOFFS: list[int] = [5, 15]

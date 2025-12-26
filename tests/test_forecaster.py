@@ -36,7 +36,9 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_asknews_func.assert_called_once_with(question.question_text)
-            assert research == "AskNews Research"
+            # Research now includes provider header
+            assert "AskNews Research" in research
+            assert "## News Articles (AskNews)" in research
 
     # Test Exa priority (when AskNews not available)
     with patch("os.getenv") as mock_getenv:
@@ -53,7 +55,8 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_exa_func.assert_called_once_with(question.question_text)
-            assert research == "Exa Research"
+            assert "Exa Research" in research
+            assert "## Web Research (Exa)" in research
 
     # Test Perplexity priority (when AskNews and Exa not available)
     with patch("os.getenv") as mock_getenv:
@@ -69,7 +72,8 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_perplexity_func.assert_called_once_with(question.question_text)
-            assert research == "Perplexity Research"
+            assert "Perplexity Research" in research
+            assert "## Web Research (Perplexity)" in research
 
     # Test OpenRouter priority (when only OpenRouter available)
     with patch("os.getenv") as mock_getenv:
@@ -84,7 +88,8 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_openrouter_func.assert_called_once_with(question.question_text)
-            assert research == "OpenRouter Research"
+            assert "OpenRouter Research" in research
+            assert "## Web Research (OpenRouter)" in research
 
     # Test no research provider available
     with patch("os.getenv") as mock_getenv:
@@ -97,4 +102,5 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_empty_func.assert_called_once_with(question.question_text)
+            # Empty results don't get headers
             assert research == ""

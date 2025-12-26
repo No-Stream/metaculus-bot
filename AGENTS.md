@@ -196,10 +196,18 @@ LLM ensemble configured in `metaculus_bot/llm_configs.py`:
 - **Install**: `conda run -n metaculus-bot poetry install` (or `make install`)
 - **Activate environment**: `conda activate metaculus-bot`
 
-### Core Operations  
+### Core Operations
 - **Run bot**: `conda run -n metaculus-bot poetry run python main.py` (or `make run`)
 - **Run tests**: `conda run -n metaculus-bot poetry run pytest` (or `make test`)
-- **Benchmark**: `conda run -n metaculus-bot poetry run python community_benchmark.py` (or `make benchmark`)
+
+### Benchmarking
+- **Smoke test (1 binary)**: `make benchmark_run_smoke_test_binary`
+- **Smoke test (4 mixed)**: `make benchmark_run_smoke_test`
+- **Small (12 mixed)**: `make benchmark_run_small`
+- **Medium (32 mixed)**: `make benchmark_run_medium`
+- **Large (100 mixed)**: `make benchmark_run_large`
+- **Display results**: `make benchmark_display`
+- **Analyze correlations**: `make analyze_correlations_latest`
 
 ### Code Quality
 - **Lint**: `make lint` (Ruff check)

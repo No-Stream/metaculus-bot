@@ -17,7 +17,7 @@ MODEL_CONFIG: Dict[str, Any] = {
     "top_p": 0.9,
     "max_tokens": 16_000,
     "stream": False,
-    "timeout": 240,
+    "timeout": 480,  # 8 minutes - reasoning models (o3, gpt-5.1) need extra time
     "allowed_tries": 3,
 }
 
