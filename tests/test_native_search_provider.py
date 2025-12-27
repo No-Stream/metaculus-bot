@@ -10,7 +10,7 @@ import pytest
 async def test_native_search_provider_constructs_correct_model_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify native search provider appends :online suffix correctly."""
+    """Verify native search provider constructs model name correctly."""
     monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")
     monkeypatch.setenv("NATIVE_SEARCH_MODEL", "x-ai/grok-4.1-fast")
 
@@ -30,7 +30,7 @@ async def test_native_search_provider_constructs_correct_model_name(
         provider = _native_search_provider()
         await provider("Will X happen?")
 
-    assert captured_model == "openrouter/x-ai/grok-4.1-fast:online"
+    assert captured_model == "openrouter/x-ai/grok-4.1-fast"
 
 
 @pytest.mark.asyncio
@@ -54,7 +54,7 @@ async def test_native_search_provider_uses_custom_model_slug(
         provider = _native_search_provider(model_slug="openai/gpt-4o")
         await provider("Will X happen?")
 
-    assert captured_model == "openrouter/openai/gpt-4o:online"
+    assert captured_model == "openrouter/openai/gpt-4o"
 
 
 @pytest.mark.asyncio

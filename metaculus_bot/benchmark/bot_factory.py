@@ -13,9 +13,9 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 MODEL_CONFIG: Dict[str, Any] = {
-    "temperature": 0.0,
-    "top_p": 0.9,
-    "max_tokens": 16_000,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_tokens": 32_000,
     "stream": False,
     "timeout": 480,  # 8 minutes - reasoning models (o3, gpt-5.1) need extra time
     "allowed_tries": 3,
@@ -41,35 +41,18 @@ DEFAULT_HELPER_LLMS: Dict[str, GeneralLlm] = {
 }
 
 
+# TODO: add various models from note e.g. gpt 5.2, g3 pro/flash, etc.
 MODEL_CATALOG: Dict[str, GeneralLlm] = {
     "qwen3-235b": GeneralLlm(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
         **MODEL_CONFIG,
     ),
-    "deepseek-3.1": GeneralLlm(
-        model="openrouter/deepseek/deepseek-chat-v3.1",
+    "deepseek-3.2": GeneralLlm(
+        model="openrouter/deepseek/deepseek-chat-v3.2",
         **MODEL_CONFIG,
     ),
     "kimi-k2": GeneralLlm(
-        model="openrouter/moonshotai/kimi-k2-0905",
-        **MODEL_CONFIG,
-    ),
-    "glm-4.5": GeneralLlm(
-        model="openrouter/z-ai/glm-4.5",
-        **MODEL_CONFIG,
-    ),
-    "r1-0528": GeneralLlm(
-        model="openrouter/deepseek/deepseek-r1-0528",
-        **MODEL_CONFIG,
-    ),
-    "grok-4-fast": GeneralLlm(
-        model="openrouter/x-ai/grok-4-fast",
-        reasoning={"enabled": True},
-        **MODEL_CONFIG,
-    ),
-    "claude-sonnet-4": build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-sonnet-4",
-        reasoning={"max_tokens": 8_000},
+        model="openrouter/moonshotai/kimi-k2-thinking",
         **MODEL_CONFIG,
     ),
     "gpt-5.1": build_llm_with_openrouter_fallback(
@@ -82,18 +65,55 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
+    # --- Models below are defined for future testing ---
+    # "gpt-5.2": build_llm_with_openrouter_fallback(
+    #     model="openrouter/openai/gpt-5.2",
+    #     reasoning={"effort": "high"},
+    #     **MODEL_CONFIG,
+    # ),
+    # "gemini-3-pro": GeneralLlm(
+    #     model="openrouter/google/gemini-3-pro-preview",
+    #     **MODEL_CONFIG,
+    # ),
+    # "gemini-3-flash": GeneralLlm(
+    #     model="openrouter/google/gemini-3-flash-preview",
+    #     **MODEL_CONFIG,
+    # ),
+    # "claude-opus-4.5": build_llm_with_openrouter_fallback(
+    #     model="openrouter/anthropic/claude-opus-4.5",
+    #     reasoning={"max_tokens": 16_000},
+    #     **MODEL_CONFIG,
+    # ),
+    # "grok-4.1-fast": build_llm_with_openrouter_fallback(
+    #     model="openrouter/x-ai/grok-4.1-fast",
+    #     reasoning={"effort": "high"},
+    #     **MODEL_CONFIG,
+    # ),
+    # "claude-sonnet-4.5": build_llm_with_openrouter_fallback(
+    #     model="openrouter/anthropic/claude-sonnet-4.5",
+    #     reasoning={"max_tokens": 16_000},
+    #     **MODEL_CONFIG,
+    # ),
+    # "glm-4.7": GeneralLlm(
+    #     model="openrouter/z-ai/glm-4.7",
+    #     **MODEL_CONFIG,
+    # ),
 }
 
 INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
     MappingProxyType({"name": "qwen3-235b", "forecaster": MODEL_CATALOG["qwen3-235b"]}),
-    MappingProxyType({"name": "deepseek-3.1", "forecaster": MODEL_CATALOG["deepseek-3.1"]}),
-    # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
-    # MappingProxyType({"name": "glm-4.5", "forecaster": MODEL_CATALOG["glm-4.5"]}),
-    # MappingProxyType({"name": "r1-0528", "forecaster": MODEL_CATALOG["r1-0528"]}),
-    # MappingProxyType({"name": "grok-4-fast", "forecaster": MODEL_CATALOG["grok-4-fast"]}),
-    # MappingProxyType({"name": "claude-sonnet-4", "forecaster": MODEL_CATALOG["claude-sonnet-4"]}),
+    MappingProxyType({"name": "deepseek-3.2", "forecaster": MODEL_CATALOG["deepseek-3.2"]}),
     MappingProxyType({"name": "gpt-5.1", "forecaster": MODEL_CATALOG["gpt-5.1"]}),
     # MappingProxyType({"name": "o3", "forecaster": MODEL_CATALOG["o3"]}),
+    # --- Models below are for future testing ---
+    # MappingProxyType({"name": "kimi-k2", "forecaster": MODEL_CATALOG["kimi-k2"]}),
+    # MappingProxyType({"name": "gpt-5.2", "forecaster": MODEL_CATALOG["gpt-5.2"]}),
+    # MappingProxyType({"name": "gemini-3-pro", "forecaster": MODEL_CATALOG["gemini-3-pro"]}),
+    # MappingProxyType({"name": "gemini-3-flash", "forecaster": MODEL_CATALOG["gemini-3-flash"]}),
+    # MappingProxyType({"name": "claude-opus-4.5", "forecaster": MODEL_CATALOG["claude-opus-4.5"]}),
+    # MappingProxyType({"name": "grok-4.1-fast", "forecaster": MODEL_CATALOG["grok-4.1-fast"]}),
+    # MappingProxyType({"name": "claude-sonnet-4.5", "forecaster": MODEL_CATALOG["claude-sonnet-4.5"]}),
+    # MappingProxyType({"name": "glm-4.7", "forecaster": MODEL_CATALOG["glm-4.7"]}),
 )
 
 STACKING_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (

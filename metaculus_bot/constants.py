@@ -87,13 +87,16 @@ NUM_RAMP_K_FACTOR: float = 3.0
 # Environment variable names
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
 NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
-# Default model for native search (without openrouter/ prefix or :online suffix)
+# Default model for native search (without openrouter/ prefix)
 NATIVE_SEARCH_DEFAULT_MODEL: str = "x-ai/grok-4.1-fast"
 # LLM parameters for native search (lower temp for factual grounding)
 NATIVE_SEARCH_TEMPERATURE: float = 0.3
 NATIVE_SEARCH_TOP_P: float = 0.9
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
 NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
+# Native search web options (passed to OpenRouter plugins)
+NATIVE_SEARCH_MAX_RESULTS: int = 20
+NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60
