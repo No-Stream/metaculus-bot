@@ -260,9 +260,9 @@ def _native_search_provider(
             NATIVE_SEARCH_TOP_P,
         )
 
-        # Determine model - append :online suffix for native search
+        # Determine model - plugins param enables web search, no :online suffix needed
         base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
-        model_with_search = f"openrouter/{base_model}:online"
+        model_with_search = f"openrouter/{base_model}"
 
         llm = GeneralLlm(
             model=model_with_search,
