@@ -4,7 +4,7 @@ _below description mostly by claude. it's a metaculus forecasting competition bo
 
 # Metaculus Forecasting Bot
 
-An advanced forecasting bot for Metaculus that leverages ensemble learning with multiple state-of-the-art LLMs and comprehensive research integration to predict future events.
+A forecasting bot for Metaculus using ensemble learning with several frontier LLMs and multiple research approaches to predict future events.
 
 ## Overview
 
@@ -15,7 +15,8 @@ includes:
 - **Robust Pipeline**: Comprehensive question processing, research, reasoning, and prediction extraction
 - **Numeric/Continuous Question Enhancement**: e.g. PCHIP interpolation (thanks Panshul), tail spreading
 - **Prompt Improvements**: obviously. e.g. encouraging wider distributions for continuous/numeric q's. do they do anything useful? possibly not.  
-- **Benchmarking on MC and Numeric Q's**: not just binary  
+- **Benchmarking on MC and Numeric Q's**: not just binary
+- **Custom Research**: Currently using Grok 4.1 Fast native search to augment Asknews.
 
 ## Quick Start
 
