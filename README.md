@@ -1,4 +1,6 @@
-~below description by claude. it's a metaculus forecasting competition bot.~
+_below description mostly by claude. it's a metaculus forecasting competition bot._
+
+---
 
 # Metaculus Forecasting Bot
 
@@ -7,12 +9,12 @@ An advanced forecasting bot for Metaculus that leverages ensemble learning with 
 ## Overview
 
 includes:
-- **Model Ensembling**: Uses GPT-5, o3, and Sonnet 4 for diverse prediction perspectives
+- **Model Ensembling**: Uses various models with support for model stacking. (uses simple median agg currently.)
 - **Research Integration**: AskNews API with Perplexity fallback for real-time information gathering
 - **Advanced Aggregation**: Multiple aggregation strategies including mean, median, and stacking approaches
 - **Robust Pipeline**: Comprehensive question processing, research, reasoning, and prediction extraction
 - **Numeric/Continuous Question Enhancement**: e.g. PCHIP interpolation (thanks Panshul), tail spreading
-- **Prompt Improvements**: obviously  
+- **Prompt Improvements**: obviously. e.g. encouraging wider distributions for continuous/numeric q's. do they do anything useful? possibly not.  
 - **Benchmarking on MC and Numeric Q's**: not just binary  
 
 ## Quick Start
@@ -224,4 +226,3 @@ This project heavily uses the [`forecasting-tools`](forecasting_tools_readme.md)
 - **Python version**: 3.11+
 - **Code formatting**: Ruff with 120-character line length
 - **Testing**: Pytest with async support
-- **Development**: WSL2 environment with zsh terminal
