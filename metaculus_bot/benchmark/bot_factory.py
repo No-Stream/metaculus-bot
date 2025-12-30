@@ -48,23 +48,23 @@ MODEL_CATALOG: Dict[str, GeneralLlm] = {
         **MODEL_CONFIG,
     ),
     "deepseek-3.2": GeneralLlm(
-        model="openrouter/deepseek/deepseek-chat-v3.2",
+        model="openrouter/deepseek/deepseek-v3.2",
         **MODEL_CONFIG,
     ),
-    "kimi-k2": GeneralLlm(
-        model="openrouter/moonshotai/kimi-k2-thinking",
-        **MODEL_CONFIG,
-    ),
+    # "kimi-k2": GeneralLlm(
+    #     model="openrouter/moonshotai/kimi-k2-thinking",
+    #     **MODEL_CONFIG,
+    # ),
     "gpt-5.1": build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.1",
         reasoning={"effort": "high"},
         **MODEL_CONFIG,
     ),
-    "o3": build_llm_with_openrouter_fallback(
-        model="openrouter/openai/o3",
-        reasoning={"effort": "high"},
-        **MODEL_CONFIG,
-    ),
+    # "o3": build_llm_with_openrouter_fallback(
+    #     model="openrouter/openai/o3",
+    #     reasoning={"effort": "high"},
+    #     **MODEL_CONFIG,
+    # ),
     # --- Models below are defined for future testing ---
     # "gpt-5.2": build_llm_with_openrouter_fallback(
     #     model="openrouter/openai/gpt-5.2",
