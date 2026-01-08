@@ -40,14 +40,13 @@ ACCEPTABLE_QUANTS = [
 ]
 
 FORECASTER_LLMS = [
-    # TODO: consider adding add'l LLMs to ensemble
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.2",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/o3",
+        model="openrouter/openai/gpt-5",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
@@ -57,23 +56,8 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.1-fast",
-        reasoning={"effort": "high"},
+        model="openrouter/google/gemini-3-flash-preview",
         **REASONING_MODEL_CONFIG,
-    ),
-    build_llm_with_openrouter_fallback(
-        model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-        provider={
-            "quantizations": ACCEPTABLE_QUANTS,
-        },
-        **QWEN_CONFIG,
-    ),
-    build_llm_with_openrouter_fallback(
-        model="openrouter/moonshotai/kimi-k2-0905",
-        provider={
-            "quantizations": ACCEPTABLE_QUANTS,
-        },
-        **QWEN_CONFIG,  # non thinking model but has similar optimal params to qwen3-235b thinking model
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3-pro-preview",
