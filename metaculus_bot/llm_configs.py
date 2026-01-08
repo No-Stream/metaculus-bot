@@ -57,12 +57,12 @@ FORECASTER_LLMS = [
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3-flash-preview",
-        reasoning={"max_tokens": 16_000},
+        reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3-pro-preview",
-        reasoning={"max_tokens": 16_000},
+        reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
 ]
