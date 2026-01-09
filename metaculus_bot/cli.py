@@ -15,6 +15,7 @@ from metaculus_bot.llm_configs import (
     RESEARCHER_LLM,
     SUMMARIZER_LLM,
 )
+from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
 
 
 def main() -> None:
@@ -39,12 +40,12 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "minibench", "quarterly_cup", "test_questions"],
+        choices=["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "minibench", "quarterly_cup", "test_questions"] = args.mode
+    run_mode: Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"] = args.mode
 
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
@@ -63,21 +64,21 @@ def main() -> None:
     )
 
     if run_mode == "tournament":
+        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
+            template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
         )
     elif run_mode == "minibench":
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
         )
-    elif run_mode == "quarterly_cup":
-        # The quarterly cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564
-        # The new quarterly cup may not be initialized near the beginning of a quarter
+    elif run_mode in ("quarterly_cup", "metaculus_cup"):
+        # The metaculus cup is a good way to test the bot's performance on regularly open questions
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_QUARTERLY_CUP_ID, return_exceptions=True)
+            template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
         )
     elif run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
