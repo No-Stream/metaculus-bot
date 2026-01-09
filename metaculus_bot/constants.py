@@ -5,7 +5,12 @@ These are intentionally minimal and focused on operational tuning knobs that
 need to be shared across modules.
 """
 
+import logging
 import os
+from datetime import datetime, timedelta
+from typing import Tuple
+
+from metaculus_bot.config import load_environment
 
 # =============================================================================
 # TOURNAMENT IDs - UPDATE THESE EACH QUARTER/SEASON
@@ -20,9 +25,6 @@ TOURNAMENT_HARD_STOP_WEEKS: int = 3  # Error out this many weeks after end date
 # Update when new cup starts: https://www.metaculus.com/tournament/metaculus-cup/
 METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current cup
 
-from datetime import datetime, timedelta
-from typing import Tuple
-
 
 class TournamentExpiredError(Exception):
     """Raised when the tournament has ended and the ID needs to be updated."""
@@ -30,7 +32,7 @@ class TournamentExpiredError(Exception):
     pass
 
 
-def check_tournament_dates(logger: "logging.Logger | None" = None) -> None:
+def check_tournament_dates(logger: logging.Logger | None = None) -> None:
     """Check if tournament dates are stale and warn/error accordingly.
 
     - Warns if current date is past TOURNAMENT_END_DATE
@@ -66,7 +68,6 @@ def check_tournament_dates(logger: "logging.Logger | None" = None) -> None:
             f"Bot will error out in {days_until_error} days."
         )
 
-from metaculus_bot.config import load_environment
 
 # Load .env early so ASKNEWS_* values are read correctly at import time in local runs
 load_environment()

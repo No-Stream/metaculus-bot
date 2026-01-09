@@ -9,13 +9,13 @@ from forecasting_tools import MetaculusApi
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
 from metaculus_bot.llm_configs import (
     FORECASTER_LLMS,
     PARSER_LLM,
     RESEARCHER_LLM,
     SUMMARIZER_LLM,
 )
-from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
 
 
 def main() -> None:
@@ -66,9 +66,7 @@ def main() -> None:
     if run_mode == "tournament":
         check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
-        )
+        forecast_reports = asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
     elif run_mode == "minibench":
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
         forecast_reports = asyncio.run(
@@ -77,9 +75,7 @@ def main() -> None:
     elif run_mode in ("quarterly_cup", "metaculus_cup"):
         # The metaculus cup is a good way to test the bot's performance on regularly open questions
         template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
-        )
+        forecast_reports = asyncio.run(template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True))
     elif run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
