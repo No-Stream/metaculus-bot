@@ -5,10 +5,69 @@ These are intentionally minimal and focused on operational tuning knobs that
 need to be shared across modules.
 """
 
+import logging
 import os
+from datetime import datetime, timedelta
 from typing import Tuple
 
 from metaculus_bot.config import load_environment
+
+# =============================================================================
+# TOURNAMENT IDs - UPDATE THESE EACH QUARTER/SEASON
+# =============================================================================
+# AI Forecasting Benchmark tournament (bot-only competition)
+# Update when new season starts: https://www.metaculus.com/project/aib/
+TOURNAMENT_ID: str = "spring-aib-2026"  # Spring 2026 AI Benchmarking
+TOURNAMENT_END_DATE: str = "2026-05-01"  # Approximate end date for warning/error checks
+TOURNAMENT_HARD_STOP_WEEKS: int = 3  # Error out this many weeks after end date
+
+# Metaculus Cup tournament (human + bot competition)
+# Update when new cup starts: https://www.metaculus.com/tournament/metaculus-cup/
+METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current cup
+
+
+class TournamentExpiredError(Exception):
+    """Raised when the tournament has ended and the ID needs to be updated."""
+
+    pass
+
+
+def check_tournament_dates(logger: logging.Logger | None = None) -> None:
+    """Check if tournament dates are stale and warn/error accordingly.
+
+    - Warns if current date is past TOURNAMENT_END_DATE
+    - Raises TournamentExpiredError if past end date + TOURNAMENT_HARD_STOP_WEEKS
+
+    Call this at bot startup to catch stale tournament IDs.
+    """
+    import logging as _logging
+
+    log = logger or _logging.getLogger(__name__)
+
+    try:
+        end_date = datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d")
+    except ValueError:
+        log.warning(f"Invalid TOURNAMENT_END_DATE format: {TOURNAMENT_END_DATE}")
+        return
+
+    today = datetime.now()
+    hard_stop_date = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
+
+    if today > hard_stop_date:
+        raise TournamentExpiredError(
+            f"Tournament '{TOURNAMENT_ID}' ended on {TOURNAMENT_END_DATE} and hard stop "
+            f"date ({hard_stop_date.date()}) has passed. Please update TOURNAMENT_ID, "
+            f"TOURNAMENT_END_DATE, and TOURNAMENT_HARD_STOP_WEEKS in constants.py for the new season."
+        )
+    elif today > end_date:
+        days_past = (today - end_date).days
+        days_until_error = (hard_stop_date - today).days
+        log.warning(
+            f"⚠️  Tournament '{TOURNAMENT_ID}' likely ended on {TOURNAMENT_END_DATE} "
+            f"({days_past} days ago). Update constants.py for the new season! "
+            f"Bot will error out in {days_until_error} days."
+        )
+
 
 # Load .env early so ASKNEWS_* values are read correctly at import time in local runs
 load_environment()
