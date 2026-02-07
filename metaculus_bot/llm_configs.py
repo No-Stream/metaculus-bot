@@ -51,8 +51,9 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.5",
-        reasoning={"max_tokens": 16_000},
+        model="openrouter/anthropic/claude-4.6-opus",
+        reasoning={"enabled": True},
+        extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
