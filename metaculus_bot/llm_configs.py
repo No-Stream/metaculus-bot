@@ -67,7 +67,7 @@ FORECASTER_LLMS = [
     ),
 ]
 
-SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/openai/gpt-5-mini")
+SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview")
 # Parser should be a reliable, low-latency model for structure extraction
 PARSER_LLM: str = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5-mini",

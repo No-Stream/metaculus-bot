@@ -288,6 +288,45 @@ class TemplateForecaster(CompactLoggingForecastBot):
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
+    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+        model = self.get_llm("summarizer", "llm")
+        prompt = clean_indents(
+            f"""
+            You are a research analyst preparing a comprehensive intelligence briefing for an expert forecaster.
+
+            The forecaster needs to answer this question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+            {question.fine_print}
+
+            Below is raw research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
+
+            1. Extracts ALL facts, statistics, data points, and quantitative information relevant to the question
+            2. Identifies expert opinions and attributes them to specific people/organizations
+            3. Separates factual claims from opinions and speculation
+            4. Preserves direct quotes where they are informative
+            5. Notes the date, source, and credibility of each piece of information
+            6. Flags any contradictions between sources
+            7. Maintains the section structure (Historical Context vs Recent Developments) if present
+
+            CRITICAL RULES:
+            - NEVER paraphrase numbers, percentages, probabilities, dates, or quantitative data. Copy them EXACTLY.
+              BAD:  "The Fed indicated a low-medium recession risk"
+              GOOD: "The Fed's March 2025 report estimated a 30% probability of recession by Q4"
+            - Be COMPREHENSIVE — do not omit relevant details. A longer, thorough summary is better than a short one.
+            - Include direct quotes from experts and officials where available.
+            - If the research contains prediction market data, include exact numbers and odds.
+            - Preserve all numerical data: poll numbers, vote counts, market prices, growth rates, dates, etc.
+            - Omit only information that is clearly irrelevant to the forecasting question.
+
+            Raw research:
+            {research}
+            """
+        )
+        return await model.invoke(prompt)
+
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
         cache_key = getattr(question, "id_of_question", None)
         if not self.is_benchmarking or self.research_cache is None or cache_key is None:
