@@ -298,8 +298,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             {question.question_text}
 
             Resolution criteria:
-            {question.resolution_criteria}
-            {question.fine_print}
+            {question.resolution_criteria or ""}
+            {question.fine_print or ""}
 
             Below is raw research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
 
@@ -343,7 +343,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if self._custom_research_provider is not None:
             return self._custom_research_provider, "custom"
 
-        default_llm = self.get_llm("default", "llm") if hasattr(self, "get_llm") else None  # type: ignore[attr-defined]
+        default_llm = self.get_llm("default", "llm")
         provider, provider_name = choose_provider_with_name(
             default_llm,
             exa_callback=self._call_exa_smart_searcher,
@@ -496,14 +496,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
         # If using stacking, aggregate the predictions here
         if self.aggregation_strategy == AggregationStrategy.STACKING:
-            try:
-                if getattr(self, "research_reports_per_question", 1) != 1:
-                    logger.warning(
-                        "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
-                        getattr(self, "research_reports_per_question", 1),
-                    )
-            except Exception:
-                pass
+            if getattr(self, "research_reports_per_question", 1) != 1:
+                logger.warning(
+                    "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
+                    getattr(self, "research_reports_per_question", 1),
+                )
             prediction_values = [pred.prediction_value for pred in valid_predictions]
             aggregated_value = await self._aggregate_predictions(
                 prediction_values,
@@ -519,13 +516,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
             aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=meta_text)
             # Mark that we expect the framework's base aggregator to combine pre-stacked outputs across
             # research reports for this question.
-            try:
-                qkey = getattr(question, "id_of_question", None)
-                if qkey is None:
-                    qkey = id(question)
-                self._stack_expected_base_combine.add(qkey)
-            except Exception:
-                pass
+            qkey = getattr(question, "id_of_question", None)
+            if qkey is None:
+                qkey = id(question)
+            self._stack_expected_base_combine.add(qkey)
             return ResearchWithPredictions(
                 research_report=research,
                 summary_report=summary_report,
@@ -638,26 +632,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             and reasoned_predictions is None
             and research is None
         ):
-            # Determine question key for expectedness tracking
-            try:
-                qkey = getattr(question, "id_of_question", None)
-                if qkey is None:
-                    # Fallback to object id if missing
-                    qkey = id(question)
-            except Exception:
+            qkey = getattr(question, "id_of_question", None)
+            if qkey is None:
                 qkey = id(question)
 
-            expected = False
-            try:
-                if qkey in self._stack_expected_base_combine:
-                    expected = True
-                    self._stack_expected_base_combine.discard(qkey)
-                    self._stacking_expected_combine_count += 1
-                else:
-                    self._stacking_unexpected_combine_count += 1
-            except Exception:
-                # Best-effort accounting; do not fail aggregation
-                pass
+            expected = qkey in self._stack_expected_base_combine
+            if expected:
+                self._stack_expected_base_combine.discard(qkey)
+                self._stacking_expected_combine_count += 1
+            else:
+                self._stacking_unexpected_combine_count += 1
 
             # Single pre-stacked prediction – return as-is
             if len(predictions) == 1:
@@ -925,9 +909,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             try:
                 predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-            except Exception:
-                # Be tolerant in tests/mocks that don't return full shape
-                pass
+            except Exception as e:
+                logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
         except Exception:
             # Fallback tolerant parse: simple options then build final list
             raw_options: list[OptionProbability] = await structure_output(

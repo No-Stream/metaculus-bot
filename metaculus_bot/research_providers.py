@@ -177,6 +177,16 @@ def _asknews_provider() -> ResearchCallable:
     return _fetch
 
 
+def _format_single_article(article: Any) -> str:
+    pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
+    return (
+        f"**{article.eng_title}**\n{article.summary}\n"
+        f"Original language: {article.language}\n"
+        f"Publish date: {pub_date}\n"
+        f"Source:[{article.source_id}]({article.article_url})\n\n"
+    )
+
+
 def _format_asknews_dual_sections(
     hot_articles: list[Any],
     historical_articles: list[Any],
@@ -190,14 +200,8 @@ def _format_asknews_dual_sections(
     hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
 
     if hist_deduped:
-        hist_urls = {
-            _normalize_url_for_dedup(str(getattr(a, "article_url", "")))
-            for a in hist_deduped
-            if hasattr(a, "article_url")
-        }
-        hot_deduped = [
-            a for a in hot_deduped if _normalize_url_for_dedup(str(getattr(a, "article_url", ""))) not in hist_urls
-        ]
+        hist_urls = {_normalize_url_for_dedup(str(a.article_url)) for a in hist_deduped}
+        hot_deduped = [a for a in hot_deduped if _normalize_url_for_dedup(str(a.article_url)) not in hist_urls]
 
     if not hist_deduped and not hot_deduped:
         return "No articles were found for this query.\n\n"
@@ -214,25 +218,13 @@ def _format_asknews_dual_sections(
         sorted_hist = sorted(hist_deduped, key=lambda x: x.pub_date, reverse=True)
         formatted_articles += "## Historical Context & Background\n\n"
         for article in sorted_hist:
-            pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += (
-                f"**{article.eng_title}**\n{article.summary}\n"
-                f"Original language: {article.language}\n"
-                f"Publish date: {pub_date}\n"
-                f"Source:[{article.source_id}]({article.article_url})\n\n"
-            )
+            formatted_articles += _format_single_article(article)
 
     if hot_deduped:
         sorted_hot = sorted(hot_deduped, key=lambda x: x.pub_date, reverse=True)
         formatted_articles += "\n## Recent Developments & Current News\n\n"
         for article in sorted_hot:
-            pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += (
-                f"**{article.eng_title}**\n{article.summary}\n"
-                f"Original language: {article.language}\n"
-                f"Publish date: {pub_date}\n"
-                f"Source:[{article.source_id}]({article.article_url})\n\n"
-            )
+            formatted_articles += _format_single_article(article)
 
     return formatted_articles
 
