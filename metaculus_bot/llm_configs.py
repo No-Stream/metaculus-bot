@@ -46,7 +46,7 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5",
+        model="openrouter/openai/gpt-5.1",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
@@ -57,7 +57,8 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/google/gemini-3-flash-preview",
+        model="openrouter/anthropic/claude-opus-4.5",
+        reasoning={"max_tokens": 16_000},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
