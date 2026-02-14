@@ -1,8 +1,15 @@
 """
-Scoring patches for mixed question types in forecasting-tools.
+DEPRECATED: Scoring patches for mixed question types in forecasting-tools.
 
 This module monkey patches the forecasting-tools library to add scoring support
 for numeric and multiple choice questions that currently have NotImplementedError.
+
+NOTE: Metaculus removed the ``aggregations`` field from their list API, so
+``community_prediction_at_access_time`` and all community-prediction-based
+baseline scoring (``expected_baseline_score``) is broken for newly-fetched questions.
+This entire module is used by the deprecated ``community_benchmark.py`` path.
+Prefer ``backtest.py`` + ``metaculus_bot/backtest/scoring.py`` which score against
+actual question resolutions.
 """
 
 import logging

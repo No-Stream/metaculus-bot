@@ -59,7 +59,8 @@ make run
 
 ### Main Components
 - **`main.py`**: Primary bot implementation using the `forecasting-tools` framework
-- **`community_benchmark.py`**: Benchmarking CLI and Streamlit UI for performance evaluation
+- **`backtest.py`**: Primary benchmarking system — scores predictions against actual resolutions
+- **`community_benchmark.py`**: DEPRECATED benchmarking CLI (community prediction baseline broken)
 - **`main_with_no_framework.py`**: Minimal dependencies variant for lightweight usage
 - **`metaculus_bot/`**: Core utilities and configurations
 
@@ -82,19 +83,34 @@ python main.py --filter-type binary --max-questions 10
 ```
 
 ### Benchmarking
+
+The primary benchmarking approach uses **resolved-question backtesting** (`backtest.py`), which scores bot predictions against actual question resolutions:
+
 ```bash
-# Quick smoke test (1 question)
-make benchmark_run_smoke_test_binary
+# Smoke test (4 resolved questions)
+make backtest_smoke_test
 
-# Small benchmark (12 mixed questions) 
-make benchmark_run_small
+# Small backtest (12 questions)
+make backtest_small
 
-# Large benchmark (100 mixed questions)
-make benchmark_run_large
+# Medium backtest (32 questions)
+make backtest_medium
 
-# Display benchmark results
-make benchmark_display
+# Large backtest (100 questions)
+make backtest_large
 ```
+
+<details>
+<summary>DEPRECATED: Community prediction benchmark</summary>
+
+The community benchmark (`community_benchmark.py`) scored bot predictions against the Metaculus community prediction as a proxy for ground truth. Metaculus removed the `aggregations` field from their list API, so `expected_baseline_score` is broken for newly-fetched questions.
+
+```bash
+make benchmark_run_smoke_test_binary   # deprecated
+make benchmark_run_small               # deprecated
+make benchmark_display                 # still works for viewing old results
+```
+</details>
 
 ### Correlation Analysis & Model Filtering
 

@@ -182,7 +182,7 @@ async def _fetch_with_retries(
             questions = await MetaculusApi.get_questions_matching_filter(
                 api_filter,
                 num_questions=count,
-                randomly_sample=True,
+                randomly_sample=False,
             )
             if not questions:
                 raise RuntimeError("API returned 0 resolved questions")
@@ -215,7 +215,10 @@ def _extract_ground_truth(question: MetaculusQuestion) -> GroundTruth | None:
     if isinstance(typed_res, CanceledResolution):
         return None
 
-    # Determine question type and extract community prediction
+    # Extract community prediction where available.
+    # NOTE: Metaculus removed aggregations from their list API, so CP data is no longer
+    # available for newly-fetched questions. Resolved tournament questions fetched via the
+    # individual question endpoint may still have this data populated.
     if isinstance(question, BinaryQuestion):
         question_type = "binary"
         community_prediction = question.community_prediction_at_access_time

@@ -24,6 +24,9 @@ class GroundTruth:
     question_type: str  # "binary", "numeric", "multiple_choice"
     resolution: Any  # bool | float | OutOfBoundsResolution | str
     resolution_string: str
+    # NOTE: community_prediction is no longer available for newly-fetched questions.
+    # Metaculus removed the aggregations field from their list API, so this will be None
+    # for new data. Historical/resolved tournament data may still populate this field.
     community_prediction: Any  # float (binary), list[float] (numeric CDF), list[float] (MC probs)
     actual_resolution_time: datetime | None
     question_text: str

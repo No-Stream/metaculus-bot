@@ -885,7 +885,9 @@ class CorrelationAnalyzer:
                 for report in benchmark.forecast_reports:
                     q_id = report.question.id_of_question
                     if q_id not in question_data:
-                        # Only attach binary community pred; MC/numeric pull CP from api_json during scoring
+                        # DEPRECATED: community_prediction_at_access_time is always None for
+                        # newly-fetched questions (Metaculus removed aggregations from list API).
+                        # This field may still have values in historical benchmark data.
                         q_type_tmp = self._get_question_type(report)
                         bin_cp = (
                             getattr(

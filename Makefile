@@ -55,23 +55,31 @@ test:
 run:
 	$(call RUN_UNBUFFERED,main.py)
 
-# Warning: this will fire off requests to OpenRouter and cost (a very small amount) of money.
+# DEPRECATED: Community benchmark baseline scoring is broken because Metaculus removed
+# the aggregations field from their list API. Use backtest_* targets instead.
+# These targets still work for fetching/running questions, but expected_baseline_score is unreliable.
 benchmark_run_smoke_test_binary:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_smoke_test'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode run --num-questions 1)
 
 benchmark_run_smoke_test:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_smoke_test'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode custom --num-questions 4 --mixed)
 
 benchmark_run_binary_only:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_small'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode run --num-questions 30)
 
 benchmark_run_small:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_small'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode custom --num-questions 12 --mixed)
 
 benchmark_run_medium:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_medium'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode custom --num-questions 32 --mixed)
 
 benchmark_run_large:
+	@echo "WARNING: community benchmark is deprecated — baseline scoring is broken. Prefer 'make backtest_large'."
 	$(call RUN_UNBUFFERED,community_benchmark.py --mode custom --num-questions 100 --mixed)
 
 benchmark_display:

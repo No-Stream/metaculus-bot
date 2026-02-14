@@ -537,6 +537,8 @@ def main():
                         if qtype == "binary":
                             vals = [float(m2r[m].prediction) for m in models_list]
                             agg_p = float(np.mean(vals)) if agg_local == "mean" else float(np.median(vals))
+                            # DEPRECATED: community_prediction_at_access_time is always None for
+                            # newly-fetched questions (Metaculus removed aggregations from list API).
                             c = getattr(rep0.question, "community_prediction_at_access_time", None)
                             if c is None:
                                 continue
@@ -790,10 +792,9 @@ def main():
                     if qtype == "binary":
                         vals = [float(m2r[m].prediction) for m in models_list]
                         agg_p = float(np.mean(vals)) if agg == "mean" else float(np.median(vals))
-                        # Score using binary baseline formula via analyzer's helper (or inline)
                         try:
-                            # Reuse analyzer's internal baseline calc for binary
-                            # Fallback: inline formula (identical to scoring patch)
+                            # DEPRECATED: community_prediction_at_access_time is always None for
+                            # newly-fetched questions (Metaculus removed aggregations from list API).
                             c = getattr(rep0.question, "community_prediction_at_access_time", None)
                             if c is None:
                                 continue

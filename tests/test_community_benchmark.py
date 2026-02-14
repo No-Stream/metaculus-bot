@@ -197,15 +197,15 @@ def test_display_mode(mock_streamlit):
     mock_streamlit.assert_called_once()
 
 
-@patch("community_benchmark.MetaculusApi.get_benchmark_questions")
+@patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
 @patch("community_benchmark.Benchmarker")
 @patch("community_benchmark.MonetaryCostManager")
-def test_benchmark_flow_without_api_calls(mock_cost_manager, mock_benchmarker_class, mock_get_questions):
+def test_benchmark_flow_without_api_calls(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter):
     """Test benchmark flow without making actual API calls."""
     import community_benchmark
 
     # Mock API calls to prevent actual requests
-    mock_get_questions.return_value = []  # Empty question list
+    mock_get_questions_filter.return_value = []
 
     # Mock benchmarker
     mock_benchmarker = Mock()
@@ -222,8 +222,10 @@ def test_benchmark_flow_without_api_calls(mock_cost_manager, mock_benchmarker_cl
     # Test that function can run without errors
     asyncio.run(community_benchmark.benchmark_forecast_bot("run", 1))
 
-    # Verify mocked functions were called
-    mock_get_questions.assert_called_once_with(1)
+    # Verify get_questions_matching_filter was called with randomly_sample=False
+    mock_get_questions_filter.assert_called_once()
+    call_kwargs = mock_get_questions_filter.call_args
+    assert call_kwargs.kwargs.get("randomly_sample") is False or call_kwargs[1].get("randomly_sample") is False
     mock_benchmarker.run_benchmark.assert_called_once()
 
 
