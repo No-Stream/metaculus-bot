@@ -1,4 +1,4 @@
-.PHONY: conda_env install test run benchmark lint format precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest
+.PHONY: conda_env install test run benchmark lint format precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -85,3 +85,15 @@ analyze_correlations_latest:
 
 analyze_correlations_latest_excluding:
 	$(call RUN_UNBUFFERED,analyze_correlations.py $$(ls -t benchmarks/benchmarks_*.jsonl | head -1) --exclude-models grok-4 gemini-2.5-pro)
+
+backtest_smoke_test:
+	$(call RUN_UNBUFFERED,backtest.py --num-questions 4)
+
+backtest_small:
+	$(call RUN_UNBUFFERED,backtest.py --num-questions 12)
+
+backtest_medium:
+	$(call RUN_UNBUFFERED,backtest.py --num-questions 32)
+
+backtest_large:
+	$(call RUN_UNBUFFERED,backtest.py --num-questions 100)
