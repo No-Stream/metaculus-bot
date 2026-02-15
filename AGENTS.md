@@ -148,7 +148,8 @@ This is a Metaculus forecasting bot forked from the metaculus starter template. 
 ## Core Architecture
 - `main.py`: Primary bot implementation using `forecasting-tools` framework
 - `main_with_no_framework.py`: Minimal dependencies variant 
-- `community_benchmark.py`: Benchmarking CLI and Streamlit UI
+- `backtest.py`: Primary benchmarking system — scores bot predictions against actual resolutions
+- `community_benchmark.py`: **DEPRECATED** benchmarking CLI (community prediction baseline broken)
 - `metaculus_bot/`: Core utilities including LLM configs, prompts, and research providers
 - `REFERENCE_COPY_OF_forecasting_tools/`: Local copy of forecasting framework (for reference) `~/workspace/metaculus-bot/REFERENCE_COPY_OF_forecasting_tools_0p2p55`. obviously, this is installed as a package, so you won't affect the package by changing these files; they're just a reference.
 - `~/workspace/metaculus-bot/REFERENCE_COPY_OF_panchul_no_1_q2_bot` - q2 2025 competition winner, has good ideas  
@@ -201,13 +202,24 @@ LLM ensemble configured in `metaculus_bot/llm_configs.py`:
 - **Run tests**: `conda run -n metaculus-bot poetry run pytest` (or `make test`)
 
 ### Benchmarking
-- **Smoke test (1 binary)**: `make benchmark_run_smoke_test_binary`
-- **Smoke test (4 mixed)**: `make benchmark_run_smoke_test`
-- **Small (12 mixed)**: `make benchmark_run_small`
-- **Medium (32 mixed)**: `make benchmark_run_medium`
-- **Large (100 mixed)**: `make benchmark_run_large`
-- **Display results**: `make benchmark_display`
-- **Analyze correlations**: `make analyze_correlations_latest`
+
+**Primary approach — resolved-question backtest** (`backtest.py`):
+Scores bot predictions against actual question resolutions. This is the preferred benchmarking method.
+- **Smoke test (4 questions)**: `make backtest_smoke_test`
+- **Small (12 questions)**: `make backtest_small`
+- **Medium (32 questions)**: `make backtest_medium`
+- **Large (100 questions)**: `make backtest_large`
+
+**DEPRECATED — community benchmark** (`community_benchmark.py`):
+Scores bot predictions against community prediction as a proxy for ground truth.
+Metaculus removed the `aggregations` field from their list API, so `community_prediction_at_access_time`
+is now always `None` for newly-fetched questions. The `expected_baseline_score` metric is broken.
+These targets still work for fetching and running questions, but baseline scoring is unreliable.
+- ~~`make benchmark_run_smoke_test_binary`~~
+- ~~`make benchmark_run_smoke_test`~~
+- ~~`make benchmark_run_small`~~ / ~~`make benchmark_run_medium`~~ / ~~`make benchmark_run_large`~~
+- `make benchmark_display` (still works for viewing old results)
+- `make analyze_correlations_latest`
 
 ### Code Quality
 - **Lint**: `make lint` (Ruff check)

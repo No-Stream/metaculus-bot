@@ -52,9 +52,12 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             Reproduce the following analysis template in your answer:
 
             ── Analysis Template ──
-            1) Source analysis
+
+            PHASE 1: OUTSIDE VIEW (anchor on historical context above)
+
+            1) Source analysis (focus on historical context section)
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
-               • Separate facts from opinions. Give more weight to opinions from identifiable experts/entities.
+               • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
 
             2) Reference class (outside view) analysis
                • List plausible reference classes for this question and evaluate suitability.
@@ -63,7 +66,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
 
-            4) Evidence weighting (for inside-view adjustment)
+            ── Now consider the recent developments above ──
+
+            PHASE 2: INSIDE VIEW UPDATE (update from your base rate using current news)
+
+            4) Evidence weighting (current news items classified as Strong/Moderate/Weak)
                • Classify key evidence using this rubric:
                  - Strong: multiple independent sources; clear causal mechanisms; strong precedent
                  - Moderate: one good source; indirect links; weak precedent
@@ -74,13 +81,15 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Strongest Bull Case (Yes): most compelling, evidence-based argument for Yes.
                • Red-team both: attack assumptions, data gaps, and causal claims.
 
-            6) Final rationale and calibration
-               • Integrate outside→inside view and justify the belief shift from the base rate.
+            6) Final rationale and calibration — integrate outside→inside view
+               • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
+               • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
                • Status-quo nudge: the world usually changes slowly—justify any deviation from status quo expectations.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
+            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
             • State the outside-view base rate you anchored to.
             • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
             • Top 3-5 evidence items + quick factual validity check.
@@ -121,9 +130,12 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         Reproduce the following analysis template in your answer:
 
         ── Analysis Template ──
-        (1) Source analysis
+
+        PHASE 1: OUTSIDE VIEW (anchor on historical context above)
+
+        (1) Source analysis (focus on historical context section)
             • Summarize key sources; note recency, credibility, and scope.
-            • Separate fact vs opinion; favor opinions from identifiable experts/entities.
+            • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
 
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
@@ -132,7 +144,11 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         (3) Timeframe reasoning
             • Time to resolution; describe how halving/doubling the timeline might reshape the distribution.
 
-        (4) Evidence weighting (for inside-view adjustment)
+        ── Now consider the recent developments above ──
+
+        PHASE 2: INSIDE VIEW UPDATE (update from your base rate using current news)
+
+        (4) Evidence weighting (current news items classified as Strong/Moderate/Weak)
             • Apply the rubric:
               - Strong: multiple independent sources; clear causality; strong precedent
               - Moderate: one good source; indirect links; weak precedent
@@ -147,8 +163,9 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         (7) Unexpected scenario(s)
             • Plausible but overlooked pathways for a different option to win; justify residual mass on tails.
 
-        (8) Final rationale and calibration
-            • Integrate outside→inside view and justify shifts.
+        (8) Final rationale and calibration — integrate outside→inside view
+            • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
+            • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
             Remember:
@@ -158,6 +175,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         ── Brief checklist (keep concise) ───────────────────────────────────
         • Paraphrase options & resolution criteria (<30 words).
+        • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
         • State the outside-view distribution used as anchor.
         • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
         • Top 3-5 evidence items + quick factual validity check.
@@ -221,9 +239,12 @@ def numeric_prompt(
         Reproduce the following analysis template in your answer:
 
         -- Analysis Template ──
-        (1) Source analysis
+
+        PHASE 1: OUTSIDE VIEW (anchor on historical context above)
+
+        (1) Source analysis (focus on historical context section)
             - Summarize key sources; note recency, credibility, and scope.
-            - Separate fact and opinion. Prefer opinions from identifiable experts and entities.
+            - Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
 
         (2) Outside view and reference classes
             - Candidate reference classes and suitability.
@@ -237,7 +258,11 @@ def numeric_prompt(
         (4) Expert and market priors
             - Cite ranges or point forecasts from specialists, prediction markets, or peers.
 
-        (5) Evidence weighting for inside view adjustments
+        ── Now consider the recent developments above ──
+
+        PHASE 2: INSIDE VIEW UPDATE (update from your base rate using current news)
+
+        (5) Evidence weighting for inside view adjustments (current news items classified as Strong/Moderate/Weak)
             - Strong: multiple independent sources, clear causal links, strong precedent
             - Moderate: one good source, indirect links, weak precedent
             - Weak: anecdotes, speculative logic, volatile indicators
@@ -246,9 +271,10 @@ def numeric_prompt(
             - Coherent pathway for unusually low results.
             - Coherent pathway for unusually high results.
 
-        (7) Red team and final rationale
+        (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
-            - Integrate outside to inside view and justify shifts.
+            - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
+            - Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
             - Status quo nudge: justify deviations from status quo expectations.
 
@@ -262,6 +288,7 @@ def numeric_prompt(
         (9) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
+            - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
             - State the outside view baseline used.
             - Consistency line about which percentile corresponds to the status quo or trend.
             - Top 3 to 5 evidence items plus a quick factual validity check.

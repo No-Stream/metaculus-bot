@@ -50,7 +50,7 @@ def main() -> None:
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
-        use_research_summary_to_forecast=False,
+        use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,

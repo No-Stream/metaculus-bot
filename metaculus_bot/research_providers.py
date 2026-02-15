@@ -160,39 +160,14 @@ def _asknews_provider() -> ResearchCallable:
 
                 assert historical_articles is not None
 
-                # Combine and format articles like forecasting-tools does
                 logger.info(
                     f"AskNews: Got {len(hot_articles)} hot articles, {len(historical_articles)} historical articles"
                 )
-                formatted_articles = "Here are the relevant news articles:\n\n"
 
-                all_articles = []
-                if hot_articles:
-                    all_articles.extend(hot_articles)
-                if historical_articles:
-                    all_articles.extend(historical_articles)
-
-                if not all_articles:
-                    return "No articles were found for this query.\n\n"
-
-                # URL deduplication (best-effort, order-preserving)
-                try:
-                    before = len(all_articles)
-                    all_articles = _dedup_articles_by_url(all_articles)
-                    removed = before - len(all_articles)
-                    if removed > 0:
-                        logger.info(
-                            f"AskNews URL dedup: {before} -> {len(all_articles)} (removed {removed} duplicates)"
-                        )
-                except Exception as dedup_exc:  # pragma: no cover - protective
-                    logger.warning(f"AskNews URL dedup failed; proceeding without dedup: {dedup_exc}")
-
-                # Sort by date and format
-                sorted_articles = sorted(all_articles, key=lambda x: x.pub_date, reverse=True)
-
-                for article in sorted_articles:
-                    pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
-                    formatted_articles += f"**{article.eng_title}**\n{article.summary}\nOriginal language: {article.language}\nPublish date: {pub_date}\nSource:[{article.source_id}]({article.article_url})\n\n"
+                formatted_articles = _format_asknews_dual_sections(
+                    hot_articles=hot_articles,
+                    historical_articles=historical_articles,
+                )
 
                 logger.info(
                     f"AskNews: Success, got {len(formatted_articles)} chars from {len(hot_articles)} hot + {len(historical_articles)} historical articles"
@@ -200,6 +175,58 @@ def _asknews_provider() -> ResearchCallable:
                 return formatted_articles
 
     return _fetch
+
+
+def _format_single_article(article: Any) -> str:
+    pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
+    return (
+        f"**{article.eng_title}**\n{article.summary}\n"
+        f"Original language: {article.language}\n"
+        f"Publish date: {pub_date}\n"
+        f"Source:[{article.source_id}]({article.article_url})\n\n"
+    )
+
+
+def _format_asknews_dual_sections(
+    hot_articles: list[Any],
+    historical_articles: list[Any],
+) -> str:
+    """Format AskNews articles into two labeled sections: Historical Context and Recent Developments.
+
+    Deduplicates within each list and cross-deduplicates (hot articles that duplicate historical
+    URLs are removed). Historical section comes first in the output.
+    """
+    hist_deduped = _dedup_articles_by_url(historical_articles) if historical_articles else []
+    hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
+
+    if hist_deduped:
+        hist_urls = {_normalize_url_for_dedup(str(a.article_url)) for a in hist_deduped}
+        hot_deduped = [a for a in hot_deduped if _normalize_url_for_dedup(str(a.article_url)) not in hist_urls]
+
+    if not hist_deduped and not hot_deduped:
+        return "No articles were found for this query.\n\n"
+
+    total_before = len(historical_articles) + len(hot_articles)
+    total_after = len(hist_deduped) + len(hot_deduped)
+    removed = total_before - total_after
+    if removed > 0:
+        logger.info(f"AskNews URL dedup: {total_before} -> {total_after} (removed {removed} duplicates)")
+
+    formatted_articles = "Here are the relevant news articles:\n\n"
+
+    if hist_deduped:
+        sorted_hist = sorted(hist_deduped, key=lambda x: x.pub_date, reverse=True)
+        formatted_articles += "## Historical Context & Background\n\n"
+        for article in sorted_hist:
+            formatted_articles += _format_single_article(article)
+
+    if hot_deduped:
+        sorted_hot = sorted(hot_deduped, key=lambda x: x.pub_date, reverse=True)
+        formatted_articles += "\n## Recent Developments & Current News\n\n"
+        for article in sorted_hot:
+            formatted_articles += _format_single_article(article)
+
+    return formatted_articles
 
 
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:

@@ -1,5 +1,12 @@
 """
-Benchmark treating the community prediction as approximate ground truth.
+DEPRECATED: Community prediction benchmark.
+
+Scores bot predictions against the Metaculus community prediction as a proxy for ground truth.
+Metaculus removed the ``aggregations`` field from their list API, so
+``community_prediction_at_access_time`` is now always None for newly-fetched questions.
+The ``expected_baseline_score`` metric is therefore broken for new runs.
+
+Prefer ``backtest.py`` which scores against actual question resolutions.
 """
 
 import argparse
@@ -141,7 +148,7 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
         "num_forecasters_gte": 40,
         "scheduled_resolve_time_lt": one_year_from_now,
         "includes_bots_in_aggregates": False,
-        "community_prediction_exists": True,
+        "open_time_gt": datetime.now() - timedelta(days=90),
     }
 
     all_questions = []
@@ -155,10 +162,6 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
 
         # Build filter per type
         filter_kwargs = base_filter_kwargs.copy()
-        if question_type != "binary":
-            filter_kwargs.pop("community_prediction_exists", None)
-            logger.info(f"⚠️  Removed community_prediction_exists filter for {question_type} questions")
-            sys.stdout.flush()
 
         # For numeric questions, include discrete types as well
         if question_type == "numeric":
@@ -190,7 +193,7 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
                 questions = await MetaculusApi.get_questions_matching_filter(
                     api_filter,
                     num_questions=count,
-                    randomly_sample=True,
+                    randomly_sample=False,
                 )
                 if not questions:
                     raise RuntimeError("API returned 0 questions")
@@ -263,16 +266,32 @@ async def benchmark_forecast_bot(
     exclude_models: list[str] | None = None,
 ) -> None:
     """
-    Run a benchmark that compares your forecasts against the community prediction.
-    Ideally 100+ questions for meaningful error bars, but can use e.g. just a few for smoke testing or 30 for a quick run.
+    DEPRECATED: Run a benchmark that compares your forecasts against the community prediction.
+    Prefer backtest.py which scores against actual question resolutions.
     """
-    # TODO: make sure this is ok w/ the max predictions at once cost safety controls we have in place
+    logger.warning(
+        "community_benchmark.py is deprecated. Metaculus removed the aggregations field "
+        "from their list API, so community_prediction_at_access_time is always None for "
+        "newly-fetched questions and expected_baseline_score is unreliable. "
+        "Use backtest.py instead."
+    )
 
     if mode == "display":
         run_benchmark_streamlit_page()
         return
     elif mode == "run":
-        questions = MetaculusApi.get_benchmark_questions(number_of_questions)
+        api_filter = ApiFilter(
+            allowed_statuses=["open"],
+            allowed_types=["binary"],
+            num_forecasters_gte=30,
+            includes_bots_in_aggregates=False,
+            open_time_gt=datetime.now() - timedelta(days=90),
+        )
+        questions = await MetaculusApi.get_questions_matching_filter(
+            api_filter,
+            num_questions=number_of_questions,
+            randomly_sample=False,
+        )
     elif mode == "custom":
         # Below is an example of getting custom questions
         one_year_from_now = datetime.now() + timedelta(days=365)
@@ -288,12 +307,12 @@ async def benchmark_forecast_bot(
                 num_forecasters_gte=40,
                 scheduled_resolve_time_lt=one_year_from_now,
                 includes_bots_in_aggregates=False,
-                community_prediction_exists=True,
+                open_time_gt=datetime.now() - timedelta(days=90),
             )
             questions = await MetaculusApi.get_questions_matching_filter(
                 api_filter,
                 num_questions=number_of_questions,
-                randomly_sample=True,
+                randomly_sample=False,
             )
 
         for question in questions:

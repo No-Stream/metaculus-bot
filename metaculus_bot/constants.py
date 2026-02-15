@@ -163,3 +163,12 @@ FETCH_RETRY_BACKOFFS: list[int] = [5, 15]
 # Distribution mix: (binary, numeric, multiple_choice)
 TYPE_MIX: Tuple[float, float, float] = (0.5, 0.25, 0.25)
 FETCH_PACING_SECONDS: int = 2
+
+# =============================================================================
+# BACKTEST SETTINGS
+# =============================================================================
+BACKTEST_DEFAULT_RESOLVED_AFTER: str = "2025-12-01"
+BACKTEST_DEFAULT_TOURNAMENT: str = "fall-aib-2025"
+BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
+BACKTEST_OVERFETCH_RATIO: int = 3
+LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
