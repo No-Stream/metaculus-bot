@@ -61,15 +61,14 @@ When asked to diagnose or debug, you should either:
 - **Modular Code**: keep things DRY, refactor out logic from monoliths after making them. Don't treat code like a hacky research notebook. It's fine when you have a complex task to have a func that does A, B, C, D, and E within one function top avoid nested functions, but each of those should be a function call. (Better to have foo with bar, baz, etc. in it than deeply nested functions, which are less readable.)
 
 ### Python Specific Standards
-- **Python Version**: 3.12 or higher
-- **Formatting**: Black with 120-character line length
+- **Python Version**: 3.11 or higher
+- **Formatting**: Ruff with 120-character line length
 - **Style**: PEP8 compliant, Google Python Style Guide
 - **Imports**: _Always_ use absolute imports, never relative. Imports should be at the __top of the file__ following PEP8, never within functions except as absolutely needed to avoid circular imports. Importing within a function is a hack!
 - **Type Hints**: Always include type hints (if types are very complicated, you may use `# type: ignore`, `Any`, and so on as needed)
 - **Error Handling**: Do the minimum viable amount - don't handle every single possible scenario. Major unexpected errors should not fail silently! Err strongly on the side of throwing/raising errors and failing fast rather than failing silently. Blanket `except Exception` is a major code smell unless you reraise.
 - **Logging**: Always use the builtin logging package, not stdout/print. Example: `logger: logging.Logger = logging.getLogger(__name__); logging.basicConfig(level=logging.INFO)`
 - **F-strings**: When printing variables or constants, prefer f-strings to avoid brittle code and duplication. In other words, instead of `foo = bar; logger.info("variable foo = bar")` do `foo = bar; logger.info(f"variable foo = {bar}")`. So if foo is updated, the log will auto-update.  
-- **Absolute Imports**: use absolute imports. Do  not use relative imports.  
 - **Kwargs and Constants**: use these to avoid magic numbers hidden in functions. Constants and magic numbers should be in config files like `settings.py`, `constants.py` or similar.
 
 ### Data Science & Defensive Programming Standards
@@ -143,7 +142,7 @@ You have access to some extra shell utilities like `ripgrep fd-find fzf bat jq`.
 # Repository-Specific Guidelines
 
 ## Project Overview
-This is a Metaculus forecasting bot forked from the metaculus starter template. It uses model ensembling, plus research integration through AskNews (w/ Perplexity as a fallback).
+This is a Metaculus forecasting bot forked from the metaculus starter template. It uses model ensembling, plus research integration through AskNews, native search (Grok), and fallback providers.
 
 ## Core Architecture
 - `main.py`: Primary bot implementation using `forecasting-tools` framework
@@ -151,30 +150,30 @@ This is a Metaculus forecasting bot forked from the metaculus starter template. 
 - `backtest.py`: Primary benchmarking system — scores bot predictions against actual resolutions
 - `community_benchmark.py`: **DEPRECATED** benchmarking CLI (community prediction baseline broken)
 - `metaculus_bot/`: Core utilities including LLM configs, prompts, and research providers
-- `REFERENCE_COPY_OF_forecasting_tools/`: Local copy of forecasting framework (for reference) `~/workspace/metaculus-bot/REFERENCE_COPY_OF_forecasting_tools_0p2p55`. obviously, this is installed as a package, so you won't affect the package by changing these files; they're just a reference.
-- `~/workspace/metaculus-bot/REFERENCE_COPY_OF_panchul_no_1_q2_bot` - q2 2025 competition winner, has good ideas  
-- `~/workspace/metaculus-bot/scratch_docs_and_planning/metaculus_api_doc_LARGE_FILE.yml` - metaculus API doc. large file. shows how to interact with metaculus
+- `REFERENCE_COPY_OF_forecasting_tools*/`: Read-only reference copy of the forecasting-tools framework source. Edits here won't affect the installed package. Path varies by machine — search for `REFERENCE_COPY_OF_forecasting_tools*` in the repo root or workspace if not found.
+- A reference copy of the Q2 2025 competition winner (panchul) may exist in the workspace (`REFERENCE_COPY_OF_panchul*`). Good ideas for comparison.
+- A Metaculus API doc (`metaculus_api_doc_LARGE_FILE.yml`) may exist in `scratch_docs_and_planning/`. Large file — use offset/limit when reading.
 
 The bot architecture follows these key components:
 - **Model Ensembling**: Multiple LLMs configured in `metaculus_bot/llm_configs.py` with aggregation strategies
-- **Research Integration**: AskNews and Exa search through `research_providers.py`
+- **Research Integration**: AskNews, native search (Grok), and fallback providers through `research_providers.py`
 - **Forecasting Pipeline**: Question ingestion → research → reasoning → prediction extraction → aggregation
 
 ## Project Structure & Module Organization
 - `tests/`: Pytest suite (`tests/test_*.py`).
-- `.github/workflows/`: CI automation for scheduled runs.
+- `.github/workflows/`: CI (lint + test on PRs) and scheduled bot runs.
 - `.env.template`: Reference for required environment variables.
 
 ## Configuration & Environment
 - Copy `.env.template` to `.env` for local development
-- Required tokens: `METACULUS_TOKEN`, plus API keys for AskNews, Perplexity, Exa, OpenRouter
-- Never commit secrets to repository
+- See `.env.template` for required API keys. Never commit secrets to repository.
 
 ### Python Environment
 - **Conda environment**: `metaculus-bot`
 - **Python binary**: `~/miniconda3/envs/metaculus-bot/bin/python`
 - **Direct execution**: Use the full python path when conda commands fail
 - Example: `~/miniconda3/envs/metaculus-bot/bin/python script.py` instead of `conda run -n metaculus-bot python script.py`
+- **NEVER use pip directly** — dependencies are managed by conda + poetry. Use `make install` or `poetry install` within the conda env.
 
 ## Key Framework Integration
 The project heavily uses `forecasting-tools` framework:
@@ -185,11 +184,9 @@ The project heavily uses `forecasting-tools` framework:
 - Research: `AskNewsSearcher`, `SmartSearcher` for information gathering
 
 ## Model Configuration
-LLM ensemble configured in `metaculus_bot/llm_configs.py`:
-- Primary models: gpt-5, o3, sonnet 4
-- Summarization: qwen 3 235b (not currently used - models get raw articles)  
-- Research: Asknews (perplexity via openrouter backup)
-- Models use OpenRouter as provider with specific quantization preferences
+LLM ensemble configured in `metaculus_bot/llm_configs.py` — see that file for current models.
+Models rotate frequently; do not hardcode model names outside of `llm_configs.py`.
+Provider: OpenRouter (with automatic key fallback).
 
 ## Development Commands
 
@@ -210,16 +207,7 @@ Scores bot predictions against actual question resolutions. This is the preferre
 - **Medium (32 questions)**: `make backtest_medium`
 - **Large (100 questions)**: `make backtest_large`
 
-**DEPRECATED — community benchmark** (`community_benchmark.py`):
-Scores bot predictions against community prediction as a proxy for ground truth.
-Metaculus removed the `aggregations` field from their list API, so `community_prediction_at_access_time`
-is now always `None` for newly-fetched questions. The `expected_baseline_score` metric is broken.
-These targets still work for fetching and running questions, but baseline scoring is unreliable.
-- ~~`make benchmark_run_smoke_test_binary`~~
-- ~~`make benchmark_run_smoke_test`~~
-- ~~`make benchmark_run_small`~~ / ~~`make benchmark_run_medium`~~ / ~~`make benchmark_run_large`~~
-- `make benchmark_display` (still works for viewing old results)
-- `make analyze_correlations_latest`
+**DEPRECATED — community benchmark** (`community_benchmark.py`): Baseline scoring broken (Metaculus removed aggregations from list API). `make benchmark_display` still works for viewing old results.
 
 ### Code Quality
 - **Lint**: `make lint` (Ruff check)
@@ -228,24 +216,7 @@ These targets still work for fetching and running questions, but baseline scorin
 - **Test single file**: `conda run -n metaculus-bot PYTHONPATH=. poetry run pytest tests/test_specific.py`
 
 ### Important commands
-- **Makefile**: this has most of them! e.g. `make test`. feel free to reference it!
-- Details: `make test` runs something like `conda run -n metaculus-bot PYTHONPATH=. poetry run pytest`, so you'll need to use the right conda env AND use poetry.
-- Note: for some reason in agentic coding CLIs like Claude Code, Codex CLI, or Gemini CLI you typically need to manually point to the miniconda3 envname metaculus-bot's python binary.
-
-## Coding Style & Naming Conventions
-- Python 3.11+, PEP 8, absolute imports only.
-- Ruff formatting with 120-char line length (`[tool.ruff].line-length = 120`).
-- Import ordering via Ruff (I rules), no separate isort.
-- Naming: functions/variables `snake_case`, classes `PascalCase`, constants `UPPER_SNAKE_CASE`, modules `snake_case`.
-- Type hints required; prefer clear, explicit variable names over comments.
-
-## Testing Guidelines
-- Framework: Pytest (+ `pytest-asyncio` as needed).
-- File names: `tests/test_*.py`; group related behaviors.
-- **Focus**: End-to-end integration tests for forecasting pipeline
-- **Coverage**: Core forecasting flows, aggregation logic, API integrations
-- **Run pattern**: All tests must pass locally before PRs
-- Run locally with `poetry run pytest` and ensure tests pass before PRs.
+The **Makefile** has most commands — e.g. `make test`, `make format`, `make run`. In agentic CLIs you may need to use the full python path (`~/miniconda3/envs/metaculus-bot/bin/python`) since conda activation can be unreliable.
 
 ## Commit & Pull Request Guidelines
 - Commits: concise, imperative subject (e.g., "fix test cmd", "add conda to make"). Add a short body when context helps.
@@ -257,6 +228,3 @@ These targets still work for fetching and running questions, but baseline scorin
 - Use GitHub Actions secrets for `METACULUS_TOKEN` and API keys (AskNews, Perplexity, Exa, etc.).
 - Limit changes to workflow files unless CI behavior is intended to change.
 
-## Additional Context
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-Local environment is WSL2 (Ubuntu) and CLI tools run in a zsh terminal window.

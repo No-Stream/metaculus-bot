@@ -168,9 +168,9 @@ OPENROUTER_API_KEY=your_openrouter_key
 
 ### Model Configuration
 Models are configured in `metaculus_bot/llm_configs.py`:
-- **Primary models**: GPT-5, o3, Sonnet 4 for forecasting
-- **Research**: AskNews with Perplexity backup
-- **Provider**: OpenRouter for consistent API access
+- See `metaculus_bot/llm_configs.py` for the current model ensemble (rotates frequently)
+- **Research**: AskNews + native search (Grok), with fallback providers
+- **Provider**: OpenRouter with automatic key fallback
 
 ## Development
 
