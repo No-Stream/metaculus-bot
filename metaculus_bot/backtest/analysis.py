@@ -150,7 +150,7 @@ def generate_backtest_report(
     lines.append("")
     lines.append("## Notes")
     lines.append(
-        "- Community prediction is the final CP at resolution time, " "which benefits from late-stage convergence"
+        "- Community prediction is the final CP at resolution time, which benefits from late-stage convergence"
     )
     lines.append("- CRPS community scores unavailable (requires x-axis values not stored)")
     lines.append("")
