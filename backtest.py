@@ -181,7 +181,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     )
 
     logger.info(
-        f"Prepared {len(question_set.questions)} questions with " f"{len(question_set.ground_truths)} ground truths"
+        f"Prepared {len(question_set.questions)} questions with {len(question_set.ground_truths)} ground truths"
     )
 
     # 2. Leakage pre-screening

@@ -96,9 +96,9 @@ class TestTournamentConfigFreshness:
 
         assert today <= hard_stop_date, (
             f"\n\n"
-            f"{'='*70}\n"
+            f"{'=' * 70}\n"
             f"TOURNAMENT CONFIG IS STALE - ACTION REQUIRED\n"
-            f"{'='*70}\n"
+            f"{'=' * 70}\n"
             f"Tournament '{TOURNAMENT_ID}' ended on {TOURNAMENT_END_DATE}.\n"
             f"Hard stop date ({hard_stop_date.date()}) has passed.\n"
             f"\n"
@@ -107,7 +107,7 @@ class TestTournamentConfigFreshness:
             f"  - TOURNAMENT_END_DATE (approximate end date)\n"
             f"\n"
             f"Check https://www.metaculus.com/project/aib/ for current tournament info.\n"
-            f"{'='*70}\n"
+            f"{'=' * 70}\n"
         )
 
     def test_tournament_end_date_is_valid_format(self) -> None:
