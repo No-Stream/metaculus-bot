@@ -85,9 +85,10 @@ async def _check_single_question_leakage(
         f"Question: {question.question_text}\n"
         f"Resolution criteria: {question.resolution_criteria}\n"
         f"Actual resolution: {ground_truth.resolution_string}\n\n"
-        f"Research report:\n{research_text}\n\n"
-        "Does the research report contain information that clearly reveals or strongly implies "
-        "the actual resolution? Answer YES or NO, then briefly explain."
+        "The research report is provided below within <research> tags. "
+        "Does it contain information that clearly reveals or strongly implies "
+        "the actual resolution? Answer YES or NO, then briefly explain.\n\n"
+        f"<research>\n{research_text}\n</research>"
     )
     try:
         response = await detector_llm.invoke(prompt)
