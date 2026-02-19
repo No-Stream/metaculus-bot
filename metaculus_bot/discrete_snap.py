@@ -33,6 +33,10 @@ from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
 
 logger = logging.getLogger(__name__)
 
+# Algorithm-internal constants
+_NEAR_ZERO_EPSILON: float = 1e-12
+_ALPHA_SAFETY_MARGIN: float = 1.1
+
 
 class OutcomeTypeResult(BaseModel):
     """Structured output for discrete/continuous classification."""
@@ -90,12 +94,10 @@ def snap_cdf_to_integers(
     # Normalize PMF to match the total mass in the smooth CDF
     total_smooth = float(p_smooth[-1] - p_smooth[0])
     total_pmf = float(pmf.sum())
-    if total_pmf > 1e-12:
+    if total_pmf > _NEAR_ZERO_EPSILON:
         pmf *= total_smooth / total_pmf
 
     # --- Step 2: Reconstruct step CDF at grid points ---
-    # The step CDF starts at the lower tail probability (p_smooth[0]), then
-    # jumps by PMF(k) at each integer's upper half-boundary (k + 0.5).
     cumulative_pmf = np.cumsum(pmf)
     tail_lower = float(p_smooth[0])
 
@@ -109,8 +111,11 @@ def snap_cdf_to_integers(
     step_cdf[-1] = float(p_smooth[-1])
 
     # --- Step 3: Uniform mixture for min-step compliance ---
-    min_alpha_for_step = NUM_MIN_PROB_STEP * n_points / total_smooth * 1.1 if total_smooth > 1e-12 else 1.0
-    alpha = max(DISCRETE_SNAP_UNIFORM_MIX, min_alpha_for_step)
+    if total_smooth > _NEAR_ZERO_EPSILON:
+        min_alpha_for_step = NUM_MIN_PROB_STEP * n_points / total_smooth * _ALPHA_SAFETY_MARGIN
+    else:
+        min_alpha_for_step = 1.0
+    alpha = min(1.0, max(DISCRETE_SNAP_UNIFORM_MIX, min_alpha_for_step))
     uniform_cdf = np.linspace(p_smooth[0], p_smooth[-1], n_points)
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
@@ -161,16 +166,8 @@ def snap_distribution_to_integers(
         logger.info("Discrete snap skipped: question already labeled discrete (cdf_size=%d)", question.cdf_size)
         return None
 
-    # Extract CDF probability values from the distribution
-    if hasattr(distribution, "_pchip_cdf_values"):
-        cdf_probs: list[float] = list(distribution._pchip_cdf_values)
-        assert len(cdf_probs) == 201, f"Unexpected _pchip_cdf_values length: {len(cdf_probs)}"
-    else:
-        cdf_probs = [p.percentile for p in distribution.cdf]
-
-    if len(cdf_probs) != 201:
-        logger.warning("Discrete snap skipped: unexpected CDF length %d", len(cdf_probs))
-        return None
+    # All NumericDistributions in our pipeline are PchipNumericDistribution (pchip_processing.py)
+    cdf_probs: list[float] = list(distribution._pchip_cdf_values)  # type: ignore[attr-defined]
 
     snapped_cdf = snap_cdf_to_integers(
         cdf_values=cdf_probs,

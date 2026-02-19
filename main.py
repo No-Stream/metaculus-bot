@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
@@ -121,7 +122,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._stacking_unexpected_combine_count: int = 0
         self._stacking_fallback_count: int = 0
         # Per-question votes from each LLM on whether outcomes are discrete integers
-        self._discrete_integer_votes: dict[int, list[bool]] = {}
+        self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
 
         if max_concurrent_research <= 0:
             raise ValueError("max_concurrent_research must be a positive integer")
@@ -959,15 +960,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
 
         if qid is not None and discrete_vote is not None:
-            if qid not in self._discrete_integer_votes:
-                self._discrete_integer_votes[qid] = []
             self._discrete_integer_votes[qid].append(discrete_vote)
         if qid is not None:
+            vote_label = {True: "DISCRETE", False: "CONTINUOUS"}.get(discrete_vote, "PARSE_FAILED")
             logger.info(
                 "Discrete vote for Q %s | model=%s | vote=%s",
                 qid,
                 getattr(llm_to_use, "model", "<unknown>"),
-                "DISCRETE" if discrete_vote is True else ("CONTINUOUS" if discrete_vote is False else "PARSE_FAILED"),
+                vote_label,
             )
 
         unit_str = getattr(question, "unit_of_measure", None) or "base unit"
@@ -1020,7 +1020,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         qid = question.id_of_question
         if qid is None:
             return prediction
-        votes = self._discrete_integer_votes.get(qid, [])
+        votes = self._discrete_integer_votes.pop(qid, [])
         if not majority_votes_discrete(votes):
             if votes:
                 logger.info("Discrete snap skipped for Q %s: votes=%s (majority=CONTINUOUS)", qid, votes)
