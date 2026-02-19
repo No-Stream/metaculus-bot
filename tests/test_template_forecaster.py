@@ -356,7 +356,7 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
         result = await bot._run_forecast_on_numeric(mock_metaculus_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
         mock_bounds.assert_called_once()
-        mock_struct.assert_called_once()
+        assert mock_struct.call_count == 2  # percentiles + outcome type classification
         assert result.prediction_value is not None
         assert "mock reasoning" in result.reasoning
 

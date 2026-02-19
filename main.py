@@ -40,6 +40,7 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
 )
+from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_diagnostics import log_final_prediction
@@ -118,6 +119,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._stacking_expected_combine_count: int = 0
         self._stacking_unexpected_combine_count: int = 0
         self._stacking_fallback_count: int = 0
+        # Per-question votes from each LLM on whether outcomes are discrete integers
+        self._discrete_integer_votes: dict[int, list[bool]] = {}
 
         if max_concurrent_research <= 0:
             raise ValueError("max_concurrent_research must be a positive integer")
@@ -692,7 +695,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     "STACKING base combine: numeric mean aggregation | CDF points=%d",
                     len(getattr(aggregated, "cdf", [])),
                 )
-                return aggregated  # type: ignore[return-value]
+                return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
             raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
 
         # Handle stacking strategy
@@ -705,7 +708,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 raise ValueError("STACKING aggregation strategy requires research context")
 
             try:
-                return await self._run_stacking(question, research, reasoned_predictions)
+                stacked = await self._run_stacking(question, research, reasoned_predictions)
+                return self._maybe_snap_to_integers(stacked, question)
             except Exception as e:
                 if self.stacking_fallback_on_failure:
                     # Increment diagnostics counter
@@ -784,7 +788,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return aggregated  # type: ignore[return-value]
+            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
@@ -937,6 +941,36 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
 
+        # Parse discrete integer classification from reasoning via parser LLM
+        qid = question.id_of_question
+        discrete_vote: bool | None = None
+        try:
+            outcome_result: OutcomeTypeResult = await structure_output(
+                reasoning,
+                OutcomeTypeResult,
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=(
+                    "The forecaster classified whether this question's resolution values are discrete "
+                    "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
+                    "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
+                ),
+            )
+            discrete_vote = outcome_result.is_discrete_integer
+        except Exception:
+            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s", qid, getattr(llm_to_use, "model", "?"))
+
+        if qid is not None and discrete_vote is not None:
+            if qid not in self._discrete_integer_votes:
+                self._discrete_integer_votes[qid] = []
+            self._discrete_integer_votes[qid].append(discrete_vote)
+        if qid is not None:
+            logger.info(
+                "Discrete vote for Q %s | model=%s | vote=%s",
+                qid,
+                getattr(llm_to_use, "model", "<unknown>"),
+                "DISCRETE" if discrete_vote is True else ("CONTINUOUS" if discrete_vote is False else "PARSE_FAILED"),
+            )
+
         unit_str = getattr(question, "unit_of_measure", None) or "base unit"
         parse_notes = (
             (
@@ -978,6 +1012,25 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
         return bound_messages(question)
+
+    def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
+        """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""
+        if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
+            return prediction
+
+        qid = getattr(question, "id_of_question", None)
+        votes = self._discrete_integer_votes.get(qid, [])
+        if not majority_votes_discrete(votes):
+            if votes:
+                logger.info("Discrete snap skipped for Q %s: votes=%s (majority=CONTINUOUS)", qid, votes)
+            return prediction
+
+        logger.info("Discrete snap: majority voted DISCRETE for Q %s | votes=%s", qid, votes)
+        snapped = snap_distribution_to_integers(prediction, question)
+        if snapped is None:
+            logger.info("Discrete snap returned None for Q %s (guard condition), keeping original", qid)
+            return prediction
+        return snapped  # type: ignore[return-value]
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         try:

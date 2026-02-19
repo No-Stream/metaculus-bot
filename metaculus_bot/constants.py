@@ -142,6 +142,10 @@ NUM_MIN_PROB_STEP: float = 5e-5
 NUM_MAX_STEP: float = 0.2
 NUM_RAMP_K_FACTOR: float = 3.0
 
+# Discrete integer CDF snapping (for "continuous" questions with integer outcomes)
+DISCRETE_SNAP_MAX_INTEGERS: int = 200
+DISCRETE_SNAP_UNIFORM_MIX: float = 0.012
+
 # --- Native Search Provider ---
 # Environment variable names
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"

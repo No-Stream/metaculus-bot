@@ -100,12 +100,12 @@ class TestProbabilityClamping:
         # After renormalization, values may go slightly below the minimum bound
         # but should still be reasonable (close to minimum)
         for option in predicted_option_list.predicted_options:
-            assert option.probability >= 0.001, (
-                f"Option {option.option_name} probability {option.probability} too low after renormalization"
-            )
-            assert option.probability <= 1.0, (
-                f"Option {option.option_name} probability {option.probability} too high after renormalization"
-            )
+            assert (
+                option.probability >= 0.001
+            ), f"Option {option.option_name} probability {option.probability} too low after renormalization"
+            assert (
+                option.probability <= 1.0
+            ), f"Option {option.option_name} probability {option.probability} too high after renormalization"
 
         # Probabilities should sum to 1 after renormalization
         total_prob = sum(opt.probability for opt in predicted_option_list.predicted_options)
