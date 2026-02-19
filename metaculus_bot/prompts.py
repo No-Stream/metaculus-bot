@@ -285,7 +285,15 @@ def numeric_prompt(
             - Avoid scientific notation.
             - Respect the explicit bounds above.
 
-        (9) Brief checklist
+        (9) Outcome type classification
+            Determine whether the resolution value for this question will always be a whole integer
+            (e.g. counts, rankings, number of events, number of countries) or can be any real number
+            (e.g. temperatures, percentages, dollar amounts, ratios).
+            Output exactly one of:
+            OUTCOME_TYPE: DISCRETE
+            OUTCOME_TYPE: CONTINUOUS
+
+        (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
@@ -295,14 +303,6 @@ def numeric_prompt(
             - Blind spot scenario and expected effect on tails.
             - Status quo nudge sanity check.
             - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
-
-        (10) Outcome type classification
-            Determine whether the resolution value for this question will always be a whole integer
-            (e.g. counts, rankings, number of events, number of countries) or can be any real number
-            (e.g. temperatures, percentages, dollar amounts, ratios).
-            Output exactly one of:
-            OUTCOME_TYPE: DISCRETE
-            OUTCOME_TYPE: CONTINUOUS
 
         Prediction:
         [Reminders:

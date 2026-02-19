@@ -179,6 +179,19 @@ class TestBoundaryHandling:
         assert result[-1] <= 0.999
 
 
+def create_pchip_distribution_from_cdf(
+    cdf: list[float], question: NumericQuestion, zero_point: float | None = None
+) -> NumericDistribution:
+    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+
+    return create_pchip_numeric_distribution(
+        pchip_cdf=cdf,
+        percentile_list=[Percentile(value=float(question.lower_bound + question.upper_bound) / 2, percentile=0.5)],
+        question=question,
+        zero_point=zero_point,
+    )
+
+
 # =============================================================================
 # Edge Case Tests
 # =============================================================================
@@ -411,19 +424,6 @@ class TestRoundTripValidation:
 # =============================================================================
 
 
-def create_pchip_distribution_from_cdf(
-    cdf: list[float], question: NumericQuestion, zero_point: float | None = None
-) -> NumericDistribution:
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
-
-    return create_pchip_numeric_distribution(
-        pchip_cdf=cdf,
-        percentile_list=[Percentile(value=float(question.lower_bound + question.upper_bound) / 2, percentile=0.5)],
-        question=question,
-        zero_point=zero_point,
-    )
-
-
 class TestSnapDistributionToIntegers:
     def test_returns_distribution(self):
         question = _make_question(lower_bound=0.0, upper_bound=10.0)
@@ -446,3 +446,67 @@ class TestSnapDistributionToIntegers:
             cdf_size=9,
         )
         assert snap_distribution_to_integers(dist, question) is None
+
+
+# =============================================================================
+# Integration Test: _maybe_snap_to_integers
+# =============================================================================
+
+
+class TestMaybeSnapIntegration:
+    """Test the vote-collection → majority-check → snap-application flow
+    through TemplateForecaster._maybe_snap_to_integers."""
+
+    def _make_bot(self):
+        from forecasting_tools import GeneralLlm
+
+        from main import TemplateForecaster
+
+        llms_config = {
+            "default": GeneralLlm(model="test_default"),
+            "summarizer": "mock_summarizer_model",
+            "parser": "mock_parser_model",
+            "researcher": "mock_researcher_model",
+        }
+        return TemplateForecaster(llms=llms_config)
+
+    def test_majority_discrete_snaps_distribution(self):
+        """When majority of votes are DISCRETE, snapping is applied and the returned distribution differs."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        qid = question.id_of_question
+        bot._discrete_integer_votes[qid] = [True, True, False]
+
+        result = bot._maybe_snap_to_integers(distribution, question)
+
+        assert result is not distribution
+        assert isinstance(result, NumericDistribution)
+        assert len(result.cdf) == 201
+
+    def test_majority_continuous_returns_original(self):
+        """When majority of votes are CONTINUOUS, the original distribution object is returned unchanged."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        qid = question.id_of_question
+        bot._discrete_integer_votes[qid] = [False, False, True]
+
+        result = bot._maybe_snap_to_integers(distribution, question)
+
+        assert result is distribution
+
+    def test_no_votes_returns_original(self):
+        """When no votes exist for the question, the original distribution is returned."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        result = bot._maybe_snap_to_integers(distribution, question)
+
+        assert result is distribution

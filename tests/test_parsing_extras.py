@@ -7,6 +7,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
 from main import TemplateForecaster
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 
 
 @pytest.mark.asyncio
@@ -78,13 +79,13 @@ async def test_numeric_parsing_raises_on_wrong_count():
     # Only 5 percentiles returned -> should raise ValidationError
     bad = [Percentile(value=v, percentile=p) for v, p in zip([1, 2, 3, 4, 5], [0.1, 0.2, 0.4, 0.6, 0.8])]
 
-    async def _fake_structure_output(*args, **kwargs):  # noqa: D401
-        return bad
-
     llm = SimpleNamespace(model="dummy")
     llm.invoke = AsyncMock(return_value="rationale")
 
-    with patch("main.structure_output", _fake_structure_output):
+    with patch(
+        "main.structure_output",
+        side_effect=[OutcomeTypeResult(is_discrete_integer=False), bad],
+    ):
         with pytest.raises(ValidationError):
             await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 

@@ -830,6 +830,7 @@ class TestStackingGuardsAndReasoning:
         )
         # Build a minimal numeric question and two distributions on same bounds
         num_q = Mock(spec=NumericQuestion)
+        num_q.id_of_question = 999
         num_q.open_upper_bound = False
         num_q.open_lower_bound = False
         num_q.upper_bound = 100.0

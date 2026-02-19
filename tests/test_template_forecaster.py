@@ -7,6 +7,7 @@ from forecasting_tools.data_models.forecast_report import ResearchWithPrediction
 from main import TemplateForecaster
 from metaculus_bot.comment_trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 
 
 @pytest.fixture
@@ -351,12 +352,15 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
 
     with (
         patch.object(bot, "_create_upper_and_lower_bound_messages", return_value=("", "")) as mock_bounds,
-        patch("main.structure_output", return_value=fake_percentiles) as mock_struct,
+        patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
+        ) as mock_struct,
     ):
         result = await bot._run_forecast_on_numeric(mock_metaculus_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
         mock_bounds.assert_called_once()
-        assert mock_struct.call_count == 2  # percentiles + outcome type classification
+        assert mock_struct.call_count == 2  # outcome type classification + percentiles
         assert result.prediction_value is not None
         assert "mock reasoning" in result.reasoning
 

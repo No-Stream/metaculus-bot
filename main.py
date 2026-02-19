@@ -22,6 +22,7 @@ from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import DateQuestion
+from pydantic import ValidationError
 
 from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_strategies import (
@@ -712,11 +713,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 return self._maybe_snap_to_integers(stacked, question)
             except Exception as e:
                 if self.stacking_fallback_on_failure:
-                    # Increment diagnostics counter
-                    try:
-                        self._stacking_fallback_count += 1  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    self._stacking_fallback_count += 1
                     logger.warning(f"Stacking failed ({type(e).__name__}: {e}), falling back to MEAN aggregation")
                     # Temporarily switch to MEAN for fallback
                     original_strategy = self.aggregation_strategy
@@ -956,8 +953,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ),
             )
             discrete_vote = outcome_result.is_discrete_integer
-        except Exception:
-            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s", qid, getattr(llm_to_use, "model", "?"))
+        except (ValidationError, ValueError) as e:
+            logger.warning(
+                "Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, getattr(llm_to_use, "model", "?"), e
+            )
 
         if qid is not None and discrete_vote is not None:
             if qid not in self._discrete_integer_votes:
@@ -1018,7 +1017,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
             return prediction
 
-        qid = getattr(question, "id_of_question", None)
+        qid = question.id_of_question
+        if qid is None:
+            return prediction
         votes = self._discrete_integer_votes.get(qid, [])
         if not majority_votes_discrete(votes):
             if votes:

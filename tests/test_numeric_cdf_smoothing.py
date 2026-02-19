@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
 
 
@@ -162,7 +163,10 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        with patch("main.structure_output", return_value=percentiles):
+        with patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
+        ):
             result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
             assert result is not None
 
@@ -196,7 +200,10 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        with patch("main.structure_output", return_value=percentiles):
+        with patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
+        ):
             result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
             assert result is not None
 

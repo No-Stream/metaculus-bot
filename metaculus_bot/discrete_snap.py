@@ -13,8 +13,10 @@ Server-side constraints (from Metaculus backend):
 The snapping algorithm:
   1. Extract integer PMF from smooth CDF via half-integer interpolation
   2. Reconstruct step-function CDF at the 201 grid points
-  3. Apply uniform mixture for min-step compliance
-  4. Apply max-step redistribution + boundary pinning via existing _safe_cdf_bounds()
+  3. Apply uniform mixture for min-step compliance (primary min-step mechanism)
+  4. Apply max-step redistribution + boundary pinning via _safe_cdf_bounds()
+     (note: _safe_cdf_bounds handles max-step and boundaries only, not min-step)
+  5. Post-hoc min-step verification (guard for concentrated distributions)
 """
 
 import logging
@@ -107,16 +109,18 @@ def snap_cdf_to_integers(
     step_cdf[-1] = float(p_smooth[-1])
 
     # --- Step 3: Uniform mixture for min-step compliance ---
-    alpha = DISCRETE_SNAP_UNIFORM_MIX
+    min_alpha_for_step = NUM_MIN_PROB_STEP * n_points / total_smooth * 1.1 if total_smooth > 1e-12 else 1.0
+    alpha = max(DISCRETE_SNAP_UNIFORM_MIX, min_alpha_for_step)
     uniform_cdf = np.linspace(p_smooth[0], p_smooth[-1], n_points)
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
     # --- Step 4: Max-step redistribution + boundary pinning ---
+    # _safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
     enforced_cdf = _safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound, NUM_MIN_PROB_STEP)
 
     result = enforced_cdf.tolist()
 
-    # Verify min step (should be guaranteed by uniform mixture, but check)
+    # Guard: uniform mixture may not satisfy min-step for very concentrated distributions
     diffs = np.diff(enforced_cdf)
     min_diff = float(np.min(diffs))
     max_diff = float(np.max(diffs))
@@ -147,6 +151,12 @@ def snap_distribution_to_integers(
     Returns a new distribution with the snapped CDF, or None if snapping
     should be skipped.
     """
+    if not (np.isfinite(question.lower_bound) and np.isfinite(question.upper_bound)):
+        logger.warning(
+            "Discrete snap skipped: non-finite bounds lower=%s upper=%s", question.lower_bound, question.upper_bound
+        )
+        return None
+
     if question.cdf_size is not None and question.cdf_size != 201:
         logger.info("Discrete snap skipped: question already labeled discrete (cdf_size=%d)", question.cdf_size)
         return None
@@ -154,6 +164,7 @@ def snap_distribution_to_integers(
     # Extract CDF probability values from the distribution
     if hasattr(distribution, "_pchip_cdf_values"):
         cdf_probs: list[float] = list(distribution._pchip_cdf_values)
+        assert len(cdf_probs) == 201, f"Unexpected _pchip_cdf_values length: {len(cdf_probs)}"
     else:
         cdf_probs = [p.percentile for p in distribution.cdf]
 

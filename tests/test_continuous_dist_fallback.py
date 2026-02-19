@@ -6,8 +6,8 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
 from pydantic import ValidationError
 
-# from forecasting_tools.data_models.questions import NumericQuestion
 from main import TemplateForecaster
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 
 
 class DummyLLM:  # minimal async LLM for tests
@@ -69,7 +69,10 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
         )
     ]
 
-    with patch("main.structure_output", return_value=fake_percentiles):
+    with patch(
+        "main.structure_output",
+        side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
+    ):
         result = await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
     values = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore
