@@ -62,7 +62,7 @@ FORECASTER_LLMS = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/google/gemini-3-pro-preview",
+        model="openrouter/google/gemini-3.1-pro-preview",
         **REASONING_MODEL_CONFIG,
     ),
 ]
