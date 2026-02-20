@@ -171,7 +171,9 @@ def snap_distribution_to_integers(
         logger.info("Discrete snap skipped: question already labeled discrete (cdf_size=%d)", question.cdf_size)
         return None
 
-    # All NumericDistributions in our pipeline are PchipNumericDistribution (pchip_processing.py)
+    if not hasattr(distribution, "_pchip_cdf_values"):
+        logger.warning("Discrete snap skipped: distribution is %s (no pchip CDF values)", type(distribution).__name__)
+        return None
     cdf_probs: list[float] = list(distribution._pchip_cdf_values)  # type: ignore[attr-defined]
 
     snapped_cdf = snap_cdf_to_integers(
