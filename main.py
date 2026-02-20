@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
@@ -22,6 +23,7 @@ from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import DateQuestion
+from pydantic import ValidationError
 
 from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_strategies import (
@@ -40,6 +42,7 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
 )
+from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_diagnostics import log_final_prediction
@@ -118,6 +121,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._stacking_expected_combine_count: int = 0
         self._stacking_unexpected_combine_count: int = 0
         self._stacking_fallback_count: int = 0
+        # Per-question votes from each LLM on whether outcomes are discrete integers
+        self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
 
         if max_concurrent_research <= 0:
             raise ValueError("max_concurrent_research must be a positive integer")
@@ -144,8 +149,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self.aggregation_strategy.value,
         )
         if self.aggregation_strategy == AggregationStrategy.STACKING:
-            stacker_name = getattr(self._stacker_llm, "model", "<missing>") if self._stacker_llm else "<missing>"
-            base_models = [getattr(m, "model", "<unknown>") for m in self._forecaster_llms]
+            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+            base_models = [m.model for m in self._forecaster_llms]
             short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
             logger.info(
                 "STACKING config | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_question=1",
@@ -397,7 +402,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     return (await self._fetch_research_with_fallback(question_text, provider, name), name)
                 return (await provider(question_text), name)
             except Exception as e:
-                logger.warning(f"Research provider {name} failed: {e}")
+                logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                 return ("", name)
 
         tasks = [_run_one(p, n) for p, n in providers]
@@ -449,7 +454,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if os.getenv("PERPLEXITY_API_KEY"):
                 logger.info("Falling back to Perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=False)
-            if os.getenv("EXA_API_KEY") and hasattr(self, "_call_exa_smart_searcher"):
+            if os.getenv("EXA_API_KEY"):
                 logger.info("Falling back to Exa search for research")
                 return await self._call_exa_smart_searcher(question_text)
         except Exception as fallback_exc:
@@ -466,8 +471,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return await super()._research_and_make_predictions(question)
 
         notepad = await self._get_notepad(question)
-        if not hasattr(notepad, "total_research_reports_attempted"):
-            raise AttributeError("Notepad is missing expected attribute 'total_research_reports_attempted'")
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
@@ -587,11 +590,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         llm_to_use: GeneralLlm | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         notepad = await self._get_notepad(question)
-        if not hasattr(notepad, "total_predictions_attempted"):
-            raise AttributeError("Notepad is missing expected attribute 'total_predictions_attempted'")
         notepad.total_predictions_attempted += 1
 
-        # Determine which LLM to use
         actual_llm = llm_to_use if llm_to_use else self.get_llm("default", "llm")
 
         if isinstance(question, BinaryQuestion):
@@ -692,7 +692,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     "STACKING base combine: numeric mean aggregation | CDF points=%d",
                     len(getattr(aggregated, "cdf", [])),
                 )
-                return aggregated  # type: ignore[return-value]
+                return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
             raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
 
         # Handle stacking strategy
@@ -705,14 +705,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 raise ValueError("STACKING aggregation strategy requires research context")
 
             try:
-                return await self._run_stacking(question, research, reasoned_predictions)
+                stacked = await self._run_stacking(question, research, reasoned_predictions)
+                return self._maybe_snap_to_integers(stacked, question)
             except Exception as e:
                 if self.stacking_fallback_on_failure:
-                    # Increment diagnostics counter
-                    try:
-                        self._stacking_fallback_count += 1  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    self._stacking_fallback_count += 1
                     logger.warning(f"Stacking failed ({type(e).__name__}: {e}), falling back to MEAN aggregation")
                     # Temporarily switch to MEAN for fallback
                     original_strategy = self.aggregation_strategy
@@ -784,7 +781,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return aggregated  # type: ignore[return-value]
+            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
@@ -912,9 +909,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             try:
                 predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-            except Exception as e:
+            except ValueError as e:
                 logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
-        except Exception:
+        except (ValidationError, ValueError) as exc:
+            logger.warning(f"Primary MC parse failed: {exc}")
             # Fallback tolerant parse: simple options then build final list
             raw_options: list[OptionProbability] = await structure_output(
                 text_to_structure=reasoning,
@@ -936,6 +934,35 @@ class TemplateForecaster(CompactLoggingForecastBot):
         reasoning = await llm_to_use.invoke(prompt)
 
         self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+
+        # Parse discrete integer classification from reasoning via parser LLM
+        qid = question.id_of_question
+        discrete_vote: bool | None = None
+        try:
+            outcome_result: OutcomeTypeResult = await structure_output(
+                reasoning,
+                OutcomeTypeResult,
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=(
+                    "The forecaster classified whether this question's resolution values are discrete "
+                    "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
+                    "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
+                ),
+            )
+            discrete_vote = outcome_result.is_discrete_integer
+        except (ValidationError, ValueError) as e:
+            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, llm_to_use.model, e)
+
+        if qid is not None and discrete_vote is not None:
+            self._discrete_integer_votes[qid].append(discrete_vote)
+        if qid is not None:
+            vote_label = {True: "DISCRETE", False: "CONTINUOUS"}.get(discrete_vote, "PARSE_FAILED")
+            logger.info(
+                "Discrete vote for Q %s | model=%s | vote=%s",
+                qid,
+                llm_to_use.model,
+                vote_label,
+            )
 
         unit_str = getattr(question, "unit_of_measure", None) or "base unit"
         parse_notes = (
@@ -979,13 +1006,29 @@ class TemplateForecaster(CompactLoggingForecastBot):
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
         return bound_messages(question)
 
-    def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
-        try:
-            model_name = getattr(llm_to_use, "model", "<unknown-model>")
-        except Exception:
-            model_name = "<unknown-model>"
+    def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
+        """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""
+        if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
+            return prediction
 
-        # Log formatted raw output at info level
+        qid = question.id_of_question
+        if qid is None:
+            return prediction
+        votes = self._discrete_integer_votes.pop(qid, [])
+        if not majority_votes_discrete(votes):
+            if votes:
+                logger.info("Discrete snap skipped for Q %s: votes=%s (majority=CONTINUOUS)", qid, votes)
+            return prediction
+
+        logger.info("Discrete snap: majority voted DISCRETE for Q %s | votes=%s", qid, votes)
+        snapped = snap_distribution_to_integers(prediction, question)
+        if snapped is None:
+            logger.info("Discrete snap returned None for Q %s (guard condition), keeping original", qid)
+            return prediction
+        return snapped  # type: ignore[return-value]
+
+    def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
+        model_name = llm_to_use.model
         logger.info(
             f"""
 \n\n

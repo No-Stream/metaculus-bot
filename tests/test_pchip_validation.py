@@ -10,6 +10,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 
 
 class TestPchipValidation:
@@ -89,7 +90,10 @@ class TestPchipValidation:
 
         # Should not raise any exceptions
         llm = self.create_dummy_llm()
-        with patch("main.structure_output", return_value=percentiles):
+        with patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
+        ):
             result = await forecaster._run_forecast_on_numeric(question, "test research", llm)
             assert result is not None
 

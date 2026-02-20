@@ -99,7 +99,7 @@ def _int_env(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -112,7 +112,7 @@ def _float_env(name: str, default: float) -> float:
         return default
     try:
         return float(raw)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -141,6 +141,10 @@ NUM_SPREAD_DELTA_MULT: float = 1e-6
 NUM_MIN_PROB_STEP: float = 5e-5
 NUM_MAX_STEP: float = 0.2
 NUM_RAMP_K_FACTOR: float = 3.0
+
+# Discrete integer CDF snapping (for "continuous" questions with integer outcomes)
+DISCRETE_SNAP_MAX_INTEGERS: int = 200
+DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
 # --- Native Search Provider ---
 # Environment variable names

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.tail_widening import widen_declared_percentiles
 
 
@@ -144,15 +145,14 @@ class TestTailWideningIntegration:
         baseline_vals = [10, 11, 13, 18, 30, 50, 70, 85, 92, 95, 96]
         declared = _eleven_percentiles(baseline_vals)
 
-        # Patch structure_output to return our declared percentiles
-        async def _fake_structure_output(*args, **kwargs):
-            return declared
-
         llm = MagicMock()
         llm.model = "m"
         llm.invoke = AsyncMock(return_value="rationale")
 
-        with patch("main.structure_output", _fake_structure_output):
+        with patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), declared],
+        ):
             result = await bot._run_forecast_on_numeric(nq, "", llm)
 
         # Ensure declared percentiles changed (tails widened)

@@ -152,7 +152,7 @@ def generate_backtest_report(
     lines.append(
         "- Community prediction is the final CP at resolution time, which benefits from late-stage convergence"
     )
-    lines.append("- CRPS community scores unavailable (requires x-axis values not stored)")
+    lines.append("- Numeric community log scores unavailable (Metaculus removed aggregations from list API)")
     lines.append("")
 
     report = "\n".join(lines)

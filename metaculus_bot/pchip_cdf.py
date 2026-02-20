@@ -279,6 +279,17 @@ def generate_pchip_cdf(
     if not open_upper_bound:
         cdf_y[-1] = 1.0
 
+    # Uniform mixture for min-step compliance (same approach as discrete_snap.py)
+    _ALPHA_SAFETY_MARGIN = 1.1
+    total_range = float(cdf_y[-1] - cdf_y[0])
+    if total_range > 1e-12:
+        min_alpha = min_step * num_points / total_range * _ALPHA_SAFETY_MARGIN
+    else:
+        min_alpha = 1.0
+    alpha = min(1.0, min_alpha)
+    uniform_cdf = np.linspace(float(cdf_y[0]), float(cdf_y[-1]), num_points)
+    cdf_y = (1.0 - alpha) * cdf_y + alpha * uniform_cdf
+
     # Strict enforcement of minimum step size with iterative approach
     def enforce_min_steps(y_values: np.ndarray, min_step_size: float) -> np.ndarray:
         """Enforce minimum step size between adjacent points"""

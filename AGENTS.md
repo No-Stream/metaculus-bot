@@ -90,6 +90,17 @@ The **Makefile** has most commands — e.g. `make test`, `make format`, `make ru
 - PRs: clear description, link issues, include config/docs updates, and screenshots/logs for behavior changes.
 - CI: all checks pass; code formatted and imports sorted.
 
+## Metaculus API Reference
+- **API docs**: https://www.metaculus.com/api/ (Swagger UI)
+- **Backend source**: https://github.com/Metaculus/metaculus (open-source, validation lives in `questions/serializers/common.py`)
+- **CDF constraints** (server-side, for `continuous_cdf` submissions):
+  - Length: `inbound_outcome_count + 1` (default 201)
+  - Min step per bin: `round(0.01 / N, 9)` (default 5e-5) — no flat segments allowed
+  - Max step per bin: `0.2 * 200 / N` (default 0.2) — spikiness cap
+  - Closed bounds: `cdf[0] == 0.0`, `cdf[-1] == 1.0`
+  - Open bounds: `cdf[0] >= 0.001`, `cdf[-1] <= 0.999`
+  - Strictly increasing (implied by min step > 0)
+
 ## Security & Configuration Tips
 - Copy `.env.template` to `.env`; never commit secrets.
 - Use GitHub Actions secrets for `METACULUS_TOKEN` and API keys (AskNews, Perplexity, Exa, etc.).

@@ -936,7 +936,7 @@ def forecast_is_already_made(post_details: dict) -> bool:
     try:
         forecast_values = post_details["question"]["my_forecasts"]["latest"]["forecast_values"]
         return forecast_values is not None
-    except Exception:
+    except (KeyError, TypeError):
         return False
 
 

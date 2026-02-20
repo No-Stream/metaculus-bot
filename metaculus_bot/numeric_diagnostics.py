@@ -65,11 +65,11 @@ def validate_cdf_construction(prediction: Any, question: NumericQuestion) -> Non
     Raises:
         AssertionError, ZeroDivisionError: If CDF validation fails
     """
-    # Skip CDF validation for PCHIP distributions since they enforce constraints internally
-    if hasattr(prediction, "_pchip_cdf_values"):
-        logger.debug(
-            f"Question {getattr(question, 'id_of_question', 'N/A')}: Skipping CDF validation for PCHIP distribution"
-        )
+    # Skip CDF validation for PCHIP distributions since they enforce constraints internally.
+    # PchipNumericDistribution is defined locally in pchip_processing.py and can't be imported,
+    # so we check for the distinguishing attribute directly.
+    if getattr(prediction, "_pchip_cdf_values", None) is not None:
+        logger.debug(f"Question {question.id_of_question}: Skipping CDF validation for PCHIP distribution")
         return
 
     try:

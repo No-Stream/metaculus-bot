@@ -285,7 +285,15 @@ def numeric_prompt(
             - Avoid scientific notation.
             - Respect the explicit bounds above.
 
-        (9) Brief checklist
+        (9) Outcome type classification
+            Determine whether the resolution value for this question will always be a whole integer
+            (e.g. counts, rankings, number of events, number of countries) or can be any real number
+            (e.g. temperatures, percentages, dollar amounts, ratios).
+            Output exactly one of:
+            OUTCOME_TYPE: DISCRETE
+            OUTCOME_TYPE: CONTINUOUS
+
+        (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
@@ -296,7 +304,7 @@ def numeric_prompt(
             - Status quo nudge sanity check.
             - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
 
-        Prediction: 
+        Prediction:
         [Reminders:
         - Floating point numbers in the base unit
         - Must be last lines, nothing after
@@ -534,10 +542,10 @@ def stacking_numeric_prompt(
         
         Remember: Think in ranges, not points. Keep 2.5th and 97.5th percentiles appropriately wide.
         Ensure strictly increasing percentiles and respect the bounds above.
-        
-        OUTPUT FORMAT, floating point numbers 
+
+        OUTPUT FORMAT, floating point numbers
         Must be last lines, nothing after, STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
-        
+
         Percentile 2.5: [value]
         Percentile 5: [value]
         Percentile 10: [value]

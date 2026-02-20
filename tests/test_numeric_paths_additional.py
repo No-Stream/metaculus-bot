@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
 
 
@@ -70,7 +71,10 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
         )
     ]
 
-    with patch("main.structure_output", return_value=plist):
+    with patch(
+        "main.structure_output",
+        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    ):
         caplog.clear()
         caplog.set_level("WARNING")
         result = await f._run_forecast_on_numeric(q, "", DummyLLM())
@@ -109,7 +113,10 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
             raise AssertionError("Percentiles at indices are too close")
 
     with (
-        patch("main.structure_output", return_value=plist),
+        patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+        ),
         patch("metaculus_bot.pchip_processing.NumericDistribution", FakeND),
     ):
         caplog.clear()
@@ -145,7 +152,10 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
                 [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
             )
         ]
-        with patch("main.structure_output", return_value=plist):
+        with patch(
+            "main.structure_output",
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+        ):
             caplog.clear()
             caplog.set_level("WARNING")
             result = await f._run_forecast_on_numeric(q, "", DummyLLM())
@@ -198,7 +208,10 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
         )
     ]
 
-    with patch("main.structure_output", return_value=plist):
+    with patch(
+        "main.structure_output",
+        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    ):
         await f._run_forecast_on_numeric(q, "", DummyLLM())
 
     # Capture the call arguments to ensure zero_point=None was used
