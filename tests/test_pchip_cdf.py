@@ -338,6 +338,50 @@ class TestGeneratePchipCdf:
         assert all(step >= 5e-5 - 1e-10 for step in steps)
         assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps)
 
+    def test_concentrated_distribution_on_wide_grid(self):
+        """Concentrated mass on a wide grid satisfies CDF constraints without aggressive enforcement.
+
+        Reproduces the oldest-human-age scenario (Q14333): percentiles cluster
+        around 111–172 on a [0, 200] grid.  Without the uniform pre-mix, PCHIP
+        produces near-zero steps in the tails and requires aggressive enforcement
+        on 11–25 % of bins.  The pre-mix should handle this proactively.
+        """
+        percentiles = {
+            2.5: 111.0,
+            5.0: 114.0,
+            10.0: 117.0,
+            20.0: 121.0,
+            40.0: 126.0,
+            50.0: 130.0,
+            60.0: 134.0,
+            80.0: 143.0,
+            90.0: 152.0,
+            95.0: 161.0,
+            97.5: 172.0,
+        }
+
+        cdf, aggressive_enforcement = generate_pchip_cdf(
+            percentile_values=percentiles,
+            open_upper_bound=True,
+            open_lower_bound=False,
+            upper_bound=200.0,
+            lower_bound=0.0,
+            zero_point=None,
+            question_id=14333,
+        )
+
+        assert len(cdf) == 201
+        assert cdf[0] == 0.0
+        assert cdf[-1] <= 0.999
+
+        steps = np.diff(cdf)
+        assert all(step >= 5e-5 - 1e-10 for step in steps), f"Min step violated: {np.min(steps)}"
+        assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps), f"Max step violated: {np.max(steps)}"
+
+        assert not aggressive_enforcement, (
+            "Uniform pre-mix should prevent aggressive enforcement for concentrated distributions"
+        )
+
     def test_discrete_style_distribution(self):
         """Test with discrete-style distribution (integer values)."""
         percentiles = {
