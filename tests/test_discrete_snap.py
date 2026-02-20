@@ -9,9 +9,11 @@ Tests cover:
 """
 
 import numpy as np
+import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
+from metaculus_bot.backtest.scoring import numeric_log_score
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.discrete_snap import (
     OutcomeTypeResult,
@@ -417,6 +419,66 @@ class TestRoundTripValidation:
         result = snap_cdf_to_integers(cdf, 0.0, 10.0, False, False)
         assert result is not None
         _validate_pchip_cdf(result, question)
+
+
+# =============================================================================
+# Scoring Tests — Metaculus log score impact of snapping
+# =============================================================================
+
+
+def _log_score(cdf: list[float], resolution: float, lb: float, ub: float) -> float:
+    """Shorthand for numeric_log_score with closed bounds."""
+    return numeric_log_score(cdf, resolution, lb, ub, open_lower_bound=False, open_upper_bound=False)
+
+
+class TestDiscreteSnapScoring:
+    """Metaculus log score impact of discrete snapping.
+
+    With steps placed at integer positions k, the snapped CDF concentrates
+    mass in exactly the scored PMF bucket for integer resolutions. This means
+    snapping improves log scores for integer resolutions (the common case for
+    discrete-integer questions). Non-integer resolutions still score worse
+    since mass is concentrated at integers, not between them.
+    """
+
+    @pytest.mark.parametrize("resolution", range(1, 10))
+    def test_snapped_beats_smooth_for_integer_resolution(self, resolution: int):
+        """Snapping improves log score for integer resolutions (step alignment at k)."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=float(resolution), spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        assert cdf_snapped is not None
+        score_smooth = _log_score(cdf_smooth, float(resolution), 0.0, 10.0)
+        score_snapped = _log_score(cdf_snapped, float(resolution), 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+        assert score_snapped > score_smooth
+
+    def test_snapped_scores_finite_for_noninteger(self):
+        """For non-integer resolution, snapping produces a finite (but worse) score."""
+        resolution = 5.3
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=resolution, spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        assert cdf_snapped is not None
+        score_smooth = _log_score(cdf_smooth, resolution, 0.0, 10.0)
+        score_snapped = _log_score(cdf_snapped, resolution, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+        assert score_snapped < score_smooth
+
+    def test_concentrated_distribution_snapped_is_finite(self):
+        """Narrow spread with max-step redistribution still produces finite scores."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.5)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        assert cdf_snapped is not None
+        score_snapped = _log_score(cdf_snapped, 5.0, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+
+    def test_lower_bound_integer_closed_bound(self):
+        """Resolution at lower bound (0 on [0,10], closed) improves with snapping."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=0.0, spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, False, False)
+        assert cdf_snapped is not None
+        assert abs(cdf_snapped[0] - 0.0) < 1e-10
+        score_snapped = _log_score(cdf_snapped, 0.0, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
 
 
 # =============================================================================

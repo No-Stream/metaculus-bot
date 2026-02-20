@@ -144,7 +144,7 @@ NUM_RAMP_K_FACTOR: float = 3.0
 
 # Discrete integer CDF snapping (for "continuous" questions with integer outcomes)
 DISCRETE_SNAP_MAX_INTEGERS: int = 200
-DISCRETE_SNAP_UNIFORM_MIX: float = 0.012
+DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
 # --- Native Search Provider ---
 # Environment variable names

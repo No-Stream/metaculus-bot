@@ -64,13 +64,13 @@ class TestAggregateScores:
         from metaculus_bot.backtest.analysis import aggregate_scores
 
         scores = [
-            QuestionScore(1, "numeric", 0.05, None, "crps"),
-            QuestionScore(2, "numeric", 0.10, None, "crps"),
+            QuestionScore(1, "numeric", 0.05, None, "numeric_log_score"),
+            QuestionScore(2, "numeric", 0.10, None, "numeric_log_score"),
         ]
         result = aggregate_scores(scores)
 
-        assert result["crps"]["community_mean"] is None
-        assert result["crps"]["bot_minus_community"] is None
+        assert result["numeric_log_score"]["community_mean"] is None
+        assert result["numeric_log_score"]["bot_minus_community"] is None
 
     def test_mixed_community_some_none(self):
         from metaculus_bot.backtest.analysis import aggregate_scores
@@ -116,7 +116,7 @@ class TestGenerateBacktestReport:
             QuestionScore(1, "binary", 50.0, 60.0, "log_score"),
             QuestionScore(2, "binary", 0.15, 0.10, "brier"),
             QuestionScore(2, "binary", 70.0, 80.0, "log_score"),
-            QuestionScore(3, "numeric", 0.05, None, "crps"),
+            QuestionScore(3, "numeric", 0.05, None, "numeric_log_score"),
         ]
         return BacktestResult(
             bot_name=bot_name,
@@ -245,7 +245,7 @@ class TestSaveBacktestData:
     def _make_result(self) -> BacktestResult:
         scores = [
             QuestionScore(1, "binary", 0.25, 0.16, "brier"),
-            QuestionScore(2, "numeric", 0.05, None, "crps"),
+            QuestionScore(2, "numeric", 0.05, None, "numeric_log_score"),
         ]
         return BacktestResult(
             bot_name="test_bot",

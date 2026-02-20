@@ -12,7 +12,7 @@ Server-side constraints (from Metaculus backend):
 
 The snapping algorithm:
   1. Extract integer PMF from smooth CDF via half-integer interpolation
-  2. Reconstruct step-function CDF at the 201 grid points
+  2. Reconstruct step-function CDF with steps at integer positions
   3. Apply uniform mixture for min-step compliance (primary min-step mechanism)
   4. Apply max-step redistribution + boundary pinning via _safe_cdf_bounds()
      (note: _safe_cdf_bounds handles max-step and boundaries only, not min-step)
@@ -101,11 +101,16 @@ def snap_cdf_to_integers(
     cumulative_pmf = np.cumsum(pmf)
     tail_lower = float(p_smooth[0])
 
-    upper_halves = integers + 0.5
+    step_positions = integers.astype(float)
     step_cdf = np.full(n_points, tail_lower, dtype=float)
-    indices = np.searchsorted(upper_halves, x_grid, side="right")
+    indices = np.searchsorted(step_positions, x_grid, side="right")
     mask = indices > 0
     step_cdf[mask] = tail_lower + cumulative_pmf[indices[mask] - 1]
+
+    # Pin cdf[0] for closed lower bound (step at k=lower_bound makes searchsorted
+    # assign mass to bucket 0, violating cdf[0]=0; pin pushes mass into bucket 1)
+    if not open_lower_bound:
+        step_cdf[0] = tail_lower
 
     # Pin final endpoint to preserve upper tail mass
     step_cdf[-1] = float(p_smooth[-1])

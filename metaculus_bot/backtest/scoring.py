@@ -1,7 +1,7 @@
 """Ground truth scoring functions for backtest evaluation.
 
-Handles binary (Brier + log score), numeric (CRPS), and multiple-choice (log score)
-question types. All functions are pure with no side effects.
+Handles binary (Brier + log score), numeric (PMF-bucket log score), and
+multiple-choice (log score) question types. All functions are pure with no side effects.
 """
 
 import logging
@@ -39,7 +39,7 @@ class QuestionScore:
     question_type: str
     bot_score: float
     community_score: float | None
-    metric_name: str  # "brier", "log_score", "crps", "mc_log_score"
+    metric_name: str  # "brier", "log_score", "numeric_log_score", "mc_log_score"
 
 
 def _clamp_prob(p: float) -> float:
@@ -136,6 +136,133 @@ def numeric_crps_from_report(report: Any, resolution: Any) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Numeric scoring (Metaculus PMF-bucket log score)
+# ---------------------------------------------------------------------------
+
+BOUNDARY_BASELINE: float = 0.05
+
+
+def _resolution_to_bucket_index(
+    resolution: float,
+    lower_bound: float,
+    upper_bound: float,
+    n_inbound: int,
+    zero_point: float | None = None,
+) -> int:
+    """Map a numeric resolution value to a PMF bucket index.
+
+    Replicates Metaculus backend's unscaled_location_to_bucket_index.
+    Returns bucket in [0, n_inbound+1] where 0 = below-lower-bound, n_inbound+1 = above-upper-bound.
+    """
+    total_range = upper_bound - lower_bound
+    if total_range <= 0:
+        raise ValueError(f"Invalid bounds: lower={lower_bound}, upper={upper_bound}")
+
+    if zero_point is not None:
+        deriv_ratio = (upper_bound - zero_point) / (lower_bound - zero_point)
+        scaled_offset = (resolution - lower_bound) * (deriv_ratio - 1) + total_range
+        if scaled_offset <= 0:
+            return 0
+        unscaled = math.log(scaled_offset / total_range) / math.log(deriv_ratio)
+    else:
+        unscaled = (resolution - lower_bound) / total_range
+
+    if unscaled < 0:
+        return 0
+    if unscaled > 1:
+        return n_inbound + 1
+    if unscaled == 1.0:
+        return n_inbound
+    return max(int(unscaled * n_inbound + 1 - 1e-10), 1)
+
+
+def numeric_log_score(
+    cdf_values: list[float],
+    resolution: float,
+    lower_bound: float,
+    upper_bound: float,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    zero_point: float | None = None,
+) -> float:
+    """Metaculus-style PMF-bucket log score for numeric questions.
+
+    Formula: 50 * ln(pmf[resolution_bucket] / baseline)
+    Higher is better. Uniform prediction scores 0.
+
+    CDF is converted to a PMF with len(cdf)+1 buckets (boundary + interior).
+    The resolution maps to one bucket; the score is the log of the PMF mass
+    in that bucket relative to a uniform baseline.
+    """
+    n_cdf = len(cdf_values)
+    if n_cdf < 2:
+        raise ValueError(f"Need at least 2 CDF values, got {n_cdf}")
+
+    n_inbound = n_cdf - 1  # 200 for standard 201-point CDF
+
+    pmf = [cdf_values[0]]
+    for i in range(1, n_cdf):
+        pmf.append(cdf_values[i] - cdf_values[i - 1])
+    pmf.append(1.0 - cdf_values[-1])
+
+    bucket = _resolution_to_bucket_index(resolution, lower_bound, upper_bound, n_inbound, zero_point)
+
+    n_open_bounds = int(open_lower_bound) + int(open_upper_bound)
+    if bucket in (0, len(pmf) - 1):
+        baseline = BOUNDARY_BASELINE
+    else:
+        baseline = (1.0 - BOUNDARY_BASELINE * n_open_bounds) / n_inbound
+
+    pmf_value = max(pmf[bucket], 1e-15)
+    return 50.0 * math.log(pmf_value / baseline)
+
+
+def numeric_log_score_from_report(report: Any, resolution: Any) -> float | None:
+    """Extract CDF from a NumericReport and compute PMF-bucket log score.
+
+    Handles OutOfBoundsResolution by mapping to the appropriate boundary bucket.
+    """
+    from forecasting_tools.data_models.questions import OutOfBoundsResolution
+
+    try:
+        cdf_points = report.prediction.cdf
+        if not cdf_points or len(cdf_points) < 2:
+            logger.warning(f"NumericReport has insufficient CDF points: {len(cdf_points) if cdf_points else 0}")
+            return None
+
+        cdf_values = [float(p.percentile) for p in cdf_points]
+
+        question = report.question
+        lower_bound = float(question.lower_bound)
+        upper_bound = float(question.upper_bound)
+        open_lower = bool(question.open_lower_bound)
+        open_upper = bool(question.open_upper_bound)
+        zero_point = float(question.zero_point) if question.zero_point is not None else None
+
+        if isinstance(resolution, OutOfBoundsResolution):
+            if resolution == OutOfBoundsResolution.BELOW_LOWER_BOUND:
+                resolution_float = lower_bound - 1.0
+            elif resolution == OutOfBoundsResolution.ABOVE_UPPER_BOUND:
+                resolution_float = upper_bound + 1.0
+            else:
+                logger.warning(f"Unknown OutOfBoundsResolution: {resolution}")
+                return None
+        elif isinstance(resolution, (int, float)):
+            resolution_float = float(resolution)
+        else:
+            logger.warning(f"Unsupported numeric resolution type: {type(resolution)}")
+            return None
+
+        return numeric_log_score(
+            cdf_values, resolution_float, lower_bound, upper_bound, open_lower, open_upper, zero_point
+        )
+
+    except Exception:
+        logger.exception("Failed to compute numeric log score from report")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Multiple-choice scoring
 # ---------------------------------------------------------------------------
 
@@ -225,10 +352,10 @@ def score_report(report: Any, ground_truth: GroundTruth) -> list[QuestionScore]:
 
     elif isinstance(report, NumericReport):
         resolution = ground_truth.resolution
-        bot_crps = numeric_crps_from_report(report, resolution)
-        if bot_crps is not None:
-            community_crps = _compute_community_numeric_crps(ground_truth)
-            scores.append(QuestionScore(qid, "numeric", bot_crps, community_crps, "crps"))
+        bot_log = numeric_log_score_from_report(report, resolution)
+        if bot_log is not None:
+            community_log = _compute_community_numeric_log_score(ground_truth, report)
+            scores.append(QuestionScore(qid, "numeric", bot_log, community_log, "numeric_log_score"))
 
     elif isinstance(report, MultipleChoiceReport):
         correct_option = ground_truth.resolution
@@ -247,11 +374,12 @@ def score_report(report: Any, ground_truth: GroundTruth) -> list[QuestionScore]:
     return scores
 
 
-def _compute_community_numeric_crps(ground_truth: GroundTruth) -> float | None:
-    """Compute CRPS for community CDF against ground truth resolution.
+def _compute_community_numeric_log_score(ground_truth: GroundTruth, report: Any) -> float | None:
+    """Compute PMF-bucket log score for community CDF against ground truth resolution.
 
-    Community prediction for numeric is stored as the raw CDF values list.
-    We reconstruct x-values assuming uniform spacing (same as Metaculus API).
+    Community prediction for numeric is stored as raw CDF values. We need bound info
+    from the report's question to compute the score. Returns None if community data
+    is unavailable (Metaculus removed aggregations from the list API).
     """
     from forecasting_tools.data_models.questions import OutOfBoundsResolution
 
@@ -260,15 +388,36 @@ def _compute_community_numeric_crps(ground_truth: GroundTruth) -> float | None:
         return None
 
     resolution = ground_truth.resolution
-    if isinstance(resolution, OutOfBoundsResolution):
-        return None
-    if not isinstance(resolution, (int, float)):
+
+    try:
+        question = report.question
+        lower_bound = float(question.lower_bound)
+        upper_bound = float(question.upper_bound)
+        open_lower = bool(question.open_lower_bound)
+        open_upper = bool(question.open_upper_bound)
+        zero_point = float(question.zero_point) if question.zero_point is not None else None
+    except (AttributeError, TypeError):
         return None
 
-    # Community CDF is raw forecast_values; we'd need x-values to compute CRPS properly.
-    # Without the original x-axis, we can't do this reliably — return None.
-    # The backtest report will note community CRPS as N/A for numeric.
-    return None
+    if isinstance(resolution, OutOfBoundsResolution):
+        if resolution == OutOfBoundsResolution.BELOW_LOWER_BOUND:
+            resolution_float = lower_bound - 1.0
+        elif resolution == OutOfBoundsResolution.ABOVE_UPPER_BOUND:
+            resolution_float = upper_bound + 1.0
+        else:
+            return None
+    elif isinstance(resolution, (int, float)):
+        resolution_float = float(resolution)
+    else:
+        return None
+
+    try:
+        cdf_values = [float(v) for v in community_cdf]
+        return numeric_log_score(
+            cdf_values, resolution_float, lower_bound, upper_bound, open_lower, open_upper, zero_point
+        )
+    except (ValueError, TypeError):
+        return None
 
 
 def _compute_community_mc_log_score(ground_truth: GroundTruth, report: Any) -> float | None:
