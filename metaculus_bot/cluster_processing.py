@@ -40,7 +40,7 @@ def detect_count_like_pattern(values: List[float]) -> bool:
         if not values:
             return False
         return all(abs(v - round(v)) <= COUNT_LIKE_THRESHOLD for v in values)
-    except Exception:
+    except (TypeError, ValueError):
         return False
 
 

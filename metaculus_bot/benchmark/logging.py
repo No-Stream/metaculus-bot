@@ -13,12 +13,13 @@ def log_bot_lineup(bots: Sequence[ForecastBot]) -> None:
         try:
             strat = getattr(b, "aggregation_strategy", None)
             strat_val = strat.value if strat else "(framework default)"
-            r = getattr(b, "research_reports_per_question", "?")
-            p = getattr(b, "predictions_per_research_report", "?")
+            r = b.research_reports_per_question
+            p = b.predictions_per_research_report
             if strat_val == "stacking":
-                stacker = getattr(getattr(b, "_stacker_llm", None), "model", "<missing>")
+                stacker_llm = getattr(b, "_stacker_llm", None)
+                stacker = stacker_llm.model if stacker_llm else "<missing>"
                 base_f = getattr(b, "_forecaster_llms", [])
-                base_names = [getattr(m, "model", "<unknown>") for m in base_f]
+                base_names = [m.model for m in base_f]
                 short = base_names if len(base_names) <= 6 else base_names[:6] + ["..."]
                 logger.info(
                     "- Bot %d/%d | name=%s | strategy=STACKING | R×P=%s×%s | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_q=1",

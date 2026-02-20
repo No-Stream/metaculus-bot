@@ -149,8 +149,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self.aggregation_strategy.value,
         )
         if self.aggregation_strategy == AggregationStrategy.STACKING:
-            stacker_name = getattr(self._stacker_llm, "model", "<missing>") if self._stacker_llm else "<missing>"
-            base_models = [getattr(m, "model", "<unknown>") for m in self._forecaster_llms]
+            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+            base_models = [m.model for m in self._forecaster_llms]
             short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
             logger.info(
                 "STACKING config | stacker=%s | base_forecasters(%d)=%s | final_outputs_per_question=1",
@@ -402,7 +402,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     return (await self._fetch_research_with_fallback(question_text, provider, name), name)
                 return (await provider(question_text), name)
             except Exception as e:
-                logger.warning(f"Research provider {name} failed: {e}")
+                logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                 return ("", name)
 
         tasks = [_run_one(p, n) for p, n in providers]
@@ -454,7 +454,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if os.getenv("PERPLEXITY_API_KEY"):
                 logger.info("Falling back to Perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=False)
-            if os.getenv("EXA_API_KEY") and hasattr(self, "_call_exa_smart_searcher"):
+            if os.getenv("EXA_API_KEY"):
                 logger.info("Falling back to Exa search for research")
                 return await self._call_exa_smart_searcher(question_text)
         except Exception as fallback_exc:
@@ -471,8 +471,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return await super()._research_and_make_predictions(question)
 
         notepad = await self._get_notepad(question)
-        if not hasattr(notepad, "total_research_reports_attempted"):
-            raise AttributeError("Notepad is missing expected attribute 'total_research_reports_attempted'")
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
@@ -592,11 +590,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         llm_to_use: GeneralLlm | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         notepad = await self._get_notepad(question)
-        if not hasattr(notepad, "total_predictions_attempted"):
-            raise AttributeError("Notepad is missing expected attribute 'total_predictions_attempted'")
         notepad.total_predictions_attempted += 1
 
-        # Determine which LLM to use
         actual_llm = llm_to_use if llm_to_use else self.get_llm("default", "llm")
 
         if isinstance(question, BinaryQuestion):
@@ -914,9 +909,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             try:
                 predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-            except Exception as e:
+            except ValueError as e:
                 logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
-        except Exception:
+        except (ValidationError, ValueError) as exc:
+            logger.warning(f"Primary MC parse failed: {exc}")
             # Fallback tolerant parse: simple options then build final list
             raw_options: list[OptionProbability] = await structure_output(
                 text_to_structure=reasoning,
@@ -955,9 +951,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
             discrete_vote = outcome_result.is_discrete_integer
         except (ValidationError, ValueError) as e:
-            logger.warning(
-                "Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, getattr(llm_to_use, "model", "?"), e
-            )
+            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, llm_to_use.model, e)
 
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
@@ -966,7 +960,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             logger.info(
                 "Discrete vote for Q %s | model=%s | vote=%s",
                 qid,
-                getattr(llm_to_use, "model", "<unknown>"),
+                llm_to_use.model,
                 vote_label,
             )
 
@@ -1034,12 +1028,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return snapped  # type: ignore[return-value]
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
-        try:
-            model_name = getattr(llm_to_use, "model", "<unknown-model>")
-        except Exception:
-            model_name = "<unknown-model>"
-
-        # Log formatted raw output at info level
+        model_name = llm_to_use.model
         logger.info(
             f"""
 \n\n

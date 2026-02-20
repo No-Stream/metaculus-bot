@@ -252,7 +252,7 @@ def widen_declared_percentiles(
                 "Tail widening produced non-monotone sequence; enforced correction applied | Q=%s",
                 getattr(question, "id_of_question", None),
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Monotonicity check failed: {e}")
 
     return result

@@ -130,8 +130,8 @@ def numeric_crps_from_report(report: Any, resolution: Any) -> float | None:
 
         return numeric_crps(x_values, cdf_values, resolution_float)
 
-    except Exception as e:
-        logger.warning(f"Failed to compute CRPS from report: {e}")
+    except Exception:
+        logger.exception("Failed to compute CRPS from report")
         return None
 
 
@@ -304,8 +304,8 @@ def mc_log_score_from_report(report: Any, correct_option: str) -> float | None:
 
         return mc_log_score(predicted_probs, correct_index)
 
-    except Exception as e:
-        logger.warning(f"Failed to compute MC log score from report: {e}")
+    except Exception:
+        logger.exception("Failed to compute MC log score from report")
         return None
 
 

@@ -1,3 +1,4 @@
+import logging
 from typing import List, Sequence, Tuple
 
 from forecasting_tools import (
@@ -16,6 +17,8 @@ from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def strip_model_tag(text: str) -> str:
@@ -89,9 +92,10 @@ async def run_stacking_mc(
 
         try:
             predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-        except Exception:
-            pass
-    except Exception:
+        except ValueError as e:
+            logger.warning(f"MC clamp/renormalize failed: {e}")
+    except Exception as e:
+        logger.warning(f"Primary MC structured parse failed: {e}")
         raw_options: List[OptionProbability] = await structure_output(
             text_to_structure=meta_reasoning,
             output_type=list[OptionProbability],
@@ -119,7 +123,7 @@ async def run_stacking_numeric(
     prompt = stacking_numeric_prompt(question, research, list(base_texts), lower_bound_message, upper_bound_message)
     meta_reasoning = await stacker_llm.invoke(prompt)
 
-    unit_str = getattr(question, "unit_of_measure", None) or "base unit"
+    unit_str = question.unit_of_measure or "base unit"
     parse_notes = (
         (
             "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
@@ -127,8 +131,8 @@ async def run_stacking_numeric(
             f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
             "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
         )
-        .replace("{lower}", str(getattr(question, "lower_bound", 0)))
-        .replace("{upper}", str(getattr(question, "upper_bound", 0)))
+        .replace("{lower}", str(question.lower_bound))
+        .replace("{upper}", str(question.upper_bound))
     )
     percentile_list: List[Percentile] = await structure_output(
         meta_reasoning, list[Percentile], model=parser_llm, additional_instructions=parse_notes

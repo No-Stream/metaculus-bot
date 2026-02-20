@@ -122,22 +122,18 @@ def validate_community_prediction_count(question: Any) -> bool:
     Returns:
         True if question has adequate community predictions, False otherwise
     """
-    # Check various possible attributes for prediction count
-    if hasattr(question, "num_predictions") and question.num_predictions is not None:
-        count = question.num_predictions
-        logger.debug(f"Question {question.id_of_question}: {count} community predictions")
-        return count >= 10
+    num_predictions = getattr(question, "num_predictions", None)
+    if num_predictions is not None:
+        logger.debug(f"Question {question.id_of_question}: {num_predictions} community predictions")
+        return num_predictions >= 10
 
-    if hasattr(question, "prediction_count") and question.prediction_count is not None:
-        count = question.prediction_count
-        logger.debug(f"Question {question.id_of_question}: {count} community predictions")
-        return count >= 10
+    prediction_count = getattr(question, "prediction_count", None)
+    if prediction_count is not None:
+        logger.debug(f"Question {question.id_of_question}: {prediction_count} community predictions")
+        return prediction_count >= 10
 
-    # Check if community prediction exists as a proxy for sufficient data
-    if (
-        hasattr(question, "community_prediction_at_access_time")
-        and question.community_prediction_at_access_time is not None
-    ):
+    community_pred = getattr(question, "community_prediction_at_access_time", None)
+    if community_pred is not None:
         logger.debug(f"Question {question.id_of_question}: has community prediction (assuming sufficient count)")
         return True
 
@@ -506,9 +502,9 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: Optional[dict] 
 
         return final_score
 
-    except Exception as e:
-        logger.error(
-            f"Error calculating MC baseline score for question {getattr(report.question, 'id_of_question', 'unknown')}: {e}"
+    except Exception:
+        logger.exception(
+            f"Error calculating MC baseline score for question {getattr(report.question, 'id_of_question', 'unknown')}"
         )
         return None
 
@@ -546,7 +542,7 @@ def _extract_numeric_community_cdf(question: Any) -> Optional[List[float]]:
             inbound = scaling.get("inbound_outcome_count")
             if inbound is not None:
                 expected_len = int(inbound) + 1
-        except Exception:
+        except (ValueError, TypeError):
             expected_len = None
 
         aggregations = question_obj.get("aggregations")
@@ -695,7 +691,8 @@ def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) 
                 # Apply relative scoring
                 return _calculate_relative_numeric_score(bot_pmf, community_pmf, upper_bound - lower_bound, q_id, cache)
 
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Numeric Question {q_id}: percentile fallback scoring failed: {e}")
                 return None
 
         # PMF-based relative scoring against community distribution
@@ -744,9 +741,9 @@ def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) 
         # Apply relative scoring
         return _calculate_relative_numeric_score(bot_pmf, community_pmf, upper_bound - lower_bound, q_id, cache)
 
-    except Exception as e:
-        logger.error(
-            f"Error calculating numeric baseline score for question {getattr(report.question, 'id_of_question', 'unknown')}: {e}"
+    except Exception:
+        logger.exception(
+            f"Error calculating numeric baseline score for question {getattr(report.question, 'id_of_question', 'unknown')}"
         )
         return None
 
@@ -806,8 +803,8 @@ def _calculate_relative_numeric_score(
 
         return final_score
 
-    except Exception as e:
-        logger.error(f"Error in relative numeric scoring: {e}")
+    except Exception:
+        logger.exception("Error in relative numeric scoring")
         return None
 
 

@@ -127,8 +127,8 @@ def generate_pchip_cdf_with_smoothing(
     smoothing_applied = False
     try:
         smoothing_applied = _apply_ramp_smoothing(pchip_cdf, question)
-    except Exception as smooth_e:
-        logger.error("Ramp smoothing skipped due to error: %s", smooth_e)
+    except Exception:
+        logger.exception("Ramp smoothing skipped due to error")
 
     # Validate the generated CDF
     _validate_pchip_cdf(pchip_cdf, question)

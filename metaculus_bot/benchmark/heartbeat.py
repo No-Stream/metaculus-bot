@@ -34,8 +34,8 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
                     logger.info(
                         f"[HB] {batch.benchmark.name} | {len(batch.questions)} questions | elapsed {elapsed_min:.1f}m"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Heartbeat progress update failed: {e}")
 
             # Mark batch as completed
             progress_state["completed_batches"] = progress_state.get("completed_batches", 0) + 1

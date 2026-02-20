@@ -500,11 +500,10 @@ def _dedup_articles_by_url(articles: list[Any]) -> list[Any]:
     result: list[Any] = []
     for item in articles:
         url = None
-        # Attribute access first, then mapping
-        if hasattr(item, "article_url"):
-            url = getattr(item, "article_url")
-        elif isinstance(item, dict):  # type: ignore[unreachable]
+        if isinstance(item, dict):  # type: ignore[unreachable]
             url = item.get("article_url")
+        else:
+            url = getattr(item, "article_url", None)
 
         if not url:
             result.append(item)

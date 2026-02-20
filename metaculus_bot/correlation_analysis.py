@@ -7,12 +7,15 @@ performance with diversity.
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
+from forecasting_tools.data_models.multiple_choice_report import PredictedOptionList
+from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from scipy.stats import pearsonr
 
 logger = logging.getLogger(__name__)
@@ -178,7 +181,7 @@ class CorrelationAnalyzer:
                 if isinstance(stacker_cfg, dict) and stacker_cfg.get("model"):
                     idents.append(str(stacker_cfg.get("model")))
         except Exception:
-            pass
+            logger.debug(f"Failed to extract identifiers for benchmark {model_name}: unexpected config structure")
         # Deduplicate while preserving order
         seen = set()
         out = []
@@ -315,14 +318,14 @@ class CorrelationAnalyzer:
         if benchmark is None:
             return False
         try:
-            cfg = getattr(benchmark, "forecast_bot_config", {}) or {}
+            cfg = benchmark.forecast_bot_config or {}
             strat = cfg.get("aggregation_strategy")
-            if hasattr(strat, "value"):
+            if isinstance(strat, Enum):
                 strat = strat.value
             if isinstance(strat, str):
                 return strat.lower() == "stacking"
         except Exception:
-            pass
+            logger.debug(f"Failed to detect stacking strategy for benchmark: {benchmark.name}")
         return False
 
     def calculate_correlation_matrix(self) -> CorrelationMatrix:
@@ -441,7 +444,8 @@ class CorrelationAnalyzer:
                                 else:
                                     corr_val, _ = pearsonr(components1, components2)
                                 corr = corr_val if not np.isnan(corr_val) else 0.0
-                            except Exception:
+                            except (ValueError, TypeError) as e:
+                                logger.debug(f"Pearson correlation failed for q={q_id} {model1} vs {model2}: {e}")
                                 corr = 0.0
                         else:
                             corr = 0.0
@@ -533,7 +537,7 @@ class CorrelationAnalyzer:
         try:
             self.log_numeric_cdf_summary()
         except Exception:
-            pass
+            logger.debug("Failed to log numeric CDF summary")
         return candidates
 
     def _extract_model_name(self, benchmark: BenchmarkForBot) -> str:
@@ -601,15 +605,13 @@ class CorrelationAnalyzer:
 
                     if model_components:
                         ensemble_base = "_".join(sorted(set(model_components)))
-                        # Try to determine aggregation strategy from benchmark config
-                        if hasattr(benchmark, "forecast_bot_config"):
-                            config = benchmark.forecast_bot_config
-                            if "aggregation_strategy" in config:
-                                strategy = config["aggregation_strategy"]
-                                if hasattr(strategy, "value"):
-                                    return f"{ensemble_base}_{strategy.value}"
-                                elif isinstance(strategy, str):
-                                    return f"{ensemble_base}_{strategy}"
+                        config = benchmark.forecast_bot_config
+                        if "aggregation_strategy" in config:
+                            strategy = config["aggregation_strategy"]
+                            if isinstance(strategy, Enum):
+                                return f"{ensemble_base}_{strategy.value}"
+                            elif isinstance(strategy, str):
+                                return f"{ensemble_base}_{strategy}"
                         return ensemble_base
 
             # Fallback to benchmark name parsing
@@ -641,20 +643,16 @@ class CorrelationAnalyzer:
             return float(prediction)
 
         # Numeric questions: use median or mean of distribution
-        if hasattr(prediction, "median"):
-            return float(prediction.median)
-        elif hasattr(prediction, "declared_percentiles") and prediction.declared_percentiles:
-            # Use the 50th percentile as central tendency
-            percentiles = prediction.declared_percentiles
-            median_percentile = next((p for p in percentiles if p.percentile == 50), None)
-            if median_percentile:
-                return float(median_percentile.value)
-            # Fallback to average of available percentiles
-            return float(np.mean([p.value for p in percentiles]))
+        if isinstance(prediction, NumericDistribution):
+            if prediction.declared_percentiles:
+                percentiles = prediction.declared_percentiles
+                median_percentile = next((p for p in percentiles if p.percentile == 50), None)
+                if median_percentile:
+                    return float(median_percentile.value)
+                return float(np.mean([p.value for p in percentiles]))
 
         # Multiple choice: convert to single numeric score (entropy or max probability)
-        if hasattr(prediction, "predicted_options"):
-            # Use maximum probability as representative value
+        if isinstance(prediction, PredictedOptionList):
             return max(opt.probability for opt in prediction.predicted_options)
 
         # Last resort: hash the prediction for some numeric value
@@ -676,71 +674,35 @@ class CorrelationAnalyzer:
             return ("binary", [float(prediction)])
 
         # Multiple choice: extract all option probabilities (check this first to avoid median conflicts)
-        if (
-            hasattr(prediction, "predicted_options")
-            and prediction.predicted_options is not None
-            and prediction.predicted_options
-        ):
+        if isinstance(prediction, PredictedOptionList) and prediction.predicted_options:
             try:
-                # Sort by option name for consistency across models
                 sorted_options = sorted(
                     prediction.predicted_options,
-                    key=lambda opt: getattr(opt, "option", "") or str(opt),
+                    key=lambda opt: opt.option_name,
                 )
-                option_probs = [float(getattr(opt, "probability", 0)) for opt in sorted_options]
+                option_probs = [float(opt.probability) for opt in sorted_options]
                 return ("multiple_choice", option_probs)
             except (TypeError, AttributeError):
-                # Handle case where predicted_options is not iterable (e.g., in tests)
-                return (
-                    "multiple_choice",
-                    [0.5, 0.5],
-                )  # Default equal probability for 2 options
+                return ("multiple_choice", [0.5, 0.5])
 
         # Numeric questions: extract all percentiles
-        if (
-            hasattr(prediction, "declared_percentiles")
-            and prediction.declared_percentiles is not None
-            and prediction.declared_percentiles
-        ):
-            # Extract the standard percentiles (10, 20, 40, 60, 80, 90)
+        if isinstance(prediction, NumericDistribution) and prediction.declared_percentiles:
             target_percentiles = [10, 20, 40, 60, 80, 90]
             percentile_values = []
 
-            # Create dict for quick lookup - handle both real and mock objects
             try:
                 percentile_dict = {p.percentile: p.value for p in prediction.declared_percentiles}
             except (TypeError, AttributeError):
-                # Handle case where declared_percentiles is not iterable (e.g., in tests)
                 percentile_dict = {}
 
             for target_p in target_percentiles:
                 if target_p in percentile_dict:
                     percentile_values.append(float(percentile_dict[target_p]))
                 else:
-                    # If missing, interpolate or use median as fallback
-                    if hasattr(prediction, "median"):
-                        try:
-                            percentile_values.append(float(prediction.median))
-                        except (TypeError, ValueError):
-                            # Handle case where median is a Mock or invalid
-                            percentile_values.append(0.0)
-                    else:
-                        # Last resort: use mean of available percentiles
-                        available_values = list(percentile_dict.values())
-                        percentile_values.append(float(np.mean(available_values)) if available_values else 0.0)
+                    available_values = list(percentile_dict.values())
+                    percentile_values.append(float(np.mean(available_values)) if available_values else 0.0)
 
             return ("numeric", percentile_values)
-        elif hasattr(prediction, "median") and prediction.median is not None:
-            # Fallback for numeric with only median
-            try:
-                median_val = float(prediction.median)
-                return (
-                    "numeric",
-                    [median_val] * 6,
-                )  # Repeat median for all percentiles
-            except (TypeError, ValueError):
-                # Handle case where median is a Mock or invalid
-                return ("numeric", [0.0] * 6)
 
         # Fallback: treat as binary with neutral prediction
         return ("binary", [0.5])
@@ -820,7 +782,7 @@ class CorrelationAnalyzer:
         count = 0
 
         for report in benchmark.forecast_reports:
-            if hasattr(report, "explanation") and report.explanation:
+            if report.explanation:
                 total_chars += len(report.explanation)
                 count += 1
 
@@ -940,7 +902,7 @@ class CorrelationAnalyzer:
                     # Aggregate per-option probabilities
                     # Build option name list from first prediction
                     first_pred = preds[0]
-                    if not hasattr(first_pred, "predicted_options") or not first_pred.predicted_options:
+                    if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
                         raise ValueError("Multiple choice prediction missing predicted_options")
                     option_names = [getattr(opt, "option_name", str(opt)) for opt in first_pred.predicted_options]
 
@@ -1042,10 +1004,10 @@ class CorrelationAnalyzer:
             for benchmark in self.benchmarks:
                 name = self._extract_model_name(benchmark)
                 for r in benchmark.forecast_reports:
-                    if getattr(r.question, "id_of_question", None) == q_id and r.prediction is pred:
+                    if r.question.id_of_question == q_id and r.prediction is pred:
                         return name
         except Exception:
-            pass
+            logger.debug(f"Failed to infer model name for question {q_id}")
         return "unknown"
 
     def _get_safe_numeric_cdf(self, model_name: str, question: Any, prediction: Any) -> Optional[List[Any]]:
@@ -1077,19 +1039,20 @@ class CorrelationAnalyzer:
         try:
             raw = getattr(prediction, "cdf")
             if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-                # If already objects with percentile and value, pass through
-                if all(hasattr(p, "percentile") for p in raw):
-                    if all(hasattr(p, "value") for p in raw):
-                        self._safe_cdf_cache[key] = list(raw)  # type: ignore[list-item]
-                        return list(raw)  # type: ignore[return-value]
-                    # Objects with percentile only: synthesize values
+                first = raw[0]
+                has_percentile = isinstance(first, (Percentile, SimpleNamespace)) and hasattr(first, "percentile")
+                has_value = isinstance(first, (Percentile, SimpleNamespace)) and hasattr(first, "value")
+                if has_percentile and has_value:
+                    self._safe_cdf_cache[key] = list(raw)  # type: ignore[list-item]
+                    return list(raw)  # type: ignore[return-value]
+                elif has_percentile:
                     lower = getattr(question, "lower_bound", 0.0)
                     upper = getattr(question, "upper_bound", 1.0)
                     n = len(raw)
                     x = np.linspace(float(lower), float(upper), n)
                     out = []
                     for xi, p in zip(x, raw):
-                        out.append(SimpleNamespace(value=float(xi), percentile=float(getattr(p, "percentile", 0.0))))
+                        out.append(SimpleNamespace(value=float(xi), percentile=float(p.percentile)))
                     self._safe_cdf_cache[key] = out
                     return out
                 else:
@@ -1200,27 +1163,21 @@ class CorrelationAnalyzer:
                     fails,
                 )
         except Exception:
-            pass
+            logger.debug("Failed to compute numeric CDF summary statistics")
 
     def _get_question_type(self, report) -> str:
         """Determine question type from report."""
         prediction = report.prediction
 
-        # Binary questions: prediction is a float
         if isinstance(prediction, (int, float)):
             return "binary"
 
-        # Multiple choice: has predicted_options
-        if hasattr(prediction, "predicted_options") and prediction.predicted_options:
+        if isinstance(prediction, PredictedOptionList):
             return "multiple_choice"
 
-        # Numeric questions: has declared_percentiles or median
-        if (hasattr(prediction, "declared_percentiles") and prediction.declared_percentiles) or hasattr(
-            prediction, "median"
-        ):
+        if isinstance(prediction, NumericDistribution):
             return "numeric"
 
-        # Fallback
         return "binary"
 
     def _aggregate_predictions(
@@ -1247,25 +1204,23 @@ class CorrelationAnalyzer:
 
             # Extract options from first prediction for consistency
             first_pred = predictions[0]
-            if not hasattr(first_pred, "predicted_options") or not first_pred.predicted_options:
+            if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
                 raise ValueError("Multiple choice prediction missing predicted_options")
 
-            # Sort options by name for consistency
             sorted_options = sorted(
                 first_pred.predicted_options,
-                key=lambda opt: getattr(opt, "option_name", str(opt)),
+                key=lambda opt: opt.option_name,
             )
-            option_names = [getattr(opt, "option_name", str(opt)) for opt in sorted_options]
+            option_names = [opt.option_name for opt in sorted_options]
 
             # Aggregate probabilities for each option
             aggregated_probs = []
             for i, option_name in enumerate(option_names):
                 option_probs = []
                 for pred in predictions:
-                    # Find probability for this option in each prediction
                     for opt in pred.predicted_options:
-                        if getattr(opt, "option_name", str(opt)) == option_name:
-                            option_probs.append(getattr(opt, "probability", 0))
+                        if opt.option_name == option_name:
+                            option_probs.append(opt.probability)
                             break
 
                 if option_probs:
@@ -1291,9 +1246,7 @@ class CorrelationAnalyzer:
             median_values = []
             for model in models:
                 pred = individual_preds[model]
-                if hasattr(pred, "median") and pred.median is not None:
-                    median_values.append(float(pred.median))
-                elif hasattr(pred, "declared_percentiles") and pred.declared_percentiles:
+                if isinstance(pred, NumericDistribution) and pred.declared_percentiles:
                     # Find 50th percentile or use mean of available percentiles
                     percentiles = pred.declared_percentiles
                     median_percentile = next((p for p in percentiles if p.percentile == 50), None)
@@ -1373,7 +1326,7 @@ class CorrelationAnalyzer:
         )
 
         # Note any filters applied
-        if getattr(self, "_filter_summary_lines", None):
+        if self._filter_summary_lines:
             report.append("## Filters Applied")
             report.extend(self._filter_summary_lines)
             report.append("")
