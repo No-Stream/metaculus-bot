@@ -4,6 +4,8 @@ Keeping these objects in a single module avoids merge-conflicts and makes it
 possible to tweak/benchmark models without touching application code.
 """
 
+from forecasting_tools import GeneralLlm
+
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = ["FORECASTER_LLMS", "SUMMARIZER_LLM", "PARSER_LLM", "RESEARCHER_LLM"]
@@ -39,25 +41,25 @@ ACCEPTABLE_QUANTS = [
     "unknown",
 ]
 
-FORECASTER_LLMS = [
+FORECASTER_LLMS: list[GeneralLlm] = [
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.4",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.1",
+        model="openrouter/openai/gpt-5.2",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-4.6-opus",
+        model="openrouter/anthropic/claude-opus-4.5",
         reasoning={"enabled": True},
         extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.5",
+        model="openrouter/anthropic/claude-opus-4.6",
         reasoning={"max_tokens": 16_000},
         **REASONING_MODEL_CONFIG,
     ),
@@ -71,9 +73,9 @@ FORECASTER_LLMS = [
     ),
 ]
 
-SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview", timeout=120)
+SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview", timeout=120)
 # Parser should be a reliable, low-latency model for structure extraction
-PARSER_LLM: str = build_llm_with_openrouter_fallback(
+PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5-mini",
     reasoning={"effort": "low"},
     **DETERMINISTIC_MODEL_CONFIG,
