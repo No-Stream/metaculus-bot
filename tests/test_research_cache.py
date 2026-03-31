@@ -16,6 +16,13 @@ from main import TemplateForecaster
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch):
+    """Prevent tests from activating paid providers (financial data, native search)."""
+    monkeypatch.delenv("FINANCIAL_DATA_ENABLED", raising=False)
+    monkeypatch.delenv("NATIVE_SEARCH_ENABLED", raising=False)
+
+
 @pytest.fixture
 def mock_question():
     """Create a mock MetaculusQuestion for testing."""

@@ -5,7 +5,7 @@ Extracted from main.py to centralize magic numbers and make them more maintainab
 These constants control various aspects of the numeric prediction processing pipeline.
 """
 
-from typing import List
+from __future__ import annotations
 
 from metaculus_bot.constants import NUM_MAX_STEP
 
@@ -16,7 +16,7 @@ EXPECTED_PERCENTILE_COUNT: int = 11
 
 # Standard percentile values that should be present in a complete forecast
 # Expressed as decimals in [0,1]
-STANDARD_PERCENTILES: List[float] = [
+STANDARD_PERCENTILES: list[float] = [
     0.025,
     0.05,
     0.10,

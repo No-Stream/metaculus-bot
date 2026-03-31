@@ -1,13 +1,8 @@
-"""
-Cluster detection and spreading utilities for numeric percentile processing.
+"""Spread clustered percentile values for CDF smoothness."""
 
-Extracted from main.py to improve testability and maintainability.
-Contains logic for detecting clusters of near-equal values and spreading them
-to ensure strictly increasing sequences.
-"""
+from __future__ import annotations
 
 import logging
-from typing import List, Tuple
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -26,16 +21,8 @@ from metaculus_bot.numeric_config import (
 logger = logging.getLogger(__name__)
 
 
-def detect_count_like_pattern(values: List[float]) -> bool:
-    """
-    Detect if all values are near integers (count-like pattern).
-
-    Args:
-        values: List of numeric values to check
-
-    Returns:
-        True if all values are near integers, False otherwise
-    """
+def detect_count_like_pattern(values: list[float]) -> bool:
+    """Detect if all values are near integers (count-like pattern)."""
     try:
         if not values:
             return False
@@ -46,17 +33,8 @@ def detect_count_like_pattern(values: List[float]) -> bool:
 
 def compute_cluster_parameters(
     range_size: float, count_like: bool, span: float | None = None
-) -> Tuple[float, float, float]:
-    """
-    Compute parameters for cluster detection and spreading.
-
-    Args:
-        range_size: Range of the question (upper_bound - lower_bound)
-        count_like: Whether values follow a count-like pattern
-
-    Returns:
-        Tuple of (value_eps, base_delta, spread_delta)
-    """
+) -> tuple[float, float, float]:
+    """Compute parameters for cluster detection and spreading."""
     value_eps = max(range_size * NUM_VALUE_EPSILON_MULT, CLUSTER_DETECTION_ATOL)
     base_delta = max(range_size * NUM_SPREAD_DELTA_MULT, CLUSTER_SPREAD_BASE_DELTA)
     # Prefer a spread relative to the raw span when available to avoid range-driven explosions
@@ -69,25 +47,13 @@ def compute_cluster_parameters(
 
 
 def apply_cluster_spreading(
-    modified_values: List[float],
+    modified_values: list[float],
     question: NumericQuestion,
     value_eps: float,
     spread_delta: float,
     range_size: float,
-) -> Tuple[List[float], int]:
-    """
-    Apply cluster spreading to ensure strictly increasing values.
-
-    Args:
-        modified_values: List of values to process (modified in place)
-        question: NumericQuestion with bounds information
-        value_eps: Epsilon for detecting clusters
-        spread_delta: Delta to use for spreading clusters
-        range_size: Range of the question
-
-    Returns:
-        Tuple of (modified_values, clusters_applied_count)
-    """
+) -> tuple[list[float], int]:
+    """Apply cluster spreading to ensure strictly increasing values."""
     clusters_applied = 0
     i = 0
 
@@ -146,23 +112,12 @@ def apply_cluster_spreading(
 
 
 def apply_jitter_for_duplicates(
-    modified_values: List[float],
+    modified_values: list[float],
     question: NumericQuestion,
     range_size: float,
-    percentile_list: List[Percentile],
-) -> List[float]:
-    """
-    Apply jitter to eliminate any remaining duplicate values.
-
-    Args:
-        modified_values: List of values to process (modified in place)
-        question: NumericQuestion with bounds information
-        range_size: Range of the question
-        percentile_list: Original percentile list for logging
-
-    Returns:
-        Modified list of values
-    """
+    percentile_list: list[Percentile],
+) -> list[float]:
+    """Apply jitter to eliminate any remaining duplicate values."""
     for i in range(1, len(modified_values)):
         if modified_values[i] <= modified_values[i - 1]:
             epsilon = max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)
@@ -187,19 +142,9 @@ def apply_jitter_for_duplicates(
 
 
 def ensure_strictly_increasing_bounded(
-    modified_values: List[float], question: NumericQuestion, range_size: float
-) -> List[float]:
-    """
-    Final pass to ensure all values are strictly increasing within bounds.
-
-    Args:
-        modified_values: List of values to process (modified in place)
-        question: NumericQuestion with bounds information
-        range_size: Range of the question
-
-    Returns:
-        Modified list of values
-    """
+    modified_values: list[float], question: NumericQuestion, range_size: float
+) -> list[float]:
+    """Final pass to ensure all values are strictly increasing within bounds."""
     epsilon = max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)
 
     # Re-ensure increasing after clamping, bounded (left-to-right)

@@ -750,7 +750,7 @@ def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) 
 
 def _calculate_relative_numeric_score(
     bot_pmf: np.ndarray, community_pmf: np.ndarray, total_range: float, q_id: Optional[int], cache: Optional[dict]
-) -> float:
+) -> float | None:
     """
     Calculate relative numeric score using community PMF as expectation weights.
 

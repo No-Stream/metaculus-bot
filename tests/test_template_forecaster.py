@@ -332,7 +332,7 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     }
     bot = TemplateForecaster(llms=llms_config)
 
-    # Mock _create_upper_and_lower_bound_messages and structured_output to return a valid percentile list
+    # Mock bound_messages and structured_output to return a valid percentile list
     from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
 
     fake_percentiles = [
@@ -351,7 +351,7 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     mock_metaculus_question.cdf_size = 201
 
     with (
-        patch.object(bot, "_create_upper_and_lower_bound_messages", return_value=("", "")) as mock_bounds,
+        patch("main.bound_messages", return_value=("", "")) as mock_bounds,
         patch(
             "main.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],

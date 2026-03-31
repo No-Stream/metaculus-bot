@@ -189,5 +189,8 @@ GEMINI.md.OLD
 .pre-commit-cache/*
 
 .gemini/
+.desloppify/
 gha-creds-*.json
 scratch/*
+scorecard.png
+.claude

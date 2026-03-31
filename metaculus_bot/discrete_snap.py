@@ -14,8 +14,8 @@ The snapping algorithm:
   1. Extract integer PMF from smooth CDF via half-integer interpolation
   2. Reconstruct step-function CDF with steps at integer positions
   3. Apply uniform mixture for min-step compliance (primary min-step mechanism)
-  4. Apply max-step redistribution + boundary pinning via _safe_cdf_bounds()
-     (note: _safe_cdf_bounds handles max-step and boundaries only, not min-step)
+  4. Apply max-step redistribution + boundary pinning via safe_cdf_bounds()
+     (note: safe_cdf_bounds handles max-step and boundaries only, not min-step)
   5. Post-hoc min-step verification (guard for concentrated distributions)
 """
 
@@ -28,7 +28,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import BaseModel
 
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
-from metaculus_bot.pchip_cdf import _safe_cdf_bounds
+from metaculus_bot.pchip_cdf import safe_cdf_bounds
 from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
 
 logger = logging.getLogger(__name__)
@@ -125,8 +125,8 @@ def snap_cdf_to_integers(
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
     # --- Step 4: Max-step redistribution + boundary pinning ---
-    # _safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
-    enforced_cdf = _safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound, NUM_MIN_PROB_STEP)
+    # safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
+    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound, NUM_MIN_PROB_STEP)
 
     result = enforced_cdf.tolist()
 

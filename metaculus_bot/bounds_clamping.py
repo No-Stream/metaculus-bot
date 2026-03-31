@@ -1,12 +1,8 @@
-"""
-Bounds clamping utilities for numeric percentile processing.
+"""Clamp numeric percentile values to question bounds."""
 
-Extracted from main.py to improve testability and maintainability.
-Contains logic for clamping values to bounds with appropriate tolerances.
-"""
+from __future__ import annotations
 
 import logging
-from typing import List, Tuple
 
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
@@ -17,37 +13,18 @@ logger = logging.getLogger(__name__)
 
 
 def calculate_bounds_buffer(question: NumericQuestion) -> float:
-    """
-    Calculate buffer for bounds clamping based on question range.
-
-    Args:
-        question: NumericQuestion to calculate buffer for
-
-    Returns:
-        Buffer size for bounds clamping
-    """
+    """Calculate buffer for bounds clamping based on question range."""
     range_size = question.upper_bound - question.lower_bound
     return 1.0 if range_size > 100 else range_size * BOUNDARY_SAFETY_MARGIN
 
 
 def clamp_values_to_bounds(
-    modified_values: List[float],
-    percentile_list: List[Percentile],
+    modified_values: list[float],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
     buffer: float,
-) -> Tuple[List[float], bool]:
-    """
-    Clamp values to bounds if they violate by small amounts.
-
-    Args:
-        modified_values: List of values to clamp (modified in place)
-        percentile_list: Original percentile list for logging context
-        question: NumericQuestion with bounds information
-        buffer: Buffer size for clamping tolerance
-
-    Returns:
-        Tuple of (modified_values, corrections_made)
-    """
+) -> tuple[list[float], bool]:
+    """Clamp values to bounds if they violate by small amounts."""
     corrections_made = False
 
     for i in range(len(modified_values)):
@@ -83,20 +60,12 @@ def clamp_values_to_bounds(
 
 
 def log_heavy_clamping_diagnostics(
-    modified_values: List[float],
-    original_values: List[float],
+    modified_values: list[float],
+    original_values: list[float],
     question: NumericQuestion,
     buffer: float,
 ) -> None:
-    """
-    Log diagnostics if too many values were clamped to bounds.
-
-    Args:
-        modified_values: Final processed values
-        original_values: Original input values
-        question: NumericQuestion for context
-        buffer: Buffer size used for clamping
-    """
+    """Log diagnostics if too many values were clamped to bounds."""
     if not original_values:
         return
 
@@ -122,43 +91,25 @@ def log_heavy_clamping_diagnostics(
 
 
 def log_corrections_summary(
-    modified_values: List[float],
-    original_values: List[float],
+    modified_values: list[float],
+    original_values: list[float],
     question: NumericQuestion,
     corrections_made: bool,
 ) -> None:
-    """
-    Log summary of corrections made to the distribution.
-
-    Args:
-        modified_values: Final processed values
-        original_values: Original input values
-        question: NumericQuestion for context
-        corrections_made: Whether bounds corrections were made
-    """
+    """Log summary of corrections made to the distribution."""
     if corrections_made or any(v != orig for v, orig in zip(modified_values, original_values)):
         logger.warning(f"Corrected numeric distribution for question {getattr(question, 'id_of_question', 'N/A')}")
 
 
 def log_cluster_spreading_summary(
-    modified_values: List[float],
-    original_values: List[float],
+    modified_values: list[float],
+    original_values: list[float],
     question: NumericQuestion,
     clusters_applied: int,
     spread_delta: float,
     count_like: bool,
 ) -> None:
-    """
-    Log summary of cluster spreading operations.
-
-    Args:
-        modified_values: Final processed values after spreading
-        original_values: Original values before spreading
-        question: NumericQuestion for context
-        clusters_applied: Number of clusters that were spread
-        spread_delta: Delta used for spreading
-        count_like: Whether distribution was detected as count-like
-    """
+    """Log summary of cluster spreading operations."""
     if clusters_applied > 0:
         # Compute pre- and post-spread min deltas for logging
         pre_deltas = [b - a for a, b in zip(original_values, original_values[1:])]

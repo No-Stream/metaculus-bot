@@ -36,6 +36,10 @@ line-length = 120
 select = ["E", "F", "I"]
 ignore = ["E501"]
 
+[tool.uv]
+# Supply chain safety: ignore packages published in the last 7 days.
+exclude-newer = "1 week"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

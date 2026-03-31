@@ -11,17 +11,14 @@ Prefer ``backtest.py`` which scores against actual question resolutions.
 
 import argparse
 import asyncio
-import atexit
 import logging
 import os
 import random
 import sys
 import time
-import weakref
 from datetime import datetime, timedelta
 from typing import Literal
 
-import aiohttp
 import typeguard
 from forecasting_tools import (
     ApiFilter,
@@ -33,6 +30,7 @@ from forecasting_tools import (
 )
 from tqdm import tqdm
 
+from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
 from metaculus_bot.benchmark.bot_factory import (
     BENCHMARK_BOT_CONFIG,
     DEFAULT_HELPER_LLMS,
@@ -63,54 +61,7 @@ logger = logging.getLogger(__name__)
 
 load_environment()
 
-
-# Quick mitigation for occasional "Unclosed client session" warnings from aiohttp when
-# using EXA search under high concurrency. Tracks sessions and closes them at process exit.
-def _enable_aiohttp_session_autoclose() -> None:
-    open_sessions: "weakref.WeakSet[aiohttp.ClientSession]" = weakref.WeakSet()
-    original_init = aiohttp.ClientSession.__init__
-
-    def tracking_init(self: aiohttp.ClientSession, *args, **kwargs):  # type: ignore[no-untyped-def]
-        original_init(self, *args, **kwargs)
-        open_sessions.add(self)
-
-    aiohttp.ClientSession.__init__ = tracking_init  # type: ignore[assignment]
-
-    def _close_open_sessions() -> None:
-        to_close = [s for s in list(open_sessions) if not s.closed]
-        if not to_close:
-            return
-        logger.debug(f"Closing {len(to_close)} lingering aiohttp sessions at exit")
-
-        async def _close_all() -> None:
-            for s in to_close:
-                try:
-                    await s.close()
-                except Exception as e:  # pragma: no cover - best-effort cleanup
-                    logger.debug(f"Error closing aiohttp session at exit: {e}")
-
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            loop.create_task(_close_all())
-        else:
-            try:
-                asyncio.run(_close_all())
-            except RuntimeError:
-                new_loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(new_loop)
-                    new_loop.run_until_complete(_close_all())
-                finally:
-                    new_loop.close()
-
-    atexit.register(_close_open_sessions)
-
-
-_enable_aiohttp_session_autoclose()
+enable_aiohttp_session_autoclose()
 
 
 # Global progress tracking state

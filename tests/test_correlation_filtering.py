@@ -1,4 +1,6 @@
-from typing import Any, Dict, List
+from __future__ import annotations
+
+from typing import Any
 
 from metaculus_bot.correlation_analysis import CorrelationAnalyzer
 
@@ -25,7 +27,7 @@ class FakeBenchmark:
         self.total_cost = 0.01
         self.forecast_reports = [FakeReport(42, 0.6, 12.3, 0.001)]
         # Emulate the llms structure used for identifier extraction
-        self.forecast_bot_config: Dict[str, Any] = {
+        self.forecast_bot_config: dict[str, Any] = {
             "aggregation_strategy": "mean",
             "llms": {
                 "default": {"model": model_path},
@@ -36,7 +38,7 @@ class FakeBenchmark:
         }
 
 
-def build_analyzer_with_models(names_and_paths: List[tuple[str, str]]) -> CorrelationAnalyzer:
+def build_analyzer_with_models(names_and_paths: list[tuple[str, str]]) -> CorrelationAnalyzer:
     benches = [FakeBenchmark(n, p) for n, p in names_and_paths]
     analyzer = CorrelationAnalyzer()
     analyzer.add_benchmark_results(benches)  # type: ignore[arg-type]

@@ -53,15 +53,21 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             ── Analysis Template ──
 
+            PHASE 0: PRELIMINARY CHECK
+
+            0) Resolution check
+               • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
+
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
             1) Source analysis (focus on historical context section)
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
 
-            2) Reference class (outside view) analysis
+            2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
+               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -248,13 +254,15 @@ def numeric_prompt(
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
-        (1) Source analysis (focus on historical context section)
+        (1) Source analysis and data anchor
             - Summarize key sources; note recency, credibility, and scope.
             - Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+            - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
-        (2) Outside view and reference classes
+        (2) Outside view and quantitative modeling
             - Candidate reference classes and suitability.
             - State the outside view range and how you anchor to it.
+            - If the data supports it, perform an explicit quantitative estimate: extrapolate recent trends, compute historical mean and variance, or fit a simple model. A rough calculation from data is more reliable than an intuitive range estimate.
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.

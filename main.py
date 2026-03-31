@@ -54,8 +54,8 @@ from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.research_providers import (
     ResearchCallable,
-    _native_search_provider,
     choose_provider_with_name,
+    native_search_provider,
 )
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
@@ -139,7 +139,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             publish_reports_to_metaculus=publish_reports_to_metaculus,
             folder_to_save_reports_to=folder_to_save_reports_to,
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
-            llms=normalized_llms,  # type: ignore[arg-type]
+            llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
         )
 
         # Log ensemble + aggregation configuration once on init
@@ -199,6 +199,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """Run stacking to aggregate multiple model predictions using a meta-model."""
         if self._stacker_llm is None:
             raise ValueError("No stacker LLM configured")
+        stacker_llm = self._stacker_llm  # Bind to local for type narrowing
 
         # Strip model names from reasoning and prepare base predictions
         base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
@@ -214,32 +215,32 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Generate appropriate stacking call based on question type
         if isinstance(question, BinaryQuestion):
             value, meta_text = await stacking.run_stacking_binary(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
                 base_predictions,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
             logger.info(f"Stacked binary prediction for {getattr(question, 'page_url', '<unknown>')}: {value}")
             return value
         elif isinstance(question, MultipleChoiceQuestion):
             pol, meta_text = await stacking.run_stacking_mc(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
                 base_predictions,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
             logger.info(f"Stacked multiple choice prediction for {getattr(question, 'page_url', '<unknown>')}: {pol}")
             return pol
         elif isinstance(question, NumericQuestion):
-            lower_msg, upper_msg = self._create_upper_and_lower_bound_messages(question)
+            upper_msg, lower_msg = bound_messages(question)
             perc_list, meta_text = await stacking.run_stacking_numeric(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
@@ -247,12 +248,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 lower_msg,
                 upper_msg,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
 
             # Use same validation and processing logic as base numeric forecasting
             percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
 
+            # question is narrowed to NumericQuestion by the elif, but the type checker
+            # only sees MetaculusQuestion from the method signature
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:
                 from metaculus_bot.exceptions import UnitMismatchError
@@ -376,7 +379,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
             providers.append(
                 (
-                    _native_search_provider(model, is_benchmarking=self.is_benchmarking),
+                    native_search_provider(model, is_benchmarking=self.is_benchmarking),
                     "native_search",
                 )
             )
@@ -622,7 +625,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         prediction = await forecast_function(question, research, actual_llm)
         # Embed model name in reasoning for reporting
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
-        return prediction  # type: ignore
+        # Each branch returns a specific ReasonedPrediction[T] but the signature
+        # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
+        return prediction  # type: ignore[return-value]
 
     async def _aggregate_predictions(
         self,
@@ -675,8 +680,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     len(predictions),
                 )
             first = predictions[0]
+            # In the branches below, isinstance narrows `first` but the checker can't
+            # narrow the full `predictions` list or know that combine_* returns a
+            # PredictionTypes member.  The return-value ignores are safe because each
+            # concrete type (float, PredictedOptionList, NumericDistribution) IS a
+            # member of PredictionTypes.
             if isinstance(first, (int, float)):
-                values = [float(p) for p in predictions]  # type: ignore[list-item]
+                values = [float(p) for p in predictions if isinstance(p, (int, float))]
                 result = combine_binary_predictions(values, AggregationStrategy.MEAN)
                 logger.info("STACKING base combine: binary mean of %s = %.3f", values, result)
                 return result  # type: ignore[return-value]
@@ -747,9 +757,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info("Aggregating %s predictions with %s", qtype, self.aggregation_strategy.value)
 
         # Binary aggregation - strategy-based dispatch
+        # Same return-value pattern as stacking branch above: each concrete type IS a
+        # PredictionTypes member but the checker can't prove it through isinstance on first.
         first_prediction = predictions[0]
         if isinstance(first_prediction, (int, float)):
-            float_preds = [float(p) for p in predictions]  # type: ignore[list-item]
+            float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
             result = combine_binary_predictions(float_preds, self.aggregation_strategy)
             if self.aggregation_strategy == AggregationStrategy.MEAN:
                 logger.info(
@@ -770,7 +782,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     float_preds,
                     result,
                 )
-            return result  # type: ignore[return-value]
+            return result  # type: ignore[return-value]  # float is a PredictionTypes member
 
         # Numeric aggregation - convert strategy to string for existing function
         if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
@@ -789,7 +801,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
+            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
@@ -801,7 +813,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self.aggregation_strategy.value,
                 summary,
             )
-            return aggregated  # type: ignore[return-value]
+            return aggregated  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
 
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
@@ -865,7 +877,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> ReasonedPrediction[float]:
         prompt = binary_prompt(question, research)
         reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
         # Provide strict parsing guidance so the parser returns a decimal in [0,1]
         binary_parse_instructions = (
             "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
@@ -891,7 +903,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> ReasonedPrediction[PredictedOptionList]:
         prompt = multiple_choice_prompt(question, research)
         reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
 
         # Build parsing instructions (used in strict path and fallback)
         parsing_instructions = clean_indents(
@@ -937,11 +949,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        upper_bound_message, lower_bound_message = bound_messages(question)
         prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
         reasoning = await llm_to_use.invoke(prompt)
 
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
 
         # Parse discrete integer classification from reasoning via parser LLM
         qid = question.id_of_question
@@ -964,7 +976,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
         if qid is not None:
-            vote_label = {True: "DISCRETE", False: "CONTINUOUS"}.get(discrete_vote, "PARSE_FAILED")
+            vote_labels = {True: "DISCRETE", False: "CONTINUOUS"}
+            vote_label = vote_labels.get(discrete_vote, "PARSE_FAILED")  # type: ignore[arg-type]  # dict keyed on bool; None key falls through to default
             logger.info(
                 "Discrete vote for Q %s | model=%s | vote=%s",
                 qid,
@@ -1011,9 +1024,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         log_final_prediction(prediction, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
-        return bound_messages(question)
-
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""
         if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
@@ -1033,7 +1043,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if snapped is None:
             logger.info("Discrete snap returned None for Q %s (guard condition), keeping original", qid)
             return prediction
-        return snapped  # type: ignore[return-value]
+        return snapped  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         model_name = llm_to_use.model

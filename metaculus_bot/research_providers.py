@@ -1,15 +1,16 @@
 """Research provider strategy abstraction.
 
-`choose_provider` returns an async callable that, given a question text, returns
-formatted research.  The selection is governed by environment variables so the
-logic lives in one place instead of being in `TemplateForecaster.run_research`.
+`choose_provider_with_name` returns an async callable (and its name) that, given
+a question text, returns formatted research.  The selection is governed by
+environment variables so the logic lives in one place instead of being in
+`TemplateForecaster.run_research`.
 """
 
 import asyncio
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from forecasting_tools import GeneralLlm, SmartSearcher
@@ -25,11 +26,6 @@ from metaculus_bot.constants import (
 QuestionText = str
 ResearchCallable = Callable[[QuestionText], Awaitable[str]]
 logger = logging.getLogger(__name__)
-
-
-class ResearchProvider(Protocol):
-    async def __call__(self, question_text: str) -> str:  # pragma: no cover
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +346,10 @@ Provide a factual research summary with citations:"""
     return _fetch
 
 
+# Public alias for the native search provider (used by tests and external callers)
+native_search_provider = _native_search_provider
+
+
 # ---------------------------------------------------------------------------
 # Strategy selector
 # ---------------------------------------------------------------------------
@@ -419,23 +419,6 @@ def choose_provider_with_name(
         return ""
 
     return _empty, "none"
-
-
-def choose_provider(
-    default_llm: GeneralLlm | None = None,
-    exa_callback: ResearchCallable | None = None,
-    perplexity_callback: ResearchCallable | None = None,
-    openrouter_callback: ResearchCallable | None = None,
-    is_benchmarking: bool = False,
-) -> ResearchCallable:
-    provider, _ = choose_provider_with_name(
-        default_llm=default_llm,
-        exa_callback=exa_callback,
-        perplexity_callback=perplexity_callback,
-        openrouter_callback=openrouter_callback,
-        is_benchmarking=is_benchmarking,
-    )
-    return provider
 
 
 # ---------------------------------------------------------------------------

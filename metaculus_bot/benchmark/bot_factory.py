@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any
 
 from forecasting_tools import GeneralLlm
 
@@ -12,7 +13,7 @@ from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
-MODEL_CONFIG: Dict[str, Any] = {
+MODEL_CONFIG: dict[str, Any] = {
     "temperature": 1.0,
     "top_p": 0.95,
     "max_tokens": 32_000,
@@ -21,7 +22,7 @@ MODEL_CONFIG: Dict[str, Any] = {
     "allowed_tries": 3,
 }
 
-BENCHMARK_BOT_CONFIG: Dict[str, Any] = {
+BENCHMARK_BOT_CONFIG: dict[str, Any] = {
     "research_reports_per_question": 1,
     "predictions_per_research_report": 1,
     "use_research_summary_to_forecast": False,
@@ -34,7 +35,7 @@ BENCHMARK_BOT_CONFIG: Dict[str, Any] = {
     "allow_research_fallback": False,
 }
 
-DEFAULT_HELPER_LLMS: Dict[str, GeneralLlm] = {
+DEFAULT_HELPER_LLMS: dict[str, GeneralLlm] = {
     "summarizer": SUMMARIZER_LLM,
     "parser": PARSER_LLM,
     "researcher": RESEARCHER_LLM,
@@ -42,7 +43,7 @@ DEFAULT_HELPER_LLMS: Dict[str, GeneralLlm] = {
 
 
 # TODO: add various models from note e.g. gpt 5.2, g3 pro/flash, etc.
-MODEL_CATALOG: Dict[str, GeneralLlm] = {
+MODEL_CATALOG: dict[str, GeneralLlm] = {
     "qwen3-235b": GeneralLlm(
         model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
         **MODEL_CONFIG,
@@ -126,13 +127,13 @@ STACKING_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
 
 def create_individual_bots(
     model_specs: Iterable[Mapping[str, GeneralLlm]],
-    helper_llms: Dict[str, GeneralLlm],
-    benchmark_config: Dict[str, Any],
+    helper_llms: dict[str, GeneralLlm],
+    benchmark_config: dict[str, Any],
     *,
     batch_size: int,
-    research_cache: Dict[int, str],
-) -> List[TemplateForecaster]:
-    bots: List[TemplateForecaster] = []
+    research_cache: dict[int, str],
+) -> list[TemplateForecaster]:
+    bots: list[TemplateForecaster] = []
     for spec in model_specs:
         bot = TemplateForecaster(
             **benchmark_config,
@@ -148,14 +149,14 @@ def create_individual_bots(
 
 def create_stacking_bots(
     stacking_specs: Iterable[Mapping[str, GeneralLlm]],
-    base_forecasters: List[GeneralLlm],
-    helper_llms: Dict[str, GeneralLlm],
-    benchmark_config: Dict[str, Any],
+    base_forecasters: list[GeneralLlm],
+    helper_llms: dict[str, GeneralLlm],
+    benchmark_config: dict[str, Any],
     *,
     batch_size: int,
-    research_cache: Dict[int, str],
-) -> List[TemplateForecaster]:
-    bots: List[TemplateForecaster] = []
+    research_cache: dict[int, str],
+) -> list[TemplateForecaster]:
+    bots: list[TemplateForecaster] = []
     for spec in stacking_specs:
         bot = TemplateForecaster(
             **benchmark_config,

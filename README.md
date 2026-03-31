@@ -9,6 +9,7 @@ A forecasting bot for Metaculus using ensemble learning with several frontier LL
 ## Overview
 
 includes:
+
 - **Model Ensembling**: Uses various models with support for model stacking. (uses simple median agg currently.)
 - **Research Integration**: AskNews API with Perplexity fallback for real-time information gathering
 - **Advanced Aggregation**: Multiple aggregation strategies including mean, median, and stacking approaches
@@ -21,35 +22,42 @@ includes:
 ## Quick Start
 
 ### Prerequisites
+
 - Python 3.11+ with conda and poetry
 - Required API keys (see Configuration section)
 
 ### Setup
+
 1. **Clone and navigate to the repository**
+
 ```bash
 git clone <repo-url>
 cd metaculus-bot
 ```
 
-2. **Set up conda environment**
+1. **Set up conda environment**
+
 ```bash
 conda create -n metaculus-bot python=3.11
 conda activate metaculus-bot
 ```
 
-3. **Install dependencies**
+1. **Install dependencies**
+
 ```bash
 make install
 # or: conda run -n metaculus-bot poetry install
 ```
 
-4. **Configure environment**
+1. **Configure environment**
+
 ```bash
 cp .env.template .env
 # Edit .env with your API keys (see Configuration section)
 ```
 
-5. **Run the bot**
+1. **Run the bot**
+
 ```bash
 make run
 # or: conda run -n metaculus-bot poetry run python main.py
@@ -58,13 +66,14 @@ make run
 ## Core Architecture
 
 ### Main Components
+
 - **`main.py`**: Primary bot implementation using the `forecasting-tools` framework
 - **`backtest.py`**: Primary benchmarking system — scores predictions against actual resolutions
 - **`community_benchmark.py`**: DEPRECATED benchmarking CLI (community prediction baseline broken)
-- **`main_with_no_framework.py`**: Minimal dependencies variant for lightweight usage
 - **`metaculus_bot/`**: Core utilities and configurations
 
 ### Key Modules
+
 - **`llm_configs.py`**: LLM ensemble configuration and model settings
 - **`research_providers.py`**: AskNews and search integration
 - **`aggregation_strategies.py`**: Multiple prediction aggregation methods
@@ -74,6 +83,7 @@ make run
 ## Usage Examples
 
 ### Basic Forecasting
+
 ```bash
 # Run the bot on current Metaculus questions
 make run
@@ -110,6 +120,7 @@ make benchmark_run_smoke_test_binary   # deprecated
 make benchmark_run_small               # deprecated
 make benchmark_display                 # still works for viewing old results
 ```
+
 </details>
 
 ### Correlation Analysis & Model Filtering
@@ -135,10 +146,12 @@ python community_benchmark.py --mode run --num-questions 30 --mixed \
 ```
 
 Notes:
+
 - Matching is substring-only, case-insensitive (no regex or space/hyphen normalization). For example, `grok-4` matches `openrouter/x-ai/grok-4`, but `grok 4` will not.
 - Filters apply before computing correlation matrices, model stats, and ensemble search. The generated report includes a “Filters Applied” section.
 
 ### Testing
+
 ```bash
 # Run all tests
 make test
@@ -150,6 +163,7 @@ conda run -n metaculus-bot PYTHONPATH=. poetry run pytest tests/test_specific.py
 ## Configuration
 
 ### Required Environment Variables
+
 Create a `.env` file based on `.env.template`:
 
 ```bash
@@ -167,7 +181,9 @@ OPENROUTER_API_KEY=your_openrouter_key
 ```
 
 ### Model Configuration
+
 Models are configured in `metaculus_bot/llm_configs.py`:
+
 - See `metaculus_bot/llm_configs.py` for the current model ensemble (rotates frequently)
 - **Research**: AskNews + native search (Grok), with fallback providers
 - **Provider**: OpenRouter with automatic key fallback
@@ -175,6 +191,7 @@ Models are configured in `metaculus_bot/llm_configs.py`:
 ## Development
 
 ### Code Quality
+
 ```bash
 # Lint code
 make lint
@@ -190,6 +207,7 @@ make precommit_all
 ```
 
 ### Makefile Commands
+
 - `make install` - Install dependencies via conda + poetry
 - `make test` - Run pytest suite
 - `make run` - Run the forecasting bot
@@ -198,6 +216,7 @@ make precommit_all
 - `make benchmark_*` - Various benchmarking options
 
 ### Testing Philosophy
+
 - Focus on end-to-end integration tests for the forecasting pipeline
 - Test core aggregation logic and API integrations
 - All tests must pass before PRs
@@ -209,7 +228,6 @@ make precommit_all
 metaculus-bot/
 ├── main.py                     # Primary bot implementation
 ├── community_benchmark.py      # Benchmarking system
-├── main_with_no_framework.py   # Minimal variant
 ├── metaculus_bot/              # Core utilities
 │   ├── llm_configs.py         # Model ensemble configuration
 │   ├── research_providers.py   # Research integration
@@ -225,6 +243,7 @@ metaculus-bot/
 ## Framework Integration
 
 This project heavily uses the [`forecasting-tools`](forecasting_tools_readme.md) framework:
+
 - `GeneralLlm` for model interfaces
 - `MetaculusApi` for platform integration
 - Question types: `BinaryQuestion`, `NumericQuestion`, `MultipleChoiceQuestion`

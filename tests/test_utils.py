@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 from abc import ABC
-from typing import List
 
 import pytest
 from forecasting_tools.data_models.forecast_report import ForecastReport
@@ -265,7 +266,7 @@ class DummyReport(ForecastReport):
         close_time=None,
     )
     explanation: str = "# Dummy"
-    prediction: List[str] = Field(default_factory=list)
+    prediction: list[str] = Field(default_factory=list)
 
     @classmethod
     def make_readable_prediction(cls, prediction: "list[str]") -> str:
