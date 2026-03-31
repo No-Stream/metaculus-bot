@@ -65,6 +65,10 @@ FORECASTER_LLMS = [
         model="openrouter/google/gemini-3.1-pro-preview",
         **REASONING_MODEL_CONFIG,
     ),
+    build_llm_with_openrouter_fallback(
+        model="openrouter/x-ai/grok-4.1-fast",
+        **REASONING_MODEL_CONFIG,
+    ),
 ]
 
 SUMMARIZER_LLM: str = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview", timeout=120)

@@ -6,12 +6,15 @@ import re
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Current model roster (from llm_configs.py). Index matches the Forecaster N label.
+# NOTE: This reflects the CURRENT config. Historical data may have fewer models.
+# The parser handles missing models gracefully.
 MODEL_NAMES: list[str] = [
-    "gpt-5.2",
+    "gpt-5.4",
     "gpt-5.1",
     "claude-4.6-opus",
     "claude-opus-4.5",
     "gemini-3.1-pro-preview",
+    "grok-4.1-fast",
 ]
 
 # Index-to-name mapping (Forecaster labels are 1-indexed)
