@@ -39,6 +39,7 @@ from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
+    FINANCIAL_DATA_ENABLED_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
 )
@@ -380,6 +381,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 )
             )
 
+        # Financial data provider if enabled
+        if os.getenv(FINANCIAL_DATA_ENABLED_ENV, "").lower() in ("true", "1", "yes"):
+            from metaculus_bot.financial_data_provider import financial_data_provider
+
+            providers.append((financial_data_provider(), "financial_data"))
+
         if not providers:
 
             async def _empty(_: str) -> str:
@@ -423,6 +430,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         headers = {
             "asknews": "## News Articles (AskNews)",
             "native_search": "## Web Research (Native Search)",
+            "financial_data": "## Financial & Economic Data",
             "exa": "## Web Research (Exa)",
             "perplexity": "## Web Research (Perplexity)",
             "openrouter": "## Web Research (OpenRouter)",
