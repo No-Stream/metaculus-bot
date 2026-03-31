@@ -41,7 +41,7 @@ ACCEPTABLE_QUANTS = [
 
 FORECASTER_LLMS = [
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.2",
+        model="openrouter/openai/gpt-5.4",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
