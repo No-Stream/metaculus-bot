@@ -85,7 +85,8 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
-               • Status-quo nudge: the world usually changes slowly—justify any deviation from status quo expectations.
+               • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
+               • Quantitative anchor: if you computed a probability from data (z-score, historical frequency, regression, etc.), state that number and explain how your final answer relates to it. If you're adjusting away from a data-derived probability, name the specific reason.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
@@ -94,7 +95,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
             • Top 3-5 evidence items + quick factual validity check.
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
-            • Status-quo nudge sanity check.
+            • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
             [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
@@ -179,7 +180,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         • State the outside-view distribution used as anchor.
         • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
         • Top 3-5 evidence items + quick factual validity check.
-        • Blind-spot statement; status-quo nudge sanity check.
+        • Blind-spot statement; trajectory check sanity check.
 
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
@@ -205,8 +206,13 @@ def numeric_prompt(
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your prediction interval) are critical.
-        Historically, LLMs like you are overconfident and produce excessively narrow prediction intervals,
-        so you should aim to produce wider and less confident predictions. Given the mathematics of log score, penalties for narrow intervals are severe.
+        Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
+        relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
+        For stable, well-measured indicators with recent data (economic indices, demographic measures,
+        climate data), anchor tightly to recent observations with historically-appropriate variance.
+        Do not over-hedge on quantities you can actually predict well.
+        Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
+        but penalties for overly wide intervals on predictable quantities also accumulate.
         Please consider news, research, and prediction markets, but you are not beholden to them.
 
         ── Question ──
@@ -276,7 +282,8 @@ def numeric_prompt(
             - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
             - Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
-            - Status quo nudge: justify deviations from status quo expectations.
+            - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
+            - Quantitative anchor: if you derived a central estimate or range from data, state it and explain how your final percentiles relate to it.
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
@@ -293,6 +300,21 @@ def numeric_prompt(
             OUTCOME_TYPE: DISCRETE
             OUTCOME_TYPE: CONTINUOUS
 
+        (9b) Forecastability classification
+            How inherently predictable is this quantity on the given time horizon?
+            - HIGH: stable indicator with recent data, low historical variance
+              (e.g., monthly unemployment rate, home price index, CO2 concentration)
+            - MEDIUM: event-based or moderately variable
+              (e.g., election results, quarterly earnings, box office)
+            - LOW: volatile or near-random on this horizon
+              (e.g., 2-week stock/futures returns, financial spreads, novel metrics)
+            Output exactly one of:
+            FORECASTABILITY: HIGH
+            FORECASTABILITY: MEDIUM
+            FORECASTABILITY: LOW
+            For LOW forecastability, your IQR should span a large fraction of the allowed range.
+            For HIGH, your IQR can be as narrow as the historical data justifies.
+
         (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
@@ -301,8 +323,9 @@ def numeric_prompt(
             - Consistency line about which percentile corresponds to the status quo or trend.
             - Top 3 to 5 evidence items plus a quick factual validity check.
             - Blind spot scenario and expected effect on tails.
-            - Status quo nudge sanity check.
-            - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
+            - Trajectory check sanity check: does your prediction align with the most likely trajectory?
+            - Forecastability check: does your interval width match the forecastability classification?
+            - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
         Prediction:
         [Reminders:
