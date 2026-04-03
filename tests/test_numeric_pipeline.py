@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
@@ -122,3 +123,43 @@ def test_build_numeric_distribution_success(monkeypatch):
     generator.assert_called_once_with(sanitized, question, None)
     create_dist.assert_called_once_with(mock_cdf, sanitized, question, None)
     validate.assert_called_once_with("pchip", question)
+
+
+def test_build_numeric_distribution_discrete_resamples_to_cdf_size():
+    """Discrete question with cdf_size=9 produces a 9-point CDF, not 201."""
+
+    question = _build_question(
+        lower_bound=-0.5,
+        upper_bound=7.5,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        zero_point=None,
+        cdf_size=9,
+    )
+
+    raw_percentiles = [
+        Percentile(percentile=0.025, value=0.0),
+        Percentile(percentile=0.05, value=0.5),
+        Percentile(percentile=0.1, value=1.0),
+        Percentile(percentile=0.2, value=1.5),
+        Percentile(percentile=0.4, value=3.0),
+        Percentile(percentile=0.5, value=3.5),
+        Percentile(percentile=0.6, value=4.0),
+        Percentile(percentile=0.8, value=5.5),
+        Percentile(percentile=0.9, value=6.5),
+        Percentile(percentile=0.95, value=7.0),
+        Percentile(percentile=0.975, value=7.2),
+    ]
+
+    sanitized, zero_point = sanitize_percentiles(raw_percentiles, question)
+    distribution = build_numeric_distribution(sanitized, question, zero_point)
+
+    cdf = distribution.cdf
+    assert len(cdf) == 9, f"Expected 9-point CDF for discrete question, got {len(cdf)}"
+
+    probs = np.array([p.percentile for p in cdf], dtype=float)
+    diffs = np.diff(probs)
+    assert np.all(diffs > 0), "CDF must be monotonically increasing"
+
+    assert abs(probs[0] - 0.0) < 1e-9, f"Closed lower bound CDF should start at 0.0, got {probs[0]}"
+    assert abs(probs[-1] - 1.0) < 1e-9, f"Closed upper bound CDF should end at 1.0, got {probs[-1]}"
