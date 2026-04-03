@@ -20,6 +20,7 @@ async def test_native_search_provider_constructs_correct_model_name(
         def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
             nonlocal captured_model
             captured_model = model
+            self.model = model
 
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
@@ -44,6 +45,7 @@ async def test_native_search_provider_uses_custom_model_slug(
         def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
             nonlocal captured_model
             captured_model = model
+            self.model = model
 
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
@@ -66,7 +68,7 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt
@@ -92,7 +94,7 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt
@@ -118,7 +120,7 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt

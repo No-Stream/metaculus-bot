@@ -9,11 +9,13 @@ from forecasting_tools import (
 
 __all__ = [
     "binary_prompt",
+    "disagreement_crux_prompt",
     "multiple_choice_prompt",
     "numeric_prompt",
     "stacking_binary_prompt",
     "stacking_multiple_choice_prompt",
     "stacking_numeric_prompt",
+    "targeted_search_prompt",
 ]
 
 
@@ -588,5 +590,52 @@ def stacking_numeric_prompt(
         Percentile 90: [value]
         Percentile 95: [value]
         Percentile 97.5: [value]
+        """
+    )
+
+
+def disagreement_crux_prompt(question_text: str, base_predictions: list[str]) -> str:
+    """Prompt for a cheap model to extract the core factual disagreement between forecaster analyses."""
+    predictions_text = "\n".join([f"Forecaster {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+
+    return clean_indents(
+        f"""
+        Multiple forecasters analyzed the same question and produced significantly different predictions.
+
+        Question:
+        {question_text}
+
+        ── Forecaster Analyses ──
+        {predictions_text}
+
+        Read the analyses above. They disagree. Identify the core factual question(s) driving
+        the disagreement — what specific facts, data points, or events do the forecasters
+        interpret differently or assume differently about?
+
+        Output ONLY the factual question(s), in 1-3 sentences. Do not forecast, do not give
+        opinions, do not explain your reasoning.
+        """
+    )
+
+
+def targeted_search_prompt(crux: str, question_text: str, *, is_benchmarking: bool = False) -> str:
+    """Prompt for Grok with native search to resolve a specific factual disagreement."""
+    benchmarking_warning = (
+        "\n\nIMPORTANT: This is a benchmarking run. DO NOT search for or include prediction "
+        "market odds, forecasts, or betting lines — this would constitute data leakage."
+        if is_benchmarking
+        else ""
+    )
+    return clean_indents(
+        f"""
+        Search the web for current, factual information to resolve this specific question:
+        {crux}
+
+        This is for forecasting the following question:
+        {question_text}
+
+        Focus on: recent official data, primary sources, quantitative evidence, confirmed
+        timelines, and resolution-relevant facts. Include inline citations [source](url)
+        for all claims.{benchmarking_warning}
         """
     )

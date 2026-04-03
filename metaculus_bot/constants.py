@@ -148,6 +148,14 @@ NUM_RAMP_K_FACTOR: float = 3.0
 DISCRETE_SNAP_MAX_INTEGERS: int = 200
 DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
+# --- Conditional Stacking Thresholds ---
+# Binary: log-odds spread (max logit - min logit). 1.2 ≈ 20pp near 50%, more sensitive near tails.
+CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD: float = 1.2
+# Multiple choice: max per-option probability spread (max - min across models for worst option).
+CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD: float = 0.20
+# Numeric: max percentile spread normalized by question range (at 10th/50th/90th percentiles).
+CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD: float = 0.15
+
 # --- Native Search Provider ---
 # Environment variable names
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
