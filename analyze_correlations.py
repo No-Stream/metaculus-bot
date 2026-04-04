@@ -11,6 +11,8 @@ Or via Makefile:
     make analyze_correlations_latest
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging

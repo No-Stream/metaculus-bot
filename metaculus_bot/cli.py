@@ -11,9 +11,11 @@ from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
 from metaculus_bot.llm_configs import (
+    DISAGREEMENT_ANALYZER_LLM,
     FORECASTER_LLMS,
     PARSER_LLM,
     RESEARCHER_LLM,
+    STACKER_LLM,
     SUMMARIZER_LLM,
 )
 
@@ -54,9 +56,11 @@ def main() -> None:
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        aggregation_strategy=AggregationStrategy.MEDIAN,
+        aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
         llms={
             "forecasters": FORECASTER_LLMS,
+            "stacker": STACKER_LLM,
+            "analyzer": DISAGREEMENT_ANALYZER_LLM,
             "summarizer": SUMMARIZER_LLM,
             "parser": PARSER_LLM,
             "researcher": RESEARCHER_LLM,

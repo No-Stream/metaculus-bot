@@ -38,7 +38,11 @@ from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
+    CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD,
+    CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
+    CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
+    FINANCIAL_DATA_ENABLED_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
 )
@@ -53,10 +57,12 @@ from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.research_providers import (
     ResearchCallable,
-    _native_search_provider,
     choose_provider_with_name,
+    native_search_provider,
 )
 from metaculus_bot.simple_types import OptionProbability
+from metaculus_bot.spread_metrics import compute_spread
+from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
@@ -85,6 +91,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research_cache: dict[int, str] | None = None,
         stacking_fallback_on_failure: bool = True,
         stacking_randomize_order: bool = True,
+        stacking_spread_thresholds: dict[str, float] | None = None,
     ) -> None:
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
@@ -98,6 +105,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         self._forecaster_llms: list[GeneralLlm] = setup.forecaster_llms
         self._stacker_llm: GeneralLlm | None = setup.stacker_llm
+        self._analyzer_llm: GeneralLlm | None = setup.analyzer_llm
         normalized_llms: dict[str, str | GeneralLlm] = setup.normalized_llms
         predictions_per_research_report = setup.predictions_per_report
 
@@ -123,6 +131,23 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._stacking_fallback_count: int = 0
         # Per-question votes from each LLM on whether outcomes are discrete integers
         self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
+        # Conditional stacking thresholds (overridable per question type)
+        _valid_threshold_keys = {"binary", "mc", "numeric"}
+        if stacking_spread_thresholds is not None:
+            unknown_keys = set(stacking_spread_thresholds) - _valid_threshold_keys
+            if unknown_keys:
+                raise ValueError(
+                    f"Unknown stacking_spread_thresholds keys: {unknown_keys}. Valid keys: {_valid_threshold_keys}"
+                )
+        self._stacking_spread_thresholds: dict[str, float] = {
+            "binary": CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD,
+            "mc": CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
+            "numeric": CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
+        } | (stacking_spread_thresholds or {})
+        self._conditional_stacking_triggered_count: int = 0
+        self._conditional_stacking_skipped_count: int = 0
+        self._conditional_stacking_crux_failures: int = 0
+        self._conditional_stacking_search_failures: int = 0
 
         if max_concurrent_research <= 0:
             raise ValueError("max_concurrent_research must be a positive integer")
@@ -138,7 +163,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             publish_reports_to_metaculus=publish_reports_to_metaculus,
             folder_to_save_reports_to=folder_to_save_reports_to,
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
-            llms=normalized_llms,  # type: ignore[arg-type]
+            llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
         )
 
         # Log ensemble + aggregation configuration once on init
@@ -158,6 +183,34 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 len(base_models),
                 short_list,
             )
+        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+            stacker_name = self._stacker_llm.model if self._stacker_llm else "<missing>"
+            analyzer_name = self._analyzer_llm.model if self._analyzer_llm else "<missing>"
+            base_models = [m.model for m in self._forecaster_llms]
+            short_list = base_models if len(base_models) <= 6 else base_models[:6] + ["..."]
+            logger.info(
+                "CONDITIONAL_STACKING config | stacker=%s | analyzer=%s | base_forecasters(%d)=%s | thresholds=%s",
+                stacker_name,
+                analyzer_name,
+                len(base_models),
+                short_list,
+                self._stacking_spread_thresholds,
+            )
+
+    def _get_threshold_for_question(self, question: MetaculusQuestion) -> float:
+        """Return the spread threshold for the given question type."""
+        if isinstance(question, BinaryQuestion):
+            return self._stacking_spread_thresholds["binary"]
+        if isinstance(question, MultipleChoiceQuestion):
+            return self._stacking_spread_thresholds["mc"]
+        if isinstance(question, NumericQuestion):
+            return self._stacking_spread_thresholds["numeric"]
+        raise ValueError(f"No spread threshold for question type: {type(question).__name__}")
+
+    def _register_expected_base_combine(self, question: MetaculusQuestion) -> None:
+        """Register that the framework's base aggregator should expect a combine call for this question."""
+        qkey = question.id_of_question if question.id_of_question is not None else id(question)
+        self._stack_expected_base_combine.add(qkey)
 
     async def forecast_questions(
         self,
@@ -187,6 +240,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         log_pchip_summary()
 
+        if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+            logger.info(
+                "Conditional stacking summary: triggered=%d, skipped=%d, crux_failures=%d, search_failures=%d",
+                self._conditional_stacking_triggered_count,
+                self._conditional_stacking_skipped_count,
+                self._conditional_stacking_crux_failures,
+                self._conditional_stacking_search_failures,
+            )
+
         return results
 
     async def _run_stacking(
@@ -198,6 +260,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """Run stacking to aggregate multiple model predictions using a meta-model."""
         if self._stacker_llm is None:
             raise ValueError("No stacker LLM configured")
+        stacker_llm = self._stacker_llm  # Bind to local for type narrowing
 
         # Strip model names from reasoning and prepare base predictions
         base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
@@ -213,32 +276,32 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Generate appropriate stacking call based on question type
         if isinstance(question, BinaryQuestion):
             value, meta_text = await stacking.run_stacking_binary(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
                 base_predictions,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
             logger.info(f"Stacked binary prediction for {getattr(question, 'page_url', '<unknown>')}: {value}")
             return value
         elif isinstance(question, MultipleChoiceQuestion):
             pol, meta_text = await stacking.run_stacking_mc(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
                 base_predictions,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
             logger.info(f"Stacked multiple choice prediction for {getattr(question, 'page_url', '<unknown>')}: {pol}")
             return pol
         elif isinstance(question, NumericQuestion):
-            lower_msg, upper_msg = self._create_upper_and_lower_bound_messages(question)
+            upper_msg, lower_msg = bound_messages(question)
             perc_list, meta_text = await stacking.run_stacking_numeric(
-                self._stacker_llm,
+                stacker_llm,
                 self.get_llm("parser", "llm"),
                 question,
                 research,
@@ -246,12 +309,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 lower_msg,
                 upper_msg,
             )
-            self._log_llm_output(self._stacker_llm, question.id_of_question, meta_text)  # type: ignore
+            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
             self._stack_meta_reasoning[question.id_of_question] = meta_text
 
             # Use same validation and processing logic as base numeric forecasting
             percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
 
+            # question is narrowed to NumericQuestion by the elif, but the type checker
+            # only sees MetaculusQuestion from the method signature
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:
                 from metaculus_bot.exceptions import UnitMismatchError
@@ -375,10 +440,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
             providers.append(
                 (
-                    _native_search_provider(model, is_benchmarking=self.is_benchmarking),
+                    native_search_provider(model, is_benchmarking=self.is_benchmarking),
                     "native_search",
                 )
             )
+
+        # Financial data provider if enabled
+        if os.getenv(FINANCIAL_DATA_ENABLED_ENV, "").lower() in ("true", "1", "yes"):
+            from metaculus_bot.financial_data_provider import financial_data_provider
+
+            providers.append((financial_data_provider(), "financial_data"))
 
         if not providers:
 
@@ -423,6 +494,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         headers = {
             "asknews": "## News Articles (AskNews)",
             "native_search": "## Web Research (Native Search)",
+            "financial_data": "## Financial & Economic Data",
             "exa": "## Web Research (Exa)",
             "perplexity": "## Web Research (Perplexity)",
             "openrouter": "## Web Research (OpenRouter)",
@@ -520,18 +592,102 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 "Stacked prediction aggregated from multiple models",
             )
             aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=meta_text)
-            # Mark that we expect the framework's base aggregator to combine pre-stacked outputs across
-            # research reports for this question.
-            qkey = getattr(question, "id_of_question", None)
-            if qkey is None:
-                qkey = id(question)
-            self._stack_expected_base_combine.add(qkey)
+            self._register_expected_base_combine(question)
             return ResearchWithPredictions(
                 research_report=research,
                 summary_report=summary_report,
                 errors=errors,
                 predictions=[aggregated_prediction],
             )
+        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+            prediction_values = [pred.prediction_value for pred in valid_predictions]
+            spread = compute_spread(question, prediction_values)
+            threshold = self._get_threshold_for_question(question)
+
+            if spread > threshold:
+                self._conditional_stacking_triggered_count += 1
+                logger.info(
+                    "Conditional stacking TRIGGERED: spread=%.3f > threshold=%.3f for question %s",
+                    spread,
+                    threshold,
+                    question.id_of_question,
+                )
+
+                if self._stacker_llm is None:
+                    raise ValueError("CONDITIONAL_STACKING requires a stacker LLM to be configured")
+                if self._analyzer_llm is None:
+                    raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
+
+                # 1. Extract the crux of disagreement
+                base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
+                try:
+                    crux = await extract_disagreement_crux(
+                        self._analyzer_llm,
+                        question.question_text,
+                        base_texts,
+                    )
+                except Exception:
+                    self._conditional_stacking_crux_failures += 1
+                    logger.exception("Disagreement crux extraction failed, skipping targeted research")
+                    crux = ""
+
+                # 2. Run targeted research if crux was extracted
+                targeted_research_text = ""
+                if crux:
+                    try:
+                        targeted_research_text = await run_targeted_search(
+                            crux, question.question_text, is_benchmarking=self.is_benchmarking
+                        )
+                    except Exception:
+                        self._conditional_stacking_search_failures += 1
+                        logger.exception("Targeted search failed, proceeding with base research only")
+
+                # 3. Combine research
+                if targeted_research_text:
+                    combined_research = (
+                        f"{research_to_use}\n\n"
+                        f"## Targeted Research (addressing model disagreement)\n"
+                        f"{targeted_research_text}"
+                    )
+                else:
+                    combined_research = research_to_use
+
+                # 4. Run stacking
+                aggregated_value = await self._aggregate_predictions(
+                    prediction_values,
+                    question,
+                    research=combined_research,
+                    reasoned_predictions=valid_predictions,
+                )
+                meta_text = self._stack_meta_reasoning.pop(
+                    question.id_of_question,
+                    "Conditional stacking: aggregated from multiple models after high-disagreement detected",
+                )
+                aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=meta_text)
+                self._register_expected_base_combine(question)
+
+                return ResearchWithPredictions(
+                    research_report=research,
+                    summary_report=summary_report,
+                    errors=errors,
+                    predictions=[aggregated_prediction],
+                )
+            else:
+                self._conditional_stacking_skipped_count += 1
+                logger.info(
+                    "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
+                    spread,
+                    threshold,
+                    question.id_of_question,
+                )
+                self._register_expected_base_combine(question)
+                return ResearchWithPredictions(
+                    research_report=research,
+                    summary_report=summary_report,
+                    errors=errors,
+                    predictions=valid_predictions,
+                )
+
         else:
             return ResearchWithPredictions(
                 research_report=research,
@@ -614,7 +770,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         prediction = await forecast_function(question, research, actual_llm)
         # Embed model name in reasoning for reporting
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
-        return prediction  # type: ignore
+        # Each branch returns a specific ReasonedPrediction[T] but the signature
+        # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
+        return prediction  # type: ignore[return-value]
 
     async def _aggregate_predictions(
         self,
@@ -631,7 +789,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # there will be no reasoned_predictions/research context provided here.
         # Treat this as a base-combine. Distinguish expected vs unexpected for logging.
         if (
-            self.aggregation_strategy == AggregationStrategy.STACKING
+            self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
             and reasoned_predictions is None
             and research is None
         ):
@@ -655,48 +813,56 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         "Unexpected STACKING combine: single input without stacking context; returning as-is"
                     )
                 return predictions[0]
-            # Multiple research reports produced multiple stacked predictions – average by MEAN
+            # Multiple predictions – combine them. CONDITIONAL_STACKING uses MEDIAN (its low-spread
+            # skip path returns all individual predictions); regular STACKING uses MEAN.
+            base_combine_strategy = (
+                AggregationStrategy.MEDIAN
+                if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
+                else AggregationStrategy.MEAN
+            )
+            strategy_name = base_combine_strategy.value
             if expected:
                 logger.info(
-                    "STACKING base combine: %d pre-stacked outputs; aggregating by mean for final output",
+                    "STACKING base combine: %d pre-stacked outputs; aggregating by %s for final output",
                     len(predictions),
+                    strategy_name,
                 )
             else:
                 logger.warning(
-                    "Unexpected STACKING combine: %d inputs without stacking context; aggregating by mean",
+                    "Unexpected STACKING combine: %d inputs without stacking context; aggregating by %s",
                     len(predictions),
+                    strategy_name,
                 )
             first = predictions[0]
+            # In the branches below, isinstance narrows `first` but the checker can't
+            # narrow the full `predictions` list or know that combine_* returns a
+            # PredictionTypes member.  The return-value ignores are safe because each
+            # concrete type (float, PredictedOptionList, NumericDistribution) IS a
+            # member of PredictionTypes.
             if isinstance(first, (int, float)):
-                values = [float(p) for p in predictions]  # type: ignore[list-item]
-                result = combine_binary_predictions(values, AggregationStrategy.MEAN)
-                logger.info("STACKING base combine: binary mean of %s = %.3f", values, result)
+                values = [float(p) for p in predictions if isinstance(p, (int, float))]
+                result = combine_binary_predictions(values, base_combine_strategy)
+                logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
                 return result  # type: ignore[return-value]
             if isinstance(first, PredictedOptionList):
                 mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                aggregated = combine_multiple_choice_predictions(
-                    mc_preds,
-                    AggregationStrategy.MEAN,
-                )
+                aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
                 summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
-                logger.info("STACKING base combine: MC mean aggregation | %s", summary)
+                logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
                 return aggregated  # type: ignore[return-value]
             if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
                 numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-                aggregated = await combine_numeric_predictions(
-                    numeric_preds,
-                    question,
-                    AggregationStrategy.MEAN,
-                )
+                aggregated = await combine_numeric_predictions(numeric_preds, question, base_combine_strategy)
                 logger.info(
-                    "STACKING base combine: numeric mean aggregation | CDF points=%d",
+                    "STACKING base combine: numeric %s aggregation | CDF points=%d",
+                    strategy_name,
                     len(getattr(aggregated, "cdf", [])),
                 )
                 return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
             raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
 
         # Handle stacking strategy
-        if self.aggregation_strategy == AggregationStrategy.STACKING:
+        if self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             if self._stacker_llm is None:
                 raise ValueError("STACKING aggregation strategy requires a stacker LLM to be configured")
             if reasoned_predictions is None:
@@ -738,18 +904,27 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         logger.info("Aggregating %s predictions with %s", qtype, self.aggregation_strategy.value)
 
+        # CONDITIONAL_STACKING uses MEDIAN for the low-spread (no-stack) path
+        effective_strategy = (
+            AggregationStrategy.MEDIAN
+            if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
+            else self.aggregation_strategy
+        )
+
         # Binary aggregation - strategy-based dispatch
+        # Same return-value pattern as stacking branch above: each concrete type IS a
+        # PredictionTypes member but the checker can't prove it through isinstance on first.
         first_prediction = predictions[0]
         if isinstance(first_prediction, (int, float)):
-            float_preds = [float(p) for p in predictions]  # type: ignore[list-item]
-            result = combine_binary_predictions(float_preds, self.aggregation_strategy)
-            if self.aggregation_strategy == AggregationStrategy.MEAN:
+            float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
+            result = combine_binary_predictions(float_preds, effective_strategy)
+            if effective_strategy == AggregationStrategy.MEAN:
                 logger.info(
                     "Binary question ensembling: mean of %s = %.3f (rounded)",
                     float_preds,
                     result,
                 )
-            elif self.aggregation_strategy == AggregationStrategy.MEDIAN:
+            elif effective_strategy == AggregationStrategy.MEDIAN:
                 logger.info(
                     "Binary question ensembling: median of %s = %.3f",
                     float_preds,
@@ -758,42 +933,41 @@ class TemplateForecaster(CompactLoggingForecastBot):
             else:
                 logger.info(
                     "Binary question ensembling: %s of %s = %.3f",
-                    self.aggregation_strategy.value,
+                    effective_strategy.value,
                     float_preds,
                     result,
                 )
-            return result  # type: ignore[return-value]
+            return result  # type: ignore[return-value]  # float is a PredictionTypes member
 
-        # Numeric aggregation - convert strategy to string for existing function
         if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
             aggregated = await combine_numeric_predictions(
                 numeric_preds,
                 question,
-                self.aggregation_strategy,
+                effective_strategy,
             )
             lb = getattr(question, "lower_bound", None)
             ub = getattr(question, "upper_bound", None)
             logger.info(
                 "Numeric aggregation=%s | preserved bounds [%s, %s] | CDF points=%d",
-                self.aggregation_strategy.value,
+                effective_strategy.value,
                 lb,
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
+            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, self.aggregation_strategy)
+            aggregated = combine_multiple_choice_predictions(mc_preds, effective_strategy)
             summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
             logger.info(
                 "MC %s aggregation; renormalized to 1.0 | %s",
-                self.aggregation_strategy.value,
+                effective_strategy.value,
                 summary,
             )
-            return aggregated  # type: ignore[return-value]
+            return aggregated  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
 
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
@@ -857,7 +1031,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> ReasonedPrediction[float]:
         prompt = binary_prompt(question, research)
         reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
         # Provide strict parsing guidance so the parser returns a decimal in [0,1]
         binary_parse_instructions = (
             "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
@@ -883,7 +1057,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> ReasonedPrediction[PredictedOptionList]:
         prompt = multiple_choice_prompt(question, research)
         reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
 
         # Build parsing instructions (used in strict path and fallback)
         parsing_instructions = clean_indents(
@@ -929,11 +1103,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        upper_bound_message, lower_bound_message = bound_messages(question)
         prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
         reasoning = await llm_to_use.invoke(prompt)
 
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)  # type: ignore
+        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
 
         # Parse discrete integer classification from reasoning via parser LLM
         qid = question.id_of_question
@@ -956,7 +1130,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
         if qid is not None:
-            vote_label = {True: "DISCRETE", False: "CONTINUOUS"}.get(discrete_vote, "PARSE_FAILED")
+            vote_labels = {True: "DISCRETE", False: "CONTINUOUS"}
+            vote_label = vote_labels.get(discrete_vote, "PARSE_FAILED")  # type: ignore[arg-type]  # dict keyed on bool; None key falls through to default
             logger.info(
                 "Discrete vote for Q %s | model=%s | vote=%s",
                 qid,
@@ -1003,9 +1178,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         log_final_prediction(prediction, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
-        return bound_messages(question)
-
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""
         if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
@@ -1025,7 +1197,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if snapped is None:
             logger.info("Discrete snap returned None for Q %s (guard condition), keeping original", qid)
             return prediction
-        return snapped  # type: ignore[return-value]
+        return snapped  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         model_name = llm_to_use.model

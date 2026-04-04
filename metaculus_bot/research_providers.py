@@ -1,15 +1,16 @@
 """Research provider strategy abstraction.
 
-`choose_provider` returns an async callable that, given a question text, returns
-formatted research.  The selection is governed by environment variables so the
-logic lives in one place instead of being in `TemplateForecaster.run_research`.
+`choose_provider_with_name` returns an async callable (and its name) that, given
+a question text, returns formatted research.  The selection is governed by
+environment variables so the logic lives in one place instead of being in
+`TemplateForecaster.run_research`.
 """
 
 import asyncio
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from forecasting_tools import GeneralLlm, SmartSearcher
@@ -25,11 +26,6 @@ from metaculus_bot.constants import (
 QuestionText = str
 ResearchCallable = Callable[[QuestionText], Awaitable[str]]
 logger = logging.getLogger(__name__)
-
-
-class ResearchProvider(Protocol):
-    async def __call__(self, question_text: str) -> str:  # pragma: no cover
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +265,36 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
     return _fetch
 
 
+def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
+    """Build a GeneralLlm configured for Grok native web search via OpenRouter.
+
+    Shared by the native search research provider and the targeted research module.
+    """
+    from metaculus_bot.constants import (
+        NATIVE_SEARCH_CONTEXT_SIZE,
+        NATIVE_SEARCH_DEFAULT_MODEL,
+        NATIVE_SEARCH_MAX_RESULTS,
+        NATIVE_SEARCH_MAX_TOKENS,
+        NATIVE_SEARCH_MODEL_ENV,
+        NATIVE_SEARCH_TEMPERATURE,
+        NATIVE_SEARCH_TIMEOUT,
+        NATIVE_SEARCH_TOP_P,
+    )
+
+    base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
+    model_with_search = f"openrouter/{base_model}"
+
+    return GeneralLlm(
+        model=model_with_search,
+        temperature=NATIVE_SEARCH_TEMPERATURE,
+        top_p=NATIVE_SEARCH_TOP_P,
+        max_tokens=NATIVE_SEARCH_MAX_TOKENS,
+        timeout=NATIVE_SEARCH_TIMEOUT,
+        plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
+        web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
+    )
+
+
 def _native_search_provider(
     model_slug: str | None = None,
     is_benchmarking: bool = False,
@@ -276,36 +302,7 @@ def _native_search_provider(
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
-        from metaculus_bot.constants import (
-            NATIVE_SEARCH_CONTEXT_SIZE,
-            NATIVE_SEARCH_DEFAULT_MODEL,
-            NATIVE_SEARCH_MAX_RESULTS,
-            NATIVE_SEARCH_MAX_TOKENS,
-            NATIVE_SEARCH_MODEL_ENV,
-            NATIVE_SEARCH_TEMPERATURE,
-            NATIVE_SEARCH_TIMEOUT,
-            NATIVE_SEARCH_TOP_P,
-        )
-
-        # Determine model - plugins param enables web search, no :online suffix needed
-        base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
-        model_with_search = f"openrouter/{base_model}"
-
-        llm = GeneralLlm(
-            model=model_with_search,
-            temperature=NATIVE_SEARCH_TEMPERATURE,
-            top_p=NATIVE_SEARCH_TOP_P,
-            max_tokens=NATIVE_SEARCH_MAX_TOKENS,
-            timeout=NATIVE_SEARCH_TIMEOUT,
-            plugins=[
-                {
-                    "id": "web",
-                    "max_results": NATIVE_SEARCH_MAX_RESULTS,
-                    "engine": "native",
-                }
-            ],
-            web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
-        )
+        llm = build_native_search_llm(model_slug)
 
         # Exclude prediction markets when benchmarking to avoid data leakage
         if is_benchmarking:
@@ -342,12 +339,16 @@ QUESTION:
 
 Provide a factual research summary with citations:"""
 
-        logger.info(f"NativeSearch: Calling {model_with_search} for research")
+        logger.info(f"NativeSearch: Calling {llm.model} for research")
         result = await llm.invoke(prompt)
-        logger.info(f"NativeSearch: Got {len(result)} chars from {model_with_search}")
+        logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
         return result
 
     return _fetch
+
+
+# Public alias for the native search provider (used by tests and external callers)
+native_search_provider = _native_search_provider
 
 
 # ---------------------------------------------------------------------------
@@ -419,23 +420,6 @@ def choose_provider_with_name(
         return ""
 
     return _empty, "none"
-
-
-def choose_provider(
-    default_llm: GeneralLlm | None = None,
-    exa_callback: ResearchCallable | None = None,
-    perplexity_callback: ResearchCallable | None = None,
-    openrouter_callback: ResearchCallable | None = None,
-    is_benchmarking: bool = False,
-) -> ResearchCallable:
-    provider, _ = choose_provider_with_name(
-        default_llm=default_llm,
-        exa_callback=exa_callback,
-        perplexity_callback=perplexity_callback,
-        openrouter_callback=openrouter_callback,
-        is_benchmarking=is_benchmarking,
-    )
-    return provider
 
 
 # ---------------------------------------------------------------------------

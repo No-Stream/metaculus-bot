@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Sequence
+from collections.abc import Sequence
 
 from forecasting_tools import PredictedOptionList
 
@@ -47,7 +47,7 @@ def build_mc_prediction(
             accum[canonical] = accum.get(canonical, 0.0) + float(item.probability)
 
     # Create list in allowed order, skipping truly missing options
-    pairs: List[tuple[str, float]] = [(name, accum[name]) for name in allowed_options if name in accum]
+    pairs: list[tuple[str, float]] = [(name, accum[name]) for name in allowed_options if name in accum]
 
     # If everything was filtered out, fall back to an even distribution over allowed options
     if not pairs and allowed_options:

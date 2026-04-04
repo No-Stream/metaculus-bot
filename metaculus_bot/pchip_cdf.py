@@ -5,8 +5,9 @@ Based on the battle-tested implementation from panchul (Q2 2025 competition winn
 Provides smooth, monotonic CDF construction with strict constraints enforcement.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Dict, List, Optional, Union
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
@@ -66,7 +67,7 @@ def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.nda
     return new_cdf
 
 
-def _safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool, min_step: float) -> np.ndarray:
+def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool, min_step: float) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
     • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
@@ -110,8 +111,8 @@ def _safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool, min_st
 
 
 def enforce_strict_increasing(
-    percentile_dict: Dict[Union[int, float], float],
-) -> Dict[Union[int, float], float]:
+    percentile_dict: dict[int | float, float],
+) -> dict[int | float, float]:
     """Ensure strictly increasing values by adding tiny jitter if necessary."""
     sorted_items = sorted(percentile_dict.items())
     last_val = -float("inf")
@@ -127,18 +128,18 @@ def enforce_strict_increasing(
 
 
 def generate_pchip_cdf(
-    percentile_values: Dict[Union[int, float], float],
+    percentile_values: dict[int | float, float],
     open_upper_bound: bool,
     open_lower_bound: bool,
     upper_bound: float,
     lower_bound: float,
-    zero_point: Optional[float] = None,
+    zero_point: float | None = None,
     *,
     min_step: float = 5.0e-5,
     num_points: int = 201,
-    question_id: Optional[Union[int, str]] = None,
-    question_url: Optional[str] = None,
-) -> tuple[List[float], bool]:
+    question_id: int | str | None = None,
+    question_url: str | None = None,
+) -> tuple[list[float], bool]:
     """
     Generate a robust continuous CDF using PCHIP interpolation with strict constraint enforcement.
 
@@ -334,7 +335,7 @@ def generate_pchip_cdf(
     cdf_y = enforce_min_steps(cdf_y, min_step)
 
     # Apply boundary constraints and max jump rules
-    cdf_y = _safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step)
+    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step)
 
     # Check if we have enough room for minimum steps
     required_range = (len(cdf_y) - 1) * min_step
@@ -447,7 +448,7 @@ def generate_pchip_cdf(
     return cdf_y.tolist(), aggressive_enforcement_used
 
 
-def percentiles_to_pchip_format(percentiles: List) -> Dict[float, float]:
+def percentiles_to_pchip_format(percentiles: list) -> dict[float, float]:
     """
     Convert forecasting-tools Percentile objects to PCHIP input format.
 

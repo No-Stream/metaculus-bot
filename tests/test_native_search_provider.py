@@ -20,14 +20,15 @@ async def test_native_search_provider_constructs_correct_model_name(
         def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
             nonlocal captured_model
             captured_model = model
+            self.model = model
 
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
     with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
-        from metaculus_bot.research_providers import _native_search_provider
+        from metaculus_bot.research_providers import native_search_provider
 
-        provider = _native_search_provider()
+        provider = native_search_provider()
         await provider("Will X happen?")
 
     assert captured_model == "openrouter/x-ai/grok-4.1-fast"
@@ -44,14 +45,15 @@ async def test_native_search_provider_uses_custom_model_slug(
         def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
             nonlocal captured_model
             captured_model = model
+            self.model = model
 
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
     with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
-        from metaculus_bot.research_providers import _native_search_provider
+        from metaculus_bot.research_providers import native_search_provider
 
-        provider = _native_search_provider(model_slug="openai/gpt-4o")
+        provider = native_search_provider(model_slug="openai/gpt-4o")
         await provider("Will X happen?")
 
     assert captured_model == "openrouter/openai/gpt-4o"
@@ -66,7 +68,7 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt
@@ -74,9 +76,9 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
             return "Mock research response"
 
     with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
-        from metaculus_bot.research_providers import _native_search_provider
+        from metaculus_bot.research_providers import native_search_provider
 
-        provider = _native_search_provider(is_benchmarking=False)
+        provider = native_search_provider(is_benchmarking=False)
         await provider("Will X happen?")
 
     assert captured_prompt is not None
@@ -92,7 +94,7 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt
@@ -100,9 +102,9 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
             return "Mock research response"
 
     with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
-        from metaculus_bot.research_providers import _native_search_provider
+        from metaculus_bot.research_providers import native_search_provider
 
-        provider = _native_search_provider(is_benchmarking=True)
+        provider = native_search_provider(is_benchmarking=True)
         await provider("Will X happen?")
 
     assert captured_prompt is not None
@@ -118,7 +120,7 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
 
     class MockLlm:
         def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
-            pass
+            self.model = kwargs.get("model", "mock")
 
         async def invoke(self, prompt: str) -> str:
             nonlocal captured_prompt
@@ -126,9 +128,9 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
             return "Mock research response"
 
     with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
-        from metaculus_bot.research_providers import _native_search_provider
+        from metaculus_bot.research_providers import native_search_provider
 
-        provider = _native_search_provider()
+        provider = native_search_provider()
         await provider("Will X happen?")
 
     assert captured_prompt is not None
@@ -145,6 +147,7 @@ class TestParallelProviderSelection:
     ) -> None:
         """Verify only primary provider returned when native search disabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.delenv("FINANCIAL_DATA_ENABLED", raising=False)
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
@@ -174,6 +177,7 @@ class TestParallelProviderSelection:
         """Verify native search provider added when enabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")
         monkeypatch.setenv("NATIVE_SEARCH_MODEL", "x-ai/grok-4.1-fast")
+        monkeypatch.delenv("FINANCIAL_DATA_ENABLED", raising=False)
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 

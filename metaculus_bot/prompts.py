@@ -9,11 +9,13 @@ from forecasting_tools import (
 
 __all__ = [
     "binary_prompt",
+    "disagreement_crux_prompt",
     "multiple_choice_prompt",
     "numeric_prompt",
     "stacking_binary_prompt",
     "stacking_multiple_choice_prompt",
     "stacking_numeric_prompt",
+    "targeted_search_prompt",
 ]
 
 
@@ -53,15 +55,21 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             ── Analysis Template ──
 
+            PHASE 0: PRELIMINARY CHECK
+
+            0) Resolution check
+               • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
+
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
             1) Source analysis (focus on historical context section)
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
 
-            2) Reference class (outside view) analysis
+            2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
+               • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -85,7 +93,8 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
-               • Status-quo nudge: the world usually changes slowly—justify any deviation from status quo expectations.
+               • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
+               • Quantitative anchor: if you computed a probability from data (z-score, historical frequency, regression, etc.), state that number and explain how your final answer relates to it. If you're adjusting away from a data-derived probability, name the specific reason.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
@@ -94,7 +103,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
             • Top 3-5 evidence items + quick factual validity check.
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
-            • Status-quo nudge sanity check.
+            • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
             [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
@@ -179,7 +188,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         • State the outside-view distribution used as anchor.
         • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
         • Top 3-5 evidence items + quick factual validity check.
-        • Blind-spot statement; status-quo nudge sanity check.
+        • Blind-spot statement; trajectory check sanity check.
 
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
@@ -205,8 +214,13 @@ def numeric_prompt(
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your prediction interval) are critical.
-        Historically, LLMs like you are overconfident and produce excessively narrow prediction intervals,
-        so you should aim to produce wider and less confident predictions. Given the mathematics of log score, penalties for narrow intervals are severe.
+        Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
+        relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
+        For stable, well-measured indicators with recent data (economic indices, demographic measures,
+        climate data), anchor tightly to recent observations with historically-appropriate variance.
+        Do not over-hedge on quantities you can actually predict well.
+        Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
+        but penalties for overly wide intervals on predictable quantities also accumulate.
         Please consider news, research, and prediction markets, but you are not beholden to them.
 
         ── Question ──
@@ -242,13 +256,15 @@ def numeric_prompt(
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
-        (1) Source analysis (focus on historical context section)
+        (1) Source analysis and data anchor
             - Summarize key sources; note recency, credibility, and scope.
             - Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+            - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
-        (2) Outside view and reference classes
+        (2) Outside view and quantitative modeling
             - Candidate reference classes and suitability.
             - State the outside view range and how you anchor to it.
+            - If the data supports it, perform an explicit quantitative estimate: extrapolate recent trends, compute historical mean and variance, or fit a simple model. A rough calculation from data is more reliable than an intuitive range estimate.
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
@@ -276,7 +292,8 @@ def numeric_prompt(
             - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
             - Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
-            - Status quo nudge: justify deviations from status quo expectations.
+            - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
+            - Quantitative anchor: if you derived a central estimate or range from data, state it and explain how your final percentiles relate to it.
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
@@ -293,6 +310,21 @@ def numeric_prompt(
             OUTCOME_TYPE: DISCRETE
             OUTCOME_TYPE: CONTINUOUS
 
+        (9b) Forecastability classification
+            How inherently predictable is this quantity on the given time horizon?
+            - HIGH: stable indicator with recent data, low historical variance
+              (e.g., monthly unemployment rate, home price index, CO2 concentration)
+            - MEDIUM: event-based or moderately variable
+              (e.g., election results, quarterly earnings, box office)
+            - LOW: volatile or near-random on this horizon
+              (e.g., 2-week stock/futures returns, financial spreads, novel metrics)
+            Output exactly one of:
+            FORECASTABILITY: HIGH
+            FORECASTABILITY: MEDIUM
+            FORECASTABILITY: LOW
+            For LOW forecastability, your IQR should span a large fraction of the allowed range.
+            For HIGH, your IQR can be as narrow as the historical data justifies.
+
         (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
@@ -301,8 +333,9 @@ def numeric_prompt(
             - Consistency line about which percentile corresponds to the status quo or trend.
             - Top 3 to 5 evidence items plus a quick factual validity check.
             - Blind spot scenario and expected effect on tails.
-            - Status quo nudge sanity check.
-            - Remember: given the mathematics of log score, penalties for overconfident, narrow intervals are severe.
+            - Trajectory check sanity check: does your prediction align with the most likely trajectory?
+            - Forecastability check: does your interval width match the forecastability classification?
+            - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
         Prediction:
         [Reminders:
@@ -557,5 +590,52 @@ def stacking_numeric_prompt(
         Percentile 90: [value]
         Percentile 95: [value]
         Percentile 97.5: [value]
+        """
+    )
+
+
+def disagreement_crux_prompt(question_text: str, base_predictions: list[str]) -> str:
+    """Prompt for a cheap model to extract the core factual disagreement between forecaster analyses."""
+    predictions_text = "\n".join([f"Forecaster {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+
+    return clean_indents(
+        f"""
+        Multiple forecasters analyzed the same question and produced significantly different predictions.
+
+        Question:
+        {question_text}
+
+        ── Forecaster Analyses ──
+        {predictions_text}
+
+        Read the analyses above. They disagree. Identify the core factual question(s) driving
+        the disagreement — what specific facts, data points, or events do the forecasters
+        interpret differently or assume differently about?
+
+        Output ONLY the factual question(s), in 1-3 sentences. Do not forecast, do not give
+        opinions, do not explain your reasoning.
+        """
+    )
+
+
+def targeted_search_prompt(crux: str, question_text: str, *, is_benchmarking: bool = False) -> str:
+    """Prompt for Grok with native search to resolve a specific factual disagreement."""
+    benchmarking_warning = (
+        "\n\nIMPORTANT: This is a benchmarking run. DO NOT search for or include prediction "
+        "market odds, forecasts, or betting lines — this would constitute data leakage."
+        if is_benchmarking
+        else ""
+    )
+    return clean_indents(
+        f"""
+        Search the web for current, factual information to resolve this specific question:
+        {crux}
+
+        This is for forecasting the following question:
+        {question_text}
+
+        Focus on: recent official data, primary sources, quantitative evidence, confirmed
+        timelines, and resolution-relevant facts. Include inline citations [source](url)
+        for all claims.{benchmarking_warning}
         """
     )

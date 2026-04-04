@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import logging
-from typing import List, Sequence, Tuple
+from collections.abc import Sequence
 
 from forecasting_tools import (
     BinaryPrediction,
@@ -39,7 +41,7 @@ async def run_stacking_binary(
     question: BinaryQuestion,
     research: str,
     base_texts: Sequence[str],
-) -> Tuple[float, str]:
+) -> tuple[float, str]:
     """Invoke the stacker for a binary question and parse to a decimal probability.
 
     Returns (prediction_in_decimal, meta_reasoning_text).
@@ -68,7 +70,7 @@ async def run_stacking_mc(
     question: MultipleChoiceQuestion,
     research: str,
     base_texts: Sequence[str],
-) -> Tuple[PredictedOptionList, str]:
+) -> tuple[PredictedOptionList, str]:
     """Invoke the stacker for a multiple choice question and parse options.
 
     Returns (PredictedOptionList, meta_reasoning_text).
@@ -96,7 +98,7 @@ async def run_stacking_mc(
             logger.warning(f"MC clamp/renormalize failed: {e}")
     except Exception as e:
         logger.warning(f"Primary MC structured parse failed: {e}")
-        raw_options: List[OptionProbability] = await structure_output(
+        raw_options: list[OptionProbability] = await structure_output(
             text_to_structure=meta_reasoning,
             output_type=list[OptionProbability],
             model=parser_llm,
@@ -114,7 +116,7 @@ async def run_stacking_numeric(
     base_texts: Sequence[str],
     lower_bound_message: str,
     upper_bound_message: str,
-) -> Tuple[List[Percentile], str]:
+) -> tuple[list[Percentile], str]:
     """Invoke the stacker for a numeric question and parse percentiles.
 
     Returns (declared_percentiles, meta_reasoning_text). The caller should perform
@@ -134,7 +136,7 @@ async def run_stacking_numeric(
         .replace("{lower}", str(question.lower_bound))
         .replace("{upper}", str(question.upper_bound))
     )
-    percentile_list: List[Percentile] = await structure_output(
+    percentile_list: list[Percentile] = await structure_output(
         meta_reasoning, list[Percentile], model=parser_llm, additional_instructions=parse_notes
     )
     return percentile_list, meta_reasoning

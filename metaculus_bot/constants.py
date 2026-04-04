@@ -5,6 +5,8 @@ These are intentionally minimal and focused on operational tuning knobs that
 need to be shared across modules.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from datetime import datetime, timedelta
@@ -146,6 +148,14 @@ NUM_RAMP_K_FACTOR: float = 3.0
 DISCRETE_SNAP_MAX_INTEGERS: int = 200
 DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
+# --- Conditional Stacking Thresholds ---
+# Binary: log-odds spread (max logit - min logit). 1.2 ≈ 20pp near 50%, more sensitive near tails.
+CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD: float = 1.2
+# Multiple choice: max per-option probability spread (max - min across models for worst option).
+CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD: float = 0.20
+# Numeric: max percentile spread normalized by question range (at 10th/50th/90th percentiles).
+CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD: float = 0.15
+
 # --- Native Search Provider ---
 # Environment variable names
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
@@ -160,6 +170,15 @@ NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
+
+# --- Financial Data Provider ---
+FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
+FRED_API_KEY_ENV: str = "FRED_API_KEY"
+FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5-mini"
+FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
+FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
+FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
+FINANCIAL_FRED_LOOKBACK_YEARS: int = 5
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60

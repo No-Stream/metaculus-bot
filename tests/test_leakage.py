@@ -182,10 +182,10 @@ class TestProcessSingleQuestion:
 class TestScreenResearchForLeakage:
     @pytest.mark.asyncio
     @patch("metaculus_bot.backtest.leakage.GeneralLlm")
-    @patch("metaculus_bot.backtest.leakage.choose_provider")
-    async def test_filters_leaked_questions(self, mock_choose_provider, mock_llm_class):
+    @patch("metaculus_bot.backtest.leakage.choose_provider_with_name")
+    async def test_filters_leaked_questions(self, mock_choose_provider_with_name, mock_llm_class):
         mock_provider = AsyncMock(return_value="some research")
-        mock_choose_provider.return_value = mock_provider
+        mock_choose_provider_with_name.return_value = (mock_provider, "mock")
 
         mock_detector = AsyncMock()
         responses = {
@@ -230,10 +230,10 @@ class TestScreenResearchForLeakage:
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.backtest.leakage.GeneralLlm")
-    @patch("metaculus_bot.backtest.leakage.choose_provider")
-    async def test_all_clean_questions_pass_through(self, mock_choose_provider, mock_llm_class):
+    @patch("metaculus_bot.backtest.leakage.choose_provider_with_name")
+    async def test_all_clean_questions_pass_through(self, mock_choose_provider_with_name, mock_llm_class):
         mock_provider = AsyncMock(return_value="research text")
-        mock_choose_provider.return_value = mock_provider
+        mock_choose_provider_with_name.return_value = (mock_provider, "mock")
 
         mock_detector = AsyncMock()
         mock_detector.invoke.return_value = "NO"
@@ -255,8 +255,8 @@ class TestScreenResearchForLeakage:
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.backtest.leakage.GeneralLlm")
-    @patch("metaculus_bot.backtest.leakage.choose_provider")
-    async def test_research_failure_keeps_question_no_cache(self, mock_choose_provider, mock_llm_class):
+    @patch("metaculus_bot.backtest.leakage.choose_provider_with_name")
+    async def test_research_failure_keeps_question_no_cache(self, mock_choose_provider_with_name, mock_llm_class):
         call_count = 0
 
         async def research_side_effect(text: str) -> str:
@@ -266,7 +266,7 @@ class TestScreenResearchForLeakage:
                 raise RuntimeError("API error")
             return "research text"
 
-        mock_choose_provider.return_value = research_side_effect
+        mock_choose_provider_with_name.return_value = (research_side_effect, "mock")
 
         mock_detector = AsyncMock()
         mock_detector.invoke.return_value = "NO"
@@ -288,9 +288,9 @@ class TestScreenResearchForLeakage:
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.backtest.leakage.GeneralLlm")
-    @patch("metaculus_bot.backtest.leakage.choose_provider")
-    async def test_choose_provider_called_with_is_benchmarking(self, mock_choose_provider, mock_llm_class):
-        mock_choose_provider.return_value = AsyncMock(return_value="research")
+    @patch("metaculus_bot.backtest.leakage.choose_provider_with_name")
+    async def test_choose_provider_called_with_is_benchmarking(self, mock_choose_provider_with_name, mock_llm_class):
+        mock_choose_provider_with_name.return_value = (AsyncMock(return_value="research"), "mock")
         mock_detector = AsyncMock()
         mock_detector.invoke.return_value = "NO"
         mock_llm_class.return_value = mock_detector
@@ -301,13 +301,13 @@ class TestScreenResearchForLeakage:
 
         await screen_research_for_leakage(questions, ground_truths)
 
-        mock_choose_provider.assert_called_once_with(is_benchmarking=True)
+        mock_choose_provider_with_name.assert_called_once_with(is_benchmarking=True)
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.backtest.leakage.GeneralLlm")
-    @patch("metaculus_bot.backtest.leakage.choose_provider")
-    async def test_empty_questions_returns_empty(self, mock_choose_provider, mock_llm_class):
-        mock_choose_provider.return_value = AsyncMock(return_value="research")
+    @patch("metaculus_bot.backtest.leakage.choose_provider_with_name")
+    async def test_empty_questions_returns_empty(self, mock_choose_provider_with_name, mock_llm_class):
+        mock_choose_provider_with_name.return_value = (AsyncMock(return_value="research"), "mock")
         mock_llm_class.return_value = AsyncMock()
 
         clean_questions, clean_gts, research_cache = await screen_research_for_leakage([], {})

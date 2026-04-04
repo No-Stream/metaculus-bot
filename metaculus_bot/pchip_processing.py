@@ -1,12 +1,8 @@
-"""
-PCHIP CDF processing utilities for numeric forecasting.
+"""PCHIP interpolation processing for numeric CDFs."""
 
-Extracted from main.py to improve testability and maintainability.
-Contains logic for PCHIP CDF generation, validation, and smoothing.
-"""
+from __future__ import annotations
 
 import logging
-from typing import List, Optional
 
 import numpy as np
 from forecasting_tools import NumericDistribution
@@ -17,13 +13,13 @@ from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_
 from metaculus_bot.numeric_config import (
     PCHIP_CDF_POINTS,
 )
-from metaculus_bot.pchip_cdf import _safe_cdf_bounds
+from metaculus_bot.pchip_cdf import safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
 
 
 # Module-level counters for PCHIP enforcement statistics (per run)
-_pchip_stats = {
+_pchip_stats: dict[str, int] = {
     "total_attempts": 0,
     "successful_without_enforcement": 0,
     "required_aggressive_enforcement": 0,
@@ -42,7 +38,7 @@ def reset_pchip_stats() -> None:
     }
 
 
-def get_pchip_stats() -> dict:
+def get_pchip_stats() -> dict[str, int]:
     """Get current PCHIP statistics."""
     return _pchip_stats.copy()
 
@@ -71,24 +67,11 @@ def log_pchip_summary() -> None:
 
 
 def generate_pchip_cdf_with_smoothing(
-    percentile_list: List[Percentile],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
-    zero_point: Optional[float],
-) -> tuple[List[float], bool, bool]:
-    """
-    Generate PCHIP CDF with optional ramp smoothing.
-
-    Args:
-        percentile_list: List of percentiles to process
-        question: NumericQuestion with bounds information
-        zero_point: Zero point for log scaling (None for linear)
-
-    Returns:
-        Tuple of (pchip_cdf_values, smoothing_applied, aggressive_enforcement_used)
-
-    Raises:
-        ValueError: If PCHIP CDF generation fails validation
-    """
+    zero_point: float | None,
+) -> tuple[list[float], bool, bool]:
+    """Generate PCHIP CDF with optional ramp smoothing."""
     from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 
     # Track attempt
@@ -139,17 +122,8 @@ def generate_pchip_cdf_with_smoothing(
     return pchip_cdf, smoothing_applied, aggressive_enforcement_used
 
 
-def _apply_ramp_smoothing(pchip_cdf: List[float], question: NumericQuestion) -> bool:
-    """
-    Apply ramp smoothing to enforce minimum step size.
-
-    Args:
-        pchip_cdf: CDF values to potentially smooth (modified in place)
-        question: NumericQuestion for bounds information
-
-    Returns:
-        True if smoothing was applied, False otherwise
-    """
+def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> bool:
+    """Apply ramp smoothing to enforce minimum step size."""
     diffs_before = np.diff(pchip_cdf)
     min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
 
@@ -169,7 +143,7 @@ def _apply_ramp_smoothing(pchip_cdf: List[float], question: NumericQuestion) -> 
             smoothed[-1] = min(smoothed[-1], 0.999)
 
         # Enforce max-step constraint post-smoothing
-        smoothed = _safe_cdf_bounds(
+        smoothed = safe_cdf_bounds(
             smoothed,
             open_lower=question.open_lower_bound,
             open_upper=question.open_upper_bound,
@@ -193,17 +167,8 @@ def _apply_ramp_smoothing(pchip_cdf: List[float], question: NumericQuestion) -> 
     return False
 
 
-def _validate_pchip_cdf(pchip_cdf: List[float], question: NumericQuestion) -> None:
-    """
-    Validate PCHIP CDF meets all requirements.
-
-    Args:
-        pchip_cdf: CDF values to validate
-        question: NumericQuestion for bounds validation
-
-    Raises:
-        ValueError: If any validation fails
-    """
+def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> None:
+    """Validate PCHIP CDF meets all requirements."""
     # Check point count
     if len(pchip_cdf) != PCHIP_CDF_POINTS:
         raise ValueError(f"PCHIP CDF has {len(pchip_cdf)} points, expected {PCHIP_CDF_POINTS}")
@@ -241,15 +206,8 @@ def _validate_pchip_cdf(pchip_cdf: List[float], question: NumericQuestion) -> No
         raise ValueError(f"PCHIP CDF open upper bound violation: {pchip_cdf[-1]} > 0.999")
 
 
-def _log_pchip_success(pchip_cdf: List[float], question: NumericQuestion, smoothing_applied: bool) -> None:
-    """
-    Log successful PCHIP CDF generation.
-
-    Args:
-        pchip_cdf: Generated CDF values
-        question: NumericQuestion for logging context
-        smoothing_applied: Whether smoothing was applied
-    """
+def _log_pchip_success(pchip_cdf: list[float], question: NumericQuestion, smoothing_applied: bool) -> None:
+    """Log successful PCHIP CDF generation."""
     min_step = np.min(np.diff(pchip_cdf))
     max_step = np.max(np.diff(pchip_cdf))
 
@@ -266,23 +224,12 @@ def _log_pchip_success(pchip_cdf: List[float], question: NumericQuestion, smooth
 
 
 def create_pchip_numeric_distribution(
-    pchip_cdf: List[float],
-    percentile_list: List[Percentile],
+    pchip_cdf: list[float],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
-    zero_point: Optional[float],
+    zero_point: float | None,
 ) -> NumericDistribution:
-    """
-    Create a custom NumericDistribution that uses PCHIP CDF.
-
-    Args:
-        pchip_cdf: Generated PCHIP CDF values
-        percentile_list: Original percentile list
-        question: NumericQuestion with bounds
-        zero_point: Zero point for scaling
-
-    Returns:
-        NumericDistribution with PCHIP CDF
-    """
+    """Create a custom NumericDistribution that uses PCHIP CDF."""
 
     class PchipNumericDistribution(NumericDistribution):
         def __init__(self, pchip_cdf_values, *args, **kwargs):
@@ -316,21 +263,11 @@ def create_pchip_numeric_distribution(
 
 
 def create_fallback_numeric_distribution(
-    percentile_list: List[Percentile],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
-    zero_point: Optional[float],
+    zero_point: float | None,
 ) -> NumericDistribution:
-    """
-    Create fallback NumericDistribution when PCHIP fails.
-
-    Args:
-        percentile_list: List of percentiles
-        question: NumericQuestion with bounds
-        zero_point: Zero point for scaling
-
-    Returns:
-        Standard NumericDistribution
-    """
+    """Create fallback NumericDistribution when PCHIP fails."""
     return NumericDistribution(
         declared_percentiles=percentile_list,
         open_upper_bound=question.open_upper_bound,

@@ -124,7 +124,7 @@ class TestTailWideningIntegration:
             publish_reports_to_metaculus=False,
         )
 
-        # Minimal numeric question with discrete cdf_size but we still expect 201-point PCHIP CDF
+        # Minimal numeric question with discrete cdf_size — CDF should be resampled to cdf_size
         nq = SimpleNamespace(
             question_text="num?",
             background_info="",
@@ -162,5 +162,5 @@ class TestTailWideningIntegration:
         # CDF is produced and monotone
         cdf = result.prediction_value.cdf  # type: ignore[attr-defined]
         probs = [p.percentile for p in cdf]
-        assert len(cdf) == 201
+        assert len(cdf) == 101
         assert all(a <= b for a, b in zip(probs[:-1], probs[1:]))

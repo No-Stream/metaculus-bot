@@ -1,14 +1,11 @@
-"""
-Percentile validation and processing utilities for numeric forecasting.
+"""Validate numeric predictions against question constraints."""
 
-Extracted from main.py to improve testability and maintainability.
-Contains validation logic for percentile sets and value processing.
-"""
+from __future__ import annotations
 
 import logging
-from typing import List, Tuple
 
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
 from metaculus_bot.numeric_config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
@@ -16,16 +13,8 @@ from metaculus_bot.numeric_config import EXPECTED_PERCENTILE_COUNT, STANDARD_PER
 logger = logging.getLogger(__name__)
 
 
-def validate_percentile_count_and_values(percentile_list: List[Percentile]) -> None:
-    """
-    Validate that we have exactly the expected number of percentiles with the correct values.
-
-    Args:
-        percentile_list: List of Percentile objects to validate
-
-    Raises:
-        ValidationError: If percentile count or values don't match expectations
-    """
+def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> None:
+    """Validate that we have exactly the expected number of percentiles with the correct values."""
     expected_percentiles = set(STANDARD_PERCENTILES)
 
     # Check count
@@ -63,20 +52,12 @@ def validate_percentile_count_and_values(percentile_list: List[Percentile]) -> N
         )
 
 
-def sort_percentiles_by_value(percentile_list: List[Percentile]) -> List[Percentile]:
-    """
-    Sort percentiles by percentile value to ensure proper order.
-
-    Args:
-        percentile_list: List of Percentile objects to sort
-
-    Returns:
-        Sorted list of percentiles
-    """
+def sort_percentiles_by_value(percentile_list: list[Percentile]) -> list[Percentile]:
+    """Sort percentiles by percentile value to ensure proper order."""
     return sorted(percentile_list, key=lambda p: p.percentile)
 
 
-def filter_to_standard_percentiles(percentile_list: List[Percentile]) -> List[Percentile]:
+def filter_to_standard_percentiles(percentile_list: list[Percentile]) -> list[Percentile]:
     """Keep only the standard 11 percentiles {2.5,5,10,20,40,50,60,80,90,95,97.5}.
 
     If extras are present, drop them before validation. If duplicates occur (same percentile
@@ -84,7 +65,7 @@ def filter_to_standard_percentiles(percentile_list: List[Percentile]) -> List[Pe
     """
     allowed = {round(p, 6) for p in STANDARD_PERCENTILES}
     seen: set[float] = set()
-    filtered: List[Percentile] = []
+    filtered: list[Percentile] = []
     for p in percentile_list:
         key = round(float(p.percentile), 6)
         if key in allowed and key not in seen:
@@ -94,13 +75,13 @@ def filter_to_standard_percentiles(percentile_list: List[Percentile]) -> List[Pe
 
 
 def detect_unit_mismatch(
-    percentile_list: List[Percentile],
-    question,
+    percentile_list: list[Percentile],
+    question: NumericQuestion,
     *,
     span_ratio_threshold: float = 1e-5,
     min_step_ratio_threshold: float = 1e-8,
     max_magnitude_ratio_threshold: float = 1e-5,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     Heuristically detect likely unit/scale mismatch.
 
@@ -149,17 +130,8 @@ def detect_unit_mismatch(
         return False, ""
 
 
-def check_discrete_question_properties(question, cdf_points: int) -> tuple[bool, bool]:
-    """
-    Check if a question is discrete and determine zero_point handling.
-
-    Args:
-        question: NumericQuestion object
-        cdf_points: Number of points expected in CDF (e.g., 201)
-
-    Returns:
-        Tuple of (is_discrete, should_force_zero_point_none)
-    """
+def check_discrete_question_properties(question: NumericQuestion, cdf_points: int) -> tuple[bool, bool]:
+    """Check if a question is discrete and determine zero_point handling."""
     cdf_size = getattr(question, "cdf_size", None)
     is_discrete = cdf_size is not None and cdf_size != cdf_points
     zero_point = getattr(question, "zero_point", None)

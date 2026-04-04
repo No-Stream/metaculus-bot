@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import List, Tuple
 
+import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
@@ -22,6 +23,7 @@ from metaculus_bot.cluster_processing import (
     detect_count_like_pattern,
     ensure_strictly_increasing_bounded,
 )
+from metaculus_bot.constants import NUM_MIN_PROB_STEP
 from metaculus_bot.numeric_config import (
     PCHIP_CDF_POINTS,
     TAIL_WIDEN_K_TAIL,
@@ -36,6 +38,7 @@ from metaculus_bot.numeric_validation import (
     sort_percentiles_by_value,
     validate_percentile_count_and_values,
 )
+from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 from metaculus_bot.pchip_processing import (
     create_fallback_numeric_distribution,
     create_pchip_numeric_distribution,
@@ -85,6 +88,37 @@ def build_numeric_distribution(
         prediction = create_fallback_numeric_distribution(percentile_list, question, zero_point)
 
     validate_cdf_construction(prediction, question)
+
+    target_cdf_size = getattr(question, "cdf_size", None)
+    if target_cdf_size is not None and target_cdf_size != PCHIP_CDF_POINTS:
+        min_step = max(NUM_MIN_PROB_STEP, 0.01 / max(1, target_cdf_size - 1))
+        pchip_percentiles = percentiles_to_pchip_format(percentile_list)
+        resampled_cdf, _ = generate_pchip_cdf(
+            percentile_values=pchip_percentiles,
+            open_upper_bound=question.open_upper_bound,
+            open_lower_bound=question.open_lower_bound,
+            upper_bound=question.upper_bound,
+            lower_bound=question.lower_bound,
+            zero_point=zero_point,
+            min_step=min_step,
+            num_points=target_cdf_size,
+            question_id=getattr(question, "id_of_question", None),
+            question_url=getattr(question, "page_url", None),
+        )
+        x_disc = np.linspace(question.lower_bound, question.upper_bound, target_cdf_size)
+        declared_percentiles = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_disc, resampled_cdf)]
+        prediction = create_pchip_numeric_distribution(
+            pchip_cdf=list(map(float, resampled_cdf)),
+            percentile_list=declared_percentiles,
+            question=question,
+            zero_point=zero_point,
+        )
+        logger.info(
+            "Discrete resample in build_numeric_distribution | Q %s | 201 -> %d points",
+            getattr(question, "id_of_question", None),
+            target_cdf_size,
+        )
+
     return prediction
 
 

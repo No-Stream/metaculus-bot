@@ -20,6 +20,7 @@ class ForecasterSetup:
     normalized_llms: Dict[str, Any]
     forecaster_llms: List[GeneralLlm]
     stacker_llm: GeneralLlm | None
+    analyzer_llm: GeneralLlm | None
     predictions_per_report: int
 
 
@@ -69,18 +70,35 @@ def prepare_llm_config(
             logger.warning("'stacker' key in llms must be a GeneralLlm object.")
         normalized_llms.pop("stacker", None)
 
+    analyzer_llm: GeneralLlm | None = None
+    if "analyzer" in normalized_llms:
+        value = normalized_llms["analyzer"]
+        if isinstance(value, GeneralLlm):
+            analyzer_llm = value
+        else:
+            logger.warning("'analyzer' key in llms must be a GeneralLlm object.")
+        normalized_llms.pop("analyzer", None)
+
     required_keys = {"default", "parser", "researcher", "summarizer"}
     missing = sorted(k for k in required_keys if k not in normalized_llms)
     if missing:
         raise ValueError(f"Missing required LLM purposes: {', '.join(missing)}. Provide these in the 'llms' config.")
 
-    if aggregation_strategy == AggregationStrategy.STACKING and stacker_llm and forecaster_llms:
+    if (
+        aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
+        and stacker_llm
+        and forecaster_llms
+    ):
         normalized_llms["default"] = stacker_llm
+
+    if aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and analyzer_llm is None:
+        raise ValueError("CONDITIONAL_STACKING requires an 'analyzer' LLM in the llms config")
 
     return ForecasterSetup(
         normalized_llms=normalized_llms,
         forecaster_llms=forecaster_llms,
         stacker_llm=stacker_llm,
+        analyzer_llm=analyzer_llm,
         predictions_per_report=effective_predictions,
     )
 

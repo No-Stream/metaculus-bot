@@ -5,6 +5,8 @@ Tracks inter-model correlations to optimize ensemble composition by balancing
 performance with diversity.
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from enum import Enum
