@@ -3,19 +3,9 @@
 import logging
 import re
 
-logger: logging.Logger = logging.getLogger(__name__)
+from metaculus_bot.llm_configs import FORECASTER_MODEL_NAMES as MODEL_NAMES
 
-# Current model roster (from llm_configs.py). Index matches the Forecaster N label.
-# NOTE: This reflects the CURRENT config. Historical data may have fewer models.
-# The parser handles missing models gracefully.
-MODEL_NAMES: list[str] = [
-    "gpt-5.4",
-    "gpt-5.1",
-    "claude-4.6-opus",
-    "claude-opus-4.5",
-    "gemini-3.1-pro-preview",
-    "grok-4.1-fast",
-]
+logger: logging.Logger = logging.getLogger(__name__)
 
 # Index-to-name mapping (Forecaster labels are 1-indexed)
 _MODEL_MAP: dict[int, str] = {i + 1: name for i, name in enumerate(MODEL_NAMES)}
@@ -51,7 +41,6 @@ def parse_per_model_forecasts(
 def parse_resolution(
     resolution_raw: str,
     question_type: str,
-    options: list[str] | None = None,
 ) -> tuple[bool | float | str | None, bool]:
     """Parse raw resolution string into a typed value.
 

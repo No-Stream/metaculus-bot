@@ -4,34 +4,38 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ## Near-term (worth exploring soon)
 
-### Supervisor agent for high-disagreement questions
+### ~~Supervisor agent for high-disagreement questions~~ DONE
 
-When model spread exceeds a threshold (e.g., 20pp on binary), trigger additional research
-and a meta-analysis to adjudicate the disagreement, rather than blindly taking the median.
+Implemented as conditional stacking (`AggregationStrategy.CONDITIONAL_STACKING`).
 
-Evidence: our analysis found model disagreement strongly predicts error (Spearman rho=0.58,
-p=0.005). High-disagreement questions score 2.6x worse. Smingers (Deep Thonks) uses an
-Opus-level supervisor for this, invoked ~1 in 6 forecasts, with modest but targeted
-improvements (avg 2.3pp adjustment).
+### ~~Financial data tool access (yFinance, FRED)~~ DONE
 
-We already have stacking mode (`AggregationStrategy.STACKING`) with prompts in `prompts.py`.
-Could enable it conditionally based on ensemble spread.
+Implemented as `financial_data_provider.py`.
 
-Implementation: detect spread after initial predictions, conditionally invoke stacking
-meta-model with additional research. Moderate effort.
+### Second-pass web search + scrape pipeline
 
-### Financial data tool access (yFinance, FRED)
+Our first-pass research (AskNews API dump, Grok native search) is a black box — we can't
+control what gets fetched, can't parse PDFs or JS-heavy pages, and can't follow up on gaps.
+A second pass with full-control scraping would address this.
 
-Our worst question category is volatile financial instruments (mean log score -5.8 vs +85.4
-for stable indicators). A key reason: web search returns narrative articles rather than
-actual price/indicator data.
+**Three use cases for the second pass:**
 
-Adding direct API access to yFinance (stock prices, returns, volatility), FRED (economic
-indicators), and possibly Google Trends would give the research phase hard data to anchor on.
-Smingers found specialized data tools were "more powerful than prompts."
+1. **Gap-filling**: After initial research + forecasting, identify information gaps or
+   unanswered questions from the first pass and run targeted searches to fill them.
+2. **Resolution source reading**: Many questions include specific resolution source URLs
+   in the fine print. Directly scraping the authoritative source (e.g., a government
+   dataset, a specific report) gives ground-truth current state instead of secondhand
+   summaries.
+3. **Reopening inaccessible sources**: The first-pass research often surfaces URLs that
+   the bot can't open (PDFs, paywalled content, JS-rendered pages). The forecasting
+   prompt should instruct models to flag interesting sources they couldn't access, so
+   the second pass can scrape them with more sophisticated tools.
 
-Needs: add yfinance + fredapi as dependencies, create a research provider or tool that
-fetches relevant data based on question classification.
+**Tool candidates**: Olostep (cheaper, PAYG) or Firecrawl (pricier but the industry norm).
+Both handle PDFs, JS rendering, and give full control over what gets fetched.
+
+**Architecture**: Runs after the initial research phase, before (or as input to) forecasting.
+Could also feed into the stacking pass for high-disagreement questions. Moderate effort.
 
 ### Separate outside/inside view stages
 
