@@ -199,7 +199,7 @@ def _process_single_question(
         logger.info(f"  Skipping Q{question_id} (no resolution)")
         return None
 
-    resolution_parsed, should_skip = parse_resolution(str(resolution_raw), q_type, q.get("options"))
+    resolution_parsed, should_skip = parse_resolution(str(resolution_raw), q_type)
     if should_skip:
         logger.info(f"  Skipping Q{question_id}: resolution={resolution_raw}")
         return None

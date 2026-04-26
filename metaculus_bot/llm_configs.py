@@ -10,6 +10,7 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 
 __all__ = [
     "FORECASTER_LLMS",
+    "FORECASTER_MODEL_NAMES",
     "SUMMARIZER_LLM",
     "PARSER_LLM",
     "RESEARCHER_LLM",
@@ -55,19 +56,20 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.2",
+        model="openrouter/openai/gpt-5.5",
         reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.5",
+        model="openrouter/anthropic/claude-opus-4.7",
         reasoning={"enabled": True},
         extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.6",
-        reasoning={"max_tokens": 16_000},
+        reasoning={"enabled": True},
+        extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
@@ -79,6 +81,18 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         **REASONING_MODEL_CONFIG,
     ),
 ]
+
+
+def _forecaster_display_name(llm: GeneralLlm) -> str:
+    """Short label for a forecaster (e.g. 'claude-opus-4.7') — strips the 'openrouter/<provider>/' prefix.
+
+    Used by performance_analysis.parsing to map 'Forecaster N' labels in bot comments
+    back to a model name without having to hand-maintain a parallel list.
+    """
+    return llm.model.rsplit("/", 1)[-1]
+
+
+FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview", timeout=120)
 # Parser should be a reliable, low-latency model for structure extraction
@@ -93,8 +107,9 @@ RESEARCHER_LLM = build_llm_with_openrouter_fallback(model="openrouter/google/gem
 
 # Stacker meta-model for conditional stacking (invoked only on high-disagreement questions)
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/anthropic/claude-opus-4.6",
-    reasoning={"max_tokens": 16_000},
+    "openrouter/anthropic/claude-opus-4.7",
+    reasoning={"enabled": True},
+    extra_body={"verbosity": "xhigh"},
     **REASONING_MODEL_CONFIG,
 )
 
