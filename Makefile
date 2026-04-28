@@ -1,4 +1,4 @@
-.PHONY: conda_env install test run benchmark lint format precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large
+.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -51,6 +51,18 @@ precommit_all:
 
 test:
 	$(call RUN_UNBUFFERED,-m pytest)
+
+# Verbose test run: shows which tests are running/failing and where, with
+# short tracebacks. Useful when debugging a regression.
+test_verbose:
+	$(call RUN_UNBUFFERED,-m pytest -v --tb=short)
+
+# One-stop pre-merge check: format, lint, then run tests with verbose output.
+# Lint output is informative on violations; tests use -v + short tracebacks so
+# you can see which test failed and why without wading through bare pass/fail.
+# Recipes run sequentially (default make behavior); if any step fails the
+# subsequent steps don't run, so failures surface immediately.
+all: format lint test_verbose
 
 run:
 	$(call RUN_UNBUFFERED,main.py)

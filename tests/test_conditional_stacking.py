@@ -82,11 +82,11 @@ class TestConditionalStackingBinaryTrigger:
 
     @pytest.mark.asyncio
     async def test_high_spread_triggers_stacking(self):
-        """High log-odds spread (>1.2) should trigger the full stacking pipeline."""
+        """High prob-range spread (>0.15) should trigger the full stacking pipeline."""
         bot = _make_bot()
         question = _make_binary_question()
 
-        # Predictions: 0.10 and 0.85 -> log-odds spread ~3.6, well above 1.2 threshold
+        # Predictions: 0.10 and 0.85 -> prob range 0.75, well above 0.15 threshold
         pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
         pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
 
@@ -137,11 +137,11 @@ class TestConditionalStackingBinaryTrigger:
 
     @pytest.mark.asyncio
     async def test_low_spread_skips_stacking(self):
-        """Low log-odds spread (<1.2) should skip stacking and return all individual predictions."""
+        """Low prob-range spread (<0.15) should skip stacking and return all individual predictions."""
         bot = _make_bot()
         question = _make_binary_question()
 
-        # Predictions: 0.45 and 0.55 -> log-odds spread ~0.40, below 1.2 threshold
+        # Predictions: 0.45 and 0.55 -> prob range 0.10, below 0.15 threshold
         pred1 = ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nSlightly no.")
         pred2 = ReasonedPrediction(prediction_value=0.55, reasoning="Model: m2\n\nSlightly yes.")
 
@@ -388,11 +388,11 @@ class TestConditionalStackingThresholds:
     async def test_custom_thresholds(self):
         """Very high custom thresholds should prevent stacking even with moderate spread."""
         bot = _make_bot(
-            stacking_spread_thresholds={"binary": 5.0, "mc": 0.90, "numeric": 0.90},
+            stacking_spread_thresholds={"binary": 0.95, "mc": 0.90, "numeric": 0.90},
         )
         question = _make_binary_question()
 
-        # Predictions: 0.20 and 0.80 -> log-odds spread ~2.77, below custom threshold of 5.0
+        # Predictions: 0.20 and 0.80 -> prob range 0.60, below custom threshold 0.95
         pred1 = ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nUnlikely.")
         pred2 = ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nLikely.")
 
@@ -418,15 +418,13 @@ class TestConditionalStackingThresholds:
     @pytest.mark.asyncio
     async def test_spread_just_above_threshold(self):
         """Spread barely above threshold should trigger stacking."""
-        # Default binary threshold is 1.2 log-odds
-        # p=0.35 -> log_odds = ln(0.35/0.65) = -0.619
-        # p=0.65 -> log_odds = ln(0.65/0.35) = +0.619
-        # spread = 0.619 - (-0.619) = 1.238 > 1.2 -> triggers
+        # Default binary threshold is 0.15 probability range (max - min).
+        # 0.40 - 0.24 = 0.16 > 0.15 -> triggers
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred1 = ReasonedPrediction(prediction_value=0.35, reasoning="Model: m1\n\nAnalysis 1")
-        pred2 = ReasonedPrediction(prediction_value=0.65, reasoning="Model: m2\n\nAnalysis 2")
+        pred1 = ReasonedPrediction(prediction_value=0.24, reasoning="Model: m1\n\nAnalysis 1")
+        pred2 = ReasonedPrediction(prediction_value=0.40, reasoning="Model: m2\n\nAnalysis 2")
 
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
@@ -456,15 +454,13 @@ class TestConditionalStackingThresholds:
     @pytest.mark.asyncio
     async def test_spread_just_below_threshold(self):
         """Spread barely below threshold should skip stacking."""
-        # Default binary threshold is 1.2 log-odds
-        # p=0.36 -> log_odds = ln(0.36/0.64) = -0.575
-        # p=0.64 -> log_odds = ln(0.64/0.36) = +0.575
-        # spread = 0.575 - (-0.575) = 1.151 < 1.2 -> skips
+        # Default binary threshold is 0.15 probability range (max - min).
+        # 0.39 - 0.25 = 0.14 < 0.15 -> skips
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred1 = ReasonedPrediction(prediction_value=0.36, reasoning="Model: m1\n\nAnalysis 1")
-        pred2 = ReasonedPrediction(prediction_value=0.64, reasoning="Model: m2\n\nAnalysis 2")
+        pred1 = ReasonedPrediction(prediction_value=0.25, reasoning="Model: m1\n\nAnalysis 1")
+        pred2 = ReasonedPrediction(prediction_value=0.39, reasoning="Model: m2\n\nAnalysis 2")
 
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
@@ -655,13 +651,13 @@ class TestConditionalStackingAggregation:
         bot = _make_bot()
         question = _make_binary_question()
 
-        # 0.40, 0.50, 0.60 -> log-odds spread ~0.81 (max - min), below 1.2 threshold
+        # 0.45, 0.50, 0.55 -> prob range 0.10, below 0.15 threshold
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot._forecaster_llms = [test_llm, test_llm, test_llm]
 
-        pred1 = ReasonedPrediction(prediction_value=0.40, reasoning="Model: m1\n\nAnalysis 1")
+        pred1 = ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nAnalysis 1")
         pred2 = ReasonedPrediction(prediction_value=0.50, reasoning="Model: m2\n\nAnalysis 2")
-        pred3 = ReasonedPrediction(prediction_value=0.60, reasoning="Model: m3\n\nAnalysis 3")
+        pred3 = ReasonedPrediction(prediction_value=0.55, reasoning="Model: m3\n\nAnalysis 3")
 
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,

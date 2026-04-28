@@ -8,16 +8,44 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import (
-    CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD,
+    CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
 )
 from metaculus_bot.spread_metrics import (
     binary_log_odds_spread,
+    binary_prob_range_spread,
     compute_spread,
     mc_max_option_spread,
     numeric_percentile_spread,
 )
+
+# ===========================================================================
+# binary_prob_range_spread (the active trigger metric)
+# ===========================================================================
+
+
+class TestBinaryProbRangeSpread:
+    def test_moderate_disagreement(self):
+        assert binary_prob_range_spread([0.50, 0.68]) == pytest.approx(0.18)
+
+    def test_tail_disagreement(self):
+        assert binary_prob_range_spread([0.01, 0.19]) == pytest.approx(0.18)
+
+    def test_all_same(self):
+        assert binary_prob_range_spread([0.5, 0.5, 0.5]) == 0.0
+
+    def test_six_model_ensemble(self):
+        assert binary_prob_range_spread([0.10, 0.15, 0.25, 0.30, 0.40, 0.55]) == pytest.approx(0.45)
+
+    def test_single_prediction_raises(self):
+        with pytest.raises(ValueError, match="at least 2"):
+            binary_prob_range_spread([0.5])
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="at least 2"):
+            binary_prob_range_spread([])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -272,7 +300,15 @@ class TestComputeSpread:
     def test_binary_dispatch(self):
         question = _make_binary_question()
         spread = compute_spread(question, [0.50, 0.68])
-        assert spread == pytest.approx(binary_log_odds_spread([0.50, 0.68]))
+        assert spread == pytest.approx(binary_prob_range_spread([0.50, 0.68]))
+
+    def test_binary_dispatch_uses_prob_range_not_log_odds(self):
+        # Regression: dispatcher must return prob-range, not log-odds.
+        question = _make_binary_question()
+        spread = compute_spread(question, [0.01, 0.19])
+        # prob-range = 0.18; log-odds ≈ 3.15 — these must differ noticeably
+        assert spread == pytest.approx(0.18, abs=0.01)
+        assert spread != pytest.approx(binary_log_odds_spread([0.01, 0.19]), abs=0.5)
 
     def test_mc_dispatch(self):
         question = _make_mc_question()
@@ -324,6 +360,6 @@ class TestComputeSpread:
 
 class TestConstants:
     def test_threshold_values(self):
-        assert CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD == 1.2
+        assert CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD == 0.15
         assert CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD == 0.20
         assert CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD == 0.15

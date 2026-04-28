@@ -12,7 +12,12 @@ import time
 import requests
 from dotenv import load_dotenv
 
-from metaculus_bot.performance_analysis.parsing import parse_per_model_forecasts, parse_resolution
+from metaculus_bot.performance_analysis.parsing import (
+    parse_per_model_forecasts,
+    parse_per_model_numeric_percentiles,
+    parse_resolution,
+    parse_stacked_marker,
+)
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -172,10 +177,34 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
     comment_id = comment["id"] if comment else None
     per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
+    per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
+    was_stacked = parse_stacked_marker(comment_text) if comment_text else None
+
+    # Cross-signal sanity: a stacked comment should expose at least one
+    # per-model entry via the rationale parsers. If the marker says stacked
+    # but we recovered nothing, the producer-side delimiter likely drifted —
+    # worth surfacing during triage, but only as DEBUG since legitimate cases
+    # (trimmed comments, binary/MC stacked Qs with no percentile restatement)
+    # look the same.
+    if was_stacked is True and not per_model_numeric_percentiles and not per_model:
+        logger.debug(
+            f"Stacked comment yielded no per-model entries: post_id={post_id}, "
+            f"comment_len={len(comment_text) if comment_text else 0}"
+        )
 
     records: list[dict] = []
     for q in questions:
-        record = _process_single_question(post_id, title, q, comment_text, comment_id, per_model, post_data)
+        record = _process_single_question(
+            post_id,
+            title,
+            q,
+            comment_text,
+            comment_id,
+            per_model,
+            per_model_numeric_percentiles,
+            was_stacked,
+            post_data,
+        )
         if record is not None:
             records.append(record)
     return records
@@ -188,6 +217,8 @@ def _process_single_question(
     comment_text: str | None,
     comment_id: int | None,
     per_model: dict[str, str],
+    per_model_numeric_percentiles: dict[str, list[tuple[float, float]]],
+    was_stacked: bool | None,
     post_data: dict,
 ) -> dict | None:
     """Process a single question dict into a scored record."""
@@ -207,10 +238,22 @@ def _process_single_question(
     my_forecasts = q.get("my_forecasts")
     forecast_values = None
     prob_yes = None
+    metaculus_scores: dict | None = None
     if my_forecasts and my_forecasts.get("latest"):
         forecast_values = my_forecasts["latest"].get("forecast_values")
         if q_type == "binary" and forecast_values and len(forecast_values) >= 2:
             prob_yes = forecast_values[1]
+        raw_sd = my_forecasts.get("score_data")
+        if raw_sd:
+            metaculus_scores = {
+                "peer_score": raw_sd.get("peer_score"),
+                "spot_peer_score": raw_sd.get("spot_peer_score"),
+                "baseline_score": raw_sd.get("baseline_score"),
+                "spot_baseline_score": raw_sd.get("spot_baseline_score"),
+                "coverage": raw_sd.get("coverage"),
+                "weighted_coverage": raw_sd.get("weighted_coverage"),
+                "relative_legacy_score": raw_sd.get("relative_legacy_score"),
+            }
 
     if forecast_values is None:
         logger.info(f"  Skipping Q{question_id}: no forecast from us")
@@ -239,12 +282,25 @@ def _process_single_question(
         "our_forecast_values": forecast_values,
         "our_prob_yes": prob_yes,
         "per_model_forecasts": per_model,
+        # Per-forecaster percentile lists for numeric/discrete questions.
+        # {model_name: [(percentile, value), ...]}. Empty for binary/MC.
+        "per_model_numeric_percentiles": per_model_numeric_percentiles,
+        # Tri-state: True/False when the STACKED=<bool> marker is present in
+        # the comment, None for older comments where the marker didn't exist
+        # and stacking status can't be determined.
+        "was_stacked": was_stacked,
         "scaling": scaling,
         "open_lower_bound": open_lower,
         "open_upper_bound": open_upper,
         "options": options,
         "comment_text": comment_text,
         "comment_id": comment_id,
+        # Metaculus-computed scores from my_forecasts.score_data. Contains
+        # peer_score (ascending: negative = worse than crowd), spot_peer_score,
+        # baseline_score, spot_baseline_score, coverage, weighted_coverage,
+        # relative_legacy_score. None for records fetched before score data
+        # was captured; always populated on fresh pulls of resolved questions.
+        "metaculus_scores": metaculus_scores,
         "metadata": {
             "nr_forecasters": q.get("nr_forecasters", 0),
             "open_time": q.get("open_time"),

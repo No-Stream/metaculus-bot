@@ -2,13 +2,30 @@
 
 import logging
 import math
+from typing import Callable
 
+from scipy.stats import spearmanr
+
+from metaculus_bot.performance_analysis.parsing import _parse_probability
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
+from metaculus_bot.spread_metrics import binary_prob_range_spread
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Type alias: given a list of per-model binary probabilities, return a spread scalar.
+BinarySpreadFn = Callable[[list[float]], float]
+
 # Calibration bucket edges for binary questions
 CALIBRATION_BUCKET_EDGES: list[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+# Case-insensitive substrings matched against the question's category tag.
+_FINANCIAL_CATEGORY_SUBSTRINGS: tuple[str, ...] = (
+    "finance",
+    "economy",
+    "business",
+    "markets",
+    "stock",
+)
 
 
 def _mean(values: list[float]) -> float | None:
@@ -82,7 +99,7 @@ def per_model_binary_scores(data: list[dict]) -> dict[str, dict]:
         per_model = r.get("per_model_forecasts") or {}
         outcome = r["resolution_parsed"]
         for model_name, raw_value in per_model.items():
-            prob = _parse_percentage(raw_value)
+            prob = _parse_probability(raw_value)
             if prob is None:
                 continue
             if model_name not in model_scores:
@@ -104,24 +121,6 @@ def per_model_binary_scores(data: list[dict]) -> dict[str, dict]:
             "count": len(scores),
         }
     return result
-
-
-def _parse_percentage(raw: str) -> float | None:
-    """Parse a percentage string like '72.0%' into a probability."""
-    raw = raw.strip()
-    if raw.endswith("%"):
-        try:
-            return float(raw[:-1]) / 100.0
-        except ValueError:
-            return None
-    try:
-        val = float(raw)
-        # Heuristic: if > 1 it's probably a percentage
-        if val > 1.0:
-            return val / 100.0
-        return val
-    except ValueError:
-        return None
 
 
 def numeric_pit_analysis(data: list[dict]) -> dict:
@@ -236,8 +235,184 @@ def mc_summary(data: list[dict]) -> dict:
     }
 
 
+def no_bias_check(data: list[dict]) -> dict:
+    """Detect systematic NO-bias on binary predictions.
+
+    Returns dict with overall bias_pp (mean_predicted - actual_yes_rate, in
+    percentage points) and a low_range subset (P(yes) in [0.10, 0.30]).
+    """
+    binary = [r for r in data if r["type"] == "binary" and isinstance(r["resolution_parsed"], bool)]
+    if not binary:
+        return {"count": 0}
+
+    probs = [r["our_prob_yes"] for r in binary]
+    outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in binary]
+    mean_predicted = _mean(probs)
+    actual_yes_rate = _mean(outcomes)
+    assert mean_predicted is not None and actual_yes_rate is not None
+    bias_pp = (mean_predicted - actual_yes_rate) * 100.0
+
+    low_range = [r for r in binary if 0.10 <= r["our_prob_yes"] <= 0.30]
+    low_range_summary: dict = {"count": 0}
+    if low_range:
+        lr_probs = [r["our_prob_yes"] for r in low_range]
+        lr_outcomes = [1.0 if r["resolution_parsed"] else 0.0 for r in low_range]
+        lr_mean_pred = _mean(lr_probs)
+        lr_actual = _mean(lr_outcomes)
+        assert lr_mean_pred is not None and lr_actual is not None
+        low_range_summary = {
+            "count": len(low_range),
+            "mean_predicted": lr_mean_pred,
+            "actual_yes_rate": lr_actual,
+            "bias_pp": (lr_mean_pred - lr_actual) * 100.0,
+        }
+
+    return {
+        "count": len(binary),
+        "mean_predicted": mean_predicted,
+        "actual_yes_rate": actual_yes_rate,
+        "bias_pp": bias_pp,
+        "low_range": low_range_summary,
+    }
+
+
+def _is_financial(category: str | None) -> bool:
+    if not category:
+        return False
+    cat_lower = category.lower()
+    return any(sub in cat_lower for sub in _FINANCIAL_CATEGORY_SUBSTRINGS)
+
+
+def financial_vs_nonfinancial_pit(data: list[dict]) -> dict:
+    """Split numeric PIT analysis by financial vs non-financial category."""
+    numeric = [r for r in data if r["type"] in ("numeric", "discrete")]
+    financial = [r for r in numeric if _is_financial((r.get("metadata") or {}).get("category"))]
+    nonfinancial = [r for r in numeric if not _is_financial((r.get("metadata") or {}).get("category"))]
+    return {
+        "financial": numeric_pit_analysis(financial),
+        "nonfinancial": numeric_pit_analysis(nonfinancial),
+    }
+
+
+def stacking_effectiveness(
+    data: list[dict],
+    threshold: float,
+    spread_fn: BinarySpreadFn = binary_prob_range_spread,
+) -> dict:
+    """Bucket binary questions by whether their spread would have triggered stacking.
+
+    On each question, compute the binary spread across per-model forecasts using
+    ``spread_fn`` (default: probability range, matching the production trigger).
+    If that spread is strictly greater than ``threshold``, count it as triggered
+    (comparison uses ``>``, matching the production trigger in main.py).
+    Returns triggered/skipped counts and mean Brier per bucket.
+
+    Note: this does NOT tell us whether the stored ensemble prediction was
+    actually produced via stacking or base aggregation. We can't distinguish
+    those from stored data alone; this is a counterfactual cohort cut showing
+    how the trigger metric correlates with outcome difficulty.
+    """
+    binary = [r for r in data if r["type"] == "binary" and isinstance(r["resolution_parsed"], bool)]
+
+    triggered: list[dict] = []
+    skipped: list[dict] = []
+    for r in binary:
+        per_model = r.get("per_model_forecasts") or {}
+        parsed = [_parse_probability(raw) for raw in per_model.values()]
+        probs = [p for p in parsed if p is not None]
+        if len(probs) < 2:
+            skipped.append(r)
+            continue
+        spread = spread_fn(probs)
+        # strict ">" matches the production trigger in main.py
+        if spread > threshold:
+            triggered.append(r)
+        else:
+            skipped.append(r)
+
+    return {
+        "triggered_count": len(triggered),
+        "skipped_count": len(skipped),
+        "triggered_mean_brier": _mean([r["brier_score"] for r in triggered]),
+        "skipped_mean_brier": _mean([r["brier_score"] for r in skipped]),
+    }
+
+
+def _spearman_rho(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman rank correlation. Returns None for n<3 or degenerate rankings.
+
+    Delegates to scipy's implementation (which handles ties via average-rank).
+    scipy returns NaN for degenerate inputs (constant input, etc.); we surface
+    that as None to match the original semantics.
+    """
+    n = len(xs)
+    if n < 3 or n != len(ys):
+        return None
+    result = spearmanr(xs, ys)
+    rho = float(result.statistic)
+    if math.isnan(rho):
+        return None
+    return rho
+
+
+def disagreement_predicts_error(
+    data: list[dict],
+    spread_fn: BinarySpreadFn = binary_prob_range_spread,
+) -> dict:
+    """Spearman correlation between per-model disagreement and prediction error.
+
+    Pass ``spread_fn=binary_log_odds_spread`` for an alternative spread metric
+    (default is probability range, which correlates more strongly with Brier
+    error in practice).
+
+    Returns dict with computed rho, n, and mean Brier per spread quartile.
+    """
+    binary = [r for r in data if r["type"] == "binary" and r["brier_score"] is not None]
+    paired: list[tuple[float, float]] = []
+    for r in binary:
+        per_model = r.get("per_model_forecasts") or {}
+        parsed = [_parse_probability(raw) for raw in per_model.values()]
+        probs = [p for p in parsed if p is not None]
+        if len(probs) < 2:
+            continue
+        spread = spread_fn(probs)
+        paired.append((spread, r["brier_score"]))
+
+    if not paired:
+        return {"count": 0, "spearman_rho": None}
+
+    spreads = [p[0] for p in paired]
+    briers = [p[1] for p in paired]
+    rho = _spearman_rho(spreads, briers)
+
+    # Quartile buckets on spread
+    quartile_briers: dict[str, float | None] = {}
+    if len(paired) >= 4:
+        sorted_pairs = sorted(paired, key=lambda t: t[0])
+        n = len(sorted_pairs)
+        q1 = sorted_pairs[: n // 4]
+        q2 = sorted_pairs[n // 4 : n // 2]
+        q3 = sorted_pairs[n // 2 : 3 * n // 4]
+        q4 = sorted_pairs[3 * n // 4 :]
+        for label, bucket in [("q1_low", q1), ("q2", q2), ("q3", q3), ("q4_high", q4)]:
+            quartile_briers[label] = _mean([p[1] for p in bucket])
+
+    return {
+        "count": len(paired),
+        "spearman_rho": rho,
+        "mean_spread": _mean(spreads),
+        "mean_brier": _mean(briers),
+        "quartile_briers": quartile_briers,
+    }
+
+
 def generate_report(data: list[dict]) -> str:
-    """Generate a markdown summary report combining all analysis functions."""
+    """Baseline markdown report (binary, numeric, MC summaries + per-model binary).
+
+    For extended analyses -- NO-bias check, financial split, stacking effectiveness,
+    disagreement-error correlation -- call those functions directly; see
+    scratch/analysis_2026-04/compute_delta.py for an example.
+    """
     lines: list[str] = []
     lines.append("# Performance Analysis Report")
     lines.append("")

@@ -50,6 +50,62 @@ into inside view for Model B, introducing diversity.
 We could prototype this by having a first pass produce only a base rate + reference class,
 then feeding that explicitly to the second pass. Moderate-to-high effort.
 
+### Post-hoc isotonic calibration on binary predictions
+
+Our performance analyses (2026-Q1 and 2026-Q2) have repeatedly found systematic
+NO-bias in the 10–30% predicted-probability band: Q1 showed −7.3pp overall bias;
+Q2's new cohort showed −22.7pp overall and −59pp in the 0.10–0.30 bucket. Six of
+the eight worst binary misses in Q2 sat in that band. The top 3 worst
+spot_peer misses (post_ids 43131, 41835, 42116) are all failures of this same
+pattern plus correlated LLM priors — ensembling doesn't help when every model
+shares the prior.
+
+Calibration is the statistical fix where prompting is least likely to work,
+because the failure pattern is statistically real across N≥100 questions, not
+vibes from N=3.
+
+**Proposal**: fit a monotonic (isotonic) regression on the combined Q1+Q2
+resolved-binary dataset, mapping the ensemble's aggregate `prob_yes` to a
+calibrated output. Apply the mapping to binary predictions before
+submission.
+
+**Why isotonic and not shrink-toward-50%** (which is the existing bullet in
+"Aggregation strategy improvements"): shrinkage is a single-parameter global
+pull that costs correctly-confident predictions to fix overconfident ones.
+Isotonic is non-parametric and monotonic — it pulls 25% → 40% if that's
+what the data says while leaving 5% and 95% largely alone if those buckets
+are well-calibrated. Much less risk of overcorrection.
+
+**Implementation sketch**:
+
+- Use `sklearn.isotonic.IsotonicRegression` fit on
+  `(our_prob_yes, resolution_as_float)` pairs from
+  `scratch/analysis_2026-04/performance_data.json`.
+- Hold out 20% as validation, report pre/post Brier + log score + PIT
+  calibration.
+- Wrap as a pure transform: `calibrated = iso.transform([raw_prob])[0]`.
+- Store the fitted model in `metaculus_bot/calibration/binary_isotonic.pkl`
+  with a training-date stamp; refit quarterly.
+- Ship behind a feature flag (e.g. `USE_BINARY_CALIBRATION = True` in
+  `metaculus_bot/constants.py`) so we can A/B via the bench runner.
+
+**Risks**:
+
+- **Overfitting to historical cohort**. Isotonic with N=100-200 is noisy;
+  use 5-fold CV to pick breakpoints. If CV Brier is not robustly better
+  than raw, don't ship.
+- **Distribution shift**: next round's question mix may differ. Mitigate
+  by refitting each round, keeping the training set rolling.
+- **Trust erosion**: if the calibration ever silently flips a confident
+  prediction, it'll look like a bug. Log raw + calibrated side-by-side
+  in the bot comment for the first cohort.
+
+**Out of scope**: numeric/MC calibration. Binary only — other question
+types don't have enough resolved data to fit a reliable mapping yet.
+
+Easy-to-moderate effort. The biggest risk is shipping it without proper
+held-out CV.
+
 ### LLM-based forecast self-evaluation
 
 After each forecast, run a cheap model to assess: research relevance, factual accuracy,

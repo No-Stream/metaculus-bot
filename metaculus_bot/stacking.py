@@ -10,10 +10,12 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericQuestion,
     PredictedOptionList,
+    ReasonedPrediction,
     structure_output,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
@@ -33,6 +35,33 @@ def strip_model_tag(text: str) -> str:
         if len(parts) >= 3 and parts[1] == "":
             return parts[2]
     return text
+
+
+def combine_stacker_and_base_reasoning(
+    meta_text: str,
+    base_predictions: Sequence[ReasonedPrediction],
+) -> str:
+    """Build the single 'Forecaster 1' reasoning block for a stacked question.
+
+    When stacking fires, the framework collapses all base predictions into one
+    ``ReasonedPrediction``. To keep the base models' reasoning visible in the
+    published comment (and recoverable by the residual-analysis collector),
+    we fold them below the stacker's meta-analysis. Each base reasoning is
+    already prefixed with ``Model: ...`` (see ``_make_prediction`` in
+    ``main.py``), so downstream parsers can still attribute each block.
+    """
+    sections = [
+        STACKER_META_ANALYSIS_HEADER,
+        "",
+        meta_text,
+        "",
+        STACKED_BASE_REASONING_HEADER,
+        "",
+    ]
+    for pred in base_predictions:
+        sections.append(pred.reasoning)
+        sections.append("")
+    return "\n".join(sections)
 
 
 async def run_stacking_binary(

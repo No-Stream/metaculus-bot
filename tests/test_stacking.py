@@ -491,6 +491,7 @@ class TestStackingMethods:
             # Test binary question routing
             binary_question = Mock(spec=BinaryQuestion)
             binary_question.id_of_question = 101
+            binary_question.page_url = "https://example.com/q/101"
             binary_question.question_text = "Test binary question?"
             binary_question.background_info = "Test background"
             binary_question.resolution_criteria = "Test resolution criteria"
@@ -519,6 +520,7 @@ class TestStackingMethods:
             mc_question.background_info = "Test background"
             mc_question.resolution_criteria = "Test resolution criteria"
             mc_question.fine_print = "Test fine print"
+            mc_question.page_url = "https://example.com/q/102"
             mc_question.options = ["A", "B", "C"]
             result = await bot._run_stacking(mc_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
@@ -537,6 +539,7 @@ class TestStackingMethods:
             numeric_question.background_info = "Test background"
             numeric_question.resolution_criteria = "Test resolution criteria"
             numeric_question.fine_print = "Test fine print"
+            numeric_question.page_url = "https://example.com/q/103"
             numeric_question.upper_bound = 100
             numeric_question.lower_bound = 0
             numeric_question.open_upper_bound = False
@@ -574,6 +577,8 @@ class TestStackingMethods:
         from forecasting_tools.data_models.questions import DateQuestion
 
         unsupported_question = Mock(spec=DateQuestion)
+        unsupported_question.id_of_question = 104
+        unsupported_question.page_url = "https://example.com/q/104"
         reasoned_preds = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
 
         with pytest.raises(ValueError, match="Unsupported question type for stacking"):
@@ -872,7 +877,9 @@ class TestStackingGuardsAndReasoning:
 
     @pytest.mark.asyncio
     async def test_stacker_reasoning_propagated(self):
-        """Stacker meta-analysis reasoning should be preserved in final ReasonedPrediction."""
+        """Stacker meta-analysis AND base model reasoning should both be preserved
+        in the final ReasonedPrediction so residual analysis can still attribute
+        per-model forecasts even when stacking overrode the base aggregation."""
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
@@ -908,4 +915,9 @@ class TestStackingGuardsAndReasoning:
 
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.7
-            assert result.predictions[0].reasoning == "Meta-analysis text"
+            reasoning = result.predictions[0].reasoning
+            assert "Meta-analysis text" in reasoning
+            assert "Analysis 1" in reasoning
+            assert "Analysis 2" in reasoning
+            assert "## Stacker Meta-Analysis" in reasoning
+            assert "## Base Model Reasoning" in reasoning

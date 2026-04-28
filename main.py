@@ -33,12 +33,13 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
+from metaculus_bot.comment_markers import STACKED_MARKER_FALSE, STACKED_MARKER_TRUE
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
-    CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD,
+    CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
@@ -54,6 +55,10 @@ from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_
 from metaculus_bot.numeric_utils import bound_messages
 from metaculus_bot.numeric_validation import detect_unit_mismatch
 from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
+from metaculus_bot.performance_analysis.parsing import (
+    annotate_forecaster_bullets_with_models,
+    extract_model_display_name_from_reasoning,
+)
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.research_providers import (
     ResearchCallable,
@@ -121,6 +126,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self.stacking_randomize_order: bool = stacking_randomize_order
         # Per-question storage for stacker meta-analysis reasoning text
         self._stack_meta_reasoning: dict[int, str] = {}
+        # Per-question flag: did this question's final prediction go through the stacker?
+        self._question_was_stacked: dict[int, bool] = {}
         # Diagnostics + state for STACKING base aggregation behavior
         # Tracks per-question expectation that the base aggregator will be called to combine
         # per-research-report, already-stacked outputs.
@@ -140,7 +147,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     f"Unknown stacking_spread_thresholds keys: {unknown_keys}. Valid keys: {_valid_threshold_keys}"
                 )
         self._stacking_spread_thresholds: dict[str, float] = {
-            "binary": CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD,
+            "binary": CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
             "mc": CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
             "numeric": CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
         } | (stacking_spread_thresholds or {})
@@ -208,9 +215,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
         raise ValueError(f"No spread threshold for question type: {type(question).__name__}")
 
     def _register_expected_base_combine(self, question: MetaculusQuestion) -> None:
-        """Register that the framework's base aggregator should expect a combine call for this question."""
-        qkey = question.id_of_question if question.id_of_question is not None else id(question)
-        self._stack_expected_base_combine.add(qkey)
+        """Register that the framework's base aggregator should expect a combine call for this question.
+
+        Relies on the assertion at the top of ``_research_and_make_predictions`` that
+        ``question.id_of_question is not None`` — so that upstream stacking state-dict
+        ops (``self._question_was_stacked[qid]``, ``self._stack_meta_reasoning[qid]``)
+        and this set's key stay consistent. A silent fallback to ``id(question)`` here
+        would let the keys desync if upstream keying ever changed.
+        """
+        self._stack_expected_base_combine.add(question.id_of_question)
 
     async def forecast_questions(
         self,
@@ -262,6 +275,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             raise ValueError("No stacker LLM configured")
         stacker_llm = self._stacker_llm  # Bind to local for type narrowing
 
+        page_url = question.page_url or "<unknown>"
+        qid = question.id_of_question
+
         # Strip model names from reasoning and prepare base predictions
         base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
 
@@ -282,9 +298,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 research,
                 base_predictions,
             )
-            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
-            self._stack_meta_reasoning[question.id_of_question] = meta_text
-            logger.info(f"Stacked binary prediction for {getattr(question, 'page_url', '<unknown>')}: {value}")
+            self._log_llm_output(stacker_llm, qid, meta_text)
+            self._stack_meta_reasoning[qid] = meta_text
+            logger.info(f"Stacked binary prediction for {page_url}: {value}")
             return value
         elif isinstance(question, MultipleChoiceQuestion):
             pol, meta_text = await stacking.run_stacking_mc(
@@ -294,9 +310,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 research,
                 base_predictions,
             )
-            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
-            self._stack_meta_reasoning[question.id_of_question] = meta_text
-            logger.info(f"Stacked multiple choice prediction for {getattr(question, 'page_url', '<unknown>')}: {pol}")
+            self._log_llm_output(stacker_llm, qid, meta_text)
+            self._stack_meta_reasoning[qid] = meta_text
+            logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
             return pol
         elif isinstance(question, NumericQuestion):
             upper_msg, lower_msg = bound_messages(question)
@@ -309,8 +325,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 lower_msg,
                 upper_msg,
             )
-            self._log_llm_output(stacker_llm, question.id_of_question, meta_text)
-            self._stack_meta_reasoning[question.id_of_question] = meta_text
+            self._log_llm_output(stacker_llm, qid, meta_text)
+            self._stack_meta_reasoning[qid] = meta_text
 
             # Use same validation and processing logic as base numeric forecasting
             percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
@@ -322,8 +338,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 from metaculus_bot.exceptions import UnitMismatchError
 
                 logger.error(
-                    f"Unit mismatch likely for Q {getattr(question, 'id_of_question', 'N/A')} | "
-                    f"URL {getattr(question, 'page_url', '<unknown>')} | reason={reason}. Withholding prediction."
+                    f"Unit mismatch likely for Q {qid} | URL {page_url} | reason={reason}. Withholding prediction."
                 )
                 raise UnitMismatchError(
                     f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
@@ -331,7 +346,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             prediction = build_numeric_distribution(percentile_list, question, zero_point)
             log_final_prediction(prediction, question)
-            logger.info(f"Stacked numeric prediction for {getattr(question, 'page_url', '<unknown>')}")
+            logger.info(f"Stacked numeric prediction for {page_url}")
             return prediction
         else:
             raise ValueError(f"Unsupported question type for stacking: {type(question)}")
@@ -542,6 +557,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if not self._forecaster_llms:
             return await super()._research_and_make_predictions(question)
 
+        assert question.id_of_question is not None, "id_of_question must not be None for stacking state-dict keying"
+
         notepad = await self._get_notepad(question)
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
@@ -586,13 +603,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 research=research_to_use,
                 reasoned_predictions=valid_predictions,
             )
-            # Create a single aggregated prediction, preserving the stacker meta-analysis when available
+            # Create a single aggregated prediction, preserving the stacker meta-analysis
+            # AND the base model reasonings (so residual analysis can recover per-model
+            # attribution even when stacking overrode the base-aggregation output).
             meta_text = self._stack_meta_reasoning.pop(
                 question.id_of_question,
                 "Stacked prediction aggregated from multiple models",
             )
-            aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=meta_text)
+            combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
+            aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
             self._register_expected_base_combine(question)
+            self._question_was_stacked[question.id_of_question] = True
             return ResearchWithPredictions(
                 research_report=research,
                 summary_report=summary_report,
@@ -663,8 +684,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question.id_of_question,
                     "Conditional stacking: aggregated from multiple models after high-disagreement detected",
                 )
-                aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=meta_text)
+                combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
+                aggregated_prediction = ReasonedPrediction(
+                    prediction_value=aggregated_value, reasoning=combined_reasoning
+                )
                 self._register_expected_base_combine(question)
+                self._question_was_stacked[question.id_of_question] = True
 
                 return ResearchWithPredictions(
                     research_report=research,
@@ -681,6 +706,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question.id_of_question,
                 )
                 self._register_expected_base_combine(question)
+                self._question_was_stacked[question.id_of_question] = False
                 return ResearchWithPredictions(
                     research_report=research,
                     summary_report=summary_report,
@@ -704,6 +730,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         predicted_research: ResearchWithPredictions,
     ) -> str:
         text = super()._format_and_expand_research_summary(report_number, report_type, predicted_research)
+        # Inject model name into summary bullets so per-model attribution survives comment trimming.
+        model_names_by_index: dict[int, str] = {}
+        for j, forecast in enumerate(predicted_research.predictions):
+            name = extract_model_display_name_from_reasoning(forecast.reasoning)
+            if name is not None:
+                model_names_by_index[j + 1] = name
+        text = annotate_forecaster_bullets_with_models(text, model_names_by_index)
         return trim_section(text, f"report_{report_number}_summary")
 
     def _format_main_research(
@@ -737,7 +770,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             final_cost,
             time_spent_in_minutes,
         )
-        return trim_comment(base_text)
+        # Always pop the state-dict entry so per-question bookkeeping doesn't leak,
+        # even for non-stacking strategies that never populate it.
+        was_stacked = self._question_was_stacked.pop(question.id_of_question, False)
+        if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
+            # Don't emit a marker for MEAN/MEDIAN/etc — the question was never a
+            # stacking candidate, so STACKED=false would misrepresent behavior.
+            return trim_comment(base_text)
+        # Append (not prepend): ForecastReport requires explanation.strip() to start with '#'.
+        marker = STACKED_MARKER_TRUE if was_stacked else STACKED_MARKER_FALSE
+        return trim_comment(f"{base_text}\n{marker}\n")
 
     async def _make_prediction(
         self,
@@ -768,7 +810,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             raise ValueError(f"Unknown question type: {type(question)}")
 
         prediction = await forecast_function(question, research, actual_llm)
-        # Embed model name in reasoning for reporting
+        # Load-bearing: performance_analysis.parsing pulls per-model attribution from this "Model:" prefix.
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
@@ -793,9 +835,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             and reasoned_predictions is None
             and research is None
         ):
-            qkey = getattr(question, "id_of_question", None)
-            if qkey is None:
-                qkey = id(question)
+            qkey = question.id_of_question
 
             expected = qkey in self._stack_expected_base_combine
             if expected:
