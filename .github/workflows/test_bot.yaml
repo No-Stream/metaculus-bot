@@ -16,8 +16,8 @@ jobs:
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
-        uses: actions/checkout@v3
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: "3.11"
@@ -41,12 +41,12 @@ jobs:
       # Use the lockfile env. To update deps, run `poetry lock` to update lockfile, then `poetry install` to install the lockfile pkgs, and finally push to Github.
       - name: Load cached venv
         id: cached-poetry-dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           max_attempts: 3
           retry_on: error
