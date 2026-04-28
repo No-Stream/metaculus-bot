@@ -60,6 +60,11 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             0) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
 
+            0b) Resolution decomposition (multi-part questions only)
+               • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "a model is released AND it is Opus-branded AND it is accessible to external users"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
+               • Write one worked Yes example (a concrete scenario where every factor = 1) and one worked No example (a concrete scenario where exactly one factor = 0, with that factor named). This is mechanical bait-and-switch protection: it forces the resolution criteria to be consumed as structured constraints rather than treated as a prose paraphrase.
+               • For single-condition questions ("Will Z happen?"), write "single-condition, decomposition skipped" and move on.
+
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
             1) Source analysis (focus on historical context section)
@@ -70,6 +75,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
+               • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. For 2-3 gaps of 70-110 days with the deadline at day 85 and day 66 already elapsed, the conditional probability is often 35-50%, not the 15-20% that an unconditional window calculation would give. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -91,10 +97,12 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
+               • Question-specific base rate: the relevant base rate is the historical frequency for questions LIKE THIS ONE (e.g., "how often do German federal elections return X"), not a generic "most things don't happen" prior.
                • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
                • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
-               • Quantitative anchor: if you computed a probability from data (z-score, historical frequency, regression, etc.), state that number and explain how your final answer relates to it. If you're adjusting away from a data-derived probability, name the specific reason.
+               • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union), your final answer should stay close to that number. You can adjust, but name the SPECIFIC new evidence justifying the adjustment. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
+               • Hedge audit: if your final probability is softer than your analysis supports — e.g., you wrote a case that points strongly in one direction but your final answer splits the difference — you are losing points. Log score rewards commitment to well-reasoned positions. Only soften when you can name specific evidence creating the uncertainty, not because it feels safer.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
@@ -177,6 +185,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
+            • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers. Adjust only with specific new evidence, not vibe.
+            • Hedge audit: if your reasoning makes a clear case that one option dominates, but your final distribution flattens it out of general conservatism, you are losing points. Log score rewards commitment to well-reasoned distributions. Only spread mass toward weaker options when you can name specific evidence that makes them plausible, not because it feels safer.
             Remember:
             • Good forecasters leave a little probability on most options and avoid overconfidence.
             • Use integers 1%-99% (no 0 % or 100 %).
@@ -293,7 +303,9 @@ def numeric_prompt(
             - Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
             - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
-            - Quantitative anchor: if you derived a central estimate or range from data, state it and explain how your final percentiles relate to it.
+            - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
+            - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
+            - Hedge audit: if your reasoning supports a tight distribution (stable indicator, strong recent data, clear trend) but you widened your percentiles out of general caution, you are losing points. Log score penalizes overly wide intervals on predictable quantities. Only widen tails when you can name specific evidence creating that uncertainty, not because it feels safer.
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
@@ -409,12 +421,20 @@ def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predict
            • Should I weight models equally or give more weight to better-reasoned analyses?
            • Are there blind spots that all models missed?
            • How should I account for model correlation vs independence?
-        
+           • Active role: you are NOT bound to produce an average of the inputs. You can side with one or two models if THEIR REASONING is stronger, not merely because their answer looks appealing. Ask:
+             - Did they cite a specific fact, calculation, or reference class the others missed or handled poorly?
+             - Did they identify a resolution-criteria detail the others glossed over?
+             - Does a later-training-cutoff model reference evidence the others don't know about?
+             If none of these apply — i.e., the dissent is just a different vibe on the same evidence — the crowd is usually right.
+           • Dissenter check: if one model's probability differs notably from the others, read its argument carefully — it may be right. Hedged consensus can reflect shared priors more than shared evidence. A confident outlier with specific evidence is often more informative than the median of hedgers.
+           • Anchor on math: if the base models computed explicit probabilities from data (base rate, frequency, z-score), and one model's calculation is sounder than the others, you can go with its number rather than averaging. Don't soften well-reasoned outputs into the hedged middle.
+
         5) Final synthesis
            • What probability best integrates all the evidence and reasoning?
            • Does this probability appropriately reflect the uncertainty in the question?
            • Sanity check: does this probability make sense given the base rate and evidence?
-        
+           • Commitment check: log score penalizes confident wrong predictions asymmetrically, but it also penalizes hedging away from well-supported answers. If the evidence supports a confident answer, commit; if it genuinely splits, hedge appropriately.
+
         The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"
         An example response is: "Probability: 50%"
         """
@@ -477,11 +497,15 @@ def stacking_multiple_choice_prompt(
            • Should models be weighted equally or by reasoning quality?
            • Are there overlooked scenarios that all models missed?
            • How should I account for correlation vs independence in model errors?
-        
+           • Active role: you are NOT bound to produce an average. If one or two models have identified a specific, well-sourced fact, a correct reference class, or an arithmetic result the others missed, you can side with them rather than averaging. Dissent backed by stronger reasoning should shift your synthesis; dissent that's just a different vibe usually shouldn't.
+           • Dissenter check: a confident outlier with specific evidence is often more informative than the median of hedgers. Read the dissenting argument carefully before assuming the crowd is right.
+           • Anchor on math: if one base model computed an explicit probability for an option from data (base rate, reference-class frequency, explicit enumeration) and its calculation is sounder than the others' vibe-based estimates, you can adopt its number for that option rather than averaging into the middle. Don't flatten well-reasoned distributions into the hedged consensus.
+
         6) Final distribution calibration
            • What probability distribution best synthesizes all analyses?
            • Does my distribution appropriately reflect uncertainty?
            • Are my tail probabilities justified given the evidence?
+           • Commitment check: log score penalizes confident-wrong predictions, but it also penalizes hedging away from well-supported distributions. If the evidence supports one option as clearly dominant, don't flatten the distribution out of general conservatism; commit to the dominant option. If the evidence genuinely splits across options, hedge appropriately.
         
         **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
@@ -567,12 +591,16 @@ def stacking_numeric_prompt(
            • Should I weight models equally or by reasoning quality?
            • Are there blind spots or scenarios all models missed?
            • How should I account for correlation vs independence in model approaches?
-        
+           • Active role: you are NOT bound to average the central estimates. If one model did an explicit calculation (extrapolation, historical trend, explicit formula) that is sounder than the others' vibe-based medians, you can go with its central estimate. A model with later training data may know facts the others don't.
+           • Dissenter check: a well-reasoned outlier median, backed by specific evidence or arithmetic, is often more informative than the average of hedged guesses.
+           • Anchor on math: if one base model derived its percentiles from an explicit computation (trend extrapolation, historical mean/variance, fitted model) and that derivation is sounder than the others' intuitive ranges, you can adopt its central estimate and width rather than averaging. Don't widen a well-reasoned tight distribution into the hedged middle.
+
         6) Final distribution calibration
            • What percentiles best synthesize all the evidence and reasoning?
            • Does my final distribution appropriately reflect epistemic uncertainty?
            • Are my tails justified given the potential for unknown unknowns?
-        
+           • Commitment check (tail width): log score penalizes overconfident narrow intervals, but also penalizes hedging wide on quantities that are actually predictable. Don't widen your 90% interval beyond what the sharpest base model supports unless you can name specific evidence creating that extra uncertainty. Hedged-wide distributions hurt log score on precise resolutions.
+
         Remember: Think in ranges, not points. Keep 2.5th and 97.5th percentiles appropriately wide.
         Ensure strictly increasing percentiles and respect the bounds above.
 

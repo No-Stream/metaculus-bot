@@ -20,7 +20,7 @@ from metaculus_bot.config import load_environment
 # AI Forecasting Benchmark tournament (bot-only competition)
 # Update when new season starts: https://www.metaculus.com/project/aib/
 TOURNAMENT_ID: str = "spring-aib-2026"  # Spring 2026 AI Benchmarking
-TOURNAMENT_END_DATE: str = "2026-05-01"  # Approximate end date for warning/error checks
+TOURNAMENT_END_DATE: str = "2026-05-06"  # Approximate end date for warning/error checks
 TOURNAMENT_HARD_STOP_WEEKS: int = 3  # Error out this many weeks after end date
 
 # Metaculus Cup tournament (human + bot competition)
@@ -149,8 +149,10 @@ DISCRETE_SNAP_MAX_INTEGERS: int = 200
 DISCRETE_SNAP_UNIFORM_MIX: float = 0.0
 
 # --- Conditional Stacking Thresholds ---
-# Binary: log-odds spread (max logit - min logit). 1.2 ≈ 20pp near 50%, more sensitive near tails.
-CONDITIONAL_STACKING_BINARY_LOG_ODDS_THRESHOLD: float = 1.2
+# Binary: probability range (max − min) across per-model predictions. Chosen because
+# log-odds spread saturates on clamped-extreme models that are often correct,
+# conflating "one model is sure" with "ensemble is split."
+CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD: float = 0.15
 # Multiple choice: max per-option probability spread (max - min across models for worst option).
 CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD: float = 0.20
 # Numeric: max percentile spread normalized by question range (at 10th/50th/90th percentiles).

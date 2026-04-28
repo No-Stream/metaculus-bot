@@ -31,12 +31,23 @@ _LOG_ODDS_CLAMP_MAX: float = 0.999
 _KEY_PERCENTILE_INDICES: list[int] = [2, 5, 8]
 
 
-def binary_log_odds_spread(prediction_values: list[float]) -> float:
-    """Compute the log-odds range across binary probability predictions.
+def binary_prob_range_spread(prediction_values: list[float]) -> float:
+    """Compute the probability range (max − min) across binary predictions.
 
-    Converts each probability to log-odds space where tail disagreement is
-    amplified (e.g. 1% vs 19% is a much larger spread than 50% vs 68% despite
-    similar absolute gaps). Returns max(log_odds) - min(log_odds).
+    Active trigger metric for conditional stacking. Plain probability range
+    avoids the log-odds failure mode where clamped-extreme predictions (~0 or ~1)
+    produce huge spreads even when the ensemble-median answer is correct.
+    """
+    if len(prediction_values) < 2:
+        raise ValueError("binary_prob_range_spread requires at least 2 predictions")
+    return max(prediction_values) - min(prediction_values)
+
+
+def binary_log_odds_spread(prediction_values: list[float]) -> float:
+    """Log-odds range across binary predictions.
+
+    Clamps probabilities to [_LOG_ODDS_CLAMP_MIN, _LOG_ODDS_CLAMP_MAX] to avoid
+    log(0). Available as an alternative spread metric; see binary_prob_range_spread.
     """
     if len(prediction_values) < 2:
         raise ValueError("binary_log_odds_spread requires at least 2 predictions")
@@ -133,7 +144,7 @@ def numeric_percentile_spread(
 def compute_spread(question: MetaculusQuestion, prediction_values: list[Any]) -> float:
     """Dispatch to the appropriate spread metric based on question type."""
     if isinstance(question, BinaryQuestion):
-        return binary_log_odds_spread(prediction_values)
+        return binary_prob_range_spread(prediction_values)
     if isinstance(question, MultipleChoiceQuestion):
         return mc_max_option_spread(prediction_values)
     if isinstance(question, NumericQuestion):
