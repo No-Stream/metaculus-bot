@@ -92,6 +92,11 @@ COMMENT_CHAR_LIMIT: int = 149_999
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
 
 
+def env_flag_enabled(env_name: str) -> bool:
+    """Return True iff env var is set to "true"/"1"/"yes" (case-insensitive)."""
+    return os.getenv(env_name, "").lower() in ("true", "1", "yes")
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -172,6 +177,41 @@ NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
+
+# --- Gemini Search Provider (Google AI Studio direct SDK) ---
+# Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
+# Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a
+# genuinely new search index to the ensemble.
+GEMINI_SEARCH_ENABLED_ENV: str = "GEMINI_SEARCH_ENABLED"
+GEMINI_SEARCH_MODEL_ENV: str = "GEMINI_SEARCH_MODEL"
+GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
+# Gemini 3 Flash preview model with grounding support. Requires billing enabled
+# on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on
+# free tier if needed. Override via GEMINI_SEARCH_MODEL env var.
+GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
+# No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
+# Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
+# capping either caused silent truncations in the past.
+# 10-minute timeout matches the Grok provider plus headroom for grounded search
+# (multiple Google Search calls per response) + thinking tokens.
+GEMINI_SEARCH_TIMEOUT: int = 600
+
+# --- Second-pass gap-fill ---
+# After first-pass research completes, a cheap analyzer identifies up to
+# GAP_FILL_MAX_GAPS factual gaps; each is resolved by a parallel grounded
+# Gemini search. Fails soft — forecast proceeds with first-pass research alone
+# if any stage errors out.
+GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
+GAP_FILL_ANALYZER_MODEL: str = "gemini-3-flash-preview"
+GAP_FILL_MAX_GAPS: int = 5
+# Analyzer call is non-grounded (no Google Search) and should return quickly.
+# Use a tight timeout to prevent a single hung analyzer request from holding a
+# research concurrency slot for the full grounded-search budget.
+GAP_FILL_ANALYZER_TIMEOUT: int = 120
+# Skip gap-fill when the first-pass research blob has less than this many
+# non-whitespace characters — likely indicates all providers soft-failed and
+# gap-fill would just hallucinate gaps or burn quota.
+GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"

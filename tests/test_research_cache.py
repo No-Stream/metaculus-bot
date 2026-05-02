@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from main import TemplateForecaster
-from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 
 @pytest.fixture(autouse=True)
@@ -24,24 +23,9 @@ def _isolate_env(monkeypatch):
 
 
 @pytest.fixture
-def mock_question():
+def mock_question(make_mock_question):
     """Create a mock MetaculusQuestion for testing."""
-    question = MagicMock()
-    question.id_of_question = 12345
-    question.question_text = "Will it rain tomorrow?"
-    question.page_url = "https://example.com/q/12345"
-    return question
-
-
-@pytest.fixture
-def test_llms():
-    """Mock LLM configuration for testing."""
-    return {
-        "default": MagicMock(),
-        "parser": PARSER_LLM,
-        "researcher": RESEARCHER_LLM,
-        "summarizer": SUMMARIZER_LLM,
-    }
+    return make_mock_question(question_id=12345, question_text="Will it rain tomorrow?")
 
 
 @pytest.mark.asyncio

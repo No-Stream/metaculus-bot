@@ -176,17 +176,30 @@ ASKNEWS_CLIENT_SECRET=your_asknews_secret
 PERPLEXITY_API_KEY=your_perplexity_key
 EXA_API_KEY=your_exa_key
 
+# Optional: Gemini grounded search (Google AI Studio key, billing enabled for
+# Gemini 3 Flash grounding; falls back to gemini-2.5-flash on free tier)
+GOOGLE_API_KEY=your_google_ai_studio_key
+
 # LLM APIs (via OpenRouter)
 OPENROUTER_API_KEY=your_openrouter_key
 ```
+
+### Optional feature flags
+
+Opt-in research sources, each independently enabled:
+
+- `NATIVE_SEARCH_ENABLED=true` — Grok 4.1-fast native web search via OpenRouter
+- `GEMINI_SEARCH_ENABLED=true` — Gemini 3 Flash with first-party Google Search grounding (requires `GOOGLE_API_KEY`)
+- `FINANCIAL_DATA_ENABLED=true` — yfinance + FRED for economic/market questions (requires `FRED_API_KEY`)
+- `GAP_FILL_ENABLED=true` — always-on second-pass that identifies gaps in first-pass research and resolves each via a parallel grounded Gemini search (requires `GOOGLE_API_KEY`)
 
 ### Model Configuration
 
 Models are configured in `metaculus_bot/llm_configs.py`:
 
 - See `metaculus_bot/llm_configs.py` for the current model ensemble (rotates frequently)
-- **Research**: AskNews + native search (Grok), with fallback providers
-- **Provider**: OpenRouter with automatic key fallback
+- **Research**: AskNews + Grok native search + (optional) Gemini grounded search, with fallback providers
+- **Provider**: OpenRouter with automatic key fallback; Gemini grounded search uses the Google AI Studio SDK directly for first-party Google Search results
 
 ## Development
 

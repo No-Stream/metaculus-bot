@@ -44,8 +44,13 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     FINANCIAL_DATA_ENABLED_ENV,
+    GAP_FILL_ENABLED_ENV,
+    GAP_FILL_MIN_RESEARCH_CHARS,
+    GEMINI_SEARCH_ENABLED_ENV,
+    GEMINI_SEARCH_MODEL_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    env_flag_enabled,
 )
 from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
 from metaculus_bot.llm_setup import prepare_llm_config
@@ -223,7 +228,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         and this set's key stay consistent. A silent fallback to ``id(question)`` here
         would let the keys desync if upstream keying ever changed.
         """
-        self._stack_expected_base_combine.add(question.id_of_question)
+        qid = question.id_of_question
+        assert qid is not None, "_register_expected_base_combine requires question.id_of_question"
+        self._stack_expected_base_combine.add(qid)
 
     async def forecast_questions(
         self,
@@ -277,6 +284,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         page_url = question.page_url or "<unknown>"
         qid = question.id_of_question
+        assert qid is not None, "_run_stacking requires question.id_of_question (upstream guarantees this)"
 
         # Strip model names from reasoning and prepare base predictions
         base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
@@ -285,9 +293,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if self.stacking_randomize_order:
             combined = list(zip(base_predictions, reasoned_predictions))
             random.shuffle(combined)
-            base_predictions, reasoned_predictions = zip(*combined)
-            base_predictions = list(base_predictions)
-            reasoned_predictions = list(reasoned_predictions)
+            base_predictions = [bp for bp, _ in combined]
+            reasoned_predictions = [rp for _, rp in combined]
 
         # Generate appropriate stacking call based on question type
         if isinstance(question, BinaryQuestion):
@@ -368,6 +375,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
             logger.info(f"Using research providers: {provider_names}")
 
             research = await self._run_providers_parallel(question.question_text, providers)
+
+            # Optional second-pass gap-fill; see run_gap_fill_pass docstring for the soft-fail contract.
+            if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
+                from metaculus_bot.targeted_research import run_gap_fill_pass
+
+                addendum = await run_gap_fill_pass(
+                    question,
+                    research,
+                    is_benchmarking=self.is_benchmarking,
+                )
+                if addendum:
+                    research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
 
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
@@ -451,7 +470,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             providers.append((primary, primary_name))
 
         # Native search if enabled
-        if os.getenv(NATIVE_SEARCH_ENABLED_ENV, "").lower() in ("true", "1", "yes"):
+        if env_flag_enabled(NATIVE_SEARCH_ENABLED_ENV):
             model = os.getenv(NATIVE_SEARCH_MODEL_ENV)
             providers.append(
                 (
@@ -460,8 +479,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 )
             )
 
+        # Gemini grounded search (first-party Google Search index) if enabled.
+        # Lazy-import the provider so the google-genai SDK only loads when the flag is on.
+        if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
+            from metaculus_bot.gemini_search_provider import gemini_search_provider
+
+            gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
+            providers.append(
+                (
+                    gemini_search_provider(gemini_model, is_benchmarking=self.is_benchmarking),
+                    "gemini_search",
+                )
+            )
+
         # Financial data provider if enabled
-        if os.getenv(FINANCIAL_DATA_ENABLED_ENV, "").lower() in ("true", "1", "yes"):
+        if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
             from metaculus_bot.financial_data_provider import financial_data_provider
 
             providers.append((financial_data_provider(), "financial_data"))
@@ -509,6 +541,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         headers = {
             "asknews": "## News Articles (AskNews)",
             "native_search": "## Web Research (Native Search)",
+            "gemini_search": "## Web Research (Google Search via Gemini)",
             "financial_data": "## Financial & Economic Data",
             "exa": "## Web Research (Exa)",
             "perplexity": "## Web Research (Perplexity)",
@@ -739,8 +772,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = annotate_forecaster_bullets_with_models(text, model_names_by_index)
         return trim_section(text, f"report_{report_number}_summary")
 
+    @classmethod
     def _format_main_research(
-        self,
+        cls,
         report_number: int,
         predicted_research: ResearchWithPredictions,
     ) -> str:
@@ -772,7 +806,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         # Always pop the state-dict entry so per-question bookkeeping doesn't leak,
         # even for non-stacking strategies that never populate it.
-        was_stacked = self._question_was_stacked.pop(question.id_of_question, False)
+        qid = question.id_of_question
+        was_stacked = self._question_was_stacked.pop(qid, False) if qid is not None else False
         if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             # Don't emit a marker for MEAN/MEDIAN/etc — the question was never a
             # stacking candidate, so STACKED=false would misrepresent behavior.

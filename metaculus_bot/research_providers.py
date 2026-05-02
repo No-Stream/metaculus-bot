@@ -22,6 +22,7 @@ from metaculus_bot.constants import (
     ASKNEWS_MAX_TRIES,
     RESEARCH_PROVIDER_ENV,
 )
+from metaculus_bot.prompts import web_research_prompt
 
 QuestionText = str
 ResearchCallable = Callable[[QuestionText], Awaitable[str]]
@@ -303,42 +304,11 @@ def _native_search_provider(
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
         llm = build_native_search_llm(model_slug)
-
-        # Exclude prediction markets when benchmarking to avoid data leakage
-        if is_benchmarking:
-            prediction_markets_instruction = ""
-            benchmarking_warning = """
-IMPORTANT: This is a model benchmarking run. DO NOT search for or include prediction market
-odds, forecasts, or betting lines - this would constitute data leakage."""
-        else:
-            prediction_markets_instruction = "\n- Prediction market odds and forecasts (if available)"
-            benchmarking_warning = ""
-
-        prompt = f"""You are a research assistant gathering factual information for a forecaster.
-
-TASK: Search the web to find relevant facts, data, and expert opinions about the question below.{benchmarking_warning}
-
-GUIDELINES:
-- Search thoroughly - make multiple searches if needed to fill gaps
-- Be factual and unbiased - report what you find, not what you think
-- Include inline citations [source name](url) for all factual claims
-- If you cannot find reliable information on something, say so explicitly
-- DO NOT hallucinate sources - only cite what you actually found
-- DO NOT make predictions or forecasts yourself
-- It's OK to have a short response if there isn't much reliable information
-
-FOCUS AREAS:
-- Recent news and developments
-- Historical context and trends
-- Statistical data and metrics
-- Expert opinions and analysis
-- Official statements and announcements{prediction_markets_instruction}
-
-QUESTION:
-{question_text}
-
-Provide a factual research summary with citations:"""
-
+        prompt = web_research_prompt(
+            question_text,
+            is_benchmarking=is_benchmarking,
+            citation_style="markdown",
+        )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
         result = await llm.invoke(prompt)
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
