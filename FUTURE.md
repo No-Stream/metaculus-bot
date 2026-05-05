@@ -106,6 +106,28 @@ types don't have enough resolved data to fit a reliable mapping yet.
 Easy-to-moderate effort. The biggest risk is shipping it without proper
 held-out CV.
 
+### Probabilistic tooling for base forecasters (DORMANT — activation guide written)
+
+Base-forecaster failure mode identified in Q2 2026 analysis: models state
+base rates, percentiles, and priors in prose but don't compute on them
+("arithmetic override"). Ships `metaculus_bot/probabilistic_tools/`,
+`metaculus_bot/structured_output_schema.py`, and
+`metaculus_bot/tool_runner.py` — pure-function Beta-binomial updaters,
+survival / hazard calculators, log-pooling + Satopää extremization,
+distribution fitting (normal / lognormal / Student-t) with out-of-bounds
+mass reporting, Dirichlet-with-Other for MC, NegBinom / Beta-binomial-ceiling
+for counts, and prior-posterior + percentile-family consistency checks.
+
+**Status:** tools + tool_runner + 261 unit/E2E tests all green. NOT wired
+into prompts, `_make_prediction`, or the stacker. Activation is a
+single-session prompt + main.py + stacking.py edit behind a
+`PROBABILISTIC_TOOLS_ENABLED` env flag.
+
+**Activation plan:** `scratch_docs_and_planning/probabilistic_tools_activation.md`
+— exact file-and-line edits, parser-ordering gotcha (JSON block before
+`Probability: ZZ%`), A/B backtest verification sequence, known landmines.
+A fresh session can flip it live with minimal context loss.
+
 ### LLM-based forecast self-evaluation
 
 After each forecast, run a cheap model to assess: research relevance, factual accuracy,
