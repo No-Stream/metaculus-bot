@@ -21,7 +21,7 @@ __all__ = [
 REASONING_MODEL_CONFIG = {
     "temperature": 1.0,  # standard sampling params for recent reasoning models
     "top_p": 0.95,
-    "max_tokens": 32_000,  # Prevent truncation issues with reasoning models
+    "max_tokens": 64_000,  # Prevent truncation; all current forecasters/stackers support 64k output
     "stream": False,
     "timeout": 480,
     "allowed_tries": 3,
@@ -116,9 +116,8 @@ RESEARCHER_LLM = build_llm_with_openrouter_fallback(model="openrouter/google/gem
 # dice with the same distribution), and the budget is better spent on a
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/anthropic/claude-opus-4.7",
-    reasoning={"enabled": True},
-    extra_body={"verbosity": "xhigh"},
+    "openrouter/anthropic/claude-opus-4.5",
+    reasoning={"max_tokens": 32_000},  # Opus 4.5 uses explicit thinking budget, not effort/verbosity levels
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
 
