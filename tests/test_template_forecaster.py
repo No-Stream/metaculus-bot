@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,6 +9,11 @@ from main import TemplateForecaster
 from metaculus_bot.comment_trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+
+# `asyncio` is used by the soft-deadline test below; an explicit no-op reference
+# prevents the formatter from pruning the import when the only usage sits far
+# below the import block (formatter heuristic).
+_ASYNCIO_SLEEP = asyncio.sleep
 
 
 @pytest.fixture
@@ -126,7 +132,7 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
         "researcher": "mock_researcher_model",
         "default": "mock_default_model",
     }
-    bot = TemplateForecaster(llms=llms_config)
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     # Mock internal methods
     bot._get_notepad = AsyncMock(
@@ -146,14 +152,25 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
         )
     )
 
+    # Wrap _forecaster_with_soft_deadline so we can count invocations. The
+    # soft-deadline wrapper is the new per-forecaster entrypoint — it delegates
+    # to _make_prediction internally. Tests mocking _gather_results_and_exceptions
+    # short-circuit execution, so we assert on the wrapper being called (once
+    # per forecaster) rather than the inner _make_prediction.
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test")
+    )
+
     result = await bot._research_and_make_predictions(mock_binary_question)
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
     bot.run_research.assert_called_once_with(mock_binary_question)
     # summarize_research is NOT called when use_research_summary_to_forecast=False (default)
     bot.summarize_research.assert_not_called()
-    assert bot._make_prediction.call_count == 2  # Called once for each forecaster
-    bot._make_prediction.assert_any_call(mock_binary_question, "mock research", mock_general_llm)
+    assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
+    bot._forecaster_with_soft_deadline.assert_any_call(
+        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question
+    )
     assert isinstance(result, ResearchWithPredictions)
     assert (
         len(result.predictions) == 2
@@ -170,7 +187,7 @@ async def test_research_and_make_predictions_with_summarization_enabled(mock_bin
         "researcher": "mock_researcher_model",
         "default": "mock_default_model",
     }
-    bot = TemplateForecaster(llms=llms_config, use_research_summary_to_forecast=True)
+    bot = TemplateForecaster(llms=llms_config, use_research_summary_to_forecast=True, min_forecasters_to_publish=1)
 
     # Mock internal methods
     bot._get_notepad = AsyncMock(
@@ -190,14 +207,22 @@ async def test_research_and_make_predictions_with_summarization_enabled(mock_bin
         )
     )
 
+    # See sibling test above — soft-deadline wrapper is the per-forecaster
+    # entrypoint, so assert on it rather than the inner _make_prediction.
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test")
+    )
+
     result = await bot._research_and_make_predictions(mock_binary_question)
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
     bot.run_research.assert_called_once_with(mock_binary_question)
     # summarize_research IS called when use_research_summary_to_forecast=True
     bot.summarize_research.assert_called_once_with(mock_binary_question, "mock research")
-    assert bot._make_prediction.call_count == 2  # Called once for each forecaster
-    bot._make_prediction.assert_any_call(mock_binary_question, "mock summary", mock_general_llm)  # Uses summary
+    assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
+    bot._forecaster_with_soft_deadline.assert_any_call(
+        mock_binary_question, "mock summary", mock_general_llm, mock_binary_question.id_of_question
+    )  # Uses summary
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
 
@@ -391,3 +416,174 @@ def test_format_methods_trim_long_outputs():
     assert formatted_rationales.startswith("## R1: Forecaster 1 Reasoning")
     assert TRIM_NOTICE in formatted_rationales
     assert len(formatted_rationales) <= REPORT_SECTION_CHAR_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# F4: real _forecaster_with_soft_deadline timeout branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
+    mock_binary_question, mock_general_llm, monkeypatch: pytest.MonkeyPatch
+):
+    """The real wrapper must raise TimeoutError and bump _forecasters_dropped_count
+    when _make_prediction exceeds FORECASTER_SOFT_DEADLINE. Prior tests replaced
+    the wrapper with an AsyncMock, so the asyncio.wait_for branch was untested.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    # Tighten the deadline to a fraction of a second so the test is fast.
+    monkeypatch.setattr("main.FORECASTER_SOFT_DEADLINE", 0.05)
+
+    async def slow_make_prediction(question, research, llm):
+        await asyncio.sleep(5)
+        return ReasonedPrediction(prediction_value=0.5, reasoning="never returned")
+
+    bot._make_prediction = AsyncMock(side_effect=slow_make_prediction)
+
+    assert bot._forecasters_dropped_count == 0
+    with pytest.raises(asyncio.TimeoutError):
+        await bot._forecaster_with_soft_deadline(
+            mock_binary_question, "research", mock_general_llm, mock_binary_question.id_of_question
+        )
+    assert bot._forecasters_dropped_count == 1
+
+
+# ---------------------------------------------------------------------------
+# F5: min-forecasters guard raise path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_min_forecasters_guard_raises_runtime_error_when_exception_group_none(
+    mock_binary_question, mock_general_llm
+):
+    """If only 1/2 forecasters succeed and threshold is 3, with no exception_group,
+    the guard raises RuntimeError and bumps _questions_failed_to_publish.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    # Warning expected on construction (threshold exceeds ensemble size); this is
+    # the exact scenario we want to test.
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=3)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+    )
+    # 1 valid, no errors, no exception group: RuntimeError path.
+    bot._gather_results_and_exceptions = AsyncMock(
+        return_value=(
+            [ReasonedPrediction(prediction_value=0.5, reasoning="ok")],
+            [],
+            None,
+        )
+    )
+
+    assert bot._questions_failed_to_publish == 0
+    with pytest.raises(RuntimeError, match="Only 1/2 forecasters succeeded"):
+        await bot._research_and_make_predictions(mock_binary_question)
+    assert bot._questions_failed_to_publish == 1
+
+
+@pytest.mark.asyncio
+async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_binary_question, mock_general_llm):
+    """If only 1/2 forecasters succeed and exception_group is non-None, the
+    re-raise path preserves the exception chain by delegating to the framework
+    helper (which raises an ExceptionGroup).
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=3)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+    )
+
+    inner = RuntimeError("forecaster 2 failed")
+    # ExceptionGroup is a Python 3.11+ builtin; ruff target-version isn't pinned
+    # here so suppress the false-positive F821.
+    exc_group = ExceptionGroup("forecaster errors", [inner])  # noqa: F821
+    bot._gather_results_and_exceptions = AsyncMock(
+        return_value=(
+            [ReasonedPrediction(prediction_value=0.5, reasoning="ok")],
+            ["RuntimeError: forecaster 2 failed"],
+            exc_group,
+        )
+    )
+
+    with pytest.raises(ExceptionGroup) as exc_info:  # noqa: F821  # 3.11+ builtin
+        await bot._research_and_make_predictions(mock_binary_question)
+
+    # The framework helper wraps the exception group with a prepended message
+    # but preserves the original wrapped exceptions.
+    assert any(isinstance(e, RuntimeError) and "forecaster 2 failed" in str(e) for e in exc_info.value.exceptions)
+    assert bot._questions_failed_to_publish == 1
+
+
+# ---------------------------------------------------------------------------
+# F9a: alertable_count sum
+# ---------------------------------------------------------------------------
+
+
+def test_alertable_count_sums_all_degradation_counters(mock_general_llm):
+    """Property must sum all six degradation counters. Using distinct powers of 2
+    makes an off-by-one or missing-counter bug visible: the resulting sum
+    uniquely identifies which subset was counted.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    bot._forecasters_dropped_count = 1
+    bot._questions_failed_to_publish = 2
+    bot._stacker_primary_failed_count = 4
+    bot._stacker_fallback_used_count = 8
+    bot._stacker_fallback_failed_count = 16
+    bot._research_provider_timeout_count = 32
+
+    assert bot.alertable_count == 63
+
+
+def test_alertable_count_zero_by_default(mock_general_llm):
+    """Fresh bot with no degradation events must report alertable_count == 0."""
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    assert bot.alertable_count == 0

@@ -3,6 +3,7 @@ import asyncio
 
 # ruff: noqa: F401
 import logging
+import sys
 from typing import Literal
 
 from forecasting_tools import MetaculusApi
@@ -18,6 +19,8 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -98,6 +101,20 @@ def main() -> None:
         raise ValueError(f"Invalid run mode: {run_mode}")
 
     TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
+
+    # Alert on degraded runs. Publication has already happened inside
+    # forecast_on_tournament / forecast_questions above, so every Q that met
+    # MIN_FORECASTERS_TO_PUBLISH is on Metaculus regardless of exit status.
+    # Non-zero exit here just triggers the GitHub Actions red-check alert so
+    # the operator knows to investigate (forecaster drops, stacker fallback
+    # usage, research provider timeouts, etc. — see main.py `alertable_count`).
+    alertable = template_bot.alertable_count
+    if alertable > 0:
+        logger.warning(
+            "Run completed with %d alertable degradation event(s); exiting non-zero so CI marks this run red.",
+            alertable,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

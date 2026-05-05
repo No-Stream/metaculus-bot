@@ -22,6 +22,7 @@ from metaculus_bot.structured_output_schema import (
     StatedHazard,
     StatedPrior,
     TailMass,
+    extract_first_balanced_braces,
     extract_json_block,
     parse_structured_block,
 )
@@ -725,6 +726,65 @@ class TestExtractJsonBlock:
     def test_empty_body_ignored(self) -> None:
         text = "```json\n\n```"
         assert extract_json_block(text) is None
+
+
+class TestExtractFirstBalancedBraces:
+    """Cover the string-literal-aware balanced-brace extractor shared by
+    ``_parse_gap_list`` (unfenced JSON fallback). Naive brace-counting silently
+    truncates JSON that contains braces inside string values — this helper
+    must not do that."""
+
+    def test_simple_object(self) -> None:
+        assert extract_first_balanced_braces('{"a": 1}') == '{"a": 1}'
+
+    def test_returns_none_on_no_braces(self) -> None:
+        assert extract_first_balanced_braces("plain prose") is None
+
+    def test_returns_none_on_empty_input(self) -> None:
+        assert extract_first_balanced_braces("") is None
+
+    def test_object_with_prefix_and_suffix_prose(self) -> None:
+        text = 'Here is the output:\n{"gap": "g"}\n\nHope that helps!'
+        assert extract_first_balanced_braces(text) == '{"gap": "g"}'
+
+    def test_brace_inside_string_value_not_counted(self) -> None:
+        # The crux of F11: a naive brace counter closes the object at the `}`
+        # inside the string value, producing '{"foo": "has a }'.
+        text = '{"foo": "has a } brace", "b": 1}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_opening_brace_inside_string_value_not_counted(self) -> None:
+        text = '{"foo": "has a { brace", "b": 1}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_mixed_braces_in_string_values(self) -> None:
+        text = '{"a": "has } and { chars", "b": 1}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_escaped_quote_inside_string(self) -> None:
+        # `\"` should NOT exit the string, so the `}` that follows is still
+        # inside the string literal.
+        text = '{"a": "quote \\" then } brace", "b": 1}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_escaped_backslash_then_quote_exits_string(self) -> None:
+        # `\\` is an escaped backslash; the following `"` then exits the
+        # string. Without correct escape handling we'd stay inside and miss
+        # the final `}`.
+        text = '{"a": "trailing slash \\\\", "b": 1}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_nested_objects(self) -> None:
+        text = '{"outer": {"inner": 1}, "k": "v"}'
+        assert extract_first_balanced_braces(text) == text
+
+    def test_returns_first_balanced_block_only(self) -> None:
+        # Trailing second object is not part of the first balanced block.
+        text = '{"first": 1} then {"second": 2}'
+        assert extract_first_balanced_braces(text) == '{"first": 1}'
+
+    def test_unbalanced_returns_none(self) -> None:
+        assert extract_first_balanced_braces('{"a": 1') is None
 
 
 # ===========================================================================

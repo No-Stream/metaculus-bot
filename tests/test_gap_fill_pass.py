@@ -118,6 +118,44 @@ class TestParseGapList:
 
         assert len(out) == 7
 
+    def test_unfenced_with_brace_inside_string_value(self) -> None:
+        """F11: braces embedded in string values must not truncate extraction.
+
+        The analyzer sometimes returns unfenced JSON with trailing commentary.
+        A naive brace counter closes the object at the first `}` it sees —
+        even one inside a string literal — producing invalid JSON that then
+        silently parses to ``[]``. The string-literal-aware helper preserves
+        the full payload.
+        """
+        raw = (
+            "Here is the gap analysis:\n"
+            '{"gaps": [{"gap": "What does the phrase \\"ends with a } brace\\" mean?", '
+            '"search_query": "q1", "why_matters": "wm1"}]}\n\n'
+            "Hope that helps!"
+        )
+        out = _parse_gap_list(raw)
+
+        assert len(out) == 1
+        # The gap text must include the brace that would have been chopped off.
+        assert "} brace" in out[0]["gap"]
+        assert out[0]["search_query"] == "q1"
+
+    def test_unfenced_with_trailing_prose_containing_braces(self) -> None:
+        """F16: trailing prose after a well-formed JSON object can contain
+        braces of its own (e.g. "{a, b} covers edge cases"). The balanced-brace
+        fallback must stop at the end of the first balanced block and not
+        attempt to extend through trailing commentary, which would break the
+        parser. The Wave 1 fix covered the string-literal-in-value case; this
+        asserts the sibling trailing-brace case is handled too.
+        """
+        raw = '{"gaps":[{"gap":"g","search_query":"q","why_matters":"w"}]}\n\nNote: the set {a, b} covers edge cases'
+        out = _parse_gap_list(raw)
+
+        assert len(out) == 1
+        assert out[0]["gap"] == "g"
+        assert out[0]["search_query"] == "q"
+        assert out[0]["why_matters"] == "w"
+
 
 # ---------------------------------------------------------------------------
 # run_gap_fill_pass integration tests

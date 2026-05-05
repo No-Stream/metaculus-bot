@@ -45,7 +45,9 @@ def _choose_transform(
 
         def fwd(x: float) -> float:
             u = (x - L) / rng
-            return logit(u)
+            # Use a tight clamp here (coordinate transform, not probability scoring)
+            # so percentiles within the outer 0.01% of the range remain distinguishable.
+            return logit(u, eps=1e-12)
 
         def inv(y: float) -> float:
             u = sigmoid(y)

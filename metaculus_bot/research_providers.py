@@ -20,6 +20,7 @@ from metaculus_bot.constants import (
     ASKNEWS_MAX_CONCURRENCY,
     ASKNEWS_MAX_RPS,
     ASKNEWS_MAX_TRIES,
+    ASKNEWS_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
@@ -53,6 +54,20 @@ async def _asknews_rate_gate() -> None:
         _ASKNEWS_LAST_CALL_TS = now
 
 
+def is_asknews_subscription_error(exc: BaseException) -> bool:
+    """True iff exc is AskNews's 403011 subscription-inactive signature.
+
+    Narrow match (class name AND inner message) so a generic "403 Forbidden"
+    from an unrelated provider isn't silenced. SDK raises ForbiddenError with
+    code 403011 or "subscription is not currently active" when billing lapses.
+    """
+    msg = str(exc).lower()
+    if "forbiddenerror" in type(exc).__name__.lower():
+        if "403011" in msg or "subscription is not currently active" in msg:
+            return True
+    return False
+
+
 def _asknews_provider() -> ResearchCallable:
     global _ASKNEWS_GLOBAL_SEMAPHORE
     if _ASKNEWS_GLOBAL_SEMAPHORE is None:
@@ -61,6 +76,14 @@ def _asknews_provider() -> ResearchCallable:
         _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max_c)
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
+        # Hard wall-clock timeout around the full provider. AskNews's internal
+        # retry loop fails fast on non-retryable errors, but a genuine network
+        # hang (connect stall, DNS hang, server not closing the stream) is
+        # otherwise unbounded. This backstops that case so a stuck AskNews
+        # call can't hold the whole research phase hostage.
+        return await asyncio.wait_for(_fetch_impl(question_text), timeout=ASKNEWS_WALL_TIMEOUT)
+
+    async def _fetch_impl(question_text: str) -> str:
         assert _ASKNEWS_GLOBAL_SEMAPHORE is not None
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)

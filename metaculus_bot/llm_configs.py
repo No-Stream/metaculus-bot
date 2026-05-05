@@ -15,6 +15,7 @@ __all__ = [
     "PARSER_LLM",
     "RESEARCHER_LLM",
     "STACKER_LLM",
+    "STACKER_FALLBACK_LLM",
     "DISAGREEMENT_ANALYZER_LLM",
 ]
 REASONING_MODEL_CONFIG = {
@@ -105,12 +106,31 @@ PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
 RESEARCHER_LLM = build_llm_with_openrouter_fallback(model="openrouter/google/gemini-3-flash-preview", timeout=120)
 
-# Stacker meta-model for conditional stacking (invoked only on high-disagreement questions)
+# Stacker meta-model for conditional stacking (invoked only on high-disagreement questions).
+#
+# allowed_tries=1: a single 8-minute attempt with no retries. The outer
+# STACKER_SOFT_DEADLINE (500s) catches wholly stuck calls; on failure we fall
+# back to STACKER_FALLBACK_LLM rather than burning another 16 min of retries
+# against the same Anthropic API that just stalled. Retrying against the same
+# provider after a stall rarely succeeds (we're almost certainly re-rolling a
+# dice with the same distribution), and the budget is better spent on a
+# different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/anthropic/claude-opus-4.7",
     reasoning={"enabled": True},
     extra_body={"verbosity": "xhigh"},
-    **REASONING_MODEL_CONFIG,
+    **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
+)
+
+# Fallback stacker used when the primary stacker times out or errors. Different
+# provider on purpose: if Anthropic is thrashing, retrying against Anthropic
+# is unlikely to recover; gpt-5.5 via OpenAI gives us an independent failure
+# mode. Tighter timeout and single try since we're already running late on
+# the critical path by the time this fires.
+STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
+    "openrouter/openai/gpt-5.5",
+    reasoning={"effort": "high"},
+    **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
 
 # Cheap model for identifying the crux of model disagreement (feeds into targeted research)

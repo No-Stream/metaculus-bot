@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
 
@@ -44,12 +45,16 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     FINANCIAL_DATA_ENABLED_ENV,
+    FORECASTER_SOFT_DEADLINE,
     GAP_FILL_ENABLED_ENV,
     GAP_FILL_MIN_RESEARCH_CHARS,
     GEMINI_SEARCH_ENABLED_ENV,
     GEMINI_SEARCH_MODEL_ENV,
+    MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    STACKER_FALLBACK_SOFT_DEADLINE,
+    STACKER_SOFT_DEADLINE,
     env_flag_enabled,
 )
 from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
@@ -102,6 +107,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacking_fallback_on_failure: bool = True,
         stacking_randomize_order: bool = True,
         stacking_spread_thresholds: dict[str, float] | None = None,
+        min_forecasters_to_publish: int | None = None,
     ) -> None:
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
@@ -127,6 +133,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self.is_benchmarking: bool = is_benchmarking
         self.allow_research_fallback: bool = allow_research_fallback
         self.research_cache: dict[int, str] | None = research_cache
+        # Resolve effective min-forecaster threshold. Defaults to the module
+        # constant for production; tests/benchmarks can override (e.g. tests
+        # typically use 2-model ensembles and would otherwise always fail the
+        # guard).
+        self.min_forecasters_to_publish: int = (
+            min_forecasters_to_publish if min_forecasters_to_publish is not None else MIN_FORECASTERS_TO_PUBLISH
+        )
+        if self.min_forecasters_to_publish <= 0:
+            raise ValueError(
+                f"min_forecasters_to_publish must be a positive integer, got {self.min_forecasters_to_publish}"
+            )
+        if self.min_forecasters_to_publish > len(self._forecaster_llms):
+            logger.warning(
+                "min_forecasters_to_publish=%d exceeds configured forecaster count=%d; "
+                "every question will fail the guard and skip publication",
+                self.min_forecasters_to_publish,
+                len(self._forecaster_llms),
+            )
         self.stacking_fallback_on_failure: bool = stacking_fallback_on_failure
         self.stacking_randomize_order: bool = stacking_randomize_order
         # Per-question storage for stacker meta-analysis reasoning text
@@ -141,6 +165,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._stacking_expected_combine_count: int = 0
         self._stacking_unexpected_combine_count: int = 0
         self._stacking_fallback_count: int = 0
+
+        # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
+        # Forecasters dropped by the per-call soft deadline (see FORECASTER_SOFT_DEADLINE).
+        self._forecasters_dropped_count: int = 0
+        # Questions that couldn't be published because fewer than
+        # MIN_FORECASTERS_TO_PUBLISH base forecasters succeeded.
+        self._questions_failed_to_publish: int = 0
+        # Primary stacker failed (timeout or exception). Counts regardless of
+        # whether fallback eventually succeeded.
+        self._stacker_primary_failed_count: int = 0
+        # Stacker fallback model was invoked.
+        self._stacker_fallback_used_count: int = 0
+        # Stacker fallback also failed; median aggregation used.
+        self._stacker_fallback_failed_count: int = 0
+        # Research provider failures other than AskNews subscription-inactive
+        # (which is expected in off-season).
+        self._research_provider_timeout_count: int = 0
+
         # Per-question votes from each LLM on whether outcomes are discrete integers
         self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
         # Conditional stacking thresholds (overridable per question type)
@@ -269,18 +311,61 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self._conditional_stacking_search_failures,
             )
 
+        # Loud end-of-run degradation summary. Any non-zero counter here means
+        # something got dropped, the stacker fell back, or a research provider
+        # failed — all states where CI (cli.py) should exit non-zero so we get
+        # paged, but every publishable question has already been published.
+        logger.info(
+            "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
+            "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
+            "research_provider_timeouts=%d",
+            self._forecasters_dropped_count,
+            self._questions_failed_to_publish,
+            self._stacker_primary_failed_count,
+            self._stacker_fallback_used_count,
+            self._stacker_fallback_failed_count,
+            self._research_provider_timeout_count,
+        )
+
         return results
+
+    @property
+    def alertable_count(self) -> int:
+        """Sum of counters whose non-zero value should page us.
+
+        Consumed by cli.py to decide whether to sys.exit(1) after all
+        publications complete. Any individual non-zero counter is enough to
+        trip the alert; the sum is just a convenient single number.
+        """
+        return (
+            self._forecasters_dropped_count
+            + self._questions_failed_to_publish
+            + self._stacker_primary_failed_count
+            + self._stacker_fallback_used_count
+            + self._stacker_fallback_failed_count
+            + self._research_provider_timeout_count
+        )
 
     async def _run_stacking(
         self,
         question: MetaculusQuestion,
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
+        stacker_llm_override: GeneralLlm | None = None,
     ) -> PredictionTypes:
-        """Run stacking to aggregate multiple model predictions using a meta-model."""
-        if self._stacker_llm is None:
-            raise ValueError("No stacker LLM configured")
-        stacker_llm = self._stacker_llm  # Bind to local for type narrowing
+        """Run stacking to aggregate multiple model predictions using a meta-model.
+
+        ``stacker_llm_override`` lets the aggregation layer invoke a fallback
+        stacker (e.g. gpt-5.5) without swapping ``self._stacker_llm`` — keeping
+        fallback behavior local to the call site and avoiding state mutation
+        that could race with concurrent questions.
+        """
+        if stacker_llm_override is not None:
+            stacker_llm = stacker_llm_override
+        else:
+            if self._stacker_llm is None:
+                raise ValueError("No stacker LLM configured")
+            stacker_llm = self._stacker_llm
 
         page_url = question.page_url or "<unknown>"
         qid = question.id_of_question
@@ -513,6 +598,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         providers: list[tuple[ResearchCallable, str]],
     ) -> str:
         """Run multiple research providers in parallel and combine results."""
+        from metaculus_bot.research_providers import is_asknews_subscription_error
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:
@@ -520,7 +606,19 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     return (await self._fetch_research_with_fallback(question_text, provider, name), name)
                 return (await provider(question_text), name)
             except Exception as e:
-                logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
+                # Off-season AskNews 403s are expected and shouldn't page us.
+                # Every other provider failure (timeouts, network, rate limits,
+                # non-403 AskNews errors) is operational and gets alerted.
+                if name == "asknews" and is_asknews_subscription_error(e):
+                    logger.info(
+                        "Research provider %s inactive (expected off-season): %s: %s",
+                        name,
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    self._research_provider_timeout_count += 1
+                    logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                 return ("", name)
 
         tasks = [_run_one(p, n) for p, n in providers]
@@ -604,10 +702,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             summary_report = research  # Use raw research for reporting compatibility
             research_to_use = research
 
-        # Generate tasks for each forecaster LLM
+        qid_for_log = question.id_of_question
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
-            [self._make_prediction(question, research_to_use, llm_instance) for llm_instance in self._forecaster_llms],
+            [
+                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log)
+                for llm_instance in self._forecaster_llms
+            ],
         )
         (
             valid_predictions,
@@ -616,12 +717,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
         ) = await self._gather_results_and_exceptions(tasks)
         if errors:
             logger.warning(f"Encountered errors while predicting: {errors}")
-        if len(valid_predictions) == 0:
-            assert exception_group, "Exception group should not be None"
-            self._reraise_exception_with_prepended_message(
-                exception_group,
-                "Error while running research and predictions",
+
+        # Min-forecasters guard: below self.min_forecasters_to_publish, the
+        # ensemble is too degraded to publish. Increment counter for end-of-run
+        # alerting and raise so this question is skipped (but other batch
+        # questions and publication continue). See cli.py for exit-status wiring.
+        n_valid = len(valid_predictions)
+        if n_valid < self.min_forecasters_to_publish:
+            self._questions_failed_to_publish += 1
+            msg = (
+                f"Only {n_valid}/{len(self._forecaster_llms)} forecasters succeeded for Q {qid_for_log} "
+                f"(need >= {self.min_forecasters_to_publish}); skipping publication."
             )
+            logger.error(msg)
+            if exception_group is not None:
+                self._reraise_exception_with_prepended_message(exception_group, msg)
+            raise RuntimeError(msg)
         # If using stacking, aggregate the predictions here
         if self.aggregation_strategy == AggregationStrategy.STACKING:
             if getattr(self, "research_reports_per_question", 1) != 1:
@@ -816,6 +927,43 @@ class TemplateForecaster(CompactLoggingForecastBot):
         marker = STACKED_MARKER_TRUE if was_stacked else STACKED_MARKER_FALSE
         return trim_comment(f"{base_text}\n{marker}\n")
 
+    async def _forecaster_with_soft_deadline(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        llm: GeneralLlm,
+        qid: int | None,
+    ) -> ReasonedPrediction[PredictionTypes]:
+        """Run a single forecaster with FORECASTER_SOFT_DEADLINE.
+
+        Why the deadline: a single stuck forecaster used to be able to hold a
+        question for litellm_timeout(480s) * allowed_tries(3) ≈ 24 min. This
+        caps each forecaster at FORECASTER_SOFT_DEADLINE (10 min).
+
+        On timeout: bumps _forecasters_dropped_count, logs a loud WARNING
+        identifying the model + question, and re-raises TimeoutError so the
+        caller's _gather_results_and_exceptions treats it like any other failed
+        forecaster (dropped from the ensemble; the other models in the ensemble
+        carry the question).
+        """
+        start = time.monotonic()
+        try:
+            return await asyncio.wait_for(
+                self._make_prediction(question, research, llm),
+                timeout=FORECASTER_SOFT_DEADLINE,
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            self._forecasters_dropped_count += 1
+            logger.warning(
+                "SOFT_DEADLINE: forecaster model=%s qid=%s exceeded %ds (elapsed=%.0fs); dropping this forecaster",
+                llm.model,
+                qid,
+                FORECASTER_SOFT_DEADLINE,
+                elapsed,
+            )
+            raise
+
     async def _make_prediction(
         self,
         question: MetaculusQuestion,
@@ -945,23 +1093,92 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if research is None:
                 raise ValueError("STACKING aggregation strategy requires research context")
 
+            # Stacker fallback chain:
+            #   1. Primary stacker (opus-4.7) under STACKER_SOFT_DEADLINE.
+            #   2. On failure/timeout: secondary stacker (gpt-5.5, different
+            #      provider so Anthropic-API thrash doesn't take us down) under
+            #      STACKER_FALLBACK_SOFT_DEADLINE.
+            #   3. On both failing: MEDIAN aggregation (not MEAN — MEAN on
+            #      disagreeing opus/gpt/gemini distributions can produce a weird
+            #      multi-modal numeric output; MEDIAN is robust).
+            #
+            # stacking_fallback_on_failure=False (used in benchmarks) preserves
+            # hard-fail behavior end-to-end so benchmark runs surface stacker
+            # regressions loudly.
+            # CancelledError is BaseException in 3.11+ — intentionally not caught here.
             try:
-                stacked = await self._run_stacking(question, research, reasoned_predictions)
+                stacked = await asyncio.wait_for(
+                    self._run_stacking(question, research, reasoned_predictions),
+                    timeout=STACKER_SOFT_DEADLINE,
+                )
                 return self._maybe_snap_to_integers(stacked, question)
-            except Exception as e:
-                if self.stacking_fallback_on_failure:
-                    self._stacking_fallback_count += 1
-                    logger.warning(f"Stacking failed ({type(e).__name__}: {e}), falling back to MEAN aggregation")
-                    # Temporarily switch to MEAN for fallback
-                    original_strategy = self.aggregation_strategy
-                    self.aggregation_strategy = AggregationStrategy.MEAN
-                    try:
-                        result = await self._aggregate_predictions(predictions, question)
-                        return result
-                    finally:
-                        self.aggregation_strategy = original_strategy
-                else:
+            except Exception as primary_exc:
+                if not self.stacking_fallback_on_failure:
                     raise
+
+                self._stacker_primary_failed_count += 1
+                logger.warning(
+                    "STACKER_PRIMARY_FAILED: primary stacker failed on Q %s (%s: %s); trying fallback model",
+                    question.id_of_question,
+                    type(primary_exc).__name__,
+                    primary_exc,
+                )
+
+                # Try fallback stacker LLM (lazy import to avoid circular deps)
+                from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
+
+                try:
+                    self._stacker_fallback_used_count += 1
+                    stacked = await asyncio.wait_for(
+                        self._run_stacking(
+                            question,
+                            research,
+                            reasoned_predictions,
+                            stacker_llm_override=STACKER_FALLBACK_LLM,
+                        ),
+                        timeout=STACKER_FALLBACK_SOFT_DEADLINE,
+                    )
+                    logger.info(
+                        "STACKER_FALLBACK_SUCCEEDED: fallback stacker succeeded on Q %s",
+                        question.id_of_question,
+                    )
+                    return self._maybe_snap_to_integers(stacked, question)
+                except Exception as fallback_exc:
+                    self._stacker_fallback_failed_count += 1
+                    self._stacking_fallback_count += 1
+                    logger.error(
+                        "STACKER_FALLBACK_FAILED: fallback stacker also failed on Q %s (%s: %s); "
+                        "falling back to MEDIAN aggregation",
+                        question.id_of_question,
+                        type(fallback_exc).__name__,
+                        fallback_exc,
+                    )
+                    # Direct per-type MEDIAN dispatch. We deliberately do NOT
+                    # mutate self.aggregation_strategy here: forecast_questions
+                    # runs questions concurrently via asyncio.gather on the same
+                    # bot instance, so a mutation during the await would let
+                    # another concurrent question observe the wrong strategy
+                    # and mis-route its dispatch.
+                    first_prediction = predictions[0]
+                    if isinstance(first_prediction, (int, float)):
+                        float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
+                        return combine_binary_predictions(  # type: ignore[return-value]  # float is a PredictionTypes member
+                            float_preds, AggregationStrategy.MEDIAN
+                        )
+                    if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
+                        numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
+                        median_numeric = await combine_numeric_predictions(
+                            numeric_preds, question, AggregationStrategy.MEDIAN
+                        )
+                        return self._maybe_snap_to_integers(median_numeric, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+                    if isinstance(first_prediction, PredictedOptionList):
+                        mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
+                        return combine_multiple_choice_predictions(  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
+                            mc_preds, AggregationStrategy.MEDIAN
+                        )
+                    raise ValueError(
+                        f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}"
+                    ) from fallback_exc
 
         # High-level aggregation log for clarity
         qtype = (

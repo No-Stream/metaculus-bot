@@ -1,7 +1,7 @@
 """Unit tests for stacking functionality."""
 
 import asyncio
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from forecasting_tools import (
@@ -381,6 +381,8 @@ class TestStackingIntegration:
     @pytest.mark.asyncio
     async def test_stacking_fallback_behavior(self):
         """Test fallback behavior when stacking fails."""
+        from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
+
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
 
         # Create bot with fallback enabled
@@ -397,21 +399,81 @@ class TestStackingIntegration:
             stacking_fallback_on_failure=True,
         )
 
-        # Mock _run_stacking to raise an exception
-        with patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")):
-            with patch.object(bot, "aggregation_strategy", AggregationStrategy.STACKING):
-                # Mock the mean aggregation path
-                with patch(
-                    "metaculus_bot.numeric_utils.aggregate_binary_mean",
-                    return_value=0.5,
-                ):
-                    result = await bot._aggregate_predictions(
-                        predictions=[0.4, 0.6],
-                        question=Mock(spec=BinaryQuestion),
-                        research="test research",
-                        reasoned_predictions=[Mock(), Mock()],
-                    )
-                    assert result == 0.5  # Should fallback to mean
+        # Mock _run_stacking to raise an exception. After primary fails we
+        # fall through to fallback LLM then to MEDIAN aggregation; patch the
+        # fallback stacker constructor call path so both stacker attempts
+        # raise, landing us in MEDIAN.
+        mock_question = Mock(spec=BinaryQuestion)
+        mock_question.id_of_question = 42
+        with (
+            patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")) as mock_run_stacking,
+            patch.object(bot, "aggregation_strategy", AggregationStrategy.STACKING),
+        ):
+            result = await bot._aggregate_predictions(
+                predictions=[0.4, 0.6],
+                question=mock_question,
+                research="test research",
+                reasoned_predictions=[Mock(), Mock()],
+            )
+            # Median of [0.4, 0.6] = 0.5 — both the primary and fallback
+            # stackers fail, so we end up in the MEDIAN branch (was MEAN
+            # before; changed as part of the fallback hardening).
+            assert result == 0.5
+            # F8: assert the degradation counters were tripped as expected.
+            # Primary fails → primary counter, then fallback is attempted
+            # (counter tripped at invocation time) and also fails.
+            assert bot._stacker_primary_failed_count == 1
+            assert bot._stacker_fallback_used_count == 1
+            assert bot._stacker_fallback_failed_count == 1
+            # Two _run_stacking calls expected: primary + fallback.
+            assert mock_run_stacking.call_count == 2
+            # The second call must have received the fallback LLM override.
+            assert mock_run_stacking.call_args_list[1].kwargs["stacker_llm_override"] is STACKER_FALLBACK_LLM
+
+    @pytest.mark.asyncio
+    async def test_stacking_fallback_success_middle_path(self):
+        """F7: Primary stacker fails, fallback stacker succeeds.
+
+        The middle path (primary raises → fallback succeeds → return fallback value)
+        was untested before: prior tests either covered primary success or both
+        failing. This asserts the counters reflect "one failure, one successful
+        recovery, no MEDIAN fallback needed".
+        """
+        from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
+
+        test_llm = GeneralLlm(model="test-model", temperature=0.0)
+
+        bot = TemplateForecaster(
+            aggregation_strategy=AggregationStrategy.STACKING,
+            llms={
+                "forecasters": [test_llm],
+                "stacker": test_llm,
+                "default": test_llm,
+                "parser": test_llm,
+                "researcher": test_llm,
+                "summarizer": test_llm,
+            },
+            stacking_fallback_on_failure=True,
+        )
+
+        mock_question = Mock(spec=BinaryQuestion)
+        mock_question.id_of_question = 99
+        # side_effect sequence: primary raises, fallback returns 0.7.
+        with patch.object(bot, "_run_stacking", side_effect=[RuntimeError("primary failed"), 0.7]) as mock_run_stacking:
+            result = await bot._aggregate_predictions(
+                predictions=[0.4, 0.6],
+                question=mock_question,
+                research="test research",
+                reasoned_predictions=[Mock(), Mock()],
+            )
+
+        assert result == 0.7, "Fallback stacker's value must be returned (not MEDIAN=0.5)."
+        assert bot._stacker_primary_failed_count == 1
+        assert bot._stacker_fallback_used_count == 1
+        assert bot._stacker_fallback_failed_count == 0
+        assert mock_run_stacking.call_count == 2
+        # Verify the fallback call received the fallback LLM as override.
+        assert mock_run_stacking.call_args_list[1].kwargs["stacker_llm_override"] is STACKER_FALLBACK_LLM
 
     @pytest.mark.asyncio
     async def test_stacking_no_fallback_raises_error(self):
@@ -630,16 +692,25 @@ class TestStackingResearchAndMakePredictions:
                 "researcher": test_llm,
                 "summarizer": test_llm,
             },
+            min_forecasters_to_publish=1,
         )
 
         question = Mock()
 
-        # Mock the necessary methods
+        # Mock the necessary methods. _forecaster_with_soft_deadline is
+        # stubbed so the coroutines created inline in _research_and_make_predictions
+        # don't leak as "never awaited" warnings when _gather_results_and_exceptions
+        # (mocked below) never touches them.
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
             patch.object(bot, "_aggregate_predictions", return_value=0.7) as mock_aggregate,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
         ):
             # Setup mock returns
             mock_notepad.return_value = Mock(total_research_reports_attempted=0)
@@ -680,6 +751,7 @@ class TestStackingResearchAndMakePredictions:
                 "researcher": test_llm,
                 "summarizer": test_llm,
             },
+            min_forecasters_to_publish=1,
         )
 
         question = Mock()
@@ -688,6 +760,11 @@ class TestStackingResearchAndMakePredictions:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0)
             pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
@@ -891,6 +968,7 @@ class TestStackingGuardsAndReasoning:
                 "researcher": test_llm,
                 "summarizer": test_llm,
             },
+            min_forecasters_to_publish=1,
         )
 
         question = Mock(spec=BinaryQuestion)
@@ -902,6 +980,11 @@ class TestStackingGuardsAndReasoning:
             patch.object(bot, "run_research", return_value="test research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
             patch.object(bot, "_run_stacking", return_value=0.7),
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
             pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")

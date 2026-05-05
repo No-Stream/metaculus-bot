@@ -245,6 +245,10 @@ class TestParallelExecution:
         with patch.object(TemplateForecaster, "__init__", lambda self: None):
             bot = TemplateForecaster.__new__(TemplateForecaster)
             bot.allow_research_fallback = False
+            # __init__ was bypassed; set the counter attribute that
+            # _run_providers_parallel now increments on non-AskNews-403
+            # provider failures.
+            bot._research_provider_timeout_count = 0
 
             async def failing_provider(q: str) -> str:
                 raise RuntimeError("Provider failed")
@@ -296,3 +300,83 @@ class TestParallelExecution:
         assert execution_order == ["slow_start", "fast_start"]
         # Fast should complete before slow
         assert completion_order == ["fast", "slow"]
+
+
+class TestAskNewsSubscriptionErrorHandling:
+    """F10: AskNews off-season 403 vs operational failure branching in
+    _run_providers_parallel.
+
+    The provider loop must silence only the exact subscription-inactive
+    signature (class-name + message match) — every other asknews failure must
+    bump _research_provider_timeout_count so CI surfaces it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_asknews_subscription_inactive_not_counted_and_info_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """AskNews 403011 → counter stays 0, INFO log emitted, no WARNING."""
+        import logging
+
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+
+        from main import TemplateForecaster
+
+        # Local class named "ForbiddenError" so type(exc).__name__ matches the
+        # SDK's real class name that is_asknews_subscription_error looks for.
+        class ForbiddenError(Exception):
+            pass
+
+        with patch.object(TemplateForecaster, "__init__", lambda self: None):
+            bot = TemplateForecaster.__new__(TemplateForecaster)
+            bot.allow_research_fallback = False
+            bot._research_provider_timeout_count = 0
+
+            async def asknews_provider(q: str) -> str:
+                raise ForbiddenError("403011 - subscription is not currently active")
+
+            with caplog.at_level(logging.INFO, logger="main"):
+                result = await bot._run_providers_parallel("test question", [(asknews_provider, "asknews")])
+
+        assert result == "", "Failed provider yields empty result."
+        assert bot._research_provider_timeout_count == 0, (
+            "Off-season subscription-inactive must NOT count as an alertable failure."
+        )
+        # Matching INFO-level log (no WARNING) should be present.
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO and "asknews" in r.getMessage().lower()]
+        warning_records = [
+            r for r in caplog.records if r.levelno == logging.WARNING and "asknews" in r.getMessage().lower()
+        ]
+        assert any("inactive" in r.getMessage().lower() or "off-season" in r.getMessage().lower() for r in info_records)
+        assert warning_records == [], "Subscription-inactive must not log at WARNING."
+
+    @pytest.mark.asyncio
+    async def test_asknews_non_subscription_error_counted_and_warning_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """AskNews non-subscription failure → counter bumped, WARNING logged."""
+        import logging
+
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+
+        from main import TemplateForecaster
+
+        with patch.object(TemplateForecaster, "__init__", lambda self: None):
+            bot = TemplateForecaster.__new__(TemplateForecaster)
+            bot.allow_research_fallback = False
+            bot._research_provider_timeout_count = 0
+
+            async def asknews_provider(q: str) -> str:
+                raise RuntimeError("connection timeout")
+
+            with caplog.at_level(logging.WARNING, logger="main"):
+                result = await bot._run_providers_parallel("test question", [(asknews_provider, "asknews")])
+
+        assert result == ""
+        assert bot._research_provider_timeout_count == 1
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("asknews" in r.getMessage().lower() for r in warning_records)

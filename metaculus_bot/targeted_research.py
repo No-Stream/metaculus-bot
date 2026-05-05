@@ -12,7 +12,6 @@ each via a parallel grounded Gemini search.
 import asyncio
 import json
 import logging
-import re
 from typing import Any
 
 import httpx
@@ -33,6 +32,7 @@ from metaculus_bot.prompts import (
     targeted_search_prompt,
 )
 from metaculus_bot.research_providers import build_native_search_llm
+from metaculus_bot.structured_output_schema import extract_first_balanced_braces, extract_json_block
 
 __all__ = [
     "extract_disagreement_crux",
@@ -115,16 +115,15 @@ def _parse_gap_list(raw: str, *, max_gaps: int | None = None) -> list[dict[str, 
     if not raw or not raw.strip():
         return []
 
-    # Strip triple-backtick fences if present
-    stripped = raw.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
-    if fence_match:
-        stripped = fence_match.group(1)
+    # Prefer fenced blocks (canonical extractor in structured_output_schema);
+    # fall back to a string-literal-aware balanced-brace scan for unfenced
+    # payloads with trailing commentary. Both helpers live in one module so
+    # the brace-scanner is fixed in one place.
+    fenced = extract_json_block(raw)
+    if fenced is not None:
+        stripped = fenced
     else:
-        # Try to extract the first {...} block
-        brace_match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-        if brace_match:
-            stripped = brace_match.group(0)
+        stripped = extract_first_balanced_braces(raw) or raw.strip()
 
     try:
         data: Any = json.loads(stripped)
@@ -230,13 +229,16 @@ async def run_gap_fill_pass(
     forecast at all; the `research.strip()` guard at the call site already
     ensures we never swallow a first-pass failure here.
     """
+    gaps: list[dict[str, str]] = []
     try:
         gaps = await _run_analyzer(question, first_pass_research, is_benchmarking=is_benchmarking)
     except _GAP_FILL_SOFT_FAIL_EXCEPTIONS as exc:
         logger.warning(f"GapFill: analyzer failed ({type(exc).__name__}): {exc}")
-        return ""
 
     if not gaps:
+        # A soft-fail here is already an async no-op; give the scheduler a
+        # checkpoint so flake8-async (ASYNC910) is satisfied on every path.
+        await asyncio.sleep(0)
         return ""
 
     search_tasks = [_resolve_single_gap(g, question.question_text, is_benchmarking=is_benchmarking) for g in gaps]

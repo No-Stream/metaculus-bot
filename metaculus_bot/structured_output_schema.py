@@ -387,6 +387,50 @@ def extract_json_block(rationale_text: str) -> str | None:
     return None
 
 
+def extract_first_balanced_braces(s: str) -> str | None:
+    """Return the first balanced ``{...}`` block in ``s``, or None if none exists.
+
+    String-literal-aware: braces inside JSON string literals are not counted.
+    Respects backslash escapes so ``"\\""`` does not terminate a string. This
+    makes the helper safe on inputs like ``{"foo": "has a } brace"}`` which a
+    naive brace-counter would truncate.
+
+    A naive scan that counted every ``{`` / ``}`` would produce malformed
+    output on payloads where the LLM embeds literal braces inside string
+    values — a common failure mode we silently hit before adding this.
+    """
+    start_idx = s.find("{")
+    if start_idx == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i in range(start_idx, len(s)):
+        c = s[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if in_string:
+            if c == "\\":
+                escape_next = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start_idx : i + 1]
+
+    return None
+
+
 def parse_structured_block(
     rationale_text: str,
     question_type: Literal["binary", "numeric", "multiple_choice"],

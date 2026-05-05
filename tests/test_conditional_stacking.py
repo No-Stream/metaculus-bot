@@ -51,6 +51,9 @@ def _make_bot(
         is_benchmarking=True,
         stacking_spread_thresholds=stacking_spread_thresholds,
         stacking_fallback_on_failure=stacking_fallback_on_failure,
+        # Test fixtures use 2-model ensembles for speed; allow publishing at
+        # that lower threshold so tests don't trip the production guard.
+        min_forecasters_to_publish=1,
     )
 
 
@@ -94,6 +97,11 @@ class TestConditionalStackingBinaryTrigger:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -149,6 +157,11 @@ class TestConditionalStackingBinaryTrigger:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -193,6 +206,11 @@ class TestConditionalStackingFallbacks:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -236,6 +254,11 @@ class TestConditionalStackingFallbacks:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -278,6 +301,11 @@ class TestConditionalStackingFallbacks:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -354,6 +382,11 @@ class TestConditionalStackingMC:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="mc research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -400,6 +433,11 @@ class TestConditionalStackingThresholds:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -430,6 +468,11 @@ class TestConditionalStackingThresholds:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -466,6 +509,11 @@ class TestConditionalStackingThresholds:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -542,6 +590,11 @@ class TestConditionalStackingNumeric:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -585,6 +638,11 @@ class TestConditionalStackingNumeric:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -617,6 +675,11 @@ class TestConditionalStackingAggregation:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -663,6 +726,11 @@ class TestConditionalStackingAggregation:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -706,6 +774,11 @@ class TestConditionalStackingBenchmarkingFlag:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -747,6 +820,11 @@ class TestConditionalStackingModelTagStripping:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -789,6 +867,11 @@ class TestConditionalStackingFailureCounters:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -822,6 +905,11 @@ class TestConditionalStackingFailureCounters:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
@@ -875,6 +963,11 @@ class TestConditionalStackingSixModelEnsemble:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
             patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
             patch(
                 "main.extract_disagreement_crux",
                 new_callable=AsyncMock,
