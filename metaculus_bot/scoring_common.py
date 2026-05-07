@@ -5,13 +5,23 @@ All functions are pure with no side effects and have no dependency on forecastin
 
 import math
 
-PROB_CLAMP_MIN: float = 1e-4
-PROB_CLAMP_MAX: float = 1.0 - 1e-4
+from metaculus_bot.prob_math_utils import PROB_CLAMP_EPS, clamp_prob
+
+PROB_CLAMP_MIN: float = PROB_CLAMP_EPS
+PROB_CLAMP_MAX: float = 1.0 - PROB_CLAMP_EPS
 BOUNDARY_BASELINE: float = 0.05
 
-
-def clamp_prob(p: float) -> float:
-    return max(PROB_CLAMP_MIN, min(PROB_CLAMP_MAX, p))
+__all__ = [
+    "BOUNDARY_BASELINE",
+    "PROB_CLAMP_MAX",
+    "PROB_CLAMP_MIN",
+    "binary_log_score",
+    "brier_score",
+    "clamp_prob",
+    "mc_log_score",
+    "numeric_log_score",
+    "resolution_to_bucket_index",
+]
 
 
 def brier_score(predicted_prob: float, outcome: bool) -> float:

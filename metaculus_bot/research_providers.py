@@ -20,8 +20,10 @@ from metaculus_bot.constants import (
     ASKNEWS_MAX_CONCURRENCY,
     ASKNEWS_MAX_RPS,
     ASKNEWS_MAX_TRIES,
+    ASKNEWS_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
+from metaculus_bot.prompts import web_research_prompt
 
 QuestionText = str
 ResearchCallable = Callable[[QuestionText], Awaitable[str]]
@@ -52,6 +54,20 @@ async def _asknews_rate_gate() -> None:
         _ASKNEWS_LAST_CALL_TS = now
 
 
+def is_asknews_subscription_error(exc: BaseException) -> bool:
+    """True iff exc is AskNews's 403011 subscription-inactive signature.
+
+    Narrow match (class name AND inner message) so a generic "403 Forbidden"
+    from an unrelated provider isn't silenced. SDK raises ForbiddenError with
+    code 403011 or "subscription is not currently active" when billing lapses.
+    """
+    msg = str(exc).lower()
+    if "forbiddenerror" in type(exc).__name__.lower():
+        if "403011" in msg or "subscription is not currently active" in msg:
+            return True
+    return False
+
+
 def _asknews_provider() -> ResearchCallable:
     global _ASKNEWS_GLOBAL_SEMAPHORE
     if _ASKNEWS_GLOBAL_SEMAPHORE is None:
@@ -60,6 +76,14 @@ def _asknews_provider() -> ResearchCallable:
         _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max_c)
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
+        # Hard wall-clock timeout around the full provider. AskNews's internal
+        # retry loop fails fast on non-retryable errors, but a genuine network
+        # hang (connect stall, DNS hang, server not closing the stream) is
+        # otherwise unbounded. This backstops that case so a stuck AskNews
+        # call can't hold the whole research phase hostage.
+        return await asyncio.wait_for(_fetch_impl(question_text), timeout=ASKNEWS_WALL_TIMEOUT)
+
+    async def _fetch_impl(question_text: str) -> str:
         assert _ASKNEWS_GLOBAL_SEMAPHORE is not None
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)
@@ -303,42 +327,11 @@ def _native_search_provider(
 
     async def _fetch(question_text: str) -> str:  # noqa: D401
         llm = build_native_search_llm(model_slug)
-
-        # Exclude prediction markets when benchmarking to avoid data leakage
-        if is_benchmarking:
-            prediction_markets_instruction = ""
-            benchmarking_warning = """
-IMPORTANT: This is a model benchmarking run. DO NOT search for or include prediction market
-odds, forecasts, or betting lines - this would constitute data leakage."""
-        else:
-            prediction_markets_instruction = "\n- Prediction market odds and forecasts (if available)"
-            benchmarking_warning = ""
-
-        prompt = f"""You are a research assistant gathering factual information for a forecaster.
-
-TASK: Search the web to find relevant facts, data, and expert opinions about the question below.{benchmarking_warning}
-
-GUIDELINES:
-- Search thoroughly - make multiple searches if needed to fill gaps
-- Be factual and unbiased - report what you find, not what you think
-- Include inline citations [source name](url) for all factual claims
-- If you cannot find reliable information on something, say so explicitly
-- DO NOT hallucinate sources - only cite what you actually found
-- DO NOT make predictions or forecasts yourself
-- It's OK to have a short response if there isn't much reliable information
-
-FOCUS AREAS:
-- Recent news and developments
-- Historical context and trends
-- Statistical data and metrics
-- Expert opinions and analysis
-- Official statements and announcements{prediction_markets_instruction}
-
-QUESTION:
-{question_text}
-
-Provide a factual research summary with citations:"""
-
+        prompt = web_research_prompt(
+            question_text,
+            is_benchmarking=is_benchmarking,
+            citation_style="markdown",
+        )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
         result = await llm.invoke(prompt)
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")

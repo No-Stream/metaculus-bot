@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -10,17 +11,104 @@ from forecasting_tools import (
 __all__ = [
     "binary_prompt",
     "disagreement_crux_prompt",
+    "gap_fill_analyzer_prompt",
+    "gap_fill_search_prompt",
     "multiple_choice_prompt",
     "numeric_prompt",
     "stacking_binary_prompt",
     "stacking_multiple_choice_prompt",
     "stacking_numeric_prompt",
     "targeted_search_prompt",
+    "web_research_prompt",
 ]
+
+
+BenchmarkingContext = Literal["search", "gap_flagging", "targeted_search"]
+
+
+def _benchmarking_warning(context: BenchmarkingContext = "search") -> str:
+    """Return the canonical benchmarking-run warning string (or empty).
+
+    Shared across all research-facing prompts so the "no prediction markets
+    during benchmarking" rule can be tweaked in one place. Leading newlines
+    match existing formatting conventions for each call site.
+    """
+    if context == "gap_flagging":
+        return (
+            "\n\nIMPORTANT: This is a benchmarking run. DO NOT flag prediction-market odds "
+            "as a gap and DO NOT request searches for prediction markets — that would be "
+            "data leakage."
+        )
+    # "search" / "targeted_search" share the same body.
+    return (
+        "\n\nIMPORTANT: This is a benchmarking run. DO NOT search for or include "
+        "prediction-market odds, forecasts, or betting lines — that would be data leakage."
+    )
 
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+CitationStyle = Literal["markdown", "auto_annotated"]
+
+
+def web_research_prompt(
+    question_text: str,
+    *,
+    is_benchmarking: bool = False,
+    citation_style: CitationStyle = "markdown",
+    allow_resolution_source_reading: bool = False,
+) -> str:
+    """Canonical web-research prompt for first-pass providers.
+
+    Shared by the OpenRouter native-search provider (markdown citations) and
+    the Gemini grounding provider (SDK auto-annotates via grounding metadata).
+    """
+    citation_clause = (
+        "Include inline citations [source name](url) for all factual claims"
+        if citation_style == "markdown"
+        else "Include inline citations for all factual claims (the tool will auto-annotate)"
+    )
+    footer = (
+        "Provide a factual research summary with citations:"
+        if citation_style == "markdown"
+        else "Provide a factual research summary:"
+    )
+    resolution_source_hint = (
+        "\n- If the question cites specific resolution sources or URLs, prioritize reading them directly"
+        if allow_resolution_source_reading
+        else ""
+    )
+    prediction_markets_instruction = (
+        "" if is_benchmarking else "\n- Prediction market odds and forecasts (if available)"
+    )
+    benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
+
+    return f"""You are a research assistant gathering factual information for a forecaster.
+
+TASK: Search the web to find relevant facts, data, and expert opinions about the question below.{benchmarking_warning}
+
+GUIDELINES:
+- Search thoroughly — issue multiple queries if needed to fill gaps
+- Be factual and unbiased — report what you find, not what you think
+- {citation_clause}
+- If you cannot find reliable information on something, say so explicitly
+- DO NOT hallucinate sources — only cite what you actually found
+- DO NOT make predictions or forecasts yourself
+- It's OK to have a short response if there isn't much reliable information{resolution_source_hint}
+
+FOCUS AREAS:
+- Recent news and developments
+- Historical context and trends
+- Statistical data and metrics
+- Expert opinions and analysis
+- Official statements and announcements{prediction_markets_instruction}
+
+QUESTION:
+{question_text}
+
+{footer}"""
 
 
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
@@ -648,12 +736,7 @@ def disagreement_crux_prompt(question_text: str, base_predictions: list[str]) ->
 
 def targeted_search_prompt(crux: str, question_text: str, *, is_benchmarking: bool = False) -> str:
     """Prompt for Grok with native search to resolve a specific factual disagreement."""
-    benchmarking_warning = (
-        "\n\nIMPORTANT: This is a benchmarking run. DO NOT search for or include prediction "
-        "market odds, forecasts, or betting lines — this would constitute data leakage."
-        if is_benchmarking
-        else ""
-    )
+    benchmarking_warning = _benchmarking_warning("targeted_search") if is_benchmarking else ""
     return clean_indents(
         f"""
         Search the web for current, factual information to resolve this specific question:
@@ -665,5 +748,120 @@ def targeted_search_prompt(crux: str, question_text: str, *, is_benchmarking: bo
         Focus on: recent official data, primary sources, quantitative evidence, confirmed
         timelines, and resolution-relevant facts. Include inline citations [source](url)
         for all claims.{benchmarking_warning}
+        """
+    )
+
+
+def gap_fill_analyzer_prompt(
+    question_text: str,
+    resolution_criteria: str | None,
+    fine_print: str | None,
+    first_pass_research: str,
+    *,
+    is_benchmarking: bool = False,
+    max_gaps: int = 5,
+) -> str:
+    """Prompt for a cheap model to identify factual gaps in the first-pass research.
+
+    Returns a JSON list of gap objects (or empty list). Quality over quantity:
+    most questions have 0-2 meaningful gaps; at most ``max_gaps``.
+    """
+    benchmarking_warning = _benchmarking_warning("gap_flagging") if is_benchmarking else ""
+    resolution_block = (resolution_criteria or "(none provided)").strip()
+    fine_print_block = (fine_print or "(none provided)").strip()
+
+    return clean_indents(
+        f"""
+        You are a research-quality auditor. A forecaster has received first-pass research
+        on a question. Your job: identify up to {max_gaps} specific factual gaps where
+        additional targeted search would meaningfully improve the forecast.{benchmarking_warning}
+
+        Be thorough but SELECTIVE. Only flag a gap if resolving it would change how a
+        superforecaster reasons about the question. Most questions have 0-2 real gaps;
+        a few have 3-5. DO NOT invent gaps for completeness.
+
+        Gap types to look for:
+
+        1. Unread resolution sources — specific URLs, datasets, or reports named in
+           resolution criteria or fine print that the first pass did not retrieve.
+           These are often authoritative ground truth.
+        2. Missing dates / chronology — first pass says "recently" or "this year" but
+           the question turns on when exactly.
+        3. Unaccessed flagged sources — first pass mentions a URL, PDF, or paywalled
+           source it could not open.
+        4. Missing quantitative specifics — first pass uses vague quantifiers
+           ("high", "several", "many") where the question turns on a number.
+        5. Unresolved contradictions — two sources disagree and the first pass did
+           not fetch a tiebreaker.
+        6. Missing base rate / reference class — the question asks about a class of
+           event but first pass gives anecdotes rather than historical frequency data.
+        7. Missing expert opinion — first pass asserts a claim that should have a
+           named expert or institution behind it but does not cite one.
+        8. Stale first-pass info — first pass appears drawn from training data rather
+           than current search (e.g., no {datetime.now().year} data on a near-term question).
+        9. Missing counter-evidence — first pass is one-sided; a "consider the
+           opposite" search would strengthen the forecast.
+
+        Output STRICT JSON, nothing else, matching this schema exactly:
+
+        {{"gaps": [
+            {{
+                "gap": "<specific factual question to resolve>",
+                "why_matters": "<1 sentence on why resolving this would change the forecast>",
+                "search_query": "<suggested search query, concise and specific>"
+            }}
+        ]}}
+
+        If there are NO meaningful gaps, return {{"gaps": []}}.
+
+        Question:
+        {question_text}
+
+        Resolution criteria:
+        {resolution_block}
+
+        Fine print (often contains resolution sources):
+        {fine_print_block}
+
+        First-pass research:
+        {first_pass_research}
+
+        Return ONLY the JSON object. No preamble, no trailing commentary.
+        """
+    )
+
+
+def gap_fill_search_prompt(
+    gap: str,
+    search_query: str,
+    question_text: str,
+    *,
+    is_benchmarking: bool = False,
+) -> str:
+    """Prompt for a grounded search to resolve one specific gap."""
+    benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
+    return clean_indents(
+        f"""
+        You are a research assistant resolving ONE specific factual gap for a forecaster.
+
+        Gap to resolve:
+        {gap}
+
+        Suggested search query (feel free to refine or supplement):
+        {search_query}
+
+        This gap is from forecasting:
+        {question_text}
+
+        Search the web for CURRENT, AUTHORITATIVE evidence addressing the gap. If the gap
+        refers to a specific URL or document (e.g., a government report, an SEC filing,
+        a dataset), try to read that source directly before doing broader searches.
+
+        GUIDELINES:
+        - Be factual and specific; report what you find, not what you think
+        - Include inline citations for every factual claim (the tool auto-annotates)
+        - If the gap cannot be resolved with available sources, say so explicitly
+        - DO NOT hallucinate sources — only cite what you actually found
+        - DO NOT produce a forecast{benchmarking_warning}
         """
     )

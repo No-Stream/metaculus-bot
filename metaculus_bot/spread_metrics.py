@@ -20,11 +20,9 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
-logger: logging.Logger = logging.getLogger(__name__)
+from metaculus_bot.prob_math_utils import logit
 
-# Clamp bounds for log-odds conversion to avoid log(0)
-_LOG_ODDS_CLAMP_MIN: float = 0.001
-_LOG_ODDS_CLAMP_MAX: float = 0.999
+logger: logging.Logger = logging.getLogger(__name__)
 
 # Indices into the standard 11-percentile list (2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5)
 # that correspond to the 10th, 50th, and 90th percentiles.
@@ -46,17 +44,13 @@ def binary_prob_range_spread(prediction_values: list[float]) -> float:
 def binary_log_odds_spread(prediction_values: list[float]) -> float:
     """Log-odds range across binary predictions.
 
-    Clamps probabilities to [_LOG_ODDS_CLAMP_MIN, _LOG_ODDS_CLAMP_MAX] to avoid
-    log(0). Available as an alternative spread metric; see binary_prob_range_spread.
+    Uses the shared ``logit`` (canonical eps=1e-4) to avoid log(0). Available as
+    an alternative spread metric; see binary_prob_range_spread.
     """
     if len(prediction_values) < 2:
         raise ValueError("binary_log_odds_spread requires at least 2 predictions")
 
-    def _to_log_odds(p: float) -> float:
-        clamped = max(_LOG_ODDS_CLAMP_MIN, min(_LOG_ODDS_CLAMP_MAX, p))
-        return math.log(clamped / (1.0 - clamped))
-
-    log_odds = [_to_log_odds(p) for p in prediction_values]
+    log_odds = [logit(p) for p in prediction_values]
     return max(log_odds) - min(log_odds)
 
 

@@ -92,6 +92,11 @@ COMMENT_CHAR_LIMIT: int = 149_999
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
 
 
+def env_flag_enabled(env_name: str) -> bool:
+    """Return True iff env var is set to "true"/"1"/"yes" (case-insensitive)."""
+    return os.getenv(env_name, "").lower() in ("true", "1", "yes")
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -127,6 +132,17 @@ ASKNEWS_MAX_RPS: float = max(0.1, _float_env("ASKNEWS_MAX_RPS", 0.8))
 # Retry tuning for AskNews
 ASKNEWS_MAX_TRIES: int = max(1, _int_env("ASKNEWS_MAX_TRIES", 3))
 ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
+# Hard wall-clock bound around the full AskNews provider (hot+historical+sleeps+retries).
+# AskNews's internal retry loop fails fast on non-retryable errors, but a network
+# hang is otherwise unbounded; this backstops that case so a stuck AskNews call
+# can't hold the whole research phase hostage.
+#
+# Sizing: each phase (hot + historical) sleeps 10.1s before its first call and
+# applies backoff `2.0 * (10 + 3**attempt)` on 429/rate-limit retries — attempt
+# 2 ≈ 38s, attempt 3 ≈ 74s. With 3 tries per phase the retry worst case is
+# ~110s hot + ~110s historical + ~30s API time ≈ 250s, so 300s leaves ~20%
+# headroom above the normal retry envelope while still bounding a genuine hang.
+ASKNEWS_WALL_TIMEOUT: int = 300
 
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp
@@ -168,10 +184,48 @@ NATIVE_SEARCH_DEFAULT_MODEL: str = "x-ai/grok-4.1-fast"
 NATIVE_SEARCH_TEMPERATURE: float = 0.3
 NATIVE_SEARCH_TOP_P: float = 0.9
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
-NATIVE_SEARCH_TIMEOUT: int = 300  # 5 minutes
+# 4 min. Observed p99 of Grok native search ≈ 48s; 240s leaves ~5x headroom
+# without letting a stuck upstream dominate a batch run.
+NATIVE_SEARCH_TIMEOUT: int = 240
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
+
+# --- Gemini Search Provider (Google AI Studio direct SDK) ---
+# Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
+# Search results (distinct from OpenRouter's Exa-backed :online plugin). Adds a
+# genuinely new search index to the ensemble.
+GEMINI_SEARCH_ENABLED_ENV: str = "GEMINI_SEARCH_ENABLED"
+GEMINI_SEARCH_MODEL_ENV: str = "GEMINI_SEARCH_MODEL"
+GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
+# Gemini 3 Flash preview model with grounding support. Requires billing enabled
+# on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on
+# free tier if needed. Override via GEMINI_SEARCH_MODEL env var.
+GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
+# No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
+# Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
+# capping either caused silent truncations in the past.
+# 3 min. Observed p99 of Gemini grounded calls (first-pass + gap-fill) ≈ 52s;
+# 180s leaves ~3x headroom. Previously 600s, which was enough to sit behind a
+# stuck upstream for the full worst-case batch budget.
+GEMINI_SEARCH_TIMEOUT: int = 180
+
+# --- Second-pass gap-fill ---
+# After first-pass research completes, a cheap analyzer identifies up to
+# GAP_FILL_MAX_GAPS factual gaps; each is resolved by a parallel grounded
+# Gemini search. Fails soft — forecast proceeds with first-pass research alone
+# if any stage errors out.
+GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
+GAP_FILL_ANALYZER_MODEL: str = "gemini-3-flash-preview"
+GAP_FILL_MAX_GAPS: int = 5
+# Analyzer call is non-grounded (no Google Search) and should return quickly.
+# Use a tight timeout to prevent a single hung analyzer request from holding a
+# research concurrency slot for the full grounded-search budget.
+GAP_FILL_ANALYZER_TIMEOUT: int = 120
+# Skip gap-fill when the first-pass research blob has less than this many
+# non-whitespace characters — likely indicates all providers soft-failed and
+# gap-fill would just hallucinate gaps or burn quota.
+GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
@@ -181,6 +235,30 @@ FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
 FINANCIAL_FRED_LOOKBACK_YEARS: int = 5
+
+# --- Soft deadlines to keep batch wall-clock inside the tournament cron window ---
+# Per-forecaster outer deadline wrapped via asyncio.wait_for around each
+# _make_prediction call. A single stuck forecaster used to be able to hold a
+# question for timeout(480s) * allowed_tries(3) ≈ 24 min; this caps that
+# worst case at 10 min, at which point the forecaster is dropped with a loud
+# WARNING and the other models carry the ensemble.
+FORECASTER_SOFT_DEADLINE: int = 600
+
+# Minimum number of successful base forecasters required to publish a question.
+# Below this, the question is skipped entirely rather than publishing a weak
+# ensemble. Chosen conservatively: median/stacker aggregation remains meaningful
+# with 3/6 inputs; below that we're closer to a single-model opinion.
+MIN_FORECASTERS_TO_PUBLISH: int = 3
+
+# Stacker soft deadline. Set slightly above the stacker LLM's litellm timeout
+# (480s) so the model's own timeout fires first with a clean exception when
+# possible; this wait_for is a final belt-and-suspenders backstop for a wholly
+# stuck call. Stacker is configured with allowed_tries=1 in llm_configs.py so
+# we only get one try before falling back.
+STACKER_SOFT_DEADLINE: int = 500
+# Stacker fallback model soft deadline. Tighter because we're already running
+# late on the critical path by the time the fallback fires.
+STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60

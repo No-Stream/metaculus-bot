@@ -80,3 +80,9 @@ jobs:
           FINANCIAL_DATA_ENABLED: 'true'
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           NATIVE_SEARCH_MODEL: 'x-ai/grok-4.1-fast'
+          # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source
+          GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_SEARCH_ENABLED: 'true'
+          # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
+          # parallel grounded Gemini searches resolve each. Fails soft.
+          GAP_FILL_ENABLED: 'true'

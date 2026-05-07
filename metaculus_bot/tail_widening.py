@@ -16,16 +16,9 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.cluster_processing import ensure_strictly_increasing_bounded
+from metaculus_bot.prob_math_utils import logit, sigmoid
 
 logger = logging.getLogger(__name__)
-
-
-def _sigmoid(y: float) -> float:
-    return 1.0 / (1.0 + math.exp(-y))
-
-
-def _logit(u: float) -> float:
-    return math.log(u / (1.0 - u))
 
 
 def _choose_transform(
@@ -52,11 +45,12 @@ def _choose_transform(
 
         def fwd(x: float) -> float:
             u = (x - L) / rng
-            u = max(1e-12, min(1.0 - 1e-12, u))
-            return _logit(u)
+            # Use a tight clamp here (coordinate transform, not probability scoring)
+            # so percentiles within the outer 0.01% of the range remain distinguishable.
+            return logit(u, eps=1e-12)
 
         def inv(y: float) -> float:
-            u = _sigmoid(y)
+            u = sigmoid(y)
             return L + rng * u
 
         return fwd, inv
