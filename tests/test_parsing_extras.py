@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +9,14 @@ from pydantic import ValidationError
 
 from main import TemplateForecaster
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 @pytest.mark.asyncio
@@ -29,6 +38,8 @@ async def test_binary_parsing_clamps_extremes():
     q.resolution_criteria = ""
     q.fine_print = ""
     q.id_of_question = 1
+    q.open_time = _stub_open_time()
+    q.scheduled_resolution_time = _stub_resolve_time()
 
     llm = MagicMock(spec=GeneralLlm)
     llm.model = "parser-test"
@@ -74,6 +85,8 @@ async def test_numeric_parsing_raises_on_wrong_count():
         zero_point=None,
         id_of_question=2,
         cdf_size=201,
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
 
     # Only 5 percentiles returned -> should raise ValidationError
@@ -139,6 +152,8 @@ async def test_parser_llm_used_for_structured_output():
     bq.resolution_criteria = ""
     bq.fine_print = ""
     bq.id_of_question = 10
+    bq.open_time = _stub_open_time()
+    bq.scheduled_resolution_time = _stub_resolve_time()
     llm = MagicMock(spec=GeneralLlm)
     llm.model = "m"
     llm.invoke = AsyncMock(return_value="r")
@@ -156,6 +171,8 @@ async def test_parser_llm_used_for_structured_output():
     mcq.resolution_criteria = ""
     mcq.fine_print = ""
     mcq.id_of_question = 20
+    mcq.open_time = _stub_open_time()
+    mcq.scheduled_resolution_time = _stub_resolve_time()
     with patch("main.structure_output", _fake_structure_output):
         await bot._run_forecast_on_multiple_choice(mcq, "", llm)
         assert captured["model"] is sentinel_parser_model
@@ -175,6 +192,8 @@ async def test_parser_llm_used_for_structured_output():
         zero_point=None,
         id_of_question=11,
         cdf_size=201,
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
     with patch("main.structure_output", _fake_structure_output):
         await bot._run_forecast_on_numeric(nq, "", llm)  # type: ignore[arg-type]
@@ -199,6 +218,8 @@ async def test_mc_additional_instructions_include_options():
     q.resolution_criteria = ""
     q.fine_print = ""
     q.id_of_question = 21
+    q.open_time = _stub_open_time()
+    q.scheduled_resolution_time = _stub_resolve_time()
 
     llm = MagicMock(spec=GeneralLlm)
     llm.model = "m"

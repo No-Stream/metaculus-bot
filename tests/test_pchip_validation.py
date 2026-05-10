@@ -2,6 +2,7 @@
 Tests for PCHIP CDF validation (QA checks that replace forecasting-tools validation).
 """
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,14 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 class TestPchipValidation:
@@ -59,6 +68,8 @@ class TestPchipValidation:
             fine_print="Test fine print",
             unit_of_measure="units",
             page_url="https://example.com/question/123",
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
     @pytest.mark.asyncio

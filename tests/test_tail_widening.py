@@ -1,4 +1,5 @@
 import math
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +10,14 @@ from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.tail_widening import widen_declared_percentiles
 
 
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
+
+
 def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
     return SimpleNamespace(
         lower_bound=lower,
@@ -17,6 +26,13 @@ def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
         open_upper_bound=open_upper,
         id_of_question=777,
         page_url="https://ex/q/777",
+        question_text="tail widening test",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        unit_of_measure="units",
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
 
 
@@ -139,6 +155,8 @@ class TestTailWideningIntegration:
             zero_point=None,
             id_of_question=4242,
             cdf_size=101,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         # Compressed tails baseline

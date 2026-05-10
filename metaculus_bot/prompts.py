@@ -46,8 +46,38 @@ def _benchmarking_warning(context: BenchmarkingContext = "search") -> str:
     )
 
 
-def _today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+def _forecasting_window_str(
+    question: BinaryQuestion | MultipleChoiceQuestion | NumericQuestion,
+) -> str:
+    """Return a window-anchor block: open date, today, resolution date, deltas.
+
+    Prevents a common failure mode where bots treat questions like "Will a
+    nuclear detonation occur in a Japanese city by 2030?" as already-resolved
+    YES because a detonation happened in 1945 — the question's forecasting
+    window is open_time → scheduled_resolution_time, not "all of history".
+    """
+    # MetaculusQuestion types these as `datetime | None`, but real API-fetched
+    # questions always populate both. Assert to fail fast — a missing timestamp
+    # means upstream data is broken and we want a loud error, not a silent
+    # fallback that corrupts forecasts.
+    assert question.open_time is not None, "question.open_time is required"
+    assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
+
+    today = datetime.now()
+    elapsed_days = (today - question.open_time).days
+    remaining_days = (question.scheduled_resolution_time - today).days
+
+    return (
+        f"Today: {today.strftime('%Y-%m-%d')}\n"
+        f"Question opened: {question.open_time.strftime('%Y-%m-%d')} ({elapsed_days} days ago)\n"
+        f"Scheduled to resolve: {question.scheduled_resolution_time.strftime('%Y-%m-%d')} "
+        f"({remaining_days} days from now)\n"
+        f"Forecasting window: open date → resolution date. "
+        f"Events occurring BEFORE the open date do NOT resolve this question YES "
+        f"unless the resolution criteria explicitly say they count. "
+        f"If the question uses forward-looking language ('will X occur by DATE'), "
+        f"interpret it as asking about the open→resolution window, not all of history."
+    )
 
 
 CitationStyle = Literal["markdown", "auto_annotated"]
@@ -138,7 +168,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             Your research assistant says:
             {research}
 
-            Today is {_today_str()}.
+            {_forecasting_window_str(question)}
             Reproduce the following analysis template in your answer:
 
             ── Analysis Template ──
@@ -147,6 +177,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             0) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
+               • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
                • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "a model is released AND it is Opus-branded AND it is accessible to external users"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
@@ -231,7 +262,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
 
-        Today's date: {_today_str()}
+        {_forecasting_window_str(question)}
         Reproduce the following analysis template in your answer:
 
         ── Analysis Template ──
@@ -343,7 +374,7 @@ def numeric_prompt(
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
 
-        Today's date: {_today_str()}
+        {_forecasting_window_str(question)}
 
         {lower_bound_message}
         {upper_bound_message}
@@ -483,9 +514,9 @@ def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predict
         
         Your research assistant provided this context:
         {research}
-        
-        Today is {_today_str()}.
-        
+
+        {_forecasting_window_str(question)}
+
         ── Multiple Expert Analyses ──
         {predictions_text}
         
@@ -554,12 +585,12 @@ def stacking_multiple_choice_prompt(
         
         ── Intelligence Briefing ────────────────────────────────
         {research}
-        
-        Today's date: {_today_str()}
-        
+
+        {_forecasting_window_str(question)}
+
         ── Multiple Expert Analyses ──
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Model agreement analysis
            • Which options show consensus vs divergence across models?
@@ -645,15 +676,15 @@ def stacking_numeric_prompt(
         
         ── Intelligence Briefing ────────────────────────────────
         {research}
-        
-        Today's date: {_today_str()}
-        
+
+        {_forecasting_window_str(question)}
+
         {lower_bound_message}
         {upper_bound_message}
-        
+
         ── Multiple Expert Analyses ──
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Distribution comparison
            • Compare the central tendencies (medians) across models - what explains differences?

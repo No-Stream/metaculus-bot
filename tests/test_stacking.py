@@ -1,6 +1,7 @@
 """Unit tests for stacking functionality."""
 
 import asyncio
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -23,6 +24,14 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 class TestStackingConfiguration:
@@ -164,6 +173,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/1",
             id_of_question=1,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Weather forecast shows 50% chance of rain."
@@ -192,6 +203,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/2",
             id_of_question=2,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Previous balls were mostly red."
@@ -222,6 +235,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/3",
             id_of_question=3,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Historical attendance averages 500 people."

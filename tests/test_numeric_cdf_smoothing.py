@@ -4,6 +4,7 @@ Tests for numeric CDF smoothing:
 - Probability-side ramp smoothing for PCHIP CDF
 """
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,14 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 def _make_forecaster():
@@ -41,6 +50,8 @@ def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0):
         fine_print="",
         unit_of_measure="units",
         page_url="https://example.com/q/999",
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
 
 
