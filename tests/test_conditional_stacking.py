@@ -135,6 +135,12 @@ class TestConditionalStackingBinaryTrigger:
             assert "Targeted Research" in agg_kwargs["research"]
             assert "base research text" in agg_kwargs["research"]
 
+            # The targeted-research section reaches the published comment via
+            # ResearchWithPredictions.research_report (the regression fix at
+            # main.py:880 replaced raw `research` with `combined_research`).
+            assert "## Targeted Research (addressing model disagreement)" in result.research_report
+            assert "base research text" in result.research_report
+
             # Result has exactly 1 prediction (stacked)
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.72
@@ -184,6 +190,10 @@ class TestConditionalStackingBinaryTrigger:
             assert len(result.predictions) == 2
             assert result.predictions[0].prediction_value == 0.45
             assert result.predictions[1].prediction_value == 0.55
+
+            # Skip path returns the raw research as research_report — no
+            # targeted-research header should leak into the published comment.
+            assert "## Targeted Research" not in result.research_report
 
             # Diagnostic counter incremented
             assert bot._conditional_stacking_skipped_count == 1

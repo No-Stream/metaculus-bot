@@ -508,12 +508,30 @@ class TestStackingIntegration:
             stacking_fallback_on_failure=False,  # No fallback
         )
 
+        # Real BinaryQuestion (not Mock(spec=...)) because _aggregate_predictions
+        # reads question.id_of_question to assert non-None and key into
+        # self._stacker_outcome on the success/fallback paths. A Mock(spec=...)
+        # returns a MagicMock for id_of_question, which would key the dict with
+        # a Mock object instead of an int — fine for the no-fallback path tested
+        # here (which raises before the dict write), but a real question is
+        # future-proof if this test ever exercises the success path.
+        question = BinaryQuestion(
+            question_text="Will it happen?",
+            background_info="bg",
+            resolution_criteria="rc",
+            fine_print="",
+            page_url="https://test.com/no-fallback",
+            id_of_question=999,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
+        )
+
         # Mock _run_stacking to raise an exception
         with patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")):
             with pytest.raises(RuntimeError, match="Stacking failed"):
                 await bot._aggregate_predictions(
                     predictions=[0.4, 0.6],
-                    question=Mock(spec=BinaryQuestion),
+                    question=question,
                     research="test research",
                     reasoned_predictions=[Mock(), Mock()],
                 )

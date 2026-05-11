@@ -23,13 +23,16 @@ from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKER
 from metaculus_bot.performance_analysis.parsing import (
     _iter_per_model_blocks,
     annotate_forecaster_bullets_with_models,
+    detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
     parse_forecaster_model_map,
+    parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
     parse_per_model_numeric_percentiles,
     parse_per_model_reasoning_text,
     parse_resolution,
     parse_stacked_marker,
+    parse_stacker_outcome_marker,
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
@@ -54,6 +57,204 @@ class TestParseStackedMarker:
 
     def test_whitespace_tolerant(self):
         assert parse_stacked_marker("<!--   STACKED=true   -->") is True
+
+
+# ---------------------------------------------------------------------------
+# parse_stacker_outcome_marker (new tri-state marker)
+# ---------------------------------------------------------------------------
+
+
+class TestParseStackerOutcomeMarker:
+    def test_primary_marker(self):
+        assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=primary -->\n") == "primary"
+
+    def test_fallback_llm_marker(self):
+        assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=fallback_llm -->\n") == "fallback_llm"
+
+    def test_fallback_median_marker(self):
+        # The load-bearing case: pre-fix, this path silently emitted STACKED=true.
+        assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=fallback_median -->\n") == "fallback_median"
+
+    def test_skipped_marker(self):
+        assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=skipped -->\n") == "skipped"
+
+    def test_absent_marker_returns_none(self):
+        assert parse_stacker_outcome_marker("# SUMMARY\nNo marker here\n") is None
+
+    def test_case_insensitive(self):
+        assert parse_stacker_outcome_marker("<!-- stacker_outcome=PRIMARY -->") == "primary"
+
+    def test_whitespace_tolerant(self):
+        assert parse_stacker_outcome_marker("<!--  STACKER_OUTCOME=fallback_llm  -->") == "fallback_llm"
+
+
+# ---------------------------------------------------------------------------
+# detect_historical_stacker_signature (body shape, no marker)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectHistoricalStackerSignature:
+    """Detection of pre-marker stacked comments (April 2026 vintage and earlier).
+
+    The historical signature is `## R1: Forecaster 1 Reasoning` immediately
+    followed by `## (Stacker )?Meta-Analysis`. This shape is produced by the
+    stacking commit (2026-04-02, c6d1ab3) and survived the rename in
+    95c4fff (2026-04-27). Comments published before either commit landed
+    don't carry the signature; comments where Forecaster 1's body is
+    ordinary model reasoning don't carry it either.
+    """
+
+    def test_historical_meta_analysis_header(self):
+        # Pre-rename: `## Meta-Analysis` (no "Stacker" prefix).
+        comment = (
+            "# SUMMARY\nstuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.5\n\n"
+            "## Meta-Analysis\n\n"
+            "Synthesis of 6 base models below.\n"
+        )
+        assert detect_historical_stacker_signature(comment) is True
+
+    def test_current_stacker_meta_analysis_header(self):
+        # Post-rename: `## Stacker Meta-Analysis`.
+        comment = (
+            "# SUMMARY\nstuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.7\n\n"
+            "## Stacker Meta-Analysis\n\n"
+            "Synthesis of 6 base models below.\n"
+        )
+        assert detect_historical_stacker_signature(comment) is True
+
+    def test_h1_meta_analysis_and_synthesis_header(self):
+        # Earliest stacker variant emitted ``# Meta-Analysis and Synthesis``
+        # as an H1 heading. Observed in April 2026 records of the
+        # spring-aib-2026 dataset (e.g., post 43155).
+        comment = (
+            "# SUMMARY\nstuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.4\n\n"
+            "# Meta-Analysis and Synthesis\n"
+            "## Model Agreement Analysis\n"
+            "..."
+        )
+        assert detect_historical_stacker_signature(comment) is True
+
+    def test_no_meta_header_in_first_section_returns_false(self):
+        # Plain stacking-skipped or non-stacking comment: Forecaster 1 has its
+        # own analysis structure, not a meta-analysis.
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "Probability: 72%\nReasoning: ...\n\n"
+            "## R1: Forecaster 2 Reasoning\nProbability: 75%\n"
+        )
+        assert detect_historical_stacker_signature(comment) is False
+
+    def test_meta_analysis_inside_individual_forecaster_body_returns_false(self):
+        # A model's own reasoning structure may include a "## Meta-Analysis"
+        # heading several paragraphs in — that's not the stacker shape; the
+        # FIRST heading after the section header is what matters.
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "## Source Analysis\nstuff\n\n"
+            "## Meta-Analysis\nlocal sub-section\n"
+        )
+        assert detect_historical_stacker_signature(comment) is False
+
+    def test_no_forecaster_1_section_returns_false(self):
+        assert detect_historical_stacker_signature("# SUMMARY\nno forecasts here\n") is False
+
+    def test_whitespace_tolerant(self):
+        comment = "## R1: Forecaster 1 Reasoning\n\n\nModel:openrouter/openai/gpt-5.5\n## Stacker Meta-Analysis\n"
+        assert detect_historical_stacker_signature(comment) is True
+
+
+# ---------------------------------------------------------------------------
+# parse_inferred_stacker_outcome (combined: marker → legacy → historical-body)
+# ---------------------------------------------------------------------------
+
+
+class TestParseInferredStackerOutcome:
+    """End-to-end stacker-outcome detection across all three sources of signal.
+
+    Verifies that the combined parser handles every combination a real dataset
+    can throw at it: post-fix tri-state markers (preferred), legacy STACKED=
+    markers (one-round back-compat), and pre-marker historical body shapes.
+    """
+
+    def test_marker_outcome_preferred_when_present(self):
+        comment = (
+            "## R1: Forecaster 1 Reasoning\nModel: x\n\n## Meta-Analysis\nstuff\n"
+            "<!-- STACKER_OUTCOME=fallback_llm -->\n"
+            "<!-- STACKED=true -->\n"
+        )
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "fallback_llm"
+        assert source == "marker_outcome"
+
+    def test_marker_outcome_fallback_median_distinguished_from_legacy(self):
+        # The bug fix: fallback_median should be readable distinctly, not
+        # collapsed to legacy STACKED=true (the pre-fix behavior).
+        comment = "stuff\n<!-- STACKER_OUTCOME=fallback_median -->\n"
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "fallback_median"
+        assert source == "marker_outcome"
+
+    def test_legacy_marker_true_maps_to_primary(self):
+        # Legacy STACKED=true cannot distinguish primary from fallback_llm,
+        # so it conservatively maps to primary (the most common case).
+        comment = "stuff\n<!-- STACKED=true -->\n"
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "primary"
+        assert source == "marker_legacy"
+
+    def test_legacy_marker_false_maps_to_skipped(self):
+        comment = "stuff\n<!-- STACKED=false -->\n"
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "skipped"
+        assert source == "marker_legacy"
+
+    def test_historical_body_with_no_marker_infers_primary(self):
+        comment = (
+            "# SUMMARY\nstuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.5\n\n"
+            "## Meta-Analysis\nSynthesis of base models.\n"
+        )
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "primary"
+        assert source == "historical_body"
+
+    def test_no_signal_returns_none(self):
+        comment = "## R1: Forecaster 1 Reasoning\nModel: openrouter/openai/gpt-5.5\n\nProbability: 72%\n"
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome is None
+        assert source == "none"
+
+    def test_marker_outcome_takes_precedence_over_historical_body(self):
+        # Belt-and-suspenders: even if both signals are present (marker added
+        # to a comment that already has the historical body shape), the
+        # explicit marker wins.
+        comment = (
+            "## R1: Forecaster 1 Reasoning\nModel: x\n## Stacker Meta-Analysis\nbody\n"
+            "<!-- STACKER_OUTCOME=fallback_median -->\n"
+        )
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "fallback_median"
+        assert source == "marker_outcome"
+
+    def test_legacy_marker_takes_precedence_over_historical_body(self):
+        # Precedence ordering is marker_outcome > marker_legacy > historical_body.
+        # If a comment has both STACKED=false (legacy "skipped") and a historical
+        # body shape that would otherwise be inferred as primary, the legacy
+        # marker wins. Source must reflect this so downstream filters can tell
+        # marker-derived outcomes from body-shape-derived ones.
+        comment = "## R1: Forecaster 1 Reasoning\nModel: x\n## Stacker Meta-Analysis\nbody\n<!-- STACKED=false -->\n"
+        outcome, source = parse_inferred_stacker_outcome(comment)
+        assert outcome == "skipped"
+        assert source == "marker_legacy"
 
 
 # ---------------------------------------------------------------------------

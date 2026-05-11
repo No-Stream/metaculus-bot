@@ -30,7 +30,86 @@ import logging
 import re
 from collections.abc import Iterator
 
-from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKED_MARKER_RE
+from metaculus_bot.comment_markers import (
+    HISTORICAL_STACKER_SIGNATURE_RE,
+    STACKED_BASE_REASONING_HEADER,
+    STACKED_MARKER_RE,
+    STACKER_OUTCOME_RE,
+)
+
+
+def parse_stacker_outcome_marker(comment_text: str) -> str | None:
+    """Return the STACKER_OUTCOME literal in ``comment_text``, else None.
+
+    Returns one of ``"primary"``, ``"fallback_llm"``, ``"fallback_median"``,
+    ``"skipped"`` (always lower-cased), or ``None`` if no marker is present.
+    Older comments predating the tri-state marker return ``None``.
+    """
+    match = STACKER_OUTCOME_RE.search(comment_text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def detect_historical_stacker_signature(comment_text: str) -> bool:
+    """Return True if the comment carries the pre-marker stacker body signature.
+
+    The stacking commit at 2026-04-02 (`c6d1ab3`) collapsed base predictions
+    into a single Forecaster 1 whose reasoning began with `## Meta-Analysis`
+    (later renamed to `## Stacker Meta-Analysis` on 2026-04-27, `95c4fff`).
+    Comments published in that ~25-day window AND any earlier code variants
+    that emitted the same shape carry no explicit `STACKED=` or
+    `STACKER_OUTCOME=` marker, but the body alone is recognizable.
+
+    Match conditions: the FIRST `## R1: Forecaster 1 Reasoning` block must
+    open with `## (Stacker )?Meta-Analysis` (modulo a possible `Model:` line
+    and whitespace). A bare meta-analysis header inside an ordinary forecaster
+    body is NOT signal — that's a model's own reasoning structure.
+
+    Returns False on comments that don't match the pattern (including all
+    non-stacked comments, all post-marker comments, and the very oldest
+    pre-stacking-commit comments).
+    """
+    return HISTORICAL_STACKER_SIGNATURE_RE.search(comment_text) is not None
+
+
+def parse_inferred_stacker_outcome(comment_text: str) -> tuple[str | None, str]:
+    """Return ``(outcome, source)`` combining marker and historical signature.
+
+    Source is a string explaining how the outcome was determined:
+
+    * ``"marker_outcome"`` — explicit ``STACKER_OUTCOME=...`` marker present.
+    * ``"marker_legacy"`` — explicit ``STACKED=true|false`` marker only;
+      outcome inferred to ``"primary"`` (true) or ``"skipped"`` (false). The
+      legacy marker can't distinguish primary from fallback_llm or skipped
+      from fallback_median, so this is a lossy mapping kept for back-compat.
+    * ``"historical_body"`` — no marker, but the comment body carries the
+      pre-marker stacker signature (`## R1: Forecaster 1 Reasoning` opening
+      with `## (Stacker )?Meta-Analysis`). Outcome inferred to ``"primary"``
+      since the body shape was only produced when the stacker LLM ran
+      successfully — failed-stacker / median-fallback paths in old code did
+      NOT collapse to a single Forecaster-1-with-Meta-Analysis shape.
+    * ``"none"`` — neither marker nor historical signature present. Returns
+      outcome=None, leaving downstream interpretation to the caller (it could
+      be a non-stacking strategy, a skipped trigger, or an old comment from
+      pre-stacking days).
+
+    Use this when analyzing a dataset that spans multiple code versions —
+    e.g., the spring-aib-2026 closing dataset where all forecasts predate
+    the explicit markers and the only signal is body shape.
+    """
+    marker_outcome = parse_stacker_outcome_marker(comment_text)
+    if marker_outcome is not None:
+        return marker_outcome, "marker_outcome"
+    legacy = parse_stacked_marker(comment_text)
+    if legacy is True:
+        return "primary", "marker_legacy"
+    if legacy is False:
+        return "skipped", "marker_legacy"
+    if detect_historical_stacker_signature(comment_text):
+        return "primary", "historical_body"
+    return None, "none"
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 

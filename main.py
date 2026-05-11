@@ -34,7 +34,14 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
-from metaculus_bot.comment_markers import STACKED_MARKER_FALSE, STACKED_MARKER_TRUE
+from metaculus_bot.comment_markers import (
+    STACKED_MARKER_FALSE,
+    STACKED_MARKER_TRUE,
+    STACKER_OUTCOME_FALLBACK_LLM,
+    STACKER_OUTCOME_FALLBACK_MEDIAN,
+    STACKER_OUTCOME_PRIMARY,
+    STACKER_OUTCOME_SKIPPED,
+)
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -155,8 +162,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self.stacking_randomize_order: bool = stacking_randomize_order
         # Per-question storage for stacker meta-analysis reasoning text
         self._stack_meta_reasoning: dict[int, str] = {}
-        # Per-question flag: did this question's final prediction go through the stacker?
-        self._question_was_stacked: dict[int, bool] = {}
+        # Per-question outcome for the stacker pipeline. One of:
+        #   "primary"          — primary stacker LLM produced the value
+        #   "fallback_llm"     — primary failed, fallback stacker LLM succeeded
+        #   "fallback_median"  — both stacker LLMs failed; MEDIAN aggregation used
+        #   "skipped"          — conditional-stacking spread <= threshold
+        # Must be set on the path that actually produced the aggregated value
+        # (not at branch entry), so median-fallback isn't mislabeled as stacked.
+        self._stacker_outcome: dict[int, str] = {}
         # Diagnostics + state for STACKING base aggregation behavior
         # Tracks per-question expectation that the base aggregator will be called to combine
         # per-research-report, already-stacked outputs.
@@ -266,7 +279,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         Relies on the assertion at the top of ``_research_and_make_predictions`` that
         ``question.id_of_question is not None`` — so that upstream stacking state-dict
-        ops (``self._question_was_stacked[qid]``, ``self._stack_meta_reasoning[qid]``)
+        ops (``self._stacker_outcome[qid]``, ``self._stack_meta_reasoning[qid]``)
         and this set's key stay consistent. A silent fallback to ``id(question)`` here
         would let the keys desync if upstream keying ever changed.
         """
@@ -757,7 +770,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
             aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
             self._register_expected_base_combine(question)
-            self._question_was_stacked[question.id_of_question] = True
+            # _stacker_outcome is populated by _aggregate_predictions on the path
+            # that actually produced aggregated_value; do not set it here.
             return ResearchWithPredictions(
                 research_report=research,
                 summary_report=summary_report,
@@ -833,10 +847,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     prediction_value=aggregated_value, reasoning=combined_reasoning
                 )
                 self._register_expected_base_combine(question)
-                self._question_was_stacked[question.id_of_question] = True
-
+                # _stacker_outcome is populated by _aggregate_predictions on the
+                # path that actually produced aggregated_value.
+                #
+                # research_report must be combined_research so the
+                # ## Targeted Research (addressing model disagreement) header
+                # reaches the published comment. Note: when
+                # use_research_summary_to_forecast=True, combined_research is
+                # built from summary_report (research_to_use), so the comment
+                # will show summary + targeted_research; the regular STACKING
+                # path above instead publishes raw research.
                 return ResearchWithPredictions(
-                    research_report=research,
+                    research_report=combined_research,
                     summary_report=summary_report,
                     errors=errors,
                     predictions=[aggregated_prediction],
@@ -850,7 +872,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question.id_of_question,
                 )
                 self._register_expected_base_combine(question)
-                self._question_was_stacked[question.id_of_question] = False
+                self._stacker_outcome[question.id_of_question] = "skipped"
                 return ResearchWithPredictions(
                     research_report=research,
                     summary_report=summary_report,
@@ -915,17 +937,30 @@ class TemplateForecaster(CompactLoggingForecastBot):
             final_cost,
             time_spent_in_minutes,
         )
-        # Always pop the state-dict entry so per-question bookkeeping doesn't leak,
-        # even for non-stacking strategies that never populate it.
         qid = question.id_of_question
-        was_stacked = self._question_was_stacked.pop(qid, False) if qid is not None else False
+        # Always pop so per-question bookkeeping doesn't leak across runs.
+        popped = self._stacker_outcome.pop(qid, None) if qid is not None else None
         if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-            # Don't emit a marker for MEAN/MEDIAN/etc — the question was never a
-            # stacking candidate, so STACKED=false would misrepresent behavior.
+            # MEAN/MEDIAN/etc were never stacking candidates — emitting a marker would misrepresent.
             return trim_comment(base_text)
-        # Append (not prepend): ForecastReport requires explanation.strip() to start with '#'.
-        marker = STACKED_MARKER_TRUE if was_stacked else STACKED_MARKER_FALSE
-        return trim_comment(f"{base_text}\n{marker}\n")
+        assert popped is not None, (
+            f"_stacker_outcome must be populated for STACKING/CONDITIONAL_STACKING qid={qid}; "
+            "every reachable code path in _aggregate_predictions sets it. Missing entry = real bug."
+        )
+        match popped:
+            case "primary":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
+            case "fallback_llm":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
+            case "fallback_median":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
+            case "skipped":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
+            case other:
+                raise ValueError(f"Unknown stacker outcome {other!r}")
+        # Append (not prepend): ForecastReport.explanation.strip() must start with '#'.
+        # Both markers emitted for one round of back-compat with parsers reading STACKED=.
+        return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n")
 
     async def _forecaster_with_soft_deadline(
         self,
@@ -1106,11 +1141,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # hard-fail behavior end-to-end so benchmark runs surface stacker
             # regressions loudly.
             # CancelledError is BaseException in 3.11+ — intentionally not caught here.
+            # _research_and_make_predictions asserts id_of_question is not None
+            # before this is reachable, so the qid is guaranteed populated.
+            qid_for_outcome = question.id_of_question
+            assert qid_for_outcome is not None
             try:
                 stacked = await asyncio.wait_for(
                     self._run_stacking(question, research, reasoned_predictions),
                     timeout=STACKER_SOFT_DEADLINE,
                 )
+                self._stacker_outcome[qid_for_outcome] = "primary"
                 return self._maybe_snap_to_integers(stacked, question)
             except Exception as primary_exc:
                 if not self.stacking_fallback_on_failure:
@@ -1142,6 +1182,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         "STACKER_FALLBACK_SUCCEEDED: fallback stacker succeeded on Q %s",
                         question.id_of_question,
                     )
+                    self._stacker_outcome[qid_for_outcome] = "fallback_llm"
                     return self._maybe_snap_to_integers(stacked, question)
                 except Exception as fallback_exc:
                     self._stacker_fallback_failed_count += 1
@@ -1153,6 +1194,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         type(fallback_exc).__name__,
                         fallback_exc,
                     )
+                    self._stacker_outcome[qid_for_outcome] = "fallback_median"
                     # Direct per-type MEDIAN dispatch. We deliberately do NOT
                     # mutate self.aggregation_strategy here: forecast_questions
                     # runs questions concurrently via asyncio.gather on the same
