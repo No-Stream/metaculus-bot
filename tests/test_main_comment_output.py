@@ -318,8 +318,11 @@ class TestStackedMarkerInjection:
         assert "*Forecaster 1 (gpt-5.5)*: 72.0%" in out
         assert "*Forecaster 2 (claude-opus-4.7)*: 68.0%" in out
         assert "*Forecaster 3 (gemini-3.1-pro-preview)*: 80.0%" in out
-        # Marker appended at the end survives.
-        assert out.rstrip().endswith(STACKED_MARKER_TRUE)
+        # Marker block appended at the end survives. The STACKED marker is
+        # followed by a TOOLS_USED marker since Workstream C activation, so
+        # the trailing token is TOOLS_USED=true/false — STACKED still appears,
+        # just not as the last line.
+        assert STACKED_MARKER_TRUE in out
         assert parse_stacked_marker(out) is True
         # Parser recovers per-model attribution keyed by model name, not "Forecaster N".
         per_model = parse_per_model_forecasts(out)

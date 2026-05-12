@@ -70,12 +70,22 @@ async def run_stacking_binary(
     question: BinaryQuestion,
     research: str,
     base_texts: Sequence[str],
+    aggregated_tool_output: str | None = None,
 ) -> tuple[float, str]:
     """Invoke the stacker for a binary question and parse to a decimal probability.
 
     Returns (prediction_in_decimal, meta_reasoning_text).
+
+    ``aggregated_tool_output``: optional markdown from
+    ``metaculus_bot.tool_runner.build_cross_model_aggregation``; injected at
+    the top of the stacker prompt. Empty / None → no section emitted.
     """
-    prompt = stacking_binary_prompt(question, research, list(base_texts))
+    prompt = stacking_binary_prompt(
+        question,
+        research,
+        list(base_texts),
+        aggregated_tool_output=aggregated_tool_output,
+    )
     meta_reasoning = await stacker_llm.invoke(prompt)
 
     parse_instructions = (
@@ -99,12 +109,19 @@ async def run_stacking_mc(
     question: MultipleChoiceQuestion,
     research: str,
     base_texts: Sequence[str],
+    aggregated_tool_output: str | None = None,
 ) -> tuple[PredictedOptionList, str]:
     """Invoke the stacker for a multiple choice question and parse options.
 
-    Returns (PredictedOptionList, meta_reasoning_text).
+    Returns (PredictedOptionList, meta_reasoning_text). See
+    ``run_stacking_binary`` for ``aggregated_tool_output`` semantics.
     """
-    prompt = stacking_multiple_choice_prompt(question, research, list(base_texts))
+    prompt = stacking_multiple_choice_prompt(
+        question,
+        research,
+        list(base_texts),
+        aggregated_tool_output=aggregated_tool_output,
+    )
     meta_reasoning = await stacker_llm.invoke(prompt)
 
     # Try strict PredictedOptionList first (compatibility) then tolerant fallback
@@ -145,13 +162,22 @@ async def run_stacking_numeric(
     base_texts: Sequence[str],
     lower_bound_message: str,
     upper_bound_message: str,
+    aggregated_tool_output: str | None = None,
 ) -> tuple[list[Percentile], str]:
     """Invoke the stacker for a numeric question and parse percentiles.
 
     Returns (declared_percentiles, meta_reasoning_text). The caller should perform
-    numeric validation, jitter/clamping, and CDF construction.
+    numeric validation, jitter/clamping, and CDF construction. See
+    ``run_stacking_binary`` for ``aggregated_tool_output`` semantics.
     """
-    prompt = stacking_numeric_prompt(question, research, list(base_texts), lower_bound_message, upper_bound_message)
+    prompt = stacking_numeric_prompt(
+        question,
+        research,
+        list(base_texts),
+        lower_bound_message,
+        upper_bound_message,
+        aggregated_tool_output=aggregated_tool_output,
+    )
     meta_reasoning = await stacker_llm.invoke(prompt)
 
     unit_str = question.unit_of_measure or "base unit"

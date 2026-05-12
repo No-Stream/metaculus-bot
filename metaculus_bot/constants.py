@@ -282,3 +282,21 @@ BACKTEST_DEFAULT_TOURNAMENT: str = "fall-aib-2025"
 BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
 LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
+
+# --- Prediction-market provider (Workstream G) ---
+# Env-gated so backtests can opt in explicitly. Resolved markets on all three
+# platforms retain their last-trade price after resolution — without the
+# ``as_of`` filter in ``fetch_market_snapshot``, pulling a market for a
+# resolved Metaculus question leaks post-resolution pricing into the
+# rationale. Default OFF until smoke + medium backtest validates match
+# quality and leakage defense; ON in all 4 production workflows per
+# scratch_docs_and_planning/atlas_inspired_improvements.md §G.
+PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
+
+# Keyword-extraction strategy for matching Metaculus questions to market
+# listings. Default ``s4_s5_union`` is the empirical best on a 15-question
+# G0 study (67% hit rate vs 33% naive baseline; see
+# scratch_docs_and_planning/prediction_market_keyword_extraction_experiment.md).
+# ``s5_only`` is cheaper at 60%; ``simple`` is the cost-floor baseline.
+PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
+PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})

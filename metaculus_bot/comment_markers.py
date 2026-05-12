@@ -52,6 +52,18 @@ STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Probabilistic-tools activation marker. Emitted alongside STACKED by
+# ``_create_unified_explanation`` so residual analysis can distinguish
+# tool-augmented runs from vanilla stacking runs.
+TOOLS_USED_MARKER_TRUE: str = "<!-- TOOLS_USED=true -->"
+TOOLS_USED_MARKER_FALSE: str = "<!-- TOOLS_USED=false -->"
+
+TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*TOOLS_USED=(true|false)\s*-->",
+    re.IGNORECASE,
+)
+
+
 # Section headers emitted by ``metaculus_bot.stacking.combine_stacker_and_base_reasoning``
 # inside the single R1 body for stacked questions. Shared with
 # ``metaculus_bot.performance_analysis.parsing`` which splits the body on
@@ -98,6 +110,12 @@ assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_MEDIAN) is not None, (
 assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED) is not None, (
     f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED={STACKER_OUTCOME_SKIPPED!r}"
 )
+assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
+    f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_TRUE={TOOLS_USED_MARKER_TRUE!r}"
+)
+assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_FALSE) is not None, (
+    f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_FALSE={TOOLS_USED_MARKER_FALSE!r}"
+)
 assert STACKER_META_ANALYSIS_HEADER.startswith("## "), (
     f"STACKER_META_ANALYSIS_HEADER must be a markdown H2 header, got {STACKER_META_ANALYSIS_HEADER!r}"
 )
@@ -118,4 +136,7 @@ __all__ = [
     "STACKED_BASE_REASONING_HEADER",
     "HISTORICAL_STACKER_META_HEADER",
     "HISTORICAL_STACKER_SIGNATURE_RE",
+    "TOOLS_USED_MARKER_TRUE",
+    "TOOLS_USED_MARKER_FALSE",
+    "TOOLS_USED_MARKER_RE",
 ]

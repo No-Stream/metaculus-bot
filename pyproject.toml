@@ -20,6 +20,7 @@ aiohttp = "^3.12.15"
 yfinance = "^0.2.48"
 fredapi = "^0.5.2"
 google-genai = "^1.74.0"
+rapidfuzz = "^3.14.3"
 
 
 [tool.poetry.group.dev.dependencies]

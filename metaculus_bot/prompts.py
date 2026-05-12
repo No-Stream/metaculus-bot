@@ -80,6 +80,17 @@ def _forecasting_window_str(
     )
 
 
+def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
+    """Render the cross-model-aggregation markdown block for the stacker prompt.
+
+    Returns the empty string when ``aggregated_tool_output`` is None or
+    empty — callers can unconditionally interpolate the result.
+    """
+    if not aggregated_tool_output:
+        return ""
+    return f"\n── Cross-model aggregation (deterministic math) ──\n{aggregated_tool_output}\n"
+
+
 CitationStyle = Literal["markdown", "auto_annotated"]
 
 
@@ -240,6 +251,23 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
             • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
+            ── STRUCTURED FORECAST (machine-readable; required) ──
+            After the analysis, emit a fenced ```json block summarizing your forecast
+            in machine-readable form. Downstream deterministic tools consume this.
+            Schema (all fields except `posterior_prob` are optional; omit if not applicable):
+
+            ```json
+            {{
+              "question_type": "binary",
+              "prior": {{"prob": 0.15, "source": "annual incidence 2015-2024"}},
+              "base_rate": {{"k": 3, "n": 12, "ref_class": "years matching condition"}},
+              "hazard": {{"rate_per_unit": 0.25, "unit": "year", "window_duration_units": 1.0, "elapsed_fraction": 0.33, "remaining_fraction": 0.67}},
+              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate"}}],
+              "scenarios": [],
+              "posterior_prob": 0.28
+            }}
+            ```
+
             [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
             """
@@ -329,6 +357,23 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
+
+        ── STRUCTURED FORECAST (machine-readable; required) ──
+        After the analysis, emit a fenced ```json block summarizing your forecast
+        in machine-readable form. Downstream deterministic tools consume this.
+        Schema (all fields except `option_probs` are optional; omit if not applicable):
+
+        ```json
+        {{
+          "question_type": "multiple_choice",
+          "option_probs": {{"Option_A": 0.5, "Option_B": 0.3, "Option_C": 0.2}},
+          "other_mass": 0.0,
+          "concentration": 20.0
+        }}
+        ```
+
+        The `option_probs` object must sum to 1.0 and use the exact option names above.
+        Emit the JSON block BEFORE the final per-option answer lines.
 
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
         Option_A: NN%
@@ -476,6 +521,35 @@ def numeric_prompt(
             - Forecastability check: does your interval width match the forecastability classification?
             - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
+        ── STRUCTURED FORECAST (machine-readable; required) ──
+        After the analysis, emit a fenced ```json block summarizing your forecast
+        in machine-readable form. Downstream deterministic tools consume this.
+        Schema (all fields except `declared_percentiles` are optional; omit if not applicable):
+
+        ```json
+        {{
+          "question_type": "numeric",
+          "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
+          "distribution_family_hint": "normal",
+          "student_t_df": null,
+          "tails": {{"below_min_expected": 0.02, "above_max_expected": 0.05}},
+          "scenarios": []
+        }}
+        ```
+
+        Notes:
+        - `declared_percentiles` must cover at least {{0.1, 0.5, 0.9}}. The JSON percentiles
+          should match your final Percentile lines below (tools operate on the JSON; the
+          official forecast is still read from the trailing Percentile lines).
+        - `distribution_family_hint` ∈ {{"normal", "lognormal", "student_t"}}.
+        - `student_t_df` only meaningful if family_hint = "student_t".
+        - `tails.below_min_expected` and `tails.above_max_expected` are the probability
+          mass you expect outside the closed bounds.
+        - TODO(Workstream D): a `mixture_components` field will be added later for the
+          EITHER percentiles OR mixture format. Do NOT use mixture fields yet.
+
+        Emit the JSON block BEFORE the final Percentile lines.
+
         Prediction:
         [Reminders:
         - Floating point numbers in the base unit
@@ -498,28 +572,41 @@ def numeric_prompt(
     )
 
 
-def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predictions: list[str]) -> str:
-    """Return the stacking prompt for binary questions that takes multiple model predictions as input."""
+def stacking_binary_prompt(
+    question: BinaryQuestion,
+    research: str,
+    base_predictions: list[str],
+    aggregated_tool_output: str | None = None,
+) -> str:
+    """Return the stacking prompt for binary questions that takes multiple model predictions as input.
+
+    ``aggregated_tool_output`` is an optional markdown block produced by
+    ``metaculus_bot.tool_runner.build_cross_model_aggregation`` — when
+    provided, it is injected at the TOP of the prompt so the stacker sees
+    deterministic cross-model math (pools, base-rate blends, etc.) before
+    the raw base-model analyses.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
         You will be judged based on the accuracy and calibration of your final forecast using the Metaculus peer score (log score).
-        
+        {aggregation_section}
         Your task is to synthesize multiple expert analyses into a single, well-calibrated probability.
-        
+
         Your Metaculus question is:
         {question.question_text}
-        
+
         Question background:
         {question.background_info}
-        
+
         This question's outcome will be determined by the specific criteria below:
         {question.resolution_criteria}
-        
+
         {question.fine_print}
-        
+
         Your research assistant provided this context:
         {research}
 
@@ -569,28 +656,35 @@ def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predict
 
 
 def stacking_multiple_choice_prompt(
-    question: MultipleChoiceQuestion, research: str, base_predictions: list[str]
+    question: MultipleChoiceQuestion,
+    research: str,
+    base_predictions: list[str],
+    aggregated_tool_output: str | None = None,
 ) -> str:
-    """Return the stacking prompt for multiple choice questions."""
+    """Return the stacking prompt for multiple choice questions.
+
+    See ``stacking_binary_prompt`` for ``aggregated_tool_output`` semantics.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        Your accuracy and calibration will be scored with Metaculus' log-score, so avoid over-confidence 
+        Your accuracy and calibration will be scored with Metaculus' log-score, so avoid over-confidence
         and make sure your probabilities sum to **100%**.
-        
+        {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
-        
+
         • Options (in resolution order): {question.options}
-        
+
         ── Context ───────────────────────────────────────────────────────────
         {question.background_info}
-        
+
         {question.resolution_criteria}
         {question.fine_print}
-        
+
         ── Intelligence Briefing ────────────────────────────────
         {research}
 
@@ -652,16 +746,21 @@ def stacking_numeric_prompt(
     base_predictions: list[str],
     lower_bound_message: str,
     upper_bound_message: str,
+    aggregated_tool_output: str | None = None,
 ) -> str:
-    """Return the stacking prompt for numeric questions."""
+    """Return the stacking prompt for numeric questions.
+
+    See ``stacking_binary_prompt`` for ``aggregated_tool_output`` semantics.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        You will be scored with Metaculus' log-score, so accuracy **and** calibration 
+        You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your 90/10 interval) are critical.
-        
+        {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
         

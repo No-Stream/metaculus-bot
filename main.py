@@ -85,6 +85,9 @@ from metaculus_bot.research_providers import (
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
+
+# Probabilistic-tools wiring (Workstream C activation). The feature flag is
+# re-exported under a descriptive local alias so call sites read clearly.
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
@@ -365,6 +368,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
         stacker_llm_override: GeneralLlm | None = None,
+        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         """Run stacking to aggregate multiple model predictions using a meta-model.
 
@@ -372,6 +376,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacker (e.g. gpt-5.5) without swapping ``self._stacker_llm`` — keeping
         fallback behavior local to the call site and avoiding state mutation
         that could race with concurrent questions.
+
+        ``aggregated_tool_output`` is the optional markdown block produced
+        upstream by ``build_cross_model_aggregation``; threaded into
+        ``run_stacking_*`` so the stacker sees deterministic cross-model
+        math at the top of its prompt.
         """
         if stacker_llm_override is not None:
             stacker_llm = stacker_llm_override
@@ -402,6 +411,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 research,
                 base_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -414,6 +424,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 research,
                 base_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -429,6 +440,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 base_predictions,
                 lower_msg,
                 upper_msg,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -596,6 +608,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             providers.append((financial_data_provider(), "financial_data"))
 
+        # Prediction-market snapshot provider if enabled. Default OFF; see
+        # scratch_docs_and_planning/atlas_inspired_improvements.md §G for
+        # smoke + medium backtest gate before flipping ON in prod workflows.
+        # Function-scoped import so the rapidfuzz dep only loads when active.
+        if env_flag_enabled("PREDICTION_MARKETS_ENABLED"):
+            from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
+
+            providers.append((prediction_market_provider(), "prediction_market"))
+
         if not providers:
 
             async def _empty(_: str) -> str:
@@ -754,11 +775,28 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     getattr(self, "research_reports_per_question", 1),
                 )
             prediction_values = [pred.prediction_value for pred in valid_predictions]
+            # Probabilistic tools: deterministic cross-model math (pools,
+            # base-rate blends, consistency checks) runs once per question
+            # and rides at the top of the stacker prompt. Entry point no-ops
+            # when PROBABILISTIC_TOOLS_ENABLED is unset. Function-scoped
+            # import for the same formatter-strip reason noted at other
+            # sites. noqa: PLC0415 intentional.
+            from metaculus_bot.tool_runner import build_cross_model_aggregation  # noqa: PLC0415
+
+            aggregated_tool_output = (
+                build_cross_model_aggregation(
+                    question=question,
+                    rationales=[p.reasoning for p in valid_predictions],
+                    prediction_values=prediction_values,
+                )
+                or None
+            )
             aggregated_value = await self._aggregate_predictions(
                 prediction_values,
                 question,
                 research=research_to_use,
                 reasoned_predictions=valid_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             # Create a single aggregated prediction, preserving the stacker meta-analysis
             # AND the base model reasonings (so residual analysis can recover per-model
@@ -832,11 +870,26 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     combined_research = research_to_use
 
                 # 4. Run stacking
+                # Compute cross-model aggregation for tool-augmented runs (no-op
+                # when PROBABILISTIC_TOOLS_ENABLED is unset). Function-scoped
+                # import to match other sites where ruff's auto-formatter
+                # strips top-level unused-imports. noqa: PLC0415.
+                from metaculus_bot.tool_runner import build_cross_model_aggregation  # noqa: PLC0415
+
+                aggregated_tool_output = (
+                    build_cross_model_aggregation(
+                        question=question,
+                        rationales=[p.reasoning for p in valid_predictions],
+                        prediction_values=prediction_values,
+                    )
+                    or None
+                )
                 aggregated_value = await self._aggregate_predictions(
                     prediction_values,
                     question,
                     research=combined_research,
                     reasoned_predictions=valid_predictions,
+                    aggregated_tool_output=aggregated_tool_output,
                 )
                 meta_text = self._stack_meta_reasoning.pop(
                     question.id_of_question,
@@ -958,9 +1011,27 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
             case other:
                 raise ValueError(f"Unknown stacker outcome {other!r}")
+
+        # Probabilistic-tools marker rides alongside the STACKER_OUTCOME + STACKED markers so
+        # residual analysis can bucket tool-augmented vs vanilla stacking runs.
+        # Function-scoped import is load-bearing: ruff's auto-formatter strips
+        # top-level imports that aren't referenced at module scope, and
+        # sequencing an import edit separately from a usage edit lets the
+        # import get stripped between calls. noqa: PLC0415 is intentional.
+        from metaculus_bot.comment_markers import (  # noqa: PLC0415
+            TOOLS_USED_MARKER_FALSE,
+            TOOLS_USED_MARKER_TRUE,
+        )
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415
+            FEATURE_FLAG_ENV as _PROBABILISTIC_TOOLS_ENABLED_ENV,
+        )
+
+        tools_marker = (
+            TOOLS_USED_MARKER_TRUE if env_flag_enabled(_PROBABILISTIC_TOOLS_ENABLED_ENV) else TOOLS_USED_MARKER_FALSE
+        )
         # Append (not prepend): ForecastReport.explanation.strip() must start with '#'.
-        # Both markers emitted for one round of back-compat with parsers reading STACKED=.
-        return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n")
+        # STACKER_OUTCOME + STACKED both emitted for one round of back-compat with parsers reading STACKED=.
+        return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}\n")
 
     async def _forecaster_with_soft_deadline(
         self,
@@ -1030,6 +1101,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
         prediction = await forecast_function(question, research, actual_llm)
         # Load-bearing: performance_analysis.parsing pulls per-model attribution from this "Model:" prefix.
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
+
+        # Probabilistic-tools activation: run deterministic math tools over
+        # the forecaster's structured JSON block (see tool_runner.py). The
+        # tool runner no-ops when the PROBABILISTIC_TOOLS_ENABLED flag is off
+        # or no block was emitted; callers don't gate. Function-scoped
+        # import: ruff's auto-formatter strips top-level imports that aren't
+        # referenced at module scope, and staging a module-import edit
+        # separately from the usage edit lets the import get stripped
+        # between calls. noqa: PLC0415 is intentional.
+        from metaculus_bot.tool_runner import run_tools_for_forecaster  # noqa: PLC0415
+
+        computed_md = run_tools_for_forecaster(
+            question=question,
+            rationale=prediction.reasoning,
+            forecaster_id=actual_llm.model,
+        )
+        if computed_md:
+            prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
@@ -1040,6 +1129,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str | None = None,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
+        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         if not predictions:
             raise ValueError("Cannot aggregate empty list of predictions")
@@ -1147,7 +1237,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
             assert qid_for_outcome is not None
             try:
                 stacked = await asyncio.wait_for(
-                    self._run_stacking(question, research, reasoned_predictions),
+                    self._run_stacking(
+                        question,
+                        research,
+                        reasoned_predictions,
+                        aggregated_tool_output=aggregated_tool_output,
+                    ),
                     timeout=STACKER_SOFT_DEADLINE,
                 )
                 self._stacker_outcome[qid_for_outcome] = "primary"
@@ -1175,6 +1270,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                             research,
                             reasoned_predictions,
                             stacker_llm_override=STACKER_FALLBACK_LLM,
+                            aggregated_tool_output=aggregated_tool_output,
                         ),
                         timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                     )
