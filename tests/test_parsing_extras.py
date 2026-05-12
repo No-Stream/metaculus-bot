@@ -49,15 +49,16 @@ async def test_binary_parsing_clamps_extremes():
         def __init__(self, val: float) -> None:
             self.prediction_in_decimal = val
 
-    # 0.0 gets clamped to 0.01
+    # 0.0 gets clamped to BINARY_PROB_MIN (0.02 since 2026-05-12; Atlas-inspired).
+    # See scratch_docs_and_planning/atlas_inspired_improvements.md Workstream B.
     with patch("main.structure_output", return_value=_Bin(0.0)):
         res = await bot._run_forecast_on_binary(q, "", llm)
-        assert res.prediction_value == 0.01
+        assert res.prediction_value == 0.02
 
-    # 1.0 gets clamped to 0.99
+    # 1.0 gets clamped to BINARY_PROB_MAX (0.98).
     with patch("main.structure_output", return_value=_Bin(1.0)):
         res = await bot._run_forecast_on_binary(q, "", llm)
-        assert res.prediction_value == 0.99
+        assert res.prediction_value == 0.98
 
 
 @pytest.mark.asyncio

@@ -116,19 +116,28 @@ BOUND_VALIDATION_TOLERANCE: float = 1e-8
 # Maximum relative error allowed in percentile values
 MAX_PERCENTILE_RELATIVE_ERROR: float = 1e-6
 
-# --- Tail Widening (disabled by default) ---
+# --- Tail Widening (identity-pass defaults; configurable) ---
 
 # Enable/disable transform-space tail widening of declared percentiles before CDF generation
 TAIL_WIDENING_ENABLE: bool = True
 
-# Tail widening stretch factor applied in transformed space around the median in tails
-# e.g., 1.25 means 25% stretch at deepest tails, ramping to 0% near the center
-TAIL_WIDEN_K_TAIL: float = 1.25
+# Tail widening stretch factor applied in transformed space around the median in tails.
+# e.g., 1.25 means 25% stretch at the deepest tails, ramping to 0% near the center.
+# Default is 1.0 (identity pass, no widening) per the 2026-05-12 empirical calibration
+# on 43 resolved numerics: k_tail=1.0 produced PIT std closest to the uniform ideal
+# (0.289) in every segment; k_tail=1.25 moved away from ideal in every segment. See
+# scratch_docs_and_planning/tail_widening_empirical_calibration.md.
+TAIL_WIDEN_K_TAIL: float = 1.0
 
 # Tail start region (fraction of percentile distance from median where widening begins)
 # Example: 0.2 means no widening for p in [0.3, 0.7], linearly ramp to full widening by p<=0.1 or p>=0.9
 TAIL_WIDEN_TAIL_START: float = 0.2
 
-# Span floor gamma to ensure tail spans are at least gamma times adjacent inner spans
-# Applies to (p05 - p02.5) vs (p10 - p05) and (p97.5 - p95) vs (p95 - p90)
-TAIL_WIDEN_SPAN_FLOOR_GAMMA: float = 1.0
+# Span floor gamma to ensure tail spans are at least gamma times adjacent inner spans.
+# Applies to (p05 - p02.5) vs (p10 - p05) and (p97.5 - p95) vs (p95 - p90).
+# Floor enforcement (tail_widening.py:171/178) is gated on `> 0`. Default disabled
+# because in all 2026 data the floor never bound (see
+# scratch_docs_and_planning/tail_widening_empirical_calibration.md section 3).
+# Setting this to any positive value re-enables the existing floor enforcement —
+# kept configurable for future models with unusually sharp declared tails.
+TAIL_WIDEN_SPAN_FLOOR_GAMMA: float = 0.0

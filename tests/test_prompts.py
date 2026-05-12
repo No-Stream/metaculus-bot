@@ -21,6 +21,7 @@ from metaculus_bot.prompts import (
     stacking_binary_prompt,
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
+    web_research_prompt,
 )
 
 # ---------------------------------------------------------------------------
@@ -305,3 +306,55 @@ class TestForecastingWindowAnchor:
         q.open_time = None
         with pytest.raises(AssertionError):
             stacking_binary_prompt(q, research="r", base_predictions=["a"])
+
+
+# ---------------------------------------------------------------------------
+# web_research_prompt
+# ---------------------------------------------------------------------------
+
+
+class TestWebResearchPromptPrimarySources:
+    """The first-pass web-research prompt must steer the model toward primary
+    sources (government stats, SEC filings, official docs, scientific
+    registries, central banks) — the pattern observed in Preseen-Atlas's
+    winning spring-AIB-2026 comments. Matches the primary-source hints
+    already present in targeted_search_prompt and gap_fill_search_prompt."""
+
+    # Domain examples we expect to see called out somewhere in the block.
+    # We assert ≥3 of these 4 show up so the list can evolve without
+    # breaking the test on single-domain renames.
+    _EXAMPLE_DOMAINS = (".gov", "sec.gov", "docs.", "who.int")
+
+    def _assert_primary_sources_block_present(self, prompt: str) -> None:
+        upper = prompt.upper()
+        assert "PRIMARY SOURCES" in upper, "expected a PRIMARY SOURCES block header"
+        hits = sum(1 for d in self._EXAMPLE_DOMAINS if d in prompt)
+        assert hits >= 3, f"expected ≥3 of {self._EXAMPLE_DOMAINS} in prompt; got {hits}"
+
+    def test_non_benchmarking_contains_primary_sources_block(self) -> None:
+        result = web_research_prompt("Will X happen?", is_benchmarking=False)
+        self._assert_primary_sources_block_present(result)
+
+    def test_benchmarking_also_contains_primary_sources_block(self) -> None:
+        """The primary-source steer is orthogonal to the benchmarking carve-out
+        — it must apply during backtests too (Atlas-style sourcing helps
+        regardless of whether prediction markets are banned)."""
+        result = web_research_prompt("Will X happen?", is_benchmarking=True)
+        self._assert_primary_sources_block_present(result)
+
+    def test_benchmarking_warning_still_present_when_benchmarking(self) -> None:
+        """Regression: adding the primary-sources block must not displace the
+        benchmarking warning."""
+        result = web_research_prompt("Will X happen?", is_benchmarking=True)
+        lowered = result.lower()
+        assert "benchmarking run" in lowered
+        assert "data leakage" in lowered
+
+    def test_prediction_market_nudge_only_when_not_benchmarking(self) -> None:
+        """Regression: the existing FOCUS AREAS 'Prediction market odds' bullet
+        must still appear only when is_benchmarking=False."""
+        non_bench = web_research_prompt("Q?", is_benchmarking=False)
+        bench = web_research_prompt("Q?", is_benchmarking=True)
+
+        assert "Prediction market odds" in non_bench
+        assert "Prediction market odds" not in bench

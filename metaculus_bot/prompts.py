@@ -135,6 +135,14 @@ FOCUS AREAS:
 - Expert opinions and analysis
 - Official statements and announcements{prediction_markets_instruction}
 
+PRIMARY SOURCES (preferred — cite these over aggregators/blogs when available):
+- Government statistics sites (e.g. `.gov`, `.gouv.fr`, `ec.europa.eu`, `*.go.jp`)
+- SEC filings and investor-relations pages (e.g. `sec.gov`, `q4cdn.com`, `*/investor-relations/`)
+- Official company and product docs (e.g. `platform.*.com`, `docs.*.com`, `*.company.com/press/`)
+- Scientific registries and public-health agencies (e.g. `who.int`, `cdc.gov`, `ecdc.europa.eu`, `pubmed.ncbi.nlm.nih.gov`, `clinicaltrials.gov`)
+- Central banks and macro agencies (e.g. `federalreserve.gov`, `ecb.europa.eu`, `imf.org`, `worldbank.org`, `bls.gov`, `bts.gov`, `census.gov`, `tsa.gov`)
+- Wire services (AP, Reuters, Bloomberg, FT) are acceptable as secondary sources
+
 QUESTION:
 {question_text}
 
