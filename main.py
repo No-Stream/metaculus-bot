@@ -1580,13 +1580,96 @@ class TemplateForecaster(CompactLoggingForecastBot):
             .replace("{lower}", str(getattr(question, "lower_bound", 0)))
             .replace("{upper}", str(getattr(question, "upper_bound", 0)))
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parse_notes,
+        # Try to parse the trailing percentile lines. Workstream E: a
+        # mixture-only rationale legitimately has no percentile lines, so a
+        # parser failure is only non-fatal when the rationale carries a
+        # populated mixture_components block (router will use it). Otherwise
+        # the exception propagates so the caller still sees the parse failure.
+        from metaculus_bot.numeric_format_router import detect_numeric_format  # noqa: PLC0415
+
+        percentile_list: list[Percentile] | None
+        try:
+            percentile_list = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=parse_notes,
+            )
+        except (ValidationError, ValueError) as e:
+            detected = detect_numeric_format(reasoning)
+            if detected in ("mixture", "both"):
+                logger.info(
+                    "Numeric percentile parser found no percentile lines for Q %s | model=%s: %s "
+                    "(rationale carries mixture_components — using mixture branch)",
+                    qid,
+                    llm_to_use.model,
+                    e,
+                )
+                percentile_list = None
+            else:
+                # No mixture fallback — reraise so the malformed forecast is
+                # surfaced rather than silently degrading.
+                raise
+
+        # Workstream E: route between mixture and percentile paths.
+        # Function-scoped import — ruff strips unused top-level imports between
+        # edits per repo convention; keep the import next to its usage.
+        from metaculus_bot.numeric_format_router import route_numeric_output  # noqa: PLC0415
+
+        routed = route_numeric_output(
+            rationale=reasoning,
+            declared_percentiles=percentile_list,
+            question=question,
         )
-        sanitized_percentiles, zero_point = sanitize_percentiles(percentile_list, question)
+        logger.info(
+            "numeric_format=%s for Q %s | model=%s | mixture_components=%s",
+            routed.format,
+            qid,
+            llm_to_use.model,
+            (len(routed.mixture.components) if routed.mixture is not None else 0),
+        )
+
+        if routed.mixture is not None:
+            # Mixture branch: percentiles_to_metaculus_cdf_via_mixture already
+            # produced a constraint-enforced 201-point CDF. Wrap as a
+            # PchipNumericDistribution so .cdf returns the pre-computed values
+            # rather than re-deriving from declared_percentiles. The
+            # unit-mismatch guard, discrete-integer snap, and ensemble
+            # aggregation downstream operate on the final CDF and apply
+            # uniformly to both branches.
+            from metaculus_bot.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
+
+            mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
+            # Synthesize the canonical 11 declared-percentile anchors from the
+            # mixture CDF so the upstream NumericDistribution shape matches the
+            # percentile-branch contract. This is presentational only — the
+            # PCHIP override means .cdf returns the mixture-derived 201 points.
+            mixture_declared: list[Percentile] = []
+            from metaculus_bot.numeric_config import STANDARD_PERCENTILES  # noqa: PLC0415
+
+            for target_pct in STANDARD_PERCENTILES:
+                # Find first cdf entry whose probability >= target.
+                hit = next(
+                    (p for p in routed.cdf_percentiles if p.percentile >= target_pct),
+                    routed.cdf_percentiles[-1],
+                )
+                mixture_declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
+
+            prediction = create_pchip_numeric_distribution(
+                mixture_cdf_values,
+                mixture_declared,
+                question,
+                zero_point=None,
+            )
+            log_final_prediction(prediction, question)
+            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+        # Percentile branch (default): existing pipeline.
+        assert routed.declared_percentiles is not None, (
+            "route_numeric_output returned a non-mixture result without declared_percentiles; "
+            "this is a router bug — mixture-fallback should have raised ValueError instead."
+        )
+        sanitized_percentiles, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
 
         prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 

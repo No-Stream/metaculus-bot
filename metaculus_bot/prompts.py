@@ -545,12 +545,32 @@ def numeric_prompt(
         - `student_t_df` only meaningful if family_hint = "student_t".
         - `tails.below_min_expected` and `tails.above_max_expected` are the probability
           mass you expect outside the closed bounds.
-        - `mixture_components` is now available in the schema (Workstream D3 — list of
-          {{weight, mean, sd}} triples summing to 1.0). Workstream E will activate the
-          EITHER percentiles OR mixture format choice in the prompt; do NOT use mixture
-          fields yet from this prompt.
+        - `mixture_components` is OPTIONAL and now wired end-to-end (see OUTPUT FORMAT
+          below). It is a list of {{weight, mean, sd}} triples whose weights sum to
+          1.0 (within 0.001).
 
-        Emit the JSON block BEFORE the final Percentile lines.
+        Emit the JSON block BEFORE the final Prediction block.
+
+        ── OUTPUT FORMAT — pick exactly one ──
+
+        OPTION A — PERCENTILES (default; what most models use):
+          Emit the trailing 11 standard percentiles as your Prediction block. Use
+          this whenever your reasoning is naturally percentile-shaped (a single
+          mode, smooth tails, no clear scenario branching). Do NOT populate
+          `mixture_components` in the JSON block.
+
+        OPTION B — MIXTURE OF NORMALS:
+          Use this when you naturally reason in 'underperform / baseline / breakout'
+          scenarios, or for clearly bimodal questions. Populate `mixture_components`
+          in the JSON block with at least 2 components whose weights sum to 1.0
+          (within 0.001), each with `weight`, `mean`, and `sd` (>0). Means and sds
+          are in the question's base unit. Code will build the 201-point Metaculus
+          CDF directly from your mixture; you may omit the percentile lines entirely
+          (the parser will use the mixture).
+
+        If you emit BOTH formats, the parser will use the mixture and ignore the
+        percentile lines (a WARNING is logged so we can audit how often this
+        happens). Pick one — don't hedge.
 
         Prediction:
         [Reminders:
