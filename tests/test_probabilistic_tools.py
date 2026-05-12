@@ -11,6 +11,7 @@ from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,
     ConsistencyResult,
+    GammaFit,
     LognormalFit,
     NormalFit,
     StudentTFit,
@@ -23,10 +24,12 @@ from metaculus_bot.probabilistic_tools import (
     beta_binomial_update,
     cdf_at_threshold,
     dirichlet_with_other,
+    fit_gamma_from_gaps,
     fit_lognormal_from_percentiles,
     fit_normal_from_percentiles,
     fit_student_t_from_percentiles,
     fit_to_11_percentiles,
+    gamma_prob_event_before,
     implied_likelihood_ratio,
     inverse_variance_pool,
     laplace_rule_of_succession,
@@ -34,6 +37,7 @@ from metaculus_bot.probabilistic_tools import (
     linear_pool_options,
     log_pool,
     negative_binomial_percentiles,
+    noisy_or,
     out_of_bounds_mass,
     percentile_family_consistency,
     percentile_monotonicity_check,
@@ -44,6 +48,7 @@ from metaculus_bot.probabilistic_tools import (
     satopaa_extremize,
     stated_base_rate_consistency,
     weibull_prob_event_before,
+    weibull_prob_event_before_conditional,
 )
 
 
@@ -351,6 +356,95 @@ class TestWeibullProbEventBefore:
             weibull_prob_event_before(scale=1.0, shape=1.0, t=-1.0)
 
 
+class TestFitGammaFromGaps:
+    def test_atlas_opus_cadence_mom_moments(self):
+        # Atlas's Opus-cadence inter-arrival gaps. MoM should land on population
+        # mean/variance exactly; k*θ = mean and k*θ**2 = variance by construction.
+        gaps = [75, 111, 73]
+        fit = fit_gamma_from_gaps(gaps)
+        assert isinstance(fit, GammaFit)
+        expected_mean = float(np.mean(gaps))
+        expected_var = float(np.var(gaps, ddof=0))
+        assert fit.mean == pytest.approx(expected_mean, abs=1e-6)
+        assert fit.variance == pytest.approx(expected_var, abs=1e-6)
+        assert fit.shape * fit.scale == pytest.approx(fit.mean, abs=1e-9)
+        assert fit.shape * fit.scale**2 == pytest.approx(fit.variance, abs=1e-9)
+
+    def test_single_observation_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([10])
+
+    def test_zero_variance_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([5, 5, 5, 5])
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([])
+
+
+class TestGammaProbEventBefore:
+    def test_atlas_conditional_probability_in_expected_band(self):
+        # Atlas noted the gap distribution [75, 111, 73] with 66 elapsed and
+        # 19 remaining, citing ~40.7% for the conditional. Use a generous band
+        # since MoM vs MLE differ.
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        result = gamma_prob_event_before(fit, elapsed=66, remaining=19)
+        assert isinstance(result, SurvivalResult)
+        assert 0.30 < result.conditional_prob_given_no_event_yet < 0.55
+        # With the (F(t)-F(elapsed))/(1-F(elapsed)) formulation the conditional
+        # represents the probability of the event in the remaining window,
+        # while the unconditional is the CDF over the full [0, elapsed+remaining]
+        # span — so the unconditional is strictly larger.
+        assert result.conditional_prob_given_no_event_yet < result.unconditional_prob
+
+    def test_elapsed_zero_conditional_equals_unconditional(self):
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        result = gamma_prob_event_before(fit, elapsed=0, remaining=50)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(result.unconditional_prob, abs=1e-12)
+
+    def test_invalid_args_raise(self):
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=-1.0, remaining=10.0)
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=5.0, remaining=0.0)
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=5.0, remaining=-1.0)
+
+
+class TestWeibullProbEventBeforeConditional:
+    def test_elapsed_zero_conditional_equals_unconditional(self):
+        result = weibull_prob_event_before_conditional(scale=10.0, shape=1.5, elapsed=0.0, remaining=5.0)
+        assert isinstance(result, SurvivalResult)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(result.unconditional_prob, abs=1e-12)
+
+    def test_elapsed_positive_splits_unconditional(self):
+        # With (F(t) - F(elapsed)) / (1 - F(elapsed)) the conditional is the
+        # probability of an event in the remaining window given survival —
+        # strictly less than the full-window CDF when F(elapsed) > 0.
+        result = weibull_prob_event_before_conditional(scale=10.0, shape=1.5, elapsed=4.0, remaining=3.0)
+        assert result.conditional_prob_given_no_event_yet < result.unconditional_prob
+        assert result.conditional_prob_given_no_event_yet > 0.0
+
+    def test_shape_one_reduces_to_exponential(self):
+        # Weibull(shape=1) is exponential with rate 1/scale. Unconditional CDF
+        # at t = elapsed + remaining = 50 with scale 100 is 1 - exp(-0.5).
+        result = weibull_prob_event_before_conditional(scale=100.0, shape=1.0, elapsed=0.0, remaining=50.0)
+        assert result.unconditional_prob == pytest.approx(1.0 - math.exp(-0.5), rel=1e-10)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(1.0 - math.exp(-0.5), rel=1e-10)
+
+    def test_invalid_args_raise(self):
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=0.0, shape=1.0, elapsed=1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=0.0, elapsed=1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=-1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=1.0, remaining=0.0)
+
+
 class TestPoissonAtLeastOne:
     def test_known_value(self):
         assert poisson_at_least_one(0.5) == pytest.approx(1.0 - math.exp(-0.5))
@@ -530,6 +624,56 @@ class TestLinearPoolOptions:
     def test_empty_raises(self):
         with pytest.raises(ValueError):
             linear_pool_options([])
+
+
+class TestNoisyOr:
+    def test_ten_identical_small_probs(self):
+        got = noisy_or([0.1] * 10)
+        expected = 1 - 0.9**10
+        assert got == pytest.approx(expected, abs=1e-9)
+
+    def test_numerical_stability_tiny_p(self):
+        got = noisy_or([1e-9, 0.5, 1e-9])
+        assert got == pytest.approx(0.5, abs=1e-8)
+
+    def test_known_case(self):
+        got = noisy_or([0.2, 0.3, 0.5])
+        expected = 1 - 0.8 * 0.7 * 0.5
+        assert got == pytest.approx(expected, abs=1e-12)
+
+    def test_all_zero(self):
+        assert noisy_or([0.0, 0.0]) == 0.0
+
+    def test_one_certain(self):
+        assert noisy_or([1.0, 0.3]) == 1.0
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([])
+
+    def test_prob_above_one_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([1.5])
+
+    def test_negative_prob_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([-0.1])
+
+    def test_weights_length_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([0.5, 0.5], weights=[1.0])
+
+    def test_negative_weight_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([0.5, 0.5], weights=[1.0, -0.1])
+
+    def test_zero_total_weight_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([0.5, 0.5], weights=[0.0, 0.0])
+
+    def test_stress_many_small_probs(self):
+        got = noisy_or([0.1] * 100)
+        assert got >= 0.9999
 
 
 class TestFitNormalFromPercentiles:

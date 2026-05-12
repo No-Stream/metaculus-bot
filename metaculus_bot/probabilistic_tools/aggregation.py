@@ -75,6 +75,30 @@ def inverse_variance_pool(means: list[float], variances: list[float]) -> tuple[f
     return pooled_mean, pooled_variance
 
 
+def noisy_or(probs: list[float], *, weights: list[float] | None = None) -> float:
+    """P(>=1 of N independent events) = 1 - prod(1 - p_i).
+
+    Used for 'will any of X, Y, Z happen' decomposition. Caller is responsible
+    for the independence assumption; tool does the math.
+
+    If ``weights`` is provided (same length as probs, sums to a positive value),
+    each p_i is scaled by ``w_i / max(w)`` before the product — this dilutes
+    evidence from lower-weighted events. Rarely what you want; prefer
+    ``weights=None``. Weights must all be >= 0.
+    """
+    _validate_probs(probs)
+    arr = np.array(probs, dtype=float)
+    if weights is not None:
+        w = resolve_weights(weights, len(probs))
+        w_max = float(w.max())
+        if w_max <= 0:
+            raise ValueError("weights must sum to > 0")
+        arr = arr * (w / w_max)
+    with np.errstate(divide="ignore"):
+        log_survival = np.sum(np.log1p(-arr))
+    return float(1.0 - np.exp(log_survival))
+
+
 def linear_pool_options(
     option_prob_lists: list[dict[str, float]],
     weights: list[float] | None = None,
