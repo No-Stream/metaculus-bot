@@ -380,6 +380,58 @@ class TestRunToolsNumeric:
             result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="m")
         assert result == ""
 
+    def test_numeric_with_mixture_components_surfaces_section(self):
+        # Workstream D3: mixture_components populated in NumericStructured should
+        # surface a "Mixture-of-normals" subsection in the output.
+        payload = _numeric_payload(
+            mixture_components=[
+                {"weight": 0.2, "mean": 20.0, "sd": 5.0},
+                {"weight": 0.55, "mean": 50.0, "sd": 8.0},
+                {"weight": 0.25, "mean": 80.0, "sd": 6.0},
+            ],
+        )
+        rationale = _wrap_json(payload)
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        assert "Mixture-of-normals" in result
+        # Each component should appear.
+        assert "20" in result and "50" in result and "80" in result
+
+    def test_numeric_without_mixture_components_unchanged(self):
+        # Regression: existing numeric path (percentiles only) still works and does
+        # NOT surface a mixture section when mixture_components is absent.
+        rationale = _wrap_json(_numeric_payload())
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        assert "Percentile-family consistency" in result
+        assert "Out-of-bounds mass" in result
+        assert "Mixture-of-normals" not in result
+
+    def test_numeric_with_both_percentiles_and_mixture_shows_both(self):
+        # When both declared_percentiles and mixture_components are present, both
+        # sections appear. No consistency check between them (that's Workstream E).
+        payload = _numeric_payload(
+            mixture_components=[
+                {"weight": 0.3, "mean": 25.0, "sd": 7.0},
+                {"weight": 0.4, "mean": 50.0, "sd": 10.0},
+                {"weight": 0.3, "mean": 75.0, "sd": 8.0},
+            ],
+        )
+        rationale = _wrap_json(payload)
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        assert "Percentile-family consistency" in result
+        assert "Mixture-of-normals" in result
+
 
 # ---------------------------------------------------------------------------
 # run_tools_for_forecaster: MC and discrete

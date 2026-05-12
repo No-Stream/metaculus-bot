@@ -1080,3 +1080,95 @@ class TestSizeCapBoundary:
             result = parse_structured_block(rationale, "binary")
         assert result is None
         assert any("size cap" in rec.message for rec in caplog.records)
+
+
+# ===========================================================================
+# NumericStructured: mixture_components (Workstream D3)
+# ===========================================================================
+
+
+class TestNumericStructuredMixture:
+    def test_valid_three_component_list_accepted(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.2, mean=2.0, sd=0.5),
+                MixtureComponentDeclaration(weight=0.55, mean=5.0, sd=1.0),
+                MixtureComponentDeclaration(weight=0.25, mean=8.0, sd=0.7),
+            ],
+        )
+        assert n.mixture_components is not None
+        assert len(n.mixture_components) == 3
+        assert sum(c.weight for c in n.mixture_components) == pytest.approx(1.0, abs=1e-6)
+
+    def test_single_component_rejected(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                mixture_components=[MixtureComponentDeclaration(weight=1.0, mean=5.0, sd=1.0)],
+            )
+
+    def test_weights_sum_below_tolerance_rejected(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                mixture_components=[
+                    MixtureComponentDeclaration(weight=0.3, mean=2.0, sd=1.0),
+                    MixtureComponentDeclaration(weight=0.3, mean=5.0, sd=1.0),
+                ],
+            )
+
+    def test_weights_sum_above_tolerance_rejected(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                mixture_components=[
+                    MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
+                    MixtureComponentDeclaration(weight=0.6, mean=5.0, sd=1.0),
+                ],
+            )
+
+    def test_zero_sd_rejected(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        with pytest.raises(ValidationError):
+            MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=0.0)
+
+    def test_negative_weight_rejected(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        with pytest.raises(ValidationError):
+            MixtureComponentDeclaration(weight=-0.1, mean=5.0, sd=1.0)
+
+    def test_mixture_components_none_still_valid(self) -> None:
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            mixture_components=None,
+        )
+        assert n.mixture_components is None
+
+    def test_numeric_without_declared_percentiles_still_fails(self) -> None:
+        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
+
+        # declared_percentiles remains required even when mixture_components is supplied.
+        with pytest.raises(ValidationError):
+            NumericStructured(  # type: ignore[call-arg]
+                question_type="numeric",
+                mixture_components=[
+                    MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
+                    MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
+                ],
+            )

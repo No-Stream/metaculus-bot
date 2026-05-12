@@ -37,6 +37,7 @@ import logging
 import math
 from typing import Literal
 
+import numpy as np
 from forecasting_tools import (
     BinaryQuestion,
     MetaculusQuestion,
@@ -51,6 +52,8 @@ from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,
     ConsistencyResult,
+    MixtureComponent,
+    MixtureOfNormals,
     SurvivalResult,
     TailMassResult,
     base_rate_blend,
@@ -61,6 +64,7 @@ from metaculus_bot.probabilistic_tools import (
     linear_pool,
     linear_pool_options,
     log_pool,
+    mixture_cdf,
     out_of_bounds_mass,
     percentile_family_consistency,
     prob_event_before,
@@ -295,6 +299,41 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
                     )
             except ValueError as exc:
                 logger.debug("out_of_bounds_mass skipped: %s", exc)
+
+    if block.mixture_components is not None:
+        lines.extend(_render_mixture_section(block, question))
+
+    return lines
+
+
+def _render_mixture_section(block: NumericStructured, question: NumericQuestion) -> list[str]:
+    """Render a ``### Mixture-of-normals`` subsection for a NumericStructured
+    with populated ``mixture_components``. Lists the components and a 5-row
+    CDF-sample table over the declared range."""
+    assert block.mixture_components is not None
+    try:
+        comps = tuple(MixtureComponent(weight=c.weight, mean=c.mean, sd=c.sd) for c in block.mixture_components)
+        mix = MixtureOfNormals(comps)
+    except ValueError as exc:
+        logger.debug("mixture construction skipped: %s", exc)
+        return []
+
+    lines: list[str] = ["### Mixture-of-normals"]
+    for i, c in enumerate(mix.components):
+        lines.append(f"- Component {i + 1}: weight {c.weight:.3f}, mean {c.mean:.3g}, sd {c.sd:.3g}")
+
+    # Build a 5-row CDF sample table across the declared question range.
+    lower = float(question.lower_bound)
+    upper = float(question.upper_bound)
+    if upper > lower:
+        try:
+            sample_grid = np.linspace(lower, upper, 5)
+            sample_cdf = mixture_cdf(mix, sample_grid)
+            lines.append("- CDF sample (value → F):")
+            for x, p in zip(sample_grid, sample_cdf):
+                lines.append(f"  - {x:.3g} → {p:.3f}")
+        except ValueError as exc:
+            logger.debug("mixture_cdf sample skipped: %s", exc)
 
     return lines
 

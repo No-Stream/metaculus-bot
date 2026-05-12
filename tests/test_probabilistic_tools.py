@@ -1344,3 +1344,238 @@ class TestEvalCdfExported:
         fit = LognormalFit(mu=0.0, sigma=1.0, method="test")
         assert eval_cdf(fit, -1.0) == 0.0
         assert eval_cdf(fit, 0.0) == 0.0
+
+
+# ===========================================================================
+# Mixture-of-normals (Workstream D3)
+# ===========================================================================
+
+
+class TestMixtureConstruction:
+    def test_normalizes_weights_to_sum_to_one(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        mix = MixtureOfNormals(
+            (MixtureComponent(weight=2.0, mean=0.0, sd=1.0), MixtureComponent(weight=6.0, mean=0.0, sd=1.0))
+        )
+        weights = [c.weight for c in mix.components]
+        assert weights[0] == pytest.approx(0.25, abs=1e-12)
+        assert weights[1] == pytest.approx(0.75, abs=1e-12)
+        assert sum(weights) == pytest.approx(1.0, abs=1e-12)
+
+    def test_negative_weight_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=-0.5, mean=10.0, sd=5.0),))
+
+    def test_zero_sd_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=1.0, mean=10.0, sd=0.0),))
+
+    def test_no_components_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals(())
+
+    def test_zero_total_weight_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=0.0, mean=10.0, sd=5.0),))
+
+
+class TestMixtureCDF:
+    def test_single_component_matches_scipy_norm(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        grid = np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+        got = mixture_cdf(mix, grid)
+        expected = stats.norm.cdf(grid, loc=0.0, scale=1.0)
+        np.testing.assert_allclose(got, expected, atol=1e-12)
+
+    def test_three_component_matches_weighted_sum(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        comps = (
+            MixtureComponent(weight=0.2, mean=68.0, sd=10.0),
+            MixtureComponent(weight=0.55, mean=85.0, sd=7.0),
+            MixtureComponent(weight=0.25, mean=105.0, sd=12.0),
+        )
+        mix = MixtureOfNormals(comps)
+        grid = np.linspace(40.0, 140.0, 201)
+        got = mixture_cdf(mix, grid)
+        expected = sum(c.weight * stats.norm.cdf(grid, loc=c.mean, scale=c.sd) for c in comps)
+        np.testing.assert_allclose(got, expected, atol=1e-12)
+
+    def test_non_finite_grid_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        with pytest.raises(ValueError):
+            mixture_cdf(mix, np.array([0.0, float("nan"), 1.0]))
+
+    def test_empty_grid_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        with pytest.raises(ValueError):
+            mixture_cdf(mix, np.array([]))
+
+
+class TestFitMixtureFromPercentiles:
+    def _invert_cdf(self, mix, p: float, lo: float, hi: float) -> float:
+        """Numerically invert the mixture CDF at probability p via bisection."""
+        from scipy.optimize import brentq
+
+        from metaculus_bot.probabilistic_tools import mixture_cdf
+
+        def f(x: float) -> float:
+            return float(mixture_cdf(mix, np.array([x]))[0]) - p
+
+        return float(brentq(f, lo, hi, xtol=1e-10, maxiter=200))
+
+    def test_recovers_three_component_mixture(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+            mixture_cdf,
+        )
+
+        true_mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.2, mean=20.0, sd=5.0),
+                MixtureComponent(weight=0.5, mean=50.0, sd=8.0),
+                MixtureComponent(weight=0.3, mean=85.0, sd=6.0),
+            )
+        )
+        # Numerically invert to get the standard 11 percentiles.
+        standard_ps = [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975]
+        pcts = {p: self._invert_cdf(true_mix, p, -50.0, 200.0) for p in standard_ps}
+
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+
+        # Compare CDFs on a fine grid spanning the declared range.
+        grid = np.linspace(-20.0, 150.0, 501)
+        got = mixture_cdf(fit, grid)
+        expected = mixture_cdf(true_mix, grid)
+        rmse = float(np.sqrt(np.mean((got - expected) ** 2)))
+        assert rmse < 0.01, f"RMSE {rmse} should be < 0.01"
+
+    def test_single_component_generator_recovered_by_three_component_fit(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+            mixture_cdf,
+        )
+
+        true_mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=50.0, sd=10.0),))
+        standard_ps = [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975]
+        pcts = {p: float(stats.norm.ppf(p, loc=50.0, scale=10.0)) for p in standard_ps}
+
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        grid = np.linspace(20.0, 80.0, 201)
+        got = mixture_cdf(fit, grid)
+        expected = mixture_cdf(true_mix, grid)
+        rmse = float(np.sqrt(np.mean((got - expected) ** 2)))
+        assert rmse < 0.02
+
+    def test_degenerate_percentiles_fallback(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        # All percentiles collapse to the same value — fall back to single-normal.
+        pcts = {0.1: 5.0, 0.5: 5.0, 0.9: 5.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        # Should return a valid mixture (no exception).
+        assert len(fit.components) >= 1
+
+    def test_n_components_one_raises(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        with pytest.raises(ValueError):
+            fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=1, seed=0)
+
+    def test_n_components_five_raises(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        with pytest.raises(ValueError):
+            fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=5, seed=0)
+
+
+class TestPercentilesToMetaculusCdfViaMixture:
+    def _make_numeric_question(
+        self,
+        *,
+        lower_bound: float = 0.0,
+        upper_bound: float = 100.0,
+        open_lower_bound: bool = False,
+        open_upper_bound: bool = False,
+    ):
+        from unittest.mock import MagicMock
+
+        from forecasting_tools.data_models.questions import NumericQuestion
+
+        q = MagicMock(spec=NumericQuestion)
+        q.lower_bound = lower_bound
+        q.upper_bound = upper_bound
+        q.open_lower_bound = open_lower_bound
+        q.open_upper_bound = open_upper_bound
+        return q
+
+    def test_closed_bounds_produces_201_point_cdf(self):
+        from forecasting_tools.data_models.numeric_report import Percentile
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            percentiles_to_metaculus_cdf_via_mixture,
+        )
+
+        mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.3, mean=25.0, sd=8.0),
+                MixtureComponent(weight=0.4, mean=50.0, sd=10.0),
+                MixtureComponent(weight=0.3, mean=75.0, sd=6.0),
+            )
+        )
+        q = self._make_numeric_question()
+        cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
+        assert isinstance(cdf, list)
+        assert len(cdf) == 201
+        for p in cdf:
+            assert isinstance(p, Percentile)
+        probs = np.array([p.percentile for p in cdf])
+        values = np.array([p.value for p in cdf])
+        diffs = np.diff(probs)
+        assert np.all(diffs >= 5e-5 - 1e-10)
+        assert probs[0] == pytest.approx(0.0, abs=1e-9)
+        assert probs[-1] == pytest.approx(1.0, abs=1e-9)
+        # Values are on the grid from lower to upper bound.
+        assert values[0] == pytest.approx(0.0)
+        assert values[-1] == pytest.approx(100.0)
+
+    def test_open_bounds_respected(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            percentiles_to_metaculus_cdf_via_mixture,
+        )
+
+        mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.5, mean=30.0, sd=5.0),
+                MixtureComponent(weight=0.5, mean=70.0, sd=5.0),
+            )
+        )
+        q = self._make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
+        assert len(cdf) == 201
+        probs = [p.percentile for p in cdf]
+        assert probs[0] >= 0.001 - 1e-12
+        assert probs[-1] <= 0.999 + 1e-12

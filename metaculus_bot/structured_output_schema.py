@@ -144,6 +144,20 @@ class ScenarioBranch(BaseModel):
     conditional_outcome: str | None = None
 
 
+class MixtureComponentDeclaration(BaseModel):
+    """Mixture-of-normals component.
+
+    Weights across all components in a NumericStructured must sum to 1.0
+    within 1e-3 tolerance (checked at ``NumericStructured`` level).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    weight: float = Field(ge=0.0)
+    mean: float
+    sd: float = Field(gt=0.0)
+
+
 class TailMass(BaseModel):
     """Declared mass outside the question's declared numeric range."""
 
@@ -215,6 +229,21 @@ class NumericStructured(BaseModel):
     student_t_df: float | None = None
     tails: TailMass | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
+    mixture_components: list[MixtureComponentDeclaration] | None = None
+
+    @field_validator("mixture_components")
+    @classmethod
+    def _check_mixture_components(
+        cls, v: list[MixtureComponentDeclaration] | None
+    ) -> list[MixtureComponentDeclaration] | None:
+        if v is None:
+            return None
+        if len(v) < 2:
+            raise ValueError(f"mixture_components requires at least 2 components (got {len(v)})")
+        total = sum(c.weight for c in v)
+        if not (0.999 <= total <= 1.001):
+            raise ValueError(f"mixture_components weights must sum to 1.0 within 1e-3, got {total}")
+        return v
 
     @field_validator("student_t_df")
     @classmethod

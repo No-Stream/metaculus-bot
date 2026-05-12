@@ -545,8 +545,10 @@ def numeric_prompt(
         - `student_t_df` only meaningful if family_hint = "student_t".
         - `tails.below_min_expected` and `tails.above_max_expected` are the probability
           mass you expect outside the closed bounds.
-        - TODO(Workstream D): a `mixture_components` field will be added later for the
-          EITHER percentiles OR mixture format. Do NOT use mixture fields yet.
+        - `mixture_components` is now available in the schema (Workstream D3 — list of
+          {{weight, mean, sd}} triples summing to 1.0). Workstream E will activate the
+          EITHER percentiles OR mixture format choice in the prompt; do NOT use mixture
+          fields yet from this prompt.
 
         Emit the JSON block BEFORE the final Percentile lines.
 
