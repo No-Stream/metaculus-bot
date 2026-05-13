@@ -141,11 +141,29 @@ def route_numeric_output(
     structured = parse_structured_block(rationale, "numeric")
     mixture: MixtureOfNormals | None = None
     structured_has_percentiles: bool = False
+    structured_percentiles_fallback: list[Percentile] | None = None
     if structured is not None and isinstance(structured, NumericStructured):
         mixture = _build_mixture_from_structured(structured)
         structured_has_percentiles = bool(structured.declared_percentiles)
+        if structured_has_percentiles:
+            structured_percentiles_fallback = [
+                Percentile(percentile=float(k), value=float(v))
+                for k, v in sorted(structured.declared_percentiles.items())
+            ]
 
     has_percentiles = declared_percentiles is not None and len(declared_percentiles) > 0
+    # F5 fallback: if the percentile parser missed the trailing
+    # "Percentile X.X" lines but the structured block carries
+    # declared_percentiles, lift them as a backup so the percentile path
+    # stays reachable.
+    effective_percentiles: list[Percentile] | None
+    if has_percentiles:
+        effective_percentiles = list(declared_percentiles or [])
+    elif structured_percentiles_fallback is not None:
+        effective_percentiles = structured_percentiles_fallback
+    else:
+        effective_percentiles = None
+    has_effective_percentiles = effective_percentiles is not None and len(effective_percentiles) > 0
     # "both" means the rationale's JSON contained both shapes — either the
     # LLM literally emitted both, or the schema mandates declared_percentiles
     # alongside an opted-in mixture. Either way, residual analysis cares about
@@ -172,15 +190,15 @@ def route_numeric_output(
                 "numeric_format_router: mixture CDF build failed (%s); falling back to percentiles",
                 exc,
             )
-            if not has_percentiles:
+            if not has_effective_percentiles:
                 raise ValueError(
                     "Mixture CDF build failed and no fallback declared_percentiles "
                     "available; cannot produce a numeric forecast."
                 ) from exc
             return RoutedNumericForecast(
                 format="percentiles",
-                cdf_percentiles=list(declared_percentiles or []),
-                declared_percentiles=list(declared_percentiles or []),
+                cdf_percentiles=list(effective_percentiles or []),
+                declared_percentiles=list(effective_percentiles or []),
                 mixture=None,
             )
 
@@ -194,11 +212,11 @@ def route_numeric_output(
     # Percentile path — pass declared_percentiles straight through so the
     # existing main.py pipeline can run sanitize_percentiles +
     # build_numeric_distribution.
-    if has_percentiles:
+    if has_effective_percentiles:
         return RoutedNumericForecast(
             format="percentiles",
-            cdf_percentiles=list(declared_percentiles or []),
-            declared_percentiles=list(declared_percentiles or []),
+            cdf_percentiles=list(effective_percentiles or []),
+            declared_percentiles=list(effective_percentiles or []),
             mixture=None,
         )
 

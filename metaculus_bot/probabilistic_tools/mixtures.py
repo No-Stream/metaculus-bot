@@ -151,39 +151,21 @@ def _fallback_single_normal(
     return MixtureOfNormals((MixtureComponent(weight=1.0, mean=mean, sd=std),))
 
 
-def fit_mixture_from_percentiles(
-    percentiles: Mapping[float, float],
-    *,
-    n_components: int = 3,
-    seed: int = 0,
-) -> MixtureOfNormals:
-    """Fit a mixture to declared percentiles via constrained LSQ.
+_MULTISTART_SEED_COUNT: int = 5
 
-    Optimization over (softmax-logits, means, log-sds). Minimize SSE between
-    mixture CDF at percentile values and the probability levels.
 
-    Fallback: if convergence fails or any resulting sd < 1e-9, return a
-    single-normal MixtureOfNormals with mean=median, sd=IQR/1.349. If that
-    also fails (no valid p=0.5, p=0.25, p=0.75 in keys, or IQR <= 0), use
-    mean=mean-of-values, sd=std-of-values with ddof=0.
+def _fit_mixture_one_seed(
+    keys: np.ndarray,
+    values: np.ndarray,
+    n_components: int,
+    seed: int,
+) -> tuple[MixtureOfNormals | None, float]:
+    """Run a single-seed L-BFGS-B fit and return (mixture, sse).
 
-    Requires 2 <= n_components <= 4. Raises ValueError on out-of-range.
-    Deterministic given the same inputs + seed.
+    Returns ``(None, +inf)`` when the optimizer fails to converge or yields
+    a sub-threshold sd. The caller picks the best across multiple seeds.
     """
-    if not (2 <= n_components <= 4):
-        raise ValueError(f"n_components must be in [2, 4], got {n_components}")
-    if not percentiles:
-        raise ValueError("percentiles must be non-empty")
-
-    sorted_items = sorted(percentiles.items())
-    keys = np.array([p for p, _ in sorted_items], dtype=float)
-    values = np.array([v for _, v in sorted_items], dtype=float)
-
     rng = np.random.default_rng(seed)
-
-    # Degenerate: all values equal → fallback.
-    if float(values.max() - values.min()) <= 0:
-        return _fallback_single_normal(values, keys, percentiles)
 
     def objective(theta: np.ndarray) -> float:
         weights, means, sds = _unpack(theta, n_components)
@@ -198,16 +180,65 @@ def fit_mixture_from_percentiles(
         method="L-BFGS-B",
         options={"maxiter": 500, "ftol": 1e-10, "gtol": 1e-8},
     )
-
     if not result.success:
-        return _fallback_single_normal(values, keys, percentiles)
+        return None, float("inf")
 
     weights, means, sds = _unpack(result.x, n_components)
     if np.any(sds < _MIN_FIT_SD):
-        return _fallback_single_normal(values, keys, percentiles)
+        return None, float("inf")
 
     comps = tuple(MixtureComponent(weight=float(w), mean=float(m), sd=float(s)) for w, m, s in zip(weights, means, sds))
-    return MixtureOfNormals(comps)
+    return MixtureOfNormals(comps), float(result.fun)
+
+
+def fit_mixture_from_percentiles(
+    percentiles: Mapping[float, float],
+    *,
+    n_components: int = 3,
+    seed: int = 0,
+) -> MixtureOfNormals:
+    """Fit a mixture to declared percentiles via multi-start constrained LSQ.
+
+    Optimization over (softmax-logits, means, log-sds). Minimize SSE between
+    mixture CDF at percentile values and the probability levels. Runs the
+    optimizer with ``seed, seed+1, ..., seed+4`` initial conditions and keeps
+    the result with the lowest SSE — bimodal/multi-modal generators are
+    sensitive to where L-BFGS-B starts, and a single seed sometimes lands
+    in a poor local minimum.
+
+    Fallback: if every seed's run fails to converge or yields any sd <
+    ``_MIN_FIT_SD``, return a single-normal MixtureOfNormals with
+    mean=median, sd=IQR/1.349. If that also fails (no valid p=0.5, p=0.25,
+    p=0.75 in keys, or IQR <= 0), use mean=mean-of-values, sd=std-of-values
+    with ddof=0.
+
+    Requires 2 <= n_components <= 4. Raises ValueError on out-of-range.
+    Deterministic given the same inputs + seed.
+    """
+    if not (2 <= n_components <= 4):
+        raise ValueError(f"n_components must be in [2, 4], got {n_components}")
+    if not percentiles:
+        raise ValueError("percentiles must be non-empty")
+
+    sorted_items = sorted(percentiles.items())
+    keys = np.array([p for p, _ in sorted_items], dtype=float)
+    values = np.array([v for _, v in sorted_items], dtype=float)
+
+    # Degenerate: all values equal → fallback.
+    if float(values.max() - values.min()) <= 0:
+        return _fallback_single_normal(values, keys, percentiles)
+
+    best_mix: MixtureOfNormals | None = None
+    best_sse: float = float("inf")
+    for offset in range(_MULTISTART_SEED_COUNT):
+        candidate, sse = _fit_mixture_one_seed(keys, values, n_components, seed + offset)
+        if candidate is not None and sse < best_sse:
+            best_mix = candidate
+            best_sse = sse
+
+    if best_mix is None:
+        return _fallback_single_normal(values, keys, percentiles)
+    return best_mix
 
 
 def percentiles_to_metaculus_cdf_via_mixture(

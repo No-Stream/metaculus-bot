@@ -157,17 +157,14 @@ class TestRouteNumericOutput:
         for p in result.cdf_percentiles:
             assert isinstance(p, Percentile)
 
-    def test_pure_mixture_no_percentiles_uses_mixture_path(self) -> None:
-        # If only mixture_components is in the JSON (and declared_percentiles
-        # arg is None), result.format must be "mixture".
-        # Schema currently requires declared_percentiles too, so we craft a
-        # payload that has mixture_components alongside the minimum required
-        # declared_percentiles, but the parsed list passed to the router is
-        # None — mimicking "the LLM emitted mixture, the percentile parser
-        # found nothing, we still got a mixture".
-        # Note: detect_numeric_format reports "both" because the schema
-        # requires declared_percentiles. The "mixture" branch in the router
-        # is reachable only when declared_percentiles arg is None.
+    def test_pure_mixture_with_percentiles_in_json_returns_both_format(self) -> None:
+        # F2: clarify the contract. The current v1 schema requires
+        # declared_percentiles even when mixture_components is present, so a
+        # payload-with-mixture always carries percentiles in the JSON. Even
+        # when the function-arg declared_percentiles is None, the router
+        # detects percentiles inside the structured block and reports
+        # ``format == "both"``, not ``"mixture"``. The literal "mixture"
+        # branch is exercised in the next test via parser bypass.
         rationale = _wrap_json_block(_VALID_MIXTURE_PAYLOAD)
         question = _make_numeric_question()
 
@@ -177,8 +174,54 @@ class TestRouteNumericOutput:
             question=question,
         )
 
-        # Mixture won.
+        assert result.format == "both"
         assert result.mixture is not None
+        assert len(result.cdf_percentiles) == 201
+
+    def test_mixture_only_no_percentiles_in_json(self, monkeypatch) -> None:
+        # F2: literal "mixture" branch — only reachable when the parser
+        # returns a NumericStructured with empty declared_percentiles,
+        # which the v1 schema currently disallows but we defend against.
+        # Monkeypatch parse_structured_block so it returns a stand-in with
+        # mixture_components populated and declared_percentiles empty.
+        from metaculus_bot import numeric_format_router
+        from metaculus_bot.structured_output_schema import (
+            MixtureComponentDeclaration,
+            NumericStructured,
+        )
+
+        # NumericStructured.model_validate would reject empty declared_percentiles,
+        # so build the instance via model_construct (skips validation) — this
+        # mimics a future schema where mixture-only payloads are legal.
+        fake_structured = NumericStructured.model_construct(
+            question_type="numeric",
+            declared_percentiles={},
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.5, mean=30.0, sd=5.0),
+                MixtureComponentDeclaration(weight=0.5, mean=70.0, sd=5.0),
+            ],
+            distribution_family_hint=None,
+            student_t_df=None,
+            tails=None,
+            scenarios=[],
+            prior=None,
+        )
+        monkeypatch.setattr(
+            numeric_format_router,
+            "parse_structured_block",
+            lambda rationale, qtype: fake_structured,
+        )
+        question = _make_numeric_question()
+
+        result = route_numeric_output(
+            rationale="ignored",
+            declared_percentiles=None,
+            question=question,
+        )
+
+        assert result.format == "mixture"
+        assert result.mixture is not None
+        assert result.declared_percentiles is None
         assert len(result.cdf_percentiles) == 201
 
     def test_percentiles_only_rationale_returns_percentiles_format(self) -> None:
@@ -282,7 +325,86 @@ class TestRouteNumericOutput:
 
     def test_mixture_build_failure_with_no_percentiles_raises(self, monkeypatch, caplog) -> None:
         """If mixture build fails AND no fallback percentiles are available,
-        the router raises rather than silently producing nothing."""
+        the router raises rather than silently producing nothing.
+
+        The structured block in _VALID_MIXTURE_PAYLOAD ships percentiles, so
+        we must monkeypatch parse_structured_block to return mixture-only
+        for this test (otherwise F5's structured-block fallback kicks in)."""
+        from metaculus_bot import numeric_format_router
+        from metaculus_bot.structured_output_schema import (
+            MixtureComponentDeclaration,
+            NumericStructured,
+        )
+
+        question = _make_numeric_question()
+
+        mixture_only = NumericStructured.model_construct(
+            question_type="numeric",
+            declared_percentiles={},
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.5, mean=30.0, sd=5.0),
+                MixtureComponentDeclaration(weight=0.5, mean=70.0, sd=5.0),
+            ],
+            distribution_family_hint=None,
+            student_t_df=None,
+            tails=None,
+            scenarios=[],
+            prior=None,
+        )
+        monkeypatch.setattr(
+            numeric_format_router,
+            "parse_structured_block",
+            lambda rationale, qtype: mixture_only,
+        )
+
+        def _broken_builder(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("simulated mixture build failure")
+
+        monkeypatch.setattr(
+            numeric_format_router,
+            "percentiles_to_metaculus_cdf_via_mixture",
+            _broken_builder,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError):
+                route_numeric_output(
+                    rationale="ignored",
+                    declared_percentiles=None,
+                    question=question,
+                )
+
+    def test_structured_block_percentiles_fallback_when_arg_none(self) -> None:
+        # F5: parser-LLM may fail to extract trailing "Percentile X.X" lines
+        # (declared_percentiles arg is None), but the rationale's JSON block
+        # carries valid declared_percentiles. The router should pick those up
+        # as fallback rather than raising.
+        rationale = _wrap_json_block(_VALID_PERCENTILES_PAYLOAD)
+        question = _make_numeric_question()
+
+        result = route_numeric_output(
+            rationale=rationale,
+            declared_percentiles=None,
+            question=question,
+        )
+
+        assert result.format == "percentiles"
+        assert result.mixture is None
+        assert result.declared_percentiles is not None
+        assert len(result.declared_percentiles) == 3
+        # Round-trip: 0.1 → 10.0, 0.5 → 50.0, 0.9 → 90.0.
+        sorted_pcts = sorted(result.declared_percentiles, key=lambda p: p.percentile)
+        assert sorted_pcts[0].percentile == pytest.approx(0.1)
+        assert sorted_pcts[0].value == pytest.approx(10.0)
+        assert sorted_pcts[1].percentile == pytest.approx(0.5)
+        assert sorted_pcts[1].value == pytest.approx(50.0)
+        assert sorted_pcts[2].percentile == pytest.approx(0.9)
+        assert sorted_pcts[2].value == pytest.approx(90.0)
+
+    def test_structured_block_percentiles_fallback_on_mixture_failure(self, monkeypatch, caplog) -> None:
+        # F5: when the mixture builder fails AND the function-arg declared
+        # percentiles are None, the router should fall back to the
+        # structured-block declared_percentiles instead of raising.
         rationale = _wrap_json_block(_VALID_MIXTURE_PAYLOAD)
         question = _make_numeric_question()
 
@@ -298,9 +420,13 @@ class TestRouteNumericOutput:
         )
 
         with caplog.at_level(logging.WARNING):
-            with pytest.raises(ValueError):
-                route_numeric_output(
-                    rationale=rationale,
-                    declared_percentiles=None,
-                    question=question,
-                )
+            result = route_numeric_output(
+                rationale=rationale,
+                declared_percentiles=None,
+                question=question,
+            )
+
+        assert result.format == "percentiles"
+        assert result.mixture is None
+        assert result.declared_percentiles is not None
+        assert len(result.declared_percentiles) == 3

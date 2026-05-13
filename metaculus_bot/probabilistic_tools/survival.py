@@ -194,9 +194,11 @@ def gamma_prob_event_before(
         if survival_elapsed <= 0.0:
             conditional = 1.0
         else:
-            conditional = (unconditional - f_elapsed) / survival_elapsed
+            # Clamp to [0, 1]: deep-tail FP error in scipy.gamma.cdf can let
+            # the raw division leak just outside the unit interval.
+            conditional = max(0.0, min(1.0, (unconditional - f_elapsed) / survival_elapsed))
     return SurvivalResult(
-        unconditional_prob=unconditional,
+        unconditional_prob=max(0.0, min(1.0, unconditional)),
         conditional_prob_given_no_event_yet=float(conditional),
     )
 
@@ -233,8 +235,10 @@ def weibull_prob_event_before_conditional(
         if survival_elapsed <= 0.0:
             conditional = 1.0
         else:
-            conditional = (unconditional - f_elapsed) / survival_elapsed
+            # Clamp to [0, 1]: deep-tail FP error in the survival math can let
+            # the raw division leak just outside the unit interval.
+            conditional = max(0.0, min(1.0, (unconditional - f_elapsed) / survival_elapsed))
     return SurvivalResult(
-        unconditional_prob=float(unconditional),
+        unconditional_prob=max(0.0, min(1.0, float(unconditional))),
         conditional_prob_given_no_event_yet=float(conditional),
     )
