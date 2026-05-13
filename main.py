@@ -786,13 +786,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     getattr(self, "research_reports_per_question", 1),
                 )
             prediction_values = [pred.prediction_value for pred in valid_predictions]
-            # Probabilistic tools: deterministic cross-model math (pools,
-            # base-rate blends, consistency checks) runs once per question
-            # and rides at the top of the stacker prompt. Entry point no-ops
-            # when PROBABILISTIC_TOOLS_ENABLED is unset. Function-scoped
-            # import for the same formatter-strip reason noted at other
-            # sites. noqa: PLC0415 intentional.
-            from metaculus_bot.tool_runner import build_cross_model_aggregation  # noqa: PLC0415
+            # Probabilistic tools: deterministic cross-model math runs once
+            # per question and rides at the top of the stacker prompt. No-ops
+            # when PROBABILISTIC_TOOLS_ENABLED is unset.
+            from metaculus_bot.tool_runner import (
+                build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
 
             aggregated_tool_output = (
                 build_cross_model_aggregation(
@@ -881,11 +880,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     combined_research = research_to_use
 
                 # 4. Run stacking
-                # Compute cross-model aggregation for tool-augmented runs (no-op
-                # when PROBABILISTIC_TOOLS_ENABLED is unset). Function-scoped
-                # import to match other sites where ruff's auto-formatter
-                # strips top-level unused-imports. noqa: PLC0415.
-                from metaculus_bot.tool_runner import build_cross_model_aggregation  # noqa: PLC0415
+                # Cross-model aggregation for tool-augmented runs (no-op when
+                # PROBABILISTIC_TOOLS_ENABLED is unset).
+                from metaculus_bot.tool_runner import (
+                    build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+                )
 
                 aggregated_tool_output = (
                     build_cross_model_aggregation(
@@ -1025,15 +1024,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Probabilistic-tools marker rides alongside the STACKER_OUTCOME + STACKED markers so
         # residual analysis can bucket tool-augmented vs vanilla stacking runs.
-        # Function-scoped import is load-bearing: ruff's auto-formatter strips
-        # top-level imports that aren't referenced at module scope, and
-        # sequencing an import edit separately from a usage edit lets the
-        # import get stripped between calls. noqa: PLC0415 is intentional.
-        from metaculus_bot.comment_markers import (  # noqa: PLC0415
+        from metaculus_bot.comment_markers import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             TOOLS_USED_MARKER_FALSE,
             TOOLS_USED_MARKER_TRUE,
         )
-        from metaculus_bot.tool_runner import (  # noqa: PLC0415
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             FEATURE_FLAG_ENV as _PROBABILISTIC_TOOLS_ENABLED_ENV,
         )
 
@@ -1115,13 +1110,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Probabilistic-tools activation: run deterministic math tools over
         # the forecaster's structured JSON block (see tool_runner.py). The
-        # tool runner no-ops when the PROBABILISTIC_TOOLS_ENABLED flag is off
-        # or no block was emitted; callers don't gate. Function-scoped
-        # import: ruff's auto-formatter strips top-level imports that aren't
-        # referenced at module scope, and staging a module-import edit
-        # separately from the usage edit lets the import get stripped
-        # between calls. noqa: PLC0415 is intentional.
-        from metaculus_bot.tool_runner import run_tools_for_forecaster  # noqa: PLC0415
+        # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
+        # block was emitted; callers don't gate.
+        from metaculus_bot.tool_runner import (
+            run_tools_for_forecaster,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
 
         computed_md = run_tools_for_forecaster(
             question=question,
@@ -1602,7 +1595,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # parser failure is only non-fatal when the rationale carries a
         # populated mixture_components block (router will use it). Otherwise
         # the exception propagates so the caller still sees the parse failure.
-        from metaculus_bot.numeric_format_router import detect_numeric_format  # noqa: PLC0415
+        from metaculus_bot.numeric_format_router import (
+            detect_numeric_format,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
 
         percentile_list: list[Percentile] | None
         try:
@@ -1629,9 +1624,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 raise
 
         # Workstream E: route between mixture and percentile paths.
-        # Function-scoped import — ruff strips unused top-level imports between
-        # edits per repo convention; keep the import next to its usage.
-        from metaculus_bot.numeric_format_router import route_numeric_output  # noqa: PLC0415
+        from metaculus_bot.numeric_format_router import (
+            route_numeric_output,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
 
         routed = route_numeric_output(
             rationale=reasoning,
@@ -1654,7 +1649,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # unit-mismatch guard, discrete-integer snap, and ensemble
             # aggregation downstream operate on the final CDF and apply
             # uniformly to both branches.
-            from metaculus_bot.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
+            from metaculus_bot.pchip_processing import (
+                create_pchip_numeric_distribution,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
 
             mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
             # Synthesize the canonical 11 declared-percentile anchors from the
@@ -1662,7 +1659,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # percentile-branch contract. This is presentational only — the
             # PCHIP override means .cdf returns the mixture-derived 201 points.
             mixture_declared: list[Percentile] = []
-            from metaculus_bot.numeric_config import STANDARD_PERCENTILES  # noqa: PLC0415
+            from metaculus_bot.numeric_config import (
+                STANDARD_PERCENTILES,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
 
             for target_pct in STANDARD_PERCENTILES:
                 # Find first cdf entry whose probability >= target.

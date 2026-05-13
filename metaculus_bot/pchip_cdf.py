@@ -127,6 +127,36 @@ def enforce_strict_increasing(
     return new_dict
 
 
+def enforce_min_steps(
+    y_values: np.ndarray,
+    min_step: float,
+    *,
+    upper_cap: float = 1.0,
+    lower_cap: float = 0.0,
+) -> np.ndarray:
+    """Enforce minimum step size between adjacent points (panchul-style sweep).
+
+    Forward pass lifts each point to be at least ``prev + min_step`` (capped at
+    ``upper_cap``). When the upper cap pins the last point before the grid
+    ends, a backward pass pulls earlier points down so every step still meets
+    ``min_step``. Used by both the PCHIP pipeline and the mixture-CDF builder
+    to keep CDFs strictly increasing under the Metaculus min-step constraint.
+    """
+    n = len(y_values)
+    result = y_values.copy()
+    for i in range(1, n):
+        if result[i] < result[i - 1] + min_step:
+            result[i] = result[i - 1] + min_step
+        if result[i] > upper_cap:
+            result[i] = upper_cap
+    for j in range(n - 2, -1, -1):
+        if result[j] > result[j + 1] - min_step:
+            result[j] = result[j + 1] - min_step
+        if result[j] < lower_cap:
+            result[j] = lower_cap
+    return result
+
+
 def generate_pchip_cdf(
     percentile_values: dict[int | float, float],
     open_upper_bound: bool,
@@ -291,48 +321,35 @@ def generate_pchip_cdf(
     uniform_cdf = np.linspace(float(cdf_y[0]), float(cdf_y[-1]), num_points)
     cdf_y = (1.0 - alpha) * cdf_y + alpha * uniform_cdf
 
-    # Strict enforcement of minimum step size with iterative approach
-    def enforce_min_steps(y_values: np.ndarray, min_step_size: float) -> np.ndarray:
-        """Enforce minimum step size between adjacent points"""
-        result = y_values.copy()
+    # First pass: enforce min-step via the shared module-level helper.
+    cdf_y = enforce_min_steps(cdf_y, min_step, upper_cap=1.0, lower_cap=0.0)
 
-        # First pass: enforce minimum steps
-        for i in range(1, len(result)):
-            if result[i] < result[i - 1] + min_step_size:
-                result[i] = min(result[i - 1] + min_step_size, 1.0)
+    # Second pass (legacy panchul redistribution): if the CDF saturated to 1.0
+    # before the grid endpoint, ramp the remaining points uniformly back up to
+    # 1.0 then re-enforce min-step with a back-fill on overflow. Kept inline
+    # because the shape of the redistribution is specific to the PCHIP path.
+    if cdf_y[-1] > 1.0:
+        overflow_idx_arr = np.where(cdf_y > 1.0)[0]
+        if len(overflow_idx_arr) > 0:
+            overflow_idx = overflow_idx_arr[0]
+            steps_remaining = len(cdf_y) - overflow_idx
 
-        # Second pass: ensure we don't exceed 1.0
-        if result[-1] > 1.0:
-            # If we've exceeded 1.0 before the end, rescale the steps
-            overflow_idx = np.where(result > 1.0)[0]
-            if len(overflow_idx) > 0:
-                overflow_idx = overflow_idx[0]
-                steps_remaining = len(result) - overflow_idx
+            for i in range(overflow_idx, len(cdf_y)):
+                t = (i - overflow_idx) / max(1, steps_remaining - 1)
+                cdf_y[i] = min(
+                    1.0,
+                    cdf_y[overflow_idx - 1] + (1.0 - cdf_y[overflow_idx - 1]) * t,
+                )
 
-                for i in range(overflow_idx, len(result)):
-                    t = (i - overflow_idx) / max(1, steps_remaining - 1)
-                    result[i] = min(
-                        1.0,
-                        result[overflow_idx - 1] + (1.0 - result[overflow_idx - 1]) * t,
-                    )
-
-                # Final check for minimum steps
-                for i in range(overflow_idx, len(result)):
-                    if i > overflow_idx and result[i] < result[i - 1] + min_step_size:
-                        result[i] = result[i - 1] + min_step_size
-                        if result[i] > 1.0:
-                            # If we exceed 1.0 again, cap at 1.0 and adjust previous values
-                            result[i] = 1.0
-                            # Backtrack and redistribute
-                            for j in range(i - 1, overflow_idx - 1, -1):
-                                max_allowed = result[j + 1] - min_step_size
-                                if result[j] > max_allowed:
-                                    result[j] = max_allowed
-
-        return result
-
-    # Apply strict step enforcement
-    cdf_y = enforce_min_steps(cdf_y, min_step)
+            for i in range(overflow_idx, len(cdf_y)):
+                if i > overflow_idx and cdf_y[i] < cdf_y[i - 1] + min_step:
+                    cdf_y[i] = cdf_y[i - 1] + min_step
+                    if cdf_y[i] > 1.0:
+                        cdf_y[i] = 1.0
+                        for j in range(i - 1, overflow_idx - 1, -1):
+                            max_allowed = cdf_y[j + 1] - min_step
+                            if cdf_y[j] > max_allowed:
+                                cdf_y[j] = max_allowed
 
     # Apply boundary constraints and max jump rules
     cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step)

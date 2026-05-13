@@ -16,40 +16,16 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric_format_router import (
     RoutedNumericForecast,
     detect_numeric_format,
     route_numeric_output,
 )
-
-# ---------------------------------------------------------------------------
-# Fixtures / helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_numeric_question(
-    *,
-    lower_bound: float = 0.0,
-    upper_bound: float = 100.0,
-    open_lower_bound: bool = False,
-    open_upper_bound: bool = False,
-) -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.lower_bound = lower_bound
-    q.upper_bound = upper_bound
-    q.open_lower_bound = open_lower_bound
-    q.open_upper_bound = open_upper_bound
-    q.zero_point = None
-    q.cdf_size = None
-    q.id_of_question = 42
-    q.page_url = "https://example.com/q/42"
-    return q
+from tests.conftest import make_mock_numeric_question as _make_numeric_question
 
 
 def _wrap_json_block(payload: dict[str, Any]) -> str:

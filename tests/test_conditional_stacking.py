@@ -12,7 +12,6 @@ from forecasting_tools import (
     GeneralLlm,
     MultipleChoiceQuestion,
     NumericDistribution,
-    NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
 )
@@ -21,6 +20,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from tests.conftest import make_mock_numeric_question
 
 # Standard 11-percentile values used throughout numeric tests
 _STANDARD_PERCENTILES = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
@@ -540,21 +540,15 @@ class TestConditionalStackingThresholds:
 
 
 def _make_numeric_question(question_id: int = 301) -> Mock:
-    question = Mock(spec=NumericQuestion)
-    question.id_of_question = question_id
-    question.question_text = "How many units will be sold?"
-    question.background_info = "Sales question"
-    question.resolution_criteria = "Resolves to actual unit count"
-    question.fine_print = ""
-    question.page_url = "https://test.com/3"
-    question.lower_bound = 0.0
-    question.upper_bound = 100.0
-    question.open_lower_bound = False
-    question.open_upper_bound = False
-    question.zero_point = None
-    question.unit_of_measure = "units"
-    question.cdf_size = 201
-    return question
+    return make_mock_numeric_question(
+        id_of_question=question_id,
+        question_text="How many units will be sold?",
+        background_info="Sales question",
+        resolution_criteria="Resolves to actual unit count",
+        page_url="https://test.com/3",
+        unit_of_measure="units",
+        cdf_size=201,
+    )
 
 
 def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) -> NumericDistribution:

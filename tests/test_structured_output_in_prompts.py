@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
+from tests.conftest import make_mock_numeric_question
 
 # All three prompts call _forecasting_window_str(question) which asserts on
 # open_time / scheduled_resolution_time. Populate in every fixture.
@@ -50,16 +51,7 @@ def _make_mc_q() -> MultipleChoiceQuestion:
 
 
 def _make_numeric_q() -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.question_text = "What will X be?"
-    q.background_info = "bg"
-    q.resolution_criteria = "rc"
-    q.fine_print = ""
-    q.unit_of_measure = "USD"
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = False
-    q.open_upper_bound = False
+    q = make_mock_numeric_question()
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
     return q
@@ -126,14 +118,14 @@ class TestNumericPromptSchemaInstruction:
             "numeric prompt should note that JSON percentiles should match the trailing Percentile lines"
         )
 
-    def test_mixture_components_not_in_numeric_schema_v1(self):
-        # Workstream D will add mixture_components. In Workstream C we must
-        # NOT include it yet (schema extension is out of scope). A TODO comment
-        # flagging future mixture support is expected.
+    def test_mixture_components_in_numeric_schema(self):
+        # Workstream D activated mixture_components end-to-end (schema slot,
+        # router, and CDF builder). The JSON example block must list the
+        # field so LLMs that lean on the literal example know they can emit
+        # a mixture.
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        # mixture_components as a schema field must not appear.
-        assert '"mixture_components"' not in prompt, (
-            "mixture_components is a Workstream D addition — must not ship in Workstream C"
+        assert '"mixture_components"' in prompt, (
+            "mixture_components must be present in the numeric schema example so LLMs see the OPTION B branch"
         )
 
     def test_schema_block_precedes_percentile_answer_lines(self):

@@ -61,20 +61,24 @@ Thresholds (`metaculus_bot/constants.py:166-175`):
 
 ### Clamps / bounds
 
-- **Binary**: `[BINARY_PROB_MIN=0.01, BINARY_PROB_MAX=0.99]` (`constants.py:149-150`). Applied per-model at `main.py:1381` and on stacker output at `stacking.py:92`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
-- **MC**: `[0.005, 0.995]`, clamp-then-renormalize via `clamp_and_renormalize_mc` (`numeric_utils.py:206`).
+- **Binary**: `[BINARY_PROB_MIN=0.02, BINARY_PROB_MAX=0.98]` (`constants.py`). Applied per-model in `main.py` and on stacker output in `stacking.py`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
+- **MC**: `[0.005, 0.995]`, clamp-then-renormalize via `clamp_and_renormalize_mc` (`numeric_utils.py`).
 - **Numeric CDF**: 201 points, `min_step ≥ 5e-5`, `max_step ≤ 0.2`, open bounds clipped to `[0.001, 0.999]`, closed bounds pinned to `{0.0, 1.0}`. Enforced in `pchip_cdf.generate_pchip_cdf` with aggressive repair + `safe_cdf_bounds` redistribution on max-step violations.
 
 ### Numeric pipeline (percentiles → PCHIP CDF)
 
-Each forecaster emits the 11 standard percentiles `{2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5}` as plain text (prompt example at `prompts.py:478-488`). Per-model stages:
+Each forecaster emits the 11 standard percentiles `{2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5}` as plain text (prompt example in `prompts.numeric_prompt`). Per-model stages:
 
-1. Parser LLM extracts `list[Percentile]` (`main.py:1487`).
-2. `sanitize_percentiles` (`numeric_pipeline.py:52`): filter to the 11, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
-3. `widen_declared_percentiles` (`tail_widening.py:95`, enabled by default): bound-aware stretch of distance-from-median by `k_tail=1.25`, only outside the central 60%. Enforces span floors on outer tails.
+1. Parser LLM extracts `list[Percentile]`.
+2. `sanitize_percentiles` (`numeric_pipeline.py`): filter to the 11, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
+3. `widen_declared_percentiles` (`tail_widening.py`): bound-aware stretch of distance-from-median by `k_tail=1.0` (identity by default; widening only kicks in when callers raise `k_tail` above 1.0) with `span_floor_gamma=0.0` (no span-floor enforcement by default). Both knobs are configurable per-call.
 4. `build_numeric_distribution` → `generate_pchip_cdf_with_smoothing` produces 201-point PCHIP CDF → ramp smoothing for min-step → validation. On failure: `create_fallback_numeric_distribution` delegates CDF build to forecasting-tools.
-5. **Discrete integer snapping** (`main.py:1515`): if a majority of forecasters vote DISCRETE, snap the distribution to integers.
+5. **Discrete integer snapping**: if a majority of forecasters vote DISCRETE, snap the distribution to integers.
 6. **Unit-mismatch guard** (`numeric_validation.detect_unit_mismatch`): withholds the prediction if values look off by orders of magnitude.
+
+### Numeric format router (`numeric_format_router.py`)
+
+The router decides whether the LLM's numeric output is in OPTION A (the default 11 trailing `Percentile X.X: ...` lines) or OPTION B (a `mixture_components` list inside the JSON block). It always returns a 201-point Metaculus CDF and records which branch produced it for residual analysis (logged as `numeric_format=...`). If both formats are present, the mixture wins deterministically and a WARNING is logged so the frequency is auditable. The mixture branch flows through `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced grid evaluation of the mixture CDF).
 
 **Ensemble aggregation** (`numeric_utils.aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 
@@ -94,39 +98,38 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 
 **Additional providers run in parallel on top of the primary** (each independently gated):
 
-- **Grok / xAI native search** (OpenRouter web plugin, `research_providers.py:292-344`): gated by `NATIVE_SEARCH_ENABLED`.
+- **Grok / xAI native search** (OpenRouter web plugin, `research_providers.py`): gated by `NATIVE_SEARCH_ENABLED`.
 - **Gemini grounded search** (`gemini_search_provider.py`): real Google Search grounding via `google-genai` SDK (not OpenRouter) + `url_context` tool for specific URL reads. Gated by `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`.
 - **Financial data** (`financial_data_provider.py`): LLM classifier routes to yfinance + FRED for financial/economic questions. Gated by `FINANCIAL_DATA_ENABLED` + `FRED_API_KEY`.
+- **Prediction-market snapshot** (`prediction_market_provider.py`): fans out to Polymarket Gamma, Kalshi (prefetch + local rapidfuzz match), and Manifold concurrently; aggregates the top matches into a benchmarking-safe research blurb. Gated by `PREDICTION_MARKETS_ENABLED` + a benchmarking guard (the snapshot is suppressed in `is_benchmarking=True` runs to avoid data leakage). **OFF by default in prod workflows** — flip on after a smoke + medium backtest gate.
 
 **Second-pass gap-fill** (`targeted_research.run_gap_fill_pass`): always-on when `GAP_FILL_ENABLED` + `GOOGLE_API_KEY` are set. Two stages: Gemini analyzer identifies up to `GAP_FILL_MAX_GAPS` factual gaps → parallel grounded-Gemini searches resolve each. Soft-fails (returns `""`) on any error.
 
-**All 4 production workflows** (`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) set `NATIVE_SEARCH_ENABLED=true`, `GEMINI_SEARCH_ENABLED=true`, `FINANCIAL_DATA_ENABLED=true`, `GAP_FILL_ENABLED=true`. So in prod the stack is AskNews + Grok native + Gemini grounded + financial-data (when classified as financial) + always-on Gemini gap-fill.
+**Production workflows** (`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) set `NATIVE_SEARCH_ENABLED=true`, `GEMINI_SEARCH_ENABLED=true`, `FINANCIAL_DATA_ENABLED=true`, `GAP_FILL_ENABLED=true`. `PREDICTION_MARKETS_ENABLED` is not yet on by default. So in prod the active stack is AskNews + Grok native + Gemini grounded + financial-data (when classified as financial) + always-on Gemini gap-fill, with the prediction-market provider available behind its env flag.
 
-No dedicated prediction-market provider (Polymarket / Kalshi / Manifold) — yet. Prompt-level nudge only, in `prompts.web_research_prompt:113-115` (outside benchmark runs) and the Perplexity prompt at `research_providers.py:278`. Benchmarking mode actively forbids prediction-market search to avoid data leakage (`_benchmarking_warning`, `prompts.py:29-46`). See `scratch_docs_and_planning/atlas_inspired_improvements.md` Workstream G for the planned first-class provider.
+### Prompts (`metaculus_bot/prompts.py`)
 
-### Prompts (`metaculus_bot/prompts.py`, ~900 lines)
+- `_benchmarking_warning`, `_forecasting_window_str`, `web_research_prompt`.
+- Base: `binary_prompt`, `multiple_choice_prompt`, `numeric_prompt`. Each base prompt now embeds the STRUCTURED FORECAST JSON-block schema instruction (Workstream C activation) so forecaster rationales emit machine-readable blocks for `tool_runner` to consume.
+- Stacking: `stacking_binary_prompt`, `stacking_multiple_choice_prompt`, `stacking_numeric_prompt`. The stacker prompts include a "Cross-model aggregation (deterministic math)" block at the top when `build_cross_model_aggregation` returns markdown.
+- Conditional-stacking support: `disagreement_crux_prompt`, `targeted_search_prompt`.
+- Gap-fill: `gap_fill_analyzer_prompt`, `gap_fill_search_prompt`.
 
-- `_benchmarking_warning` (L29), `_forecasting_window_str` (L49), `web_research_prompt` (L86).
-- Base: `binary_prompt` (L144), `multiple_choice_prompt` (L241), `numeric_prompt` (L334).
-- Stacking: `stacking_binary_prompt` (L493), `stacking_multiple_choice_prompt` (L563), `stacking_numeric_prompt` (L641).
-- Conditional-stacking support: `disagreement_crux_prompt` (L744), `targeted_search_prompt` (L768).
-- Gap-fill: `gap_fill_analyzer_prompt` (L786), `gap_fill_search_prompt` (L865).
-
-## Dormant scaffolding (important)
+## Probabilistic tools (ACTIVE)
 
 ### `metaculus_bot/probabilistic_tools/`
 
 Reusable probability math — pooling, Beta-Binomial Bayes, percentile → parametric fits (normal/lognormal/Student-t), declared-vs-math consistency checks, Dirichlet CIs, Neg-Bin/Poisson discrete percentiles, exponential/Weibull survival, Gamma-conjugate hazard. `prob_event_before`, `poisson_at_least_one`, `linear_pool` / `log_pool` / `satopaa_extremize`, `beta_binomial_update`, `cdf_at_threshold`, `dirichlet_with_other` are wired into `tool_runner` dispatch.
 
+Newly-added math (Workstreams D1-D3):
+
+- **Noisy-OR** (`noisy_or.py`): rare-binary decomposition `1 − ∏(1 − pᵢ)` for combining independent failure-mode probabilities. Wired into `tool_runner`.
+- **Mixture-of-normals** (`mixtures.py`): `MixtureOfNormals` / `MixtureComponent` types, `mixture_cdf`, `fit_mixture_from_percentiles` (multi-start L-BFGS-B with single-normal fallback), and `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced 201-point CDF). Schema slot lives in `structured_output_schema.NumericStructured.mixture_components`; the numeric-format router branches on it.
+- **Gamma waiting-time, conditional-given-survival**: `gamma_prob_event_before` with elapsed-window split (`survival_distributions.py`) — covers the missing waiting-time fitter alongside the existing exponential / Weibull / Gamma-hazard variants.
+
 ### `metaculus_bot/tool_runner.py`
 
-Despite the name, **not** an LLM tool-calling harness. A **deterministic probability-math post-processor** that would run on structured JSON blocks emitted by each forecaster (priors, base rates, hazards, percentiles, scenarios) and inject a "Computed quantities" section into the stacker prompt. Entry points `run_tools_for_forecaster` (L360) and `build_cross_model_aggregation` (L554). Gated by `PROBABILISTIC_TOOLS_ENABLED` env var (unset) and **not imported anywhere in production code** — only tests.
-
-### Activation plan
-
-`scratch_docs_and_planning/probabilistic_tools_activation.md` details the three pending edits: (1) append structured-block JSON instructions to `binary_prompt` / `multiple_choice_prompt` / `numeric_prompt`, (2) call `run_tools_for_forecaster` in `_make_prediction`, (3) plumb `build_cross_model_aggregation` output into the stacker prompts. All library code and unit tests exist; none of the three wiring edits have been shipped.
-
-**Coverage gaps vs. desirable patterns**: noisy-OR for rare-binary decomposition (`1 − ∏(1−pᵢ)`) is not implemented; mixture-of-normals CDF builder is not implemented (schema slot exists in `structured_output_schema.NumericStructured.mixture_components` but no evaluator); Gamma-waiting-time fitter is missing (have exponential survival, Weibull unconditional, and Gamma-conjugate hazard, but not Gamma waiting-time with conditional-given-survival).
+Despite the name, **not** an LLM tool-calling harness. A **deterministic probability-math post-processor** that runs on structured JSON blocks emitted by each forecaster (priors, base rates, hazards, percentiles, scenarios) and injects a "Computed quantities" section into per-forecaster rationales plus a cross-model aggregation block into the stacker prompt. Entry points `run_tools_for_forecaster` and `build_cross_model_aggregation`. Gated by `PROBABILISTIC_TOOLS_ENABLED`; both entry points no-op when the flag is unset. **Wired into production code**: `run_tools_for_forecaster` runs from `_make_prediction`, and `build_cross_model_aggregation` feeds the stacker prompts in both the STACKING and CONDITIONAL_STACKING paths. A `TOOLS_USED` marker is emitted in the comment trailer alongside the `STACKER_OUTCOME` marker so residual analysis can bucket tool-augmented vs. vanilla runs.
 
 ## Project structure
 
@@ -187,6 +190,15 @@ LLM ensemble lives in `metaculus_bot/llm_configs.py` — single source of truth.
 - **Format**: `make format` (Ruff format + autofix).
 - **Pre-commit**: `make precommit_install` then `make precommit` or `make precommit_all`.
 - **Test single file**: `conda run -n metaculus-bot PYTHONPATH=. poetry run pytest tests/test_specific.py`.
+
+### Function-scoped imports in `main.py`
+
+`main.py` keeps a handful of `from x import y` statements inside functions instead of at module scope, each tagged `# noqa: PLC0415  # function-scoped: see AGENTS.md`. Two reasons drive this:
+
+1. **Optional dependency loading.** `prediction_market_provider` pulls in `rapidfuzz`; `tool_runner`, `numeric_format_router`, etc. only matter when their corresponding feature flag is on. Importing them at function scope keeps the cold-start path lean and avoids surprising errors when an optional dep isn't installed.
+2. **Ruff auto-formatter behavior.** When a usage edit is staged separately from the import edit (common during refactors and subagent dispatches), Ruff's auto-formatter strips the now-unused top-level import between cycles. Function-scoped imports survive this because the symbol is referenced in the same statement block.
+
+Don't hoist these to the top of `main.py` without first checking that both reasons no longer apply.
 
 ### Important commands
 

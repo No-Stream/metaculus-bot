@@ -10,28 +10,14 @@ parser uses mixture and warns. The prompt should say so explicitly.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock
-
 from forecasting_tools import NumericQuestion
 
 from metaculus_bot.prompts import numeric_prompt
+from tests.conftest import make_mock_numeric_question
 
 
 def _make_numeric_q() -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.question_text = "What will X be?"
-    q.background_info = "bg"
-    q.resolution_criteria = "rc"
-    q.fine_print = ""
-    q.unit_of_measure = "USD"
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = False
-    q.open_upper_bound = False
-    q.open_time = datetime.now() - timedelta(days=30)
-    q.scheduled_resolution_time = datetime.now() + timedelta(days=365)
-    return q
+    return make_mock_numeric_question(with_open_resolve_times=True)
 
 
 class TestNumericPromptOptionABranching:

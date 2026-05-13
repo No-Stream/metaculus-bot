@@ -5,15 +5,20 @@ default; run locally with `pytest -m integration tests/test_prediction_market_in
 when validating after a schema drift or initial implementation.
 
 Each test uses a simple, high-signal query and asserts that the response
-parses. Skips gracefully on 429 / 5xx / network errors so a transient upstream
-blip doesn't break a dev loop.
+parses. Skips gracefully on transient network errors (aiohttp.ClientError,
+asyncio.TimeoutError) so a 5xx blip or slow upstream doesn't break a dev
+loop. Genuine schema breaks — pydantic validation errors, AttributeError on
+missing fields, etc. — are NOT caught and will fail loud, which is the point
+of the test.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from unittest.mock import MagicMock
 
+import aiohttp
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -33,14 +38,12 @@ def _build_integration_question() -> MagicMock:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_polymarket_real_search_returns_parseable_response():
-    import aiohttp
-
     from metaculus_bot.prediction_market_provider import _polymarket_search
 
     async with aiohttp.ClientSession() as session:
         try:
             matches = await _polymarket_search(session, "Trump president 2026")
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Polymarket transient error: {e}")
 
     if not matches:
@@ -49,21 +52,19 @@ async def test_polymarket_real_search_returns_parseable_response():
     m0 = matches[0]
     assert m0.platform == "polymarket"
     assert m0.market_title
-    if m0.implied_prob_yes is not None:
-        assert 0.0 <= m0.implied_prob_yes <= 1.0
+    assert m0.implied_prob_yes is not None
+    assert 0.0 <= m0.implied_prob_yes <= 1.0
 
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_manifold_real_search_returns_parseable_response():
-    import aiohttp
-
     from metaculus_bot.prediction_market_provider import _manifold_search
 
     async with aiohttp.ClientSession() as session:
         try:
             matches = await _manifold_search(session, "Trump president 2026")
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Manifold transient error: {e}")
 
     if not matches:
@@ -72,21 +73,19 @@ async def test_manifold_real_search_returns_parseable_response():
     m0 = matches[0]
     assert m0.platform == "manifold"
     assert m0.market_title
-    if m0.implied_prob_yes is not None:
-        assert 0.0 <= m0.implied_prob_yes <= 1.0
+    assert m0.implied_prob_yes is not None
+    assert 0.0 <= m0.implied_prob_yes <= 1.0
 
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
-    import aiohttp
-
     from metaculus_bot.prediction_market_provider import _kalshi_prefetch_events, _kalshi_search_local
 
     async with aiohttp.ClientSession() as session:
         try:
             events = await _kalshi_prefetch_events(session, event_limit=500, page_sleep_s=1.0)
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Kalshi prefetch transient error: {e}")
 
     if not events:
@@ -110,7 +109,7 @@ async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
 
     try:
         snapshot = await pmp.fetch_market_snapshot(q, timeout=30.0)
-    except Exception as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         pytest.skip(f"Orchestrator transient error: {e}")
 
     # Zero matches is acceptable -- skip rather than fail on a sparse-topic day.

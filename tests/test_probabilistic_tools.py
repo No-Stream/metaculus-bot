@@ -1640,6 +1640,58 @@ class TestFitMixtureFromPercentiles:
         # IQR = 20, so sd = 20 / 1.349.
         assert fit.components[0].sd == pytest.approx(20.0 / 1.349, rel=1e-6)
 
+    def test_fallback_uses_mean_std_when_iqr_keys_missing(self, monkeypatch):
+        # F24: when the optimizer fails AND the percentile dict is missing
+        # any of {0.25, 0.5, 0.75}, the IQR-based single-normal fallback
+        # cannot run. The secondary fallback (mean+std of values, ddof=0)
+        # must produce a valid MixtureOfNormals with sd > 0 rather than
+        # raising.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+        )
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
+        # Only p10 / p50 / p90 — no p25 or p75, so the IQR branch can't fire.
+        # Median is present but is_integer key match needs both 0.25 and 0.75.
+        pcts = {0.1: 5.0, 0.5: 20.0, 0.9: 40.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        assert isinstance(fit, MixtureOfNormals)
+        assert len(fit.components) == 1
+        # mean = (5 + 20 + 40) / 3 ≈ 21.667
+        expected_mean = (5.0 + 20.0 + 40.0) / 3
+        assert fit.components[0].mean == pytest.approx(expected_mean, rel=1e-6)
+        # sd > 0 (must use std-of-values, not collapse to zero)
+        assert fit.components[0].sd > 0.0
+
+    def test_fallback_uses_floor_when_values_collapse_to_single_point(self, monkeypatch):
+        # F24: secondary fallback's tiny-positive-floor branch — when the
+        # optimizer fails AND no valid IQR is available AND std-of-values is
+        # zero (all percentiles map to the same value), sd must collapse to
+        # a positive floor (max(|mean| * 0.1, 1e-6)) rather than 0.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001
+            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
+        # Note: degenerate-percentiles short-circuit fires *before* the
+        # optimizer in fit_mixture_from_percentiles, so this exercises the
+        # `_fallback_single_normal` floor branch directly.
+        pcts = {0.1: 5.0, 0.5: 5.0, 0.9: 5.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        assert fit.components[0].sd > 0.0
+        assert fit.components[0].mean == pytest.approx(5.0)
+
     def test_subthreshold_sd_falls_back_to_single_normal(self, monkeypatch):
         # F10: when every seed's optimizer reports success but produces an sd
         # below _MIN_FIT_SD, fall back to the single-normal safety net.
@@ -1676,16 +1728,14 @@ class TestPercentilesToMetaculusCdfViaMixture:
         open_lower_bound: bool = False,
         open_upper_bound: bool = False,
     ):
-        from unittest.mock import MagicMock
+        from tests.conftest import make_mock_numeric_question
 
-        from forecasting_tools.data_models.questions import NumericQuestion
-
-        q = MagicMock(spec=NumericQuestion)
-        q.lower_bound = lower_bound
-        q.upper_bound = upper_bound
-        q.open_lower_bound = open_lower_bound
-        q.open_upper_bound = open_upper_bound
-        return q
+        return make_mock_numeric_question(
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            open_lower_bound=open_lower_bound,
+            open_upper_bound=open_upper_bound,
+        )
 
     def test_closed_bounds_produces_201_point_cdf(self):
         from forecasting_tools.data_models.numeric_report import Percentile

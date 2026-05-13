@@ -533,7 +533,8 @@ def numeric_prompt(
           "distribution_family_hint": "normal",
           "student_t_df": null,
           "tails": {{"below_min_expected": 0.02, "above_max_expected": 0.05}},
-          "scenarios": []
+          "scenarios": [],
+          "mixture_components": null
         }}
         ```
 

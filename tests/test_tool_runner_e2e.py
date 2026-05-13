@@ -42,6 +42,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.tool_runner import FEATURE_FLAG_ENV
+from tests.conftest import make_mock_numeric_question
 
 # ---------------------------------------------------------------------------
 # Common fixtures: bots and questions
@@ -130,23 +131,11 @@ def _make_mc_q(qid: int = 102) -> MultipleChoiceQuestion:
 
 
 def _make_numeric_q(qid: int = 103) -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.id_of_question = qid
-    q.id_of_post = qid
-    q.question_text = "What value?"
-    q.background_info = "bg"
-    q.resolution_criteria = "rc"
-    q.fine_print = ""
-    q.unit_of_measure = "USD"
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = False
-    q.open_upper_bound = False
-    q.zero_point = None
-    q.cdf_size = None
-    q.nominal_lower_bound = None
-    q.nominal_upper_bound = None
-    q.page_url = f"https://example.com/q/{qid}"
+    q = make_mock_numeric_question(
+        id_of_question=qid,
+        question_text="What value?",
+        with_open_resolve_times=False,
+    )
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
     return q

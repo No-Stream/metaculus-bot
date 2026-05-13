@@ -22,7 +22,7 @@ from scipy import optimize
 from scipy.stats import norm
 
 from metaculus_bot.numeric_config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
-from metaculus_bot.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.pchip_cdf import enforce_min_steps, safe_cdf_bounds
 
 
 @dataclass(frozen=True)
@@ -287,43 +287,10 @@ def percentiles_to_metaculus_cdf_via_mixture(
 
     # Enforce min-step iteratively, with backward pass to handle CDFs that
     # saturate before the grid endpoint (forward+backward sweep).
-    cdf = _enforce_min_steps(cdf, MIN_CDF_PROB_STEP, upper_cap=hi_cap, lower_cap=lo_cap)
+    cdf = enforce_min_steps(cdf, MIN_CDF_PROB_STEP, upper_cap=hi_cap, lower_cap=lo_cap)
 
     # Final monotonicity safety + apply boundary constraints + max-step redistribution.
     cdf = np.maximum.accumulate(cdf)
     cdf = safe_cdf_bounds(cdf, open_lower, open_upper, MIN_CDF_PROB_STEP)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf[i])) for i in range(num_points)]
-
-
-def _enforce_min_steps(
-    y_values: np.ndarray,
-    min_step: float,
-    *,
-    upper_cap: float = 1.0,
-    lower_cap: float = 0.0,
-) -> np.ndarray:
-    """Enforce minimum step size between adjacent points (panchul-style).
-
-    Forward pass lifts each point to be >= prev + min_step (capped at
-    ``upper_cap``). If any point exceeds ``upper_cap``, a backward pass
-    pulls prior points down so they sit at least ``min_step`` below their
-    successor. Reshapes the CDF when the mixture saturates to 1.0 before
-    the grid ends (typical for tight-sd components in the tails).
-    """
-    n = len(y_values)
-    result = y_values.copy()
-    # Forward pass: enforce min-step, cap at upper_cap.
-    for i in range(1, n):
-        if result[i] < result[i - 1] + min_step:
-            result[i] = result[i - 1] + min_step
-        if result[i] > upper_cap:
-            result[i] = upper_cap
-    # Backward pass: if the last point is pinned at upper_cap, back-fill so
-    # every step is at least min_step.
-    for j in range(n - 2, -1, -1):
-        if result[j] > result[j + 1] - min_step:
-            result[j] = result[j + 1] - min_step
-        if result[j] < lower_cap:
-            result[j] = lower_cap
-    return result

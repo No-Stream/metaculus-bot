@@ -28,6 +28,7 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+from tests.conftest import make_mock_numeric_question
 
 # _forecasting_window_str asserts on open_time / scheduled_resolution_time;
 # populate in every mock question fixture below.
@@ -67,18 +68,7 @@ def _make_mc_q() -> MultipleChoiceQuestion:
 
 
 def _make_numeric_q() -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.id_of_question = 3
-    q.question_text = "What will X be?"
-    q.background_info = "bg"
-    q.resolution_criteria = "rc"
-    q.fine_print = ""
-    q.page_url = "https://example.com/q/3"
-    q.unit_of_measure = "USD"
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = False
-    q.open_upper_bound = False
+    q = make_mock_numeric_question(id_of_question=3)
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
     return q

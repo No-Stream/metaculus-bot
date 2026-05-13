@@ -145,14 +145,9 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 ASKNEWS_WALL_TIMEOUT: int = 300
 
 # --- Forecasting clamps and numeric smoothing ---
-# Binary prediction clamp.
-# Widened from [0.01, 0.99] to [0.02, 0.98] on 2026-05-12. Preseen-Atlas
-# (top bot on spring-AIB-2026) publishes `submitted = 0.96 * model_estimate
-# + 0.02` on every comment — equivalent to clipping to [0.02, 0.98] plus a
-# 4% linear shrink. We adopted the clip-only portion: the tail protection
-# buys most of the log-loss improvement without dulling confident-correct
-# calls. See scratch_docs_and_planning/atlas_inspired_improvements.md
-# (Workstream B) for the full rationale.
+# Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
+# (Atlas publishes `0.96 * estimate + 0.02`; we adopt the clip portion only).
+# See scratch_docs_and_planning/atlas_inspired_improvements.md Workstream B.
 BINARY_PROB_MIN: float = 0.02
 BINARY_PROB_MAX: float = 0.98
 

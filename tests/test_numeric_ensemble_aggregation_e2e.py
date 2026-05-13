@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
@@ -27,6 +26,7 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution, Pe
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy, combine_numeric_predictions
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+from tests.conftest import make_mock_numeric_question
 
 # ---------------------------------------------------------------------------
 # Fixtures: a question + helpers to build rationales for each branch
@@ -56,25 +56,13 @@ def _make_bot() -> TemplateForecaster:
 
 
 def _make_numeric_question() -> NumericQuestion:
-    q = MagicMock(spec=NumericQuestion)
-    q.id_of_question = 4242
-    q.page_url = "https://example.com/q/4242"
-    q.question_text = "Numeric Q for ensemble"
-    q.background_info = ""
-    q.resolution_criteria = ""
-    q.fine_print = ""
-    q.unit_of_measure = "USD"
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = False
-    q.open_upper_bound = False
-    q.zero_point = None
-    q.cdf_size = None
-    q.nominal_lower_bound = None
-    q.nominal_upper_bound = None
-    q.open_time = datetime.now() - timedelta(days=30)
-    q.scheduled_resolution_time = datetime.now() + timedelta(days=365)
-    return q
+    return make_mock_numeric_question(
+        id_of_question=4242,
+        question_text="Numeric Q for ensemble",
+        background_info="",
+        resolution_criteria="",
+        with_open_resolve_times=True,
+    )
 
 
 _DECLARED_PERCENTILES_A: list[tuple[float, float]] = [
