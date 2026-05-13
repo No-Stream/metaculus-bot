@@ -117,6 +117,9 @@ def mock_question():
     q.short_title = "Starship orbit 2026"
     q.resolution_criteria = "Resolves Yes if a SpaceX Starship reaches orbital velocity before 2026-07-01."
     q.page_url = "https://metaculus.com/q/12345"
+    # Set to None so the provider falls back to datetime.now(UTC) for as_of,
+    # which keeps post-2026 close_times in the test fixtures un-filtered.
+    q.scheduled_resolution_time = None
     return q
 
 
@@ -230,6 +233,22 @@ class TestPolymarket:
         assert top.ask == pytest.approx(0.75)
 
     @pytest.mark.asyncio
+    async def test_match_confidence_is_nonzero_for_strong_match(self, polymarket_payload):
+        """F9: every Polymarket parse populates a real fuzzy-match confidence,
+        not the legacy 0.0 placeholder. Confidence comes from token_set_ratio
+        between the active query and the market title."""
+        from metaculus_bot.prediction_market_provider import _polymarket_search
+
+        session = FakeSession({"https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload)})
+        matches = await _polymarket_search(session, "Starship orbit 2026")
+
+        # The query "Starship orbit 2026" is a strong token-set-ratio match
+        # against the top market title; confidence must be well above 0.0.
+        assert matches[0].match_confidence > 0.5
+        # Every match has SOME positive confidence (queries overlap on "2026").
+        assert all(m.match_confidence > 0.0 for m in matches)
+
+    @pytest.mark.asyncio
     async def test_rate_limit_retry_with_backoff_then_empty(self, monkeypatch):
         """403 on every attempt -> bounded retry -> eventual empty list, no exception."""
         from metaculus_bot import prediction_market_provider as pmp
@@ -320,6 +339,47 @@ class TestKalshi:
             events = await _kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
         assert events == []
 
+    @pytest.mark.asyncio
+    async def test_prefetch_writes_cache_incrementally(self):
+        """F6: Kalshi prefetch updates _KALSHI_CACHE after each successful page,
+        not only at the end. A partial run still warms whatever pages completed.
+        """
+        from metaculus_bot import prediction_market_provider as pmp
+
+        page_one = {
+            "events": [
+                {"event_ticker": "EV1", "title": "Event 1", "markets": []},
+                {"event_ticker": "EV2", "title": "Event 2", "markets": []},
+            ],
+            "cursor": "next-page-cursor",
+        }
+
+        # Capture cache state right after page 1 completes by failing page 2.
+        captured_cache_after_page_one: list[list[dict]] = []
+
+        call_count = {"n": 0}
+
+        def handler(_params):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Snapshot the cache as it will be set inside prefetch right
+                # after this page is consumed.
+                return FakeResponse(200, page_one)
+            # Return 500 on page 2 so prefetch breaks early -- cache should
+            # already contain page 1.
+            captured_cache_after_page_one.append(list(pmp._KALSHI_CACHE.get("events", (0, []))[1]))
+            return FakeResponse(500, text="page 2 boom")
+
+        pmp._reset_session_caches()
+        session = FakeSession({"https://api.elections.kalshi.com/trade-api/v2/events": [handler, handler]})
+        events = await pmp._kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
+
+        # Returned list should have 2 events from page 1 (page 2 broke early).
+        assert len(events) == 2
+        # And the cache contained page 1 events BEFORE page 2 was attempted.
+        assert len(captured_cache_after_page_one) == 1
+        assert len(captured_cache_after_page_one[0]) == 2
+
 
 # ---------------------------------------------------------------------------
 # Manifold tests
@@ -351,6 +411,18 @@ class TestManifold:
         with caplog.at_level(logging.WARNING):
             matches = await _manifold_search(session, "anything")
         assert matches == []
+
+    @pytest.mark.asyncio
+    async def test_match_confidence_is_nonzero_for_strong_match(self, manifold_payload):
+        """F9: Manifold parse populates real fuzzy-match confidence per row."""
+        from metaculus_bot.prediction_market_provider import _manifold_search
+
+        session = FakeSession({"https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload)})
+        matches = await _manifold_search(session, "Starship orbit July 2026")
+
+        assert len(matches) == 1
+        # Title is "Will Starship reach orbit before July 2026?" — strong overlap.
+        assert matches[0].match_confidence > 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +708,46 @@ class TestFetchMarketSnapshot:
         assert "polymarket" not in platforms
 
     @pytest.mark.asyncio
+    async def test_snapshot_cache_key_includes_as_of(
+        self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
+    ):
+        """F1/F7: snapshot cache keyed by (qid, as_of_iso) so a backtest at
+        as_of=A doesn't reuse a snapshot computed at as_of=B."""
+        from datetime import datetime, timezone
+
+        from metaculus_bot import prediction_market_provider as pmp
+
+        handlers = {
+            "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
+            "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+        }
+
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "Starship orbit"  # noqa: ASYNC910
+
+        as_of_a = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        as_of_b = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+        pmp._reset_session_caches()
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", FakeLlm),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snap_a = await pmp.fetch_market_snapshot(mock_question, as_of=as_of_a, timeout=5.0)
+            snap_b = await pmp.fetch_market_snapshot(mock_question, as_of=as_of_b, timeout=5.0)
+
+        # Two distinct cache entries should exist, one per (qid, as_of_iso).
+        assert (mock_question.id_of_question, as_of_a.isoformat()) in pmp._SNAPSHOT_CACHE
+        assert (mock_question.id_of_question, as_of_b.isoformat()) in pmp._SNAPSHOT_CACHE
+        # Both calls should have produced a snapshot (not collided as None).
+        assert snap_a is not None and snap_b is not None
+
+    @pytest.mark.asyncio
     async def test_max_matches_per_platform_respected(
         self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):
@@ -675,7 +787,7 @@ class TestFetchMarketSnapshot:
 
 class TestProviderFactory:
     @pytest.mark.asyncio
-    async def test_disabled_flag_returns_empty_at_orchestrator_level(self, monkeypatch):
+    async def test_disabled_flag_returns_empty_at_orchestrator_level(self, monkeypatch, mock_question):
         """When PREDICTION_MARKETS_ENABLED is not set, the provider returns ''.
         This is a defense-in-depth check at the research-provider entrypoint."""
         from metaculus_bot.prediction_market_provider import prediction_market_provider
@@ -683,14 +795,67 @@ class TestProviderFactory:
         monkeypatch.delenv("PREDICTION_MARKETS_ENABLED", raising=False)
 
         provider = prediction_market_provider()
-        # Calling the provider with a question_text should return empty string
-        # because the flag gate prevents any fetching.
-        result = await provider("Will Starship reach orbit?")
+        # The provider takes a MetaculusQuestion. With the flag disabled it
+        # short-circuits to empty without touching the question.
+        result = await provider(mock_question)
         assert result == ""
 
     @pytest.mark.asyncio
+    async def test_factory_derives_as_of_from_scheduled_resolution(
+        self, monkeypatch, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
+    ):
+        """F1: when the question carries scheduled_resolution_time, the
+        provider derives as_of from it (with a small backward buffer) so the
+        leakage filter is active even when the orchestrator caller didn't
+        supply as_of explicitly."""
+        from datetime import datetime, timezone
+
+        from metaculus_bot import prediction_market_provider as pmp
+
+        # Set scheduled_resolution_time so the provider derives a real as_of.
+        mock_question.scheduled_resolution_time = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
+
+        handlers = {
+            "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
+            "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+        }
+
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "Starship orbit"  # noqa: ASYNC910
+
+        captured_as_ofs: list[datetime | None] = []
+        original_fetch = pmp.fetch_market_snapshot
+
+        async def _capturing_fetch(question_arg, *, as_of=None, **kwargs):
+            captured_as_ofs.append(as_of)
+            return await original_fetch(question_arg, as_of=as_of, **kwargs)
+
+        pmp._reset_session_caches()
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", FakeLlm),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+            patch.object(pmp, "fetch_market_snapshot", _capturing_fetch),
+        ):
+            provider = pmp.prediction_market_provider()
+            await provider(mock_question)
+
+        assert len(captured_as_ofs) == 1
+        derived = captured_as_ofs[0]
+        # Derived as_of should be slightly before scheduled_resolution_time
+        # (backward buffer applied).
+        assert derived is not None
+        assert derived < mock_question.scheduled_resolution_time
+
+    @pytest.mark.asyncio
     async def test_enabled_flag_fetches_and_formats(
-        self, monkeypatch, polymarket_payload, manifold_payload, kalshi_events_payload
+        self, monkeypatch, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):
         from metaculus_bot import prediction_market_provider as pmp
 
@@ -715,7 +880,7 @@ class TestProviderFactory:
             patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
         ):
             provider = pmp.prediction_market_provider()
-            out = await provider("Will SpaceX Starship reach orbit before July 2026?")
+            out = await provider(mock_question)
 
         assert isinstance(out, str)
         assert "NOT AN ANCHOR" in out

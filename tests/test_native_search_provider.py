@@ -1,9 +1,17 @@
 """Tests for native search research provider."""
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _make_q(text: str) -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
+    contract. Tests only care about question_text on this path."""
+    q = MagicMock()
+    q.question_text = text
+    return q
 
 
 @pytest.mark.asyncio
@@ -29,7 +37,7 @@ async def test_native_search_provider_constructs_correct_model_name(
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider()
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert captured_model == "openrouter/x-ai/grok-4.1-fast"
 
@@ -54,7 +62,7 @@ async def test_native_search_provider_uses_custom_model_slug(
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(model_slug="openai/gpt-4o")
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert captured_model == "openrouter/openai/gpt-4o"
 
@@ -79,7 +87,7 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=False)
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert captured_prompt is not None
     assert "Prediction market" in captured_prompt
@@ -105,7 +113,7 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=True)
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert captured_prompt is not None
     assert "Prediction market" not in captured_prompt
@@ -131,7 +139,7 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider()
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert captured_prompt is not None
     assert "DO NOT hallucinate" in captured_prompt
@@ -225,7 +233,7 @@ class TestParallelExecution:
                 return "Research from provider 2"
 
             providers = [(provider1, "asknews"), (provider2, "native_search")]
-            result = await bot._run_providers_parallel("Test question", providers)
+            result = await bot._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from provider 1" in result
         assert "Research from provider 2" in result
@@ -257,7 +265,7 @@ class TestParallelExecution:
                 return "Research from working provider"
 
             providers = [(failing_provider, "failing"), (working_provider, "working")]
-            result = await bot._run_providers_parallel("Test question", providers)
+            result = await bot._run_providers_parallel(_make_q("Test question"), providers)
 
         # Should still have result from working provider
         assert "Research from working provider" in result
@@ -294,7 +302,7 @@ class TestParallelExecution:
 
             # Slow provider listed first, but fast should complete first if parallel
             providers = [(slow_provider, "slow"), (fast_provider, "fast")]
-            await bot._run_providers_parallel("Test question", providers)
+            await bot._run_providers_parallel(_make_q("Test question"), providers)
 
         # Both should start before either completes (parallel execution)
         assert execution_order == ["slow_start", "fast_start"]
@@ -338,7 +346,7 @@ class TestAskNewsSubscriptionErrorHandling:
                 raise ForbiddenError("403011 - subscription is not currently active")
 
             with caplog.at_level(logging.INFO, logger="main"):
-                result = await bot._run_providers_parallel("test question", [(asknews_provider, "asknews")])
+                result = await bot._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
         assert bot._research_provider_timeout_count == 0, (
@@ -374,7 +382,7 @@ class TestAskNewsSubscriptionErrorHandling:
                 raise RuntimeError("connection timeout")
 
             with caplog.at_level(logging.WARNING, logger="main"):
-                result = await bot._run_providers_parallel("test question", [(asknews_provider, "asknews")])
+                result = await bot._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
         assert bot._research_provider_timeout_count == 1

@@ -40,10 +40,12 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Literal
 
 import aiohttp
+import litellm.exceptions
+from forecasting_tools.data_models.questions import MetaculusQuestion
 from rapidfuzz import fuzz
 
 from metaculus_bot.constants import (
@@ -71,9 +73,11 @@ POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 MANIFOLD_SEARCH_URL = "https://api.manifold.markets/v0/search-markets"
 KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
 
-# Bounded retry-with-backoff for transient 403/429/5xx from Polymarket.
-POLYMARKET_MAX_ATTEMPTS = 3
-MANIFOLD_MAX_ATTEMPTS = 3
+# Bounded retry-with-backoff for transient 403/429/5xx. The s4_s5_union strategy
+# already issues 2 queries per platform; one-and-done retries suffice.
+POLYMARKET_MAX_ATTEMPTS = 2
+MANIFOLD_MAX_ATTEMPTS = 2
+HTTP_RETRY_BACKOFF_SECS = 0.5
 
 # Client-side Kalshi fuzzy-match threshold below which we drop candidates.
 KALSHI_MIN_FUZZY_SCORE = 40.0
@@ -82,11 +86,20 @@ KALSHI_MIN_FUZZY_SCORE = 40.0
 # fetch_market_snapshot; this is the per-HTTP-call cap.
 PLATFORM_HTTP_TIMEOUT = 10.0
 
+# Hard cap on a single response body. Polymarket/Manifold don't paginate
+# search responses, so a single payload should fit comfortably under this.
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
 # Kalshi events cache TTL.
 KALSHI_CACHE_TTL_S = 6 * 60 * 60  # 6h
 
 # Max events to prefetch from Kalshi (G0 used 3k; cap matches).
 KALSHI_PREFETCH_EVENT_LIMIT = 3000
+
+# Buffer applied to scheduled_resolution_time when the orchestrator derives a
+# default `as_of`. Subtracting a day keeps backtest as_of strictly before any
+# market that closes alongside the question, defending against same-day leakage.
+AS_OF_DEFAULT_BUFFER = timedelta(days=1)
 
 # Raw-rules truncation for formatter output.
 RAW_RULES_MAX_CHARS = 200
@@ -122,12 +135,13 @@ class MarketSnapshot:
 # Per-session caches (module-scoped; reset via `_reset_session_caches`)
 # ---------------------------------------------------------------------------
 
-# Kalshi events cache: (timestamp_monotonic, events_list)
+# Kalshi events cache: (timestamp_monotonic, events_list).
 _KALSHI_CACHE: dict[str, tuple[float, list[dict]]] = {}
-# Keyword-extraction cache: qid -> list[query_str]
+# Keyword-extraction cache: qid -> list[query_str].
 _KEYWORD_CACHE: dict[int, list[str]] = {}
-# Snapshot cache: qid -> MarketSnapshot
-_SNAPSHOT_CACHE: dict[int, MarketSnapshot] = {}
+# Snapshot cache keyed by (qid, as_of_iso). The as_of leg keeps backtest runs
+# at different as-of instants from sharing a snapshot computed at one as-of.
+_SNAPSHOT_CACHE: dict[tuple[int, str], MarketSnapshot] = {}
 
 
 def _reset_session_caches() -> None:
@@ -139,7 +153,9 @@ def _reset_session_caches() -> None:
 
 def _get_session() -> aiohttp.ClientSession:
     """Construct a fresh aiohttp session. Patched in tests."""
-    return aiohttp.ClientSession()
+    timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
+    connector = aiohttp.TCPConnector(limit=20)
+    return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 
 # ---------------------------------------------------------------------------
@@ -242,16 +258,19 @@ class KeywordExtractor:
 
     async def _run_llm(self, prompt_template: str, title: str, rc: str) -> str:
         prompt = prompt_template.format(title=title[:400], rc=rc[:400])
+        # Constructor errors are config bugs (bad model slug, missing API key wiring,
+        # etc.) and should crash loudly. Only the .invoke call is expected to face
+        # transient LLM errors -- those soft-fall to "" so the snapshot still runs.
+        llm = build_llm_with_openrouter_fallback(
+            model=KEYWORD_EXTRACT_MODEL,
+            temperature=0.0,
+            max_tokens=KEYWORD_EXTRACT_MAX_TOKENS,
+            reasoning_effort="low",
+            timeout=60,
+        )
         try:
-            llm = build_llm_with_openrouter_fallback(
-                model=KEYWORD_EXTRACT_MODEL,
-                temperature=0.0,
-                max_tokens=KEYWORD_EXTRACT_MAX_TOKENS,
-                reasoning_effort="low",
-                timeout=60,
-            )
             content = await llm.invoke(prompt)
-        except Exception:
+        except (litellm.exceptions.APIError, asyncio.TimeoutError, RuntimeError):
             logger.warning("Keyword extraction LLM call failed", exc_info=True)
             return ""  # noqa: ASYNC910
         return _clean_llm_query(content)
@@ -271,16 +290,96 @@ class KeywordExtractor:
 
 
 # ---------------------------------------------------------------------------
+# HTTP helper (shared by Polymarket and Manifold)
+# ---------------------------------------------------------------------------
+
+
+async def _http_get_with_backoff(
+    session: Any,
+    url: str,
+    params: dict[str, str],
+    *,
+    max_attempts: int,
+    retryable_statuses: Iterable[int] | None = None,
+    label: str,
+) -> Any | None:
+    """GET `url` with `max_attempts` and a single bounded backoff between retries.
+
+    Returns the parsed JSON body on 200, or None on retry exhaustion / non-200.
+    Caps the response body at MAX_RESPONSE_BYTES so a runaway upstream can't
+    blow up memory. Caps cumulative sleep so we don't exceed PLATFORM_HTTP_TIMEOUT;
+    the s4_s5_union strategy already runs 2 queries per platform, so one-and-done
+    retries suffice.
+
+    `retryable_statuses` defaults to (403, 429, 500, 502, 503, 504). Statuses
+    >= 500 are also treated as retryable.
+    """
+    retryable: set[int] = set(retryable_statuses or (403, 429, 500, 502, 503, 504))
+    cumulative_sleep = 0.0
+    timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
+
+    for attempt in range(max_attempts):
+        try:
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                status = resp.status
+                if status in retryable or status >= 500:
+                    if attempt + 1 >= max_attempts:
+                        logger.warning(f"{label} HTTP {status} after {attempt + 1} attempts; giving up")
+                        return None
+                    # Budget-cap sleep against the per-platform timeout floor.
+                    sleep_for = HTTP_RETRY_BACKOFF_SECS
+                    if cumulative_sleep + sleep_for + PLATFORM_HTTP_TIMEOUT > PLATFORM_HTTP_TIMEOUT * max_attempts:
+                        logger.warning(f"{label} HTTP {status}: sleep budget exhausted; giving up")
+                        return None
+                    logger.warning(f"{label} HTTP {status}; retry {attempt + 2}/{max_attempts} after {sleep_for:.2f}s")
+                    await asyncio.sleep(sleep_for)
+                    cumulative_sleep += sleep_for
+                    continue
+                if status != 200:
+                    text = (await resp.text())[:200]
+                    logger.warning(f"{label} HTTP {status} non-retryable: {text}")
+                    return None
+                # Try size-capped raw read first (real aiohttp); fall back to
+                # resp.json() when the response object is a test stub without
+                # a .content attribute. Both code paths return parsed JSON.
+                content_attr = getattr(resp, "content", None)
+                if content_attr is not None and hasattr(content_attr, "read"):
+                    raw = await content_attr.read(MAX_RESPONSE_BYTES)
+                    try:
+                        return json.loads(raw)
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+                        logger.warning(f"{label} JSON decode failed: {e}")
+                        return None
+                try:
+                    return await resp.json()
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"{label} JSON decode failed: {e}")
+                    return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt + 1 >= max_attempts:
+                logger.warning(f"{label} transient error after {attempt + 1} attempts: {e}")
+                return None
+            sleep_for = HTTP_RETRY_BACKOFF_SECS
+            logger.warning(f"{label} transient error: {e}; retry {attempt + 2}/{max_attempts} after {sleep_for:.2f}s")
+            await asyncio.sleep(sleep_for)
+            cumulative_sleep += sleep_for
+    return None  # noqa: ASYNC910
+
+
+# ---------------------------------------------------------------------------
 # Polymarket
 # ---------------------------------------------------------------------------
 
 
-def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
+def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch]:
     """Parse Gamma public-search response into MarketMatch objects.
 
     Gamma returns {events: [...], markets: [...]}. Each event may have nested
     markets with `outcomePrices` (JSON-encoded string or list). Take the first
     outcome's price as implied P(Yes).
+
+    `query` is used to compute a fuzzy match-confidence score per row, so
+    downstream filtering by confidence works uniformly across platforms.
     """
     if not isinstance(payload, dict):
         logger.warning("Polymarket returned non-dict payload")
@@ -306,6 +405,8 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
                 return None
         return None
 
+    q_lower = (query or "").lower()
+
     events = payload.get("events") or []
     for ev in events[:10]:
         title = ev.get("title") or ev.get("question") or ""
@@ -329,6 +430,8 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
             vol_24h = _safe_float(m0.get("volume24hr"))
         spread = (ask - bid) if (bid is not None and ask is not None) else None
 
+        confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
+
         out.append(
             MarketMatch(
                 platform="polymarket",
@@ -341,7 +444,7 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
                 volume_24h=vol_24h if vol_24h is not None else volume,
                 close_time=close_time,
                 is_resolved=bool(ev.get("closed")) or bool(ev.get("resolved")),
-                match_confidence=0.0,  # filled in later by the orchestrator
+                match_confidence=confidence,
                 raw_rules=description[:2000],
             )
         )
@@ -354,6 +457,7 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
             slug = m.get("slug") or ""
             url = f"https://polymarket.com/market/{slug}" if slug else ""
             implied = _prob_from_prices(m.get("outcomePrices"))
+            confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
             out.append(
                 MarketMatch(
                     platform="polymarket",
@@ -366,7 +470,7 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
                     volume_24h=_safe_float(m.get("volume24hr")),
                     close_time=_parse_iso(m.get("endDate") or ""),
                     is_resolved=bool(m.get("closed")),
-                    match_confidence=0.0,
+                    match_confidence=confidence,
                     raw_rules=(m.get("description") or "")[:2000],
                 )
             )
@@ -375,30 +479,16 @@ def _parse_polymarket_matches(payload: Any) -> list[MarketMatch]:
 
 
 async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
-    params = {"q": query, "limit_per_type": "10"}
-    for attempt in range(POLYMARKET_MAX_ATTEMPTS):
-        try:
-            async with session.get(
-                POLYMARKET_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT)
-            ) as resp:
-                if resp.status in (403, 429) or resp.status >= 500:
-                    backoff = 1.0 * (2**attempt)
-                    logger.warning(
-                        f"Polymarket HTTP {resp.status} for q={query[:40]!r}; "
-                        f"retry {attempt + 1}/{POLYMARKET_MAX_ATTEMPTS} after {backoff:.1f}s"
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                if resp.status != 200:
-                    text = (await resp.text())[:200]
-                    logger.warning(f"Polymarket HTTP {resp.status} non-retryable: {text}")
-                    return []
-                payload = await resp.json()
-                return _parse_polymarket_matches(payload)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Polymarket transient error q={query[:40]!r}: {e}; retry {attempt + 1}")
-            await asyncio.sleep(1.0 * (2**attempt))
-    return []  # noqa: ASYNC910
+    payload = await _http_get_with_backoff(
+        session,
+        POLYMARKET_SEARCH_URL,
+        {"q": query, "limit_per_type": "10"},
+        max_attempts=POLYMARKET_MAX_ATTEMPTS,
+        label=f"Polymarket q={query[:40]!r}",
+    )
+    if payload is None:
+        return []
+    return _parse_polymarket_matches(payload, query=query)
 
 
 # ---------------------------------------------------------------------------
@@ -406,11 +496,12 @@ async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_manifold_matches(payload: Any) -> list[MarketMatch]:
+def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
     if not isinstance(payload, list):
         logger.warning("Manifold returned non-list payload")
         return []
 
+    q_lower = (query or "").lower()
     out: list[MarketMatch] = []
     for m in payload[:10]:
         if not isinstance(m, dict):
@@ -428,6 +519,8 @@ def _parse_manifold_matches(payload: Any) -> list[MarketMatch]:
             except (OverflowError, OSError, ValueError):
                 close_time = None
 
+        confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
+
         out.append(
             MarketMatch(
                 platform="manifold",
@@ -440,7 +533,7 @@ def _parse_manifold_matches(payload: Any) -> list[MarketMatch]:
                 volume_24h=_safe_float(m.get("volume24Hours")),
                 close_time=close_time,
                 is_resolved=bool(m.get("isResolved")),
-                match_confidence=0.0,
+                match_confidence=confidence,
                 raw_rules=(m.get("textDescription") or "")[:2000],
             )
         )
@@ -448,26 +541,17 @@ def _parse_manifold_matches(payload: Any) -> list[MarketMatch]:
 
 
 async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
-    params = {"term": query, "contractType": "BINARY", "limit": "10"}
-    for attempt in range(MANIFOLD_MAX_ATTEMPTS):
-        try:
-            async with session.get(
-                MANIFOLD_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT)
-            ) as resp:
-                if resp.status == 429 or resp.status >= 500:
-                    backoff = 1.0 * (2**attempt)
-                    await asyncio.sleep(backoff)
-                    continue
-                if resp.status != 200:
-                    text = (await resp.text())[:200]
-                    logger.warning(f"Manifold HTTP {resp.status} non-retryable: {text}")
-                    return []
-                payload = await resp.json()
-                return _parse_manifold_matches(payload)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Manifold transient error q={query[:40]!r}: {e}; retry {attempt + 1}")
-            await asyncio.sleep(1.0 * (2**attempt))
-    return []  # noqa: ASYNC910
+    payload = await _http_get_with_backoff(
+        session,
+        MANIFOLD_SEARCH_URL,
+        {"term": query, "contractType": "BINARY", "limit": "10"},
+        max_attempts=MANIFOLD_MAX_ATTEMPTS,
+        retryable_statuses=(429, 500, 502, 503, 504),
+        label=f"Manifold q={query[:40]!r}",
+    )
+    if payload is None:
+        return []
+    return _parse_manifold_matches(payload, query=query)
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +566,9 @@ async def _kalshi_prefetch_events(
 
     Uses the `/events?with_nested_markets=true` endpoint NOT `/markets` --
     per G0, `/markets` is dominated by sports-parlay 'MVE' rows.
+
+    Cache is updated INCREMENTALLY after each successful page so a cancelled
+    prefetch still warms whatever pages completed.
     """
     cached = _KALSHI_CACHE.get("events")
     if cached is not None:
@@ -520,6 +607,9 @@ async def _kalshi_prefetch_events(
         if not isinstance(batch, list):
             break
         all_events.extend([ev for ev in batch if isinstance(ev, dict)])
+        # Incremental cache write: a cancelled prefetch warms whatever pages
+        # made it through so the next call picks up where we left off.
+        _KALSHI_CACHE["events"] = (time.monotonic(), list(all_events))
         cursor = data.get("cursor") or None
         if not cursor or not batch:
             break
@@ -603,6 +693,14 @@ def _kalshi_search_local(
 # ---------------------------------------------------------------------------
 
 
+def _as_of_cache_key(as_of: datetime | None) -> str:
+    if as_of is None:
+        return "none"
+    return (
+        as_of.astimezone(timezone.utc).isoformat() if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc).isoformat()
+    )
+
+
 async def fetch_market_snapshot(
     question: Any,
     *,
@@ -620,35 +718,49 @@ async def fetch_market_snapshot(
     less than or equal to as_of. Required in backtest; optional in prod.
     """
     qid = getattr(question, "id_of_question", None)
-    cached_snap = _SNAPSHOT_CACHE.get(qid) if qid is not None else None
-    if cached_snap is not None:
-        return cached_snap  # noqa: ASYNC910
+    cache_key = (qid, _as_of_cache_key(as_of)) if qid is not None else None
+    if cache_key is not None:
+        cached_snap = _SNAPSHOT_CACHE.get(cache_key)
+        if cached_snap is not None:
+            return cached_snap  # noqa: ASYNC910
 
+    # Session lifecycle: create the aiohttp session at the orchestrator level so
+    # cleanup happens OUTSIDE the wait_for cancellation boundary. wait_for kills
+    # inner work cleanly, then the surrounding context manager runs session.close().
+    session_cm = _get_session()
     try:
-        snapshot = await asyncio.wait_for(
-            _fetch_market_snapshot_impl(
-                question,
-                platforms=platforms,
-                max_matches_per_platform=max_matches_per_platform,
-                as_of=as_of,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
-        return MarketSnapshot(matches=[])  # noqa: ASYNC910
+        async with session_cm as session:
+            try:
+                snapshot = await asyncio.wait_for(
+                    _fetch_market_snapshot_impl(
+                        question,
+                        session=session,
+                        platforms=platforms,
+                        max_matches_per_platform=max_matches_per_platform,
+                        as_of=as_of,
+                    ),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
+                return MarketSnapshot(matches=[])  # noqa: ASYNC910
     except Exception:
+        # Outer safety net; should not normally fire -- investigate if seen.
+        # Re-raise after logging would defeat the soft-fail contract that the
+        # rest of the bot depends on, so we swallow + log here. Inner narrow
+        # handlers in platform helpers cover the common paths.
         logger.warning("Prediction-market snapshot FAILED (soft-fail returning empty)", exc_info=True)
         return MarketSnapshot(matches=[])  # noqa: ASYNC910
 
-    if qid is not None:
-        _SNAPSHOT_CACHE[qid] = snapshot
+    if cache_key is not None:
+        _SNAPSHOT_CACHE[cache_key] = snapshot
     return snapshot
 
 
 async def _fetch_market_snapshot_impl(
     question: Any,
     *,
+    session: aiohttp.ClientSession,
     platforms: tuple[str, ...],
     max_matches_per_platform: int,
     as_of: datetime | None,
@@ -664,47 +776,47 @@ async def _fetch_market_snapshot_impl(
         logger.info("Keyword extraction produced no queries; returning empty snapshot")
         return MarketSnapshot(matches=[])
 
-    session_cm = _get_session()
-    async with session_cm as session:
-        all_matches: list[MarketMatch] = []
+    all_matches: list[MarketMatch] = []
 
-        async def _poly_for_all_queries() -> list[MarketMatch]:
-            tasks = [_polymarket_search(session, q) for q in queries]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return _flatten_results(results, "polymarket")
+    async def _poly_for_all_queries() -> list[MarketMatch]:
+        tasks = [_polymarket_search(session, q) for q in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return _flatten_results(results, "polymarket")
 
-        async def _manifold_for_all_queries() -> list[MarketMatch]:
-            mf_queries = extractor.queries_for_platform(question, queries, "manifold")
-            tasks = [_manifold_search(session, q) for q in mf_queries]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return _flatten_results(results, "manifold")
+    async def _manifold_for_all_queries() -> list[MarketMatch]:
+        mf_queries = extractor.queries_for_platform(question, queries, "manifold")
+        tasks = [_manifold_search(session, q) for q in mf_queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return _flatten_results(results, "manifold")
 
-        async def _kalshi_for_all_queries() -> list[MarketMatch]:
-            try:
-                events = await _kalshi_prefetch_events(session, event_limit=KALSHI_PREFETCH_EVENT_LIMIT)
-            except Exception:
-                logger.warning("Kalshi prefetch failed", exc_info=True)
-                return []  # noqa: ASYNC910
-            merged: list[MarketMatch] = []
-            for q in queries:
-                merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
-            return merged
+    async def _kalshi_for_all_queries() -> list[MarketMatch]:
+        # Inner narrow handlers in _kalshi_prefetch_events are exhaustive
+        # (ClientError, TimeoutError, ValueError, TypeError). No outer catch
+        # here -- anything escaping is a programming bug we want loud.
+        events = await _kalshi_prefetch_events(session, event_limit=KALSHI_PREFETCH_EVENT_LIMIT)
+        merged: list[MarketMatch] = []
+        for q in queries:
+            merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
+        return merged
 
-        platform_tasks: list[tuple[str, asyncio.Task]] = []
-        if "polymarket" in platforms:
-            platform_tasks.append(("polymarket", asyncio.create_task(_poly_for_all_queries())))
-        if "manifold" in platforms:
-            platform_tasks.append(("manifold", asyncio.create_task(_manifold_for_all_queries())))
-        if "kalshi" in platforms:
-            platform_tasks.append(("kalshi", asyncio.create_task(_kalshi_for_all_queries())))
+    platform_tasks: list[tuple[str, asyncio.Task]] = []
+    if "polymarket" in platforms:
+        platform_tasks.append(("polymarket", asyncio.create_task(_poly_for_all_queries())))
+    if "manifold" in platforms:
+        platform_tasks.append(("manifold", asyncio.create_task(_manifold_for_all_queries())))
+    if "kalshi" in platforms:
+        platform_tasks.append(("kalshi", asyncio.create_task(_kalshi_for_all_queries())))
 
-        for platform, task in platform_tasks:
-            try:
-                matches = await task
-            except Exception:
-                logger.warning(f"Platform {platform} failed (soft-fail)", exc_info=True)
-                matches = []
-            all_matches.extend(matches)
+    for platform, task in platform_tasks:
+        try:
+            matches = await task
+        except (aiohttp.ClientError, OSError, RuntimeError) as e:
+            # Inner platform helpers each call asyncio.gather(..., return_exceptions=True)
+            # so coroutines don't propagate. This narrow catch covers residual
+            # transport/runtime errors only. AttributeError/TypeError remain bugs.
+            logger.warning(f"Platform {platform} failed (soft-fail): {type(e).__name__}: {e}")
+            matches = []
+        all_matches.extend(matches)
 
     # Dedup within-platform by market_url (or title fallback), cap per platform.
     by_platform: dict[str, list[MarketMatch]] = {"polymarket": [], "kalshi": [], "manifold": []}
@@ -791,32 +903,24 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
 def prediction_market_provider() -> ResearchCallable:
     """Factory returning an async research callable for prediction-market data.
 
-    The returned callable takes a question_text (per the ResearchCallable
-    contract) but internally constructs a minimal question shim so the
-    orchestrator can use its full API. In practice, when called from
-    `_run_providers_parallel`, the caller should pass the actual question
-    text -- the orchestrator will extract keywords from that text alone.
+    The returned callable accepts a `MetaculusQuestion` and uses its full API:
+    `id_of_question` for caching, `question_text` / `resolution_criteria` for
+    keyword extraction, `scheduled_resolution_time` for backtest leakage defense.
 
     Gated on PREDICTION_MARKETS_ENABLED env flag; disabled returns "".
     """
 
-    async def _fetch(question_text: str) -> str:
+    async def _fetch(question: MetaculusQuestion) -> str:
         if not env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             return ""  # noqa: ASYNC910
 
-        # Build a minimal question shim from the question_text the orchestrator
-        # passes us. Full question object would let us use title +
-        # resolution_criteria separately, but at the provider layer we only
-        # have question_text.
-        class _QuestionShim:
-            def __init__(self, text: str) -> None:
-                self.id_of_question: int | None = None
-                self.question_text = text
-                self.title = text
-                self.resolution_criteria = ""
+        scheduled = getattr(question, "scheduled_resolution_time", None)
+        if isinstance(scheduled, datetime):
+            as_of = scheduled - AS_OF_DEFAULT_BUFFER
+        else:
+            as_of = datetime.now(timezone.utc)
 
-        shim = _QuestionShim(question_text)
-        snapshot = await fetch_market_snapshot(shim)
+        snapshot = await fetch_market_snapshot(question, as_of=as_of)
         return format_snapshot_for_research(snapshot)
 
     return _fetch

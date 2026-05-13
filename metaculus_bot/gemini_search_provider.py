@@ -15,6 +15,7 @@ import logging
 import os
 from typing import Any
 
+from forecasting_tools.data_models.questions import MetaculusQuestion
 from google import genai
 from google.genai import types as genai_types
 
@@ -190,12 +191,12 @@ def gemini_search_provider(
 ) -> ResearchCallable:
     """Research provider using Gemini with Google Search grounding.
 
-    Mirrors the `_native_search_provider` contract (`question_text -> str`).
+    Mirrors the `_native_search_provider` contract (`MetaculusQuestion -> str`).
     """
 
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         prompt = web_research_prompt(
-            question_text,
+            question.question_text,
             is_benchmarking=is_benchmarking,
             citation_style="auto_annotated",
             allow_resolution_source_reading=True,

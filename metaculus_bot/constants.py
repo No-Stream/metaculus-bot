@@ -289,8 +289,8 @@ LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
 # ``as_of`` filter in ``fetch_market_snapshot``, pulling a market for a
 # resolved Metaculus question leaks post-resolution pricing into the
 # rationale. Default OFF until smoke + medium backtest validates match
-# quality and leakage defense; ON in all 4 production workflows per
-# scratch_docs_and_planning/atlas_inspired_improvements.md §G.
+# quality and leakage defense. Flip ON in production workflows after that
+# gate. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 
 # Keyword-extraction strategy for matching Metaculus questions to market

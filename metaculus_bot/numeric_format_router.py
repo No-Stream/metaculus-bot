@@ -183,9 +183,10 @@ def route_numeric_output(
             )
         try:
             cdf = percentiles_to_metaculus_cdf_via_mixture(mixture, question)
-        except Exception as exc:
+        except (ValueError, RuntimeError) as exc:
             # Soft-fall to percentiles when the mixture builder blows up. We
             # log loudly because this is a real failure mode worth auditing.
+            # AttributeError/TypeError would be programming bugs and should crash.
             logger.warning(
                 "numeric_format_router: mixture CDF build failed (%s); falling back to percentiles",
                 exc,

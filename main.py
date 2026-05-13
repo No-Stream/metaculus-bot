@@ -60,6 +60,7 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    PREDICTION_MARKETS_ENABLED_ENV,
     STACKER_FALLBACK_SOFT_DEADLINE,
     STACKER_SOFT_DEADLINE,
     env_flag_enabled,
@@ -484,7 +485,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
-            research = await self._run_providers_parallel(question.question_text, providers)
+            research = await self._run_providers_parallel(question, providers)
 
             # Optional second-pass gap-fill; see run_gap_fill_pass docstring for the soft-fail contract.
             if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
@@ -561,11 +562,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return self._custom_research_provider, "custom"
 
         default_llm = self.get_llm("default", "llm")
+
+        async def _exa_callback(question: MetaculusQuestion) -> str:
+            return await self._call_exa_smart_searcher(question)
+
+        async def _perplexity_callback(question: MetaculusQuestion) -> str:
+            return await self._call_perplexity(question)
+
+        async def _openrouter_callback(question: MetaculusQuestion) -> str:
+            return await self._call_perplexity(question, use_open_router=True)
+
         provider, provider_name = choose_provider_with_name(
             default_llm,
-            exa_callback=self._call_exa_smart_searcher,
-            perplexity_callback=self._call_perplexity,
-            openrouter_callback=lambda q: self._call_perplexity(q, use_open_router=True),
+            exa_callback=_exa_callback,
+            perplexity_callback=_perplexity_callback,
+            openrouter_callback=_openrouter_callback,
             is_benchmarking=self.is_benchmarking,
         )
         return provider, provider_name
@@ -612,14 +623,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # scratch_docs_and_planning/atlas_inspired_improvements.md §G for
         # smoke + medium backtest gate before flipping ON in prod workflows.
         # Function-scoped import so the rapidfuzz dep only loads when active.
-        if env_flag_enabled("PREDICTION_MARKETS_ENABLED"):
+        if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
 
             providers.append((prediction_market_provider(), "prediction_market"))
 
         if not providers:
 
-            async def _empty(_: str) -> str:
+            async def _empty(_: MetaculusQuestion) -> str:
                 return ""
 
             providers.append((_empty, "none"))
@@ -628,7 +639,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     async def _run_providers_parallel(
         self,
-        question_text: str,
+        question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
     ) -> str:
         """Run multiple research providers in parallel and combine results."""
@@ -637,8 +648,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:
                 if name == "asknews" and self.allow_research_fallback:
-                    return (await self._fetch_research_with_fallback(question_text, provider, name), name)
-                return (await provider(question_text), name)
+                    return (await self._fetch_research_with_fallback(question, provider, name), name)
+                return (await provider(question), name)
             except Exception as e:
                 # Off-season AskNews 403s are expected and shouldn't page us.
                 # Every other provider failure (timeouts, network, rate limits,
@@ -684,16 +695,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     async def _fetch_research_with_fallback(
         self,
-        question_text: str,
+        question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
     ) -> str:
         try:
-            return await provider(question_text)
+            return await provider(question)
         except Exception as exc:
             if self.allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
-                fallback = await self._attempt_research_fallback(question_text)
+                fallback = await self._attempt_research_fallback(question.question_text)
                 if fallback is not None:
                     return fallback
             raise
@@ -1402,7 +1413,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
 
-    async def _call_perplexity(self, question: str, use_open_router: bool = True) -> str:
+    async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
+        # Accept either a MetaculusQuestion (new ResearchCallable contract) or a
+        # plain question_text string (for the fallback path that's already
+        # extracted .question_text upstream).
+        question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
+
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             ""
@@ -1419,7 +1435,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             You DO NOT produce forecasts yourself; you must provide ALL relevant data to the superforecaster so they can make an expert judgment.
 
             Question:
-            {question}
+            {question_text}
             """
         )  # NOTE: The metac bot in Q1 put everything but the question in the system prompt.
         if use_open_router:
@@ -1436,10 +1452,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         response = await model.invoke(prompt)
         return response
 
-    async def _call_exa_smart_searcher(self, question: str) -> str:
+    async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
         """
         SmartSearcher is a custom class that is a wrapper around an search on Exa.ai
         """
+        question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
         searcher = SmartSearcher(
             model=self.get_llm("default", "llm"),
             temperature=0,
@@ -1451,7 +1468,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             "you a question they intend to forecast on. To be a great assistant, you generate"
             "a concise but detailed rundown of the most relevant news, including if the question"
             "would resolve Yes or No based on current information. You do not produce forecasts yourself."
-            f"\n\nThe question is: {question}"
+            f"\n\nThe question is: {question_text}"
         )  # You can ask the searcher to filter by date, exclude/include a domain, and run specific searches for finding sources vs finding highlights within a source
         response = await searcher.invoke(prompt)
         return response

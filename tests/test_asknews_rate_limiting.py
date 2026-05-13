@@ -1,11 +1,19 @@
 """Test that AskNews integration properly handles rate limiting."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from metaculus_bot.research_providers import _asknews_provider
+
+
+def _make_q(text: str) -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
+    contract."""
+    q = MagicMock()
+    q.question_text = text
+    return q
 
 
 @pytest.mark.asyncio
@@ -34,7 +42,7 @@ async def test_asknews_rate_limiting_delay():
             mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
             provider = _asknews_provider()
-            await provider("test question")
+            await provider(_make_q("test question"))
 
             # Verify two calls were made
             assert len(call_times) == 2
@@ -69,7 +77,7 @@ async def test_asknews_calls_both_endpoints():
             mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
             provider = _asknews_provider()
-            result = await provider("test question")
+            result = await provider(_make_q("test question"))
 
             # Verify both strategies were called
             assert "latest news" in search_calls

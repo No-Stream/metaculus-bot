@@ -9,6 +9,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
+def _make_q(text: str) -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
+    contract. Tests only care about question_text on this path."""
+    q = MagicMock()
+    q.question_text = text
+    return q
+
+
 # ---------------------------------------------------------------------------
 # Canned response helpers (for grounding metadata tests)
 # ---------------------------------------------------------------------------
@@ -85,7 +94,7 @@ async def test_provider_uses_default_model(monkeypatch: pytest.MonkeyPatch) -> N
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider()
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     assert fake_client.aio.models.generate_content.await_count == 1
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
@@ -107,7 +116,7 @@ async def test_provider_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> No
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider()
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     assert call_kwargs["model"] == "gemini-2.5-flash"
@@ -126,7 +135,7 @@ async def test_provider_uses_explicit_slug(monkeypatch: pytest.MonkeyPatch) -> N
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider(model_slug="gemini-explicit-override")
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     assert call_kwargs["model"] == "gemini-explicit-override"
@@ -146,7 +155,7 @@ async def test_provider_attaches_google_search_and_url_context_tools(
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider()
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     config = call_kwargs["config"]
@@ -177,7 +186,7 @@ async def test_benchmarking_carve_out(monkeypatch: pytest.MonkeyPatch) -> None:
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider(is_benchmarking=True)
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     prompt = call_kwargs["contents"]
@@ -197,7 +206,7 @@ async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.
         from metaculus_bot.gemini_search_provider import gemini_search_provider
 
         provider = gemini_search_provider(is_benchmarking=False)
-        await provider("Will X happen?")
+        await provider(_make_q("Will X happen?"))
 
     call_kwargs = fake_client.aio.models.generate_content.await_args.kwargs
     prompt = call_kwargs["contents"]

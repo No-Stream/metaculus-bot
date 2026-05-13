@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import yfinance
 from forecasting_tools import GeneralLlm
+from forecasting_tools.data_models.questions import MetaculusQuestion
 from fredapi import Fred
 
 from metaculus_bot.constants import (
@@ -292,8 +293,8 @@ def financial_data_provider() -> ResearchCallable:
         timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
     )
 
-    async def _fetch(question_text: str) -> str:
-        classification = await _classify_financial_question(question_text, classifier_llm)
+    async def _fetch(question: MetaculusQuestion) -> str:
+        classification = await _classify_financial_question(question.question_text, classifier_llm)
         if classification is None:
             return ""
 
