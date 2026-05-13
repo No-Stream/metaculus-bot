@@ -396,9 +396,31 @@ class TestRunToolsNumeric:
             rationale=rationale,
             forecaster_id="m",
         )
-        assert "Mixture-of-normals" in result
-        # Each component should appear.
-        assert "20" in result and "50" in result and "80" in result
+        # Section header.
+        assert "### Mixture-of-normals" in result
+
+        # Each component's full triple (weight, mean, sd) must appear in the
+        # rendered table — not just the mean. Per _render_mixture_section
+        # tool_runner.py:322-323:
+        #   "- Component {i+1}: weight {weight:.3f}, mean {mean:.3g}, sd {sd:.3g}"
+        assert "Component 1: weight 0.200, mean 20, sd 5" in result
+        assert "Component 2: weight 0.550, mean 50, sd 8" in result
+        assert "Component 3: weight 0.250, mean 80, sd 6" in result
+
+        # CDF sample table header + exactly 5 sample rows over [0, 100].
+        # Sample rows are indented two spaces ("  - "); the header line is "- ".
+        assert "CDF sample (value → F):" in result
+        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
+        assert len(cdf_sample_lines) == 5, f"expected 5 CDF sample rows, got {len(cdf_sample_lines)}"
+
+        # Bounded size: a well-formed mixture section is a small markdown
+        # block. A pathological serializer dumping a 201-pt CDF would balloon
+        # this past a few hundred chars — guard the upper bound.
+        mixture_section = result.split("### Mixture-of-normals", 1)[1]
+        assert len(mixture_section) < 1000, (
+            f"mixture section is unexpectedly large ({len(mixture_section)} chars); "
+            "rendering may be dumping more than the 5-row sample table"
+        )
 
     def test_numeric_without_mixture_components_unchanged(self):
         # Regression: existing numeric path (percentiles only) still works and does
@@ -429,8 +451,16 @@ class TestRunToolsNumeric:
             rationale=rationale,
             forecaster_id="m",
         )
+        # Both sections must surface — no consistency check between them.
         assert "Percentile-family consistency" in result
-        assert "Mixture-of-normals" in result
+        assert "### Mixture-of-normals" in result
+        # Each component's full triple appears verbatim.
+        assert "Component 1: weight 0.300, mean 25, sd 7" in result
+        assert "Component 2: weight 0.400, mean 50, sd 10" in result
+        assert "Component 3: weight 0.300, mean 75, sd 8" in result
+        # CDF sample table has exactly 5 rows.
+        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
+        assert len(cdf_sample_lines) == 5
 
 
 # ---------------------------------------------------------------------------

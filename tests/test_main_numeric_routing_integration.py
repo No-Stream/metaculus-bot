@@ -218,6 +218,62 @@ async def test_both_path_uses_mixture_and_warns(caplog: pytest.LogCaptureFixture
 
 
 @pytest.mark.asyncio
+async def test_percentile_path_default_k_tail_is_identity_no_op() -> None:
+    """Gap 4: with the new default k_tail=1.0, the percentile pipeline produces
+    a NumericDistribution whose declared percentile values match the input
+    declarations (modulo deterministic sanitize jitter / clamp). The previous
+    k_tail=1.25 default actively widened the tails — this regression catches
+    silent reactivation of the old default."""
+    bot = _make_bot()
+    question = _make_numeric_question()
+    rationale = _percentiles_only_rationale()
+
+    with patch("main.structure_output", new=_structure_output_mock(_percentile_objs())):
+        with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
+            pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
+
+    declared = pred.prediction_value.declared_percentiles
+    declared_by_pct: dict[float, float] = {round(float(p.percentile), 4): float(p.value) for p in declared}
+
+    # Outer-tail anchors are the ones that would move under k_tail>1; they must
+    # match the input declarations to within float precision (jitter is only
+    # applied to duplicate values, which our test inputs don't have).
+    for input_pct, input_val in _DECLARED_PERCENTILES:
+        observed = declared_by_pct.get(round(input_pct, 4))
+        assert observed is not None, f"missing declared pct {input_pct}"
+        assert abs(observed - input_val) < 1e-6, (
+            f"k_tail=1.0 default failed: pct {input_pct} declared {input_val}, got {observed}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_percentile_path_with_old_k_tail_visibly_widens_tails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gap 4: monkeypatch the active k_tail to the old 1.25 default and verify
+    the tails *do* move. Together with the test above, this proves the new
+    k_tail=1.0 default is a true no-op (not silently broken)."""
+    monkeypatch.setattr("metaculus_bot.numeric_pipeline.TAIL_WIDEN_K_TAIL", 1.25)
+
+    bot = _make_bot()
+    question = _make_numeric_question()
+    rationale = _percentiles_only_rationale()
+
+    with patch("main.structure_output", new=_structure_output_mock(_percentile_objs())):
+        with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
+            pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
+
+    declared = pred.prediction_value.declared_percentiles
+    declared_by_pct: dict[float, float] = {round(float(p.percentile), 4): float(p.value) for p in declared}
+
+    # k_tail=1.25 widens distance-from-median outside the central 60%. The
+    # 2.5% / 97.5% anchors must move at least a touch (>0.1 unit on the [0, 100]
+    # range — comfortably above any sanitize-pass jitter).
+    p025 = declared_by_pct[0.025]
+    p975 = declared_by_pct[0.975]
+    assert abs(p025 - 5.0) > 0.1, f"k_tail=1.25 should widen p025 but got {p025} vs declared 5.0"
+    assert abs(p975 - 95.0) > 0.1, f"k_tail=1.25 should widen p975 but got {p975} vs declared 95.0"
+
+
+@pytest.mark.asyncio
 async def test_mixture_path_produces_different_cdf_than_percentile_path() -> None:
     """Sanity: mixture branch is not silently falling back to percentiles.
 

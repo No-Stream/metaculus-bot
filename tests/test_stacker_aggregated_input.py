@@ -343,6 +343,200 @@ class TestRunStackingNumericThreading:
         assert "Cross-model aggregation (deterministic math)" in captured_prompts[0]
 
 
+# ---------------------------------------------------------------------------
+# End-to-end runtime threading: stacker LLM receives the full aggregation block
+# verbatim (Gap 5). Earlier tests above check that the kwarg threads through to
+# the prompt builder; these assert that *all* aggregation lines actually reach
+# the captured prompt, in order, with no rewriting / truncation.
+# ---------------------------------------------------------------------------
+
+
+_RICH_AGG_BLOCK = (
+    "- **Pools over 4 forecasters**: linear 0.412, log 0.379, Satopää α=2.5 0.451\n"
+    "- **Blended base rate across 3 forecasters**: 0.302 (range 0.250–0.410)\n"
+    "- **Prior/posterior snapshot**: 4 forecasters declared priors, "
+    "priors range 0.180–0.330, posteriors range 0.250–0.460"
+)
+
+
+class TestRunStackingBinaryFullPromptCapture:
+    def test_all_aggregation_lines_present_and_ordered_in_prompt(self, monkeypatch):
+        captured_prompts: list[str] = []
+
+        class FakeStackerLLM:
+            model = "stacker"
+
+            async def invoke(self, prompt: str) -> str:
+                await asyncio.sleep(0)
+                captured_prompts.append(prompt)
+                return "Probability: 41%"
+
+        class FakeParserLLM:
+            model = "parser"
+
+        async def fake_structure_output(*_args, **_kwargs):
+            from forecasting_tools import BinaryPrediction
+
+            await asyncio.sleep(0)
+            return BinaryPrediction(prediction_in_decimal=0.41)
+
+        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+
+        asyncio.run(
+            stacking.run_stacking_binary(
+                stacker_llm=FakeStackerLLM(),  # type: ignore[arg-type]
+                parser_llm=FakeParserLLM(),  # type: ignore[arg-type]
+                question=_make_binary_q(),
+                research="news context",
+                base_texts=["base reasoning 1", "base reasoning 2", "base reasoning 3"],
+                aggregated_tool_output=_RICH_AGG_BLOCK,
+            )
+        )
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+
+        # The header must appear, and every aggregation bullet must be present
+        # verbatim (no truncation, no escaping).
+        assert "Cross-model aggregation (deterministic math)" in prompt
+        assert "Pools over 4 forecasters" in prompt
+        assert "linear 0.412, log 0.379, Satopää α=2.5 0.451" in prompt
+        assert "Blended base rate across 3 forecasters" in prompt
+        assert "range 0.250–0.410" in prompt
+        assert "Prior/posterior snapshot" in prompt
+
+        # Aggregation block precedes both expert analyses AND research context.
+        agg_idx = prompt.find("Cross-model aggregation")
+        analyses_idx = prompt.find("Multiple Expert Analyses")
+        assert 0 <= agg_idx < analyses_idx
+
+        # Lines must appear in the same order as the source block — guards
+        # against accidental dict-iteration / set-based reformatting.
+        pools_idx = prompt.find("Pools over 4 forecasters")
+        blended_idx = prompt.find("Blended base rate across 3 forecasters")
+        snapshot_idx = prompt.find("Prior/posterior snapshot")
+        assert pools_idx < blended_idx < snapshot_idx
+
+
+class TestRunStackingMcFullPromptCapture:
+    def test_all_aggregation_lines_present_for_mc(self, monkeypatch):
+        captured_prompts: list[str] = []
+        mc_agg_block = "- **Linear pool across 3 forecasters** (top 3): Red=0.520, Blue=0.310, Green=0.170"
+
+        class FakeStackerLLM:
+            model = "stacker"
+
+            async def invoke(self, prompt: str) -> str:
+                await asyncio.sleep(0)
+                captured_prompts.append(prompt)
+                return "Red: 50%\nBlue: 30%\nGreen: 20%"
+
+        class FakeParserLLM:
+            model = "parser"
+
+        async def fake_structure_output(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            return PredictedOptionList(
+                predicted_options=[
+                    PredictedOption(option_name="Red", probability=0.5),
+                    PredictedOption(option_name="Blue", probability=0.3),
+                    PredictedOption(option_name="Green", probability=0.2),
+                ]
+            )
+
+        mc_q = MagicMock(spec=MultipleChoiceQuestion)
+        mc_q.id_of_question = 7
+        mc_q.question_text = "Color?"
+        mc_q.options = ["Red", "Blue", "Green"]
+        mc_q.background_info = "bg"
+        mc_q.resolution_criteria = "rc"
+        mc_q.fine_print = ""
+        mc_q.page_url = "https://example.com/q/7"
+        mc_q.open_time = _OPEN
+        mc_q.scheduled_resolution_time = _RESOLVE
+
+        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+
+        asyncio.run(
+            stacking.run_stacking_mc(
+                stacker_llm=FakeStackerLLM(),  # type: ignore[arg-type]
+                parser_llm=FakeParserLLM(),  # type: ignore[arg-type]
+                question=mc_q,
+                research="research",
+                base_texts=["m1", "m2", "m3"],
+                aggregated_tool_output=mc_agg_block,
+            )
+        )
+        prompt = captured_prompts[0]
+        assert "Cross-model aggregation (deterministic math)" in prompt
+        assert "Linear pool across 3 forecasters" in prompt
+        assert "Red=0.520, Blue=0.310, Green=0.170" in prompt
+        agg_idx = prompt.find("Cross-model aggregation")
+        analyses_idx = prompt.find("Multiple Expert Analyses")
+        assert 0 <= agg_idx < analyses_idx
+
+
+class TestRunStackingNumericFullPromptCapture:
+    def test_all_aggregation_lines_present_for_numeric(self, monkeypatch):
+        from forecasting_tools.data_models.numeric_report import Percentile
+
+        captured_prompts: list[str] = []
+        numeric_agg_block = (
+            "- **Forecaster medians**: min 25.5, max 47.2, n=3\n"
+            "- **Declared distribution families**: lognormal, normal (3 forecasters)"
+        )
+
+        class FakeStackerLLM:
+            model = "stacker"
+
+            async def invoke(self, prompt: str) -> str:
+                await asyncio.sleep(0)
+                captured_prompts.append(prompt)
+                return "percentiles..."
+
+        class FakeParserLLM:
+            model = "parser"
+
+        async def fake_structure_output(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            return [
+                Percentile(percentile=0.025, value=10.0),
+                Percentile(percentile=0.05, value=15.0),
+                Percentile(percentile=0.1, value=20.0),
+                Percentile(percentile=0.2, value=25.0),
+                Percentile(percentile=0.4, value=30.0),
+                Percentile(percentile=0.5, value=35.0),
+                Percentile(percentile=0.6, value=40.0),
+                Percentile(percentile=0.8, value=50.0),
+                Percentile(percentile=0.9, value=60.0),
+                Percentile(percentile=0.95, value=70.0),
+                Percentile(percentile=0.975, value=80.0),
+            ]
+
+        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+
+        asyncio.run(
+            stacking.run_stacking_numeric(
+                stacker_llm=FakeStackerLLM(),  # type: ignore[arg-type]
+                parser_llm=FakeParserLLM(),  # type: ignore[arg-type]
+                question=_make_numeric_q(),
+                research="research",
+                base_texts=["m1", "m2", "m3"],
+                lower_bound_message="",
+                upper_bound_message="",
+                aggregated_tool_output=numeric_agg_block,
+            )
+        )
+        prompt = captured_prompts[0]
+        assert "Cross-model aggregation (deterministic math)" in prompt
+        assert "Forecaster medians" in prompt
+        assert "min 25.5, max 47.2, n=3" in prompt
+        assert "Declared distribution families" in prompt
+        assert "lognormal, normal" in prompt
+        agg_idx = prompt.find("Cross-model aggregation")
+        analyses_idx = prompt.find("Multiple Expert Analyses")
+        assert 0 <= agg_idx < analyses_idx
+
+
 # Silence unused-import complaints: Sequence/patch kept for future expansion.
 _ = Sequence
 _ = patch
