@@ -539,18 +539,6 @@ class TestConditionalStackingThresholds:
             assert bot._conditional_stacking_skipped_count == 1
 
 
-def _make_numeric_question(question_id: int = 301) -> Mock:
-    return make_mock_numeric_question(
-        id_of_question=question_id,
-        question_text="How many units will be sold?",
-        background_info="Sales question",
-        resolution_criteria="Resolves to actual unit count",
-        page_url="https://test.com/3",
-        unit_of_measure="units",
-        cdf_size=201,
-    )
-
-
 def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) -> NumericDistribution:
     """Build a NumericDistribution with 11 percentiles centered on median_value.
 
@@ -578,7 +566,14 @@ class TestConditionalStackingNumeric:
     async def test_numeric_high_spread_triggers(self):
         """Numeric predictions with large median disagreement (spread/range > 0.15) should trigger stacking."""
         bot = _make_bot()
-        question = _make_numeric_question()
+        question = make_mock_numeric_question(
+            question_text="How many units will be sold?",
+            background_info="Sales question",
+            resolution_criteria="Resolves to actual unit count",
+            page_url="https://test.com/3",
+            unit_of_measure="units",
+            cdf_size=201,
+        )
 
         # Model 1 centered at 30, model 2 centered at 70
         # At the 50th percentile (index 5): values 30 vs 70 -> raw spread 40, normalized 40/100 = 0.40 >> 0.15
@@ -628,7 +623,14 @@ class TestConditionalStackingNumeric:
     async def test_numeric_low_spread_skips(self):
         """Numeric predictions with similar medians (spread/range < 0.15) should skip stacking."""
         bot = _make_bot()
-        question = _make_numeric_question()
+        question = make_mock_numeric_question(
+            question_text="How many units will be sold?",
+            background_info="Sales question",
+            resolution_criteria="Resolves to actual unit count",
+            page_url="https://test.com/3",
+            unit_of_measure="units",
+            cdf_size=201,
+        )
 
         # Model 1 centered at 48, model 2 centered at 52
         # At 50th percentile (index 5): values 48 vs 52 -> raw spread 4, normalized 4/100 = 0.04 << 0.15

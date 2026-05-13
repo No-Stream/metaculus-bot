@@ -50,6 +50,7 @@ from metaculus_bot.probabilistic_tools import (
     weibull_prob_event_before,
     weibull_prob_event_before_conditional,
 )
+from tests.conftest import make_mock_numeric_question
 
 
 class TestBetaBinomialUpdate:
@@ -1720,23 +1721,6 @@ class TestFitMixtureFromPercentiles:
 
 
 class TestPercentilesToMetaculusCdfViaMixture:
-    def _make_numeric_question(
-        self,
-        *,
-        lower_bound: float = 0.0,
-        upper_bound: float = 100.0,
-        open_lower_bound: bool = False,
-        open_upper_bound: bool = False,
-    ):
-        from tests.conftest import make_mock_numeric_question
-
-        return make_mock_numeric_question(
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
-            open_lower_bound=open_lower_bound,
-            open_upper_bound=open_upper_bound,
-        )
-
     def test_closed_bounds_produces_201_point_cdf(self):
         from forecasting_tools.data_models.numeric_report import Percentile
 
@@ -1753,7 +1737,7 @@ class TestPercentilesToMetaculusCdfViaMixture:
                 MixtureComponent(weight=0.3, mean=75.0, sd=6.0),
             )
         )
-        q = self._make_numeric_question()
+        q = make_mock_numeric_question()
         cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
         assert isinstance(cdf, list)
         assert len(cdf) == 201
@@ -1782,7 +1766,7 @@ class TestPercentilesToMetaculusCdfViaMixture:
                 MixtureComponent(weight=0.5, mean=70.0, sd=5.0),
             )
         )
-        q = self._make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        q = make_mock_numeric_question(open_lower_bound=True, open_upper_bound=True)
         cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
         assert len(cdf) == 201
         probs = [p.percentile for p in cdf]
