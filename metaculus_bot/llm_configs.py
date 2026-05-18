@@ -82,8 +82,12 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         model="openrouter/google/gemini-3.1-pro-preview",
         **REASONING_MODEL_CONFIG,
     ),
+    # 2026-05-18: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
+    # Added explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
+    # (4.3 defaults to low effort if unspecified, vs. 4.1-fast which had no effort flag).
     build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.1-fast",
+        model="openrouter/x-ai/grok-4.3",
+        reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
 ]
