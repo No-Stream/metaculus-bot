@@ -326,8 +326,12 @@ WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
 
 # Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).
 # Stock forecasting-tools uses synchronous `requests.post` with no timeout, so
-# a hung server can block the whole batch indefinitely. We wrap each POST in
-# asyncio.to_thread + asyncio.wait_for and retry once on timeout.
+# a hung server can block the whole batch indefinitely. publish_hardening.py
+# wraps each POST on a concurrent.futures.ThreadPoolExecutor with a
+# Future.result(timeout=...) cap *and* monkey-patches `requests.post` on the
+# forecasting-tools module to inject a request-side socket timeout (so the
+# underlying socket actually closes when the server stalls). Retry once on
+# timeout / connection error.
 PUBLISH_POST_TIMEOUT: int = 20
 PUBLISH_POST_RETRIES: int = 1
 

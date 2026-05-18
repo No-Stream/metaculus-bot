@@ -48,6 +48,8 @@ from metaculus_bot.comment_markers import (
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
+    TOOLS_USED_MARKER_FALSE,
+    TOOLS_USED_MARKER_TRUE,
 )
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
@@ -871,10 +873,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             raise RuntimeError(msg)
         # Stacking budget gate. If we've burned through the per-Q wall-clock
         # budget (e.g. research stalled, fan-out used most of the budget),
-        # skip the stacker LLM entirely and force the MEDIAN fallback. The
-        # WALL_CLOCK_STACKING_MIN_BUDGET (90s) reserves time for publish
-        # hardening (4 POSTs * 20s timeout * (1 + 1 retry) worst case ≈ 160s
-        # but typical is sub-second; 90s is the cheap heuristic floor).
+        # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
+        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET (90s) floor leaves
+        # headroom for sustained slowness on a single POST. The 160s worst case
+        # (4 POSTs * 20s * (1 + 1 retry)) requires multi-POST stalling, which
+        # is recovered by skip_stacking_for_budget already.
         skip_stacking_for_budget = (
             self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
             and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
@@ -1159,10 +1162,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # actual per-type dispatch (PROBABILISTIC_TOOLS_TYPES allow-list), not just the global
         # flag — otherwise a numeric question with TYPES="binary,multiple_choice" would emit
         # TOOLS_USED=true even though no tool fired (F21).
-        from metaculus_bot.comment_markers import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            TOOLS_USED_MARKER_FALSE,
-            TOOLS_USED_MARKER_TRUE,
-        )
         from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             _feature_enabled as _tool_runner_feature_enabled,
         )

@@ -241,18 +241,169 @@ def test_publish_hardening_idempotent(monkeypatch):
 
     from metaculus_bot import publish_hardening
 
-    # Capture original methods so we can restore them.
-    originals = {name: getattr(MetaculusApi, name) for name in publish_hardening._PATCHED_METHODS}
-    # Reset sentinel for a clean start.
+    # Use monkeypatch to capture + restore each method (and the sentinel) so the
+    # real MetaculusApi class is unpatched at test exit. monkeypatch.setattr
+    # records originals before the test runs and restores them after.
+    for name in publish_hardening._PATCHED_METHODS:
+        # The descriptor in __dict__ is the classmethod wrapper; setattr accepts
+        # the same shape on restore, so capturing via getattr is fine.
+        monkeypatch.setattr(MetaculusApi, name, MetaculusApi.__dict__[name])
+    # Sentinel: pytest's monkeypatch will delete this attr if it didn't exist
+    # before, or restore the prior value if it did.
     if hasattr(MetaculusApi, publish_hardening._SENTINEL):
+        monkeypatch.setattr(MetaculusApi, publish_hardening._SENTINEL, False)
         delattr(MetaculusApi, publish_hardening._SENTINEL)
-        for name, fn in originals.items():
-            setattr(MetaculusApi, name, fn)
+    else:
+        monkeypatch.setattr(MetaculusApi, publish_hardening._SENTINEL, False, raising=False)
+        delattr(MetaculusApi, publish_hardening._SENTINEL)
 
     publish_hardening.apply_publish_hardening()
-    after_first = {name: getattr(MetaculusApi, name) for name in publish_hardening._PATCHED_METHODS}
+    # Compare the underlying function objects in __dict__ — bound classmethod
+    # views from getattr() are fresh each access so identity-via-getattr is
+    # unreliable. The wrapper function inside the classmethod descriptor IS
+    # identity-stable across calls.
+    after_first = {name: MetaculusApi.__dict__[name].__func__ for name in publish_hardening._PATCHED_METHODS}
     publish_hardening.apply_publish_hardening()
-    after_second = {name: getattr(MetaculusApi, name) for name in publish_hardening._PATCHED_METHODS}
-    # The second call must NOT re-wrap (otherwise we'd see a new wrapper object).
+    after_second = {name: MetaculusApi.__dict__[name].__func__ for name in publish_hardening._PATCHED_METHODS}
     for name in publish_hardening._PATCHED_METHODS:
         assert after_first[name] is after_second[name]
+
+
+def test_publish_hardening_supports_class_and_instance_calls(monkeypatch):
+    """F18 regression: hardened post_* must be callable from class AND instance.
+
+    Original code used ``setattr(MetaculusApi, name, wrapper)`` where ``wrapper``
+    was a plain function — class-level calls worked but instance-level calls
+    passed ``self`` as the first positional arg, breaking the signature. Fix
+    re-wraps as ``classmethod`` so both calling conventions work.
+    """
+    from forecasting_tools import MetaculusApi
+
+    from metaculus_bot import publish_hardening
+
+    # Snapshot + restore via monkeypatch.
+    for name in publish_hardening._PATCHED_METHODS:
+        monkeypatch.setattr(MetaculusApi, name, MetaculusApi.__dict__[name])
+    if hasattr(MetaculusApi, publish_hardening._SENTINEL):
+        monkeypatch.setattr(MetaculusApi, publish_hardening._SENTINEL, False)
+        delattr(MetaculusApi, publish_hardening._SENTINEL)
+
+    # Stub _post_question_prediction so we don't hit the network. It's the
+    # underlying call inside post_binary_question_prediction.
+    calls: list[tuple[int, dict]] = []
+
+    def fake_post_question_prediction(cls, question_id, payload):
+        calls.append((question_id, payload))
+
+    monkeypatch.setattr(MetaculusApi, "_post_question_prediction", classmethod(fake_post_question_prediction))
+
+    publish_hardening.apply_publish_hardening()
+
+    # Class-level call must work.
+    MetaculusApi.post_binary_question_prediction(question_id=1, prediction_in_decimal=0.5)
+    # Instance-level call must ALSO work without TypeError.
+    MetaculusApi().post_binary_question_prediction(question_id=2, prediction_in_decimal=0.6)
+
+    assert len(calls) == 2
+    assert calls[0][0] == 1
+    assert calls[1][0] == 2
+
+
+def test_publish_hardening_injects_socket_timeout(monkeypatch):
+    """F17 regression: a hung requests.post must be bounded by injected ``timeout=``.
+
+    Without the request-side socket timeout, ``Future.cancel()`` is a no-op once
+    the worker thread is inside ``requests.post``, so a hung POST silently runs
+    until the underlying socket times out (no caller-side bound). With the fix,
+    the wrapper monkey-patches ``requests.post`` on the forecasting-tools
+    module to inject ``timeout=PUBLISH_POST_TIMEOUT`` whenever the caller didn't
+    pass one, so the socket-level timeout fires.
+
+    This test verifies that the injection happens by capturing kwargs passed to
+    a fake ``requests.post``.
+    """
+    from forecasting_tools.helpers import metaculus_api as ft_metaculus_api
+
+    from metaculus_bot import publish_hardening
+
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_TIMEOUT", 0.5)
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_RETRIES", 0)
+
+    captured_kwargs: list[dict] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {}
+
+    def fake_post(*args, **kwargs):
+        captured_kwargs.append(dict(kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(ft_metaculus_api.requests, "post", fake_post)
+
+    # Build a minimal "post"-like fn that calls requests.post on the patched
+    # module, the same way MetaculusApi's internals do.
+    def caller_that_uses_module_requests(*args, **kwargs):
+        return ft_metaculus_api.requests.post("http://example.invalid", json={"k": "v"})
+
+    wrapped = publish_hardening._wrap_with_timeout_retry("fake", caller_that_uses_module_requests)
+    wrapped()
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("timeout") == 0.5, (
+        f"timeout kwarg should have been injected by _inject_socket_timeout; got {captured_kwargs[0]}"
+    )
+
+    # And after the wrapper exits, requests.post must be restored to fake_post
+    # (NOT the timeout-injecting wrapper). Verify by calling directly without
+    # a timeout kwarg and confirming none was injected.
+    captured_kwargs.clear()
+    ft_metaculus_api.requests.post("http://example.invalid", json={"k": "v"})
+    assert "timeout" not in captured_kwargs[0], (
+        f"timeout injection should NOT leak past the wrapper; got {captured_kwargs[0]}"
+    )
+
+
+def test_publish_hardening_bounds_hung_request_via_socket_timeout(monkeypatch):
+    """F17: a requests.post that hangs forever must be bounded by injected timeout.
+
+    Simulates a server-stalled POST by having fake_post raise requests.Timeout
+    when the timeout kwarg is passed (the real behavior of urllib3 when the
+    socket timeout fires). Without F17, no timeout is passed and the call
+    would hang. With F17, the wrapper raises after the timeout-induced error.
+    """
+    from forecasting_tools.helpers import metaculus_api as ft_metaculus_api
+
+    from metaculus_bot import publish_hardening
+
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_TIMEOUT", 0.5)
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_RETRIES", 0)
+
+    def fake_hung_post(*args, **kwargs):
+        # urllib3 / requests raises requests.Timeout when the socket-level
+        # timeout fires. Simulate that here, gated on the injected kwarg.
+        if "timeout" in kwargs:
+            raise requests.Timeout("simulated socket timeout")
+        # If no timeout is passed, simulate an unbounded hang. Sleep longer
+        # than any reasonable test would tolerate — if F17 were broken this
+        # branch would be reached and the test would fail by timeout.
+        time.sleep(60)
+
+    monkeypatch.setattr(ft_metaculus_api.requests, "post", fake_hung_post)
+
+    def caller(*args, **kwargs):
+        return ft_metaculus_api.requests.post("http://example.invalid", json={})
+
+    wrapped = publish_hardening._wrap_with_timeout_retry("fake", caller)
+    start = time.monotonic()
+    with pytest.raises(requests.Timeout):
+        wrapped()
+    elapsed = time.monotonic() - start
+    # Must complete promptly (well under PUBLISH_POST_TIMEOUT + 1s); the
+    # injected timeout makes fake_hung_post raise immediately.
+    assert elapsed < 1.5, f"hung-post test took {elapsed:.2f}s, indicating socket timeout NOT injected"
