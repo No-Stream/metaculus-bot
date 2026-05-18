@@ -15,6 +15,7 @@ import logging
 import os
 from typing import Any
 
+from forecasting_tools.data_models.questions import MetaculusQuestion
 from google import genai
 from google.genai import types as genai_types
 
@@ -49,9 +50,13 @@ def _cached_client_for_key(api_key: str) -> genai.Client:
 
 
 def build_gemini_client() -> genai.Client:
-    """Return the cached google-genai Client for the current GOOGLE_API_KEY.
+    """Return the cached google-genai Client for the operator's personal Gemini key.
 
-    Raises ValueError if the key is missing so misconfiguration is loud.
+    Reads GOOGLE_API_KEY (the operator's personal Google AI Studio key — in CI
+    populated from ``secrets.GEMINI_API_KEY``). There is no Metaculus-donated
+    Gemini key on the google-genai side; the donated path only exists for
+    OpenRouter-routed Gemini models. Raises ValueError if the key is missing
+    so misconfiguration is loud.
     """
     api_key = os.getenv(GOOGLE_API_KEY_ENV)
     if not api_key:
@@ -190,12 +195,12 @@ def gemini_search_provider(
 ) -> ResearchCallable:
     """Research provider using Gemini with Google Search grounding.
 
-    Mirrors the `_native_search_provider` contract (`question_text -> str`).
+    Mirrors the `_native_search_provider` contract (`MetaculusQuestion -> str`).
     """
 
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         prompt = web_research_prompt(
-            question_text,
+            question.question_text,
             is_benchmarking=is_benchmarking,
             citation_style="auto_annotated",
             allow_resolution_source_reading=True,

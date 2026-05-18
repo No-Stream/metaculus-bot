@@ -7,8 +7,10 @@ assumptions, etc.) and return ground-truth probability math: Beta-binomial
 posteriors, survival probabilities, pooled probabilities, fitted
 distributions, out-of-bounds mass, consistency flags.
 
-Dormant surface — imported by ``metaculus_bot.tool_runner`` but not wired
-into prompts or the runtime pipeline yet.
+Active surface, gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and
+per-question-type via ``PROBABILISTIC_TOOLS_TYPES``. See
+``metaculus_bot/tool_runner.py`` for dispatch and
+``main.py:_make_prediction`` for the activation site.
 
 Error conventions
 -----------------
@@ -39,7 +41,7 @@ for the full activation plan):
   ``TailMassResult``, ``NormalFit``/``LognormalFit``/``StudentTFit``,
   ``DirichletCI``, ``SurvivalResult``) and ``DEFAULT_INFORMATIVE_PRIOR_STRENGTH``.
 - **Library helpers for future wiring (phase-3)**: ``bayes_from_likelihoods``,
-  ``laplace_rule_of_succession``, ``inverse_variance_pool``,
+  ``laplace_rule_of_succession``, ``inverse_variance_pool``, ``noisy_or``,
   ``weibull_prob_event_before``, ``poisson_at_least_one``,
   ``base_rate_to_hazard``, ``fit_to_11_percentiles``,
   ``percentiles_to_metaculus_cdf``, ``negative_binomial_percentiles``,
@@ -54,6 +56,7 @@ from metaculus_bot.probabilistic_tools.aggregation import (
     linear_pool,
     linear_pool_options,
     log_pool,
+    noisy_or,
     satopaa_extremize,
 )
 from metaculus_bot.probabilistic_tools.base_rate import (
@@ -92,12 +95,23 @@ from metaculus_bot.probabilistic_tools.mc_discrete import (
     negative_binomial_percentiles,
     poisson_percentiles,
 )
+from metaculus_bot.probabilistic_tools.mixtures import (
+    MixtureComponent,
+    MixtureOfNormals,
+    fit_mixture_from_percentiles,
+    mixture_cdf,
+    percentiles_to_metaculus_cdf_via_mixture,
+)
 from metaculus_bot.probabilistic_tools.survival import (
+    GammaFit,
     SurvivalResult,
     base_rate_to_hazard,
+    fit_gamma_from_gaps,
+    gamma_prob_event_before,
     poisson_at_least_one,
     prob_event_before,
     weibull_prob_event_before,
+    weibull_prob_event_before_conditional,
 )
 
 __all__ = [
@@ -106,7 +120,10 @@ __all__ = [
     "DEFAULT_INFORMATIVE_PRIOR_STRENGTH",
     "DirichletCI",
     "FitType",
+    "GammaFit",
     "LognormalFit",
+    "MixtureComponent",
+    "MixtureOfNormals",
     "NormalFit",
     "StudentTFit",
     "SurvivalResult",
@@ -118,25 +135,32 @@ __all__ = [
     "beta_binomial_update",
     "cdf_at_threshold",
     "dirichlet_with_other",
+    "fit_gamma_from_gaps",
     "fit_lognormal_from_percentiles",
     "fit_normal_from_percentiles",
     "fit_student_t_from_percentiles",
+    "fit_mixture_from_percentiles",
     "fit_to_11_percentiles",
+    "gamma_prob_event_before",
     "implied_likelihood_ratio",
     "inverse_variance_pool",
     "laplace_rule_of_succession",
     "linear_pool",
     "linear_pool_options",
     "log_pool",
+    "mixture_cdf",
     "negative_binomial_percentiles",
+    "noisy_or",
     "out_of_bounds_mass",
     "percentile_family_consistency",
     "percentile_monotonicity_check",
     "percentiles_to_metaculus_cdf",
+    "percentiles_to_metaculus_cdf_via_mixture",
     "poisson_at_least_one",
     "poisson_percentiles",
     "prob_event_before",
     "satopaa_extremize",
     "stated_base_rate_consistency",
     "weibull_prob_event_before",
+    "weibull_prob_event_before_conditional",
 ]

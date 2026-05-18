@@ -2,8 +2,15 @@
 Tests for custom probability clamping in prediction extraction.
 
 Tests that probabilities are correctly clamped after LLM extraction:
-- Binary questions: 1% to 99% (0.01 to 0.99)
+- Binary questions: 2% to 98% (0.02 to 0.98) — see note below
 - Multiple choice questions: 0.5% to 99.5% (0.005 to 0.995) with renormalization
+
+Binary bounds were widened from [0.01, 0.99] to [0.02, 0.98] on 2026-05-12
+following Preseen-Atlas (spring-AIB-2026 leader), whose comments publish
+`submitted = 0.96 * model_estimate + 0.02` on every forecast. We adopted the
+clip-only portion (tail protection from log-loss blowup on misses) without
+the linear shrink. See:
+scratch_docs_and_planning/atlas_inspired_improvements.md (Workstream B).
 """
 
 import pytest
@@ -17,32 +24,32 @@ class TestProbabilityClamping:
     """Test custom probability clamping logic directly."""
 
     def test_binary_clamping_logic(self):
-        """Test binary prediction clamping logic."""
-        # Test the exact clamping logic used in main.py:373
+        """Test binary prediction clamping logic at the Atlas-inspired [0.02, 0.98]."""
+        # Mirror the clamp in main.py:_run_forecast_on_binary and stacking.py:run_stacking_binary.
 
-        # Test extreme low value (should be clamped to 0.01)
+        # Test extreme low value (should be clamped to 0.02)
         raw_prediction = 0.0001
-        clamped = max(0.01, min(0.99, raw_prediction))
-        assert clamped == 0.01, f"Expected 0.01, got {clamped}"
+        clamped = max(0.02, min(0.98, raw_prediction))
+        assert clamped == 0.02, f"Expected 0.02, got {clamped}"
 
-        # Test extreme high value (should be clamped to 0.99)
+        # Test extreme high value (should be clamped to 0.98)
         raw_prediction = 0.9999
-        clamped = max(0.01, min(0.99, raw_prediction))
-        assert clamped == 0.99, f"Expected 0.99, got {clamped}"
+        clamped = max(0.02, min(0.98, raw_prediction))
+        assert clamped == 0.98, f"Expected 0.98, got {clamped}"
 
         # Test normal value (should be preserved)
         raw_prediction = 0.65
-        clamped = max(0.01, min(0.99, raw_prediction))
+        clamped = max(0.02, min(0.98, raw_prediction))
         assert clamped == 0.65, f"Expected 0.65, got {clamped}"
 
         # Test boundary values
-        raw_prediction = 0.01
-        clamped = max(0.01, min(0.99, raw_prediction))
-        assert clamped == 0.01, f"Expected 0.01, got {clamped}"
+        raw_prediction = 0.02
+        clamped = max(0.02, min(0.98, raw_prediction))
+        assert clamped == 0.02, f"Expected 0.02, got {clamped}"
 
-        raw_prediction = 0.99
-        clamped = max(0.01, min(0.99, raw_prediction))
-        assert clamped == 0.99, f"Expected 0.99, got {clamped}"
+        raw_prediction = 0.98
+        clamped = max(0.02, min(0.98, raw_prediction))
+        assert clamped == 0.98, f"Expected 0.98, got {clamped}"
 
     def test_mc_clamping_logic(self):
         """Test multiple choice prediction clamping logic."""
@@ -143,13 +150,13 @@ class TestProbabilityClamping:
 
     def test_boundary_conditions(self):
         """Test clamping at exact boundary values."""
-        # Binary boundaries
-        assert max(0.01, min(0.99, 0.01)) == 0.01
-        assert max(0.01, min(0.99, 0.99)) == 0.99
-        assert max(0.01, min(0.99, 0.009)) == 0.01
-        assert max(0.01, min(0.99, 0.991)) == 0.99
+        # Binary boundaries — Atlas-inspired [0.02, 0.98], see module docstring.
+        assert max(0.02, min(0.98, 0.02)) == 0.02
+        assert max(0.02, min(0.98, 0.98)) == 0.98
+        assert max(0.02, min(0.98, 0.019)) == 0.02
+        assert max(0.02, min(0.98, 0.981)) == 0.98
 
-        # MC boundaries
+        # MC boundaries (unchanged — Workstream B is binary-only).
         assert max(0.005, min(0.995, 0.005)) == 0.005
         assert max(0.005, min(0.995, 0.995)) == 0.995
         assert max(0.005, min(0.995, 0.004)) == 0.005

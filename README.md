@@ -10,14 +10,12 @@ A forecasting bot for Metaculus using ensemble learning with several frontier LL
 
 includes:
 
-- **Model Ensembling**: Uses various models with support for model stacking. (uses simple median agg currently.)
-- **Research Integration**: AskNews API with Perplexity fallback for real-time information gathering
-- **Advanced Aggregation**: Multiple aggregation strategies including mean, median, and stacking approaches
-- **Robust Pipeline**: Comprehensive question processing, research, reasoning, and prediction extraction
-- **Numeric/Continuous Question Enhancement**: e.g. PCHIP interpolation (thanks Panshul), tail spreading
-- **Prompt Improvements**: obviously. e.g. encouraging wider distributions for continuous/numeric q's. do they do anything useful? possibly not.  
-- **Benchmarking on MC and Numeric Q's**: not just binary
-- **Custom Research**: Currently using Grok 4.1 Fast native search to augment Asknews.
+- **Model ensembling with meta-stacker**: 6-LLM forecaster fan-out → `CONDITIONAL_STACKING` by default (MEDIAN when models agree, stacker LLM rewrite when they disagree). Mean / median / always-stack strategies also available.
+- **Multi-provider research**: AskNews + Gemini grounded search (first-party Google Search) + optional Grok native search + Perplexity / Exa fallbacks + yfinance/FRED for financial questions, all fanned out in parallel.
+- **Gap-fill second pass**: after first-pass research, a Gemini analyzer identifies factual gaps and resolves each via parallel grounded searches.
+- **Targeted disagreement research**: when base models disagree, a cheap LLM extracts the crux and Grok native search resolves it before the stacker runs.
+- **Numeric CDF pipeline**: PCHIP interpolation (thanks Panshul) + tail widening, with aggressive enforcement of Metaculus CDF constraints (201 pts, min/max step, bound pinning).
+- **Backtest-first benchmarking** on binary, numeric, and MC resolved questions (`backtest.py`).
 
 ## Quick Start
 
@@ -72,13 +70,18 @@ make run
 - **`community_benchmark.py`**: DEPRECATED benchmarking CLI (community prediction baseline broken)
 - **`metaculus_bot/`**: Core utilities and configurations
 
-### Key Modules
+### Key modules
 
-- **`llm_configs.py`**: LLM ensemble configuration and model settings
-- **`research_providers.py`**: AskNews and search integration
-- **`aggregation_strategies.py`**: Multiple prediction aggregation methods
-- **`prompts.py`**: Specialized prompts for different question types
-- **`numeric_*.py`**: Numeric question processing and validation
+- **`llm_configs.py`**: LLM ensemble + stacker + support-model configuration (single source of truth; rotates frequently)
+- **`research_providers.py`**: AskNews, Perplexity, Exa, native-search orchestration
+- **`gemini_search_provider.py`**: Gemini 3 with first-party Google Search grounding
+- **`financial_data_provider.py`**: yfinance + FRED for financial/economic questions
+- **`targeted_research.py`**: disagreement-crux targeted search + always-on gap-fill second pass
+- **`stacking.py`** and **`aggregation_strategies.py`**: CONDITIONAL_STACKING / STACKING / MEAN / MEDIAN
+- **`spread_metrics.py`**: per-type spread computation that triggers CONDITIONAL_STACKING
+- **`prompts.py`**: prompts for base forecasting, stacking, gap-fill, targeted research
+- **`numeric_pipeline.py`** / **`pchip_cdf.py`** / **`tail_widening.py`**: percentile → 201-point CDF pipeline
+- **`probabilistic_tools/`** and **`tool_runner.py`**: deterministic probability math for structured forecaster JSON blocks (dormant — see `scratch_docs_and_planning/probabilistic_tools_activation.md`)
 
 ## Usage Examples
 
@@ -193,13 +196,12 @@ Opt-in research sources, each independently enabled:
 - `FINANCIAL_DATA_ENABLED=true` — yfinance + FRED for economic/market questions (requires `FRED_API_KEY`)
 - `GAP_FILL_ENABLED=true` — always-on second-pass that identifies gaps in first-pass research and resolves each via a parallel grounded Gemini search (requires `GOOGLE_API_KEY`)
 
-### Model Configuration
+### Model configuration
 
-Models are configured in `metaculus_bot/llm_configs.py`:
-
-- See `metaculus_bot/llm_configs.py` for the current model ensemble (rotates frequently)
-- **Research**: AskNews + Grok native search + (optional) Gemini grounded search, with fallback providers
-- **Provider**: OpenRouter with automatic key fallback; Gemini grounded search uses the Google AI Studio SDK directly for first-party Google Search results
+- `metaculus_bot/llm_configs.py` is the single source of truth for the 6-model forecaster ensemble, stacker + cross-provider fallback stacker, disagreement analyzer, summarizer/researcher, and parser. Rotates frequently — don't hardcode model names elsewhere.
+- **Aggregation**: `CONDITIONAL_STACKING` by default (CLI: `metaculus_bot/cli.py`). MEDIAN when base models agree, stacker LLM rewrite when they disagree. Thresholds in `metaculus_bot/constants.py` (binary 0.15 probability range, MC 0.20 max option, numeric 0.15 normalized percentile spread).
+- **Research**: AskNews + Gemini grounded search + optional Grok native search + Perplexity + Exa fallbacks, with yfinance/FRED for financial questions. All opt-in independently via env flags; Gemini grounded search uses the Google AI Studio SDK directly for first-party Google Search results.
+- **Provider**: OpenRouter with automatic key fallback for LLMs.
 
 ## Development
 
@@ -240,16 +242,24 @@ make precommit_all
 ```
 metaculus-bot/
 ├── main.py                     # Primary bot implementation
-├── community_benchmark.py      # Benchmarking system
+├── backtest.py                 # Resolved-question backtester (primary benchmarking)
+├── community_benchmark.py      # DEPRECATED community-prediction benchmarker
 ├── metaculus_bot/              # Core utilities
-│   ├── llm_configs.py         # Model ensemble configuration
-│   ├── research_providers.py   # Research integration
-│   ├── aggregation_strategies.py # Prediction aggregation
-│   ├── prompts.py             # Question-specific prompts
-│   └── numeric_*.py           # Numeric processing modules
-├── tests/                      # Test suite
-├── .github/workflows/          # CI automation
-├── AGENTS.md                   # Detailed coding guidelines
+│   ├── llm_configs.py              # Forecaster + stacker + support models
+│   ├── research_providers.py       # AskNews / Perplexity / Exa / native-search orchestration
+│   ├── gemini_search_provider.py   # Gemini 3 with first-party Google Search grounding
+│   ├── financial_data_provider.py  # yfinance + FRED
+│   ├── targeted_research.py        # Disagreement-crux + gap-fill second pass
+│   ├── stacking.py                 # Stacker LLM meta-prompts
+│   ├── aggregation_strategies.py   # MEAN / MEDIAN / STACKING / CONDITIONAL_STACKING
+│   ├── spread_metrics.py           # Per-type disagreement metric
+│   ├── prompts.py                  # Base / stacking / gap-fill / targeted prompts
+│   ├── numeric_pipeline.py, pchip_cdf.py, tail_widening.py  # Percentile → 201pt CDF
+│   ├── probabilistic_tools/        # (dormant) Bayesian / survival / fit helpers
+│   └── tool_runner.py              # (dormant) deterministic math over structured blocks
+├── tests/                      # Pytest suite
+├── .github/workflows/          # CI + scheduled bot runs
+├── AGENTS.md                   # Repo-specific agent/coding guidelines (CLAUDE.md is a symlink)
 └── Makefile                    # Development commands
 ```
 

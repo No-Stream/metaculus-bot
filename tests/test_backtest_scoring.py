@@ -1,5 +1,6 @@
 """Tests for backtest scoring functions."""
 
+import math
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -8,13 +9,88 @@ import pytest
 from metaculus_bot.backtest.scoring import (
     GroundTruth,
     QuestionScore,
+    _canonicalize_mc_option,
     binary_log_score,
     brier_score,
     mc_log_score,
+    mc_log_score_from_report,
     numeric_crps,
     numeric_log_score,
     score_report,
 )
+
+
+def _make_mc_report(option_probs: dict[str, float]) -> MagicMock:
+    """Build a MagicMock MultipleChoiceReport with given option-probability map."""
+    from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
+
+    report = MagicMock(spec=MultipleChoiceReport)
+    options = list(option_probs.keys())
+
+    question = MagicMock()
+    question.options = options
+    report.question = question
+
+    predicted_options = []
+    for option, prob in option_probs.items():
+        po = MagicMock()
+        po.option_name = option
+        po.probability = prob
+        predicted_options.append(po)
+    prediction = MagicMock()
+    prediction.predicted_options = predicted_options
+    report.prediction = prediction
+
+    return report
+
+
+class TestMcOptionCanonicalization:
+    """Regression coverage for the '3.0' vs '3' MC option-matching mismatch.
+
+    Manifest resolution strings sometimes arrive in float form ('3.0') while the
+    question.options list holds integer-form strings ('3'); pre-fix, the
+    string-equality match silently failed and the score was dropped.
+    """
+
+    def test_correct_option_3_dot_0_matches_int_option_3(self) -> None:
+        report = _make_mc_report({"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.6, "No Decision": 0.1})
+        score = mc_log_score_from_report(report, correct_option="3.0")
+        assert score is not None
+        assert isinstance(score, float)
+        assert math.isfinite(score)
+        # Sanity-check: the score reflects p_correct=0.6 (much higher than uniform 0.2 baseline).
+        baseline_uniform = _make_mc_report({"0": 0.2, "1": 0.2, "2": 0.2, "3": 0.2, "No Decision": 0.2})
+        baseline_score = mc_log_score_from_report(baseline_uniform, correct_option="3.0")
+        assert baseline_score is not None
+        assert score > baseline_score
+
+    def test_correct_option_int_3_matches_float_option_3_dot_0(self) -> None:
+        report = _make_mc_report({"0.0": 0.1, "1.0": 0.1, "2.0": 0.1, "3.0": 0.6, "No Decision": 0.1})
+        score = mc_log_score_from_report(report, correct_option="3")
+        assert score is not None
+        assert math.isfinite(score)
+
+    def test_canonical_match_falls_back_when_neither_matches(self, caplog: pytest.LogCaptureFixture) -> None:
+        report = _make_mc_report({"S&P 500": 0.4, "Nasdaq": 0.4, "Dow Jones": 0.2})
+        with caplog.at_level("WARNING", logger="metaculus_bot.backtest.scoring"):
+            score = mc_log_score_from_report(report, correct_option="Nikkei 225")
+        assert score is None
+        assert any("Nikkei 225" in record.message for record in caplog.records)
+
+    def test_no_decision_option_unchanged(self) -> None:
+        report = _make_mc_report({"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.1, "No Decision": 0.6})
+        score = mc_log_score_from_report(report, correct_option="No Decision")
+        assert score is not None
+        assert math.isfinite(score)
+
+    def test_canonicalize_preserves_non_numeric_strings(self) -> None:
+        assert _canonicalize_mc_option("Nikkei 225") == "Nikkei 225"
+        assert _canonicalize_mc_option("3.0") == "3"
+        assert _canonicalize_mc_option("3") == "3"
+        assert _canonicalize_mc_option("3.5") == "3.5"
+        assert _canonicalize_mc_option(" 3 ") == "3"
+        assert _canonicalize_mc_option("No Decision") == "No Decision"
+
 
 # ---------------------------------------------------------------------------
 # Brier score

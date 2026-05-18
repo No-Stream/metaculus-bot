@@ -12,7 +12,6 @@ from forecasting_tools import (
     GeneralLlm,
     MultipleChoiceQuestion,
     NumericDistribution,
-    NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
 )
@@ -21,6 +20,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from tests.conftest import make_mock_numeric_question
 
 # Standard 11-percentile values used throughout numeric tests
 _STANDARD_PERCENTILES = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
@@ -96,7 +96,7 @@ class TestConditionalStackingBinaryTrigger:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -135,6 +135,12 @@ class TestConditionalStackingBinaryTrigger:
             assert "Targeted Research" in agg_kwargs["research"]
             assert "base research text" in agg_kwargs["research"]
 
+            # The targeted-research section reaches the published comment via
+            # ResearchWithPredictions.research_report (the regression fix at
+            # main.py:880 replaced raw `research` with `combined_research`).
+            assert "## Targeted Research (addressing model disagreement)" in result.research_report
+            assert "base research text" in result.research_report
+
             # Result has exactly 1 prediction (stacked)
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.72
@@ -156,7 +162,7 @@ class TestConditionalStackingBinaryTrigger:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -185,6 +191,10 @@ class TestConditionalStackingBinaryTrigger:
             assert result.predictions[0].prediction_value == 0.45
             assert result.predictions[1].prediction_value == 0.55
 
+            # Skip path returns the raw research as research_report — no
+            # targeted-research header should leak into the published comment.
+            assert "## Targeted Research" not in result.research_report
+
             # Diagnostic counter incremented
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
@@ -205,7 +215,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -253,7 +263,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -300,7 +310,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -381,7 +391,7 @@ class TestConditionalStackingMC:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -432,7 +442,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -467,7 +477,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -508,7 +518,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -527,24 +537,6 @@ class TestConditionalStackingThresholds:
             mock_crux.assert_not_called()
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
-
-
-def _make_numeric_question(question_id: int = 301) -> Mock:
-    question = Mock(spec=NumericQuestion)
-    question.id_of_question = question_id
-    question.question_text = "How many units will be sold?"
-    question.background_info = "Sales question"
-    question.resolution_criteria = "Resolves to actual unit count"
-    question.fine_print = ""
-    question.page_url = "https://test.com/3"
-    question.lower_bound = 0.0
-    question.upper_bound = 100.0
-    question.open_lower_bound = False
-    question.open_upper_bound = False
-    question.zero_point = None
-    question.unit_of_measure = "units"
-    question.cdf_size = 201
-    return question
 
 
 def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) -> NumericDistribution:
@@ -574,7 +566,14 @@ class TestConditionalStackingNumeric:
     async def test_numeric_high_spread_triggers(self):
         """Numeric predictions with large median disagreement (spread/range > 0.15) should trigger stacking."""
         bot = _make_bot()
-        question = _make_numeric_question()
+        question = make_mock_numeric_question(
+            question_text="How many units will be sold?",
+            background_info="Sales question",
+            resolution_criteria="Resolves to actual unit count",
+            page_url="https://test.com/3",
+            unit_of_measure="units",
+            cdf_size=201,
+        )
 
         # Model 1 centered at 30, model 2 centered at 70
         # At the 50th percentile (index 5): values 30 vs 70 -> raw spread 40, normalized 40/100 = 0.40 >> 0.15
@@ -589,7 +588,7 @@ class TestConditionalStackingNumeric:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -624,7 +623,14 @@ class TestConditionalStackingNumeric:
     async def test_numeric_low_spread_skips(self):
         """Numeric predictions with similar medians (spread/range < 0.15) should skip stacking."""
         bot = _make_bot()
-        question = _make_numeric_question()
+        question = make_mock_numeric_question(
+            question_text="How many units will be sold?",
+            background_info="Sales question",
+            resolution_criteria="Resolves to actual unit count",
+            page_url="https://test.com/3",
+            unit_of_measure="units",
+            cdf_size=201,
+        )
 
         # Model 1 centered at 48, model 2 centered at 52
         # At 50th percentile (index 5): values 48 vs 52 -> raw spread 4, normalized 4/100 = 0.04 << 0.15
@@ -637,7 +643,7 @@ class TestConditionalStackingNumeric:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -674,7 +680,7 @@ class TestConditionalStackingAggregation:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -725,7 +731,7 @@ class TestConditionalStackingAggregation:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -773,7 +779,7 @@ class TestConditionalStackingBenchmarkingFlag:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -819,7 +825,7 @@ class TestConditionalStackingModelTagStripping:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -866,7 +872,7 @@ class TestConditionalStackingFailureCounters:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -904,7 +910,7 @@ class TestConditionalStackingFailureCounters:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -962,7 +968,7 @@ class TestConditionalStackingSixModelEnsemble:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",

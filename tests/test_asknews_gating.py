@@ -1,7 +1,16 @@
 import types
 from typing import Callable
+from unittest.mock import MagicMock
 
 import pytest
+
+
+def _make_q(text: str) -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
+    contract. Tests only care about question_text on this path."""
+    q = MagicMock()
+    q.question_text = text
+    return q
 
 
 def _install_asknews_stub(monkeypatch: pytest.MonkeyPatch, on_search: Callable[[str], object]) -> None:
@@ -69,7 +78,7 @@ async def test_asknews_rate_gate_runs_before_both_calls(
 
     provider, name = rp.choose_provider_with_name()
     assert name == "asknews"
-    await provider("Will X happen?")
+    await provider(_make_q("Will X happen?"))
 
     # Two calls -> two gates; and we keep an explicit inter-call sleep
     assert len(gate_calls) == 2
@@ -115,7 +124,7 @@ async def test_global_semaphore_serializes_concurrent_requests(
 
     provider, _ = rp.choose_provider_with_name(forced_provider := None)  # type: ignore[arg-type]
     # Launch multiple requests concurrently; each request does 2 sequential calls
-    await __import__("asyncio").gather(*(provider(f"Q{i}") for i in range(4)))
+    await __import__("asyncio").gather(*(provider(_make_q(f"Q{i}")) for i in range(4)))
 
     # Entire attempt is under the global semaphore -> at most 1 in-flight search
     assert max_in_flight == 1
@@ -156,7 +165,7 @@ async def test_rps_gate_sleeps_before_historical_call(
     monkeypatch.setattr(rp.asyncio, "sleep", fake_sleep, raising=True)
 
     provider, _ = rp.choose_provider_with_name()
-    await provider("Test")
+    await provider(_make_q("Test"))
 
     # We expect both the explicit inter-call sleep and ~2.0s RPS sleep
     assert any(s > 0 for s in sleep_calls)

@@ -30,13 +30,134 @@ import logging
 import re
 from collections.abc import Iterator
 
-from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKED_MARKER_RE
+from metaculus_bot.comment_markers import (
+    HISTORICAL_STACKER_SIGNATURE_RE,
+    STACKED_BASE_REASONING_HEADER,
+    STACKED_MARKER_RE,
+    STACKER_OUTCOME_RE,
+)
+
+
+def parse_stacker_outcome_marker(comment_text: str) -> str | None:
+    """Return the STACKER_OUTCOME literal in ``comment_text``, else None.
+
+    Returns one of ``"primary"``, ``"fallback_llm"``, ``"fallback_median"``,
+    ``"skipped"`` (always lower-cased), or ``None`` if no marker is present.
+    Older comments predating the tri-state marker return ``None``.
+    """
+    match = STACKER_OUTCOME_RE.search(comment_text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def detect_historical_stacker_signature(comment_text: str) -> bool:
+    """Return True if the comment carries the pre-marker stacker body signature.
+
+    The stacking commit at 2026-04-02 (`c6d1ab3`) collapsed base predictions
+    into a single Forecaster 1 whose reasoning began with `## Meta-Analysis`
+    (later renamed to `## Stacker Meta-Analysis` on 2026-04-27, `95c4fff`).
+    Comments published in that ~25-day window AND any earlier code variants
+    that emitted the same shape carry no explicit `STACKED=` or
+    `STACKER_OUTCOME=` marker, but the body alone is recognizable.
+
+    Match conditions: the FIRST `## R1: Forecaster 1 Reasoning` block must
+    open with `## (Stacker )?Meta-Analysis` (modulo a possible `Model:` line
+    and whitespace). A bare meta-analysis header inside an ordinary forecaster
+    body is NOT signal — that's a model's own reasoning structure.
+
+    Returns False on comments that don't match the pattern (including all
+    non-stacked comments, all post-marker comments, and the very oldest
+    pre-stacking-commit comments).
+    """
+    return HISTORICAL_STACKER_SIGNATURE_RE.search(comment_text) is not None
+
+
+def parse_inferred_stacker_outcome(comment_text: str) -> tuple[str | None, str]:
+    """Return ``(outcome, source)`` combining marker and historical signature.
+
+    Source is a string explaining how the outcome was determined:
+
+    * ``"marker_outcome"`` — explicit ``STACKER_OUTCOME=...`` marker present.
+    * ``"marker_legacy"`` — explicit ``STACKED=true|false`` marker only;
+      outcome inferred to ``"primary"`` (true) or ``"skipped"`` (false). The
+      legacy marker can't distinguish primary from fallback_llm or skipped
+      from fallback_median, so this is a lossy mapping kept for back-compat.
+    * ``"historical_body"`` — no marker, but the comment body carries the
+      pre-marker stacker signature (`## R1: Forecaster 1 Reasoning` opening
+      with `## (Stacker )?Meta-Analysis`). Outcome inferred to ``"primary"``
+      since the body shape was only produced when the stacker LLM ran
+      successfully — failed-stacker / median-fallback paths in old code did
+      NOT collapse to a single Forecaster-1-with-Meta-Analysis shape.
+    * ``"none"`` — neither marker nor historical signature present. Returns
+      outcome=None, leaving downstream interpretation to the caller (it could
+      be a non-stacking strategy, a skipped trigger, or an old comment from
+      pre-stacking days).
+
+    Use this when analyzing a dataset that spans multiple code versions —
+    e.g., the spring-aib-2026 closing dataset where all forecasts predate
+    the explicit markers and the only signal is body shape.
+    """
+    marker_outcome = parse_stacker_outcome_marker(comment_text)
+    if marker_outcome is not None:
+        return marker_outcome, "marker_outcome"
+    legacy = parse_stacked_marker(comment_text)
+    if legacy is True:
+        return "primary", "marker_legacy"
+    if legacy is False:
+        return "skipped", "marker_legacy"
+    if detect_historical_stacker_signature(comment_text):
+        return "primary", "historical_body"
+    return None, "none"
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Matches bullet lines like: *Forecaster 3*: 72.0%
 # Also matches the annotated form: *Forecaster 3 (gpt-5.5)*: 72.0%
-_FORECASTER_RE: re.Pattern[str] = re.compile(r"\*Forecaster\s+(\d+)(?:\s*\(([^)]+)\))?\*\s*:\s*(.+)")
+#
+# F10: anchor to start-of-line (or start-of-string) so stray ``*Forecaster N*:``
+# patterns inside reasoning prose ("...*Forecaster 3*: 50% would have been
+# wrong") don't get parsed as real bullets. The bot only ever emits these
+# bullets at column 0; quoted occurrences inside prose always have leading
+# context. We additionally split on the summary-section boundary in
+# ``_summary_section_for_bullets`` to limit the regex to the right section.
+_FORECASTER_RE: re.Pattern[str] = re.compile(r"(?m)^\*Forecaster\s+(\d+)(?:\s*\(([^)]+)\))?\*\s*:\s*(.+)")
+
+# Header that follows the summary section (``### Forecasts``) and marks the
+# end of the bullet region. Comments are structured as
+# ``## Report 1 Summary / ### Forecasts / *Forecaster N*: ... / ### Research
+# Summary / ...`` (see ``metaculus_bot.comment_trimming._SUMMARY_END_MARKER``).
+# Splitting on this boundary prevents the parser from picking up bullet-shaped
+# strings inside research prose or rationale bodies.
+_SUMMARY_END_MARKER: str = "### Research Summary"
+
+# Secondary boundary: the rationales divider ``================... FORECAST
+# SECTION:``. Used as a backup when the research-summary marker is absent
+# (e.g. if it's been trimmed away) but the rationale section is still present.
+_FORECAST_SECTION_MARKER_RE: re.Pattern[str] = re.compile(r"^=+\s*\nFORECAST SECTION:", re.MULTILINE)
+
+
+def _summary_section_for_bullets(comment_text: str) -> str:
+    """Return the prefix of ``comment_text`` that contains the summary bullets.
+
+    Splits on ``### Research Summary`` (the canonical end-of-summary marker).
+    Falls back to splitting on the ``FORECAST SECTION:`` divider if the
+    summary marker is missing. If neither is present, logs a warning and
+    returns the full text — caller will fall back to legacy unanchored matching
+    (still safer than mislabeling, since the regex itself is now line-anchored).
+    """
+    marker_idx = comment_text.find(_SUMMARY_END_MARKER)
+    if marker_idx >= 0:
+        return comment_text[:marker_idx]
+    fallback = _FORECAST_SECTION_MARKER_RE.search(comment_text)
+    if fallback is not None:
+        return comment_text[: fallback.start()]
+    logger.warning(
+        "No summary-section boundary marker found in comment; falling back to line-anchored matching across full text"
+    )
+    return comment_text
+
 
 # Matches the leading "Model: openrouter/..." line prepended to each
 # ReasonedPrediction.reasoning by main.TemplateForecaster._make_prediction.
@@ -70,11 +191,21 @@ _PROBABILITY_VALUE_RE: re.Pattern[str] = re.compile(r"(-?[0-9]+(?:\.[0-9]+)?)\s*
 def _parse_probability(raw: str) -> float | None:
     """Parse a per-model forecast string into a probability in [0, 1].
 
-    Accepts values like ``"72.0%"`` and ``"0.72"``. Treats bare numbers > 1 as
-    percentages (heuristic for inputs like ``"72"`` missing the ``%``). Returns
-    None for unparseable strings or values that fall outside [0, 1] after
-    scaling — an out-of-range forecast is almost certainly a parse error and
-    shouldn't silently enter Brier/spread calculations.
+    Accepts values like ``"72.0%"`` and ``"0.72"``. Heuristic for bare numbers:
+
+    * Explicit ``%`` in the source string → always divide by 100.
+    * Bare value in ``[0, 1]`` → treat as already-scaled probability.
+    * Bare value in ``[1.5, 100]`` → treat as percentage (the bot's
+      missing-``%`` form on values like ``"72"``); divide by 100.
+    * Bare value in ``(1.0, 1.5)`` → ambiguous (too high for a valid
+      probability, too low to confidently be a percentage). Reject as a
+      parse error to avoid silently corrupting Brier/spread calculations
+      with a ~2× scaled value (the F11 bug pre-fix).
+    * Bare value > 100 or value < 0 → reject as out-of-range parse error.
+
+    Returns ``None`` for any rejected case and logs a WARNING when an
+    in-range but ambiguous value is dropped, so operators can grep the
+    skip rate for upstream parse drift.
     """
     match = _PROBABILITY_VALUE_RE.search(raw)
     if match is None:
@@ -83,11 +214,29 @@ def _parse_probability(raw: str) -> float | None:
         num = float(match.group(1))
     except ValueError:
         return None
-    if "%" in raw or num > 1.0:
-        num = num / 100.0
-    if num < 0.0 or num > 1.0:
+    has_percent = "%" in raw
+    if has_percent:
+        scaled = num / 100.0
+    elif 0.0 <= num <= 1.0:
+        scaled = num
+    elif 1.5 <= num <= 100.0:
+        scaled = num / 100.0
+    else:
+        # Either negative, in the (1.0, 1.5) ambiguous zone, or > 100.
+        # The (1.0, 1.5) zone is the load-bearing fix: ``"1.2"`` was being
+        # silently coerced to 0.012 — a parse error masquerading as a tiny
+        # probability that contaminated Brier / spread metrics. Drop it
+        # explicitly with a WARNING so the skip rate is auditable.
+        logger.warning(
+            "Dropping out-of-range probability value: %r (parsed as %s; "
+            "neither a valid decimal probability nor a confident percentage)",
+            raw,
+            num,
+        )
         return None
-    return num
+    if scaled < 0.0 or scaled > 1.0:
+        return None
+    return scaled
 
 
 # Matches each R1 Forecaster N Reasoning section, capturing the section body
@@ -408,8 +557,9 @@ def parse_per_model_forecasts(
     else:
         fallback_map = parse_forecaster_model_map(comment_text)
 
+    summary_text = _summary_section_for_bullets(comment_text)
     result: dict[str, str] = {}
-    for match in _FORECASTER_RE.finditer(comment_text):
+    for match in _FORECASTER_RE.finditer(summary_text):
         idx = int(match.group(1))
         inline_name = match.group(2)
         value = match.group(3).strip()

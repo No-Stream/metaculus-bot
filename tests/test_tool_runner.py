@@ -21,6 +21,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.tool_runner import (
     FEATURE_FLAG_ENV,
+    TYPES_ENV,
+    _feature_enabled,
     _lr_chained_posterior,
     aggregate_binary_values,
     aggregate_mc_values,
@@ -379,6 +381,88 @@ class TestRunToolsNumeric:
         with caplog.at_level(logging.WARNING):
             result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="m")
         assert result == ""
+
+    def test_numeric_with_mixture_components_surfaces_section(self):
+        # Workstream D3: mixture_components populated in NumericStructured should
+        # surface a "Mixture-of-normals" subsection in the output.
+        payload = _numeric_payload(
+            mixture_components=[
+                {"weight": 0.2, "mean": 20.0, "sd": 5.0},
+                {"weight": 0.55, "mean": 50.0, "sd": 8.0},
+                {"weight": 0.25, "mean": 80.0, "sd": 6.0},
+            ],
+        )
+        rationale = _wrap_json(payload)
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        # Section header.
+        assert "### Mixture-of-normals" in result
+
+        # Each component's full triple (weight, mean, sd) must appear in the
+        # rendered table — not just the mean. Per _render_mixture_section
+        # tool_runner.py:322-323:
+        #   "- Component {i+1}: weight {weight:.3f}, mean {mean:.3g}, sd {sd:.3g}"
+        assert "Component 1: weight 0.200, mean 20, sd 5" in result
+        assert "Component 2: weight 0.550, mean 50, sd 8" in result
+        assert "Component 3: weight 0.250, mean 80, sd 6" in result
+
+        # CDF sample table header + exactly 5 sample rows over [0, 100].
+        # Sample rows are indented two spaces ("  - "); the header line is "- ".
+        assert "CDF sample (value → F):" in result
+        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
+        assert len(cdf_sample_lines) == 5, f"expected 5 CDF sample rows, got {len(cdf_sample_lines)}"
+
+        # Bounded size: a well-formed mixture section is a small markdown
+        # block. A pathological serializer dumping a 201-pt CDF would balloon
+        # this past a few hundred chars — guard the upper bound.
+        mixture_section = result.split("### Mixture-of-normals", 1)[1]
+        assert len(mixture_section) < 1000, (
+            f"mixture section is unexpectedly large ({len(mixture_section)} chars); "
+            "rendering may be dumping more than the 5-row sample table"
+        )
+
+    def test_numeric_without_mixture_components_unchanged(self):
+        # Regression: existing numeric path (percentiles only) still works and does
+        # NOT surface a mixture section when mixture_components is absent.
+        rationale = _wrap_json(_numeric_payload())
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        assert "Percentile-family consistency" in result
+        assert "Out-of-bounds mass" in result
+        assert "Mixture-of-normals" not in result
+
+    def test_numeric_with_both_percentiles_and_mixture_shows_both(self):
+        # When both declared_percentiles and mixture_components are present, both
+        # sections appear. No consistency check between them (that's Workstream E).
+        payload = _numeric_payload(
+            mixture_components=[
+                {"weight": 0.3, "mean": 25.0, "sd": 7.0},
+                {"weight": 0.4, "mean": 50.0, "sd": 10.0},
+                {"weight": 0.3, "mean": 75.0, "sd": 8.0},
+            ],
+        )
+        rationale = _wrap_json(payload)
+        result = run_tools_for_forecaster(
+            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
+            rationale=rationale,
+            forecaster_id="m",
+        )
+        # Both sections must surface — no consistency check between them.
+        assert "Percentile-family consistency" in result
+        assert "### Mixture-of-normals" in result
+        # Each component's full triple appears verbatim.
+        assert "Component 1: weight 0.300, mean 25, sd 7" in result
+        assert "Component 2: weight 0.400, mean 50, sd 10" in result
+        assert "Component 3: weight 0.300, mean 75, sd 8" in result
+        # CDF sample table has exactly 5 rows.
+        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
+        assert len(cdf_sample_lines) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1240,6 +1324,134 @@ class TestCrossModelMixedBlocks:
 
 
 # ---------------------------------------------------------------------------
+# Spread plausibility check (Phase A.3 Package 3c)
+# ---------------------------------------------------------------------------
+
+
+class TestSpreadPlausibilityCheck:
+    """Per-forecaster spread sanity check for numeric aggregation.
+
+    Defense-in-depth atop the family-consistency check. Catches a
+    confidently-narrow forecaster (e.g. qid 43171's GLM-4.5-air with σ=13K
+    while ensemble σ ~965K) that the family check ratifies but is
+    effectively over-fit to fabricated data.
+
+    σ is derived from declared P10/P90: σ ≈ (P90 - P10) / 2.5631 (the
+    ``_P10_P90_Z_GAP`` constant from probabilistic_tools/distributions.py).
+    For each forecaster, ratio = σ_i / median(σ across forecasters). If
+    ratio < 0.10, emit a ⚠ Spread anomaly line. Otherwise emit a single
+    summary line confirming all forecasters fall within the threshold.
+    """
+
+    def _make_pcts(self, median: float, p10: float, p90: float) -> list[Percentile]:
+        """11-point percentile vector implied σ = (p90 - p10) / 2.5631."""
+        return [
+            Percentile(percentile=0.025, value=median - 2 * (median - p10)),
+            Percentile(percentile=0.05, value=median - 1.5 * (median - p10)),
+            Percentile(percentile=0.10, value=p10),
+            Percentile(percentile=0.20, value=median - 0.5 * (median - p10)),
+            Percentile(percentile=0.40, value=median - 0.1 * (median - p10)),
+            Percentile(percentile=0.50, value=median),
+            Percentile(percentile=0.60, value=median + 0.1 * (p90 - median)),
+            Percentile(percentile=0.80, value=median + 0.5 * (p90 - median)),
+            Percentile(percentile=0.90, value=p90),
+            Percentile(percentile=0.95, value=median + 1.5 * (p90 - median)),
+            Percentile(percentile=0.975, value=median + 2 * (p90 - median)),
+        ]
+
+    def test_warns_on_narrow_sigma_forecaster(self):
+        """Forecaster 4 has σ ≈ 0.039 (P90-P10 = 0.1 / 2.5631), the others σ ≈ 1.0."""
+        # Three forecasters with σ ≈ 1.0 ((P90-P10) ≈ 2.5631) plus one narrow.
+        preds = [
+            self._make_pcts(median=10.0, p10=10.0 - 1.28155, p90=10.0 + 1.28155),
+            self._make_pcts(median=12.0, p10=12.0 - 1.28155, p90=12.0 + 1.28155),
+            self._make_pcts(median=11.0, p10=11.0 - 1.28155, p90=11.0 + 1.28155),
+            self._make_pcts(median=10.5, p10=10.5 - 0.05, p90=10.5 + 0.05),
+        ]
+        out = aggregate_numeric_values(rationales=["", "", "", ""], prediction_percentiles=preds)
+        assert "⚠ Spread anomaly" in out
+        # 1-indexed, so the narrow forecaster is #4.
+        assert "forecaster 4" in out
+        # No false-positives for the three normal forecasters.
+        for idx in (1, 2, 3):
+            assert f"forecaster {idx})" not in out, f"forecaster {idx} should not be flagged"
+
+    def test_no_warning_when_all_within_threshold(self):
+        """Three forecasters, σ in {0.95, 1.0, 1.05} — all within 10× of median σ."""
+        preds = [
+            self._make_pcts(median=10.0, p10=10.0 - 0.5 * 2.5631 * 0.95, p90=10.0 + 0.5 * 2.5631 * 0.95),
+            self._make_pcts(median=10.0, p10=10.0 - 0.5 * 2.5631 * 1.0, p90=10.0 + 0.5 * 2.5631 * 1.0),
+            self._make_pcts(median=10.0, p10=10.0 - 0.5 * 2.5631 * 1.05, p90=10.0 + 0.5 * 2.5631 * 1.05),
+        ]
+        out = aggregate_numeric_values(rationales=["", "", ""], prediction_percentiles=preds)
+        assert "⚠ Spread anomaly" not in out
+        assert "Spread plausibility" in out
+        assert "all 3 forecasters within 10×" in out
+
+    def test_skips_when_p10_or_p90_missing(self):
+        """Forecasters without both P10 and P90 are excluded from the σ pool."""
+        # Two forecasters have full P10/P90, one only has P50.
+        preds_full = self._make_pcts(median=10.0, p10=8.0, p90=12.0)
+        preds_full_2 = self._make_pcts(median=11.0, p10=9.0, p90=13.0)
+        preds_no_tail = [Percentile(percentile=0.5, value=10.5)]
+
+        out = aggregate_numeric_values(
+            rationales=["", "", ""],
+            prediction_percentiles=[preds_full, preds_full_2, preds_no_tail],
+        )
+        # Should still produce a summary line for the 2 forecasters with valid σ.
+        assert "Spread plausibility" in out
+        assert "all 2 forecasters within 10×" in out
+
+    def test_skips_when_only_one_forecaster(self):
+        """With one forecaster the median σ is undefined; section is suppressed."""
+        # Even though we still have ≥2 entries (gating bound), only one has P10/P90.
+        preds_full = self._make_pcts(median=10.0, p10=8.0, p90=12.0)
+        preds_no_tail = [Percentile(percentile=0.5, value=10.5)]
+
+        out = aggregate_numeric_values(
+            rationales=["", ""],
+            prediction_percentiles=[preds_full, preds_no_tail],
+        )
+        # No spread section because only one forecaster has a valid σ.
+        assert "Spread anomaly" not in out
+        assert "Spread plausibility" not in out
+
+    def test_emits_summary_when_no_anomalies(self):
+        """When all σ within threshold, emit a single summary line."""
+        preds = [
+            self._make_pcts(median=10.0, p10=8.0, p90=12.0),  # σ ≈ 1.56
+            self._make_pcts(median=10.0, p10=8.5, p90=11.5),  # σ ≈ 1.17
+            self._make_pcts(median=10.0, p10=7.5, p90=12.5),  # σ ≈ 1.95
+        ]
+        out = aggregate_numeric_values(rationales=["", "", ""], prediction_percentiles=preds)
+        assert "Spread plausibility" in out
+        assert "all 3 forecasters" in out
+
+    def test_qid_43171_regression_pattern(self):
+        """Replay qid 43171's pattern: one forecaster with σ ~0.04M, three with σ in 1-3M.
+
+        Don't need real Metaculus data — synthetic 4-forecaster scenario reproduces
+        the GLM-vs-ensemble-σ ratio that the family check failed to catch.
+        """
+        # Three with σ ~1.0M-3.0M, one narrow with σ ~0.04M. Ratio ~= 0.02 ≪ 0.10.
+        m = 1_000_000.0  # Median value scale
+        preds = [
+            # σ ≈ 1.0M
+            self._make_pcts(median=m, p10=m - 1.28155 * 1_000_000, p90=m + 1.28155 * 1_000_000),
+            # σ ≈ 2.0M
+            self._make_pcts(median=m, p10=m - 1.28155 * 2_000_000, p90=m + 1.28155 * 2_000_000),
+            # σ ≈ 3.0M
+            self._make_pcts(median=m, p10=m - 1.28155 * 3_000_000, p90=m + 1.28155 * 3_000_000),
+            # σ ≈ 0.04M (the GLM-style narrow one — third forecaster, 0-indexed = 3, 1-indexed = 4)
+            self._make_pcts(median=m, p10=m - 1.28155 * 40_000, p90=m + 1.28155 * 40_000),
+        ]
+        out = aggregate_numeric_values(rationales=["", "", "", ""], prediction_percentiles=preds)
+        assert "⚠ Spread anomaly" in out
+        assert "forecaster 4" in out  # 1-indexed: the narrow one is the 4th in the list
+
+
+# ---------------------------------------------------------------------------
 # Dummy assertion so pytest doesn't skip the file on collection issues.
 # ---------------------------------------------------------------------------
 
@@ -1251,6 +1463,134 @@ def test_module_imports():
     assert callable(aggregate_binary_values)
     assert callable(aggregate_numeric_values)
     assert callable(aggregate_mc_values)
+
+
+# ---------------------------------------------------------------------------
+# Per-type gating (PROBABILISTIC_TOOLS_TYPES allow-list)
+# ---------------------------------------------------------------------------
+
+
+class TestPerTypeGating:
+    def test_global_off_disables_all_types(self, monkeypatch):
+        # FEATURE_FLAG_ENV unset → all _feature_enabled(...) return False
+        monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+        assert _feature_enabled("binary") is False
+        assert _feature_enabled("multiple_choice") is False
+        assert _feature_enabled("numeric") is False
+        assert _feature_enabled(None) is False
+
+    def test_global_on_default_types_all_enabled(self, monkeypatch):
+        # FEATURE_FLAG_ENV=true, TYPES unset → defaults to all 3 enabled (back-compat)
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.delenv(TYPES_ENV, raising=False)
+        assert _feature_enabled("binary") is True
+        assert _feature_enabled("multiple_choice") is True
+        assert _feature_enabled("numeric") is True
+
+    def test_types_csv_excludes_numeric(self, monkeypatch):
+        # Production setting: binary+MC only
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
+        assert _feature_enabled("binary") is True
+        assert _feature_enabled("multiple_choice") is True
+        assert _feature_enabled("numeric") is False
+
+    def test_types_csv_strips_whitespace(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary, multiple_choice ")
+        assert _feature_enabled("binary") is True
+        assert _feature_enabled("multiple_choice") is True
+        assert _feature_enabled("numeric") is False
+
+    def test_invalid_type_in_csv_is_ignored_with_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary,foo,multiple_choice")
+        with caplog.at_level("WARNING"):
+            assert _feature_enabled("binary") is True
+            assert _feature_enabled("multiple_choice") is True
+            assert _feature_enabled("numeric") is False
+        assert any("invalid" in rec.message.lower() for rec in caplog.records)
+
+    def test_question_type_none_only_checks_global(self, monkeypatch):
+        # When question_type isn't known, only the global flag matters.
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary")  # numeric+mc disallowed
+        assert _feature_enabled(None) is True  # passes — type-agnostic check
+
+
+class TestPerTypeAggregateGating:
+    def test_aggregate_numeric_returns_empty_when_numeric_excluded_by_types(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
+        preds = [
+            [
+                Percentile(percentile=0.1, value=10),
+                Percentile(percentile=0.5, value=30),
+                Percentile(percentile=0.9, value=50),
+            ],
+            [
+                Percentile(percentile=0.1, value=20),
+                Percentile(percentile=0.5, value=40),
+                Percentile(percentile=0.9, value=60),
+            ],
+        ]
+        result = aggregate_numeric_values(rationales=["", ""], prediction_percentiles=preds)
+        assert result == ""
+
+    def test_aggregate_binary_runs_when_binary_in_types(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
+        rationales = [
+            _wrap_json(_binary_payload(posterior_prob=0.2)),
+            _wrap_json(_binary_payload(posterior_prob=0.5)),
+        ]
+        result = aggregate_binary_values(rationales=rationales, prediction_probs=[0.2, 0.5])
+        assert result != ""  # non-empty CMA produced
+
+    def test_aggregate_mc_runs_when_mc_in_types(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "true")
+        monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
+        pred1 = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Red", probability=0.5),
+                PredictedOption(option_name="Blue", probability=0.5),
+            ]
+        )
+        pred2 = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Red", probability=0.4),
+                PredictedOption(option_name="Blue", probability=0.6),
+            ]
+        )
+        result = aggregate_mc_values(["", ""], prediction_options=[pred1, pred2])
+        assert result != ""
+
+
+# ---------------------------------------------------------------------------
+# Production workflow YAML configuration
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowYamlConfiguration:
+    def test_workflow_yamls_set_both_env_vars(self):
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        workflows = [
+            repo_root / ".github/workflows/run_bot_on_tournament.yaml",
+            repo_root / ".github/workflows/run_bot_on_metaculus_cup.yaml",
+            repo_root / ".github/workflows/run_bot_on_minibench.yaml",
+        ]
+        for path in workflows:
+            text = path.read_text(encoding="utf-8")
+            assert "PROBABILISTIC_TOOLS_ENABLED" in text, f"{path} missing global flag"
+            assert "PROBABILISTIC_TOOLS_TYPES" in text, f"{path} missing types flag"
+            # Light check: types contains binary + multiple_choice (not numeric).
+            # Operator can change later but the default ship state should match
+            # the empirical (binary p=0.094, MC directional, numeric inconclusive)
+            # decision.
+            assert "binary" in text
+            assert "multiple_choice" in text
 
 
 # Appease linters about pytest fixture param naming — kept unused on purpose.

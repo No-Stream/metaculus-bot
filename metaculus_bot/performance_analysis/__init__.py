@@ -22,6 +22,7 @@ from metaculus_bot.performance_analysis.audit import (
     emit_synthesis,
     load_combined_dataset,
     rank_our_models_by_accuracy,
+    select_cohort,
     select_worst_misses,
 )
 from metaculus_bot.performance_analysis.collector import (
@@ -33,13 +34,16 @@ from metaculus_bot.performance_analysis.collector import (
 )
 from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
+    detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
     parse_forecaster_model_map,
+    parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
     parse_per_model_numeric_percentiles,
     parse_per_model_reasoning_text,
     parse_resolution,
     parse_stacked_marker,
+    parse_stacker_outcome_marker,
 )
 from metaculus_bot.performance_analysis.scoring import (
     binary_log_score,
@@ -54,6 +58,7 @@ __all__ = [
     "binary_summary",
     "brier_score",
     "build_performance_dataset",
+    "detect_historical_stacker_signature",
     "disagreement_predicts_error",
     "emit_combined_report",
     "emit_external_comment_stub",
@@ -72,14 +77,17 @@ __all__ = [
     "numeric_log_score",
     "numeric_pit_analysis",
     "parse_forecaster_model_map",
+    "parse_inferred_stacker_outcome",
     "parse_per_model_forecasts",
     "parse_per_model_numeric_percentiles",
     "parse_per_model_reasoning_text",
     "parse_resolution",
     "parse_stacked_marker",
+    "parse_stacker_outcome_marker",
     "per_model_binary_scores",
     "rank_our_models_by_accuracy",
     "save_dataset",
+    "select_cohort",
     "select_worst_misses",
     "stacking_effectiveness",
 ]

@@ -10,11 +10,50 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
 from metaculus_bot.pchip_cdf import (
+    enforce_min_steps,
     enforce_strict_increasing,
     generate_pchip_cdf,
     percentiles_to_pchip_format,
     safe_cdf_bounds,
 )
+
+
+class TestEnforceMinSteps:
+    """Test the panchul-style forward+backward sweep that keeps adjacent
+    CDF points at least ``min_step`` apart while respecting upper/lower caps.
+
+    Used by both the PCHIP pipeline and the mixture-of-normals CDF builder."""
+
+    def test_already_compliant_input_unchanged(self):
+        y = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+        out = enforce_min_steps(y, min_step=0.05)
+        np.testing.assert_allclose(out, y)
+
+    def test_below_min_step_lifts_via_forward_pass(self):
+        y = np.array([0.0, 0.001, 0.002, 0.003])
+        out = enforce_min_steps(y, min_step=0.1)
+        for i in range(1, len(out)):
+            assert out[i] - out[i - 1] >= 0.1 - 1e-12
+
+    def test_upper_cap_pins_late_values_and_back_fills(self):
+        # Mixture-CDF case: tight tails saturate early; backward pass back-fills.
+        y = np.array([0.0, 0.5, 0.9, 0.99, 0.999, 1.0, 1.0, 1.0])
+        out = enforce_min_steps(y, min_step=0.01, upper_cap=1.0)
+        for i in range(1, len(out)):
+            assert out[i] - out[i - 1] >= 0.01 - 1e-12
+        assert out[-1] <= 1.0 + 1e-12
+
+    def test_open_upper_cap_respected(self):
+        # Open-upper question: cap at 0.999 instead of 1.0.
+        y = np.array([0.0, 0.5, 0.99, 0.995, 0.999])
+        out = enforce_min_steps(y, min_step=0.001, upper_cap=0.999)
+        assert out[-1] <= 0.999 + 1e-12
+
+    def test_lower_cap_pulls_negatives_up(self):
+        # Open-lower question: backward pass could drop a value below 0.001.
+        y = np.array([0.0005, 0.0006, 0.0007, 0.5, 1.0])
+        out = enforce_min_steps(y, min_step=0.0005, upper_cap=1.0, lower_cap=0.001)
+        assert out[0] >= 0.001 - 1e-12
 
 
 class TestPercentilesToPchipFormat:

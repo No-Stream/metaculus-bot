@@ -7,8 +7,10 @@ fields (prior, base rate, hazard, percentiles, scenarios, etc.). A post-hoc
 tool runner extracts these blocks and feeds them to probabilistic tools
 (Beta-binomial, log-pooling, distribution fitting).
 
-This module defines the schemas and extraction helpers. It is DORMANT:
-nothing here is wired into the prompt or runtime pipeline yet.
+This module defines the schemas and extraction helpers. Active surface,
+gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and per-question-type
+via ``PROBABILISTIC_TOOLS_TYPES``. See ``metaculus_bot/tool_runner.py``
+for dispatch and ``main.py:_make_prediction`` for the activation site.
 
 Note: ``DiscreteCountStructured`` is defined here but not dispatched by the
 current tool runner — discrete-count question dispatch is phase-3 work. The
@@ -144,6 +146,20 @@ class ScenarioBranch(BaseModel):
     conditional_outcome: str | None = None
 
 
+class MixtureComponentDeclaration(BaseModel):
+    """Mixture-of-normals component.
+
+    Weights across all components in a NumericStructured must sum to 1.0
+    within 1e-3 tolerance (checked at ``NumericStructured`` level).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    weight: float = Field(ge=0.0)
+    mean: float
+    sd: float = Field(gt=0.0)
+
+
 class TailMass(BaseModel):
     """Declared mass outside the question's declared numeric range."""
 
@@ -215,6 +231,21 @@ class NumericStructured(BaseModel):
     student_t_df: float | None = None
     tails: TailMass | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
+    mixture_components: list[MixtureComponentDeclaration] | None = None
+
+    @field_validator("mixture_components")
+    @classmethod
+    def _check_mixture_components(
+        cls, v: list[MixtureComponentDeclaration] | None
+    ) -> list[MixtureComponentDeclaration] | None:
+        if v is None:
+            return None
+        if len(v) < 2:
+            raise ValueError(f"mixture_components requires at least 2 components (got {len(v)})")
+        total = sum(c.weight for c in v)
+        if not (0.999 <= total <= 1.001):
+            raise ValueError(f"mixture_components weights must sum to 1.0 within 1e-3, got {total}")
+        return v
 
     @field_validator("student_t_df")
     @classmethod

@@ -15,14 +15,17 @@ at ``<audit_dir>/human_comments/<post_id>.md`` and inlines them verbatim.
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
+from typing import Literal
 
-from metaculus_bot.performance_analysis.collector import load_dataset
+from metaculus_bot.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.performance_analysis.collector import load_dataset, resolve_numeric_record_to_score_inputs
 from metaculus_bot.performance_analysis.parsing import (
     _parse_probability,
     parse_per_model_forecasts,
 )
-from metaculus_bot.performance_analysis.scoring import brier_score
+from metaculus_bot.performance_analysis.scoring import brier_score, numeric_log_score
 
 logger = logging.getLogger(__name__)
 
@@ -52,74 +55,138 @@ def _record_peer_score(record: dict) -> float | None:
     return sd.get("peer_score")
 
 
-def select_worst_misses(
+def _has_rankable_score(r: dict, fallback_field: str) -> bool:
+    return _record_peer_score(r) is not None or r.get(fallback_field) is not None
+
+
+def _filter_by_type(records: list[dict], q_types: tuple[str, ...], fallback_field: str) -> list[dict]:
+    return [r for r in records if r.get("type") in q_types and _has_rankable_score(r, fallback_field)]
+
+
+def _rank_key_worst_binary(r: dict) -> tuple[int, float]:
+    peer = _record_peer_score(r)
+    if peer is not None:
+        return (0, peer)  # primary: peer ascending (most negative = worst)
+    brier = r.get("brier_score")
+    if brier is None:
+        return (2, 0.0)
+    return (1, -brier)  # fallback: higher Brier = worse
+
+
+def _rank_key_worst_logscore(r: dict, field: str) -> tuple[int, float]:
+    peer = _record_peer_score(r)
+    if peer is not None:
+        return (0, peer)
+    log = r.get(field)
+    if log is None:
+        return (2, 0.0)
+    return (1, log)  # fallback: lower log = worse
+
+
+def _rank_key_best_binary(r: dict) -> tuple[int, float]:
+    peer = _record_peer_score(r)
+    if peer is not None:
+        return (0, -peer)  # primary: peer descending (most positive = best)
+    brier = r.get("brier_score")
+    if brier is None:
+        return (2, 0.0)
+    return (1, brier)  # fallback: lower Brier = better
+
+
+def _rank_key_best_logscore(r: dict, field: str) -> tuple[int, float]:
+    peer = _record_peer_score(r)
+    if peer is not None:
+        return (0, -peer)
+    log = r.get(field)
+    if log is None:
+        return (2, 0.0)
+    return (1, -log)  # fallback: higher log = better
+
+
+def _middle_band(records: list[dict]) -> list[dict]:
+    """Return the records whose peer_score falls in the 20-80 percentile band.
+
+    Records without a peer_score are dropped — middle-mode is peer-anchored
+    only. This is intentional: the cohort is meant to surface "ordinary
+    questions" relative to the crowd, which requires peer comparability.
+    """
+    with_peer = [r for r in records if _record_peer_score(r) is not None]
+    if not with_peer:
+        return []
+    sorted_records = sorted(with_peer, key=lambda r: _record_peer_score(r) or 0.0)
+    n = len(sorted_records)
+    lower_idx = int(0.2 * n)
+    upper_idx = max(lower_idx, int(0.8 * n))
+    return sorted_records[lower_idx:upper_idx]
+
+
+def select_cohort(
     records: list[dict],
+    mode: Literal["worst", "best", "middle"],
     n_binary: int = 10,
     n_numeric: int = 5,
     n_mc: int = 2,
     extra_post_ids: list[int] | None = None,
+    seed: int = 42,
 ) -> list[dict]:
-    """Pick the worst records per question type, ranked by peer score.
+    """Pick records per question type, ranked by peer score under one of three modes.
 
     Peer score compares our log score to the crowd's mean log score (negative =
     worse than peers). When populated on ``metaculus_scores.peer_score``, it's
     the canonical ranking signal because it's comparable across question types
     and accounts for question difficulty.
 
-    Records missing peer score fall back to absolute scores:
-    - Binary: highest Brier (worse = farther from truth).
-    - Numeric/discrete/MC: lowest log score (worse = more confidently wrong).
+    Modes:
+    - ``"worst"``: peer ascending (most negative = worst). Fallback: highest
+      Brier (binary) / lowest log score (numeric, MC).
+    - ``"best"``: peer descending (most positive = best). Fallback: lowest
+      Brier / highest log score.
+    - ``"middle"``: rank by peer_score, drop the bottom 20% and top 20% as
+      extremes, then ``random.Random(seed).sample(...)`` to draw N per type.
+      Middle 60% (not pure random) so the cohort surfaces "ordinary"
+      questions; pure random risks repeatedly drawing near-extremes that
+      defeat the purpose. Records without peer_score are dropped from middle
+      mode (no peer comparability → no "middle").
 
-    Records that are None on both peer and the type-specific fallback are
-    dropped.
+    Records missing both peer score and the type-specific fallback are
+    dropped (worst/best modes). Middle mode additionally drops records
+    without peer score regardless of fallback availability.
 
     ``extra_post_ids`` unions a manually-curated list of post_ids onto the
-    selection (deduplicated, appended in input order). Use this to include
-    questions the user wants audited regardless of the automatic ranking —
-    e.g. spot_peer_score outliers not caught by the peer_score top-N.
+    selection (deduplicated, appended in input order). Useful for spot_peer
+    outliers or known-interesting questions outside the auto-selected top-N.
 
     Returns concatenated list in (binary, numeric, mc, extras) order.
     """
+    if mode == "worst":
+        binary_pool = _filter_by_type(records, ("binary",), "brier_score")
+        numeric_pool = _filter_by_type(records, ("numeric", "discrete"), "numeric_log_score")
+        mc_pool = _filter_by_type(records, ("multiple_choice",), "mc_log_score")
+        sel_binary = sorted(binary_pool, key=_rank_key_worst_binary)[:n_binary]
+        sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_worst_logscore(r, "numeric_log_score"))[:n_numeric]
+        sel_mc = sorted(mc_pool, key=lambda r: _rank_key_worst_logscore(r, "mc_log_score"))[:n_mc]
+    elif mode == "best":
+        binary_pool = _filter_by_type(records, ("binary",), "brier_score")
+        numeric_pool = _filter_by_type(records, ("numeric", "discrete"), "numeric_log_score")
+        mc_pool = _filter_by_type(records, ("multiple_choice",), "mc_log_score")
+        sel_binary = sorted(binary_pool, key=_rank_key_best_binary)[:n_binary]
+        sel_numeric = sorted(numeric_pool, key=lambda r: _rank_key_best_logscore(r, "numeric_log_score"))[:n_numeric]
+        sel_mc = sorted(mc_pool, key=lambda r: _rank_key_best_logscore(r, "mc_log_score"))[:n_mc]
+    elif mode == "middle":
+        rng = random.Random(seed)
+        middle = _middle_band(records)
+        binary_pool = [r for r in middle if r.get("type") == "binary"]
+        numeric_pool = [r for r in middle if r.get("type") in ("numeric", "discrete")]
+        mc_pool = [r for r in middle if r.get("type") == "multiple_choice"]
+        sel_binary = rng.sample(binary_pool, min(n_binary, len(binary_pool)))
+        sel_numeric = rng.sample(numeric_pool, min(n_numeric, len(numeric_pool)))
+        sel_mc = rng.sample(mc_pool, min(n_mc, len(mc_pool)))
+    else:
+        raise ValueError(  # type: ignore[reportUnreachable]
+            f"Unknown mode {mode!r}; expected 'worst', 'best', or 'middle'"
+        )
 
-    def _rank_key_binary(r: dict) -> tuple[int, float]:
-        peer = _record_peer_score(r)
-        if peer is not None:
-            return (0, peer)  # primary: peer ascending (most negative = worst)
-        brier = r.get("brier_score")
-        if brier is None:
-            return (2, 0.0)
-        return (1, -brier)  # fallback: higher Brier = worse
-
-    def _rank_key_logscore(r: dict, field: str) -> tuple[int, float]:
-        peer = _record_peer_score(r)
-        if peer is not None:
-            return (0, peer)
-        log = r.get(field)
-        if log is None:
-            return (2, 0.0)
-        return (1, log)  # fallback: lower log = worse
-
-    def _has_rankable_score(r: dict, fallback_field: str) -> bool:
-        return _record_peer_score(r) is not None or r.get(fallback_field) is not None
-
-    worst_binary = sorted(
-        [r for r in records if r.get("type") == "binary" and _has_rankable_score(r, "brier_score")],
-        key=_rank_key_binary,
-    )[:n_binary]
-    worst_numeric = sorted(
-        [
-            r
-            for r in records
-            if r.get("type") in ("numeric", "discrete") and _has_rankable_score(r, "numeric_log_score")
-        ],
-        key=lambda r: _rank_key_logscore(r, "numeric_log_score"),
-    )[:n_numeric]
-    worst_mc = sorted(
-        [r for r in records if r.get("type") == "multiple_choice" and _has_rankable_score(r, "mc_log_score")],
-        key=lambda r: _rank_key_logscore(r, "mc_log_score"),
-    )[:n_mc]
-
-    selected = worst_binary + worst_numeric + worst_mc
+    selected = sel_binary + sel_numeric + sel_mc
     if extra_post_ids:
         seen = {r["post_id"] for r in selected}
         by_pid = {r["post_id"]: r for r in records}
@@ -135,21 +202,74 @@ def select_worst_misses(
     return selected
 
 
+def select_worst_misses(
+    records: list[dict],
+    n_binary: int = 10,
+    n_numeric: int = 5,
+    n_mc: int = 2,
+    extra_post_ids: list[int] | None = None,
+) -> list[dict]:
+    """Backward-compat alias for ``select_cohort(mode='worst', ...)``.
+
+    Preserved so the April audit driver script (``scratch/audit_2026-04/run_audit.py``)
+    keeps working unchanged. Identical behavior to the worst-mode path of
+    ``select_cohort``.
+    """
+    return select_cohort(
+        records,
+        mode="worst",
+        n_binary=n_binary,
+        n_numeric=n_numeric,
+        n_mc=n_mc,
+        extra_post_ids=extra_post_ids,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-model accuracy ranking
 # ---------------------------------------------------------------------------
 
 
 def rank_our_models_by_accuracy(record: dict) -> list[dict]:
-    """Rank the ensemble members on a single binary record by Brier score.
+    """Rank the ensemble members on a single record by per-model score.
 
-    Returns a list of ``{model, prob, score}`` dicts ordered best-first.
-    Only binary records are supported for now — numeric/MC per-model scoring
-    would require the full CDF/probability vector per model which isn't
-    always parseable from the comment.
+    Binary: each ``{model: percentage_string}`` entry from
+    ``per_model_forecasts`` is parsed to a probability and scored with Brier
+    (lower is better). Sort is **ascending** by Brier (best first).
+
+    Numeric / discrete: each ``{model: [(percentile, value), ...]}`` entry
+    from ``per_model_numeric_percentiles`` is converted to a 201-point CDF
+    via PCHIP, then scored with Metaculus-style ``numeric_log_score`` (higher
+    is better). Sort is **descending** by score (best first). The return
+    semantics differ between binary and numeric — both list "best first" but
+    via different score directions; downstream consumers should treat the
+    list as ordered, not the score values directly.
+
+    For numeric / discrete, **we score the raw model output — pre tail-
+    widening, pre validation**. This isolates *model judgment* from
+    *post-processing* effects. The bot's actual published CDF goes through
+    additional ``numeric_pipeline.py`` post-processing (tail widening, etc.)
+    which is intentionally excluded from this audit-side scoring.
+
+    Returns a list of dicts. Binary entries: ``{model, prob, score, raw}``.
+    Numeric/discrete entries: ``{model, percentiles, score, raw}`` where
+    ``raw`` is a short summary like ``"P10≈X P50≈Y P90≈Z"``.
+
+    Empty list when:
+    - Type isn't binary/numeric/discrete.
+    - Resolution isn't usable (None binary; non-recognized numeric resolution).
+    - Numeric scaling bounds are missing.
+    - No parseable per-model entries.
     """
-    if record.get("type") != "binary":
-        return []
+    q_type = record.get("type")
+    if q_type == "binary":
+        return _rank_binary(record)
+    if q_type in ("numeric", "discrete"):
+        return _rank_numeric(record)
+    return []
+
+
+def _rank_binary(record: dict) -> list[dict]:
     resolution = record.get("resolution_parsed")
     if not isinstance(resolution, bool):
         return []
@@ -171,6 +291,81 @@ def rank_our_models_by_accuracy(record: dict) -> list[dict]:
         )
     ranked.sort(key=lambda d: d["score"])
     return ranked
+
+
+def _rank_numeric(record: dict) -> list[dict]:
+    score_inputs = resolve_numeric_record_to_score_inputs(record)
+    if score_inputs is None:
+        return []
+    res_float, lower_bound, upper_bound, zero_point = score_inputs
+
+    open_lower = bool(record.get("open_lower_bound", False))
+    open_upper = bool(record.get("open_upper_bound", False))
+
+    per_model = record.get("per_model_numeric_percentiles") or {}
+    skipped_count = 0
+    ranked: list[dict] = []
+    post_id = record.get("post_id")
+    for model, percentile_pairs in per_model.items():
+        percentile_dict = {float(p): float(v) for p, v in percentile_pairs}
+        try:
+            cdf, _ = generate_pchip_cdf(
+                percentile_dict,
+                open_upper_bound=open_upper,
+                open_lower_bound=open_lower,
+                upper_bound=upper_bound,
+                lower_bound=lower_bound,
+                zero_point=zero_point,
+            )
+        except (ValueError, RuntimeError) as exc:
+            logger.warning(f"Per-model PCHIP failure post={post_id} model={model}: {exc}")
+            skipped_count += 1
+            continue
+
+        try:
+            score = numeric_log_score(
+                cdf,
+                res_float,
+                lower_bound,
+                upper_bound,
+                open_lower,
+                open_upper,
+                zero_point,
+            )
+        except (ValueError, ZeroDivisionError) as exc:
+            logger.warning(f"Per-model scoring failure post={post_id} model={model}: {exc}")
+            skipped_count += 1
+            continue
+
+        ranked.append(
+            {
+                "model": model,
+                "percentiles": percentile_pairs,
+                "score": score,
+                "raw": _summarize_percentiles(percentile_dict),
+            }
+        )
+
+    # If the majority of models failed, the audit output for this question
+    # would be misleading (empty or near-empty ranking) — surface loudly
+    # rather than silently produce a degraded report.
+    if per_model and skipped_count >= len(per_model) / 2:
+        logger.error(
+            f"Per-model numeric scoring degraded post={post_id}: "
+            f"{skipped_count}/{len(per_model)} models failed; ranking unreliable"
+        )
+
+    ranked.sort(key=lambda d: -d["score"])
+    return ranked
+
+
+def _summarize_percentiles(percentile_dict: dict[float, float]) -> str:
+    """Render a tiny "P10≈X P50≈Y P90≈Z" preview for the audit Markdown."""
+    parts: list[str] = []
+    for target in (10, 50, 90):
+        nearest_key = min(percentile_dict.keys(), key=lambda k: abs(k - target))
+        parts.append(f"P{target}≈{percentile_dict[nearest_key]:g}")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -384,14 +579,38 @@ def emit_external_comment_stub(record: dict, out_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def emit_synthesis(records_with_rankings: list[dict], out_path: Path) -> None:
-    """Write a cross-cutting synthesis of model-level patterns across all misses."""
-    lines: list[str] = []
-    lines.append("# Audit synthesis — bot misses vs per-model dissent\n")
-    lines.append(
+_DEFAULT_SYNTHESIS_FRAMING: dict[str, str] = {
+    "title": "Audit synthesis — bot misses vs per-model dissent",
+    "intro_paragraph": (
         "For each worst-scored question, which ensemble members were closest to the truth, "
-        "and how far did the ensemble aggregate sit from the best member?\n"
-    )
+        "and how far did the ensemble aggregate sit from the best member?"
+    ),
+    "cohort_name": "binary worst misses",
+    "tally_best_label": "times best",
+    "tally_worst_label": "times worst",
+    "delta_section_label": "Ensemble-vs-best delta (binary, sorted by worst regret)",
+    "spread_section_label": "High-spread misses (dissenting-model signal)",
+}
+
+
+def emit_synthesis(
+    records_with_rankings: list[dict],
+    out_path: Path,
+    framing: dict[str, str] | None = None,
+) -> None:
+    """Write a cross-cutting synthesis of model-level patterns across all misses.
+
+    ``framing`` lets callers override the misses-cohort defaults so the same
+    function can emit synthesis files for hits or middle cohorts (where labels
+    like "times best / times worst" or "High-spread misses" no longer fit).
+    Missing keys fall back to defaults; ``framing=None`` is identical to the
+    pre-parameterization behavior.
+    """
+    f = {**_DEFAULT_SYNTHESIS_FRAMING, **(framing or {})}
+
+    lines: list[str] = []
+    lines.append(f"# {f['title']}\n")
+    lines.append(f"{f['intro_paragraph']}\n")
 
     # Per-model "best finisher" tally — how often was each model the closest?
     best_model_tally: dict[str, int] = {}
@@ -415,11 +634,11 @@ def emit_synthesis(records_with_rankings: list[dict], out_path: Path) -> None:
             delta = ensemble_brier - best_brier if ensemble_brier is not None else 0.0
             ensemble_vs_best_deltas.append((rec["post_id"], best["model"], ensemble_brier or 0.0, best_brier, delta))
 
-    lines.append(f"## Scope\n\n- {binary_count} binary misses ranked.\n")
+    lines.append(f"## Scope\n\n- {binary_count} binary records ranked.\n")
 
     if best_model_tally:
-        lines.append("## Closest-to-truth tally (binary worst misses)\n")
-        lines.append("| model | times best | times worst |")
+        lines.append(f"## Closest-to-truth tally ({f['cohort_name']})\n")
+        lines.append(f"| model | {f['tally_best_label']} | {f['tally_worst_label']} |")
         lines.append("|---|---|---|")
         all_models = sorted(set(best_model_tally) | set(avoided_model_tally))
         for m in sorted(all_models, key=lambda k: -best_model_tally.get(k, 0)):
@@ -427,7 +646,7 @@ def emit_synthesis(records_with_rankings: list[dict], out_path: Path) -> None:
         lines.append("")
 
     if ensemble_vs_best_deltas:
-        lines.append("## Ensemble-vs-best delta (binary, sorted by worst regret)\n")
+        lines.append(f"## {f['delta_section_label']}\n")
         lines.append("| post | best model | ensemble Brier | best-model Brier | Δ (lost by aggregating) |")
         lines.append("|---|---|---|---|---|")
         for pid, best_m, ens, best, delta in sorted(ensemble_vs_best_deltas, key=lambda t: -t[4]):
@@ -435,24 +654,32 @@ def emit_synthesis(records_with_rankings: list[dict], out_path: Path) -> None:
         lines.append("")
 
     # Spread buckets — large per-model spread + wrong ensemble = stacking case.
+    # Only meaningful for binary records: "spread" here is max - min over the
+    # per-model probabilities (a number in [0, 1]). Numeric/discrete entries
+    # produced by ``_rank_numeric`` carry ``percentiles`` rather than ``prob``,
+    # and a percentile-based spread isn't directly comparable, so we skip them
+    # here rather than synthesize a number that the reader would misread.
     high_spread_miss = []
     for entry in records_with_rankings:
         ranked = entry["ranked"]
+        rec = entry["record"]
+        if rec.get("type") != "binary":
+            continue
         if len(ranked) < 2:
             continue
         probs = [r["prob"] for r in ranked]
         spread = max(probs) - min(probs)
         high_spread_miss.append(
             (
-                entry["record"]["post_id"],
-                entry["record"].get("title", "")[:60],
+                rec["post_id"],
+                rec.get("title", "")[:60],
                 spread,
-                entry["record"].get("brier_score"),
-                entry["record"].get("was_stacked"),
+                rec.get("brier_score"),
+                rec.get("was_stacked"),
             )
         )
     if high_spread_miss:
-        lines.append("## High-spread misses (dissenting-model signal)\n")
+        lines.append(f"## {f['spread_section_label']}\n")
         lines.append("| post | title | best-vs-worst spread | Brier | was_stacked |")
         lines.append("|---|---|---|---|---|")
         for pid, t, s, b, st in sorted(high_spread_miss, key=lambda x: -x[2])[:10]:

@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -354,6 +355,55 @@ class TestEmitSynthesisSpreadOrdering:
         assert "-8.0pp" not in text
 
 
+class TestEmitSynthesisMixedCohort:
+    """Phase 0 added numeric ranking via _rank_numeric, which produces entries
+    with ``percentiles`` instead of ``prob``. The high-spread section was
+    binary-only; passing a mixed binary+numeric cohort previously raised
+    ``KeyError: 'prob'``. The fix is a type-aware skip in the spread-section
+    loop. This test locks the fix.
+    """
+
+    def test_mixed_binary_and_numeric_does_not_raise(self, tmp_path):
+        from metaculus_bot.performance_analysis.audit import emit_synthesis, rank_our_models_by_accuracy
+
+        binary_rec = _binary_record(
+            41001,
+            prob_yes=0.2,
+            resolution=True,
+            title="binary q",
+            per_model={"gpt-5.2": "13%", "claude": "20%"},
+        )
+        per_model_percentiles = {
+            "gpt-5.2": [(10.0, 40.0), (50.0, 50.0), (90.0, 60.0)],
+            "claude": [(10.0, 30.0), (50.0, 45.0), (90.0, 55.0)],
+        }
+        numeric_rec = _numeric_record(41002, resolution=50.0, per_model_percentiles=per_model_percentiles)
+
+        binary_ranked = rank_our_models_by_accuracy(binary_rec)
+        numeric_ranked = rank_our_models_by_accuracy(numeric_rec)
+
+        # Mixed cohort: should NOT raise KeyError.
+        out = tmp_path / "synthesis.md"
+        emit_synthesis(
+            [
+                {"record": binary_rec, "ranked": binary_ranked},
+                {"record": numeric_rec, "ranked": numeric_ranked},
+            ],
+            out,
+        )
+        text = out.read_text()
+
+        # Spread section appears (with the binary entry).
+        assert "spread" in text.lower()
+        # Binary record's post id appears in the synthesis.
+        assert "41001" in text
+        # Numeric record is silently skipped from the spread section — its
+        # post id is NOT in the spread table (numeric percentile-based spread
+        # isn't directly comparable to binary prob-range).
+        spread_section = text.split("High-spread")[-1] if "High-spread" in text else ""
+        assert "41002" not in spread_section
+
+
 class TestEmitMissMarkdown:
     """Exercises audit.emit_miss_markdown — the per-question audit file."""
 
@@ -620,3 +670,504 @@ class TestEmitCombinedReport:
         content = combined_path.read_text()
         # Synthesis header emitted by emit_synthesis should appear in combined.
         assert "Audit synthesis" in content
+
+
+# ---------------------------------------------------------------------------
+# Helpers for new (Phase 0) tests below.
+# ---------------------------------------------------------------------------
+
+
+def _numeric_record(
+    post_id: int,
+    resolution: float | str,
+    per_model_percentiles: dict[str, list[Any]] | None = None,
+    *,
+    lower_bound: float = 0.0,
+    upper_bound: float = 100.0,
+    open_lower: bool = False,
+    open_upper: bool = False,
+    zero_point: float | None = None,
+    q_type: str = "numeric",
+    numeric_log_score: float | None = 0.0,
+    title: str | None = None,
+) -> dict:
+    return {
+        "post_id": post_id,
+        "type": q_type,
+        "title": title or f"Q{post_id}",
+        "resolution_raw": str(resolution),
+        "resolution_parsed": resolution,
+        "our_prob_yes": None,
+        "our_forecast_values": [i / 200 for i in range(201)],
+        "per_model_forecasts": {},
+        "per_model_numeric_percentiles": per_model_percentiles or {},
+        "scaling": {"range_min": lower_bound, "range_max": upper_bound, "zero_point": zero_point},
+        "open_lower_bound": open_lower,
+        "open_upper_bound": open_upper,
+        "options": None,
+        "comment_text": "",
+        "brier_score": None,
+        "log_score": None,
+        "numeric_log_score": numeric_log_score,
+        "mc_log_score": None,
+        "metadata": {"category": None, "nr_forecasters": 0},
+    }
+
+
+# ---------------------------------------------------------------------------
+# select_cohort: best mode (Change 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectCohortBest:
+    def test_best_mode_takes_highest_peer_first(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        a = _binary_record(1, 0.10, True)  # Brier 0.81 — but huge POSITIVE peer
+        a["metaculus_scores"] = {"peer_score": 80.0}
+        b = _binary_record(2, 0.95, True)  # Brier 0.0025, mild peer
+        b["metaculus_scores"] = {"peer_score": 5.0}
+        c = _binary_record(3, 0.5, True)
+        c["metaculus_scores"] = {"peer_score": -5.0}
+        result = select_cohort([a, b, c], mode="best", n_binary=2, n_numeric=0, n_mc=0)
+        assert [r["post_id"] for r in result] == [1, 2]
+
+    def test_best_mode_falls_back_to_lowest_brier_when_peer_missing(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        a = _binary_record(1, 0.05, True)  # Brier 0.9025 — worst hit
+        b = _binary_record(2, 0.95, True)  # Brier 0.0025 — best hit
+        c = _binary_record(3, 0.50, True)  # Brier 0.25
+        result = select_cohort([a, b, c], mode="best", n_binary=2, n_numeric=0, n_mc=0)
+        assert [r["post_id"] for r in result] == [2, 3]
+
+    def test_best_mode_numeric_falls_back_to_highest_log_score_when_peer_missing(self):
+        # _numeric_record's default has no metaculus_scores → no peer_score, so
+        # _rank_key_best_logscore's fallback path (sort descending by
+        # numeric_log_score) is what's exercised here. Locks the fallback.
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        rs = [
+            _numeric_record(10, resolution=50.0, numeric_log_score=-30.0),
+            _numeric_record(11, resolution=50.0, numeric_log_score=20.0),
+            _numeric_record(12, resolution=50.0, numeric_log_score=5.0),
+        ]
+        result = select_cohort(rs, mode="best", n_binary=0, n_numeric=2, n_mc=0)
+        assert [r["post_id"] for r in result] == [11, 12]
+
+    def test_best_mode_numeric_with_peer_score_takes_highest_peer(self):
+        # Sibling to the fallback test above: when peer_score is populated, it
+        # wins over the numeric_log_score fallback (peer is more comparable
+        # across question types and accounts for difficulty).
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        a = _numeric_record(20, resolution=50.0, numeric_log_score=-30.0)
+        a["metaculus_scores"] = {"peer_score": 80.0}  # great peer despite bad raw log
+        b = _numeric_record(21, resolution=50.0, numeric_log_score=20.0)
+        b["metaculus_scores"] = {"peer_score": -5.0}
+        c = _numeric_record(22, resolution=50.0, numeric_log_score=5.0)
+        c["metaculus_scores"] = {"peer_score": 10.0}
+        result = select_cohort([a, b, c], mode="best", n_binary=0, n_numeric=2, n_mc=0)
+        # peer_score order desc: a(80) > c(10) > b(-5)
+        assert [r["post_id"] for r in result] == [20, 22]
+
+    def test_best_mode_extra_post_ids_appended(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        auto = _binary_record(1, 0.95, True)  # auto-picked best
+        auto["metaculus_scores"] = {"peer_score": 50.0}
+        weak = _binary_record(2, 0.3, True)
+        weak["metaculus_scores"] = {"peer_score": -10.0}
+        extra = _binary_record(3, 0.6, True)
+        extra["metaculus_scores"] = {"peer_score": -2.0}
+        result = select_cohort(
+            [auto, weak, extra],
+            mode="best",
+            n_binary=1,
+            n_numeric=0,
+            n_mc=0,
+            extra_post_ids=[3],
+        )
+        assert [r["post_id"] for r in result] == [1, 3]
+
+
+# ---------------------------------------------------------------------------
+# select_cohort: middle mode (Change 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectCohortMiddle:
+    def _spread_records(self) -> list[dict]:
+        # 20 binary records, peer_score from -19 to 0 (one each), so the
+        # 20-80 percentile band will contain peer_scores roughly -16..-3.
+        records = []
+        for i in range(20):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            records.append(r)
+        return records
+
+    def test_middle_mode_excludes_top_and_bottom_extremes(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = self._spread_records()
+        # Middle 60% of 20 = 12 records. We sample 5 from those 12.
+        # The four most-negative (worst tail, post_ids 16..19) and four most-
+        # positive (best tail, post_ids 0..3) must be excluded.
+        result = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        pids = {r["post_id"] for r in result}
+        forbidden_extremes = {0, 1, 2, 3, 16, 17, 18, 19}
+        assert pids.isdisjoint(forbidden_extremes)
+        assert len(pids) == 5
+
+    def test_middle_mode_reproducible_under_same_seed(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = self._spread_records()
+        a = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        b = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        assert [r["post_id"] for r in a] == [r["post_id"] for r in b]
+
+    def test_middle_mode_different_seed_gives_different_sample(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = self._spread_records()
+        a = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        b = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=1)
+        assert [r["post_id"] for r in a] != [r["post_id"] for r in b]
+
+    def test_middle_mode_respects_n_binary_n_numeric_n_mc(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        binaries = []
+        for i in range(20):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            binaries.append(r)
+        numerics = []
+        for i in range(20):
+            r = _numeric_record(100 + i, resolution=50.0, numeric_log_score=-float(i))
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            numerics.append(r)
+        mcs = []
+        for i in range(20):
+            r = {
+                "post_id": 200 + i,
+                "type": "multiple_choice",
+                "mc_log_score": -float(i),
+                "brier_score": None,
+                "numeric_log_score": None,
+                "metaculus_scores": {"peer_score": -float(i)},
+            }
+            mcs.append(r)
+        result = select_cohort(binaries + numerics + mcs, mode="middle", n_binary=3, n_numeric=2, n_mc=1, seed=42)
+        type_counts: dict[str, int] = {}
+        for r in result:
+            type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+        assert type_counts.get("binary", 0) == 3
+        assert type_counts.get("numeric", 0) == 2
+        assert type_counts.get("multiple_choice", 0) == 1
+
+    def test_middle_mode_returns_empty_when_no_peer_scores(self):
+        # Middle mode is peer-score-anchored — records without peer_score
+        # have no "middle" to land in. The cohort should be empty (not raise).
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            # No metaculus_scores → no peer_score
+            records.append(r)
+        result = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        assert result == []
+
+    def test_middle_mode_handles_small_n_without_crashing(self):
+        # 3 records: lower_idx = int(0.2*3) = 0, upper_idx = int(0.8*3) = 2,
+        # so middle = records[0:2] (2 records). Sample 5 from a pool of 2 must
+        # not raise — `min(n_binary, len(pool))` caps the request.
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = []
+        for i in range(3):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            records.append(r)
+        result = select_cohort(records, mode="middle", n_binary=5, n_numeric=0, n_mc=0, seed=42)
+        # Must not raise; result is bounded by the middle-band size.
+        assert len(result) <= 2
+
+    def test_middle_mode_n_larger_than_pool_returns_pool_size(self):
+        # When n_binary > middle-band size, we get the whole band, no crash.
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.5, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            records.append(r)
+        # Middle 60% of 10 = 6 records. Asking for 20 should return ≤6.
+        result = select_cohort(records, mode="middle", n_binary=20, n_numeric=0, n_mc=0, seed=42)
+        assert 1 <= len(result) <= 6
+
+
+class TestSelectCohortValidation:
+    def test_invalid_mode_raises_value_error(self):
+        from typing import cast
+
+        from metaculus_bot.performance_analysis.audit import select_cohort
+
+        # cast() to defeat the Literal type so the runtime guard is reachable
+        # in the test (otherwise the type checker rejects "random" at edit time).
+        bad_mode = cast(Any, "random")
+        with pytest.raises(ValueError, match="Unknown mode"):
+            select_cohort([], mode=bad_mode)
+
+
+# ---------------------------------------------------------------------------
+# rank_our_models_by_accuracy: numeric / discrete (Change 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRankNumericPerModel:
+    def test_numeric_record_ranks_truth_centered_first(self):
+        # Three models against resolution=50. The model centered on truth
+        # must rank first (robust by symmetry); the relative order of the
+        # two off-center models depends on PCHIP construction details +
+        # asymmetric log-score weighting, so we don't pin it. Instead we
+        # check that all three models are present and that the truth-
+        # centered one is best.
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {
+            "tight_around_truth": [(10, 45.0), (50, 50.0), (90, 55.0)],
+            "tight_around_80": [(10, 75.0), (50, 80.0), (90, 85.0)],
+            "tight_around_10": [(10, 5.0), (50, 10.0), (90, 15.0)],
+        }
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+        ranked = rank_our_models_by_accuracy(rec)
+        assert ranked[0]["model"] == "tight_around_truth"
+        assert {r["model"] for r in ranked} == set(per_model.keys())
+        # higher = better, so first beats last
+        assert ranked[0]["score"] > ranked[-1]["score"]
+
+    def test_numeric_skips_model_with_only_one_valid_percentile(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {
+            "good": [(10, 45.0), (50, 50.0), (90, 55.0)],
+            "broken": [(50, 50.0)],  # only 1 valid percentile -> PCHIP raises
+        }
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+        ranked = rank_our_models_by_accuracy(rec)
+        assert {r["model"] for r in ranked} == {"good"}
+
+    def test_numeric_above_upper_bound_resolution(self):
+        # PCHIP doesn't extrapolate beyond the highest provided percentile, so
+        # cdf[-1] (and therefore the residual above-upper-bound mass) is set by
+        # the *largest percentile label* given. wide_upper_tail provides P10/
+        # P50/P75 → cdf[-1] ≈ 0.75, leaving 25% of probability mass above the
+        # upper bound. narrow_upper_tail provides P10/P50/P95 → cdf[-1] ≈ 0.95
+        # leaving only 5% above upper. When the question resolves
+        # above_upper_bound, the model that left more residual mass up there
+        # wins.
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {
+            "narrow_upper_tail": [(10, 5.0), (50, 10.0), (95, 15.0)],
+            "wide_upper_tail": [(10, 90.0), (50, 95.0), (75, 99.0)],
+        }
+        rec = _numeric_record(
+            1,
+            resolution="above_upper_bound",
+            per_model_percentiles=per_model,
+            open_upper=True,
+            lower_bound=0.0,
+            upper_bound=100.0,
+        )
+        ranked = rank_our_models_by_accuracy(rec)
+        assert ranked[0]["model"] == "wide_upper_tail"
+
+    def test_numeric_below_lower_bound_resolution(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {
+            "narrow_low": [(10, 0.5), (50, 1.0), (90, 5.0)],
+            "narrow_high": [(10, 90.0), (50, 95.0), (90, 99.0)],
+        }
+        rec = _numeric_record(
+            1,
+            resolution="below_lower_bound",
+            per_model_percentiles=per_model,
+            open_lower=True,
+            lower_bound=0.0,
+            upper_bound=100.0,
+        )
+        ranked = rank_our_models_by_accuracy(rec)
+        assert ranked[0]["model"] == "narrow_low"
+
+    def test_discrete_type_is_handled(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {
+            "good": [(10, 45.0), (50, 50.0), (90, 55.0)],
+            "bad": [(10, 5.0), (50, 10.0), (90, 15.0)],
+        }
+        rec = _numeric_record(
+            1,
+            resolution=50.0,
+            per_model_percentiles=per_model,
+            q_type="discrete",
+        )
+        ranked = rank_our_models_by_accuracy(rec)
+        assert ranked[0]["model"] == "good"
+
+    def test_numeric_returns_empty_when_no_per_model_percentiles(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles={})
+        assert rank_our_models_by_accuracy(rec) == []
+
+    def test_numeric_returns_empty_when_resolution_is_none(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {"good": [(10, 45.0), (50, 50.0), (90, 55.0)]}
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+        rec["resolution_parsed"] = None
+        assert rank_our_models_by_accuracy(rec) == []
+
+    def test_numeric_returns_empty_when_bounds_missing(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {"good": [(10, 45.0), (50, 50.0), (90, 55.0)]}
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+        rec["scaling"] = {"range_min": None, "range_max": None, "zero_point": None}
+        assert rank_our_models_by_accuracy(rec) == []
+
+    def test_numeric_raw_field_summarizes_percentiles(self):
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        per_model = {"m1": [(10, 25.0), (50, 50.0), (90, 75.0)]}
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+        ranked = rank_our_models_by_accuracy(rec)
+        raw = ranked[0]["raw"]
+        assert "P10" in raw
+        assert "P50" in raw
+        assert "P90" in raw
+
+    def test_numeric_skips_model_when_scoring_raises(self, monkeypatch):
+        # numeric_log_score may raise ValueError or ZeroDivisionError on
+        # degenerate CDFs that PCHIP nonetheless accepts. The skip path at
+        # audit.py's `except (ValueError, ZeroDivisionError)` block must drop
+        # the offending model and continue ranking the others.
+        from metaculus_bot.performance_analysis import audit
+
+        per_model = {
+            "good": [(10, 45.0), (50, 50.0), (90, 55.0)],
+            "bad_score": [(10, 40.0), (50, 50.0), (90, 60.0)],
+        }
+        rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
+
+        original = audit.numeric_log_score
+        call_state = {"call_idx": 0}
+
+        def flaky_score(*args, **kwargs):
+            # Iteration order over `per_model` is insertion-order in CPython 3.7+,
+            # so "good" is scored first (call 0), "bad_score" second (call 1).
+            call_state["call_idx"] += 1
+            if call_state["call_idx"] == 2:
+                raise ValueError("degenerate CDF")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(audit, "numeric_log_score", flaky_score)
+        ranked = audit.rank_our_models_by_accuracy(rec)
+        models_ranked = [r["model"] for r in ranked]
+        assert models_ranked == ["good"]
+        assert "bad_score" not in models_ranked
+
+
+# ---------------------------------------------------------------------------
+# emit_synthesis framing parameter (Change 3)
+# ---------------------------------------------------------------------------
+
+
+class TestEmitSynthesisFraming:
+    def _entries(self) -> list[dict]:
+        from metaculus_bot.performance_analysis.audit import rank_our_models_by_accuracy
+
+        rec = _binary_record(
+            42,
+            prob_yes=0.10,
+            resolution=True,
+            per_model={"gpt-5.5": "15%", "claude-opus-4.7": "25%"},
+        )
+        ranked = rank_our_models_by_accuracy(rec)
+        return [{"record": rec, "ranked": ranked}]
+
+    def test_default_framing_unchanged_when_none_passed(self, tmp_path):
+        from metaculus_bot.performance_analysis.audit import emit_synthesis
+
+        out = tmp_path / "synthesis.md"
+        emit_synthesis(self._entries(), out)
+        text = out.read_text()
+        assert "Audit synthesis — bot misses vs per-model dissent" in text
+        assert "binary worst misses" in text
+        assert "times best" in text
+        assert "times worst" in text
+        assert "High-spread misses" in text
+
+    def test_custom_framing_swaps_labels(self, tmp_path):
+        from metaculus_bot.performance_analysis.audit import emit_synthesis
+
+        out = tmp_path / "synthesis.md"
+        framing = {
+            "title": "Audit synthesis — bot best hits",
+            "intro_paragraph": "For each best-scored question, which member led?",
+            "cohort_name": "binary best hits",
+            "tally_best_label": "times closest",
+            "tally_worst_label": "times farthest",
+            "delta_section_label": "Ensemble-vs-best delta (binary, sorted by widest hit margin)",
+            "spread_section_label": "High-spread hits (dissenting-model signal)",
+        }
+        emit_synthesis(self._entries(), out, framing=framing)
+        text = out.read_text()
+        assert "Audit synthesis — bot best hits" in text
+        assert "binary best hits" in text
+        assert "times closest" in text
+        assert "times farthest" in text
+        assert "widest hit margin" in text
+        assert "High-spread hits" in text
+        # Default labels must be absent.
+        assert "binary worst misses" not in text
+        assert "times worst" not in text
+        assert "High-spread misses" not in text
+
+    def test_partial_framing_falls_back_to_defaults_for_unset_keys(self, tmp_path):
+        from metaculus_bot.performance_analysis.audit import emit_synthesis
+
+        out = tmp_path / "synthesis.md"
+        # Override only title; everything else should default.
+        emit_synthesis(self._entries(), out, framing={"title": "Custom title"})
+        text = out.read_text()
+        assert "Custom title" in text
+        # Defaults still present.
+        assert "binary worst misses" in text
+
+
+# ---------------------------------------------------------------------------
+# select_worst_misses backward-compat alias (Change 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectWorstMissesAlias:
+    def test_alias_matches_select_cohort_worst(self):
+        from metaculus_bot.performance_analysis.audit import select_cohort, select_worst_misses
+
+        records = []
+        for i in range(10):
+            r = _binary_record(i, 0.10 + 0.05 * i, True)
+            r["metaculus_scores"] = {"peer_score": -float(i)}
+            records.append(r)
+        # extra_post_ids passed through identically.
+        a = select_worst_misses(records, n_binary=5, n_numeric=0, n_mc=0, extra_post_ids=[9])
+        b = select_cohort(records, mode="worst", n_binary=5, n_numeric=0, n_mc=0, extra_post_ids=[9])
+        assert [r["post_id"] for r in a] == [r["post_id"] for r in b]

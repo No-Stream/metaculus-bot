@@ -1,6 +1,7 @@
 """Unit tests for stacking functionality."""
 
 import asyncio
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -23,6 +24,14 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 class TestStackingConfiguration:
@@ -164,6 +173,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/1",
             id_of_question=1,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Weather forecast shows 50% chance of rain."
@@ -192,6 +203,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/2",
             id_of_question=2,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Previous balls were mostly red."
@@ -207,7 +220,11 @@ class TestStackingPrompts:
         assert "Previous balls were mostly red" in prompt
         assert "Model 1 Analysis:" in prompt
         assert "Red seems most likely" in prompt
-        assert "Option_A: NN%" in prompt
+        # The trailing answer-format example interpolates real option names so
+        # strict parsers can map LLM output directly to question.options.
+        assert "Red: NN%" in prompt
+        assert "Blue: NN%" in prompt
+        assert "Green: NN%" in prompt
 
     def test_stacking_numeric_prompt(self):
         """Test numeric stacking prompt generation."""
@@ -222,6 +239,8 @@ class TestStackingPrompts:
             fine_print="",
             page_url="https://test.com/3",
             id_of_question=3,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         research = "Historical attendance averages 500 people."
@@ -493,12 +512,30 @@ class TestStackingIntegration:
             stacking_fallback_on_failure=False,  # No fallback
         )
 
+        # Real BinaryQuestion (not Mock(spec=...)) because _aggregate_predictions
+        # reads question.id_of_question to assert non-None and key into
+        # self._stacker_outcome on the success/fallback paths. A Mock(spec=...)
+        # returns a MagicMock for id_of_question, which would key the dict with
+        # a Mock object instead of an int — fine for the no-fallback path tested
+        # here (which raises before the dict write), but a real question is
+        # future-proof if this test ever exercises the success path.
+        question = BinaryQuestion(
+            question_text="Will it happen?",
+            background_info="bg",
+            resolution_criteria="rc",
+            fine_print="",
+            page_url="https://test.com/no-fallback",
+            id_of_question=999,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
+        )
+
         # Mock _run_stacking to raise an exception
         with patch.object(bot, "_run_stacking", side_effect=RuntimeError("Stacking failed")):
             with pytest.raises(RuntimeError, match="Stacking failed"):
                 await bot._aggregate_predictions(
                     predictions=[0.4, 0.6],
-                    question=Mock(spec=BinaryQuestion),
+                    question=question,
                     research="test research",
                     reasoned_predictions=[Mock(), Mock()],
                 )
@@ -699,12 +736,12 @@ class TestStackingResearchAndMakePredictions:
 
         # Mock the necessary methods. _forecaster_with_soft_deadline is
         # stubbed so the coroutines created inline in _research_and_make_predictions
-        # don't leak as "never awaited" warnings when _gather_results_and_exceptions
+        # don't leak as "never awaited" warnings when _gather_predictions_with_wall_clock
         # (mocked below) never touches them.
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(bot, "_aggregate_predictions", return_value=0.7) as mock_aggregate,
             patch.object(
                 bot,
@@ -759,7 +796,7 @@ class TestStackingResearchAndMakePredictions:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -978,7 +1015,7 @@ class TestStackingGuardsAndReasoning:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(bot, "_run_stacking", return_value=0.7),
             patch.object(
                 bot,

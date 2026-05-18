@@ -3,7 +3,12 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    # Split across multiple cron entries to avoid GitHub Actions silently dropping
+    # */N schedules under runner load. Off-the-hour offsets dodge the :00 burst.
+    # Make sure to skip already forecasted questions!
+    - cron: "3 * * * *"  # every hour at :03
+    - cron: "23 * * * *" # every hour at :23
+    - cron: "43 * * * *" # every hour at :43
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -27,7 +32,7 @@ jobs:
         uses: snok/install-poetry@v1
         continue-on-error: true
         with:
-          version: 1.8.4
+          version: 2.2.1
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
@@ -36,7 +41,7 @@ jobs:
           poetry --version || (
             python -m pip install -U pip &&
             for i in 1 2 3; do
-              python -m pip install "poetry==1.8.4" && break || sleep 10;
+              python -m pip install "poetry==2.2.1" && break || sleep 10;
             done &&
             poetry --version
           )
@@ -75,14 +80,30 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_MAX_CONCURRENCY: '1'
           ASKNEWS_MAX_RPS: '0.2'
-          # Native search runs in parallel with AskNews using Grok's web search
+          # Native search runs in parallel with AskNews; model defaults to
+          # openai/gpt-5.5 (medium effort, verbosity=low, 360s) per constants.py.
           NATIVE_SEARCH_ENABLED: 'true'
           FINANCIAL_DATA_ENABLED: 'true'
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          NATIVE_SEARCH_MODEL: 'x-ai/grok-4.1-fast'
-          # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source
+          # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source.
+          # GOOGLE_API_KEY is the operator's personal Google AI Studio key (stored
+          # in CI as secrets.GEMINI_API_KEY). The grounded-search side has no
+          # donated/shared path — Google AI Studio doesn't offer one.
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_SEARCH_ENABLED: 'true'
+          # OpenRouter Gemini routing (forecaster, stacker, summarizer when the
+          # ensemble includes a Google model). When 'false' (default), Gemini
+          # OpenRouter calls flow through OPENROUTER_API_KEY only — bypassing
+          # the Metaculus-donated OAI_ANTH_OPENROUTER_KEY wrapper. Off because
+          # the donated-key Google route has been flaky.
+          GEMINI_USE_DONATED_OPENROUTER_KEY: 'false'
           # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
           # parallel grounded Gemini searches resolve each. Fails soft.
           GAP_FILL_ENABLED: 'true'
+          # Probabilistic tools post-processor: deterministic probability math
+          # injected into per-forecaster rationales and the stacker's view.
+          # Per-type allow-list: empirically helpful for binary (Wilcoxon p=0.094,
+          # n=44) and MC (directional, n=22); inconclusive for numeric (n=22,
+          # p=0.113), so excluded.
+          PROBABILISTIC_TOOLS_ENABLED: 'true'
+          PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'

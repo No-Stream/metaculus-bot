@@ -1,4 +1,5 @@
 # type: ignore
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,14 @@ from pydantic import ValidationError
 
 from main import TemplateForecaster
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 class DummyLLM:  # minimal async LLM for tests
@@ -35,6 +44,8 @@ def make_dummy_numeric_question():
         zero_point=0,
         id_of_question=123,  # Added for testing purposes
         cdf_size=201,
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
 
 

@@ -11,6 +11,7 @@ from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,
     ConsistencyResult,
+    GammaFit,
     LognormalFit,
     NormalFit,
     StudentTFit,
@@ -23,10 +24,12 @@ from metaculus_bot.probabilistic_tools import (
     beta_binomial_update,
     cdf_at_threshold,
     dirichlet_with_other,
+    fit_gamma_from_gaps,
     fit_lognormal_from_percentiles,
     fit_normal_from_percentiles,
     fit_student_t_from_percentiles,
     fit_to_11_percentiles,
+    gamma_prob_event_before,
     implied_likelihood_ratio,
     inverse_variance_pool,
     laplace_rule_of_succession,
@@ -34,6 +37,7 @@ from metaculus_bot.probabilistic_tools import (
     linear_pool_options,
     log_pool,
     negative_binomial_percentiles,
+    noisy_or,
     out_of_bounds_mass,
     percentile_family_consistency,
     percentile_monotonicity_check,
@@ -44,7 +48,9 @@ from metaculus_bot.probabilistic_tools import (
     satopaa_extremize,
     stated_base_rate_consistency,
     weibull_prob_event_before,
+    weibull_prob_event_before_conditional,
 )
+from tests.conftest import make_mock_numeric_question
 
 
 class TestBetaBinomialUpdate:
@@ -351,6 +357,163 @@ class TestWeibullProbEventBefore:
             weibull_prob_event_before(scale=1.0, shape=1.0, t=-1.0)
 
 
+class TestFitGammaFromGaps:
+    def test_atlas_opus_cadence_mom_moments(self):
+        # Atlas's Opus-cadence inter-arrival gaps. MoM should land on population
+        # mean/variance exactly; k*θ = mean and k*θ**2 = variance by construction.
+        gaps = [75, 111, 73]
+        fit = fit_gamma_from_gaps(gaps)
+        assert isinstance(fit, GammaFit)
+        expected_mean = float(np.mean(gaps))
+        expected_var = float(np.var(gaps, ddof=0))
+        assert fit.mean == pytest.approx(expected_mean, abs=1e-6)
+        assert fit.variance == pytest.approx(expected_var, abs=1e-6)
+        assert fit.shape * fit.scale == pytest.approx(fit.mean, abs=1e-9)
+        assert fit.shape * fit.scale**2 == pytest.approx(fit.variance, abs=1e-9)
+
+    def test_single_observation_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([10])
+
+    def test_zero_variance_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([5, 5, 5, 5])
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            fit_gamma_from_gaps([])
+
+
+class TestGammaProbEventBefore:
+    def test_atlas_conditional_probability_in_expected_band(self):
+        # Atlas noted the gap distribution [75, 111, 73] with 66 elapsed and
+        # 19 remaining, citing ~40.7% for the conditional. Use a generous band
+        # since MoM vs MLE differ.
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        result = gamma_prob_event_before(fit, elapsed=66, remaining=19)
+        assert isinstance(result, SurvivalResult)
+        assert 0.30 < result.conditional_prob_given_no_event_yet < 0.55
+        # With the (F(t)-F(elapsed))/(1-F(elapsed)) formulation the conditional
+        # represents the probability of the event in the remaining window,
+        # while the unconditional is the CDF over the full [0, elapsed+remaining]
+        # span — so the unconditional is strictly larger.
+        assert result.conditional_prob_given_no_event_yet < result.unconditional_prob
+
+    def test_elapsed_zero_conditional_equals_unconditional(self):
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        result = gamma_prob_event_before(fit, elapsed=0, remaining=50)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(result.unconditional_prob, abs=1e-12)
+
+    def test_invalid_args_raise(self):
+        fit = fit_gamma_from_gaps([75, 111, 73])
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=-1.0, remaining=10.0)
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=5.0, remaining=0.0)
+        with pytest.raises(ValueError):
+            gamma_prob_event_before(fit, elapsed=5.0, remaining=-1.0)
+
+    def test_deep_tail_conditional_stays_in_unit_interval(self):
+        # F4: with shape=0.5 and elapsed=100, scale=1, the survival 1-F(100)
+        # underflows to 0. The pre-clamp ``survival_elapsed <= 0.0`` branch
+        # already pins this to 1.0; assert that path returns a value in [0, 1].
+        fit = GammaFit(shape=0.5, scale=1.0, mean=0.5, variance=0.5)
+        result = gamma_prob_event_before(fit, elapsed=100.0, remaining=10.0)
+        assert math.isfinite(result.conditional_prob_given_no_event_yet)
+        assert 0.0 <= result.conditional_prob_given_no_event_yet <= 1.0
+        assert math.isfinite(result.unconditional_prob)
+        assert 0.0 <= result.unconditional_prob <= 1.0
+
+    def test_fp_overshoot_in_conditional_is_clamped(self, monkeypatch):
+        # F4: simulate a buggy/imprecise underlying CDF where
+        # (F(t) - F(elapsed)) / (1 - F(elapsed)) overshoots [0, 1] due to
+        # float arithmetic. The function must clamp the conditional return
+        # rather than letting it leak outside the unit interval.
+        from metaculus_bot.probabilistic_tools import survival as survival_mod
+
+        class _FakeGamma:
+            @staticmethod
+            def cdf(x, a, scale):  # noqa: ARG004 — args mirror scipy
+                # Pretend F(elapsed=10) = 0.9999999, F(total=11) = 1.00000005
+                # → diff = 1.0000000600000005e-7, survival = 1e-7, ratio > 1.
+                if x == 11.0:
+                    return 1.00000005
+                if x == 10.0:
+                    return 0.9999999
+                return 0.5
+
+        monkeypatch.setattr(survival_mod.stats, "gamma", _FakeGamma)
+        fit = GammaFit(shape=1.0, scale=1.0, mean=1.0, variance=1.0)
+        result = gamma_prob_event_before(fit, elapsed=10.0, remaining=1.0)
+        assert 0.0 <= result.conditional_prob_given_no_event_yet <= 1.0
+        assert 0.0 <= result.unconditional_prob <= 1.0
+
+
+class TestWeibullProbEventBeforeConditional:
+    def test_elapsed_zero_conditional_equals_unconditional(self):
+        result = weibull_prob_event_before_conditional(scale=10.0, shape=1.5, elapsed=0.0, remaining=5.0)
+        assert isinstance(result, SurvivalResult)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(result.unconditional_prob, abs=1e-12)
+
+    def test_elapsed_positive_splits_unconditional(self):
+        # With (F(t) - F(elapsed)) / (1 - F(elapsed)) the conditional is the
+        # probability of an event in the remaining window given survival —
+        # strictly less than the full-window CDF when F(elapsed) > 0.
+        result = weibull_prob_event_before_conditional(scale=10.0, shape=1.5, elapsed=4.0, remaining=3.0)
+        assert result.conditional_prob_given_no_event_yet < result.unconditional_prob
+        assert result.conditional_prob_given_no_event_yet > 0.0
+
+    def test_shape_one_reduces_to_exponential(self):
+        # Weibull(shape=1) is exponential with rate 1/scale. Unconditional CDF
+        # at t = elapsed + remaining = 50 with scale 100 is 1 - exp(-0.5).
+        result = weibull_prob_event_before_conditional(scale=100.0, shape=1.0, elapsed=0.0, remaining=50.0)
+        assert result.unconditional_prob == pytest.approx(1.0 - math.exp(-0.5), rel=1e-10)
+        assert result.conditional_prob_given_no_event_yet == pytest.approx(1.0 - math.exp(-0.5), rel=1e-10)
+
+    def test_invalid_args_raise(self):
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=0.0, shape=1.0, elapsed=1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=0.0, elapsed=1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=-1.0, remaining=1.0)
+        with pytest.raises(ValueError):
+            weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=1.0, remaining=0.0)
+
+    def test_deep_tail_conditional_stays_in_unit_interval(self):
+        # F4: with shape=3, scale=1, elapsed=20, the survival math
+        # math.exp(-(20)**3) underflows to 0. The pre-clamp branch returns
+        # 1.0; the result must remain in [0, 1] regardless.
+        result = weibull_prob_event_before_conditional(scale=1.0, shape=3.0, elapsed=20.0, remaining=5.0)
+        assert math.isfinite(result.conditional_prob_given_no_event_yet)
+        assert 0.0 <= result.conditional_prob_given_no_event_yet <= 1.0
+        assert math.isfinite(result.unconditional_prob)
+        assert 0.0 <= result.unconditional_prob <= 1.0
+
+    def test_fp_overshoot_in_conditional_is_clamped(self, monkeypatch):
+        # F4: simulate FP error where (F(t) - F(elapsed)) / (1 - F(elapsed))
+        # overshoots [0, 1]. Patch math.exp to produce slightly inconsistent
+        # exponentials matching: exp(-(elapsed/scale)**shape) = 0.0000001 (so
+        # F(elapsed) = 0.9999999) and exp(-(total/scale)**shape) = -5e-8 → 0
+        # but pre-clamp evaluates as F(total) = 1.00000005.
+        from metaculus_bot.probabilistic_tools import survival as survival_mod
+
+        original_exp = math.exp
+
+        def _fake_exp(x: float) -> float:
+            # x for elapsed=10, scale=1, shape=1 is -10.0; for total=11 is -11.0.
+            if x == -11.0:
+                return -5e-8  # -> F(total) = 1.00000005
+            if x == -10.0:
+                return 1e-7  # -> F(elapsed) = 0.9999999
+            return original_exp(x)
+
+        monkeypatch.setattr(survival_mod.math, "exp", _fake_exp)
+        result = weibull_prob_event_before_conditional(scale=1.0, shape=1.0, elapsed=10.0, remaining=1.0)
+        assert 0.0 <= result.conditional_prob_given_no_event_yet <= 1.0
+        assert 0.0 <= result.unconditional_prob <= 1.0
+
+
 class TestPoissonAtLeastOne:
     def test_known_value(self):
         assert poisson_at_least_one(0.5) == pytest.approx(1.0 - math.exp(-0.5))
@@ -530,6 +693,51 @@ class TestLinearPoolOptions:
     def test_empty_raises(self):
         with pytest.raises(ValueError):
             linear_pool_options([])
+
+
+class TestNoisyOr:
+    def test_ten_identical_small_probs(self):
+        got = noisy_or([0.1] * 10)
+        expected = 1 - 0.9**10
+        assert got == pytest.approx(expected, abs=1e-9)
+
+    def test_numerical_stability_tiny_p(self):
+        got = noisy_or([1e-9, 0.5, 1e-9])
+        assert got == pytest.approx(0.5, abs=1e-8)
+
+    def test_known_case(self):
+        got = noisy_or([0.2, 0.3, 0.5])
+        expected = 1 - 0.8 * 0.7 * 0.5
+        assert got == pytest.approx(expected, abs=1e-12)
+
+    def test_all_zero(self):
+        assert noisy_or([0.0, 0.0]) == 0.0
+
+    def test_one_certain(self):
+        assert noisy_or([1.0, 0.3]) == 1.0
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([])
+
+    def test_prob_above_one_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([1.5])
+
+    def test_negative_prob_raises(self):
+        with pytest.raises(ValueError):
+            noisy_or([-0.1])
+
+    def test_rejects_unknown_kwargs(self):
+        # F3: noisy_or no longer accepts a weights kwarg. Passing one must
+        # raise TypeError rather than silently degrading the math via the
+        # old non-standard scaling formula.
+        with pytest.raises(TypeError):
+            noisy_or([0.1, 0.2], weights=[1.0, 1.0])  # ty: ignore[unknown-argument]  # type: ignore[call-arg]
+
+    def test_stress_many_small_probs(self):
+        got = noisy_or([0.1] * 100)
+        assert got >= 0.9999
 
 
 class TestFitNormalFromPercentiles:
@@ -1047,23 +1255,26 @@ class TestNelderMeadNonConvergenceRaises:
 
         from metaculus_bot.probabilistic_tools import distributions as dist_mod
 
-        def _forced_fail(objective, x0, **kwargs):
+        def _forced_fail(_objective, x0, **_kwargs):
             return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
 
         monkeypatch.setattr(dist_mod.optimize, "minimize", _forced_fail)
         return monkeypatch
 
-    def test_fit_normal_raises_on_non_convergence(self, forced_failure_monkeypatch):
+    @pytest.mark.usefixtures("forced_failure_monkeypatch")
+    def test_fit_normal_raises_on_non_convergence(self):
         pvs = {q: float(stats.norm.ppf(q)) for q in [0.1, 0.5, 0.9]}
         with pytest.raises(ValueError, match="did not converge"):
             fit_normal_from_percentiles(pvs)
 
-    def test_fit_lognormal_raises_on_non_convergence(self, forced_failure_monkeypatch):
+    @pytest.mark.usefixtures("forced_failure_monkeypatch")
+    def test_fit_lognormal_raises_on_non_convergence(self):
         pvs = {q: float(math.exp(stats.norm.ppf(q))) for q in [0.1, 0.5, 0.9]}
         with pytest.raises(ValueError, match="did not converge"):
             fit_lognormal_from_percentiles(pvs)
 
-    def test_fit_student_t_raises_on_non_convergence(self, forced_failure_monkeypatch):
+    @pytest.mark.usefixtures("forced_failure_monkeypatch")
+    def test_fit_student_t_raises_on_non_convergence(self):
         pvs = {q: float(stats.t.ppf(q, df=5.0)) for q in [0.1, 0.5, 0.9]}
         with pytest.raises(ValueError, match="did not converge"):
             fit_student_t_from_percentiles(pvs, df=5.0)
@@ -1200,3 +1411,364 @@ class TestEvalCdfExported:
         fit = LognormalFit(mu=0.0, sigma=1.0, method="test")
         assert eval_cdf(fit, -1.0) == 0.0
         assert eval_cdf(fit, 0.0) == 0.0
+
+
+# ===========================================================================
+# Mixture-of-normals (Workstream D3)
+# ===========================================================================
+
+
+class TestMixtureConstruction:
+    def test_normalizes_weights_to_sum_to_one(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        mix = MixtureOfNormals(
+            (MixtureComponent(weight=2.0, mean=0.0, sd=1.0), MixtureComponent(weight=6.0, mean=0.0, sd=1.0))
+        )
+        weights = [c.weight for c in mix.components]
+        assert weights[0] == pytest.approx(0.25, abs=1e-12)
+        assert weights[1] == pytest.approx(0.75, abs=1e-12)
+        assert sum(weights) == pytest.approx(1.0, abs=1e-12)
+
+    def test_negative_weight_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=-0.5, mean=10.0, sd=5.0),))
+
+    def test_zero_sd_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=1.0, mean=10.0, sd=0.0),))
+
+    def test_no_components_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals(())
+
+    def test_zero_total_weight_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals
+
+        with pytest.raises(ValueError):
+            MixtureOfNormals((MixtureComponent(weight=0.0, mean=10.0, sd=5.0),))
+
+
+class TestMixtureCDF:
+    def test_single_component_matches_scipy_norm(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        grid = np.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+        got = mixture_cdf(mix, grid)
+        expected = stats.norm.cdf(grid, loc=0.0, scale=1.0)
+        np.testing.assert_allclose(got, expected, atol=1e-12)
+
+    def test_three_component_matches_weighted_sum(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        comps = (
+            MixtureComponent(weight=0.2, mean=68.0, sd=10.0),
+            MixtureComponent(weight=0.55, mean=85.0, sd=7.0),
+            MixtureComponent(weight=0.25, mean=105.0, sd=12.0),
+        )
+        mix = MixtureOfNormals(comps)
+        grid = np.linspace(40.0, 140.0, 201)
+        got = mixture_cdf(mix, grid)
+        expected = sum(c.weight * stats.norm.cdf(grid, loc=c.mean, scale=c.sd) for c in comps)
+        np.testing.assert_allclose(got, expected, atol=1e-12)
+
+    def test_non_finite_grid_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        with pytest.raises(ValueError):
+            mixture_cdf(mix, np.array([0.0, float("nan"), 1.0]))
+
+    def test_empty_grid_raises(self):
+        from metaculus_bot.probabilistic_tools import MixtureComponent, MixtureOfNormals, mixture_cdf
+
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=1.0),))
+        with pytest.raises(ValueError):
+            mixture_cdf(mix, np.array([]))
+
+
+class TestFitMixtureFromPercentiles:
+    def _invert_cdf(self, mix, p: float, lo: float, hi: float) -> float:
+        """Numerically invert the mixture CDF at probability p via bisection."""
+        from scipy.optimize import brentq
+
+        from metaculus_bot.probabilistic_tools import mixture_cdf
+
+        def f(x: float) -> float:
+            return float(mixture_cdf(mix, np.array([x]))[0]) - p
+
+        return float(brentq(f, lo, hi, xtol=1e-10, maxiter=200))
+
+    def test_recovers_three_component_mixture(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+            mixture_cdf,
+        )
+
+        true_mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.2, mean=20.0, sd=5.0),
+                MixtureComponent(weight=0.5, mean=50.0, sd=8.0),
+                MixtureComponent(weight=0.3, mean=85.0, sd=6.0),
+            )
+        )
+        # Numerically invert to get the standard 11 percentiles.
+        standard_ps = [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975]
+        pcts = {p: self._invert_cdf(true_mix, p, -50.0, 200.0) for p in standard_ps}
+
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+
+        # Compare CDFs on a fine grid spanning the declared range.
+        grid = np.linspace(-20.0, 150.0, 501)
+        got = mixture_cdf(fit, grid)
+        expected = mixture_cdf(true_mix, grid)
+        rmse = float(np.sqrt(np.mean((got - expected) ** 2)))
+        assert rmse < 0.01, f"RMSE {rmse} should be < 0.01"
+
+    def test_single_component_generator_recovered_by_three_component_fit(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+            mixture_cdf,
+        )
+
+        true_mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=50.0, sd=10.0),))
+        standard_ps = [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975]
+        pcts = {p: float(stats.norm.ppf(p, loc=50.0, scale=10.0)) for p in standard_ps}
+
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        grid = np.linspace(20.0, 80.0, 201)
+        got = mixture_cdf(fit, grid)
+        expected = mixture_cdf(true_mix, grid)
+        rmse = float(np.sqrt(np.mean((got - expected) ** 2)))
+        assert rmse < 0.02
+
+    def test_degenerate_percentiles_fallback(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        # All percentiles collapse to the same value — fall back to single-normal.
+        pcts = {0.1: 5.0, 0.5: 5.0, 0.9: 5.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        # Should return a valid mixture (no exception).
+        assert len(fit.components) >= 1
+
+    def test_n_components_one_raises(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        with pytest.raises(ValueError):
+            fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=1, seed=0)
+
+    def test_n_components_five_raises(self):
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+
+        with pytest.raises(ValueError):
+            fit_mixture_from_percentiles({0.1: 1.0, 0.5: 2.0, 0.9: 3.0}, n_components=5, seed=0)
+
+    def test_multi_start_recovers_bimodal_independent_of_seed(self):
+        # F10: bimodal generator with widely separated modes is brittle for
+        # single-seed L-BFGS-B from a centered start. Multi-start (best of 5
+        # seeds by SSE) should consistently recover the true CDF.
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+            mixture_cdf,
+        )
+
+        true_mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.5, mean=30.0, sd=5.0),
+                MixtureComponent(weight=0.5, mean=70.0, sd=5.0),
+            )
+        )
+        # Numerically invert to declared percentiles.
+        from scipy.optimize import brentq
+
+        def _invert(p: float) -> float:
+            def f(x: float) -> float:
+                return float(mixture_cdf(true_mix, np.array([x]))[0]) - p
+
+            return float(brentq(f, -50.0, 200.0, xtol=1e-10, maxiter=200))
+
+        standard_ps = [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975]
+        pcts = {p: _invert(p) for p in standard_ps}
+
+        # Multi-start should recover SSE < 0.01 regardless of which seed we
+        # ask for; with single-start, seeds 5/6/10/15 land in a poor local
+        # minimum (SSE ~3.2) for this bimodal generator. Multi-start picks
+        # the best of seeds [base, base+1..4], removing seed-dependence.
+        grid = np.linspace(0.0, 100.0, 401)
+        expected_cdf = mixture_cdf(true_mix, grid)
+        for seed in [0, 5, 6, 10, 15, 42]:
+            fit = fit_mixture_from_percentiles(pcts, n_components=2, seed=seed)
+            got = mixture_cdf(fit, grid)
+            sse = float(np.sum((got - expected_cdf) ** 2))
+            assert sse < 0.01, f"seed={seed}: SSE {sse} should be < 0.01"
+
+    def test_optimizer_failure_falls_back_to_single_normal(self, monkeypatch):
+        # F10: when every seed's L-BFGS-B run fails (result.success=False),
+        # fit_mixture_from_percentiles must fall back to the single-normal
+        # safety net (median + IQR/1.349 etc.) rather than returning a
+        # broken MixtureOfNormals.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+        )
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
+        # Provide percentiles with a clean p25/p50/p75 so the IQR fallback runs.
+        pcts = {0.1: 5.0, 0.25: 10.0, 0.5: 20.0, 0.75: 30.0, 0.9: 40.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        assert isinstance(fit, MixtureOfNormals)
+        assert len(fit.components) == 1
+        assert fit.components[0].mean == pytest.approx(20.0)
+        # IQR = 20, so sd = 20 / 1.349.
+        assert fit.components[0].sd == pytest.approx(20.0 / 1.349, rel=1e-6)
+
+    def test_fallback_uses_mean_std_when_iqr_keys_missing(self, monkeypatch):
+        # F24: when the optimizer fails AND the percentile dict is missing
+        # any of {0.25, 0.5, 0.75}, the IQR-based single-normal fallback
+        # cannot run. The secondary fallback (mean+std of values, ddof=0)
+        # must produce a valid MixtureOfNormals with sd > 0 rather than
+        # raising.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+        )
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
+        # Only p10 / p50 / p90 — no p25 or p75, so the IQR branch can't fire.
+        # Median is present but is_integer key match needs both 0.25 and 0.75.
+        pcts = {0.1: 5.0, 0.5: 20.0, 0.9: 40.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        assert isinstance(fit, MixtureOfNormals)
+        assert len(fit.components) == 1
+        # mean = (5 + 20 + 40) / 3 ≈ 21.667
+        expected_mean = (5.0 + 20.0 + 40.0) / 3
+        assert fit.components[0].mean == pytest.approx(expected_mean, rel=1e-6)
+        # sd > 0 (must use std-of-values, not collapse to zero)
+        assert fit.components[0].sd > 0.0
+
+    def test_fallback_uses_floor_when_values_collapse_to_single_point(self, monkeypatch):
+        # F24: secondary fallback's tiny-positive-floor branch — when the
+        # optimizer fails AND no valid IQR is available AND std-of-values is
+        # zero (all percentiles map to the same value), sd must collapse to
+        # a positive floor (max(|mean| * 0.1, 1e-6)) rather than 0.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import fit_mixture_from_percentiles
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        def _always_fail(objective, x0, **kwargs):  # noqa: ARG001
+            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
+        # Note: degenerate-percentiles short-circuit fires *before* the
+        # optimizer in fit_mixture_from_percentiles, so this exercises the
+        # `_fallback_single_normal` floor branch directly.
+        pcts = {0.1: 5.0, 0.5: 5.0, 0.9: 5.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=3, seed=0)
+        assert fit.components[0].sd > 0.0
+        assert fit.components[0].mean == pytest.approx(5.0)
+
+    def test_subthreshold_sd_falls_back_to_single_normal(self, monkeypatch):
+        # F10: when every seed's optimizer reports success but produces an sd
+        # below _MIN_FIT_SD, fall back to the single-normal safety net.
+        from scipy.optimize import OptimizeResult
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureOfNormals,
+            fit_mixture_from_percentiles,
+        )
+        from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
+
+        # 3 components, each with log_sd=-50 (sd ≈ 1.9e-22 << _MIN_FIT_SD=1e-9).
+        n = 3
+        bad_log_sd = -50.0
+        x_bad = np.concatenate([np.zeros(n), np.array([10.0, 20.0, 30.0]), np.full(n, bad_log_sd)])
+
+        def _success_with_tiny_sd(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
+            return OptimizeResult(success=True, message="ok", x=x_bad, fun=0.0, nit=1)
+
+        monkeypatch.setattr(mixtures_mod.optimize, "minimize", _success_with_tiny_sd)
+        pcts = {0.1: 5.0, 0.25: 10.0, 0.5: 20.0, 0.75: 30.0, 0.9: 40.0}
+        fit = fit_mixture_from_percentiles(pcts, n_components=n, seed=0)
+        assert isinstance(fit, MixtureOfNormals)
+        # Fallback returns a single-normal MixtureOfNormals.
+        assert len(fit.components) == 1
+
+
+class TestPercentilesToMetaculusCdfViaMixture:
+    def test_closed_bounds_produces_201_point_cdf(self):
+        from forecasting_tools.data_models.numeric_report import Percentile
+
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            percentiles_to_metaculus_cdf_via_mixture,
+        )
+
+        mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.3, mean=25.0, sd=8.0),
+                MixtureComponent(weight=0.4, mean=50.0, sd=10.0),
+                MixtureComponent(weight=0.3, mean=75.0, sd=6.0),
+            )
+        )
+        q = make_mock_numeric_question()
+        cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
+        assert isinstance(cdf, list)
+        assert len(cdf) == 201
+        for p in cdf:
+            assert isinstance(p, Percentile)
+        probs = np.array([p.percentile for p in cdf])
+        values = np.array([p.value for p in cdf])
+        diffs = np.diff(probs)
+        assert np.all(diffs >= 5e-5 - 1e-10)
+        assert probs[0] == pytest.approx(0.0, abs=1e-9)
+        assert probs[-1] == pytest.approx(1.0, abs=1e-9)
+        # Values are on the grid from lower to upper bound.
+        assert values[0] == pytest.approx(0.0)
+        assert values[-1] == pytest.approx(100.0)
+
+    def test_open_bounds_respected(self):
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            percentiles_to_metaculus_cdf_via_mixture,
+        )
+
+        mix = MixtureOfNormals(
+            (
+                MixtureComponent(weight=0.5, mean=30.0, sd=5.0),
+                MixtureComponent(weight=0.5, mean=70.0, sd=5.0),
+            )
+        )
+        q = make_mock_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q)
+        assert len(cdf) == 201
+        probs = [p.percentile for p in cdf]
+        assert probs[0] >= 0.001 - 1e-12
+        assert probs[-1] <= 0.999 + 1e-12

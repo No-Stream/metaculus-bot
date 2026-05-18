@@ -46,8 +46,49 @@ def _benchmarking_warning(context: BenchmarkingContext = "search") -> str:
     )
 
 
-def _today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+def _forecasting_window_str(
+    question: BinaryQuestion | MultipleChoiceQuestion | NumericQuestion,
+) -> str:
+    """Return a window-anchor block: open date, today, resolution date, deltas.
+
+    Prevents a common failure mode where bots treat questions like "Will a
+    nuclear detonation occur in a Japanese city by 2030?" as already-resolved
+    YES because a detonation happened in 1945 — the question's forecasting
+    window is open_time → scheduled_resolution_time, not "all of history".
+    """
+    # MetaculusQuestion types these as `datetime | None`, but real API-fetched
+    # questions always populate both. Assert to fail fast — a missing timestamp
+    # means upstream data is broken and we want a loud error, not a silent
+    # fallback that corrupts forecasts.
+    assert question.open_time is not None, "question.open_time is required"
+    assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
+
+    today = datetime.now()
+    elapsed_days = (today - question.open_time).days
+    remaining_days = (question.scheduled_resolution_time - today).days
+
+    return (
+        f"Today: {today.strftime('%Y-%m-%d')}\n"
+        f"Question opened: {question.open_time.strftime('%Y-%m-%d')} ({elapsed_days} days ago)\n"
+        f"Scheduled to resolve: {question.scheduled_resolution_time.strftime('%Y-%m-%d')} "
+        f"({remaining_days} days from now)\n"
+        f"Forecasting window: open date → resolution date. "
+        f"Events occurring BEFORE the open date do NOT resolve this question YES "
+        f"unless the resolution criteria explicitly say they count. "
+        f"If the question uses forward-looking language ('will X occur by DATE'), "
+        f"interpret it as asking about the open→resolution window, not all of history."
+    )
+
+
+def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
+    """Render the cross-model-aggregation markdown block for the stacker prompt.
+
+    Returns the empty string when ``aggregated_tool_output`` is None or
+    empty — callers can unconditionally interpolate the result.
+    """
+    if not aggregated_tool_output:
+        return ""
+    return f"\n── Cross-model aggregation (deterministic math) ──\n{aggregated_tool_output}\n"
 
 
 CitationStyle = Literal["markdown", "auto_annotated"]
@@ -105,6 +146,14 @@ FOCUS AREAS:
 - Expert opinions and analysis
 - Official statements and announcements{prediction_markets_instruction}
 
+PRIMARY SOURCES (preferred — cite these over aggregators/blogs when available):
+- Government statistics sites (e.g. `.gov`, `.gouv.fr`, `ec.europa.eu`, `*.go.jp`)
+- SEC filings and investor-relations pages (e.g. `sec.gov`, `q4cdn.com`, `*/investor-relations/`)
+- Official company and product docs (e.g. `platform.*.com`, `docs.*.com`, `*.company.com/press/`)
+- Scientific registries and public-health agencies (e.g. `who.int`, `cdc.gov`, `ecdc.europa.eu`, `pubmed.ncbi.nlm.nih.gov`, `clinicaltrials.gov`)
+- Central banks and macro agencies (e.g. `federalreserve.gov`, `ecb.europa.eu`, `imf.org`, `worldbank.org`, `bls.gov`, `bts.gov`, `census.gov`, `tsa.gov`)
+- Wire services (AP, Reuters, Bloomberg, FT) are acceptable as secondary sources
+
 QUESTION:
 {question_text}
 
@@ -138,7 +187,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             Your research assistant says:
             {research}
 
-            Today is {_today_str()}.
+            {_forecasting_window_str(question)}
             Reproduce the following analysis template in your answer:
 
             ── Analysis Template ──
@@ -147,6 +196,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             0) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
+               • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
                • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "a model is released AND it is Opus-branded AND it is accessible to external users"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
@@ -201,6 +251,23 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
             • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
+            ── STRUCTURED FORECAST (machine-readable; required) ──
+            After the analysis, emit a fenced ```json block summarizing your forecast
+            in machine-readable form. Downstream deterministic tools consume this.
+            Schema (all fields except `posterior_prob` are optional; omit if not applicable):
+
+            ```json
+            {{
+              "question_type": "binary",
+              "prior": {{"prob": 0.15, "source": "annual incidence 2015-2024"}},
+              "base_rate": {{"k": 3, "n": 12, "ref_class": "years matching condition"}},
+              "hazard": {{"rate_per_unit": 0.25, "unit": "year", "window_duration_units": 1.0, "elapsed_fraction": 0.33, "remaining_fraction": 0.67}},
+              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate"}}],
+              "scenarios": [],
+              "posterior_prob": 0.28
+            }}
+            ```
+
             [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
             """
@@ -208,6 +275,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
 
 def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> str:
+    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
@@ -231,7 +299,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
 
-        Today's date: {_today_str()}
+        {_forecasting_window_str(question)}
         Reproduce the following analysis template in your answer:
 
         ── Analysis Template ──
@@ -291,11 +359,25 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
 
+        ── STRUCTURED FORECAST (machine-readable; required) ──
+        After the analysis, emit a fenced ```json block summarizing your forecast
+        in machine-readable form. Downstream deterministic tools consume this.
+        Schema (all fields except `option_probs` are optional; omit if not applicable):
+
+        ```json
+        {{
+          "question_type": "multiple_choice",
+          "option_probs": {{"Option_A": 0.5, "Option_B": 0.3, "Option_C": 0.2}},
+          "other_mass": 0.0,
+          "concentration": 20.0
+        }}
+        ```
+
+        The `option_probs` object must sum to 1.0 and use the exact option names above.
+        Emit the JSON block BEFORE the final per-option answer lines.
+
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        Option_A: NN%
-        Option_B: NN%
-        …
-        Option_N: NN%
+        {answer_example_lines}
         """
     )
 
@@ -343,7 +425,7 @@ def numeric_prompt(
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
 
-        Today's date: {_today_str()}
+        {_forecasting_window_str(question)}
 
         {lower_bound_message}
         {upper_bound_message}
@@ -437,6 +519,58 @@ def numeric_prompt(
             - Forecastability check: does your interval width match the forecastability classification?
             - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
+        ── STRUCTURED FORECAST (machine-readable; required) ──
+        After the analysis, emit a fenced ```json block summarizing your forecast
+        in machine-readable form. Downstream deterministic tools consume this.
+        Schema (all fields except `declared_percentiles` are optional; omit if not applicable):
+
+        ```json
+        {{
+          "question_type": "numeric",
+          "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
+          "distribution_family_hint": "normal",
+          "student_t_df": null,
+          "tails": {{"below_min_expected": 0.02, "above_max_expected": 0.05}},
+          "scenarios": [],
+          "mixture_components": null
+        }}
+        ```
+
+        Notes:
+        - `declared_percentiles` must cover at least {{0.1, 0.5, 0.9}}. The JSON percentiles
+          should match your final Percentile lines below (tools operate on the JSON; the
+          official forecast is still read from the trailing Percentile lines).
+        - `distribution_family_hint` ∈ {{"normal", "lognormal", "student_t"}}.
+        - `student_t_df` only meaningful if family_hint = "student_t".
+        - `tails.below_min_expected` and `tails.above_max_expected` are the probability
+          mass you expect outside the closed bounds.
+        - `mixture_components` is OPTIONAL and now wired end-to-end (see OUTPUT FORMAT
+          below). It is a list of {{weight, mean, sd}} triples whose weights sum to
+          1.0 (within 0.001).
+
+        Emit the JSON block BEFORE the final Prediction block.
+
+        ── OUTPUT FORMAT — pick exactly one ──
+
+        OPTION A — PERCENTILES (default; what most models use):
+          Emit the trailing 11 standard percentiles as your Prediction block. Use
+          this whenever your reasoning is naturally percentile-shaped (a single
+          mode, smooth tails, no clear scenario branching). Do NOT populate
+          `mixture_components` in the JSON block.
+
+        OPTION B — MIXTURE OF NORMALS:
+          Use this when you naturally reason in 'underperform / baseline / breakout'
+          scenarios, or for clearly bimodal questions. Populate `mixture_components`
+          in the JSON block with at least 2 components whose weights sum to 1.0
+          (within 0.001), each with `weight`, `mean`, and `sd` (>0). Means and sds
+          are in the question's base unit. Code will build the 201-point Metaculus
+          CDF directly from your mixture; you may omit the percentile lines entirely
+          (the parser will use the mixture).
+
+        If you emit BOTH formats, the parser will use the mixture and ignore the
+        percentile lines (a WARNING is logged so we can audit how often this
+        happens). Pick one — don't hedge.
+
         Prediction:
         [Reminders:
         - Floating point numbers in the base unit
@@ -459,33 +593,46 @@ def numeric_prompt(
     )
 
 
-def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predictions: list[str]) -> str:
-    """Return the stacking prompt for binary questions that takes multiple model predictions as input."""
+def stacking_binary_prompt(
+    question: BinaryQuestion,
+    research: str,
+    base_predictions: list[str],
+    aggregated_tool_output: str | None = None,
+) -> str:
+    """Return the stacking prompt for binary questions that takes multiple model predictions as input.
+
+    ``aggregated_tool_output`` is an optional markdown block produced by
+    ``metaculus_bot.tool_runner.build_cross_model_aggregation`` — when
+    provided, it is injected at the TOP of the prompt so the stacker sees
+    deterministic cross-model math (pools, base-rate blends, etc.) before
+    the raw base-model analyses.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
         You will be judged based on the accuracy and calibration of your final forecast using the Metaculus peer score (log score).
-        
+        {aggregation_section}
         Your task is to synthesize multiple expert analyses into a single, well-calibrated probability.
-        
+
         Your Metaculus question is:
         {question.question_text}
-        
+
         Question background:
         {question.background_info}
-        
+
         This question's outcome will be determined by the specific criteria below:
         {question.resolution_criteria}
-        
+
         {question.fine_print}
-        
+
         Your research assistant provided this context:
         {research}
-        
-        Today is {_today_str()}.
-        
+
+        {_forecasting_window_str(question)}
+
         ── Multiple Expert Analyses ──
         {predictions_text}
         
@@ -530,36 +677,44 @@ def stacking_binary_prompt(question: BinaryQuestion, research: str, base_predict
 
 
 def stacking_multiple_choice_prompt(
-    question: MultipleChoiceQuestion, research: str, base_predictions: list[str]
+    question: MultipleChoiceQuestion,
+    research: str,
+    base_predictions: list[str],
+    aggregated_tool_output: str | None = None,
 ) -> str:
-    """Return the stacking prompt for multiple choice questions."""
+    """Return the stacking prompt for multiple choice questions.
+
+    See ``stacking_binary_prompt`` for ``aggregated_tool_output`` semantics.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
+    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        Your accuracy and calibration will be scored with Metaculus' log-score, so avoid over-confidence 
+        Your accuracy and calibration will be scored with Metaculus' log-score, so avoid over-confidence
         and make sure your probabilities sum to **100%**.
-        
+        {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
-        
+
         • Options (in resolution order): {question.options}
-        
+
         ── Context ───────────────────────────────────────────────────────────
         {question.background_info}
-        
+
         {question.resolution_criteria}
         {question.fine_print}
-        
+
         ── Intelligence Briefing ────────────────────────────────
         {research}
-        
-        Today's date: {_today_str()}
-        
+
+        {_forecasting_window_str(question)}
+
         ── Multiple Expert Analyses ──
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Model agreement analysis
            • Which options show consensus vs divergence across models?
@@ -599,10 +754,7 @@ def stacking_multiple_choice_prompt(
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
         
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        Option_A: NN%
-        Option_B: NN%
-        …
-        Option_N: NN%
+        {answer_example_lines}
         """
     )
 
@@ -613,16 +765,21 @@ def stacking_numeric_prompt(
     base_predictions: list[str],
     lower_bound_message: str,
     upper_bound_message: str,
+    aggregated_tool_output: str | None = None,
 ) -> str:
-    """Return the stacking prompt for numeric questions."""
+    """Return the stacking prompt for numeric questions.
+
+    See ``stacking_binary_prompt`` for ``aggregated_tool_output`` semantics.
+    """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
+    aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
 
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        You will be scored with Metaculus' log-score, so accuracy **and** calibration 
+        You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your 90/10 interval) are critical.
-        
+        {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
         
@@ -645,15 +802,15 @@ def stacking_numeric_prompt(
         
         ── Intelligence Briefing ────────────────────────────────
         {research}
-        
-        Today's date: {_today_str()}
-        
+
+        {_forecasting_window_str(question)}
+
         {lower_bound_message}
         {upper_bound_message}
-        
+
         ── Multiple Expert Analyses ──
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Distribution comparison
            • Compare the central tendencies (medians) across models - what explains differences?

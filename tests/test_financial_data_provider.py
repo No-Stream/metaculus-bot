@@ -6,6 +6,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
+
+def _make_q(text: str) -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
+    contract. Tests only care about question_text on this path."""
+    q = MagicMock()
+    q.question_text = text
+    return q
+
+
 # ---------------------------------------------------------------------------
 # Classifier tests
 # ---------------------------------------------------------------------------
@@ -262,7 +271,9 @@ class TestFinancialDataProviderIntegration:
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
             try:
                 provider = financial_data_provider()
-                result = await provider("Will Apple stock price exceed $200 and will unemployment stay below 5%?")
+                result = await provider(
+                    _make_q("Will Apple stock price exceed $200 and will unemployment stay below 5%?")
+                )
             finally:
                 monkeypatch.undo()
 
@@ -280,7 +291,7 @@ class TestFinancialDataProviderIntegration:
             from metaculus_bot.financial_data_provider import financial_data_provider
 
             provider = financial_data_provider()
-            result = await provider("Will it rain in London tomorrow?")
+            result = await provider(_make_q("Will it rain in London tomorrow?"))
 
         assert result == ""
 
@@ -316,7 +327,7 @@ class TestFinancialDataProviderIntegration:
             from metaculus_bot.financial_data_provider import financial_data_provider
 
             provider = financial_data_provider()
-            result = await provider("Compare Apple and BADTICKER stock performance")
+            result = await provider(_make_q("Compare Apple and BADTICKER stock performance"))
 
         assert "AAPL" in result
         # BADTICKER should not appear (its fetch failed and returned "")
@@ -347,7 +358,7 @@ class TestFinancialDataProviderIntegration:
             monkeypatch.delenv("FRED_API_KEY", raising=False)
             try:
                 provider = financial_data_provider()
-                result = await provider("Will Apple stock rise and unemployment fall?")
+                result = await provider(_make_q("Will Apple stock rise and unemployment fall?"))
             finally:
                 monkeypatch.undo()
 

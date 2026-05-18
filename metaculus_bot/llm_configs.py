@@ -17,6 +17,7 @@ __all__ = [
     "STACKER_LLM",
     "STACKER_FALLBACK_LLM",
     "DISAGREEMENT_ANALYZER_LLM",
+    "PREDICTION_MARKET_KEYWORD_LLM_CONFIG",
 ]
 REASONING_MODEL_CONFIG = {
     "temperature": 1.0,  # standard sampling params for recent reasoning models
@@ -81,8 +82,12 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         model="openrouter/google/gemini-3.1-pro-preview",
         **REASONING_MODEL_CONFIG,
     ),
+    # 2026-05-18: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
+    # Added explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
+    # (4.3 defaults to low effort if unspecified, vs. 4.1-fast which had no effort flag).
     build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.1-fast",
+        model="openrouter/x-ai/grok-4.3",
+        reasoning={"effort": "high"},
         **REASONING_MODEL_CONFIG,
     ),
 ]
@@ -99,7 +104,17 @@ def _forecaster_display_name(llm: GeneralLlm) -> str:
 
 FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
-SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3-flash-preview", timeout=120)
+# Summarizer: compresses AskNews/Perplexity research output. Migrated 2026-05-17
+# from gemini-3-flash-preview to gpt-5.4-mini for: (1) consistency with the rest
+# of the OpenAI-based support stack (analyzer, parser, native search), (2) lower
+# rate-limit exposure than the donated-key Google route, (3) the donated-key
+# data-policy block on OpenAI is expected to be lifted; until then, summarizer
+# bills to personal OPENROUTER_API_KEY (~$0.01/call × every Q).
+SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
+    "openrouter/openai/gpt-5.4-mini",
+    reasoning={"effort": "low"},
+    **DETERMINISTIC_MODEL_CONFIG,
+)
 # Parser should be a reliable, low-latency model for structure extraction
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5-mini",
@@ -108,7 +123,12 @@ PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 )
 # Researcher is only used by the base bot when internal research is invoked.
 # Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
-RESEARCHER_LLM = build_llm_with_openrouter_fallback(model="openrouter/google/gemini-3-flash-preview", timeout=120)
+# Migrated 2026-05-17 same rationale as SUMMARIZER_LLM above.
+RESEARCHER_LLM = build_llm_with_openrouter_fallback(
+    model="openrouter/openai/gpt-5.4-mini",
+    reasoning={"effort": "low"},
+    **DETERMINISTIC_MODEL_CONFIG,
+)
 
 # Stacker meta-model for conditional stacking (invoked only on high-disagreement questions).
 #
@@ -136,9 +156,29 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
 
-# Cheap model for identifying the crux of model disagreement (feeds into targeted research)
+# Keyword-extraction LLM config for the prediction-market provider.
+# Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
+# gpt-5-mini reasoning=low burns 128-512 tokens on invisible reasoning before
+# emitting any visible response, so max_tokens=800 is load-bearing.
+# Constructed per-call inside _run_llm rather than as a singleton because the
+# provider is gated OFF by default and we don't want to pay construction cost
+# (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
+PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
+    "model": "openrouter/openai/gpt-5-mini",
+    "temperature": 0.0,
+    "max_tokens": 800,
+    "reasoning_effort": "low",
+    "timeout": 60,
+}
+
+
+# Medium-effort model for identifying the crux of model disagreement (feeds into targeted research).
+# Crux text becomes the targeted-search query, so quality drives downstream retrieval quality;
+# medium effort gives faster wall-clock for a structured 1-3 sentence extraction without
+# materially hurting quality, and matches the effort tier we settled on for native search.
+# Cost is ~$0.055/disagreement-Q × ~75 Qs/tournament = ~$4/tournament — negligible.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5-mini",
-    reasoning={"effort": "low"},
+    "openrouter/openai/gpt-5.5",
+    reasoning={"effort": "medium"},
     **DETERMINISTIC_MODEL_CONFIG,
 )

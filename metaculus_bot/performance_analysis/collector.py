@@ -13,6 +13,7 @@ import requests
 from dotenv import load_dotenv
 
 from metaculus_bot.performance_analysis.parsing import (
+    parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
     parse_per_model_numeric_percentiles,
     parse_resolution,
@@ -176,9 +177,17 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     comment = comment_lookup.get(post_id)
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
     comment_id = comment["id"] if comment else None
+    comment_created_at = comment.get("created_at") if comment else None
     per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
+    # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
+    # the legacy STACKED= marker, then to historical body-shape detection for
+    # comments that predate either marker.
+    if comment_text:
+        stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
+    else:
+        stacker_outcome, stacker_outcome_source = None, "none"
 
     # Cross-signal sanity: a stacked comment should expose at least one
     # per-model entry via the rationale parsers. If the marker says stacked
@@ -204,6 +213,9 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             per_model_numeric_percentiles,
             was_stacked,
             post_data,
+            comment_created_at=comment_created_at,
+            stacker_outcome=stacker_outcome,
+            stacker_outcome_source=stacker_outcome_source,
         )
         if record is not None:
             records.append(record)
@@ -220,6 +232,10 @@ def _process_single_question(
     per_model_numeric_percentiles: dict[str, list[tuple[float, float]]],
     was_stacked: bool | None,
     post_data: dict,
+    *,
+    comment_created_at: str | None = None,
+    stacker_outcome: str | None = None,
+    stacker_outcome_source: str = "none",
 ) -> dict | None:
     """Process a single question dict into a scored record."""
     question_id = q.get("id")
@@ -287,14 +303,26 @@ def _process_single_question(
         "per_model_numeric_percentiles": per_model_numeric_percentiles,
         # Tri-state: True/False when the STACKED=<bool> marker is present in
         # the comment, None for older comments where the marker didn't exist
-        # and stacking status can't be determined.
+        # and stacking status can't be determined. Kept for back-compat;
+        # prefer stacker_outcome below for new analyses.
         "was_stacked": was_stacked,
+        # Tri-state stacker outcome ("primary"|"fallback_llm"|"fallback_median"
+        # |"skipped") with provenance string ("marker_outcome"|"marker_legacy"|
+        # "historical_body"|"none"). Distinguishes median-fallback from skipped
+        # at the record level — the legacy `was_stacked` collapses both to
+        # False/None and so is lossy for stacking-treatment-effect cuts.
+        "stacker_outcome": stacker_outcome,
+        "stacker_outcome_source": stacker_outcome_source,
         "scaling": scaling,
         "open_lower_bound": open_lower,
         "open_upper_bound": open_upper,
         "options": options,
         "comment_text": comment_text,
         "comment_id": comment_id,
+        # ISO-8601 timestamp on the bot's comment so cohort cuts can filter by
+        # *submit*-date (e.g., May-vintage stack) instead of the coarser
+        # actual_resolve_time stamp on the question.
+        "bot_comment_created_at": comment_created_at,
         # Metaculus-computed scores from my_forecasts.score_data. Contains
         # peer_score (ascending: negative = worse than crowd), spot_peer_score,
         # baseline_score, spot_baseline_score, coverage, weighted_coverage,
@@ -318,6 +346,46 @@ def _process_single_question(
     return record
 
 
+def resolve_numeric_record_to_score_inputs(
+    record: dict,
+) -> tuple[float, float, float, float | None] | None:
+    """Coerce a numeric/discrete record to (res_float, lower, upper, zero_point).
+
+    Returns None when the record can't be scored (missing bounds,
+    unrecognized resolution). ``above_upper_bound`` / ``below_lower_bound``
+    are coerced to ``upper + 1.0`` / ``lower - 1.0`` to feed
+    ``numeric_log_score``'s out-of-bounds branch. ``zero_point`` is None
+    when scaling.zero_point is None or 0/0.0 (the linear-scale sentinel).
+
+    Shared by ``_compute_scores`` (record-level scoring) and
+    ``audit._rank_numeric`` (per-model scoring) so both paths follow the
+    same coercion rules.
+    """
+    scaling = record.get("scaling") or {}
+    lower_raw = scaling.get("range_min")
+    upper_raw = scaling.get("range_max")
+    if lower_raw is None or upper_raw is None:
+        return None
+
+    lower_bound = float(lower_raw)
+    upper_bound = float(upper_raw)
+
+    zero_point_raw = scaling.get("zero_point")
+    zero_point = float(zero_point_raw) if zero_point_raw not in (None, 0, 0.0) else None
+
+    resolution = record.get("resolution_parsed")
+    if resolution == "above_upper_bound":
+        res_float = upper_bound + 1.0
+    elif resolution == "below_lower_bound":
+        res_float = lower_bound - 1.0
+    elif isinstance(resolution, (int, float)) and not isinstance(resolution, bool):
+        res_float = float(resolution)
+    else:
+        return None
+
+    return res_float, lower_bound, upper_bound, zero_point
+
+
 def _compute_scores(record: dict) -> None:
     """Compute and set score fields on a record dict in place."""
     q_type = record["type"]
@@ -334,37 +402,23 @@ def _compute_scores(record: dict) -> None:
             record["log_score"] = binary_log_score(prob_yes, resolution)
 
     elif q_type in ("numeric", "discrete"):
-        scaling = record["scaling"]
-        lower_bound = scaling.get("range_min")
-        upper_bound = scaling.get("range_max")
-        zero_point_raw = scaling.get("zero_point")
-        zero_point = float(zero_point_raw) if zero_point_raw not in (None, 0, 0.0) else None
+        score_inputs = resolve_numeric_record_to_score_inputs(record)
+        if score_inputs is None:
+            return
+        res_float, lower_bound, upper_bound, zero_point = score_inputs
 
-        if lower_bound is not None and upper_bound is not None:
-            lower_bound = float(lower_bound)
-            upper_bound = float(upper_bound)
-
-            if resolution == "above_upper_bound":
-                res_float = upper_bound + 1.0
-            elif resolution == "below_lower_bound":
-                res_float = lower_bound - 1.0
-            elif isinstance(resolution, (int, float)):
-                res_float = float(resolution)
-            else:
-                return
-
-            try:
-                record["numeric_log_score"] = numeric_log_score(
-                    forecast_values,
-                    res_float,
-                    lower_bound,
-                    upper_bound,
-                    record["open_lower_bound"],
-                    record["open_upper_bound"],
-                    zero_point,
-                )
-            except (ValueError, ZeroDivisionError) as e:
-                logger.warning(f"Failed numeric scoring for post {record['post_id']}: {e}")
+        try:
+            record["numeric_log_score"] = numeric_log_score(
+                forecast_values,
+                res_float,
+                lower_bound,
+                upper_bound,
+                record["open_lower_bound"],
+                record["open_upper_bound"],
+                zero_point,
+            )
+        except (ValueError, ZeroDivisionError) as e:
+            logger.warning(f"Failed numeric scoring for post {record['post_id']}: {e}")
 
     elif q_type == "multiple_choice" and isinstance(resolution, str):
         options = record.get("options") or []

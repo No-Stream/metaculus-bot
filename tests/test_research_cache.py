@@ -154,8 +154,8 @@ async def test_research_cache_different_questions_separate_cache_entries(test_ll
     )
 
     # Mock provider to return different results based on question
-    async def mock_provider(question_text):
-        if "Question 1" in question_text:
+    async def mock_provider(question):
+        if "Question 1" in question.question_text:
             return "Research for Q1"
         else:
             return "Research for Q2"

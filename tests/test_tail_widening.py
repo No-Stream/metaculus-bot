@@ -1,4 +1,6 @@
 import math
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +11,14 @@ from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.tail_widening import widen_declared_percentiles
 
 
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
+
+
 def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
     return SimpleNamespace(
         lower_bound=lower,
@@ -17,13 +27,20 @@ def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
         open_upper_bound=open_upper,
         id_of_question=777,
         page_url="https://ex/q/777",
+        question_text="tail widening test",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        unit_of_measure="units",
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
 
 
-def _eleven_percentiles(values: list[float]) -> list[Percentile]:
+def _eleven_percentiles(values: Sequence[float]) -> list[Percentile]:
     ps = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
     assert len(values) == len(ps)
-    return [Percentile(percentile=p, value=v) for p, v in zip(ps, values)]
+    return [Percentile(percentile=p, value=float(v)) for p, v in zip(ps, values)]
 
 
 class TestTailWideningUnit:
@@ -33,6 +50,74 @@ class TestTailWideningUnit:
         out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
         assert [p.value for p in out] == [p.value for p in base]
         assert next(p.value for p in out if math.isclose(p.percentile, 0.5)) == 50
+
+    def test_k_tail_one_identity_on_declared_percentiles(self):
+        """k_tail=1.0 with gamma=0.0 must return the input list unchanged (identity pass).
+
+        Locks in the default no-op behavior after flipping TAIL_WIDEN_K_TAIL: 1.25 -> 1.0.
+        See scratch_docs_and_planning/tail_widening_empirical_calibration.md.
+        """
+        q = _make_question(0.0, 100.0, False, False)
+        shapes = [
+            [5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98],
+            [10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98],
+            [1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97],
+        ]
+        for values in shapes:
+            base = _eleven_percentiles(values)
+            out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
+            assert [p.value for p in out] == values
+            assert [p.percentile for p in out] == [p.percentile for p in base]
+
+    def test_k_tail_below_one_raises(self):
+        """k_tail=0.8 currently silently no-ops (narrowing unimplemented). Must raise."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        with pytest.raises(ValueError, match="narrowing is not implemented"):
+            widen_declared_percentiles(base, q, k_tail=0.8, tail_start=0.2, span_floor_gamma=0.0)
+
+    def test_k_tail_negative_raises(self):
+        """Negative k_tail is nonsense; must fail fast per repo fail-fast convention."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        with pytest.raises(ValueError):
+            widen_declared_percentiles(base, q, k_tail=-1.0, tail_start=0.2, span_floor_gamma=0.0)
+
+    def test_span_floor_gamma_negative_raises(self):
+        """Negative span_floor_gamma produces nonsense; must fail fast."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        with pytest.raises(ValueError):
+            widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=-0.5)
+
+    def test_span_floor_gamma_zero_matches_one_on_real_shapes(self):
+        """On realistic ensemble-averaged declared shapes, the span floor never binds:
+        gamma=0.0 (disabled) and gamma=1.0 (enabled) must produce identical output.
+
+        Regression test for the empirical finding in
+        scratch_docs_and_planning/tail_widening_empirical_calibration.md section 3 —
+        locks in the justification for flipping the default gamma to 0.0.
+        """
+        q = _make_question(0.0, 100.0, False, False)
+        # Shapes mirror ensemble-averaged declared percentiles on real 2026 data:
+        # the outer tail span (p05 - p025) is already at least as wide as
+        # gamma=1.0 * (p10 - p05), mirroring ensembles-of-LLMs that hedge the outer
+        # 2.5% tail conservatively. Empirical study confirms this holds on all 43
+        # production questions.
+        realistic_shapes = [
+            [2, 5, 7, 15, 30, 50, 70, 85, 93, 95, 98],
+            [1, 4, 6, 12, 30, 50, 70, 88, 94, 96, 99],
+            [10, 15, 18, 25, 38, 50, 62, 75, 82, 85, 90],
+            [5, 12, 15, 22, 35, 50, 65, 78, 85, 88, 95],
+        ]
+        for values in realistic_shapes:
+            base = _eleven_percentiles(values)
+            out_zero = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=0.0)
+            out_one = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=1.0)
+            vals_zero = [p.value for p in out_zero]
+            vals_one = [p.value for p in out_one]
+            for a, b in zip(vals_zero, vals_one):
+                assert math.isclose(a, b, rel_tol=0, abs_tol=1e-12), (values, vals_zero, vals_one)
 
     def test_closed_bounds_widening_increases_tail_spans(self):
         q = _make_question(0.0, 100.0, False, False)
@@ -139,6 +224,8 @@ class TestTailWideningIntegration:
             zero_point=None,
             id_of_question=4242,
             cdf_size=101,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
         )
 
         # Compressed tails baseline

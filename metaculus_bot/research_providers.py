@@ -1,9 +1,14 @@
 """Research provider strategy abstraction.
 
 `choose_provider_with_name` returns an async callable (and its name) that, given
-a question text, returns formatted research.  The selection is governed by
-environment variables so the logic lives in one place instead of being in
+a `MetaculusQuestion`, returns formatted research.  The selection is governed
+by environment variables so the logic lives in one place instead of being in
 `TemplateForecaster.run_research`.
+
+Providers receive the full question (not just the text) so they can use
+auxiliary fields like `id_of_question` for caching, `resolution_criteria` for
+keyword extraction, and `scheduled_resolution_time` for backtest-leakage
+defenses (see `prediction_market_provider.py`).
 """
 
 import asyncio
@@ -14,6 +19,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from forecasting_tools import GeneralLlm, SmartSearcher
+from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
     ASKNEWS_BACKOFF_SECS,
@@ -25,8 +31,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.prompts import web_research_prompt
 
-QuestionText = str
-ResearchCallable = Callable[[QuestionText], Awaitable[str]]
+ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
 logger = logging.getLogger(__name__)
 
 
@@ -75,13 +80,13 @@ def _asknews_provider() -> ResearchCallable:
         max_c = max(1, int(ASKNEWS_MAX_CONCURRENCY))
         _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max_c)
 
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         # Hard wall-clock timeout around the full provider. AskNews's internal
         # retry loop fails fast on non-retryable errors, but a genuine network
         # hang (connect stall, DNS hang, server not closing the stream) is
         # otherwise unbounded. This backstops that case so a stuck AskNews
         # call can't hold the whole research phase hostage.
-        return await asyncio.wait_for(_fetch_impl(question_text), timeout=ASKNEWS_WALL_TIMEOUT)
+        return await asyncio.wait_for(_fetch_impl(question.question_text), timeout=ASKNEWS_WALL_TIMEOUT)
 
     async def _fetch_impl(question_text: str) -> str:
         assert _ASKNEWS_GLOBAL_SEMAPHORE is not None
@@ -250,7 +255,7 @@ def _format_asknews_dual_sections(
 
 
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         searcher = SmartSearcher(
             model=default_llm,
             temperature=0,
@@ -262,7 +267,7 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
             " you a question they intend to forecast on. To be a great assistant, you generate"
             " a concise but detailed rundown of the most relevant news, including if the question"
             " would resolve Yes or No based on current information. You do not produce forecasts yourself."
-            f"\n\nThe question is: {question_text}"
+            f"\n\nThe question is: {question.question_text}"
         )
         return await searcher.invoke(prompt)
 
@@ -270,7 +275,7 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         model_name = "openrouter/perplexity/sonar-reasoning-pro" if use_open_router else "perplexity/sonar-pro"
         model = GeneralLlm(model=model_name, temperature=0.1)
         # Exclude prediction markets research when benchmarking to avoid data leakage
@@ -282,7 +287,7 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
             "Generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.\n"
             f"{prediction_markets_instruction}"
             "Do not produce forecasts yourself. Provide data for the superforecaster.\n\n"
-            f"Question:\n{question_text}"
+            f"Question:\n{question.question_text}"
         )
         return await model.invoke(prompt)
 
@@ -290,9 +295,13 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
 
 
 def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
-    """Build a GeneralLlm configured for Grok native web search via OpenRouter.
+    """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
     Shared by the native search research provider and the targeted research module.
+
+    Reads NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY env at call
+    time so workflow overrides take effect without re-importing. An empty string
+    in either env var disables passing the corresponding kwarg.
     """
     from metaculus_bot.constants import (
         NATIVE_SEARCH_CONTEXT_SIZE,
@@ -300,15 +309,19 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         NATIVE_SEARCH_MAX_RESULTS,
         NATIVE_SEARCH_MAX_TOKENS,
         NATIVE_SEARCH_MODEL_ENV,
+        NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
+        NATIVE_SEARCH_REASONING_EFFORT_ENV,
         NATIVE_SEARCH_TEMPERATURE,
         NATIVE_SEARCH_TIMEOUT,
         NATIVE_SEARCH_TOP_P,
+        NATIVE_SEARCH_VERBOSITY_DEFAULT,
+        NATIVE_SEARCH_VERBOSITY_ENV,
     )
 
     base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
     model_with_search = f"openrouter/{base_model}"
 
-    return GeneralLlm(
+    kwargs: dict = dict(
         model=model_with_search,
         temperature=NATIVE_SEARCH_TEMPERATURE,
         top_p=NATIVE_SEARCH_TOP_P,
@@ -318,6 +331,22 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
     )
 
+    effort = os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    if effort:
+        kwargs["reasoning"] = {"effort": effort}
+
+    # `verbosity` is a top-level OpenRouter / litellm parameter (see litellm
+    # `acompletion(... verbosity=...)` and OpenAI gpt-5 transformation). Earlier
+    # we tucked it inside `extra_body`; that worked because OpenRouter merges
+    # the body, but the canonical form matches the docs and survives any future
+    # extra_body validation. GeneralLlm passes unknown kwargs through to
+    # litellm by default (`pass_through_unknown_kwargs=True`).
+    verbosity = os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
+    if verbosity:
+        kwargs["verbosity"] = verbosity
+
+    return GeneralLlm(**kwargs)
+
 
 def _native_search_provider(
     model_slug: str | None = None,
@@ -325,10 +354,10 @@ def _native_search_provider(
 ) -> ResearchCallable:
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
-    async def _fetch(question_text: str) -> str:  # noqa: D401
+    async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
-            question_text,
+            question.question_text,
             is_benchmarking=is_benchmarking,
             citation_style="markdown",
         )
@@ -409,7 +438,7 @@ def choose_provider_with_name(
             return openrouter_callback, "openrouter"
         return _perplexity_provider(True, is_benchmarking), "openrouter"
 
-    async def _empty(_: str) -> str:  # noqa: D401
+    async def _empty(_: MetaculusQuestion) -> str:  # noqa: D401
         return ""
 
     return _empty, "none"

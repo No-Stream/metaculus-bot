@@ -35,7 +35,7 @@ async def test_run_research_priority():
             mock_choose.return_value = (mock_asknews_func, "asknews")
 
             research = await forecaster.run_research(question)
-            mock_asknews_func.assert_called_once_with(question.question_text)
+            mock_asknews_func.assert_called_once_with(question)
             # Research now includes provider header
             assert "AskNews Research" in research
             assert "## News Articles (AskNews)" in research
@@ -54,7 +54,7 @@ async def test_run_research_priority():
             mock_choose.return_value = (mock_exa_func, "exa")
 
             research = await forecaster.run_research(question)
-            mock_exa_func.assert_called_once_with(question.question_text)
+            mock_exa_func.assert_called_once_with(question)
             assert "Exa Research" in research
             assert "## Web Research (Exa)" in research
 
@@ -71,7 +71,7 @@ async def test_run_research_priority():
             mock_choose.return_value = (mock_perplexity_func, "perplexity")
 
             research = await forecaster.run_research(question)
-            mock_perplexity_func.assert_called_once_with(question.question_text)
+            mock_perplexity_func.assert_called_once_with(question)
             assert "Perplexity Research" in research
             assert "## Web Research (Perplexity)" in research
 
@@ -87,7 +87,7 @@ async def test_run_research_priority():
             mock_choose.return_value = (mock_openrouter_func, "openrouter")
 
             research = await forecaster.run_research(question)
-            mock_openrouter_func.assert_called_once_with(question.question_text)
+            mock_openrouter_func.assert_called_once_with(question)
             assert "OpenRouter Research" in research
             assert "## Web Research (OpenRouter)" in research
 
@@ -101,6 +101,6 @@ async def test_run_research_priority():
             mock_choose.return_value = (mock_empty_func, "fallback")
 
             research = await forecaster.run_research(question)
-            mock_empty_func.assert_called_once_with(question.question_text)
+            mock_empty_func.assert_called_once_with(question)
             # Empty results don't get headers
             assert research == ""

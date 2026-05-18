@@ -3,10 +3,13 @@ performance-analysis collector.
 
 Covers three just-added paths that were previously untested:
 
-1. ``TemplateForecaster._create_unified_explanation`` appends a
-   ``<!-- STACKED=true/false -->`` marker only when the aggregation strategy
-   is STACKING or CONDITIONAL_STACKING, and the value always comes from
-   ``self._question_was_stacked.pop(qid, False)``.
+1. ``TemplateForecaster._create_unified_explanation`` appends both a
+   tri-state ``<!-- STACKER_OUTCOME=primary|fallback_llm|fallback_median|skipped -->``
+   marker AND a legacy ``<!-- STACKED=true/false -->`` marker (for one round
+   of back-compat with older parsers) only when the aggregation strategy is
+   STACKING or CONDITIONAL_STACKING. The value comes from
+   ``self._stacker_outcome.pop(qid, None)``; missing entries default to
+   ``"fallback_median"`` (conservative — "stacker did not really succeed").
 
 2. ``TemplateForecaster._format_and_expand_research_summary`` annotates
    ``*Forecaster N*`` bullets with the model name pulled from each forecast's
@@ -38,13 +41,22 @@ from forecasting_tools.data_models.forecast_report import ResearchWithPrediction
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.comment_markers import STACKED_MARKER_FALSE, STACKED_MARKER_TRUE
+from metaculus_bot.comment_markers import (
+    STACKED_MARKER_FALSE,
+    STACKED_MARKER_TRUE,
+    STACKER_OUTCOME_FALLBACK_LLM,
+    STACKER_OUTCOME_FALLBACK_MEAN,
+    STACKER_OUTCOME_FALLBACK_MEDIAN,
+    STACKER_OUTCOME_PRIMARY,
+    STACKER_OUTCOME_SKIPPED,
+)
 from metaculus_bot.performance_analysis.collector import _process_single_question
 from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_forecasts,
     parse_per_model_numeric_percentiles,
     parse_per_model_reasoning_text,
     parse_stacked_marker,
+    parse_stacker_outcome_marker,
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
@@ -129,80 +141,160 @@ class TestStackedMarkerInjection:
         # across questions within a run.
         bot = _make_bot(AggregationStrategy.MEAN)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
-        assert q.id_of_question not in bot._question_was_stacked
+        assert q.id_of_question not in bot._stacker_outcome
 
-    def test_stacking_true_emits_true_marker(self):
+    def test_stacking_primary_emits_primary_and_legacy_true_markers(self):
+        # primary outcome → tri-state STACKER_OUTCOME=primary AND legacy STACKED=true
+        # (the legacy marker stays during one round of back-compat).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
+        assert STACKER_OUTCOME_PRIMARY in out
         assert STACKED_MARKER_TRUE in out
         assert STACKED_MARKER_FALSE not in out
+        assert parse_stacker_outcome_marker(out) == "primary"
         assert parse_stacked_marker(out) is True
         # State cleaned
-        assert q.id_of_question not in bot._question_was_stacked
+        assert q.id_of_question not in bot._stacker_outcome
 
-    def test_stacking_false_emits_false_marker(self):
-        # Invariant under test: the marker value comes from the dict. In
-        # production STACKING always sets True, but the plumbing must honor
-        # whatever the dict says — otherwise CONDITIONAL_STACKING's skip-path
-        # value would silently get overridden.
+    def test_stacking_fallback_llm_emits_fallback_llm_and_legacy_true(self):
+        # fallback_llm outcome (primary stacker failed; fallback LLM succeeded)
+        # → STACKER_OUTCOME=fallback_llm AND legacy STACKED=true (since the
+        # ensemble value still came from a stacker LLM, not MEDIAN).
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = False
+        bot._stacker_outcome[q.id_of_question] = "fallback_llm"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
-        assert STACKED_MARKER_FALSE in out
-        assert STACKED_MARKER_TRUE not in out
-        assert parse_stacked_marker(out) is False
-        assert q.id_of_question not in bot._question_was_stacked
-
-    def test_conditional_stacking_true_emits_true_marker(self):
-        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
-        q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = True
-
-        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
-
+        assert STACKER_OUTCOME_FALLBACK_LLM in out
         assert STACKED_MARKER_TRUE in out
+        assert parse_stacker_outcome_marker(out) == "fallback_llm"
         assert parse_stacked_marker(out) is True
 
-    def test_conditional_stacking_false_emits_false_marker(self):
-        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+    def test_stacking_fallback_median_emits_fallback_median_and_legacy_false(self):
+        # fallback_median outcome (BOTH stacker LLMs failed; MEDIAN was used)
+        # → STACKER_OUTCOME=fallback_median AND legacy STACKED=false. This is
+        # the load-bearing fix from the May 2026 analysis: previously this path
+        # silently emitted STACKED=true, contaminating treatment-effect cuts.
+        bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = False
+        bot._stacker_outcome[q.id_of_question] = "fallback_median"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
+        assert STACKER_OUTCOME_FALLBACK_MEDIAN in out
         assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "fallback_median"
         assert parse_stacked_marker(out) is False
 
-    def test_conditional_stacking_missing_dict_entry_defaults_to_false(self):
-        # Production code path ALWAYS populates the dict before reaching
-        # _create_unified_explanation. But the ``pop(..., False)`` default
-        # is a defensive fallback — if some future change drops a branch,
-        # we should emit STACKED=false rather than crash or emit nothing.
+    def test_stacking_skipped_emits_skipped_and_legacy_false(self):
+        # skipped outcome (CONDITIONAL_STACKING below threshold; never
+        # invoked the stacker) → STACKER_OUTCOME=skipped AND legacy STACKED=false.
         bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
         q = _make_binary_question()
-        assert q.id_of_question not in bot._question_was_stacked
+        bot._stacker_outcome[q.id_of_question] = "skipped"
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
             out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
+        assert STACKER_OUTCOME_SKIPPED in out
         assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "skipped"
         assert parse_stacked_marker(out) is False
+
+    def test_stacking_budget_skip_emits_fallback_mean_marker(self):
+        # F15: under AggregationStrategy.STACKING, the wall-clock budget-skip
+        # path forces base-combine via MEAN (not MEDIAN — see main.py:1308-1314).
+        # That path must therefore emit STACKER_OUTCOME=fallback_mean so
+        # downstream residual-analysis cuts that bucket on aggregation strategy
+        # don't conflate it with the MEDIAN-fallback bucket. The CONDITIONAL_
+        # STACKING budget-skip path (covered by the next test) keeps
+        # fallback_median because that strategy's base-combine uses MEDIAN.
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "fallback_mean"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_FALLBACK_MEAN in out
+        assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "fallback_mean"
+        assert parse_stacked_marker(out) is False
+
+    def test_conditional_stacking_budget_skip_keeps_fallback_median_marker(self):
+        # F15 control case: CONDITIONAL_STACKING budget-skip still uses MEDIAN
+        # for base-combine, so the fallback_median marker remains accurate
+        # there. This test pins that the marker is NOT changed under
+        # CONDITIONAL_STACKING by the F15 fix.
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "fallback_median"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_FALLBACK_MEDIAN in out
+        assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "fallback_median"
+        assert parse_stacked_marker(out) is False
+
+    def test_conditional_stacking_primary_emits_primary_marker(self):
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "primary"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_PRIMARY in out
+        assert STACKED_MARKER_TRUE in out
+        assert parse_stacker_outcome_marker(out) == "primary"
+        assert parse_stacked_marker(out) is True
+
+    def test_conditional_stacking_missing_dict_entry_raises(self):
+        # Every reachable code path in _aggregate_predictions populates
+        # _stacker_outcome before _create_unified_explanation runs. A missing
+        # entry under STACKING/CONDITIONAL_STACKING means a real bug — fail
+        # loudly rather than silently mislabel as fallback_median.
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = _make_binary_question()
+        assert q.id_of_question not in bot._stacker_outcome
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            with pytest.raises(AssertionError, match="_stacker_outcome must be populated"):
+                bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+    def test_qid_none_under_stacking_raises(self):
+        # Defensive branch in _create_unified_explanation: if id_of_question is
+        # None, popped is None and the fail-fast assert fires. This shouldn't
+        # happen in practice (upstream assert in _research_and_make_predictions
+        # guarantees a non-None qid) but lock the behavior.
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_binary_question()
+        # Bypass the pydantic id_of_question setter via __dict__ (model_construct
+        # would also work but this keeps the test minimal).
+        object.__setattr__(q, "id_of_question", None)
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            with pytest.raises(AssertionError, match="_stacker_outcome must be populated"):
+                bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
     def test_marker_survives_trim_comment(self):
         # trim_comment preserves the tail when truncating; the marker is
@@ -212,7 +304,7 @@ class TestStackedMarkerInjection:
 
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
         huge_base = "# SUMMARY\n" + ("X" * (COMMENT_CHAR_LIMIT + 1000))
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=huge_base):
@@ -234,11 +326,19 @@ class TestStackedMarkerInjection:
         # anchors on. If annotation wiring ran before trim (as in production),
         # the annotated bullets are already present in the base_text; the trim
         # just needs to preserve them.
+        #
+        # NOTE: model strings here (and in the parametrized fixtures below) are
+        # *illustrative* — they need to be plausible names that the parser can
+        # recognize, but the specific identity of "gpt-5.5" / "claude-opus-4.7" /
+        # "gemini-3.1-pro-preview" doesn't drive what's under test (trim
+        # preservation + per-model regex extraction). On forecaster rotation,
+        # update them to current names but verify the parser logic still
+        # matches the new shape (provider/family-name/version pattern).
         from metaculus_bot.constants import COMMENT_CHAR_LIMIT
 
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question()
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
 
         summary_head = (
             "# SUMMARY\n"
@@ -266,8 +366,11 @@ class TestStackedMarkerInjection:
         assert "*Forecaster 1 (gpt-5.5)*: 72.0%" in out
         assert "*Forecaster 2 (claude-opus-4.7)*: 68.0%" in out
         assert "*Forecaster 3 (gemini-3.1-pro-preview)*: 80.0%" in out
-        # Marker appended at the end survives.
-        assert out.rstrip().endswith(STACKED_MARKER_TRUE)
+        # Marker block appended at the end survives. The STACKED marker is
+        # followed by a TOOLS_USED marker since Workstream C activation, so
+        # the trailing token is TOOLS_USED=true/false — STACKED still appears,
+        # just not as the last line.
+        assert STACKED_MARKER_TRUE in out
         assert parse_stacked_marker(out) is True
         # Parser recovers per-model attribution keyed by model name, not "Forecaster N".
         per_model = parse_per_model_forecasts(out)
@@ -724,7 +827,7 @@ class TestProducerConsumerRoundTrip:
     def test_stacked_binary_roundtrip_recovers_models_and_marker(self):
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question(qid=555)
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
 
         predictions = [
             _make_prediction_with_model(0.72, "openrouter/openai/gpt-5.5", body="gpt analysis"),
@@ -787,7 +890,7 @@ class TestProducerConsumerRoundTrip:
 
         bot = _make_bot(AggregationStrategy.STACKING)
         q = _make_binary_question(qid=777)
-        bot._question_was_stacked[q.id_of_question] = True
+        bot._stacker_outcome[q.id_of_question] = "primary"
 
         # Base predictions, one per ensemble member, each tagged with Model: by
         # _make_prediction in production (here we build the tag manually).

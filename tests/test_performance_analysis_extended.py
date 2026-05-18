@@ -205,3 +205,182 @@ class TestDisagreementPredictsError:
         result = disagreement_predicts_error(records)
         assert result["count"] == 2
         assert result["spearman_rho"] is None  # n<3
+
+
+# ---------------------------------------------------------------------------
+# collector — bot_comment_created_at field
+# ---------------------------------------------------------------------------
+
+
+class TestCollectorCommentCreatedAt:
+    """Records produced by the collector should surface the comment's
+    ``created_at`` timestamp so cohort cuts can filter by submit-date (vs the
+    coarser actual_resolve_time on the question)."""
+
+    def _post_data(self, post_id: int, question_id: int, resolution: str = "yes") -> dict:
+        return {
+            "id": post_id,
+            "title": f"Q{post_id}",
+            "question": {
+                "id": question_id,
+                "type": "binary",
+                "resolution": resolution,
+                "my_forecasts": {
+                    "latest": {
+                        "forecast_values": [0.3, 0.7],
+                        "score_data": {"peer_score": 1.0},
+                    },
+                },
+                "scaling": {},
+                "options": None,
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "nr_forecasters": 5,
+                "title": f"Q{post_id}",
+            },
+            "projects": {},
+        }
+
+    def test_record_includes_bot_comment_created_at(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        post = self._post_data(1, 11)
+        comment = {
+            "id": 999,
+            "text": "*Forecaster 1*: 70%\n",
+            "on_post": 1,
+            "created_at": "2026-04-30T12:34:56Z",
+        }
+        records = _process_post(post, {1: comment})
+        assert len(records) == 1
+        assert records[0]["bot_comment_created_at"] == "2026-04-30T12:34:56Z"
+
+    def test_record_has_none_when_comment_missing(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        post = self._post_data(2, 22)
+        records = _process_post(post, {})
+        assert len(records) == 1
+        assert records[0]["bot_comment_created_at"] is None
+
+    def test_record_has_none_when_comment_lacks_created_at(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        post = self._post_data(3, 33)
+        comment = {"id": 1000, "text": "*Forecaster 1*: 70%\n", "on_post": 3}
+        records = _process_post(post, {3: comment})
+        assert len(records) == 1
+        assert records[0]["bot_comment_created_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# collector — stacker_outcome / stacker_outcome_source fields
+# ---------------------------------------------------------------------------
+
+
+class TestCollectorStackerOutcome:
+    """Records produced by the collector should expose the tri-state
+    ``stacker_outcome`` plus its provenance, computed from
+    ``parse_inferred_stacker_outcome`` over the comment text. The legacy
+    ``was_stacked`` field collapses median-fallback into False, so analyses
+    that need to distinguish "stacker LLM ran" from "MEDIAN fallback" must
+    consume ``stacker_outcome``.
+    """
+
+    def _post_data(self, post_id: int, question_id: int) -> dict:
+        return {
+            "id": post_id,
+            "title": f"Q{post_id}",
+            "question": {
+                "id": question_id,
+                "type": "binary",
+                "resolution": "yes",
+                "my_forecasts": {
+                    "latest": {
+                        "forecast_values": [0.3, 0.7],
+                        "score_data": {"peer_score": 1.0},
+                    },
+                },
+                "scaling": {},
+                "options": None,
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "nr_forecasters": 5,
+                "title": f"Q{post_id}",
+            },
+            "projects": {},
+        }
+
+    def _run(self, post_id: int, question_id: int, comment_text: str | None) -> dict:
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        post = self._post_data(post_id, question_id)
+        if comment_text is None:
+            records = _process_post(post, {})
+        else:
+            records = _process_post(post, {post_id: {"id": 999, "text": comment_text, "on_post": post_id}})
+        assert len(records) == 1
+        return records[0]
+
+    def test_outcome_marker_primary(self):
+        rec = self._run(1, 11, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=primary -->\n")
+        assert rec["stacker_outcome"] == "primary"
+        assert rec["stacker_outcome_source"] == "marker_outcome"
+
+    def test_outcome_marker_fallback_median_distinguished_from_skipped(self):
+        # The load-bearing case: pre-fix this would round-trip as STACKED=true
+        # → was_stacked=True with no way to tell median-fallback from primary.
+        # Now stacker_outcome="fallback_median" is preserved on the record.
+        rec = self._run(2, 22, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=fallback_median -->\n")
+        assert rec["stacker_outcome"] == "fallback_median"
+        assert rec["stacker_outcome_source"] == "marker_outcome"
+
+    def test_outcome_marker_skipped(self):
+        rec = self._run(3, 33, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped -->\n")
+        assert rec["stacker_outcome"] == "skipped"
+        assert rec["stacker_outcome_source"] == "marker_outcome"
+
+    def test_legacy_marker_only_maps_to_primary(self):
+        rec = self._run(4, 44, "*Forecaster 1*: 70%\n<!-- STACKED=true -->\n")
+        assert rec["stacker_outcome"] == "primary"
+        assert rec["stacker_outcome_source"] == "marker_legacy"
+
+    def test_legacy_marker_false_maps_to_skipped(self):
+        rec = self._run(5, 55, "*Forecaster 1*: 70%\n<!-- STACKED=false -->\n")
+        assert rec["stacker_outcome"] == "skipped"
+        assert rec["stacker_outcome_source"] == "marker_legacy"
+
+    def test_historical_body_inferred_primary(self):
+        # Pre-marker comment from spring-aib-2026 dataset: no STACKED= or
+        # STACKER_OUTCOME= marker, but the Forecaster 1 body opens with
+        # "## Stacker Meta-Analysis", which only the stacker pipeline produces.
+        comment = (
+            "# SUMMARY\n"
+            "*Forecaster 1*: 70%\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.7\n\n"
+            "## Stacker Meta-Analysis\n\n"
+            "Synthesis of 6 base models below.\n"
+        )
+        rec = self._run(6, 66, comment)
+        assert rec["stacker_outcome"] == "primary"
+        assert rec["stacker_outcome_source"] == "historical_body"
+
+    def test_no_signal_returns_none(self):
+        rec = self._run(7, 77, "*Forecaster 1*: 70%\n")
+        assert rec["stacker_outcome"] is None
+        assert rec["stacker_outcome_source"] == "none"
+
+    def test_missing_comment_returns_none(self):
+        rec = self._run(8, 88, None)
+        assert rec["stacker_outcome"] is None
+        assert rec["stacker_outcome_source"] == "none"
+
+    def test_outcome_marker_takes_precedence_over_legacy(self):
+        # Both markers coexist for one round of back-compat. The collector
+        # must prefer the richer STACKER_OUTCOME= signal so median-fallback
+        # isn't silently downgraded to "primary".
+        comment = "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=fallback_median -->\n<!-- STACKED=false -->\n"
+        rec = self._run(9, 99, comment)
+        assert rec["stacker_outcome"] == "fallback_median"
+        assert rec["stacker_outcome_source"] == "marker_outcome"

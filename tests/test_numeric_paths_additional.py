@@ -3,6 +3,7 @@ Additional tests to cover PCHIP fallback/smoothing paths and input validation.
 Concise scenarios to increase confidence in complex numeric forecast flow.
 """
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +13,14 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
 
 
 def _make_forecaster():
@@ -41,6 +50,8 @@ def _make_question(**overrides):
         unit_of_measure="units",
         page_url="https://example/q/4242",
         cdf_size=201,
+        open_time=_stub_open_time(),
+        scheduled_resolution_time=_stub_resolve_time(),
     )
     opts.update(overrides)
     return SimpleNamespace(**opts)
@@ -268,6 +279,8 @@ async def test_binary_parse_additional_instructions_capture():
     q.resolution_criteria = ""
     q.fine_print = ""
     q.id_of_question = 7
+    q.open_time = _stub_open_time()
+    q.scheduled_resolution_time = _stub_resolve_time()
 
     # Dummy forecaster LLM
     llm = MagicMock(spec=GeneralLlm)

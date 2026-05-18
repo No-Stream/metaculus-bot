@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,6 +10,15 @@ from main import TemplateForecaster
 from metaculus_bot.comment_trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 from metaculus_bot.discrete_snap import OutcomeTypeResult
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
+
 
 # `asyncio` is used by the soft-deadline test below; an explicit no-op reference
 # prevents the formatter from pruning the import when the only usage sits far
@@ -34,6 +44,8 @@ def mock_metaculus_question():
     question.fine_print = "Fine print"
     question.unit_of_measure = "units"
     question.id_of_question = 123  # Add a mock ID for testing
+    question.open_time = _stub_open_time()
+    question.scheduled_resolution_time = _stub_resolve_time()
     return question
 
 
@@ -47,6 +59,8 @@ def mock_binary_question():
     question.fine_print = "Binary fine print"
     question.unit_of_measure = "binary units"
     question.id_of_question = 456
+    question.open_time = _stub_open_time()
+    question.scheduled_resolution_time = _stub_resolve_time()
     return question
 
 
@@ -484,20 +498,14 @@ async def test_min_forecasters_guard_raises_runtime_error_when_exception_group_n
         return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
     )
     bot.run_research = AsyncMock(return_value="mock research")
+    # Both forecaster tasks succeed; threshold is 3, so we get "Only 2/2" and the
+    # min-forecasters guard fires.
     bot._forecaster_with_soft_deadline = AsyncMock(
         return_value=ReasonedPrediction(prediction_value=0.5, reasoning="ok")
     )
-    # 1 valid, no errors, no exception group: RuntimeError path.
-    bot._gather_results_and_exceptions = AsyncMock(
-        return_value=(
-            [ReasonedPrediction(prediction_value=0.5, reasoning="ok")],
-            [],
-            None,
-        )
-    )
 
     assert bot._questions_failed_to_publish == 0
-    with pytest.raises(RuntimeError, match="Only 1/2 forecasters succeeded"):
+    with pytest.raises(RuntimeError, match="Only 2/2 forecasters succeeded"):
         await bot._research_and_make_predictions(mock_binary_question)
     assert bot._questions_failed_to_publish == 1
 
@@ -521,21 +529,17 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
         return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
     )
     bot.run_research = AsyncMock(return_value="mock research")
-    bot._forecaster_with_soft_deadline = AsyncMock(
-        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="ok")
-    )
+    # First forecaster succeeds; second raises. Below the 3/2 threshold, the
+    # exception group is wrapped and re-raised.
+    call_count = {"n": 0}
 
-    inner = RuntimeError("forecaster 2 failed")
-    # ExceptionGroup is a Python 3.11+ builtin; ruff target-version isn't pinned
-    # here so suppress the false-positive F821.
-    exc_group = ExceptionGroup("forecaster errors", [inner])  # noqa: F821
-    bot._gather_results_and_exceptions = AsyncMock(
-        return_value=(
-            [ReasonedPrediction(prediction_value=0.5, reasoning="ok")],
-            ["RuntimeError: forecaster 2 failed"],
-            exc_group,
-        )
-    )
+    async def mixed_results(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+        raise RuntimeError("forecaster 2 failed")
+
+    bot._forecaster_with_soft_deadline = mixed_results
 
     with pytest.raises(ExceptionGroup) as exc_info:  # noqa: F821  # 3.11+ builtin
         await bot._research_and_make_predictions(mock_binary_question)

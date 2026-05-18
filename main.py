@@ -4,8 +4,9 @@ import os
 import random
 import time
 from collections import defaultdict
-from typing import Any, Coroutine, Sequence, cast
+from typing import Any, Coroutine, Literal, Sequence, cast
 
+from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryPrediction,
     BinaryQuestion,
@@ -34,7 +35,23 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
-from metaculus_bot.comment_markers import STACKED_MARKER_FALSE, STACKED_MARKER_TRUE
+from metaculus_bot.calibration import (
+    BINARY_PLATT_PARAMS,
+    MC_PLATT_PARAMS,
+    apply_binary_platt,
+    apply_mc_platt,
+)
+from metaculus_bot.comment_markers import (
+    STACKED_MARKER_FALSE,
+    STACKED_MARKER_TRUE,
+    STACKER_OUTCOME_FALLBACK_LLM,
+    STACKER_OUTCOME_FALLBACK_MEAN,
+    STACKER_OUTCOME_FALLBACK_MEDIAN,
+    STACKER_OUTCOME_PRIMARY,
+    STACKER_OUTCOME_SKIPPED,
+    TOOLS_USED_MARKER_FALSE,
+    TOOLS_USED_MARKER_TRUE,
+)
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -43,6 +60,7 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
+    CRUX_SOFT_DEADLINE,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     FINANCIAL_DATA_ENABLED_ENV,
     FORECASTER_SOFT_DEADLINE,
@@ -53,8 +71,14 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    PER_QUESTION_WALL_CLOCK_DEADLINE,
+    PLATT_BINARY_MAX_ABS_DEVIATION,
+    PLATT_CALIBRATION_ENABLED_ENV,
+    PLATT_MC_MAX_ABS_DEVIATION,
+    PREDICTION_MARKETS_ENABLED_ENV,
     STACKER_FALLBACK_SOFT_DEADLINE,
     STACKER_SOFT_DEADLINE,
+    WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
 from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
@@ -78,6 +102,9 @@ from metaculus_bot.research_providers import (
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
+
+# Probabilistic-tools wiring (Workstream C activation). The feature flag is
+# re-exported under a descriptive local alias so call sites read clearly.
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
@@ -155,8 +182,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self.stacking_randomize_order: bool = stacking_randomize_order
         # Per-question storage for stacker meta-analysis reasoning text
         self._stack_meta_reasoning: dict[int, str] = {}
-        # Per-question flag: did this question's final prediction go through the stacker?
-        self._question_was_stacked: dict[int, bool] = {}
+        # Per-question outcome for the stacker pipeline. One of:
+        #   "primary"          — primary stacker LLM produced the value
+        #   "fallback_llm"     — primary failed, fallback stacker LLM succeeded
+        #   "fallback_median"  — both stacker LLMs failed; MEDIAN aggregation used
+        #   "skipped"          — conditional-stacking spread <= threshold
+        # Must be set on the path that actually produced the aggregated value
+        # (not at branch entry), so median-fallback isn't mislabeled as stacked.
+        self._stacker_outcome: dict[int, str] = {}
         # Diagnostics + state for STACKING base aggregation behavior
         # Tracks per-question expectation that the base aggregator will be called to combine
         # per-research-report, already-stacked outputs.
@@ -266,7 +299,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         Relies on the assertion at the top of ``_research_and_make_predictions`` that
         ``question.id_of_question is not None`` — so that upstream stacking state-dict
-        ops (``self._question_was_stacked[qid]``, ``self._stack_meta_reasoning[qid]``)
+        ops (``self._stacker_outcome[qid]``, ``self._stack_meta_reasoning[qid]``)
         and this set's key stay consistent. A silent fallback to ``id(question)`` here
         would let the keys desync if upstream keying ever changed.
         """
@@ -352,6 +385,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research: str,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
         stacker_llm_override: GeneralLlm | None = None,
+        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         """Run stacking to aggregate multiple model predictions using a meta-model.
 
@@ -359,6 +393,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacker (e.g. gpt-5.5) without swapping ``self._stacker_llm`` — keeping
         fallback behavior local to the call site and avoiding state mutation
         that could race with concurrent questions.
+
+        ``aggregated_tool_output`` is the optional markdown block produced
+        upstream by ``build_cross_model_aggregation``; threaded into
+        ``run_stacking_*`` so the stacker sees deterministic cross-model
+        math at the top of its prompt.
         """
         if stacker_llm_override is not None:
             stacker_llm = stacker_llm_override
@@ -389,6 +428,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 research,
                 base_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -401,6 +441,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 research,
                 base_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -416,6 +457,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 base_predictions,
                 lower_msg,
                 upper_msg,
+                aggregated_tool_output=aggregated_tool_output,
             )
             self._log_llm_output(stacker_llm, qid, meta_text)
             self._stack_meta_reasoning[qid] = meta_text
@@ -459,7 +501,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
-            research = await self._run_providers_parallel(question.question_text, providers)
+            research = await self._run_providers_parallel(question, providers)
 
             # Optional second-pass gap-fill; see run_gap_fill_pass docstring for the soft-fail contract.
             if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
@@ -536,11 +578,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return self._custom_research_provider, "custom"
 
         default_llm = self.get_llm("default", "llm")
+
+        async def _exa_callback(question: MetaculusQuestion) -> str:
+            return await self._call_exa_smart_searcher(question)
+
+        async def _perplexity_callback(question: MetaculusQuestion) -> str:
+            return await self._call_perplexity(question)
+
+        async def _openrouter_callback(question: MetaculusQuestion) -> str:
+            return await self._call_perplexity(question, use_open_router=True)
+
         provider, provider_name = choose_provider_with_name(
             default_llm,
-            exa_callback=self._call_exa_smart_searcher,
-            perplexity_callback=self._call_perplexity,
-            openrouter_callback=lambda q: self._call_perplexity(q, use_open_router=True),
+            exa_callback=_exa_callback,
+            perplexity_callback=_perplexity_callback,
+            openrouter_callback=_openrouter_callback,
             is_benchmarking=self.is_benchmarking,
         )
         return provider, provider_name
@@ -583,9 +635,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
             providers.append((financial_data_provider(), "financial_data"))
 
+        # Prediction-market snapshot provider if enabled. Default OFF; see
+        # scratch_docs_and_planning/atlas_inspired_improvements.md §G for
+        # smoke + medium backtest gate before flipping ON in prod workflows.
+        # Function-scoped import so the rapidfuzz dep only loads when active.
+        if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
+            from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
+
+            # F7: thread is_benchmarking so the provider hard-disables under
+            # backtest, regardless of operator env flag. Mirrors the
+            # gemini_search_provider / native_search_provider call sites above.
+            providers.append((prediction_market_provider(is_benchmarking=self.is_benchmarking), "prediction_market"))
+
         if not providers:
 
-            async def _empty(_: str) -> str:
+            async def _empty(_: MetaculusQuestion) -> str:
                 return ""
 
             providers.append((_empty, "none"))
@@ -594,7 +658,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     async def _run_providers_parallel(
         self,
-        question_text: str,
+        question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
     ) -> str:
         """Run multiple research providers in parallel and combine results."""
@@ -603,8 +667,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:
                 if name == "asknews" and self.allow_research_fallback:
-                    return (await self._fetch_research_with_fallback(question_text, provider, name), name)
-                return (await provider(question_text), name)
+                    return (await self._fetch_research_with_fallback(question, provider, name), name)
+                return (await provider(question), name)
             except Exception as e:
                 # Off-season AskNews 403s are expected and shouldn't page us.
                 # Every other provider failure (timeouts, network, rate limits,
@@ -619,6 +683,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 else:
                     self._research_provider_timeout_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
+                # Deprecation tripwire: research providers (notably native_search
+                # via plain GeneralLlm for Grok) bypass the FallbackOpenRouterLlm
+                # wrapper, so should_retry_with_general_key is never called for
+                # them. Record here so the post-submission check fires CI red.
+                # The 2026-05-15 x-ai/grok-4.1-fast deprecation that motivated this
+                # tripwire flowed through exactly this path.
+                from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
+
+                _record_deprecation_if_matched(f"<provider:{name}>", str(e))
                 return ("", name)
 
         tasks = [_run_one(p, n) for p, n in providers]
@@ -650,16 +723,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     async def _fetch_research_with_fallback(
         self,
-        question_text: str,
+        question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
     ) -> str:
         try:
-            return await provider(question_text)
+            return await provider(question)
         except Exception as exc:
             if self.allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
-                fallback = await self._attempt_research_fallback(question_text)
+                fallback = await self._attempt_research_fallback(question.question_text)
                 if fallback is not None:
                     return fallback
             raise
@@ -680,6 +753,70 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return None
 
     # Override _research_and_make_predictions to support multiple LLMs
+    def _remaining_budget_seconds(self, start_time: float) -> float:
+        """Return remaining per-Q wall-clock budget in seconds (can go negative).
+
+        ``start_time`` is captured at the top of ``_research_and_make_predictions``
+        and represents this question's processing-start tick. Compared against
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` (58:30 of the 60-min Metaculus close
+        window).
+        """
+        return PER_QUESTION_WALL_CLOCK_DEADLINE - (time.time() - start_time)
+
+    async def _gather_predictions_with_wall_clock(
+        self,
+        coros: list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
+        qid_for_log: int,
+        per_q_start: float,
+    ) -> tuple[list[ReasonedPrediction[PredictionTypes]], list[str], ExceptionGroup | None]:
+        """Run forecaster coroutines concurrently with a wall-clock cap.
+
+        Differs from the parent ``_gather_results_and_exceptions`` in two ways:
+        - Pending tasks at deadline are cancelled (parent's ``asyncio.gather``
+          can't cancel mid-flight).
+        - Drops counter is bumped on cancellation so end-of-run alerting
+          surfaces the abort.
+
+        Mirrors ``_gather_results_and_exceptions`` return shape so callers
+        treat it identically. Tests can patch this method directly to inject
+        a synthetic prediction list without spinning up real tasks.
+        """
+        tasks = [asyncio.create_task(coro, name=f"forecaster:{idx}:q{qid_for_log}") for idx, coro in enumerate(coros)]
+        n_total = len(tasks)
+        remaining = self._remaining_budget_seconds(per_q_start)
+        wait_timeout = max(0.0, remaining)
+        done_set, pending_set = await asyncio.wait(tasks, timeout=wait_timeout, return_when=asyncio.ALL_COMPLETED)
+        if pending_set:
+            for pending in pending_set:
+                pending.cancel()
+            # Give cancelled tasks a chance to clean up so we don't leak warnings.
+            await asyncio.wait(pending_set, timeout=2.0)
+            self._forecasters_dropped_count += len(pending_set)
+            logger.warning(
+                "WALLCLOCK_ABORT: qid=%s elapsed=%.1fs forecasters_completed=%d/%d cancelled=%d remaining_budget=%.1fs",
+                qid_for_log,
+                time.time() - per_q_start,
+                len(done_set),
+                n_total,
+                len(pending_set),
+                remaining,
+            )
+
+        # Sort by task name (stable across runs) since asyncio.wait returns sets.
+        done_sorted = sorted(done_set, key=lambda t: t.get_name())
+        valid_predictions: list[ReasonedPrediction[PredictionTypes]] = []
+        errors: list[str] = []
+        exceptions: list[BaseException] = []
+        for task in done_sorted:
+            exc = task.exception()
+            if exc is None:
+                valid_predictions.append(cast(ReasonedPrediction[PredictionTypes], task.result()))
+            else:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                exceptions.append(exc)
+        exception_group: ExceptionGroup | None = ExceptionGroup(f"Errors: {errors}", exceptions) if exceptions else None
+        return valid_predictions, errors, exception_group
+
     async def _research_and_make_predictions(
         self,
         question: MetaculusQuestion,
@@ -689,6 +826,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return await super()._research_and_make_predictions(question)
 
         assert question.id_of_question is not None, "id_of_question must not be None for stacking state-dict keying"
+
+        # Per-Q wall-clock cutoff: research, fan-out, aggregation, and publish
+        # all share the same budget. Recorded as early as possible so we don't
+        # overshoot from research-time alone.
+        per_q_start = time.time()
 
         notepad = await self._get_notepad(question)
         notepad.total_research_reports_attempted += 1
@@ -714,7 +856,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             valid_predictions,
             errors,
             exception_group,
-        ) = await self._gather_results_and_exceptions(tasks)
+        ) = await self._gather_predictions_with_wall_clock(tasks, qid_for_log, per_q_start)
         if errors:
             logger.warning(f"Encountered errors while predicting: {errors}")
 
@@ -733,19 +875,70 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if exception_group is not None:
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
+        # Stacking budget gate. If we've burned through the per-Q wall-clock
+        # budget (e.g. research stalled, fan-out used most of the budget),
+        # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
+        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET (90s) floor leaves
+        # headroom for sustained slowness on a single POST. The 160s worst case
+        # (4 POSTs * 20s * (1 + 1 retry)) requires multi-POST stalling, which
+        # is recovered by skip_stacking_for_budget already.
+        skip_stacking_for_budget = (
+            self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
+            and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
+        )
+        if skip_stacking_for_budget:
+            # F15: the base-combine re-entry uses MEAN under STACKING and
+            # MEDIAN under CONDITIONAL_STACKING (see _aggregate_predictions:
+            # base_combine_strategy at main.py:1310-1314). The marker must
+            # match the actual aggregation method so residual analysis cuts
+            # bucket the two paths correctly.
+            budget_skip_outcome = (
+                "fallback_median"
+                if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
+                else "fallback_mean"
+            )
+            logger.warning(
+                "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing %s fallback",
+                qid_for_log,
+                self._remaining_budget_seconds(per_q_start),
+                WALL_CLOCK_STACKING_MIN_BUDGET,
+                budget_skip_outcome,
+            )
+            self._stacker_outcome[question.id_of_question] = budget_skip_outcome
+            # Register so parent's _aggregate_predictions (which will run with
+            # reasoned_predictions=None) takes the expected base-combine path
+            # and doesn't log "Unexpected STACKING combine".
+            self._register_expected_base_combine(question)
+
         # If using stacking, aggregate the predictions here
-        if self.aggregation_strategy == AggregationStrategy.STACKING:
+        if self.aggregation_strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
             if getattr(self, "research_reports_per_question", 1) != 1:
                 logger.warning(
                     "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
                     getattr(self, "research_reports_per_question", 1),
                 )
             prediction_values = [pred.prediction_value for pred in valid_predictions]
+            # Probabilistic tools: deterministic cross-model math runs once
+            # per question and rides at the top of the stacker prompt. No-ops
+            # when PROBABILISTIC_TOOLS_ENABLED is unset.
+            from metaculus_bot.tool_runner import (
+                build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
+
+            aggregated_tool_output = (
+                build_cross_model_aggregation(
+                    question=question,
+                    rationales=[p.reasoning for p in valid_predictions],
+                    prediction_values=prediction_values,
+                )
+                or None
+            )
             aggregated_value = await self._aggregate_predictions(
                 prediction_values,
                 question,
                 research=research_to_use,
                 reasoned_predictions=valid_predictions,
+                aggregated_tool_output=aggregated_tool_output,
             )
             # Create a single aggregated prediction, preserving the stacker meta-analysis
             # AND the base model reasonings (so residual analysis can recover per-model
@@ -757,14 +950,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
             combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
             aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
             self._register_expected_base_combine(question)
-            self._question_was_stacked[question.id_of_question] = True
+            # _stacker_outcome is populated by _aggregate_predictions on the path
+            # that actually produced aggregated_value; do not set it here.
             return ResearchWithPredictions(
                 research_report=research,
                 summary_report=summary_report,
                 errors=errors,
                 predictions=[aggregated_prediction],
             )
-        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
             prediction_values = [pred.prediction_value for pred in valid_predictions]
             spread = compute_spread(question, prediction_values)
             threshold = self._get_threshold_for_question(question)
@@ -783,14 +977,28 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 if self._analyzer_llm is None:
                     raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
-                # 1. Extract the crux of disagreement
+                # 1. Extract the crux of disagreement under a soft deadline.
+                # Without the wait_for the call's worst case is litellm timeout
+                # (300s) * allowed_tries (3) ≈ 15 min on the critical path; the
+                # CRUX_SOFT_DEADLINE caps that at 180s.
                 base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
                 try:
-                    crux = await extract_disagreement_crux(
-                        self._analyzer_llm,
-                        question.question_text,
-                        base_texts,
+                    crux = await asyncio.wait_for(
+                        extract_disagreement_crux(
+                            self._analyzer_llm,
+                            question.question_text,
+                            base_texts,
+                        ),
+                        timeout=CRUX_SOFT_DEADLINE,
                     )
+                except asyncio.TimeoutError:
+                    self._conditional_stacking_crux_failures += 1
+                    logger.warning(
+                        "CRUX_SOFT_DEADLINE: crux extraction exceeded %ds for Q %s; skipping targeted research",
+                        CRUX_SOFT_DEADLINE,
+                        question.id_of_question,
+                    )
+                    crux = ""
                 except Exception:
                     self._conditional_stacking_crux_failures += 1
                     logger.exception("Disagreement crux extraction failed, skipping targeted research")
@@ -818,11 +1026,26 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     combined_research = research_to_use
 
                 # 4. Run stacking
+                # Cross-model aggregation for tool-augmented runs (no-op when
+                # PROBABILISTIC_TOOLS_ENABLED is unset).
+                from metaculus_bot.tool_runner import (
+                    build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+                )
+
+                aggregated_tool_output = (
+                    build_cross_model_aggregation(
+                        question=question,
+                        rationales=[p.reasoning for p in valid_predictions],
+                        prediction_values=prediction_values,
+                    )
+                    or None
+                )
                 aggregated_value = await self._aggregate_predictions(
                     prediction_values,
                     question,
                     research=combined_research,
                     reasoned_predictions=valid_predictions,
+                    aggregated_tool_output=aggregated_tool_output,
                 )
                 meta_text = self._stack_meta_reasoning.pop(
                     question.id_of_question,
@@ -833,10 +1056,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     prediction_value=aggregated_value, reasoning=combined_reasoning
                 )
                 self._register_expected_base_combine(question)
-                self._question_was_stacked[question.id_of_question] = True
-
+                # _stacker_outcome is populated by _aggregate_predictions on the
+                # path that actually produced aggregated_value.
+                #
+                # research_report must be combined_research so the
+                # ## Targeted Research (addressing model disagreement) header
+                # reaches the published comment. Note: when
+                # use_research_summary_to_forecast=True, combined_research is
+                # built from summary_report (research_to_use), so the comment
+                # will show summary + targeted_research; the regular STACKING
+                # path above instead publishes raw research.
                 return ResearchWithPredictions(
-                    research_report=research,
+                    research_report=combined_research,
                     summary_report=summary_report,
                     errors=errors,
                     predictions=[aggregated_prediction],
@@ -850,7 +1081,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question.id_of_question,
                 )
                 self._register_expected_base_combine(question)
-                self._question_was_stacked[question.id_of_question] = False
+                self._stacker_outcome[question.id_of_question] = "skipped"
                 return ResearchWithPredictions(
                     research_report=research,
                     summary_report=summary_report,
@@ -858,13 +1089,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     predictions=valid_predictions,
                 )
 
-        else:
-            return ResearchWithPredictions(
-                research_report=research,
-                summary_report=summary_report,
-                errors=errors,
-                predictions=valid_predictions,
-            )
+        # Catch-all: non-stacking strategy, OR stacking strategy whose budget
+        # gate forced fallback_median above. In both cases we return the raw
+        # valid_predictions and let the parent class's per-Q aggregator combine
+        # them. For the skip case, _stacker_outcome was already set to
+        # "fallback_median" upstream so the comment-marker reflects reality.
+        return ResearchWithPredictions(
+            research_report=research,
+            summary_report=summary_report,
+            errors=errors,
+            predictions=valid_predictions,
+        )
 
     @classmethod
     def _format_and_expand_research_summary(
@@ -915,17 +1150,53 @@ class TemplateForecaster(CompactLoggingForecastBot):
             final_cost,
             time_spent_in_minutes,
         )
-        # Always pop the state-dict entry so per-question bookkeeping doesn't leak,
-        # even for non-stacking strategies that never populate it.
         qid = question.id_of_question
-        was_stacked = self._question_was_stacked.pop(qid, False) if qid is not None else False
+        # Always pop so per-question bookkeeping doesn't leak across runs.
+        popped = self._stacker_outcome.pop(qid, None) if qid is not None else None
         if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-            # Don't emit a marker for MEAN/MEDIAN/etc — the question was never a
-            # stacking candidate, so STACKED=false would misrepresent behavior.
+            # MEAN/MEDIAN/etc were never stacking candidates — emitting a marker would misrepresent.
             return trim_comment(base_text)
-        # Append (not prepend): ForecastReport requires explanation.strip() to start with '#'.
-        marker = STACKED_MARKER_TRUE if was_stacked else STACKED_MARKER_FALSE
-        return trim_comment(f"{base_text}\n{marker}\n")
+        assert popped is not None, (
+            f"_stacker_outcome must be populated for STACKING/CONDITIONAL_STACKING qid={qid}; "
+            "every reachable code path in _aggregate_predictions sets it. Missing entry = real bug."
+        )
+        match popped:
+            case "primary":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
+            case "fallback_llm":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
+            case "fallback_median":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
+            case "fallback_mean":
+                # F15: STACKING budget-skip path uses MEAN base-combine (not MEDIAN).
+                # Emit a distinct marker so residual analysis can bucket the two paths.
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
+            case "skipped":
+                outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
+            case other:
+                raise ValueError(f"Unknown stacker outcome {other!r}")
+
+        # Probabilistic-tools marker rides alongside the STACKER_OUTCOME + STACKED markers so
+        # residual analysis can bucket tool-augmented vs vanilla stacking runs. Marker reflects
+        # actual per-type dispatch (PROBABILISTIC_TOOLS_TYPES allow-list), not just the global
+        # flag — otherwise a numeric question with TYPES="binary,multiple_choice" would emit
+        # TOOLS_USED=true even though no tool fired (F21).
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            _feature_enabled as _tool_runner_feature_enabled,
+        )
+
+        if isinstance(question, BinaryQuestion):
+            qtype: Literal["binary", "numeric", "multiple_choice"] | None = "binary"
+        elif isinstance(question, NumericQuestion):
+            qtype = "numeric"
+        elif isinstance(question, MultipleChoiceQuestion):
+            qtype = "multiple_choice"
+        else:
+            qtype = None
+        tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE
+        # Append (not prepend): ForecastReport.explanation.strip() must start with '#'.
+        # STACKER_OUTCOME + STACKED both emitted for one round of back-compat with parsers reading STACKED=.
+        return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}\n")
 
     async def _forecaster_with_soft_deadline(
         self,
@@ -995,6 +1266,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
         prediction = await forecast_function(question, research, actual_llm)
         # Load-bearing: performance_analysis.parsing pulls per-model attribution from this "Model:" prefix.
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
+
+        # Probabilistic-tools activation: run deterministic math tools over
+        # the forecaster's structured JSON block (see tool_runner.py). The
+        # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
+        # block was emitted; callers don't gate.
+        from metaculus_bot.tool_runner import (
+            run_tools_for_forecaster,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
+
+        computed_md = run_tools_for_forecaster(
+            question=question,
+            rationale=prediction.reasoning,
+            forecaster_id=actual_llm.model,
+        )
+        if computed_md:
+            prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
@@ -1005,6 +1292,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str | None = None,
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
+        aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
         if not predictions:
             raise ValueError("Cannot aggregate empty list of predictions")
@@ -1057,6 +1345,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     strategy_name,
                 )
             first = predictions[0]
+            # F16: under CONDITIONAL_STACKING the multi-input re-entry case is the
+            # low-spread skip path, where `predictions` are RAW per-forecaster
+            # outputs (not yet Platt-calibrated). Apply Platt to the combined
+            # value so low-spread vs. high-spread questions have symmetric
+            # calibration treatment. STACKING's multi-input case is per-research-
+            # report stacker outputs that were already calibrated by the fresh-
+            # aggregation path that produced them — re-applying would double-
+            # apply, so leave that branch alone.
+            apply_platt_after_combine = self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
             # In the branches below, isinstance narrows `first` but the checker can't
             # narrow the full `predictions` list or know that combine_* returns a
             # PredictionTypes member.  The return-value ignores are safe because each
@@ -1066,12 +1363,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 values = [float(p) for p in predictions if isinstance(p, (int, float))]
                 result = combine_binary_predictions(values, base_combine_strategy)
                 logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
                 return result  # type: ignore[return-value]
             if isinstance(first, PredictedOptionList):
                 mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
                 aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
                 summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
                 logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]
                 return aggregated  # type: ignore[return-value]
             if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
                 numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
@@ -1081,7 +1382,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     strategy_name,
                     len(getattr(aggregated, "cdf", [])),
                 )
-                return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
+                snapped = self._maybe_snap_to_integers(aggregated, question)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(snapped, question)  # type: ignore[arg-type]
+                return snapped  # type: ignore[return-value]
             raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
 
         # Handle stacking strategy
@@ -1106,12 +1410,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # hard-fail behavior end-to-end so benchmark runs surface stacker
             # regressions loudly.
             # CancelledError is BaseException in 3.11+ — intentionally not caught here.
+            # _research_and_make_predictions asserts id_of_question is not None
+            # before this is reachable, so the qid is guaranteed populated.
+            qid_for_outcome = question.id_of_question
+            assert qid_for_outcome is not None
             try:
                 stacked = await asyncio.wait_for(
-                    self._run_stacking(question, research, reasoned_predictions),
+                    self._run_stacking(
+                        question,
+                        research,
+                        reasoned_predictions,
+                        aggregated_tool_output=aggregated_tool_output,
+                    ),
                     timeout=STACKER_SOFT_DEADLINE,
                 )
-                return self._maybe_snap_to_integers(stacked, question)
+                self._stacker_outcome[qid_for_outcome] = "primary"
+                return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
             except Exception as primary_exc:
                 if not self.stacking_fallback_on_failure:
                     raise
@@ -1135,6 +1449,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                             research,
                             reasoned_predictions,
                             stacker_llm_override=STACKER_FALLBACK_LLM,
+                            aggregated_tool_output=aggregated_tool_output,
                         ),
                         timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                     )
@@ -1142,7 +1457,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         "STACKER_FALLBACK_SUCCEEDED: fallback stacker succeeded on Q %s",
                         question.id_of_question,
                     )
-                    return self._maybe_snap_to_integers(stacked, question)
+                    self._stacker_outcome[qid_for_outcome] = "fallback_llm"
+                    return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
                 except Exception as fallback_exc:
                     self._stacker_fallback_failed_count += 1
                     self._stacking_fallback_count += 1
@@ -1153,6 +1469,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         type(fallback_exc).__name__,
                         fallback_exc,
                     )
+                    self._stacker_outcome[qid_for_outcome] = "fallback_median"
                     # Direct per-type MEDIAN dispatch. We deliberately do NOT
                     # mutate self.aggregation_strategy here: forecast_questions
                     # runs questions concurrently via asyncio.gather on the same
@@ -1162,19 +1479,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     first_prediction = predictions[0]
                     if isinstance(first_prediction, (int, float)):
                         float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-                        return combine_binary_predictions(  # type: ignore[return-value]  # float is a PredictionTypes member
-                            float_preds, AggregationStrategy.MEDIAN
+                        return self._apply_platt_calibration(
+                            combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # float is a PredictionTypes member
+                            question,
                         )
                     if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
                         numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
                         median_numeric = await combine_numeric_predictions(
                             numeric_preds, question, AggregationStrategy.MEDIAN
                         )
-                        return self._maybe_snap_to_integers(median_numeric, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+                        return self._apply_platt_calibration(
+                            self._maybe_snap_to_integers(median_numeric, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
+                            question,
+                        )
                     if isinstance(first_prediction, PredictedOptionList):
                         mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                        return combine_multiple_choice_predictions(  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
-                            mc_preds, AggregationStrategy.MEDIAN
+                        return self._apply_platt_calibration(
+                            combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
+                            question,
                         )
                     raise ValueError(
                         f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}"
@@ -1229,7 +1551,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     float_preds,
                     result,
                 )
-            return result  # type: ignore[return-value]  # float is a PredictionTypes member
+            return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]  # float is a PredictionTypes member
 
         if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
@@ -1247,7 +1569,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+            return self._apply_platt_calibration(
+                self._maybe_snap_to_integers(aggregated, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
+                question,
+            )
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
@@ -1259,12 +1584,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 effective_strategy.value,
                 summary,
             )
-            return aggregated  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
+            return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
 
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
 
-    async def _call_perplexity(self, question: str, use_open_router: bool = True) -> str:
+    async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
+        # Accept either a MetaculusQuestion (new ResearchCallable contract) or a
+        # plain question_text string (for the fallback path that's already
+        # extracted .question_text upstream).
+        question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
+
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             ""
@@ -1281,7 +1611,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             You DO NOT produce forecasts yourself; you must provide ALL relevant data to the superforecaster so they can make an expert judgment.
 
             Question:
-            {question}
+            {question_text}
             """
         )  # NOTE: The metac bot in Q1 put everything but the question in the system prompt.
         if use_open_router:
@@ -1298,10 +1628,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         response = await model.invoke(prompt)
         return response
 
-    async def _call_exa_smart_searcher(self, question: str) -> str:
+    async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
         """
         SmartSearcher is a custom class that is a wrapper around an search on Exa.ai
         """
+        question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
         searcher = SmartSearcher(
             model=self.get_llm("default", "llm"),
             temperature=0,
@@ -1313,7 +1644,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             "you a question they intend to forecast on. To be a great assistant, you generate"
             "a concise but detailed rundown of the most relevant news, including if the question"
             "would resolve Yes or No based on current information. You do not produce forecasts yourself."
-            f"\n\nThe question is: {question}"
+            f"\n\nThe question is: {question_text}"
         )  # You can ask the searcher to filter by date, exclude/include a domain, and run specific searches for finding sources vs finding highlights within a source
         response = await searcher.invoke(prompt)
         return response
@@ -1442,13 +1773,108 @@ class TemplateForecaster(CompactLoggingForecastBot):
             .replace("{lower}", str(getattr(question, "lower_bound", 0)))
             .replace("{upper}", str(getattr(question, "upper_bound", 0)))
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parse_notes,
+        # Try to parse the trailing percentile lines. Workstream E: a
+        # mixture-only rationale legitimately has no percentile lines, so a
+        # parser failure is only non-fatal when the rationale carries a
+        # populated mixture_components block (router will use it). Otherwise
+        # the exception propagates so the caller still sees the parse failure.
+        from metaculus_bot.numeric_format_router import (
+            detect_numeric_format,  # noqa: PLC0415  # function-scoped: see AGENTS.md
         )
-        sanitized_percentiles, zero_point = sanitize_percentiles(percentile_list, question)
+
+        percentile_list: list[Percentile] | None
+        try:
+            percentile_list = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=parse_notes,
+            )
+        except (ValidationError, ValueError) as e:
+            detected = detect_numeric_format(reasoning)
+            if detected in ("mixture", "both"):
+                logger.info(
+                    "Numeric percentile parser found no percentile lines for Q %s | model=%s: %s "
+                    "(rationale carries mixture_components — using mixture branch)",
+                    qid,
+                    llm_to_use.model,
+                    e,
+                )
+                percentile_list = None
+            else:
+                # No mixture fallback — reraise so the malformed forecast is
+                # surfaced rather than silently degrading.
+                raise
+
+        # Workstream E: route between mixture and percentile paths.
+        from metaculus_bot.numeric_format_router import (
+            route_numeric_output,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
+
+        routed = route_numeric_output(
+            rationale=reasoning,
+            declared_percentiles=percentile_list,
+            question=question,
+        )
+        logger.info(
+            "numeric_format=%s for Q %s | model=%s | mixture_components=%s",
+            routed.format,
+            qid,
+            llm_to_use.model,
+            (len(routed.mixture.components) if routed.mixture is not None else 0),
+        )
+
+        if routed.mixture is not None:
+            # Mixture branch: percentiles_to_metaculus_cdf_via_mixture already
+            # produced a constraint-enforced 201-point CDF. Wrap as a
+            # PchipNumericDistribution so .cdf returns the pre-computed values
+            # rather than re-deriving from declared_percentiles.
+            #
+            # detect_unit_mismatch is intentionally NOT called on this branch.
+            # The heuristic checks declared-percentile spread against the
+            # question's bound range; mixture_declared (synthesized below) is
+            # built by walking the mixture CDF for each STANDARD_PERCENTILE,
+            # so its values always span [lower, upper] and the heuristic can
+            # never fire. The percentile branch below still runs the guard
+            # because raw LLM-declared percentiles can plausibly land in the
+            # wrong unit.
+            from metaculus_bot.pchip_processing import (
+                create_pchip_numeric_distribution,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
+
+            mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
+            # Synthesize the canonical 11 declared-percentile anchors from the
+            # mixture CDF so the upstream NumericDistribution shape matches the
+            # percentile-branch contract. This is presentational only — the
+            # PCHIP override means .cdf returns the mixture-derived 201 points.
+            mixture_declared: list[Percentile] = []
+            from metaculus_bot.numeric_config import (
+                STANDARD_PERCENTILES,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+            )
+
+            for target_pct in STANDARD_PERCENTILES:
+                # Find first cdf entry whose probability >= target.
+                hit = next(
+                    (p for p in routed.cdf_percentiles if p.percentile >= target_pct),
+                    routed.cdf_percentiles[-1],
+                )
+                mixture_declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
+
+            prediction = create_pchip_numeric_distribution(
+                mixture_cdf_values,
+                mixture_declared,
+                question,
+                zero_point=None,
+            )
+            log_final_prediction(prediction, question)
+            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+        # Percentile branch (default): existing pipeline.
+        assert routed.declared_percentiles is not None, (
+            "route_numeric_output returned a non-mixture result without declared_percentiles; "
+            "this is a router bug — mixture-fallback should have raised ValueError instead."
+        )
+        sanitized_percentiles, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
 
         prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 
@@ -1469,6 +1895,73 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Log final prediction
         log_final_prediction(prediction, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
+        """Apply post-hoc Platt scaling to the final binary or MC probability.
+
+        Short-circuits and returns ``prediction`` unchanged when any of:
+
+        * ``PLATT_CALIBRATION_ENABLED`` is unset;
+        * both ``BINARY_PLATT_PARAMS`` and ``MC_PLATT_PARAMS`` are still
+          identity (the checked-in default until the fit CLI populates them);
+        * ``prediction`` is a NumericDistribution (numeric calibration is
+          intentionally out of scope for this initial rollout).
+
+        Called on FRESH aggregation return points in
+        ``_aggregate_predictions`` and on the CONDITIONAL_STACKING multi-input
+        base-combine re-entry (where the inputs are RAW per-forecaster
+        predictions from the low-spread skip path — not yet calibrated).
+        Deliberately NOT called on the STACKING multi-input base-combine
+        re-entry (per-research-report stacker outputs already calibrated by
+        the fresh-aggregation path) or the single-input re-entry under
+        either strategy (single pre-stacked output already calibrated).
+        Re-applying in those cases would double-apply.
+        """
+        if not env_flag_enabled(PLATT_CALIBRATION_ENABLED_ENV):
+            return prediction
+
+        if BINARY_PLATT_PARAMS.is_identity() and MC_PLATT_PARAMS.is_identity():
+            return prediction
+
+        if isinstance(question, BinaryQuestion) and isinstance(prediction, (int, float)):
+            calibrated = apply_binary_platt(
+                float(prediction),
+                BINARY_PLATT_PARAMS,
+                max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION,
+            )
+            if calibrated != float(prediction):
+                logger.info(
+                    "PLATT_BINARY: q=%s raw=%.4f calibrated=%.4f bias=%.4f slope=%.4f cap=%.3f",
+                    question.id_of_question,
+                    float(prediction),
+                    calibrated,
+                    BINARY_PLATT_PARAMS.bias,
+                    BINARY_PLATT_PARAMS.slope,
+                    PLATT_BINARY_MAX_ABS_DEVIATION,
+                )
+            return calibrated  # type: ignore[return-value]  # float is a PredictionTypes member
+
+        if isinstance(prediction, PredictedOptionList):
+            raw_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
+            apply_mc_platt(
+                prediction,
+                MC_PLATT_PARAMS,
+                max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION,
+            )
+            calibrated_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
+            if raw_summary != calibrated_summary:
+                logger.info(
+                    "PLATT_MC: q=%s raw=%s calibrated=%s bias=%.4f slope=%.4f cap=%.3f",
+                    question.id_of_question,
+                    raw_summary,
+                    calibrated_summary,
+                    MC_PLATT_PARAMS.bias,
+                    MC_PLATT_PARAMS.slope,
+                    PLATT_MC_MAX_ABS_DEVIATION,
+                )
+            return prediction
+
+        return prediction
 
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from datetime import datetime, timedelta
 
 import pytest
 from forecasting_tools.data_models.forecast_report import ForecastReport
@@ -21,6 +22,15 @@ from metaculus_bot.numeric_utils import (
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.utils.logging_utils import compact_log_report_summary
 
+
+def _open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
+
+
 # ---------- Prompt builders -------------------------------------------------
 
 
@@ -35,6 +45,8 @@ def test_binary_prompt_contains_inputs():
         fine_print="Fine print",
         published_time=None,
         close_time=None,
+        open_time=_open_time(),
+        scheduled_resolution_time=_resolve_time(),
     )
     prompt = binary_prompt(question, "research snippet")
     assert "Will it rain tomorrow?" in prompt
@@ -53,10 +65,15 @@ def test_multiple_choice_prompt_contains_options():
         fine_print="",
         published_time=None,
         close_time=None,
+        open_time=_open_time(),
+        scheduled_resolution_time=_resolve_time(),
     )
     prompt = multiple_choice_prompt(question, "mc research")
     assert "Who will win?" in prompt
-    assert "Option_A" in prompt  # output format marker
+    # The trailing answer-format example must list real option names so strict
+    # parsers can map the LLM's output directly onto question.options.
+    assert "A: NN%" in prompt
+    assert "B: NN%" in prompt
 
 
 def test_numeric_prompt_bounds_and_research():
@@ -70,6 +87,8 @@ def test_numeric_prompt_bounds_and_research():
         fine_print="",
         published_time=None,
         close_time=None,
+        open_time=_open_time(),
+        scheduled_resolution_time=_resolve_time(),
         lower_bound=0,
         upper_bound=100,
         open_lower_bound=False,
@@ -93,6 +112,8 @@ def test_numeric_prompt_includes_p5_and_p95():
         fine_print="",
         published_time=None,
         close_time=None,
+        open_time=_open_time(),
+        scheduled_resolution_time=_resolve_time(),
         lower_bound=0,
         upper_bound=100,
         open_lower_bound=False,

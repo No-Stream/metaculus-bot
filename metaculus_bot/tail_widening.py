@@ -96,9 +96,9 @@ def widen_declared_percentiles(
     percentile_list: List[Percentile],
     question: NumericQuestion,
     *,
-    k_tail: float = 1.25,
+    k_tail: float = 1.0,
     tail_start: float = 0.2,
-    span_floor_gamma: float = 1.0,
+    span_floor_gamma: float = 0.0,
 ) -> List[Percentile]:
     """
     Widen tails by scaling distances from the median in a transformed space.
@@ -107,10 +107,34 @@ def widen_declared_percentiles(
     ----------
     percentile_list: list of Percentile (assumed sorted by percentile and strictly increasing values)
     question: NumericQuestion with bound semantics
-    k_tail: maximum stretch factor at deepest tails in transformed space (>=1.0)
-    tail_start: tail ramp start (fraction of percentile distance from the median)
-    span_floor_gamma: enforce (p05 - p02.5) >= gamma*(p10 - p05) and (p97.5 - p95) >= gamma*(p95 - p90)
+    k_tail: maximum stretch factor at the deepest tails in transformed space.
+        `k_tail=1.0` disables widening (identity pass). Values `< 1.0` raise
+        `ValueError` because narrowing is not implemented — the ramp weight in
+        `_tail_weight` never goes below zero and the inverse-transform branch
+        only runs when `k_tail > 1.0`, so a caller passing `0.8` would silently
+        get the identity pass. See
+        `scratch_docs_and_planning/tail_widening_empirical_calibration.md` for
+        the empirical rationale behind the `1.0` default.
+    tail_start: tail ramp start (fraction of percentile distance from the median).
+    span_floor_gamma: enforces `(p05 - p02.5) >= gamma * (p10 - p05)` and the
+        upper mirror `(p97.5 - p95) >= gamma * (p95 - p90)`. `0.0` disables the
+        check (the default — on all 2026 data the floor never bound). Any
+        positive value re-enables the existing floor enforcement; negative
+        values raise `ValueError`. Kept configurable for forecasters that
+        declare unusually sharp tails.
     """
+
+    if k_tail < 1.0:
+        raise ValueError(
+            f"k_tail={k_tail} is invalid: narrowing is not implemented (k_tail < 1.0). "
+            "Only widening (k_tail >= 1.0) is supported; k_tail=1.0 is the identity "
+            "pass. See scratch_docs_and_planning/tail_widening_empirical_calibration.md."
+        )
+    if span_floor_gamma < 0.0:
+        raise ValueError(
+            f"span_floor_gamma={span_floor_gamma} is invalid: must be >= 0.0. "
+            "Use 0.0 to disable the floor check; any positive value enables it."
+        )
 
     # If no percentiles, or both widening and span-floor disabled, bail out
     if not percentile_list or (k_tail <= 1.0 and span_floor_gamma <= 0.0):
