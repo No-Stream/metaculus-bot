@@ -615,3 +615,124 @@ async def test_conditional_stacking_base_combine_reentry_does_not_double_apply(
         f"CONDITIONAL_STACKING base-combine re-entry must return the pre-stacked "
         f"value as-is; got {result!r}, expected 0.42."
     )
+
+
+@pytest.mark.asyncio
+async def test_conditional_stacking_skip_path_applies_platt_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F16: CONDITIONAL_STACKING low-spread (skip) path must apply Platt calibration.
+
+    The CS-skip branch returns raw per-forecaster predictions; the parent class
+    then re-enters ``_aggregate_predictions`` with ``research=None`` and
+    ``reasoned_predictions=None``, hitting the multi-input base-combine block.
+    Pre-fix that block produced an UN-calibrated MEDIAN — meaning low-disagreement
+    questions silently bypassed Platt while high-disagreement questions (which
+    flow through the stacker fresh-aggregation path) had it applied. That
+    asymmetry contaminates any treatment-effect cut.
+
+    After the fix, the base-combine block applies Platt when the strategy is
+    CONDITIONAL_STACKING and the input list is the multi-element CS-skip case.
+    The single-input case (high-spread stacker output) remains a no-op
+    passthrough since the stacker fresh-aggregation already calibrated it.
+    """
+    monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
+    params = PlattParams(bias=0.5, slope=1.2)
+    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+
+    bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
+    question = _make_binary_question()
+    bot._register_expected_base_combine(question)
+
+    preds = [0.45, 0.50, 0.55]
+    raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
+    expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
+
+    result = await bot._aggregate_predictions(
+        predictions=preds,
+        question=question,
+        research=None,
+        reasoned_predictions=None,
+    )
+
+    assert result == expected, (
+        f"CONDITIONAL_STACKING skip-path multi-input re-entry must apply Platt to "
+        f"the median of raw forecasters; got {result!r}, expected {expected!r} "
+        f"(raw_median={raw_median!r})."
+    )
+    assert result != raw_median, (
+        "Non-identity params should move the result; if this fires, calibration "
+        "is being skipped on the CS low-spread path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_conditional_stacking_skip_path_applies_platt_mc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F16 MC arm: CS low-spread re-entry must apply MC Platt to the combined options.
+
+    Mirrors the binary case for the MC arm of the base-combine block.
+    """
+    monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
+    params = PlattParams(bias=0.3, slope=1.4)
+    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+
+    bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
+    question = _make_mc_question()
+    bot._register_expected_base_combine(question)
+
+    pred_a = _make_mc_pred([0.50, 0.30, 0.15, 0.05])
+    pred_b = _make_mc_pred([0.40, 0.35, 0.20, 0.05])
+
+    ref_inputs = [deepcopy(pred_a), deepcopy(pred_b)]
+    combined = combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
+    expected_pol = apply_mc_platt(combined, params, max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION)
+    expected_probs = {o.option_name: o.probability for o in expected_pol.predicted_options}
+
+    result = await bot._aggregate_predictions(
+        predictions=[pred_a, pred_b],
+        question=question,
+        research=None,
+        reasoned_predictions=None,
+    )
+
+    assert isinstance(result, PredictedOptionList)
+    result_probs = {o.option_name: o.probability for o in result.predicted_options}
+    for name, exp in expected_probs.items():
+        assert result_probs[name] == pytest.approx(exp), (
+            f"option {name!r}: got {result_probs[name]!r}, expected {exp!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stacking_base_combine_reentry_multi_input_does_not_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STACKING control: multi-input re-entry under STACKING is the per-research-report
+    re-aggregation of already-calibrated stacker outputs. Re-applying Platt would
+    double-apply, so it remains a no-op even with the F16 fix (which is
+    CS-only). Pin this so the F16 fix doesn't accidentally regress STACKING.
+    """
+    monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
+    params = PlattParams(bias=0.5, slope=1.5)
+    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+
+    bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.STACKING)
+    question = _make_binary_question()
+    bot._register_expected_base_combine(question)
+
+    preds = [0.42, 0.48]
+    raw_mean = combine_binary_predictions(preds, AggregationStrategy.MEAN)
+
+    result = await bot._aggregate_predictions(
+        predictions=preds,
+        question=question,
+        research=None,
+        reasoned_predictions=None,
+    )
+
+    assert result == raw_mean, (
+        f"STACKING multi-input re-entry must NOT apply Platt (inputs are already "
+        f"calibrated stacker outputs); got {result!r}, expected raw MEAN={raw_mean!r}."
+    )

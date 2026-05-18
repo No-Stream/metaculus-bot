@@ -2,15 +2,19 @@
 
 Two marker families coexist on every stacked comment for one round of back-compat:
 
-* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|skipped>`` — the new
-  tri-state marker. ``primary`` and ``fallback_llm`` mean a stacker LLM
-  produced the value; ``fallback_median`` means both stacker LLMs failed and
-  MEDIAN aggregation was used; ``skipped`` means the conditional-stacking
-  trigger short-circuited the stacker entirely.
+* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|fallback_mean|skipped>``
+  — the tri-state-plus marker. ``primary`` and ``fallback_llm`` mean a stacker
+  LLM produced the value; ``fallback_median`` means both stacker LLMs failed
+  and MEDIAN aggregation was used (CONDITIONAL_STACKING budget-skip path);
+  ``fallback_mean`` is the analogous outcome on the regular STACKING budget-
+  skip path, where the base-combine re-entry uses MEAN rather than MEDIAN
+  (F15 — keeps the marker truthful for residual analysis cuts that bucket on
+  aggregation strategy); ``skipped`` means the conditional-stacking trigger
+  short-circuited the stacker entirely.
 * ``STACKED=<true|false>`` — legacy binary marker derived from the new outcome
   (true ↔ outcome ∈ {primary, fallback_llm}, false ↔ outcome ∈ {skipped,
-  fallback_median}). Kept around for one round so any external parsers don't
-  break the day this fix lands.
+  fallback_median, fallback_mean}). Kept around for one round so any external
+  parsers don't break the day this fix lands.
 
 Both are injected into each published Metaculus comment by the bot's
 ``_create_unified_explanation`` override (see ``main.py``), and parsed back out
@@ -45,10 +49,16 @@ STACKED_MARKER_RE: re.Pattern[str] = re.compile(
 STACKER_OUTCOME_PRIMARY: str = "<!-- STACKER_OUTCOME=primary -->"
 STACKER_OUTCOME_FALLBACK_LLM: str = "<!-- STACKER_OUTCOME=fallback_llm -->"
 STACKER_OUTCOME_FALLBACK_MEDIAN: str = "<!-- STACKER_OUTCOME=fallback_median -->"
+# F15: STACKING budget-skip path uses MEAN base-combine (CONDITIONAL_STACKING uses
+# MEDIAN). The original "fallback_median" marker silently mislabeled the STACKING
+# variant; this constant gives that path its own bucket so residual analysis cuts
+# can separate MEAN-fallback from MEDIAN-fallback without re-deriving the
+# strategy from other signals.
+STACKER_OUTCOME_FALLBACK_MEAN: str = "<!-- STACKER_OUTCOME=fallback_mean -->"
 STACKER_OUTCOME_SKIPPED: str = "<!-- STACKER_OUTCOME=skipped -->"
 
 STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|skipped)\s*-->",
+    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|fallback_mean|skipped)\s*-->",
     re.IGNORECASE,
 )
 
@@ -107,6 +117,9 @@ assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_LLM) is not None, (
 assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_MEDIAN) is not None, (
     f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_FALLBACK_MEDIAN={STACKER_OUTCOME_FALLBACK_MEDIAN!r}"
 )
+assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_MEAN) is not None, (
+    f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_FALLBACK_MEAN={STACKER_OUTCOME_FALLBACK_MEAN!r}"
+)
 assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED) is not None, (
     f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED={STACKER_OUTCOME_SKIPPED!r}"
 )
@@ -130,6 +143,7 @@ __all__ = [
     "STACKER_OUTCOME_PRIMARY",
     "STACKER_OUTCOME_FALLBACK_LLM",
     "STACKER_OUTCOME_FALLBACK_MEDIAN",
+    "STACKER_OUTCOME_FALLBACK_MEAN",
     "STACKER_OUTCOME_SKIPPED",
     "STACKER_OUTCOME_RE",
     "STACKER_META_ANALYSIS_HEADER",

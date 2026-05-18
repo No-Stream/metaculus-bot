@@ -801,6 +801,45 @@ class TestProviderFactory:
         assert result == ""
 
     @pytest.mark.asyncio
+    async def test_is_benchmarking_short_circuits_regardless_of_env_flag(self, monkeypatch, mock_question):
+        """F7: is_benchmarking=True must hard-disable the provider, even when
+        PREDICTION_MARKETS_ENABLED is set in the operator's environment.
+
+        The ``as_of`` filter only drops markets that closed BEFORE ``as_of``;
+        markets that are still open OR closed between ``as_of`` and now leak
+        post-``as_of`` information into a backtest. The benchmarking guard is
+        the only safe defense — any other path risks data leakage. This
+        mirrors the contract used by ``gemini_search_provider`` and
+        ``native_search_provider``.
+        """
+        from metaculus_bot.prediction_market_provider import prediction_market_provider
+
+        # Set the env flag so we'd otherwise enable the provider — the
+        # is_benchmarking guard must override.
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
+
+        provider = prediction_market_provider(is_benchmarking=True)
+        result = await provider(mock_question)
+        assert result == "", "is_benchmarking=True must short-circuit to '' regardless of env flag"
+
+    @pytest.mark.asyncio
+    async def test_is_benchmarking_default_false_preserves_existing_behavior(self, monkeypatch, mock_question):
+        """F7 control: factory called without is_benchmarking still gates only on env flag.
+
+        Pins that adding the new param doesn't accidentally flip the default
+        behavior (which would silence the provider in prod where
+        is_benchmarking is False).
+        """
+        from metaculus_bot.prediction_market_provider import prediction_market_provider
+
+        monkeypatch.delenv("PREDICTION_MARKETS_ENABLED", raising=False)
+
+        # No is_benchmarking arg → defaults to False. Env flag off → empty.
+        provider = prediction_market_provider()
+        result = await provider(mock_question)
+        assert result == ""
+
+    @pytest.mark.asyncio
     async def test_factory_derives_as_of_from_scheduled_resolution(
         self, monkeypatch, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):

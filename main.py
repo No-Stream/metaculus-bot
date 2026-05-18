@@ -45,6 +45,7 @@ from metaculus_bot.comment_markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,
+    STACKER_OUTCOME_FALLBACK_MEAN,
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
@@ -641,7 +642,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
 
-            providers.append((prediction_market_provider(), "prediction_market"))
+            # F7: thread is_benchmarking so the provider hard-disables under
+            # backtest, regardless of operator env flag. Mirrors the
+            # gemini_search_provider / native_search_provider call sites above.
+            providers.append((prediction_market_provider(is_benchmarking=self.is_benchmarking), "prediction_market"))
 
         if not providers:
 
@@ -883,13 +887,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
             and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
         )
         if skip_stacking_for_budget:
+            # F15: the base-combine re-entry uses MEAN under STACKING and
+            # MEDIAN under CONDITIONAL_STACKING (see _aggregate_predictions:
+            # base_combine_strategy at main.py:1310-1314). The marker must
+            # match the actual aggregation method so residual analysis cuts
+            # bucket the two paths correctly.
+            budget_skip_outcome = (
+                "fallback_median"
+                if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
+                else "fallback_mean"
+            )
             logger.warning(
-                "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing median fallback",
+                "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing %s fallback",
                 qid_for_log,
                 self._remaining_budget_seconds(per_q_start),
                 WALL_CLOCK_STACKING_MIN_BUDGET,
+                budget_skip_outcome,
             )
-            self._stacker_outcome[question.id_of_question] = "fallback_median"
+            self._stacker_outcome[question.id_of_question] = budget_skip_outcome
             # Register so parent's _aggregate_predictions (which will run with
             # reasoned_predictions=None) takes the expected base-combine path
             # and doesn't log "Unexpected STACKING combine".
@@ -1152,6 +1167,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
             case "fallback_median":
                 outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
+            case "fallback_mean":
+                # F15: STACKING budget-skip path uses MEAN base-combine (not MEDIAN).
+                # Emit a distinct marker so residual analysis can bucket the two paths.
+                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
             case "skipped":
                 outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
             case other:
@@ -1326,6 +1345,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     strategy_name,
                 )
             first = predictions[0]
+            # F16: under CONDITIONAL_STACKING the multi-input re-entry case is the
+            # low-spread skip path, where `predictions` are RAW per-forecaster
+            # outputs (not yet Platt-calibrated). Apply Platt to the combined
+            # value so low-spread vs. high-spread questions have symmetric
+            # calibration treatment. STACKING's multi-input case is per-research-
+            # report stacker outputs that were already calibrated by the fresh-
+            # aggregation path that produced them — re-applying would double-
+            # apply, so leave that branch alone.
+            apply_platt_after_combine = self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
             # In the branches below, isinstance narrows `first` but the checker can't
             # narrow the full `predictions` list or know that combine_* returns a
             # PredictionTypes member.  The return-value ignores are safe because each
@@ -1335,12 +1363,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 values = [float(p) for p in predictions if isinstance(p, (int, float))]
                 result = combine_binary_predictions(values, base_combine_strategy)
                 logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
                 return result  # type: ignore[return-value]
             if isinstance(first, PredictedOptionList):
                 mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
                 aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
                 summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
                 logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]
                 return aggregated  # type: ignore[return-value]
             if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
                 numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
@@ -1350,7 +1382,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     strategy_name,
                     len(getattr(aggregated, "cdf", [])),
                 )
-                return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]
+                snapped = self._maybe_snap_to_integers(aggregated, question)
+                if apply_platt_after_combine:
+                    return self._apply_platt_calibration(snapped, question)  # type: ignore[arg-type]
+                return snapped  # type: ignore[return-value]
             raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
 
         # Handle stacking strategy
@@ -1872,11 +1907,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
         * ``prediction`` is a NumericDistribution (numeric calibration is
           intentionally out of scope for this initial rollout).
 
-        Called only on FRESH aggregation return points in
-        ``_aggregate_predictions`` — NOT on the STACKING base-combine
-        re-entry (``main.py:1145-1214``) where the inputs were already
-        calibrated by a prior call to this method, so re-applying would
-        double-apply the recalibration.
+        Called on FRESH aggregation return points in
+        ``_aggregate_predictions`` and on the CONDITIONAL_STACKING multi-input
+        base-combine re-entry (where the inputs are RAW per-forecaster
+        predictions from the low-spread skip path — not yet calibrated).
+        Deliberately NOT called on the STACKING multi-input base-combine
+        re-entry (per-research-report stacker outputs already calibrated by
+        the fresh-aggregation path) or the single-input re-entry under
+        either strategy (single pre-stacked output already calibrated).
+        Re-applying in those cases would double-apply.
         """
         if not env_flag_enabled(PLATT_CALIBRATION_ENABLED_ENV):
             return prediction

@@ -45,6 +45,7 @@ from metaculus_bot.comment_markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,
+    STACKER_OUTCOME_FALLBACK_MEAN,
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
@@ -213,6 +214,45 @@ class TestStackedMarkerInjection:
         assert STACKED_MARKER_FALSE in out
         assert STACKED_MARKER_TRUE not in out
         assert parse_stacker_outcome_marker(out) == "skipped"
+        assert parse_stacked_marker(out) is False
+
+    def test_stacking_budget_skip_emits_fallback_mean_marker(self):
+        # F15: under AggregationStrategy.STACKING, the wall-clock budget-skip
+        # path forces base-combine via MEAN (not MEDIAN — see main.py:1308-1314).
+        # That path must therefore emit STACKER_OUTCOME=fallback_mean so
+        # downstream residual-analysis cuts that bucket on aggregation strategy
+        # don't conflate it with the MEDIAN-fallback bucket. The CONDITIONAL_
+        # STACKING budget-skip path (covered by the next test) keeps
+        # fallback_median because that strategy's base-combine uses MEDIAN.
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "fallback_mean"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_FALLBACK_MEAN in out
+        assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "fallback_mean"
+        assert parse_stacked_marker(out) is False
+
+    def test_conditional_stacking_budget_skip_keeps_fallback_median_marker(self):
+        # F15 control case: CONDITIONAL_STACKING budget-skip still uses MEDIAN
+        # for base-combine, so the fallback_median marker remains accurate
+        # there. This test pins that the marker is NOT changed under
+        # CONDITIONAL_STACKING by the F15 fix.
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "fallback_median"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_FALLBACK_MEDIAN in out
+        assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "fallback_median"
         assert parse_stacked_marker(out) is False
 
     def test_conditional_stacking_primary_emits_primary_marker(self):

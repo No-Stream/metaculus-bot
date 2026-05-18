@@ -169,6 +169,45 @@ async def test_tight_budget_skips_stacking_forces_fallback_median(monkeypatch, m
     assert bot._stacker_outcome.get(mock_binary_question.id_of_question) == "fallback_median"
 
 
+@pytest.mark.asyncio
+async def test_tight_budget_under_stacking_forces_fallback_mean(monkeypatch, mock_binary_question, mock_general_llm):
+    """F15: STACKING budget-skip path must set outcome=fallback_mean (not fallback_median).
+
+    The base-combine re-entry under AggregationStrategy.STACKING uses MEAN
+    (main.py:1308-1314). Setting outcome=fallback_median there mislabels the
+    aggregation method in the comment marker, contaminating downstream
+    residual-analysis cuts. After the F15 fix, the budget-skip path must pick
+    fallback_mean for STACKING and fallback_median for CONDITIONAL_STACKING.
+    """
+    monkeypatch.setattr("main.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.5)
+    monkeypatch.setattr("main.WALL_CLOCK_STACKING_MIN_BUDGET", 1_000_000)  # always trips
+
+    llms_config = {
+        "forecasters": [mock_general_llm] * 3,
+        "stacker": mock_general_llm,
+        "analyzer": mock_general_llm,
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(
+        llms=llms_config,
+        min_forecasters_to_publish=2,
+        aggregation_strategy=AggregationStrategy.STACKING,
+    )
+    bot._get_notepad = AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
+    bot.run_research = AsyncMock(return_value="research")
+
+    async def fast(*args, **kwargs):
+        return ReasonedPrediction(prediction_value=0.6, reasoning="ok")
+
+    bot._forecaster_with_soft_deadline = fast
+
+    await bot._research_and_make_predictions(mock_binary_question)
+    assert bot._stacker_outcome.get(mock_binary_question.id_of_question) == "fallback_mean"
+
+
 # ---------------------------------------------------------------------------
 # Publish hardening
 # ---------------------------------------------------------------------------

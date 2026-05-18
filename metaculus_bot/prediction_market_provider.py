@@ -893,7 +893,7 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
 # ---------------------------------------------------------------------------
 
 
-def prediction_market_provider() -> ResearchCallable:
+def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallable:
     """Factory returning an async research callable for prediction-market data.
 
     The returned callable accepts a `MetaculusQuestion` and uses its full API:
@@ -901,9 +901,18 @@ def prediction_market_provider() -> ResearchCallable:
     keyword extraction, `scheduled_resolution_time` for backtest leakage defense.
 
     Gated on PREDICTION_MARKETS_ENABLED env flag; disabled returns "".
+
+    F7: when ``is_benchmarking=True`` the provider hard-disables regardless of
+    the env flag. The ``as_of`` filter only drops markets that closed BEFORE
+    ``as_of``; still-open markets and markets that closed between ``as_of`` and
+    now would leak post-``as_of`` information into a backtest. The benchmarking
+    guard is the only safe defense — see CLAUDE.md and the
+    ``gemini_search_provider`` / ``native_search_provider`` precedents.
     """
 
     async def _fetch(question: MetaculusQuestion) -> str:
+        if is_benchmarking:
+            return ""  # noqa: ASYNC910
         if not env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             return ""  # noqa: ASYNC910
 
