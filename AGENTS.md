@@ -40,7 +40,7 @@ See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequentl
 Support models (also in `llm_configs.py`):
 
 - **Stacker**: `claude-opus-4.5` (primary), `gpt-5.5` (cross-provider fallback for independence if Anthropic thrashes). Both `allowed_tries=1` — on stall, we fall back rather than burn budget retrying the same provider.
-- **Disagreement analyzer**: `gpt-5.5` (high-effort crux extractor; quality drives targeted-search query).
+- **Disagreement analyzer**: `gpt-5.5` (medium-effort crux extractor; quality drives targeted-search query, with a 180s soft deadline).
 - **Summarizer / researcher**: `gpt-5.4-mini` (low effort, deterministic). Migrated 2026-05-17 from gemini-3-flash-preview for consistency with OpenAI-based support stack and to dodge donated-key Google rate limits; bills to personal `OPENROUTER_API_KEY` until OpenAI data-policy block is lifted.
 - **Parser**: `gpt-5-mini` (low effort, deterministic).
 

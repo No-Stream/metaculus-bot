@@ -736,12 +736,12 @@ class TestStackingResearchAndMakePredictions:
 
         # Mock the necessary methods. _forecaster_with_soft_deadline is
         # stubbed so the coroutines created inline in _research_and_make_predictions
-        # don't leak as "never awaited" warnings when _gather_results_and_exceptions
+        # don't leak as "never awaited" warnings when _gather_predictions_with_wall_clock
         # (mocked below) never touches them.
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(bot, "_aggregate_predictions", return_value=0.7) as mock_aggregate,
             patch.object(
                 bot,
@@ -796,7 +796,7 @@ class TestStackingResearchAndMakePredictions:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -1015,7 +1015,7 @@ class TestStackingGuardsAndReasoning:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(bot, "_run_stacking", return_value=0.7),
             patch.object(
                 bot,

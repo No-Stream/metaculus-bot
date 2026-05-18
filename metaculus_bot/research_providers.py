@@ -335,9 +335,15 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
     if effort:
         kwargs["reasoning"] = {"effort": effort}
 
+    # `verbosity` is a top-level OpenRouter / litellm parameter (see litellm
+    # `acompletion(... verbosity=...)` and OpenAI gpt-5 transformation). Earlier
+    # we tucked it inside `extra_body`; that worked because OpenRouter merges
+    # the body, but the canonical form matches the docs and survives any future
+    # extra_body validation. GeneralLlm passes unknown kwargs through to
+    # litellm by default (`pass_through_unknown_kwargs=True`).
     verbosity = os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
     if verbosity:
-        kwargs["extra_body"] = {"verbosity": verbosity}
+        kwargs["verbosity"] = verbosity
 
     return GeneralLlm(**kwargs)
 

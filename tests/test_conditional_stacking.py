@@ -96,7 +96,7 @@ class TestConditionalStackingBinaryTrigger:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -162,7 +162,7 @@ class TestConditionalStackingBinaryTrigger:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -215,7 +215,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -263,7 +263,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -310,7 +310,7 @@ class TestConditionalStackingFallbacks:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -391,7 +391,7 @@ class TestConditionalStackingMC:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -442,7 +442,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -477,7 +477,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -518,7 +518,7 @@ class TestConditionalStackingThresholds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -588,7 +588,7 @@ class TestConditionalStackingNumeric:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -643,7 +643,7 @@ class TestConditionalStackingNumeric:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -680,7 +680,7 @@ class TestConditionalStackingAggregation:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -731,7 +731,7 @@ class TestConditionalStackingAggregation:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -779,7 +779,7 @@ class TestConditionalStackingBenchmarkingFlag:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -825,7 +825,7 @@ class TestConditionalStackingModelTagStripping:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -872,7 +872,7 @@ class TestConditionalStackingFailureCounters:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -910,7 +910,7 @@ class TestConditionalStackingFailureCounters:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -968,7 +968,7 @@ class TestConditionalStackingSixModelEnsemble:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_results_and_exceptions") as mock_gather,
+            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",

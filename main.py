@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
 
+from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryPrediction,
     BinaryQuestion,
@@ -56,6 +57,7 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
+    CRUX_SOFT_DEADLINE,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     FINANCIAL_DATA_ENABLED_ENV,
     FORECASTER_SOFT_DEADLINE,
@@ -66,12 +68,14 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    PER_QUESTION_WALL_CLOCK_DEADLINE,
     PLATT_BINARY_MAX_ABS_DEVIATION,
     PLATT_CALIBRATION_ENABLED_ENV,
     PLATT_MC_MAX_ABS_DEVIATION,
     PREDICTION_MARKETS_ENABLED_ENV,
     STACKER_FALLBACK_SOFT_DEADLINE,
     STACKER_SOFT_DEADLINE,
+    WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
 from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
@@ -743,6 +747,70 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return None
 
     # Override _research_and_make_predictions to support multiple LLMs
+    def _remaining_budget_seconds(self, start_time: float) -> float:
+        """Return remaining per-Q wall-clock budget in seconds (can go negative).
+
+        ``start_time`` is captured at the top of ``_research_and_make_predictions``
+        and represents this question's processing-start tick. Compared against
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` (58:30 of the 60-min Metaculus close
+        window).
+        """
+        return PER_QUESTION_WALL_CLOCK_DEADLINE - (time.time() - start_time)
+
+    async def _gather_predictions_with_wall_clock(
+        self,
+        coros: list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
+        qid_for_log: int,
+        per_q_start: float,
+    ) -> tuple[list[ReasonedPrediction[PredictionTypes]], list[str], ExceptionGroup | None]:
+        """Run forecaster coroutines concurrently with a wall-clock cap.
+
+        Differs from the parent ``_gather_results_and_exceptions`` in two ways:
+        - Pending tasks at deadline are cancelled (parent's ``asyncio.gather``
+          can't cancel mid-flight).
+        - Drops counter is bumped on cancellation so end-of-run alerting
+          surfaces the abort.
+
+        Mirrors ``_gather_results_and_exceptions`` return shape so callers
+        treat it identically. Tests can patch this method directly to inject
+        a synthetic prediction list without spinning up real tasks.
+        """
+        tasks = [asyncio.create_task(coro, name=f"forecaster:{idx}:q{qid_for_log}") for idx, coro in enumerate(coros)]
+        n_total = len(tasks)
+        remaining = self._remaining_budget_seconds(per_q_start)
+        wait_timeout = max(0.0, remaining)
+        done_set, pending_set = await asyncio.wait(tasks, timeout=wait_timeout, return_when=asyncio.ALL_COMPLETED)
+        if pending_set:
+            for pending in pending_set:
+                pending.cancel()
+            # Give cancelled tasks a chance to clean up so we don't leak warnings.
+            await asyncio.wait(pending_set, timeout=2.0)
+            self._forecasters_dropped_count += len(pending_set)
+            logger.warning(
+                "WALLCLOCK_ABORT: qid=%s elapsed=%.1fs forecasters_completed=%d/%d cancelled=%d remaining_budget=%.1fs",
+                qid_for_log,
+                time.time() - per_q_start,
+                len(done_set),
+                n_total,
+                len(pending_set),
+                remaining,
+            )
+
+        # Sort by task name (stable across runs) since asyncio.wait returns sets.
+        done_sorted = sorted(done_set, key=lambda t: t.get_name())
+        valid_predictions: list[ReasonedPrediction[PredictionTypes]] = []
+        errors: list[str] = []
+        exceptions: list[BaseException] = []
+        for task in done_sorted:
+            exc = task.exception()
+            if exc is None:
+                valid_predictions.append(cast(ReasonedPrediction[PredictionTypes], task.result()))
+            else:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                exceptions.append(exc)
+        exception_group: ExceptionGroup | None = ExceptionGroup(f"Errors: {errors}", exceptions) if exceptions else None
+        return valid_predictions, errors, exception_group
+
     async def _research_and_make_predictions(
         self,
         question: MetaculusQuestion,
@@ -752,6 +820,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             return await super()._research_and_make_predictions(question)
 
         assert question.id_of_question is not None, "id_of_question must not be None for stacking state-dict keying"
+
+        # Per-Q wall-clock cutoff: research, fan-out, aggregation, and publish
+        # all share the same budget. Recorded as early as possible so we don't
+        # overshoot from research-time alone.
+        per_q_start = time.time()
 
         notepad = await self._get_notepad(question)
         notepad.total_research_reports_attempted += 1
@@ -777,7 +850,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             valid_predictions,
             errors,
             exception_group,
-        ) = await self._gather_results_and_exceptions(tasks)
+        ) = await self._gather_predictions_with_wall_clock(tasks, qid_for_log, per_q_start)
         if errors:
             logger.warning(f"Encountered errors while predicting: {errors}")
 
@@ -796,8 +869,31 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if exception_group is not None:
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
+        # Stacking budget gate. If we've burned through the per-Q wall-clock
+        # budget (e.g. research stalled, fan-out used most of the budget),
+        # skip the stacker LLM entirely and force the MEDIAN fallback. The
+        # WALL_CLOCK_STACKING_MIN_BUDGET (90s) reserves time for publish
+        # hardening (4 POSTs * 20s timeout * (1 + 1 retry) worst case ≈ 160s
+        # but typical is sub-second; 90s is the cheap heuristic floor).
+        skip_stacking_for_budget = (
+            self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
+            and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
+        )
+        if skip_stacking_for_budget:
+            logger.warning(
+                "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing median fallback",
+                qid_for_log,
+                self._remaining_budget_seconds(per_q_start),
+                WALL_CLOCK_STACKING_MIN_BUDGET,
+            )
+            self._stacker_outcome[question.id_of_question] = "fallback_median"
+            # Register so parent's _aggregate_predictions (which will run with
+            # reasoned_predictions=None) takes the expected base-combine path
+            # and doesn't log "Unexpected STACKING combine".
+            self._register_expected_base_combine(question)
+
         # If using stacking, aggregate the predictions here
-        if self.aggregation_strategy == AggregationStrategy.STACKING:
+        if self.aggregation_strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
             if getattr(self, "research_reports_per_question", 1) != 1:
                 logger.warning(
                     "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
@@ -844,7 +940,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 errors=errors,
                 predictions=[aggregated_prediction],
             )
-        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
+        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
             prediction_values = [pred.prediction_value for pred in valid_predictions]
             spread = compute_spread(question, prediction_values)
             threshold = self._get_threshold_for_question(question)
@@ -863,14 +959,28 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 if self._analyzer_llm is None:
                     raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
-                # 1. Extract the crux of disagreement
+                # 1. Extract the crux of disagreement under a soft deadline.
+                # Without the wait_for the call's worst case is litellm timeout
+                # (300s) * allowed_tries (3) ≈ 15 min on the critical path; the
+                # CRUX_SOFT_DEADLINE caps that at 180s.
                 base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
                 try:
-                    crux = await extract_disagreement_crux(
-                        self._analyzer_llm,
-                        question.question_text,
-                        base_texts,
+                    crux = await asyncio.wait_for(
+                        extract_disagreement_crux(
+                            self._analyzer_llm,
+                            question.question_text,
+                            base_texts,
+                        ),
+                        timeout=CRUX_SOFT_DEADLINE,
                     )
+                except asyncio.TimeoutError:
+                    self._conditional_stacking_crux_failures += 1
+                    logger.warning(
+                        "CRUX_SOFT_DEADLINE: crux extraction exceeded %ds for Q %s; skipping targeted research",
+                        CRUX_SOFT_DEADLINE,
+                        question.id_of_question,
+                    )
+                    crux = ""
                 except Exception:
                     self._conditional_stacking_crux_failures += 1
                     logger.exception("Disagreement crux extraction failed, skipping targeted research")
@@ -961,13 +1071,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     predictions=valid_predictions,
                 )
 
-        else:
-            return ResearchWithPredictions(
-                research_report=research,
-                summary_report=summary_report,
-                errors=errors,
-                predictions=valid_predictions,
-            )
+        # Catch-all: non-stacking strategy, OR stacking strategy whose budget
+        # gate forced fallback_median above. In both cases we return the raw
+        # valid_predictions and let the parent class's per-Q aggregator combine
+        # them. For the skip case, _stacker_outcome was already set to
+        # "fallback_median" upstream so the comment-marker reflects reality.
+        return ResearchWithPredictions(
+            research_report=research,
+            summary_report=summary_report,
+            errors=errors,
+            predictions=valid_predictions,
+        )
 
     @classmethod
     def _format_and_expand_research_summary(

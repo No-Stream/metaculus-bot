@@ -43,9 +43,12 @@ async def test_native_search_provider_constructs_correct_model_name(
 
     assert captured_model == "openrouter/openai/gpt-5.5"
     # Default reasoning effort + verbosity should be plumbed through.
+    # `verbosity` is now top-level (canonical OpenRouter / litellm form);
+    # `extra_body` is no longer used to smuggle it.
     assert captured_kwargs is not None
     assert captured_kwargs.get("reasoning") == {"effort": "medium"}
-    assert captured_kwargs.get("extra_body") == {"verbosity": "low"}
+    assert captured_kwargs.get("verbosity") == "low"
+    assert "extra_body" not in captured_kwargs
 
 
 @pytest.mark.asyncio

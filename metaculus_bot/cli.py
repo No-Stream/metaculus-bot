@@ -23,6 +23,7 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
+from metaculus_bot.publish_hardening import apply_publish_hardening
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,11 @@ def main() -> None:
     litellm_logger = logging.getLogger("LiteLLM")
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
+
+    # Wrap MetaculusApi publish POSTs with timeout + retry. See
+    # metaculus_bot/publish_hardening.py for rationale (stock requests.post
+    # has no timeout; a single hung POST blocks the whole batch).
+    apply_publish_hardening()
 
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(

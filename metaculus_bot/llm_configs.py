@@ -151,11 +151,13 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
 
-# High-effort model for identifying the crux of model disagreement (feeds into targeted research).
-# Crux text becomes the targeted-search query, so quality drives downstream retrieval quality.
+# Medium-effort model for identifying the crux of model disagreement (feeds into targeted research).
+# Crux text becomes the targeted-search query, so quality drives downstream retrieval quality;
+# medium effort gives faster wall-clock for a structured 1-3 sentence extraction without
+# materially hurting quality, and matches the effort tier we settled on for native search.
 # Cost is ~$0.055/disagreement-Q × ~75 Qs/tournament = ~$4/tournament — negligible.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.5",
-    reasoning={"effort": "high"},
+    reasoning={"effort": "medium"},
     **DETERMINISTIC_MODEL_CONFIG,
 )

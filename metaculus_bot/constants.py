@@ -313,6 +313,24 @@ FORECASTER_SOFT_DEADLINE: int = 600
 # with 3/6 inputs; below that we're closer to a single-model opinion.
 MIN_FORECASTERS_TO_PUBLISH: int = 3
 
+# Per-question wall-clock cutoff (58:30 of the 60-min Metaculus close window).
+# At deadline, in-flight forecasters are cancelled; we base-combine whatever
+# completed (>=MIN_FORECASTERS_TO_PUBLISH) and submit. Remainder budget reserves
+# time for stacker-skip + publish (with 20s POST timeouts + 1 retry).
+PER_QUESTION_WALL_CLOCK_DEADLINE: int = 3510
+
+# Below this remaining-budget threshold, skip stacking and force fallback_median
+# aggregation. Reserves enough time for publish hardening (20s POST timeout + 1
+# retry across two POSTs = 80s worst case) plus headroom.
+WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
+
+# Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).
+# Stock forecasting-tools uses synchronous `requests.post` with no timeout, so
+# a hung server can block the whole batch indefinitely. We wrap each POST in
+# asyncio.to_thread + asyncio.wait_for and retry once on timeout.
+PUBLISH_POST_TIMEOUT: int = 20
+PUBLISH_POST_RETRIES: int = 1
+
 # Stacker soft deadline. Set slightly above the stacker LLM's litellm timeout
 # (480s) so the model's own timeout fires first with a clean exception when
 # possible; this wait_for is a final belt-and-suspenders backstop for a wholly
@@ -322,6 +340,11 @@ STACKER_SOFT_DEADLINE: int = 500
 # Stacker fallback model soft deadline. Tighter because we're already running
 # late on the critical path by the time the fallback fires.
 STACKER_FALLBACK_SOFT_DEADLINE: int = 300
+
+# Per-question soft deadline for the disagreement-crux extractor (gpt-5.5 medium effort).
+# Caps the unbounded worst case on the conditional-stacking critical path: without
+# this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
+CRUX_SOFT_DEADLINE: int = 180
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60
