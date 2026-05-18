@@ -24,6 +24,7 @@ These tests pin five behaviors:
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from unittest.mock import MagicMock, Mock, patch
 
@@ -51,6 +52,9 @@ from metaculus_bot.calibration import (
     apply_mc_platt,
 )
 from metaculus_bot.constants import (
+    BINARY_PROB_MIN,
+    MC_PROB_MAX,
+    MC_PROB_MIN,
     PLATT_BINARY_MAX_ABS_DEVIATION,
     PLATT_MC_MAX_ABS_DEVIATION,
 )
@@ -120,12 +124,12 @@ def _make_binary_question(qid: int = 12345) -> MagicMock:
     return q
 
 
-def _make_mc_question(qid: int = 22222) -> MagicMock:
+def _make_mc_question(qid: int = 22222, n_options: int = 4) -> MagicMock:
     q = MagicMock(spec=MultipleChoiceQuestion)
     q.id_of_question = qid
     q.question_text = "Which option occurs?"
     q.page_url = f"https://metaculus.com/questions/{qid}/"
-    q.options = ["A", "B", "C", "D"]
+    q.options = [f"opt_{i}" for i in range(n_options)] if n_options > 4 else ["A", "B", "C", "D"][:n_options]
     q.background_info = "bg"
     q.resolution_criteria = "rc"
     q.fine_print = ""
@@ -140,7 +144,7 @@ def _make_mc_pred(probs: list[float], names: list[str] | None = None) -> Predict
     deep copy.
     """
     if names is None:
-        names = ["A", "B", "C", "D"][: len(probs)]
+        names = ["A", "B", "C", "D"][: len(probs)] if len(probs) <= 4 else [f"opt_{i}" for i in range(len(probs))]
     if len(names) != len(probs):
         raise ValueError("names/probs length mismatch")
     return PredictedOptionList(
@@ -291,6 +295,87 @@ async def test_calibration_on_nonidentity_applies_mc(monkeypatch: pytest.MonkeyP
     raw_probs = {o.option_name: o.probability for o in raw_combined.predicted_options}
     assert any(abs(result_probs[n] - raw_probs[n]) > 1e-9 for n in result_probs), (
         "non-identity MC params should change at least one option probability."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4b. Many-option MC, low-prob options can fall below BINARY_PROB_MIN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mc_many_options_can_fall_below_binary_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: MC calibration must not inherit the binary 0.02 floor.
+
+    Builds a 10-option question with three options below the binary floor
+    (0.005, 0.010, 0.015). The pre-fix path routed every option through
+    ``apply_binary_platt``, which clamped each to >= 0.02 BEFORE MC
+    renormalization — making the effective MC floor 0.02 instead of the
+    documented 0.005, and inflating tiny options 4-10x. The fix routes
+    options through the bound-free Platt helper and lets
+    ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.005, 0.995]``
+    bounds at the tail.
+
+    Reference is hand-computed (Platt math + MC-bounds clamp + renormalize)
+    rather than calling ``apply_mc_platt`` itself, to avoid circularity.
+    """
+    monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
+    params = PlattParams(bias=0.0, slope=1.2)
+    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+    # Keep the cap loose so the per-option Platt math, not the cap, is what
+    # produces sub-0.02 outputs. The shipping cap is small enough that it
+    # would otherwise pin tiny options to within 0.02-ish of their input.
+    # 1.0 is loose enough that the cap never binds for any p in [0, 1].
+    loose_cap = 1.0
+    monkeypatch.setattr(main, "PLATT_MC_MAX_ABS_DEVIATION", loose_cap)
+
+    bot = _make_median_bot()
+    question = _make_mc_question(n_options=10)
+
+    # Three options below the binary floor + seven absorbing the rest.
+    small = [0.005, 0.010, 0.015]  # sums to 0.030
+    large = [0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.07]  # sums to 0.97
+    raw = small + large
+    assert sum(raw) == pytest.approx(1.0, abs=1e-12)
+    names = [f"opt_{i}" for i in range(len(raw))]
+
+    pred_a = _make_mc_pred(raw, names=names)
+    pred_b = _make_mc_pred(raw, names=names)
+
+    # Reference: combine MEDIAN (identical inputs → equals raw), then apply
+    # Platt math by hand, apply the loose cap (no-op for p in [0, 1]), then
+    # clamp to MC bounds and renormalize. Hand-rolled rather than calling
+    # apply_mc_platt to avoid circularity with the code under test.
+    combined = combine_multiple_choice_predictions([deepcopy(pred_a), deepcopy(pred_b)], AggregationStrategy.MEDIAN)
+    raw_combined = [o.probability for o in combined.predicted_options]
+    per_option_unclipped = [
+        1.0 / (1.0 + math.exp(-(params.bias + params.slope * math.log(p / (1.0 - p))))) for p in raw_combined
+    ]
+    per_option = [max(p - loose_cap, min(p + loose_cap, q)) for p, q in zip(raw_combined, per_option_unclipped)]
+    clamped = [max(MC_PROB_MIN, min(MC_PROB_MAX, q)) for q in per_option]
+    total = sum(clamped)
+    expected_probs = {n: q / total for n, q in zip(names, clamped)}
+
+    result = await bot._aggregate_predictions([pred_a, pred_b], question)
+
+    assert isinstance(result, PredictedOptionList)
+    result_probs = {o.option_name: o.probability for o in result.predicted_options}
+
+    for name, exp in expected_probs.items():
+        assert result_probs[name] == pytest.approx(exp, abs=1e-9), (
+            f"option {name!r}: got {result_probs[name]!r}, expected {exp!r}"
+        )
+    assert sum(result_probs.values()) == pytest.approx(1.0, abs=1e-9)
+
+    # Load-bearing regression assertion: at least one of the three small-input
+    # options must end up below the binary floor (0.02). If the binary clamp
+    # leaks into the MC path, every option gets pinned at >= 0.02 and this
+    # fires.
+    low_probs = [result_probs[names[i]] for i in range(3)]
+    assert any(p < BINARY_PROB_MIN for p in low_probs), (
+        f"At least one small-input option should fall below the binary floor "
+        f"({BINARY_PROB_MIN}); got {low_probs!r}. If this fails, the binary "
+        f"clamp leaked into the MC path."
     )
 
 

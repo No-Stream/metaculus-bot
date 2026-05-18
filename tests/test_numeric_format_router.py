@@ -406,3 +406,54 @@ class TestRouteNumericOutput:
         assert result.mixture is None
         assert result.declared_percentiles is not None
         assert len(result.declared_percentiles) == 3
+
+    def test_f5_fallback_with_11_percentiles_drives_full_pipeline(self) -> None:
+        # F22 (b)/(c): F5 fallback path uses unsanitized percentiles from the
+        # structured block. Verify that when the JSON block carries the full
+        # 11 standard percentiles, the downstream pipeline (sanitize_percentiles
+        # + build_numeric_distribution) still succeeds end-to-end. Earlier the
+        # test only checked router output; this test extends coverage to the
+        # full numeric pipeline that main.py runs after the router returns.
+        eleven_percentiles = {
+            "0.025": 5.0,
+            "0.05": 8.0,
+            "0.10": 12.0,
+            "0.20": 20.0,
+            "0.40": 35.0,
+            "0.50": 50.0,
+            "0.60": 60.0,
+            "0.80": 75.0,
+            "0.90": 85.0,
+            "0.95": 92.0,
+            "0.975": 96.0,
+        }
+        payload: dict[str, Any] = {
+            "question_type": "numeric",
+            "declared_percentiles": eleven_percentiles,
+            "distribution_family_hint": "normal",
+        }
+        rationale = _wrap_json_block(payload)
+        question = _make_numeric_question()
+
+        result = route_numeric_output(
+            rationale=rationale,
+            declared_percentiles=None,
+            question=question,
+        )
+
+        assert result.format == "percentiles"
+        assert result.mixture is None
+        assert result.declared_percentiles is not None
+        assert len(result.declared_percentiles) == 11
+
+        # Drive the downstream pipeline that main.py runs on the percentile
+        # branch. Both calls must succeed without raising.
+        from metaculus_bot.numeric_pipeline import (
+            build_numeric_distribution,
+            sanitize_percentiles,
+        )
+
+        sanitized, zero_point = sanitize_percentiles(result.declared_percentiles, question)
+        prediction = build_numeric_distribution(sanitized, question, zero_point)
+        assert prediction is not None
+        assert len(prediction.declared_percentiles) >= 11

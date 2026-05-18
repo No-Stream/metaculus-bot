@@ -7,8 +7,10 @@ assumptions, etc.) and return ground-truth probability math: Beta-binomial
 posteriors, survival probabilities, pooled probabilities, fitted
 distributions, out-of-bounds mass, consistency flags.
 
-Dormant surface — imported by ``metaculus_bot.tool_runner`` but not wired
-into prompts or the runtime pipeline yet.
+Active surface, gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and
+per-question-type via ``PROBABILISTIC_TOOLS_TYPES``. See
+``metaculus_bot/tool_runner.py`` for dispatch and
+``main.py:_make_prediction`` for the activation site.
 
 Error conventions
 -----------------

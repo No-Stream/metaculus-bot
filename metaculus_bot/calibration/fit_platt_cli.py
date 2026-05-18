@@ -319,7 +319,7 @@ def _try_plot(
         return "No fits ran; skipping calibration plot."
 
     try:
-        import matplotlib
+        import matplotlib  # noqa: BLE001  # matplotlib genuinely optional for CLI plotting; CLI works without it
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt

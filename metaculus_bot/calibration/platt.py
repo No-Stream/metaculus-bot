@@ -142,6 +142,49 @@ def fit_platt(
     return PlattParams(bias=bias_hat, slope=slope_hat)
 
 
+def _apply_platt_transform(
+    p_raw: float,
+    params: PlattParams,
+    *,
+    max_abs_deviation: float | None = None,
+) -> float:
+    """Apply Platt math + optional absolute-deviation cap, no probability-bound clamp.
+
+    Internal helper. Callers must apply the appropriate output bounds
+    themselves (binary uses ``[BINARY_PROB_MIN, BINARY_PROB_MAX]``; MC uses
+    ``[MC_PROB_MIN, MC_PROB_MAX]`` via ``clamp_and_renormalize_mc``). Keeping
+    the bound-clamp out of this helper is what lets the MC path ship option
+    probabilities below ``BINARY_PROB_MIN``, which is correct on
+    many-option questions where individual options legitimately sit below
+    the binary floor.
+
+    Pipeline:
+
+    1. ``z = bias + slope * logit(p_raw)`` then ``p_adj = sigmoid(z)``.
+    2. If ``max_abs_deviation`` is set, clip ``p_adj`` to within
+       ``[p_raw - max_abs_deviation, p_raw + max_abs_deviation]``.
+    """
+    if not math.isfinite(p_raw):
+        raise ValueError(f"p_raw must be finite; got {p_raw!r}")
+
+    if max_abs_deviation is not None and not (max_abs_deviation >= 0.0):
+        raise ValueError(f"max_abs_deviation must be a finite non-negative number; got {max_abs_deviation!r}")
+
+    if params.is_identity() and max_abs_deviation is None:
+        return p_raw
+
+    p_clamped = clamp_prob(p_raw)
+    z = params.bias + params.slope * logit(p_clamped)
+    p_adj = sigmoid(z)
+
+    if max_abs_deviation is not None:
+        lower = p_raw - max_abs_deviation
+        upper = p_raw + max_abs_deviation
+        p_adj = max(lower, min(upper, p_adj))
+
+    return p_adj
+
+
 def apply_binary_platt(
     p_raw: float,
     params: PlattParams,
@@ -161,23 +204,7 @@ def apply_binary_platt(
     Identity params are a fast no-op (still goes through the binary clamp at
     the tail, matching every other binary code path in the bot).
     """
-    if not math.isfinite(p_raw):
-        raise ValueError(f"p_raw must be finite; got {p_raw!r}")
-
-    if params.is_identity() and max_abs_deviation is None:
-        return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, p_raw))
-
-    p_clamped = clamp_prob(p_raw)
-    z = params.bias + params.slope * logit(p_clamped)
-    p_adj = sigmoid(z)
-
-    if max_abs_deviation is not None:
-        if not (max_abs_deviation >= 0.0):
-            raise ValueError(f"max_abs_deviation must be a finite non-negative number; got {max_abs_deviation!r}")
-        lower = p_raw - max_abs_deviation
-        upper = p_raw + max_abs_deviation
-        p_adj = max(lower, min(upper, p_adj))
-
+    p_adj = _apply_platt_transform(p_raw, params, max_abs_deviation=max_abs_deviation)
     return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, p_adj))
 
 
@@ -190,9 +217,12 @@ def apply_mc_platt(
     """Apply a Platt recalibration to each MC option, then renormalize.
 
     The same single fitted curve is applied to each option's probability
-    via the binary helper (one-vs-rest decomposition matching the article).
-    After the per-option transforms, ``clamp_and_renormalize_mc`` enforces
-    ``[MC_PROB_MIN, MC_PROB_MAX]`` and rescales to sum to 1.
+    (one-vs-rest decomposition matching the article). The per-option
+    transform runs WITHOUT the binary ``[BINARY_PROB_MIN, BINARY_PROB_MAX]``
+    clamp — that floor (0.02) is too aggressive for many-option questions,
+    where options legitimately sit below it. After the per-option transforms,
+    ``clamp_and_renormalize_mc`` enforces the MC-correct bounds
+    ``[MC_PROB_MIN, MC_PROB_MAX]`` (0.005 / 0.995) and rescales to sum to 1.
 
     Returns the same ``PredictedOptionList`` for convenience (option
     probabilities are mutated in place, mirroring ``clamp_and_renormalize_mc``).
@@ -201,7 +231,7 @@ def apply_mc_platt(
         return clamp_and_renormalize_mc(predicted_option_list)
 
     for option in predicted_option_list.predicted_options:
-        option.probability = apply_binary_platt(
+        option.probability = _apply_platt_transform(
             float(option.probability),
             params,
             max_abs_deviation=max_abs_deviation,

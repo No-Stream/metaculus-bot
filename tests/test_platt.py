@@ -195,6 +195,59 @@ class TestApplyMCPlatt:
         total = sum(o.probability for o in result.predicted_options)
         assert total == pytest.approx(1.0, abs=1e-9)
 
+    def test_low_prob_options_can_fall_below_binary_floor(self):
+        """Regression: many-option MC must not inherit the BINARY_PROB_MIN floor.
+
+        With 10 options and several below the 0.02 binary floor, the older
+        implementation (which routed every option through ``apply_binary_platt``)
+        clamped each to >= 0.02 BEFORE MC renormalization. That broke
+        many-option questions: the effective MC floor became 0.02, not 0.005,
+        and any low-probability option got artificially inflated.
+
+        The fix routes options through the bound-free Platt helper and lets
+        ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.005, 0.995]``
+        bounds. Reference is built by hand: apply Platt math + cap directly,
+        then clamp to MC bounds, then renormalize. (Comparing against
+        ``apply_mc_platt`` would be circular.)
+        """
+        params = PlattParams(bias=0.0, slope=1.2)
+        # 10 options: three below the 0.02 binary floor, seven that absorb the rest.
+        # Sum is exactly 1.0 before calibration.
+        small = [0.005, 0.010, 0.015]  # sum 0.030
+        large = [0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.07]  # sum 0.97
+        raw = small + large
+        assert sum(raw) == pytest.approx(1.0, abs=1e-12)
+        names = [f"opt_{i}" for i in range(len(raw))]
+        opts = self._make_options(list(zip(names, raw)))
+
+        result = apply_mc_platt(opts, params)
+
+        # Reference: the math the implementation should be doing.
+        per_option = [_sigmoid(params.bias + params.slope * _logit(p)) for p in raw]
+        clamped = [max(MC_PROB_MIN, min(MC_PROB_MAX, q)) for q in per_option]
+        total = sum(clamped)
+        expected = [q / total for q in clamped]
+
+        for option, exp in zip(result.predicted_options, expected):
+            assert option.probability == pytest.approx(exp, abs=1e-9)
+
+        # Sum-to-one invariant.
+        assert sum(o.probability for o in result.predicted_options) == pytest.approx(1.0, abs=1e-9)
+
+        # Load-bearing regression assertion: at least one option must end up
+        # below the BINARY floor (0.02). With slope=1.2 the small-end options
+        # get pushed even lower (logit-space stretching), so the post-Platt
+        # raw probabilities for the three small inputs land well below 0.02 —
+        # renormalization barely lifts them because the large options also
+        # shrink slightly. If the binary floor were re-applied, all three
+        # would be pinned at >= 0.02 / sum_after_clamp instead.
+        low_probs = [o.probability for o in result.predicted_options[:3]]
+        assert any(p < BINARY_PROB_MIN for p in low_probs), (
+            f"At least one of the three small-input options should be below the binary floor "
+            f"({BINARY_PROB_MIN}); got {low_probs!r}. If this fails, the binary clamp leaked "
+            f"into the MC path."
+        )
+
 
 class TestFitPlatt:
     def test_length_mismatch_raises(self):

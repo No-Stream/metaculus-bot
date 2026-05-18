@@ -4,7 +4,7 @@ import os
 import random
 import time
 from collections import defaultdict
-from typing import Any, Coroutine, Sequence, cast
+from typing import Any, Coroutine, Literal, Sequence, cast
 
 from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
@@ -1155,18 +1155,27 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 raise ValueError(f"Unknown stacker outcome {other!r}")
 
         # Probabilistic-tools marker rides alongside the STACKER_OUTCOME + STACKED markers so
-        # residual analysis can bucket tool-augmented vs vanilla stacking runs.
+        # residual analysis can bucket tool-augmented vs vanilla stacking runs. Marker reflects
+        # actual per-type dispatch (PROBABILISTIC_TOOLS_TYPES allow-list), not just the global
+        # flag — otherwise a numeric question with TYPES="binary,multiple_choice" would emit
+        # TOOLS_USED=true even though no tool fired (F21).
         from metaculus_bot.comment_markers import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             TOOLS_USED_MARKER_FALSE,
             TOOLS_USED_MARKER_TRUE,
         )
         from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            FEATURE_FLAG_ENV as _PROBABILISTIC_TOOLS_ENABLED_ENV,
+            _feature_enabled as _tool_runner_feature_enabled,
         )
 
-        tools_marker = (
-            TOOLS_USED_MARKER_TRUE if env_flag_enabled(_PROBABILISTIC_TOOLS_ENABLED_ENV) else TOOLS_USED_MARKER_FALSE
-        )
+        if isinstance(question, BinaryQuestion):
+            qtype: Literal["binary", "numeric", "multiple_choice"] | None = "binary"
+        elif isinstance(question, NumericQuestion):
+            qtype = "numeric"
+        elif isinstance(question, MultipleChoiceQuestion):
+            qtype = "multiple_choice"
+        else:
+            qtype = None
+        tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE
         # Append (not prepend): ForecastReport.explanation.strip() must start with '#'.
         # STACKER_OUTCOME + STACKED both emitted for one round of back-compat with parsers reading STACKED=.
         return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}\n")
@@ -1785,10 +1794,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # Mixture branch: percentiles_to_metaculus_cdf_via_mixture already
             # produced a constraint-enforced 201-point CDF. Wrap as a
             # PchipNumericDistribution so .cdf returns the pre-computed values
-            # rather than re-deriving from declared_percentiles. The
-            # unit-mismatch guard, discrete-integer snap, and ensemble
-            # aggregation downstream operate on the final CDF and apply
-            # uniformly to both branches.
+            # rather than re-deriving from declared_percentiles.
+            #
+            # detect_unit_mismatch is intentionally NOT called on this branch.
+            # The heuristic checks declared-percentile spread against the
+            # question's bound range; mixture_declared (synthesized below) is
+            # built by walking the mixture CDF for each STANDARD_PERCENTILE,
+            # so its values always span [lower, upper] and the heuristic can
+            # never fire. The percentile branch below still runs the guard
+            # because raw LLM-declared percentiles can plausibly land in the
+            # wrong unit.
             from metaculus_bot.pchip_processing import (
                 create_pchip_numeric_distribution,  # noqa: PLC0415  # function-scoped: see AGENTS.md
             )

@@ -22,6 +22,7 @@ import pytest
 from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.performance_analysis.parsing import (
     _iter_per_model_blocks,
+    _parse_probability,
     annotate_forecaster_bullets_with_models,
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
@@ -966,3 +967,282 @@ class TestIterPerModelBlocks:
         assert "stacker meta prose" in blocks[0][1]
         assert blocks[1][0] == "gpt-5.5"
         assert blocks[2][0] == "claude-opus-4.7"
+
+
+# ---------------------------------------------------------------------------
+# F10 — _FORECASTER_RE must only match summary-section bullets, not stray
+# ``*Forecaster N*: value`` strings appearing inside reasoning prose. Without
+# this, an LLM that quotes a forecaster's value back ("...*Forecaster 3*: 50%
+# would have been wrong") gets parsed as if it were a real bullet, contaminating
+# rank/disagreement metrics.
+# ---------------------------------------------------------------------------
+
+
+class TestForecasterReBoundedToSummarySection:
+    def test_stray_forecaster_pattern_in_reasoning_not_parsed(self):
+        # A bullet-shaped string appearing INSIDE Forecaster 1's reasoning must
+        # NOT be picked up as a real summary bullet. Only the bullets in
+        # ``## Report 1 Summary`` count.
+        comment = _build_comment(
+            bullets=[(1, "73.0%"), (2, "75.0%")],
+            rationales=[
+                (1, "openrouter/openai/gpt-5.5"),
+                (2, "openrouter/anthropic/claude-opus-4.7"),
+            ],
+        )
+        # Inject a stray "bullet" inside the rationale prose - this should be
+        # ignored. Without anchoring this becomes a third forecaster.
+        comment = comment.replace(
+            "reasoning text here.",
+            "reasoning text here. Note: *Forecaster 99*: 12.0% would have been wrong.",
+            1,
+        )
+        result = parse_per_model_forecasts(comment)
+        # Only the two real summary bullets — not "Forecaster 99".
+        assert set(result.keys()) == {"gpt-5.5", "claude-opus-4.7"}
+        assert "Forecaster 99" not in result
+
+    def test_real_summary_bullets_still_parsed(self):
+        # Belt-and-suspenders: confirm anchoring doesn't break the normal path.
+        comment = _build_comment(
+            bullets=[(1, "73.0%"), (2, "75.0%"), (3, "80.0%")],
+            rationales=[
+                (1, "openrouter/openai/gpt-5.5"),
+                (2, "openrouter/anthropic/claude-opus-4.7"),
+                (3, "openrouter/google/gemini-3.1-pro-preview"),
+            ],
+        )
+        result = parse_per_model_forecasts(comment)
+        assert result == {"gpt-5.5": "73.0%", "claude-opus-4.7": "75.0%", "gemini-3.1-pro-preview": "80.0%"}
+
+    def test_no_summary_marker_falls_back_with_warning(self, caplog):
+        # When the comment has no ``### Research Summary`` marker (truncated /
+        # malformed), the parser must still be able to read summary bullets if
+        # they exist BEFORE any stray reasoning text — and emit a warning so
+        # operators notice. We accept the legacy unanchored behavior in this
+        # path because there's no clean section to bound to.
+        import logging
+
+        comment = "*Forecaster 1*: 73.0%\n*Forecaster 2*: 75.0%\n"
+        with caplog.at_level(logging.WARNING):
+            result = parse_per_model_forecasts(comment)
+        assert result == {"Forecaster 1": "73.0%", "Forecaster 2": "75.0%"}
+
+    def test_bullets_in_research_summary_section_still_excluded(self):
+        # Edge case: research prose between ``### Research Summary`` and the
+        # rationale section sometimes quotes forecaster-shaped strings. The
+        # cleanest split is on the section-end marker (Research Summary or the
+        # forecast section divider).
+        comment = _build_comment(
+            bullets=[(1, "73.0%")],
+            rationales=[(1, "openrouter/openai/gpt-5.5")],
+        )
+        # Inject a stray bullet shape inside the research summary section.
+        comment = comment.replace(
+            "Some research text.",
+            "Some research text.\nQuote: *Forecaster 99*: 99% (this is a quote, not a bullet).",
+        )
+        result = parse_per_model_forecasts(comment)
+        assert "Forecaster 99" not in result
+        assert result == {"gpt-5.5": "73.0%"}
+
+
+# ---------------------------------------------------------------------------
+# F11 — _parse_probability must reject implausible values that would be silent
+# parse errors. Currently ``"1.5"`` becomes 0.015 (almost certainly wrong),
+# which silently enters Brier/spread calcs. Tighten the heuristic so:
+#   - Explicit "%" → divide by 100 always
+#   - Bare value in [0, 1] → leave alone
+#   - Bare value in [1.5, 100] → treat as percentage, divide by 100
+#   - Bare value in (1, 1.5) → ambiguous, reject (None) - was a probability
+#     >1.0 (impossible) but too small to be a reasonable percentage
+#   - Bare value > 100 → reject (None)
+# ---------------------------------------------------------------------------
+
+
+class TestParseProbabilityHeuristic:
+    def test_decimal_probability_unchanged(self):
+        assert _parse_probability("0.72") == pytest.approx(0.72)
+
+    def test_explicit_percentage(self):
+        assert _parse_probability("72.0%") == pytest.approx(0.72)
+
+    def test_explicit_percentage_with_value_below_1_5_still_works(self):
+        # ``"1.0%"`` is unambiguously 1% because of the explicit % sign.
+        assert _parse_probability("1.0%") == pytest.approx(0.01)
+
+    def test_bare_value_above_threshold_treated_as_percentage(self):
+        # ``"72"`` (no %) is almost certainly the bot's missing-% form.
+        assert _parse_probability("72") == pytest.approx(0.72)
+
+    def test_bare_value_at_threshold_lower_bound(self):
+        # The lower bound for "treat as percentage" — 1.5 is unambiguous.
+        assert _parse_probability("1.5") == pytest.approx(0.015)
+
+    def test_bare_value_in_ambiguous_range_rejected(self):
+        # ``"1.2"`` (no %) is ambiguous: too high to be a valid probability,
+        # too low to confidently be a percentage. Reject as parse error.
+        assert _parse_probability("1.2") is None
+
+    def test_bare_value_just_above_one_rejected(self):
+        # ``"1.01"`` shouldn't silently become 0.0101 — that's almost certainly
+        # a parse error (a real bullet would be 0.01 or 1%).
+        assert _parse_probability("1.01") is None
+
+    def test_bare_value_above_one_hundred_rejected(self):
+        # ``"150"`` could be a percentage (impossible) or some other quantity.
+        # Either way, not a valid probability.
+        assert _parse_probability("150") is None
+
+    def test_negative_value_rejected(self):
+        assert _parse_probability("-0.5") is None
+
+    def test_unparseable_string_returns_none(self):
+        assert _parse_probability("not a number") is None
+        assert _parse_probability("") is None
+
+    def test_zero_and_one_boundaries_accepted(self):
+        assert _parse_probability("0") == pytest.approx(0.0)
+        assert _parse_probability("0.0") == pytest.approx(0.0)
+        assert _parse_probability("1") == pytest.approx(1.0)
+        assert _parse_probability("1.0") == pytest.approx(1.0)
+
+    def test_one_hundred_percent_accepted(self):
+        assert _parse_probability("100%") == pytest.approx(1.0)
+        assert _parse_probability("100") == pytest.approx(1.0)
+
+    def test_zero_percent_accepted(self):
+        # 0% explicit is a real corner: divide by 100 still yields 0.
+        assert _parse_probability("0%") == pytest.approx(0.0)
+
+    def test_warning_emitted_when_skipping_ambiguous(self, caplog):
+        # WARNING-level log when we drop an out-of-range value — operators
+        # should be able to grep for these to spot upstream parse drift.
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            assert _parse_probability("1.2") is None
+        # We don't strictly require a specific message format, just that
+        # something was logged at WARNING when we dropped a parseable but
+        # implausible value.
+        assert any("1.2" in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# F12 — fall-aib-2025 fixture: the binary Platt fit was unstable between
+# fall-aib-2025 and spring-aib-2026 (slope drift > 0.3). The Platt plan
+# documented an >=80% parse-rate stability gate. Lock in the parser's
+# performance on a representative fall-aib-2025 comment so we catch any
+# regression that would silently invalidate the fit.
+# ---------------------------------------------------------------------------
+
+
+# Synthesized from a real fall-aib-2025 binary comment shape (post 41137-era):
+# 6-model ensemble with the older roster (gpt-5.1, o3, claude-sonnet-4.5,
+# grok-4.1-fast, qwen3-235b-a22b-thinking-2507, kimi-k2-0905). Structurally
+# identical to a current-vintage comment, just with different model paths
+# and slightly older summary header content.
+FALL_AIB_2025_FIXTURE = """# SUMMARY
+*Question*: Will a sixth contentious case be opened at the International Court of Justice in 2025?
+*Final Prediction*: 21.0%
+*Total Cost*: $0.0775
+*Time Spent*: 8.64 minutes
+
+
+## Report 1 Summary
+### Forecasts
+*Forecaster 1*: 25.0%
+*Forecaster 2*: 33.0%
+*Forecaster 3*: 22.0%
+*Forecaster 4*: 10.0%
+*Forecaster 5*: 20.0%
+*Forecaster 6*: 10.0%
+
+
+### Research Summary
+Brief research summary covering recent ICJ news.
+
+================================================================================
+FORECAST SECTION:
+
+## R1: Forecaster 1 Reasoning
+Model: openrouter/openai/gpt-5.1
+
+Analysis text. Final probability: 25%
+
+## R1: Forecaster 2 Reasoning
+Model: openrouter/openai/o3
+
+Analysis text. Final probability: 33%
+
+## R1: Forecaster 3 Reasoning
+Model: openrouter/anthropic/claude-sonnet-4.5
+
+Analysis text. Final probability: 22%
+
+## R1: Forecaster 4 Reasoning
+Model: openrouter/x-ai/grok-4.1-fast
+
+Analysis text. Final probability: 10%
+
+## R1: Forecaster 5 Reasoning
+Model: openrouter/qwen/qwen3-235b-a22b-thinking-2507
+
+Analysis text. Final probability: 20%
+
+## R1: Forecaster 6 Reasoning
+Model: openrouter/moonshotai/kimi-k2-0905
+
+Analysis text. Final probability: 10%
+
+<!-- STACKED=false -->
+"""
+
+
+class TestFallAib2025Fixture:
+    def test_parse_rate_meets_eighty_percent_threshold(self):
+        # All 6 bullets must resolve to NAMED model keys (no anonymized
+        # ``Forecaster N`` placeholders). Parse rate = 6/6 = 100%, well
+        # above the 80% gate.
+        result = parse_per_model_forecasts(FALL_AIB_2025_FIXTURE)
+        named_keys = [k for k in result if not k.startswith("Forecaster ")]
+        total = len(result)
+        assert total == 6, f"Expected 6 bullets, parsed {total}"
+        parse_rate = len(named_keys) / total
+        assert parse_rate >= 0.80, f"Parse rate {parse_rate:.0%} below 80% gate"
+
+    def test_old_roster_model_names_extracted(self):
+        # Specific check: the older roster names must come through cleanly.
+        result = parse_per_model_forecasts(FALL_AIB_2025_FIXTURE)
+        expected_models = {
+            "gpt-5.1",
+            "o3",
+            "claude-sonnet-4.5",
+            "grok-4.1-fast",
+            "qwen3-235b-a22b-thinking-2507",
+            "kimi-k2-0905",
+        }
+        assert set(result.keys()) == expected_models
+
+    def test_values_attributed_correctly(self):
+        result = parse_per_model_forecasts(FALL_AIB_2025_FIXTURE)
+        assert result["gpt-5.1"] == "25.0%"
+        assert result["o3"] == "33.0%"
+        assert result["claude-sonnet-4.5"] == "22.0%"
+        assert result["grok-4.1-fast"] == "10.0%"
+        assert result["qwen3-235b-a22b-thinking-2507"] == "20.0%"
+        assert result["kimi-k2-0905"] == "10.0%"
+
+    def test_probabilities_parse_to_valid_range(self):
+        # The full Platt fit pipeline runs _parse_probability on each value;
+        # confirm none of them get dropped by the F11 heuristic tightening.
+        result = parse_per_model_forecasts(FALL_AIB_2025_FIXTURE)
+        parsed = {k: _parse_probability(v) for k, v in result.items()}
+        for model, prob in parsed.items():
+            assert prob is not None, f"{model} dropped by parser"
+            assert 0.0 <= prob <= 1.0
+
+    def test_legacy_stacked_marker_parsed(self):
+        # Fall-aib-2025 comments use the legacy STACKED= marker. Confirm
+        # the marker reader still picks it up.
+        assert parse_stacked_marker(FALL_AIB_2025_FIXTURE) is False

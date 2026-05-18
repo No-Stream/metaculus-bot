@@ -55,6 +55,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.research_providers import ResearchCallable
 
 logger = logging.getLogger(__name__)
@@ -62,12 +63,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------------
-
-# Keyword-extraction model (per G0 finding: gpt-5-mini reasoning=low).
-KEYWORD_EXTRACT_MODEL = "openrouter/openai/gpt-5-mini"
-# G0 token-budget trap: gpt-5-mini burns 128-512 tokens on invisible reasoning.
-# 800 provides headroom so the visible response fits inside the budget.
-KEYWORD_EXTRACT_MAX_TOKENS = 800
 
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 MANIFOLD_SEARCH_URL = "https://api.manifold.markets/v0/search-markets"
@@ -261,13 +256,7 @@ class KeywordExtractor:
         # Constructor errors are config bugs (bad model slug, missing API key wiring,
         # etc.) and should crash loudly. Only the .invoke call is expected to face
         # transient LLM errors -- those soft-fall to "" so the snapshot still runs.
-        llm = build_llm_with_openrouter_fallback(
-            model=KEYWORD_EXTRACT_MODEL,
-            temperature=0.0,
-            max_tokens=KEYWORD_EXTRACT_MAX_TOKENS,
-            reasoning_effort="low",
-            timeout=60,
-        )
+        llm = build_llm_with_openrouter_fallback(**PREDICTION_MARKET_KEYWORD_LLM_CONFIG)
         try:
             content = await llm.invoke(prompt)
         except (litellm.exceptions.APIError, asyncio.TimeoutError, RuntimeError):
@@ -292,6 +281,28 @@ class KeywordExtractor:
 # ---------------------------------------------------------------------------
 # HTTP helper (shared by Polymarket and Manifold)
 # ---------------------------------------------------------------------------
+
+
+async def _read_json_capped(resp: Any, label: str) -> Any | None:
+    """Parse a response body as JSON, capping the read at MAX_RESPONSE_BYTES.
+
+    Real aiohttp exposes `.content.read(n)` which short-circuits the body;
+    test stubs only implement `.json()`. Falls back transparently when the
+    cap path isn't available. Returns None on decode failure (caller logs).
+    """
+    content_attr = getattr(resp, "content", None)
+    if content_attr is not None and hasattr(content_attr, "read"):
+        raw = await content_attr.read(MAX_RESPONSE_BYTES)
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+            logger.warning(f"{label} JSON decode failed: {e}")
+            return None  # noqa: ASYNC910
+    try:
+        return await resp.json()
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"{label} JSON decode failed: {e}")
+        return None  # noqa: ASYNC910
 
 
 async def _http_get_with_backoff(
@@ -339,26 +350,11 @@ async def _http_get_with_backoff(
                     text = (await resp.text())[:200]
                     logger.warning(f"{label} HTTP {status} non-retryable: {text}")
                     return None
-                # Try size-capped raw read first (real aiohttp); fall back to
-                # resp.json() when the response object is a test stub without
-                # a .content attribute. Both code paths return parsed JSON.
-                content_attr = getattr(resp, "content", None)
-                if content_attr is not None and hasattr(content_attr, "read"):
-                    raw = await content_attr.read(MAX_RESPONSE_BYTES)
-                    try:
-                        return json.loads(raw)
-                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
-                        logger.warning(f"{label} JSON decode failed: {e}")
-                        return None
-                try:
-                    return await resp.json()
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"{label} JSON decode failed: {e}")
-                    return None
+                return await _read_json_capped(resp, label)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt + 1 >= max_attempts:
                 logger.warning(f"{label} transient error after {attempt + 1} attempts: {e}")
-                return None
+                return None  # noqa: ASYNC910
             sleep_for = HTTP_RETRY_BACKOFF_SECS
             logger.warning(f"{label} transient error: {e}; retry {attempt + 2}/{max_attempts} after {sleep_for:.2f}s")
             await asyncio.sleep(sleep_for)
@@ -593,15 +589,12 @@ async def _kalshi_prefetch_events(
                     text = (await resp.text())[:200]
                     logger.warning(f"Kalshi prefetch HTTP {resp.status}: {text}")
                     break
-                data = await resp.json()
+                data = await _read_json_capped(resp, "Kalshi prefetch")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Kalshi prefetch transient error: {e}")
             break
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Kalshi prefetch JSON parse error: {e}")
-            break
 
-        if not isinstance(data, dict):
+        if data is None or not isinstance(data, dict):
             break
         batch = data.get("events") or []
         if not isinstance(batch, list):

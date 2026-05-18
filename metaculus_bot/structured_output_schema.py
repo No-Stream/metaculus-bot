@@ -7,8 +7,10 @@ fields (prior, base rate, hazard, percentiles, scenarios, etc.). A post-hoc
 tool runner extracts these blocks and feeds them to probabilistic tools
 (Beta-binomial, log-pooling, distribution fitting).
 
-This module defines the schemas and extraction helpers. It is DORMANT:
-nothing here is wired into the prompt or runtime pipeline yet.
+This module defines the schemas and extraction helpers. Active surface,
+gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and per-question-type
+via ``PROBABILISTIC_TOOLS_TYPES``. See ``metaculus_bot/tool_runner.py``
+for dispatch and ``main.py:_make_prediction`` for the activation site.
 
 Note: ``DiscreteCountStructured`` is defined here but not dispatched by the
 current tool runner — discrete-count question dispatch is phase-3 work. The

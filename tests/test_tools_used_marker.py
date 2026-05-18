@@ -15,12 +15,12 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
-from forecasting_tools import BinaryQuestion, ForecastBot, GeneralLlm
+from forecasting_tools import BinaryQuestion, ForecastBot, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.comment_markers import TOOLS_USED_MARKER_FALSE, TOOLS_USED_MARKER_TRUE
-from metaculus_bot.tool_runner import FEATURE_FLAG_ENV
+from metaculus_bot.tool_runner import FEATURE_FLAG_ENV, TYPES_ENV
 
 
 def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
@@ -45,8 +45,8 @@ def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
     )
 
 
-def _make_q() -> MagicMock:
-    q = MagicMock(spec=BinaryQuestion)
+def _make_q(spec=BinaryQuestion) -> MagicMock:
+    q = MagicMock(spec=spec)
     q.id_of_question = 99
     q.question_text = "Will X happen?"
     q.page_url = "https://metaculus.com/q/99/"
@@ -119,6 +119,73 @@ class TestToolsUsedMarker:
 
         assert TOOLS_USED_MARKER_TRUE not in out
         assert TOOLS_USED_MARKER_FALSE not in out
+
+
+class TestToolsUsedMarkerPerTypeDispatch:
+    """F21 regression: marker reflects actual per-type dispatch via
+    PROBABILISTIC_TOOLS_TYPES, not just the global flag.
+
+    Previously the marker was set by ``env_flag_enabled(FEATURE_FLAG_ENV)``
+    alone, so a numeric question with TYPES="binary,multiple_choice" would
+    emit TOOLS_USED=true even though tool_runner._feature_enabled("numeric")
+    returned False and no tool ran. That broke residual-analysis bucketing.
+    """
+
+    def test_numeric_q_with_binary_only_types_emits_false(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
+        monkeypatch.setenv(TYPES_ENV, "binary,multiple_choice")
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_q(spec=NumericQuestion)
+        bot._stacker_outcome[q.id_of_question] = "primary"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert TOOLS_USED_MARKER_FALSE in out
+        assert TOOLS_USED_MARKER_TRUE not in out
+
+    def test_binary_q_with_binary_only_types_emits_true(self, monkeypatch):
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
+        monkeypatch.setenv(TYPES_ENV, "binary")
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_q(spec=BinaryQuestion)
+        bot._stacker_outcome[q.id_of_question] = "primary"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert TOOLS_USED_MARKER_TRUE in out
+        assert TOOLS_USED_MARKER_FALSE not in out
+
+    def test_global_flag_off_emits_false_regardless_of_type(self, monkeypatch):
+        monkeypatch.delenv(FEATURE_FLAG_ENV, raising=False)
+        # Even with the per-type allow-list explicitly including binary, a
+        # disabled global flag must short-circuit to FALSE.
+        monkeypatch.setenv(TYPES_ENV, "binary,numeric,multiple_choice")
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_q(spec=BinaryQuestion)
+        bot._stacker_outcome[q.id_of_question] = "primary"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert TOOLS_USED_MARKER_FALSE in out
+        assert TOOLS_USED_MARKER_TRUE not in out
+
+    def test_mc_q_with_numeric_only_types_emits_false(self, monkeypatch):
+        # Belt-and-suspenders for the third question type: MC question with
+        # numeric-only allow-list still emits FALSE.
+        monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
+        monkeypatch.setenv(TYPES_ENV, "numeric")
+        bot = _make_bot(AggregationStrategy.STACKING)
+        q = _make_q(spec=MultipleChoiceQuestion)
+        bot._stacker_outcome[q.id_of_question] = "primary"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert TOOLS_USED_MARKER_FALSE in out
+        assert TOOLS_USED_MARKER_TRUE not in out
 
 
 _ = pytest
