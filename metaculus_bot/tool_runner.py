@@ -6,9 +6,11 @@ base forecaster emits (priors, base rates, hazards, percentiles, scenarios,
 etc.) and returns markdown-ready strings for injection into the stacker's
 view.
 
-DORMANT: nothing here is wired into prompts or the runtime pipeline. See
-``scratch_docs_and_planning/probabilistic_tools_activation.md`` for the
-activation recipe.
+Active surface: wired into ``main.py:_make_prediction`` (per-forecaster
+``## Computed quantities``) and into the stacker prompt via
+``build_cross_model_aggregation``. Per-question-type gating uses
+``_feature_enabled(qtype)`` against ``PROBABILISTIC_TOOLS_TYPES`` so
+numeric/binary/MC can be enabled independently.
 
 Feature flag: ``PROBABILISTIC_TOOLS_ENABLED`` (env var, false-y by default).
 The public entry points ``run_tools_for_forecaster`` and
