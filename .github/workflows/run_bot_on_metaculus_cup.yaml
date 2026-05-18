@@ -27,7 +27,7 @@ jobs:
         uses: snok/install-poetry@v1
         continue-on-error: true
         with:
-          version: 1.8.4
+          version: 2.2.1
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
@@ -36,7 +36,7 @@ jobs:
           poetry --version || (
             python -m pip install -U pip &&
             for i in 1 2 3; do
-              python -m pip install "poetry==1.8.4" && break || sleep 10;
+              python -m pip install "poetry==2.2.1" && break || sleep 10;
             done &&
             poetry --version
           )
