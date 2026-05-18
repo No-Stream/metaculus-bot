@@ -11,6 +11,10 @@ from forecasting_tools import MetaculusApi
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
+from metaculus_bot.fallback_openrouter import (
+    check_deprecation_alerts_and_exit,
+    get_donated_404_fallback_count,
+)
 from metaculus_bot.llm_configs import (
     DISAGREEMENT_ANALYZER_LLM,
     FORECASTER_LLMS,
@@ -108,13 +112,31 @@ def main() -> None:
     # Non-zero exit here just triggers the GitHub Actions red-check alert so
     # the operator knows to investigate (forecaster drops, stacker fallback
     # usage, research provider timeouts, etc. — see main.py `alertable_count`).
-    alertable = template_bot.alertable_count
+    bot_alertable = template_bot.alertable_count
+    # Donated-key 404 fallback: counted in fallback_openrouter at the wrapper
+    # level (process-global, since the wrapper has no link back to the bot).
+    # The fallback was successful — the run completed using the paid key —
+    # but the donated key's allowed-providers list is now stale and the
+    # operator should investigate.
+    donated_404 = get_donated_404_fallback_count()
+    alertable = bot_alertable + donated_404
     if alertable > 0:
         logger.warning(
-            "Run completed with %d alertable degradation event(s); exiting non-zero so CI marks this run red.",
+            "Run completed with %d alertable degradation event(s) (bot=%d, donated_404_fallback=%d); "
+            "exiting non-zero so CI marks this run red.",
             alertable,
+            bot_alertable,
+            donated_404,
         )
         sys.exit(1)
+
+    # Post-submission deprecation tripwire. Runs LAST so submission has fully
+    # completed (and so other alertable conditions exit first with their own
+    # log lines). When OpenRouter retires a model the bot uses (e.g. the
+    # 2026-05-15 x-ai/grok-4.1-fast deprecation that silently 404'd for ~2
+    # days), this prints a loud banner + sys.exit(1) so GitHub Actions turns
+    # red. Returns silently when no deprecation was observed.
+    check_deprecation_alerts_and_exit()
 
 
 if __name__ == "__main__":

@@ -124,13 +124,16 @@ async def run_stacking_mc(
     )
     meta_reasoning = await stacker_llm.invoke(prompt)
 
+    # Defined OUTSIDE the try so the fallback (except) branch can also use it
+    # without Pyright flagging it as possibly-unbound. Both the strict and
+    # tolerant parser invocations use the same instruction text.
+    parsing_instructions = (
+        "Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and "
+        "`probability` (decimal in [0,1]). Use option names exactly from this list (case-insensitive accepted):\n"
+        f"{question.options}\nDo not include any other options."
+    )
     # Try strict PredictedOptionList first (compatibility) then tolerant fallback
     try:
-        parsing_instructions = (
-            "Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and "
-            "`probability` (decimal in [0,1]). Use option names exactly from this list (case-insensitive accepted):\n"
-            f"{question.options}\nDo not include any other options. Remove prefixes like 'Option X:' if present."
-        )
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=meta_reasoning,
             output_type=PredictedOptionList,

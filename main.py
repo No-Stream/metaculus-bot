@@ -34,6 +34,12 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.api_key_utils import get_openrouter_api_key
+from metaculus_bot.calibration import (
+    BINARY_PLATT_PARAMS,
+    MC_PLATT_PARAMS,
+    apply_binary_platt,
+    apply_mc_platt,
+)
 from metaculus_bot.comment_markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
@@ -60,6 +66,9 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    PLATT_BINARY_MAX_ABS_DEVIATION,
+    PLATT_CALIBRATION_ENABLED_ENV,
+    PLATT_MC_MAX_ABS_DEVIATION,
     PREDICTION_MARKETS_ENABLED_ENV,
     STACKER_FALLBACK_SOFT_DEADLINE,
     STACKER_SOFT_DEADLINE,
@@ -664,6 +673,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 else:
                     self._research_provider_timeout_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
+                # Deprecation tripwire: research providers (notably native_search
+                # via plain GeneralLlm for Grok) bypass the FallbackOpenRouterLlm
+                # wrapper, so should_retry_with_general_key is never called for
+                # them. Record here so the post-submission check fires CI red.
+                # The 2026-05-15 x-ai/grok-4.1-fast deprecation that motivated this
+                # tripwire flowed through exactly this path.
+                from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
+
+                _record_deprecation_if_matched(f"<provider:{name}>", str(e))
                 return ("", name)
 
         tasks = [_run_one(p, n) for p, n in providers]
@@ -1250,7 +1268,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     timeout=STACKER_SOFT_DEADLINE,
                 )
                 self._stacker_outcome[qid_for_outcome] = "primary"
-                return self._maybe_snap_to_integers(stacked, question)
+                return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
             except Exception as primary_exc:
                 if not self.stacking_fallback_on_failure:
                     raise
@@ -1283,7 +1301,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         question.id_of_question,
                     )
                     self._stacker_outcome[qid_for_outcome] = "fallback_llm"
-                    return self._maybe_snap_to_integers(stacked, question)
+                    return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
                 except Exception as fallback_exc:
                     self._stacker_fallback_failed_count += 1
                     self._stacking_fallback_count += 1
@@ -1304,19 +1322,24 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     first_prediction = predictions[0]
                     if isinstance(first_prediction, (int, float)):
                         float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-                        return combine_binary_predictions(  # type: ignore[return-value]  # float is a PredictionTypes member
-                            float_preds, AggregationStrategy.MEDIAN
+                        return self._apply_platt_calibration(
+                            combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # float is a PredictionTypes member
+                            question,
                         )
                     if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
                         numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
                         median_numeric = await combine_numeric_predictions(
                             numeric_preds, question, AggregationStrategy.MEDIAN
                         )
-                        return self._maybe_snap_to_integers(median_numeric, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+                        return self._apply_platt_calibration(
+                            self._maybe_snap_to_integers(median_numeric, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
+                            question,
+                        )
                     if isinstance(first_prediction, PredictedOptionList):
                         mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                        return combine_multiple_choice_predictions(  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
-                            mc_preds, AggregationStrategy.MEDIAN
+                        return self._apply_platt_calibration(
+                            combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
+                            question,
                         )
                     raise ValueError(
                         f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}"
@@ -1371,7 +1394,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     float_preds,
                     result,
                 )
-            return result  # type: ignore[return-value]  # float is a PredictionTypes member
+            return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]  # float is a PredictionTypes member
 
         if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
@@ -1389,7 +1412,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 ub,
                 len(getattr(aggregated, "cdf", [])),
             )
-            return self._maybe_snap_to_integers(aggregated, question)  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+            return self._apply_platt_calibration(
+                self._maybe_snap_to_integers(aggregated, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
+                question,
+            )
 
         # Multiple choice aggregation - strategy-based dispatch
         if isinstance(first_prediction, PredictedOptionList):
@@ -1401,7 +1427,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 effective_strategy.value,
                 summary,
             )
-            return aggregated  # type: ignore[return-value]  # PredictedOptionList is a PredictionTypes member
+            return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
 
         # Fallback for unexpected prediction types
         raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
@@ -1706,6 +1732,69 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Log final prediction
         log_final_prediction(prediction, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
+        """Apply post-hoc Platt scaling to the final binary or MC probability.
+
+        Short-circuits and returns ``prediction`` unchanged when any of:
+
+        * ``PLATT_CALIBRATION_ENABLED`` is unset;
+        * both ``BINARY_PLATT_PARAMS`` and ``MC_PLATT_PARAMS`` are still
+          identity (the checked-in default until the fit CLI populates them);
+        * ``prediction`` is a NumericDistribution (numeric calibration is
+          intentionally out of scope for this initial rollout).
+
+        Called only on FRESH aggregation return points in
+        ``_aggregate_predictions`` — NOT on the STACKING base-combine
+        re-entry (``main.py:1145-1214``) where the inputs were already
+        calibrated by a prior call to this method, so re-applying would
+        double-apply the recalibration.
+        """
+        if not env_flag_enabled(PLATT_CALIBRATION_ENABLED_ENV):
+            return prediction
+
+        if BINARY_PLATT_PARAMS.is_identity() and MC_PLATT_PARAMS.is_identity():
+            return prediction
+
+        if isinstance(question, BinaryQuestion) and isinstance(prediction, (int, float)):
+            calibrated = apply_binary_platt(
+                float(prediction),
+                BINARY_PLATT_PARAMS,
+                max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION,
+            )
+            if calibrated != float(prediction):
+                logger.info(
+                    "PLATT_BINARY: q=%s raw=%.4f calibrated=%.4f bias=%.4f slope=%.4f cap=%.3f",
+                    question.id_of_question,
+                    float(prediction),
+                    calibrated,
+                    BINARY_PLATT_PARAMS.bias,
+                    BINARY_PLATT_PARAMS.slope,
+                    PLATT_BINARY_MAX_ABS_DEVIATION,
+                )
+            return calibrated  # type: ignore[return-value]  # float is a PredictionTypes member
+
+        if isinstance(prediction, PredictedOptionList):
+            raw_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
+            apply_mc_platt(
+                prediction,
+                MC_PLATT_PARAMS,
+                max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION,
+            )
+            calibrated_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
+            if raw_summary != calibrated_summary:
+                logger.info(
+                    "PLATT_MC: q=%s raw=%s calibrated=%s bias=%.4f slope=%.4f cap=%.3f",
+                    question.id_of_question,
+                    raw_summary,
+                    calibrated_summary,
+                    MC_PLATT_PARAMS.bias,
+                    MC_PLATT_PARAMS.slope,
+                    PLATT_MC_MAX_ABS_DEVIATION,
+                )
+            return prediction
+
+        return prediction
 
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""

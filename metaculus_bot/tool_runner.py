@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Literal
 
 import numpy as np
@@ -42,6 +43,7 @@ from forecasting_tools import (
     BinaryQuestion,
     MetaculusQuestion,
     MultipleChoiceQuestion,
+    NumericDistribution,
     NumericQuestion,
     PredictedOptionList,
 )
@@ -84,9 +86,48 @@ logger = logging.getLogger(__name__)
 
 FEATURE_FLAG_ENV = "PROBABILISTIC_TOOLS_ENABLED"
 
+# Per-question-type allow-list. CSV of {"binary", "multiple_choice", "numeric"}.
+# Defaults to all 3 types when unset (back-compat: setting only the global
+# flag enables everything as before). Production workflows set this
+# explicitly to scope which types receive tool augmentation — empirically,
+# binary + MC benefit, numeric is inconclusive.
+TYPES_ENV = "PROBABILISTIC_TOOLS_TYPES"
+DEFAULT_TYPES_CSV = "binary,multiple_choice,numeric"
+_VALID_TYPES = frozenset({"binary", "multiple_choice", "numeric"})
 
-def _feature_enabled() -> bool:
-    return env_flag_enabled(FEATURE_FLAG_ENV)
+# Z-gap between P10 and P90 in a standard normal — mirrors
+# ``metaculus_bot.probabilistic_tools.distributions._P10_P90_Z_GAP``. Used to
+# derive an approximate σ from declared P10/P90 percentile pairs in the
+# spread plausibility check.
+_P10_P90_Z_GAP: float = 2.5631
+
+# Per-forecaster σ ratio (vs ensemble median σ) below which we emit a
+# ⚠ Spread anomaly line. Threshold of 0.10 catches the qid 43171
+# GLM-4.5-air case (σ=13K vs ensemble median σ ~965K, ratio ~1.3%) while
+# being generous enough that legitimate-but-tighter forecasters don't get
+# flagged. Defense-in-depth atop the family-consistency check.
+_SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
+
+
+def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choice"] | None = None) -> bool:
+    """Return True iff global PROBABILISTIC_TOOLS_ENABLED is set AND
+    question_type (when given) appears in the PROBABILISTIC_TOOLS_TYPES allow-list.
+
+    The allow-list defaults to all 3 types; production workflows set it explicitly
+    to scope which types receive tool augmentation. When question_type is None
+    (rare callers that don't know the type yet), only the global flag is checked.
+    """
+    if not env_flag_enabled(FEATURE_FLAG_ENV):
+        return False
+    if question_type is None:
+        return True
+    raw = os.environ.get(TYPES_ENV, DEFAULT_TYPES_CSV)
+    allowed = {t.strip() for t in raw.split(",") if t.strip()}
+    if not allowed.issubset(_VALID_TYPES):
+        invalid = allowed - _VALID_TYPES
+        logger.warning("PROBABILISTIC_TOOLS_TYPES has invalid entries %s; ignoring them", invalid)
+        allowed = allowed & _VALID_TYPES
+    return question_type in allowed
 
 
 def _question_type_of(question: MetaculusQuestion) -> Literal["binary", "numeric", "multiple_choice"] | None:
@@ -408,9 +449,6 @@ def run_tools_for_forecaster(
     when the feature flag is off, no structured block was found, or no
     tool produced output.
     """
-    if not _feature_enabled():
-        return ""
-
     qtype = _question_type_of(question)
     if qtype is None:
         logger.debug(
@@ -418,6 +456,9 @@ def run_tools_for_forecaster(
             type(question).__name__,
             forecaster_id,
         )
+        return ""
+
+    if not _feature_enabled(qtype):
         return ""
 
     block = parse_structured_block(rationale, qtype)
@@ -503,6 +544,83 @@ def _aggregate_binary_lines(prediction_probs: list[float], blocks: list[BinarySt
     return lines
 
 
+def _derive_sigma_from_percentiles(pcts: list[Percentile]) -> float | None:
+    """Extract σ ≈ (P90 - P10) / z_gap. Returns None if either percentile is missing.
+
+    Preferred over fitting a parametric distribution because (a) it's cheap,
+    (b) it's the same approximation used by ``_initial_normal_guess`` in
+    probabilistic_tools/distributions.py, and (c) we just need an order-of-
+    magnitude proxy to compare against the ensemble median.
+    """
+    p10_val: float | None = None
+    p90_val: float | None = None
+    for p in pcts:
+        if abs(p.percentile - 0.10) < 1e-6:
+            p10_val = p.value
+        elif abs(p.percentile - 0.90) < 1e-6:
+            p90_val = p.value
+    if p10_val is None or p90_val is None:
+        return None
+    sigma = (p90_val - p10_val) / _P10_P90_Z_GAP
+    if sigma <= 0 or not math.isfinite(sigma):
+        return None
+    return sigma
+
+
+def _spread_plausibility_lines(prediction_percentiles: list[list[Percentile]]) -> list[str]:
+    """Per-forecaster σ vs ensemble median σ. ⚠ flag when ratio < threshold.
+
+    Defense-in-depth atop ``percentile_family_consistency`` — catches
+    confidently-narrow forecasters whose claimed-vs-best-fit family looks
+    fine but whose σ is implausibly small relative to peers (qid 43171).
+
+    Skip semantics:
+    * Forecasters missing P10 or P90 are recorded at DEBUG and excluded
+      from the σ pool (no crash). They still consume a forecaster_idx slot.
+    * If fewer than 2 forecasters have valid σ, the section is suppressed
+      entirely (median undefined for n=1, and there's nothing to compare).
+    """
+    lines: list[str] = []
+    sigmas_with_idx: list[tuple[int, float]] = []
+    for idx, pcts in enumerate(prediction_percentiles, start=1):
+        sigma = _derive_sigma_from_percentiles(pcts)
+        if sigma is None:
+            logger.debug(
+                "spread_plausibility: forecaster %d missing P10 or P90; skipping σ derivation",
+                idx,
+            )
+            continue
+        sigmas_with_idx.append((idx, sigma))
+
+    if len(sigmas_with_idx) < 2:
+        return lines
+
+    sigmas = [s for _, s in sigmas_with_idx]
+    median_sigma = float(np.median(sigmas))
+    if median_sigma <= 0 or not math.isfinite(median_sigma):
+        return lines
+
+    anomalies: list[str] = []
+    for idx, sigma in sigmas_with_idx:
+        ratio = sigma / median_sigma
+        if ratio < _SPREAD_ANOMALY_RATIO_THRESHOLD:
+            anomalies.append(
+                f"- ⚠ Spread anomaly (forecaster {idx}): σ={sigma:.3g} is "
+                f"{ratio * 100:.1f}% of ensemble median σ={median_sigma:.3g}"
+            )
+
+    if anomalies:
+        lines.extend(anomalies)
+    else:
+        threshold_factor = int(round(1.0 / _SPREAD_ANOMALY_RATIO_THRESHOLD))
+        lines.append(
+            f"- **Spread plausibility**: all {len(sigmas)} forecasters within "
+            f"{threshold_factor}× spread of ensemble median "
+            f"(σ range {min(sigmas):.3g}–{max(sigmas):.3g})"
+        )
+    return lines
+
+
 def _aggregate_numeric_lines(
     prediction_percentiles: list[list[Percentile]],
     blocks: list[NumericStructured],
@@ -525,6 +643,8 @@ def _aggregate_numeric_lines(
         if hints:
             unique = sorted(set(hints))
             lines.append(f"- **Declared distribution families**: {', '.join(unique)} ({len(hints)} forecasters)")
+
+    lines.extend(_spread_plausibility_lines(prediction_percentiles))
 
     return lines
 
@@ -560,7 +680,7 @@ def aggregate_binary_values(rationales: list[str], prediction_probs: list[float]
 
     Returns empty string when the feature flag is off or there is nothing to report.
     """
-    if not _feature_enabled():
+    if not _feature_enabled("binary"):
         return ""
     blocks_all = _parse_all_blocks(rationales, "binary")
     binary_blocks = [b for b in blocks_all if isinstance(b, BinaryStructured)]
@@ -568,13 +688,34 @@ def aggregate_binary_values(rationales: list[str], prediction_probs: list[float]
     return "\n".join(lines) if lines else ""
 
 
-def aggregate_numeric_values(rationales: list[str], prediction_percentiles: list[list[Percentile]]) -> str:
-    """Public entry for numeric aggregation (typed)."""
-    if not _feature_enabled():
+def aggregate_numeric_values(
+    rationales: list[str],
+    prediction_percentiles: list[list[Percentile]] | list[NumericDistribution],
+) -> str:
+    """Public entry for numeric aggregation (typed).
+
+    Accepts either ``list[list[Percentile]]`` (legacy) or
+    ``list[NumericDistribution]`` (current). ``main.py`` passes the latter
+    because ``ReasonedPrediction.prediction_value`` for numeric questions is a
+    ``NumericDistribution``; iterating that Pydantic model yields
+    ``(field_name, value)`` tuples and silently broke the median-extraction
+    loop. Normalize at the boundary so both shapes work.
+    """
+    if not _feature_enabled("numeric"):
         return ""
+    normalized: list[list[Percentile]] = []
+    for entry in prediction_percentiles:
+        if isinstance(entry, NumericDistribution):
+            # declared_percentiles preserves the 11 anchor points the
+            # forecaster asserted; that's what the median-extraction loop
+            # expects. The 201-point CDF would also work but is less
+            # information-dense (median is one of the 11 anchors).
+            normalized.append(list(entry.declared_percentiles))
+        else:
+            normalized.append(list(entry))
     blocks_all = _parse_all_blocks(rationales, "numeric")
     numeric_blocks = [b for b in blocks_all if isinstance(b, NumericStructured)]
-    lines = _aggregate_numeric_lines(prediction_percentiles, numeric_blocks)
+    lines = _aggregate_numeric_lines(normalized, numeric_blocks)
     return "\n".join(lines) if lines else ""
 
 
@@ -584,7 +725,7 @@ def aggregate_mc_values(_rationales: list[str], prediction_options: list[Predict
     ``_rationales`` is accepted for API symmetry with the binary/numeric
     facades but unused: MC aggregation only needs option probability lists.
     """
-    if not _feature_enabled():
+    if not _feature_enabled("multiple_choice"):
         return ""
     lines = _aggregate_mc_lines(prediction_options)
     return "\n".join(lines) if lines else ""
@@ -602,11 +743,11 @@ def build_cross_model_aggregation(
     unsupported, or there is nothing useful to report. Callers can instead
     use the typed entry points (``aggregate_binary_values`` etc.) directly.
     """
-    if not _feature_enabled():
-        return ""
-
     qtype = _question_type_of(question)
     if qtype is None:
+        return ""
+
+    if not _feature_enabled(qtype):
         return ""
 
     if qtype == "binary":
@@ -640,7 +781,7 @@ def cdf_at_threshold_for_forecaster(
     bounds — the result is still computed (it's legitimately a tail-mass
     query) but the line helps trace unexpected inputs.
     """
-    if not _feature_enabled():
+    if not _feature_enabled("numeric"):
         return None
     if not question.open_lower_bound and threshold < question.lower_bound:
         logger.debug(

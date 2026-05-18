@@ -70,7 +70,10 @@ def test_multiple_choice_prompt_contains_options():
     )
     prompt = multiple_choice_prompt(question, "mc research")
     assert "Who will win?" in prompt
-    assert "Option_A" in prompt  # output format marker
+    # The trailing answer-format example must list real option names so strict
+    # parsers can map the LLM's output directly onto question.options.
+    assert "A: NN%" in prompt
+    assert "B: NN%" in prompt
 
 
 def test_numeric_prompt_bounds_and_research():

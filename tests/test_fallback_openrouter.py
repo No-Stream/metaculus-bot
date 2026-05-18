@@ -1,21 +1,46 @@
-import types
+from unittest.mock import AsyncMock
 
 import pytest
 
 from metaculus_bot.fallback_openrouter import (
+    DONATED_KEY_PROVIDERS,
     FallbackOpenRouterLlm,
     build_llm_with_openrouter_fallback,
-    is_openrouter_openai_or_anthropic,
     should_retry_with_general_key,
+    should_route_via_donated_key,
 )
 
 
 class TestPredicates:
-    def test_is_openrouter_openai_or_anthropic(self) -> None:
-        assert is_openrouter_openai_or_anthropic("openrouter/openai/gpt-5.1") is True
-        assert is_openrouter_openai_or_anthropic("openrouter/anthropic/claude-sonnet-4") is True
-        assert is_openrouter_openai_or_anthropic("openrouter/google/gemini-2.5-pro") is False
-        assert is_openrouter_openai_or_anthropic("perplexity/sonar") is False
+    def test_should_route_via_donated_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # OpenAI / Anthropic always route via the donated key when one is configured.
+        assert should_route_via_donated_key("openrouter/openai/gpt-5.1") is True
+        assert should_route_via_donated_key("openrouter/anthropic/claude-sonnet-4") is True
+        # Google is gated on GEMINI_USE_DONATED_OPENROUTER_KEY. With the toggle on,
+        # gemini-3-pro and gemini-3-flash prefer the donated key with paid-key fallback.
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
+        assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is True
+        assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is True
+        # Default (toggle off): Google calls go through the operator's personal key only.
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
+        assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
+        assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is False
+        # Default with the env var unset behaves like off.
+        monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
+        assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
+        # Providers NOT covered by the donated key.
+        assert should_route_via_donated_key("openrouter/x-ai/grok-4.1-fast") is False
+        assert should_route_via_donated_key("openrouter/qwen/qwen3-235b") is False
+        # Non-OpenRouter slugs.
+        assert should_route_via_donated_key("perplexity/sonar") is False
+        # Defensive: bogus inputs return False rather than raising.
+        assert should_route_via_donated_key("openrouter/") is False  # parts < 2
+        assert should_route_via_donated_key("") is False
+
+    def test_donated_key_providers_set(self) -> None:
+        # Pin the membership so any drift surfaces in code review rather than
+        # silently changing routing.
+        assert DONATED_KEY_PROVIDERS == frozenset({"openai", "anthropic", "google"})
 
     @pytest.mark.parametrize(
         "message, expected",
@@ -26,6 +51,19 @@ class TestPredicates:
             ("401 Unauthorized", True),
             ("invalid API key", True),
             ("disabled api key", True),
+            # Donated-key allowed-providers 404 quirk → should fall back.
+            ("404 No allowed providers are available for the selected model.", True),
+            ("no allowed providers", True),
+            # Donated-key data-policy / guardrail 404 (added 2026-05-17 for OpenAI
+            # native search migration) — donated key's data-collection guardrail
+            # blocks OpenAI native search; the personal key has no such block.
+            (
+                "404 No endpoints available matching your guardrail restrictions and data policy. "
+                "Configure: https://openrouter.ai/settings/privacy",
+                True,
+            ),
+            ("matching your guardrail restrictions", True),
+            ("data policy", True),
             ("403 Forbidden moderation", False),
             ("429 Too Many Requests", False),
             ("Rate limit exceeded", False),
@@ -39,7 +77,7 @@ class TestPredicates:
 
 class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
-    async def test_primary_success_no_fallback(self) -> None:
+    async def test_primary_success_no_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
@@ -47,17 +85,14 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        async def fake_primary(self, prompt):  # type: ignore[no-untyped-def]
-            return "answer"
-
-        # Patch the internal primary call point to avoid network
-        llm._invoke_once_using_primary = types.MethodType(fake_primary, llm)  # type: ignore[method-assign]
+        # Patch the internal primary call point to avoid network.
+        monkeypatch.setattr(llm, "_invoke_once_using_primary", AsyncMock(return_value="answer"))
 
         out = await llm.invoke("hi")
         assert out == "answer"
 
     @pytest.mark.asyncio
-    async def test_fallback_on_402(self) -> None:
+    async def test_fallback_on_402(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm = FallbackOpenRouterLlm(
             model="openrouter/anthropic/claude-sonnet-4",
             primary_api_key="special",
@@ -65,20 +100,18 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        async def fail_primary(self, prompt):  # type: ignore[no-untyped-def]
-            raise Exception("HTTP 402 Payment Required: insufficient credit")
-
-        async def succeed_secondary(self, prompt):  # type: ignore[no-untyped-def]
-            return "ok"
-
-        llm._invoke_once_using_primary = types.MethodType(fail_primary, llm)  # type: ignore[method-assign]
-        llm._invoke_once_using_secondary = types.MethodType(succeed_secondary, llm)  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("HTTP 402 Payment Required: insufficient credit")),
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
 
         out = await llm.invoke("hi")
         assert out == "ok"
 
     @pytest.mark.asyncio
-    async def test_no_fallback_on_403(self) -> None:
+    async def test_no_fallback_on_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
@@ -86,16 +119,17 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        async def fail_primary(self, prompt):  # type: ignore[no-untyped-def]
-            raise Exception("403 Forbidden moderation")
-
-        llm._invoke_once_using_primary = types.MethodType(fail_primary, llm)  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("403 Forbidden moderation")),
+        )
 
         with pytest.raises(Exception):
             await llm.invoke("hi")
 
     @pytest.mark.asyncio
-    async def test_no_secondary_key_configured(self) -> None:
+    async def test_no_secondary_key_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
             primary_api_key="special",
@@ -103,10 +137,11 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        async def fail_primary(self, prompt):  # type: ignore[no-untyped-def]
-            raise Exception("401 Unauthorized")
-
-        llm._invoke_once_using_primary = types.MethodType(fail_primary, llm)  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("401 Unauthorized")),
+        )
 
         with pytest.raises(Exception):
             await llm.invoke("hi")
@@ -129,11 +164,121 @@ class TestBuilder:
         assert isinstance(llm, GL)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
-    def test_builder_plain_for_non_openai_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_builder_plain_for_non_donated_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Models from providers not in DONATED_KEY_PROVIDERS get a plain GeneralLlm
+        (no donated-key wrapping). Grok via x-ai is the canonical example.
+        """
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
-        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-2.5-pro")
+        llm = build_llm_with_openrouter_fallback("openrouter/x-ai/grok-4.1-fast")
         # Not wrapper, should be a GeneralLlm
         from forecasting_tools import GeneralLlm as GL
 
         assert isinstance(llm, GL)
         assert not isinstance(llm, FallbackOpenRouterLlm)
+
+    def test_builder_returns_wrapper_for_google_when_donated_toggle_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Google routes via the donated wrapper only when GEMINI_USE_DONATED_OPENROUTER_KEY=true.
+
+        Originally added in task #12 (Google in DONATED_KEY_PROVIDERS). The
+        toggle was added later when the donated-key Google route got flaky
+        enough that we wanted to default to personal-key-only.
+        """
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        assert isinstance(llm, FallbackOpenRouterLlm)
+
+    def test_builder_plain_for_google_when_donated_toggle_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the donated-key toggle off (default), Google calls bypass the donated
+        wrapper entirely — the resulting LLM is a plain GeneralLlm using the
+        operator's general OpenRouter key.
+        """
+        from forecasting_tools import GeneralLlm as GL
+
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        assert isinstance(llm, GL)
+        assert not isinstance(llm, FallbackOpenRouterLlm)
+
+    def test_builder_plain_for_google_when_toggle_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default (env var unset) matches the toggle-off behavior."""
+        from forecasting_tools import GeneralLlm as GL
+
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        assert isinstance(llm, GL)
+        assert not isinstance(llm, FallbackOpenRouterLlm)
+
+
+class TestDeprecationTripwire:
+    """Post-submission deprecation tripwire (added 2026-05-17 after the
+    2026-05-15 x-ai/grok-4.1-fast deprecation silently 404'd for ~2 days).
+    """
+
+    def test_records_deprecation_404(self) -> None:
+        """A canonical OpenRouter deprecation 404 is recorded with model + msg."""
+        from metaculus_bot.fallback_openrouter import (
+            _DEPRECATION_ALERTS,
+            _record_deprecation_if_matched,
+            clear_deprecation_alerts,
+        )
+
+        clear_deprecation_alerts()
+        msg = "Grok 4.1 Fast is deprecated. xAI recommends switching to Grok 4.3"
+        matched = _record_deprecation_if_matched("x-ai/grok-4.1-fast", msg)
+        assert matched is True
+        assert _DEPRECATION_ALERTS == [("x-ai/grok-4.1-fast", msg)]
+        clear_deprecation_alerts()
+
+    def test_does_not_record_unrelated_error(self) -> None:
+        """Plain 401/429/etc. don't match — false positives turn CI red without cause."""
+        from metaculus_bot.fallback_openrouter import (
+            _DEPRECATION_ALERTS,
+            _record_deprecation_if_matched,
+            clear_deprecation_alerts,
+        )
+
+        clear_deprecation_alerts()
+        for msg in (
+            "401 Unauthorized: invalid api key",
+            "429 Too Many Requests: rate limit exceeded",
+            "402 Payment Required: insufficient credit",
+            "404 No allowed providers",
+            "503 Service Unavailable",
+        ):
+            matched = _record_deprecation_if_matched("openrouter/openai/gpt-5.5", msg)
+            assert matched is False, f"falsely matched: {msg}"
+        assert _DEPRECATION_ALERTS == []
+        clear_deprecation_alerts()
+
+    def test_check_exits_on_populated_list(self) -> None:
+        """Tripwire fires sys.exit(1) when at least one deprecation was seen."""
+        from metaculus_bot.fallback_openrouter import (
+            _record_deprecation_if_matched,
+            check_deprecation_alerts_and_exit,
+            clear_deprecation_alerts,
+        )
+
+        clear_deprecation_alerts()
+        _record_deprecation_if_matched("x-ai/grok-4.1-fast", "Grok 4.1 Fast is deprecated.")
+        with pytest.raises(SystemExit) as exc_info:
+            check_deprecation_alerts_and_exit()
+        assert exc_info.value.code == 1
+        clear_deprecation_alerts()
+
+    def test_check_returns_silently_on_empty(self) -> None:
+        """No deprecation observed → tripwire is a no-op (run completes cleanly)."""
+        from metaculus_bot.fallback_openrouter import (
+            check_deprecation_alerts_and_exit,
+            clear_deprecation_alerts,
+        )
+
+        clear_deprecation_alerts()
+        # Must not raise SystemExit
+        check_deprecation_alerts_and_exit()

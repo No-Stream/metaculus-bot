@@ -1,4 +1,4 @@
-.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large
+.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score check_credits
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -117,3 +117,34 @@ backtest_medium:
 
 backtest_large:
 	$(call RUN_UNBUFFERED,backtest.py --num-questions 100)
+
+# Probabilistic-tools ablation benchmark.
+# CLI: metaculus_bot/ablation/cli.py (entry point: python -m metaculus_bot.ablation.cli).
+# Tournaments default in the CLI (spring-aib-2026 + other 2026 slugs); not pinned here.
+ablation_qa_research:
+	# Runs only fetch + research + leakage screen + QA dump, then halts.
+	# Uses 3/3/3 question mix. No forecasting, no stacking.
+	# Config-in-code: --no-gap-fill (gap-fill amplifies leakage on resolved Qs);
+	# --gemini-model gemini-2.5-flash (free tier, no Tier 1 billing required).
+	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --num-binary 3 --num-multiple-choice 3 --num-numeric 3 --resolved-after 2026-01-01 --no-gap-fill --gemini-model gemini-2.5-flash --qa-research)
+
+ablation_smoke:
+	# 9 questions: 3 binary, 3 MC, 3 numeric. Full pipeline through scoring.
+	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --num-binary 3 --num-multiple-choice 3 --num-numeric 3 --resolved-after 2026-01-01 --no-gap-fill --gemini-model gemini-2.5-flash)
+
+ablation_small:
+	# 15 questions: 5/5/5.
+	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --num-binary 5 --num-multiple-choice 5 --num-numeric 5 --resolved-after 2026-01-01 --no-gap-fill --gemini-model gemini-2.5-flash)
+
+ablation_medium:
+	# 60 questions: 20/20/20. PENDING USER SIGN-OFF — do not run without explicit go-ahead.
+	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --num-binary 20 --num-multiple-choice 20 --num-numeric 20 --resolved-after 2026-01-01 --no-gap-fill --gemini-model gemini-2.5-flash)
+
+ablation_score:
+	# Re-runs scoring against existing caches (no API spend).
+	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --stages score)
+
+# Check OpenRouter key balances. Pass ARGS="--key donated" or ARGS="--key personal"
+# to limit which key is queried (default: both).
+check_credits:
+	@$(PY_ABS) -m metaculus_bot.check_openrouter_credits $(ARGS)

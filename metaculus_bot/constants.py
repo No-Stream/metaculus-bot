@@ -19,13 +19,28 @@ from metaculus_bot.config import load_environment
 # =============================================================================
 # AI Forecasting Benchmark tournament (bot-only competition)
 # Update when new season starts: https://www.metaculus.com/project/aib/
-TOURNAMENT_ID: str = "spring-aib-2026"  # Spring 2026 AI Benchmarking
-TOURNAMENT_END_DATE: str = "2026-05-06"  # Approximate end date for warning/error checks
-TOURNAMENT_HARD_STOP_WEEKS: int = 3  # Error out this many weeks after end date
+TOURNAMENT_ID: str = "summer-futureeval-2026"  # Summer 2026 FutureEval Bot Tournament (project ID: 33022)
+TOURNAMENT_END_DATE: str = "2026-09-06"  # Formal tournament close date
+TOURNAMENT_HARD_STOP_WEEKS: int = 2  # ~2 weeks of wiggle room past close before erroring
 
 # Metaculus Cup tournament (human + bot competition)
 # Update when new cup starts: https://www.metaculus.com/tournament/metaculus-cup/
 METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current cup
+
+
+def gemini_use_donated_openrouter_key() -> bool:
+    """Whether OpenRouter Gemini calls should route through the Metaculus-donated key.
+
+    Returns True iff GEMINI_USE_DONATED_OPENROUTER_KEY=="true". Default is
+    False — the donated-key Google route has been flaky, so we prefer the
+    operator's personal OPENROUTER_API_KEY for Gemini. Read at call time (not
+    import) so workflow env changes take effect without re-importing.
+
+    Scope: this toggle only affects OpenRouter routing (``fallback_openrouter``).
+    The google-genai grounded-search provider has no donated path — it always
+    reads the operator's personal GOOGLE_API_KEY.
+    """
+    return os.getenv(GEMINI_USE_DONATED_OPENROUTER_KEY_ENV, "false").strip().lower() == "true"
 
 
 class TournamentExpiredError(Exception):
@@ -155,6 +170,24 @@ BINARY_PROB_MAX: float = 0.98
 MC_PROB_MIN: float = 0.005
 MC_PROB_MAX: float = 0.995
 
+# --- Post-hoc Platt calibration of the final published probability ---
+# Final-output logistic recalibration following Metaculus's notebook
+# "Improving Forecaster Performance via Automated Calibration Adjustment"
+# (2026-05-01). Fitted parameters live in metaculus_bot/calibration/params.py
+# and are hand-edited after running the fit_platt_cli.
+#
+# Both deviation caps are HARD absolute caps applied AFTER the smooth
+# logistic transform. They cap how far the calibration is allowed to move
+# any single probability from the raw aggregation output. The user's stance:
+# "tweak, don't massively deviate" — the underlying fit can want a large
+# move; the cap prevents us from acting on it. Tune by hand after seeing
+# the unconstrained fit.
+PLATT_CALIBRATION_ENABLED_ENV: str = "PLATT_CALIBRATION_ENABLED"
+PLATT_BINARY_MAX_ABS_DEVIATION: float = 0.10
+# MC cap is tighter because the per-option Platt is applied N times per
+# question and small per-option drift compounds after renormalization.
+PLATT_MC_MAX_ABS_DEVIATION: float = 0.05
+
 # Numeric CDF smoothing and spacing
 NUM_VALUE_EPSILON_MULT: float = 1e-9
 NUM_SPREAD_DELTA_MULT: float = 1e-6
@@ -181,14 +214,30 @@ CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD: float = 0.15
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
 NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
 # Default model for native search (without openrouter/ prefix)
-NATIVE_SEARCH_DEFAULT_MODEL: str = "x-ai/grok-4.1-fast"
+# 2026-05-17: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
+# Initially flipped to gpt-5.4-mini, but v3 bench (scratch/native_search_bench_2026-05-17/comparison_v3.md)
+# showed gpt-5.5 with reasoning=medium + verbosity=low fits in ~230s under a
+# 360s cap with 130s headroom, and consistently produces materially deeper
+# research (Opus rubric: 23/25 vs mini's 15-16/25 across two unrelated
+# questions). Donated key currently blocked by data-policy guardrail —
+# see FUTURE.md "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block" — calls
+# bill to personal OPENROUTER_API_KEY for now (~$0.15/call × 250 Qs =
+# ~$40/tournament).
+NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.5"
 # LLM parameters for native search (lower temp for factual grounding)
 NATIVE_SEARCH_TEMPERATURE: float = 0.3
 NATIVE_SEARCH_TOP_P: float = 0.9
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
-# 4 min. Observed p99 of Grok native search ≈ 48s; 240s leaves ~5x headroom
-# without letting a stuck upstream dominate a batch run.
-NATIVE_SEARCH_TIMEOUT: int = 240
+NATIVE_SEARCH_TIMEOUT: int = (
+    360  # 2026-05-17: raised 240→360 alongside gpt-5.5 medium-effort migration; see comparison_v3.md
+)
+# Reasoning effort and verbosity for the OpenAI native-search call.
+# Override via env vars NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY.
+# Empty string disables passing the kwarg.
+NATIVE_SEARCH_REASONING_EFFORT_ENV: str = "NATIVE_SEARCH_REASONING_EFFORT"
+NATIVE_SEARCH_REASONING_EFFORT_DEFAULT: str = "medium"
+NATIVE_SEARCH_VERBOSITY_ENV: str = "NATIVE_SEARCH_VERBOSITY"
+NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
@@ -199,7 +248,19 @@ NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
 # genuinely new search index to the ensemble.
 GEMINI_SEARCH_ENABLED_ENV: str = "GEMINI_SEARCH_ENABLED"
 GEMINI_SEARCH_MODEL_ENV: str = "GEMINI_SEARCH_MODEL"
+# GOOGLE_API_KEY is the operator's personal Google AI Studio key (in CI it's
+# stored as ``secrets.GEMINI_API_KEY`` and surfaced as GOOGLE_API_KEY for the
+# google-genai SDK). The grounded-search provider always reads this — it has
+# no donated/shared-key path because Google AI Studio doesn't offer one.
 GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
+# Toggle for OpenRouter Gemini routing only. Controls whether models like
+# ``openrouter/google/gemini-3.1-pro-preview`` flow through the Metaculus-
+# donated OpenRouter key (``OAI_ANTH_OPENROUTER_KEY``) with paid-key fallback,
+# or skip the donated wrapper entirely and route through the operator's
+# personal ``OPENROUTER_API_KEY``. Does NOT affect the google-genai grounded
+# search provider — that always uses the personal GOOGLE_API_KEY. Default off
+# because the donated-key Google route has been flaky.
+GEMINI_USE_DONATED_OPENROUTER_KEY_ENV: str = "GEMINI_USE_DONATED_OPENROUTER_KEY"
 # Gemini 3 Flash preview model with grounding support. Requires billing enabled
 # on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on
 # free tier if needed. Override via GEMINI_SEARCH_MODEL env var.

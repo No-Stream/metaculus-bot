@@ -220,7 +220,11 @@ class TestStackingPrompts:
         assert "Previous balls were mostly red" in prompt
         assert "Model 1 Analysis:" in prompt
         assert "Red seems most likely" in prompt
-        assert "Option_A: NN%" in prompt
+        # The trailing answer-format example interpolates real option names so
+        # strict parsers can map LLM output directly to question.options.
+        assert "Red: NN%" in prompt
+        assert "Blue: NN%" in prompt
+        assert "Green: NN%" in prompt
 
     def test_stacking_numeric_prompt(self):
         """Test numeric stacking prompt generation."""

@@ -18,16 +18,18 @@ def _make_q(text: str) -> MagicMock:
 async def test_native_search_provider_constructs_correct_model_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify native search provider constructs model name correctly."""
+    """Verify native search provider constructs model name correctly via NATIVE_SEARCH_MODEL env override."""
     monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")
-    monkeypatch.setenv("NATIVE_SEARCH_MODEL", "x-ai/grok-4.1-fast")
+    monkeypatch.setenv("NATIVE_SEARCH_MODEL", "openai/gpt-5.5")
 
     captured_model: str | None = None
+    captured_kwargs: dict | None = None
 
     class MockLlm:
         def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
-            nonlocal captured_model
+            nonlocal captured_model, captured_kwargs
             captured_model = model
+            captured_kwargs = kwargs
             self.model = model
 
         async def invoke(self, prompt: str) -> str:
@@ -39,7 +41,11 @@ async def test_native_search_provider_constructs_correct_model_name(
         provider = native_search_provider()
         await provider(_make_q("Will X happen?"))
 
-    assert captured_model == "openrouter/x-ai/grok-4.1-fast"
+    assert captured_model == "openrouter/openai/gpt-5.5"
+    # Default reasoning effort + verbosity should be plumbed through.
+    assert captured_kwargs is not None
+    assert captured_kwargs.get("reasoning") == {"effort": "medium"}
+    assert captured_kwargs.get("extra_body") == {"verbosity": "low"}
 
 
 @pytest.mark.asyncio
@@ -155,7 +161,11 @@ class TestParallelProviderSelection:
     ) -> None:
         """Verify only primary provider returned when native search disabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
-        monkeypatch.delenv("FINANCIAL_DATA_ENABLED", raising=False)
+        # Use setenv("false") rather than delenv(): on first import in isolation,
+        # `from main import ...` triggers load_environment() which re-injects
+        # FINANCIAL_DATA_ENABLED=true from .env. setenv survives that
+        # (load_dotenv defaults to override=False).
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
@@ -184,8 +194,9 @@ class TestParallelProviderSelection:
     ) -> None:
         """Verify native search provider added when enabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")
-        monkeypatch.setenv("NATIVE_SEARCH_MODEL", "x-ai/grok-4.1-fast")
-        monkeypatch.delenv("FINANCIAL_DATA_ENABLED", raising=False)
+        monkeypatch.setenv("NATIVE_SEARCH_MODEL", "openai/gpt-5.5")
+        # See sibling test: setenv("false") survives load_environment(), delenv doesn't.
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 

@@ -36,6 +36,51 @@ Implemented as conditional stacking (`AggregationStrategy.CONDITIONAL_STACKING`)
 
 Implemented as `financial_data_provider.py`.
 
+### Run crux extraction on every question + always-on stacker (added 2026-05-17)
+
+Today crux-extract + targeted-search + stacker only fire on the ~30% high-spread subset (CONDITIONAL_STACKING + `spread > threshold`). User raised whether the pipeline would be cleaner if it always ran: forecaster fan-out → crux extract → targeted re-research → final stacker.
+
+**Cost** at gpt-5.5 high effort, ~250 Qs/tournament:
+
+- Crux extract: 250 × $0.055 ≈ $14
+- Targeted search (gpt-5.4-mini): 250 × $0.076 ≈ $19
+- Stacker (claude-opus-4.5): 250 × $0.30 ≈ $75
+- Total uplift vs disagreement-only: ~$80/tournament
+
+**Open question**: do cruxes on uncontroversial questions actually move predictions, or just add latency + cost? User's framing — "cruxes only make sense if we stack all the time, otherwise the crux research is wasted on a one-pass prediction." So this is paired: either both flip on together, or neither.
+
+**Test before flipping**: pick 50 historical resolved Qs from past tournaments where base models AGREED, run both pipelines offline, compare Brier / log-loss. ~Half-day of eng work, but the math win is ambiguous, hence test before flip.
+
+Priority: HIGH (clean architecture + the user views the 0.15 disagreement bar as somewhat arbitrary).
+
+### Re-run native-search model evaluation each quarter (added 2026-05-17)
+
+After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search models 2026-05-17, baseline data lives at `scratch/native_search_bench_2026-05-17/comparison_v3.md` (v3 supersedes the earlier v2 verdict; the final landing config is `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity=low` under a 360s cap). As cheaper / better OpenAI search models ship (gpt-5.6, mini variants), or if Anthropic/Google add native search to OpenRouter, re-run the harness:
+
+1. `python scratch/native_search_bench_2026-05-17/run.py --question-id <new open Q>` (or refactor into a make target if it gets reused).
+2. Update `metaculus_bot/constants.py:NATIVE_SEARCH_DEFAULT_MODEL` based on results.
+
+Bake into the quarterly review cadence.
+
+### Resolve `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search (added 2026-05-17, HIGH PRIORITY)
+
+When migrating native search from `x-ai/grok-4.1-fast` (deprecated) to OpenAI native search on 2026-05-17 (final landing config: `openai/gpt-5.5` medium-effort + verbosity=low, see W-C v2), the donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) returned a 404 with:
+
+> No endpoints available matching your guardrail restrictions and data policy.
+> Configure: <https://openrouter.ai/settings/privacy>
+
+This means OpenAI native-search calls fall back to the personal `OPENROUTER_API_KEY` instead of the donated subsidy. At ~$0.15/call × 250 Qs/tournament that's ~$40/tournament (size grew vs the original mini-only estimate of ~$3-5 because we landed on gpt-5.5 medium-effort, not mini) — still small enough to defer, but worth reclaiming.
+
+**Investigation paths**:
+
+1. **Email Metaculus** (<ben@metaculus.com>) — ask whether the data-policy guardrail on the shared OpenRouter account can be relaxed for OpenAI native search, or whether they need to whitelist a specific endpoint.
+2. **OpenRouter request preferences** — try `provider: {data_collection: "deny"}` or `provider: {require_parameters: true}` in the chat completions request to see if a compliant OpenAI endpoint is available; OpenRouter's privacy doc at <https://openrouter.ai/docs/features/privacy> describes the routing knobs. The metaculus-bot's `build_native_search_llm` already uses `extra_body` for plugins, so adding `provider` is one line.
+3. **Accept personal-key spend** — if (1) and (2) both fail, the migration still solved the Grok deprecation; the cost is small enough to live with.
+
+Today's status: code falls back automatically via `FallbackOpenRouterLlm` (added pattern matcher for "guardrail" / "data policy" in `fallback_openrouter.py`). No incidents expected.
+
+Priority: HIGH — it's free money to reclaim, and the same guardrail may bite us when the next OpenAI/Anthropic/Google migration comes up.
+
 ### Second-pass web search + scrape pipeline
 
 Our first-pass research (AskNews API dump, Grok native search) is a black box — we can't
@@ -248,6 +293,26 @@ Blocked on: STACKER_OUTCOME marker fix (Priority 1A in NEXT_SESSION_QUEUE.md), t
 ≥30 stacked records under the new marker, before this can be tested. Defer.
 
 ## Medium-term (requires more exploration)
+
+### Gemini grounding via OpenRouter — currently NOT supported (added 2026-05-17)
+
+Goal would be: route Gemini Google-Search-grounded calls (currently in `metaculus_bot/gemini_search_provider.py` via direct `google-genai` SDK + `GOOGLE_API_KEY`) through OpenRouter so the donated Metaculus credits cover them, freeing up personal Google API budget.
+
+**Status as of 2026-05-17**: NOT supported. OpenRouter's web plugin and `:online` suffix expose native search ONLY for Anthropic / OpenAI / Perplexity / xAI. Gemini falls back to **Exa** (verified HIGH confidence: <https://openrouter.ai/docs/guides/features/plugins/web-search>). Migrating today would silently swap Google's grounded retrieval for Exa text-search — quality regression, not just cost optimization.
+
+**Recheck periodically**: <https://openrouter.ai/changes> — if/when OpenRouter announces native Google grounding (or a passthrough for `tools=[{"google_search":{}}]`), revisit this migration. Until then, no action.
+
+### Update analysis-CLI defaults to summer-futureeval-2026 (added 2026-05-17)
+
+Tournament rolled over from `spring-aib-2026` to `summer-futureeval-2026` on 2026-05-17. The bot's live tournament target (`metaculus_bot/constants.py:TOURNAMENT_ID`) updated immediately, but **three CLI default constants stayed pinned to spring** intentionally:
+
+- `metaculus_bot/ablation/cli.py:95` — `DEFAULT_TOURNAMENTS = ["spring-aib-2026"]`
+- `metaculus_bot/performance_analysis/collector.py:30` — `DEFAULT_TOURNAMENT = "spring-aib-2026"`
+- `metaculus_bot/performance_analysis/cli.py:17` — same constant
+
+**Rationale for not updating yet**: ablation + perf-analysis are run against *resolved* questions. Summer just opened (zero resolved Qs); spring just closed (n=189, ongoing residual analysis). Updating the defaults now would force `--tournament spring-aib-2026` on every analysis command for what's still the active dataset.
+
+**Flip when**: summer accumulates ~30+ resolved Qs (probably 6-8 weeks in, mid-July 2026), enough to ablate against. At that point also update the slug example in `tests/test_tournament_dates.py:127,131` (currently still references spring as the example slug in error-path messaging — harmless but stale).
 
 ### Mixture model parameterization for numeric questions
 

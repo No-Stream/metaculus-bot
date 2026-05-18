@@ -95,10 +95,13 @@ class TestMultipleChoicePromptSchemaInstruction:
     def test_schema_block_precedes_option_answer_lines(self):
         prompt = multiple_choice_prompt(_make_mc_q(), research="R")
         schema_idx = prompt.find('"question_type"')
-        answer_idx = prompt.find("Option_A: NN%")
+        # The trailing answer block now interpolates real option names rather
+        # than literal Option_A placeholders, so we anchor on the first real
+        # option from the test fixture (`_make_mc_q` uses ["Red","Blue","Green"]).
+        answer_idx = prompt.find("Red: NN%")
         assert schema_idx >= 0
         assert answer_idx >= 0
-        assert schema_idx < answer_idx, "JSON schema must come before final Option_A: NN% lines (Option A ordering)"
+        assert schema_idx < answer_idx, "JSON schema must come before final per-option answer lines (Option A ordering)"
 
 
 class TestNumericPromptSchemaInstruction:

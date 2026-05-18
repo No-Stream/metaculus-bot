@@ -313,6 +313,79 @@ class TestForecastingWindowAnchor:
 # ---------------------------------------------------------------------------
 
 
+class TestMcPromptInterpolatesRealOptionNames:
+    """Strict parsers (e.g. gemma-4-31b-it) refuse to map literal ``Option_A: NN%``
+    placeholders onto real option names in the allowed-list — they correctly
+    emit ``<<NOT_FOUND>>`` because the prompt example does not contain anything
+    semantically tied to the question's actual options.
+
+    Fix: the example block in both ``multiple_choice_prompt`` and
+    ``stacking_multiple_choice_prompt`` must interpolate the real option names
+    so the LLM emits text the parser can directly recognize.
+    """
+
+    def test_stacking_mc_prompt_emits_real_option_names(self) -> None:
+        q = _mc_q()
+        q.options = ["Apple", "Banana", "Cherry"]
+
+        result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
+
+        assert "Apple: NN%" in result
+        assert "Banana: NN%" in result
+        assert "Cherry: NN%" in result
+
+    def test_stacking_mc_prompt_drops_literal_option_a_b_placeholders(self) -> None:
+        q = _mc_q()
+        q.options = ["Apple", "Banana", "Cherry"]
+
+        result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
+
+        assert "Option_A: NN%" not in result
+        assert "Option_B: NN%" not in result
+        assert "Option_N: NN%" not in result
+
+    def test_multiple_choice_prompt_emits_real_option_names(self) -> None:
+        q = _mc_q()
+        q.options = ["Apple", "Banana", "Cherry"]
+
+        result = multiple_choice_prompt(q, research="r")
+
+        assert "Apple: NN%" in result
+        assert "Banana: NN%" in result
+        assert "Cherry: NN%" in result
+
+    def test_multiple_choice_prompt_drops_literal_option_a_b_placeholders(self) -> None:
+        q = _mc_q()
+        q.options = ["Apple", "Banana", "Cherry"]
+
+        result = multiple_choice_prompt(q, research="r")
+
+        # Note: the JSON schema example block still uses Option_A/B/C as JSON
+        # keys to illustrate the mapping shape; that's fine. What we don't want
+        # is the literal "Option_A: NN%" answer-line example, since that's the
+        # text the parser actually has to map onto real option names.
+        assert "Option_A: NN%" not in result
+        assert "Option_B: NN%" not in result
+        assert "Option_N: NN%" not in result
+
+    def test_stacking_mc_prompt_preserves_options_in_order(self) -> None:
+        """The example answer lines must list options in the same order as
+        ``question.options`` — the trailing answer lines downstream rely on
+        that ordering to carry into the LLM's output."""
+        q = _mc_q()
+        q.options = ["Manufacturing PMI higher", "Services PMI higher", "Equal"]
+
+        result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
+
+        idx_mfg = result.find("Manufacturing PMI higher: NN%")
+        idx_svc = result.find("Services PMI higher: NN%")
+        idx_eq = result.find("Equal: NN%")
+        assert idx_mfg >= 0
+        assert idx_svc >= 0
+        assert idx_eq >= 0
+        assert idx_mfg < idx_svc < idx_eq
+
+
 class TestWebResearchPromptPrimarySources:
     """The first-pass web-research prompt must steer the model toward primary
     sources (government stats, SEC filings, official docs, scientific

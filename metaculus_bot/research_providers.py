@@ -295,9 +295,13 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
 
 
 def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
-    """Build a GeneralLlm configured for Grok native web search via OpenRouter.
+    """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
     Shared by the native search research provider and the targeted research module.
+
+    Reads NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY env at call
+    time so workflow overrides take effect without re-importing. An empty string
+    in either env var disables passing the corresponding kwarg.
     """
     from metaculus_bot.constants import (
         NATIVE_SEARCH_CONTEXT_SIZE,
@@ -305,15 +309,19 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         NATIVE_SEARCH_MAX_RESULTS,
         NATIVE_SEARCH_MAX_TOKENS,
         NATIVE_SEARCH_MODEL_ENV,
+        NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
+        NATIVE_SEARCH_REASONING_EFFORT_ENV,
         NATIVE_SEARCH_TEMPERATURE,
         NATIVE_SEARCH_TIMEOUT,
         NATIVE_SEARCH_TOP_P,
+        NATIVE_SEARCH_VERBOSITY_DEFAULT,
+        NATIVE_SEARCH_VERBOSITY_ENV,
     )
 
     base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
     model_with_search = f"openrouter/{base_model}"
 
-    return GeneralLlm(
+    kwargs: dict = dict(
         model=model_with_search,
         temperature=NATIVE_SEARCH_TEMPERATURE,
         top_p=NATIVE_SEARCH_TOP_P,
@@ -322,6 +330,16 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
     )
+
+    effort = os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    if effort:
+        kwargs["reasoning"] = {"effort": effort}
+
+    verbosity = os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
+    if verbosity:
+        kwargs["extra_body"] = {"verbosity": verbosity}
+
+    return GeneralLlm(**kwargs)
 
 
 def _native_search_provider(

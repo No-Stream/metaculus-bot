@@ -169,6 +169,19 @@ def numeric_log_score_from_report(report: NumericReport, resolution: NumericReso
 # ---------------------------------------------------------------------------
 
 
+def _canonicalize_mc_option(s: str) -> str:
+    """Best-effort normalize numeric MC options. '3.0' -> '3', ' 3 ' -> '3'."""
+    stripped = s.strip()
+    # Try to coerce to int via float (handles '3.0', '3', ' 3 ', '+3').
+    try:
+        f = float(stripped)
+        if f.is_integer():
+            return str(int(f))
+        return str(f)
+    except (ValueError, TypeError):
+        return stripped
+
+
 def mc_log_score_from_report(report: MultipleChoiceReport, correct_option: str) -> float | None:
     """Extract probabilities from a MultipleChoiceReport and compute log score."""
     try:
@@ -182,11 +195,23 @@ def mc_log_score_from_report(report: MultipleChoiceReport, correct_option: str) 
         }
 
         predicted_probs = [option_probs.get(opt, 0.0) for opt in options]
+        options_list = list(options)
         try:
-            correct_index = list(options).index(correct_option)
+            correct_index = options_list.index(correct_option)
         except ValueError:
-            logger.warning(f"Correct option '{correct_option}' not found in question options: {options}")
-            return None
+            # Try canonical-form fallback before reporting failure. Resolution strings
+            # sometimes come through as float-formatted ('3.0') while options are
+            # integer-formatted ('3'); canonicalize both sides and retry.
+            canonical_correct = _canonicalize_mc_option(correct_option)
+            canonical_options = [_canonicalize_mc_option(o) for o in options_list]
+            try:
+                correct_index = canonical_options.index(canonical_correct)
+            except ValueError:
+                logger.warning(
+                    f"Correct option '{correct_option}' (canonical {canonical_correct!r}) not found in "
+                    f"question options: {options_list} (canonical {canonical_options!r})"
+                )
+                return None
 
         return mc_log_score(predicted_probs, correct_index)
 

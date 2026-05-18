@@ -176,6 +176,9 @@ cython_debug/
 
 *.json
 
+# Benchmark and ablation outputs — never committed; per-operator local state
+backtests/
+
 # Agentic coding tool steering files other than reference AGENTS.md
 AGENTS.md:Zone.Identifier
 .roo/*

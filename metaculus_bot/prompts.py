@@ -275,6 +275,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
 
 def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> str:
+    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
@@ -376,10 +377,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         Emit the JSON block BEFORE the final per-option answer lines.
 
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        Option_A: NN%
-        Option_B: NN%
-        …
-        Option_N: NN%
+        {answer_example_lines}
         """
     )
 
@@ -690,6 +688,7 @@ def stacking_multiple_choice_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
+    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
 
     return clean_indents(
         f"""
@@ -755,10 +754,7 @@ def stacking_multiple_choice_prompt(
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
         
         ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        Option_A: NN%
-        Option_B: NN%
-        …
-        Option_N: NN%
+        {answer_example_lines}
         """
     )
 
