@@ -12,9 +12,20 @@ organized per pipeline stage:
 * ``stacker_outputs/<qid>/arm_{A,B}.json`` — per-arm stacker output.
 * ``scores/run_<ts>.json`` + ``scores/summary_<ts>.md`` — per-run analysis.
 
-Every JSON write is atomic: the payload is written to a tempfile in the same
-parent directory and ``os.replace``'d into place. A crash mid-write leaves the
-cache in either the old state or the new state — never partially corrupt.
+Each individual JSON write is atomic: the payload is written to a tempfile
+in the same parent directory and ``os.replace``'d into place, so a crash
+mid-write to a single file leaves it in either the old state or the new
+state — never partially corrupt.
+
+Multi-file pairs (meta+blob in ``write_research`` / ``write_pruned_research``)
+are NOT atomic across both files. ``write_research`` writes meta FIRST, blob
+SECOND; an interruption between the two leaves a partial state with the
+NEWER meta on disk and the OLDER blob (rather than the silently-corrupt
+inverse, NEW blob + OLD meta). The meta-first order is operator-detectable
+from the meta payload (e.g. timestamp, redactor_invocation_id) — a downstream
+consumer that distrusts the pair re-runs the producing stage. Future hardening
+could add a ``blob_sha`` field to the meta so consumers verify; we accept the
+detect-and-rerun tradeoff for now.
 
 JSON payloads carry a top-level ``cache_schema_version`` field. Reads raise
 ``ValueError`` on a mismatch instead of returning silently-stale data; writes

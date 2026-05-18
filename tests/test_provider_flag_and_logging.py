@@ -15,6 +15,23 @@ _TZ = timezone
 _ = asyncio  # used inside nested async def stubs defined in tests below
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Skip the AskNews 10s rate-limit pre-sleep in tests; SDK is mocked anyway.
+
+    research_providers.py inserts unconditional ``await asyncio.sleep(10.1)``
+    gates before each of the HOT and HISTORICAL AskNews calls. Even when the
+    SDK is mocked, those sleeps still run — adding ~20s per test, ~100s for
+    this whole file. Patching only the research_providers module's asyncio
+    keeps the fixture scoped to this file (no global conftest pollution).
+    """
+
+    async def _instant(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("metaculus_bot.research_providers.asyncio.sleep", _instant)
+
+
 @pytest.mark.asyncio
 async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
     # Force AskNews via env flag and provide required creds

@@ -286,6 +286,14 @@ class TestStackedMarkerInjection:
         # anchors on. If annotation wiring ran before trim (as in production),
         # the annotated bullets are already present in the base_text; the trim
         # just needs to preserve them.
+        #
+        # NOTE: model strings here (and in the parametrized fixtures below) are
+        # *illustrative* — they need to be plausible names that the parser can
+        # recognize, but the specific identity of "gpt-5.5" / "claude-opus-4.7" /
+        # "gemini-3.1-pro-preview" doesn't drive what's under test (trim
+        # preservation + per-model regex extraction). On forecaster rotation,
+        # update them to current names but verify the parser logic still
+        # matches the new shape (provider/family-name/version pattern).
         from metaculus_bot.constants import COMMENT_CHAR_LIMIT
 
         bot = _make_bot(AggregationStrategy.STACKING)

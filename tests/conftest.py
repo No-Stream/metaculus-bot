@@ -77,6 +77,14 @@ def _clear_gemini_client_cache():
     The Gemini provider caches one client per API key via functools.lru_cache;
     without clearing, a test that mocks genai.Client will see a stale cached
     mock from an earlier test that used a different mock.
+
+    Autouse-global because the gemini client cache is process-wide and can
+    pollute even unrelated tests if any prior test loads the module (e.g. via
+    a transitive import in main.py / research_providers.py). Scoping to
+    gemini-named tests would miss those indirect-load cases. The clear is
+    cheap (a single ``cache_clear`` on a 1-entry lru_cache) so the per-test
+    cost is negligible — leaving the autouse global is the simpler,
+    safer choice.
     """
     from metaculus_bot import gemini_search_provider as gsp
 

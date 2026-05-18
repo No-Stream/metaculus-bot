@@ -11,6 +11,10 @@ from metaculus_bot.constants import (
     BINARY_PROB_MIN,
     MC_PROB_MAX,
     MC_PROB_MIN,
+    NATIVE_SEARCH_DEFAULT_MODEL,
+    NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
+    NATIVE_SEARCH_TIMEOUT,
+    NATIVE_SEARCH_VERBOSITY_DEFAULT,
 )
 
 
@@ -46,3 +50,32 @@ class TestMCClampBoundsUnchanged:
 
     def test_mc_prob_max_is_0_995(self):
         assert MC_PROB_MAX == 0.995
+
+
+class TestNativeSearchDefaults:
+    """Pin OpenAI native-search defaults to the W-A bench winner.
+
+    These four constants together are the configuration that came out on top in
+    ``scratch/native_search_bench_2026-05-17/comparison_v3.md`` — gpt-5.5 with
+    medium reasoning effort + low verbosity, fitting under a 360s cap with
+    materially deeper research than the gpt-5.4-mini fallback. Don't change
+    these without rerunning the bench; rotating to a new model on a hunch
+    silently regresses research quality on every question.
+    """
+
+    def test_native_search_default_model_is_gpt_5_5(self):
+        """Locks the default OpenRouter model to ``openai/gpt-5.5``."""
+        assert NATIVE_SEARCH_DEFAULT_MODEL == "openai/gpt-5.5"
+
+    def test_native_search_reasoning_effort_default_is_medium(self):
+        """Medium effort is the bench winner — high burned budget without
+        improving rubric scores; low produced shallower research."""
+        assert NATIVE_SEARCH_REASONING_EFFORT_DEFAULT == "medium"
+
+    def test_native_search_verbosity_default_is_low(self):
+        """Low verbosity keeps the response tight without losing substance."""
+        assert NATIVE_SEARCH_VERBOSITY_DEFAULT == "low"
+
+    def test_native_search_timeout_is_360s(self):
+        """360s cap leaves ~130s headroom on top of observed p99 (~230s)."""
+        assert NATIVE_SEARCH_TIMEOUT == 360

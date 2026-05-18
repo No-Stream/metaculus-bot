@@ -31,10 +31,31 @@ import re
 from datetime import datetime
 from typing import Any
 
+import openai
 from forecasting_tools import GeneralLlm, MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.backtest.scoring import GroundTruth
+
+# Transient exceptions worth a single retry. The detector LLM call can fail in
+# two ways that legitimately recover on retry: (1) the LLM provider hiccups
+# (``openai.APIError`` is the common base for litellm's connection/timeout/
+# rate-limit/service-unavailable wrappers — ``litellm.APIError``, ``litellm.
+# APIConnectionError``, ``litellm.RateLimitError``, ``litellm.Timeout`` are
+# all subclasses of ``openai.APIError`` but NOT of one another — checked
+# inheritance directly, see the litellm exception module) or the asyncio
+# call times out (``asyncio.TimeoutError``); (2) the LLM emits malformed/
+# unexpected JSON, which ``_extract_is_leaked`` raises as ``ValueError``
+# (and ``json.JSONDecodeError``, a ValueError subclass, on a strict-JSON
+# parse failure before the regex fallback). Anything outside this set is a
+# real bug — schema-parse typo, AttributeError from a refactor, KeyError
+# from missing dict access — and must propagate so the operator sees it,
+# instead of being silently swallowed as ``detector_failed=True``.
+_DETECTOR_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    openai.APIError,  # litellm exceptions (RateLimitError, Timeout, APIConnectionError, ...)
+    ValueError,  # includes json.JSONDecodeError + _extract_is_leaked failures
+)
 
 DEFAULT_DETECTOR_MODEL: str = "openrouter/z-ai/glm-4.5-air:free"
 _EMPTY_BLOB_RESPONSE: str = "<empty research; nothing to leak>"
@@ -186,7 +207,7 @@ async def _detect_leakage_structured(
             response = await detector_llm.invoke(prompt)
             is_leaked = _extract_is_leaked(response)
             return is_leaked, response
-        except Exception as exc:  # noqa: BLE001 - re-raised after final attempt
+        except _DETECTOR_TRANSIENT_EXCEPTIONS as exc:
             last_exc = exc
             if attempt < 1:
                 logger.info(
@@ -290,11 +311,16 @@ async def screen_research_blob(
 
     try:
         is_leaked, response_text = await _detect_leakage_structured(question, ground_truth, research_blob, detector_llm)
-    except Exception:
+    except _DETECTOR_TRANSIENT_EXCEPTIONS:
         # Conservative-drop: production returns False (keep) on detector
-        # failure; we override to True (drop) for the ablation. Both
-        # transport errors (network, HTTP 5xx) and JSON-parse failures land
-        # here — either way we don't trust the verdict.
+        # failure; we override to True (drop) for the ablation. Transient
+        # transport errors (litellm.APIError + subclasses, asyncio timeouts)
+        # and JSON-parse failures (ValueError, json.JSONDecodeError) land
+        # here — either way we don't trust the verdict but we know the
+        # detector itself isn't buggy. Anything outside this set (KeyError,
+        # AttributeError, TypeError from a refactor regression) propagates
+        # so the operator sees real bugs instead of losing questions silently
+        # to detector_failed=True.
         logger.exception(f"Leakage detector failed for qid {qid}")
         verdict = _build_verdict(
             is_leaked=True,

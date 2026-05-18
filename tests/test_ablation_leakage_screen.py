@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 
 from metaculus_bot.ablation.cache import AblationCache
@@ -22,6 +23,17 @@ from metaculus_bot.ablation.leakage_screen import (
     screen_research_blob,
 )
 from metaculus_bot.backtest.scoring import GroundTruth
+
+
+def _transient_api_error(message: str) -> litellm.APIConnectionError:
+    """Realistic transient detector failure — what an actual provider blip raises.
+
+    The detector retry loop only catches the narrow transient set
+    (``litellm.APIError`` + ``asyncio.TimeoutError`` + ``ValueError``); using
+    a real ``litellm`` exception keeps these tests aligned with what the
+    runtime actually sees, instead of papering over a buggy ``RuntimeError``.
+    """
+    return litellm.APIConnectionError(message=message, llm_provider="z-ai", model="glm-4.5-air:free")
 
 
 def _blob_sha(s: str) -> str:
@@ -223,7 +235,7 @@ class TestScreenResearchBlob:
     @pytest.mark.asyncio
     async def test_detector_failure_returns_is_leaked_true_conservatively(self, cache: AblationCache) -> None:
         detector_llm = AsyncMock()
-        detector_llm.invoke.side_effect = RuntimeError("network")
+        detector_llm.invoke.side_effect = _transient_api_error("network")
 
         question = _make_question(42)
         gt = _make_ground_truth(42)
@@ -287,7 +299,7 @@ class TestScreenResearchBlob:
         detector_llm = AsyncMock()
         detector_llm.invoke = AsyncMock(
             side_effect=[
-                RuntimeError("transient blip"),
+                _transient_api_error("transient blip"),
                 '{"is_leaked": false, "explanation": "clean on retry"}',
             ]
         )
@@ -305,7 +317,7 @@ class TestScreenResearchBlob:
     async def test_two_transient_failures_falls_through_to_detector_failed(self, cache: AblationCache) -> None:
         """If BOTH attempts fail, the detector is conservatively marked failed."""
         detector_llm = AsyncMock()
-        detector_llm.invoke = AsyncMock(side_effect=RuntimeError("persistent failure"))
+        detector_llm.invoke = AsyncMock(side_effect=_transient_api_error("persistent failure"))
 
         question = _make_question(98)
         gt = _make_ground_truth(98)
@@ -317,11 +329,33 @@ class TestScreenResearchBlob:
         assert detector_llm.invoke.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_real_bug_propagates_instead_of_being_swallowed(self, cache: AblationCache) -> None:
+        """Fail-fast: a programming bug (KeyError, AttributeError, TypeError)
+        inside ``_extract_is_leaked`` or the LLM wrapper must propagate so
+        the operator sees the stack trace, not be silently bucketed as
+        ``detector_failed=True``. The retry loop only catches the narrow
+        transient set; everything else surfaces.
+        """
+        detector_llm = AsyncMock()
+        detector_llm.invoke = AsyncMock(side_effect=KeyError("schema_field_typo"))
+
+        question = _make_question(77)
+        gt = _make_ground_truth(77)
+
+        with pytest.raises(KeyError, match="schema_field_typo"):
+            await screen_research_blob(question, gt, "research blob", cache, detector_llm=detector_llm)
+
+        # Crucially: nothing was written to cache — an undiscovered bug doesn't
+        # poison the verdict cache with detector_failed=True entries that future
+        # runs would honor.
+        assert cache.read_leakage_screen(qid=77) is None
+
+    @pytest.mark.asyncio
     async def test_detector_failure_logs_exception(
         self, cache: AblationCache, caplog: pytest.LogCaptureFixture
     ) -> None:
         detector_llm = AsyncMock()
-        detector_llm.invoke.side_effect = RuntimeError("network blew up")
+        detector_llm.invoke.side_effect = _transient_api_error("network blew up")
 
         question = _make_question(42)
         gt = _make_ground_truth(42)
@@ -413,7 +447,7 @@ class TestScreenBatch:
         async def invoke_side_effect(prompt: str) -> str:
             await asyncio.sleep(0)
             if "Question 1" in prompt:
-                raise RuntimeError("transient failure")
+                raise _transient_api_error("transient failure")
             return '{"is_leaked": false, "explanation": "clean"}'
 
         mock_detector = AsyncMock()
