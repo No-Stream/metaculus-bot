@@ -335,6 +335,25 @@ WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
 PUBLISH_POST_TIMEOUT: int = 20
 PUBLISH_POST_RETRIES: int = 1
 
+# Fetch hardening: retry/timeout for question-list GETs to the Metaculus API.
+# Stock forecasting-tools issues `requests.get` with no timeout and no retry,
+# so a single transient 403/429/5xx anywhere in the question pagination kills
+# the whole CI run. Observed 2026-05-19: a CDN/WAF-style 403 (33s stall +
+# generic "API only available to authenticated users" body) on a healthy key.
+# fetch_hardening.py wraps `_get_questions_from_api` (the single chokepoint
+# for every question-list GET) with a request-side socket timeout + bounded
+# retry on retryable statuses and connection-level errors.
+# Backoff sized for the realistic failure mode: a CDN/WAF edge-node overload
+# typically clears in 10-60s, not 1-3s. The observed 2026-05-19 incident had
+# a 33s server-side stall before the 403; backoff in the 10-25s range gives
+# the edge layer time to recover. Cost of waiting is ~zero (tournament fetch
+# is on a 20-minute cron and ~40min total budget); cost of retrying too soon
+# is hitting the same wall and burning the run.
+FETCH_GET_TIMEOUT: int = 60
+FETCH_GET_RETRIES: int = 2
+FETCH_GET_BACKOFF_BASE: float = 10.0
+FETCH_GET_BACKOFF_JITTER: float = 3.0
+
 # Stacker soft deadline. Set slightly above the stacker LLM's litellm timeout
 # (480s) so the model's own timeout fires first with a clean exception when
 # possible; this wait_for is a final belt-and-suspenders backstop for a wholly
