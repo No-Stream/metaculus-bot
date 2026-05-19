@@ -15,6 +15,7 @@ from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_donated_404_fallback_count,
 )
+from metaculus_bot.fetch_hardening import apply_fetch_hardening
 from metaculus_bot.llm_configs import (
     DISAGREEMENT_ANALYZER_LLM,
     FORECASTER_LLMS,
@@ -50,6 +51,11 @@ def main() -> None:
     # metaculus_bot/publish_hardening.py for rationale (stock requests.post
     # has no timeout; a single hung POST blocks the whole batch).
     apply_publish_hardening()
+
+    # Wrap MetaculusApi question-list GET with timeout + bounded retry. See
+    # metaculus_bot/fetch_hardening.py for rationale (stock requests.get has
+    # no timeout/retry; a single transient 403/429/5xx kills the whole run).
+    apply_fetch_hardening()
 
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(
