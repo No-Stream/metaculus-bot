@@ -14,17 +14,16 @@ import json
 import logging
 from typing import Any
 
-import httpx
 from forecasting_tools import GeneralLlm, MetaculusQuestion
-from google.genai import errors as genai_errors
-from google.genai import types as genai_types
 
 from metaculus_bot.constants import (
     GAP_FILL_ANALYZER_MODEL,
     GAP_FILL_ANALYZER_TIMEOUT,
+    GAP_FILL_ANALYZER_WALL_TIMEOUT,
     GAP_FILL_MAX_GAPS,
+    NATIVE_SEARCH_WALL_TIMEOUT,
 )
-from metaculus_bot.gemini_search_provider import build_gemini_client, invoke_gemini_grounded
+from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
 from metaculus_bot.prompts import (
     disagreement_crux_prompt,
     gap_fill_analyzer_prompt,
@@ -43,14 +42,15 @@ __all__ = [
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Exceptions that trigger a soft-fail (return "") from run_gap_fill_pass.
-_GAP_FILL_SOFT_FAIL_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    asyncio.TimeoutError,
-    ValueError,  # missing GOOGLE_API_KEY from build_gemini_client
-    genai_errors.APIError,  # covers ClientError + ServerError from the SDK
-    httpx.HTTPError,  # raw httpx network errors (SDK uses httpx underneath)
-    ConnectionError,
-    OSError,  # DNS / socket failures not wrapped by httpx
-)
+# Broad by design — the docstring policy is "Never raises. Returns '' on any
+# upstream failure" (gap-fill is an optional enrichment layer; a forecast with
+# only first-pass research is strictly better than no forecast at all). Listing
+# specific classes was tractable when both stages used google-genai; after the
+# 2026-05-20 analyzer migration to OpenRouter/litellm, the analyzer can raise
+# litellm.APIError, openai.AuthenticationError, anthropic.RateLimitError, etc.
+# Catching `Exception` matches the policy and keeps the catch in one place
+# (CancelledError still propagates because it inherits from BaseException).
+_GAP_FILL_SOFT_FAIL_EXCEPTIONS: tuple[type[BaseException], ...] = (Exception,)
 
 
 async def extract_disagreement_crux(
@@ -92,7 +92,12 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
     llm = build_native_search_llm()
     prompt = targeted_search_prompt(crux, question_text, is_benchmarking=is_benchmarking)
     logger.info(f"Running targeted search via {llm.model} for crux: {crux[:100]}...")
-    result = await llm.invoke(prompt)
+    # Wall-clock backstop: shares NATIVE_SEARCH_WALL_TIMEOUT with the
+    # native_search research provider since both call the same LLM
+    # configuration via build_native_search_llm. The 2026-05-20 OpenRouter
+    # whitespace-drip incident defeated litellm's per-HTTP-request timeout;
+    # asyncio.wait_for is the hard cap regardless of upstream behavior.
+    result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
     logger.info(f"Targeted search complete: {len(result)} chars")
     return result
 
@@ -162,13 +167,26 @@ async def _run_analyzer(
     *,
     is_benchmarking: bool,
 ) -> list[dict[str, str]]:
-    """Call the analyzer Gemini model (no grounding) to identify gaps.
+    """Call the analyzer LLM (no grounding) to identify gaps.
 
-    Uses `response_mime_type="application/json"` so the model returns valid JSON
-    directly rather than prose-wrapped JSON, which makes `_parse_gap_list` more
-    reliable and documents the "no grounding" contract explicitly.
+    Migrated 2026-05-20 from gemini-3-flash-preview (google-genai direct) to
+    gpt-5.5 low-effort via OpenRouter (with donated-key fallback). The analyzer
+    is non-grounded so it doesn't need Google's search index; this gets us
+    OpenAI-stack consistency with native_search and the disagreement analyzer.
+
+    Without google-genai's response_mime_type=application/json, the prompt asks
+    for ```json fenced output and _parse_gap_list handles fence stripping +
+    balanced-brace fallback for trailing commentary.
     """
-    client = build_gemini_client()
+    from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+
+    llm = build_llm_with_openrouter_fallback(
+        model=GAP_FILL_ANALYZER_MODEL,
+        reasoning={"effort": "low"},
+        temperature=0.0,
+        timeout=GAP_FILL_ANALYZER_TIMEOUT,
+        allowed_tries=1,
+    )
     prompt = gap_fill_analyzer_prompt(
         question_text=question.question_text,
         resolution_criteria=getattr(question, "resolution_criteria", None),
@@ -177,13 +195,11 @@ async def _run_analyzer(
         is_benchmarking=is_benchmarking,
         max_gaps=GAP_FILL_MAX_GAPS,
     )
-    config = genai_types.GenerateContentConfig(response_mime_type="application/json")
     logger.info(f"GapFill: calling analyzer {GAP_FILL_ANALYZER_MODEL} for gap identification")
-    response = await asyncio.wait_for(
-        client.aio.models.generate_content(model=GAP_FILL_ANALYZER_MODEL, contents=prompt, config=config),
-        timeout=GAP_FILL_ANALYZER_TIMEOUT,
-    )
-    raw_text: str = getattr(response, "text", "") or ""
+    # Wall-clock backstop has slight headroom over the litellm per-request
+    # timeout (135s vs 120s) so the cleaner per-request error fires first when
+    # possible, mirroring NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT.
+    raw_text = await asyncio.wait_for(llm.invoke(prompt), timeout=GAP_FILL_ANALYZER_WALL_TIMEOUT)
     gaps = _parse_gap_list(raw_text, max_gaps=GAP_FILL_MAX_GAPS)
     logger.info(f"GapFill: analyzer returned {len(gaps)} gap(s)")
     return gaps
@@ -218,8 +234,8 @@ async def run_gap_fill_pass(
     """Identify and resolve factual gaps in first-pass research.
 
     Two-stage flow:
-    1. Analyzer call (Gemini 3 Flash, no grounding) → JSON list of up to
-       ``GAP_FILL_MAX_GAPS`` gaps.
+    1. Analyzer call (gpt-5.5 effort=low via OpenRouter, no grounding) → JSON
+       list of up to ``GAP_FILL_MAX_GAPS`` gaps.
     2. Parallel grounded Gemini searches, one per gap, via ``asyncio.gather``.
 
     Never raises. Returns "" on any upstream failure (missing API key, timeout,

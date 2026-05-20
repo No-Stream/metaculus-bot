@@ -46,9 +46,15 @@ async def test_native_search_provider_constructs_correct_model_name(
     # `verbosity` is now top-level (canonical OpenRouter / litellm form);
     # `extra_body` is no longer used to smuggle it.
     assert captured_kwargs is not None
-    assert captured_kwargs.get("reasoning") == {"effort": "medium"}
+    # Default reasoning effort dropped medium→low on 2026-05-20; see
+    # NATIVE_SEARCH_REASONING_EFFORT_DEFAULT in constants.py for rationale.
+    assert captured_kwargs.get("reasoning") == {"effort": "low"}
     assert captured_kwargs.get("verbosity") == "low"
     assert "extra_body" not in captured_kwargs
+    # 2026-05-20: pinned to allowed_tries=1 for native_search; the wall-clock
+    # guard at the caller bounds the budget, retrying a malformed-whitespace
+    # response from OpenRouter doesn't help (and burns the budget).
+    assert captured_kwargs.get("allowed_tries") == 1
 
 
 @pytest.mark.asyncio
@@ -153,6 +159,41 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
     assert captured_prompt is not None
     assert "DO NOT hallucinate" in captured_prompt
     assert "only cite what you actually found" in captured_prompt
+
+
+@pytest.mark.asyncio
+async def test_native_search_provider_enforces_wall_clock_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung llm.invoke must be bounded by NATIVE_SEARCH_WALL_TIMEOUT.
+
+    Regression test for the 2026-05-20 incident: an OpenRouter response
+    dripped ~700 lines of whitespace over 8m37s before closing with malformed
+    JSON, defeating the per-HTTP-request timeout entirely. The asyncio.wait_for
+    wrapper in _native_search_provider._fetch is the wall-clock backstop;
+    this test locks it in so a future refactor can't silently remove it.
+    """
+    # _fetch reads NATIVE_SEARCH_WALL_TIMEOUT via a function-scoped import from
+    # constants, so we patch the constants module (not the research_providers
+    # module) for the override to take effect at call time.
+    monkeypatch.setattr("metaculus_bot.constants.NATIVE_SEARCH_WALL_TIMEOUT", 0.05)
+
+    class HangingLlm:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.model = kwargs.get("model", "mock")
+
+        async def invoke(self, prompt: str) -> str:
+            # Sleep well past the 0.05s wall-clock cap; test passes only if
+            # asyncio.wait_for cancels this before it returns.
+            await asyncio.sleep(5)
+            return "should never reach here"
+
+    with patch("metaculus_bot.research_providers.GeneralLlm", HangingLlm):
+        from metaculus_bot.research_providers import native_search_provider
+
+        provider = native_search_provider()
+        with pytest.raises(asyncio.TimeoutError):
+            await provider(_make_q("Will X happen?"))
 
 
 class TestParallelProviderSelection:

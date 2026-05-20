@@ -53,24 +53,28 @@ class TestMCClampBoundsUnchanged:
 
 
 class TestNativeSearchDefaults:
-    """Pin OpenAI native-search defaults to the W-A bench winner.
+    """Pin OpenAI native-search defaults.
 
-    These four constants together are the configuration that came out on top in
-    ``scratch/native_search_bench_2026-05-17/comparison_v3.md`` — gpt-5.5 with
-    medium reasoning effort + low verbosity, fitting under a 360s cap with
-    materially deeper research than the gpt-5.4-mini fallback. Don't change
-    these without rerunning the bench; rotating to a new model on a hunch
-    silently regresses research quality on every question.
+    Model + verbosity locked from ``scratch/native_search_bench_2026-05-17/comparison_v3.md``.
+    Reasoning effort dropped medium→low on 2026-05-20 after an OpenRouter
+    whitespace-stream incident consumed 8m37s on a single call; v3 bench
+    measured low at ~50s vs medium at ~230s, so low gives ~4.5× more headroom
+    under the wall-clock cap. Quality at low is not graded by the v3 bench
+    (sanity-check only) — rerun the bench with a graded `low` arm if you
+    want to revert.
     """
 
     def test_native_search_default_model_is_gpt_5_5(self):
         """Locks the default OpenRouter model to ``openai/gpt-5.5``."""
         assert NATIVE_SEARCH_DEFAULT_MODEL == "openai/gpt-5.5"
 
-    def test_native_search_reasoning_effort_default_is_medium(self):
-        """Medium effort is the bench winner — high burned budget without
-        improving rubric scores; low produced shallower research."""
-        assert NATIVE_SEARCH_REASONING_EFFORT_DEFAULT == "medium"
+    def test_native_search_reasoning_effort_default_is_low(self):
+        """Low effort gives ~4.5× faster wall-clock vs medium on the v3 bench
+        (~50s vs ~230s), keeping us well clear of NATIVE_SEARCH_WALL_TIMEOUT
+        (420s) after the 2026-05-20 OpenRouter whitespace-stream incident.
+        Override via NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs
+        medium quality back."""
+        assert NATIVE_SEARCH_REASONING_EFFORT_DEFAULT == "low"
 
     def test_native_search_verbosity_default_is_low(self):
         """Low verbosity keeps the response tight without losing substance."""

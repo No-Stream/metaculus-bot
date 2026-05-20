@@ -106,3 +106,7 @@ jobs:
           # p=0.113), so excluded.
           PROBABILISTIC_TOOLS_ENABLED: 'true'
           PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'
+          # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
+          # is_benchmarking=False in the prod path (this workflow), so the
+          # provider's own benchmarking guard doesn't suppress it here.
+          PREDICTION_MARKETS_ENABLED: 'true'

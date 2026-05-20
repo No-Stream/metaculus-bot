@@ -107,3 +107,8 @@ jobs:
           # p=0.113), so excluded.
           PROBABILISTIC_TOOLS_ENABLED: 'true'
           PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'
+          # Prediction-market snapshot provider: queries Polymarket, Kalshi,
+          # Manifold concurrently and aggregates into research blurb. Hard-
+          # disabled under is_benchmarking=True to prevent backtest leakage
+          # (the prod path is_benchmarking=False, so this fires here).
+          PREDICTION_MARKETS_ENABLED: 'true'

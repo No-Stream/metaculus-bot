@@ -327,6 +327,12 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         top_p=NATIVE_SEARCH_TOP_P,
         max_tokens=NATIVE_SEARCH_MAX_TOKENS,
         timeout=NATIVE_SEARCH_TIMEOUT,
+        # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
+        # 2026-05-20 incident) won't be cured by retrying the same call, and
+        # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
+        # bounding the budget. With allowed_tries=1 + wait_for(420s), worst
+        # case is ~7 min instead of timeout(360s) * default_tries(3) ~18 min.
+        allowed_tries=1,
         plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
     )
@@ -355,6 +361,8 @@ def _native_search_provider(
     """Research provider using models with native web search capability via OpenRouter :online suffix."""
 
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
+        from metaculus_bot.constants import NATIVE_SEARCH_WALL_TIMEOUT
+
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
             question.question_text,
@@ -362,7 +370,11 @@ def _native_search_provider(
             citation_style="markdown",
         )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
-        result = await llm.invoke(prompt)
+        # Wall-clock backstop: see NATIVE_SEARCH_WALL_TIMEOUT in constants.py
+        # for the 2026-05-20 incident that motivated this guard. Mirrors the
+        # AskNews (research_providers.py:89) and gemini gap-fill
+        # (targeted_research.py:182) wrappers.
+        result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
         return result
 
