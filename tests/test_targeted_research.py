@@ -1,5 +1,6 @@
 """Unit tests for targeted_research module and its prompt functions."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -104,3 +105,31 @@ class TestRunTargetedSearch:
             await run_targeted_search("crux", "q", is_benchmarking=True)
 
         mock_prompt.assert_called_once_with("crux", "q", is_benchmarking=True)
+
+    @pytest.mark.asyncio
+    async def test_enforces_wall_clock_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hung llm.invoke must be bounded by NATIVE_SEARCH_WALL_TIMEOUT.
+
+        run_targeted_search shares the build_native_search_llm config with the
+        native_search research provider, so the same OpenRouter whitespace-drip
+        pathology (2026-05-20 incident) can defeat the per-HTTP-request timeout
+        here too. The asyncio.wait_for wrapper is the wall-clock backstop;
+        this test locks it in so a future refactor can't silently remove it.
+        """
+        # Override the wall-clock cap to a short value via the constants module
+        # (run_targeted_search reads it at import time, but patching the
+        # already-imported reference in targeted_research is what takes effect).
+        monkeypatch.setattr("metaculus_bot.targeted_research.NATIVE_SEARCH_WALL_TIMEOUT", 0.05)
+
+        class HangingLlm:
+            model = "mock-native-search"
+
+            async def invoke(self, prompt: str) -> str:
+                # Sleep well past the 0.05s wall-clock cap; test passes only if
+                # asyncio.wait_for cancels this before it returns.
+                await asyncio.sleep(5)
+                return "should never reach here"
+
+        with patch("metaculus_bot.targeted_research.build_native_search_llm", return_value=HangingLlm()):
+            with pytest.raises(asyncio.TimeoutError):
+                await run_targeted_search("crux", "question text")

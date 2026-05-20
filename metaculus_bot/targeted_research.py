@@ -19,7 +19,9 @@ from forecasting_tools import GeneralLlm, MetaculusQuestion
 from metaculus_bot.constants import (
     GAP_FILL_ANALYZER_MODEL,
     GAP_FILL_ANALYZER_TIMEOUT,
+    GAP_FILL_ANALYZER_WALL_TIMEOUT,
     GAP_FILL_MAX_GAPS,
+    NATIVE_SEARCH_WALL_TIMEOUT,
 )
 from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
 from metaculus_bot.prompts import (
@@ -90,7 +92,12 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
     llm = build_native_search_llm()
     prompt = targeted_search_prompt(crux, question_text, is_benchmarking=is_benchmarking)
     logger.info(f"Running targeted search via {llm.model} for crux: {crux[:100]}...")
-    result = await llm.invoke(prompt)
+    # Wall-clock backstop: shares NATIVE_SEARCH_WALL_TIMEOUT with the
+    # native_search research provider since both call the same LLM
+    # configuration via build_native_search_llm. The 2026-05-20 OpenRouter
+    # whitespace-drip incident defeated litellm's per-HTTP-request timeout;
+    # asyncio.wait_for is the hard cap regardless of upstream behavior.
+    result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
     logger.info(f"Targeted search complete: {len(result)} chars")
     return result
 
@@ -189,7 +196,10 @@ async def _run_analyzer(
         max_gaps=GAP_FILL_MAX_GAPS,
     )
     logger.info(f"GapFill: calling analyzer {GAP_FILL_ANALYZER_MODEL} for gap identification")
-    raw_text = await asyncio.wait_for(llm.invoke(prompt), timeout=GAP_FILL_ANALYZER_TIMEOUT)
+    # Wall-clock backstop has slight headroom over the litellm per-request
+    # timeout (135s vs 120s) so the cleaner per-request error fires first when
+    # possible, mirroring NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT.
+    raw_text = await asyncio.wait_for(llm.invoke(prompt), timeout=GAP_FILL_ANALYZER_WALL_TIMEOUT)
     gaps = _parse_gap_list(raw_text, max_gaps=GAP_FILL_MAX_GAPS)
     logger.info(f"GapFill: analyzer returned {len(gaps)} gap(s)")
     return gaps

@@ -311,6 +311,13 @@ GAP_FILL_MAX_GAPS: int = 5
 # Use a tight timeout to prevent a single hung analyzer request from holding a
 # research concurrency slot for the full grounded-search budget.
 GAP_FILL_ANALYZER_TIMEOUT: int = 120
+# Wall-clock backstop for the analyzer call. Slight headroom over
+# GAP_FILL_ANALYZER_TIMEOUT so the cleaner per-request error from litellm fires
+# first when possible (auth failure, model-not-found, etc.) — same pattern as
+# NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT (60s headroom). Without
+# this, asyncio.wait_for and the litellm request timeout fire at the exact
+# same second and we lose the descriptive error message.
+GAP_FILL_ANALYZER_WALL_TIMEOUT: int = 135
 # Skip gap-fill when the first-pass research blob has less than this many
 # non-whitespace characters — likely indicates all providers soft-failed and
 # gap-fill would just hallucinate gaps or burn quota.
