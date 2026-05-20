@@ -231,11 +231,30 @@ NATIVE_SEARCH_MAX_TOKENS: int = 16_000
 NATIVE_SEARCH_TIMEOUT: int = (
     360  # 2026-05-17: raised 240→360 alongside gpt-5.5 medium-effort migration; see comparison_v3.md
 )
+# Wall-clock backstop for the native-search provider. NATIVE_SEARCH_TIMEOUT
+# above is the litellm per-HTTP-request timeout; it resets across retries
+# (allowed_tries default 3 ⇒ worst case ~18 min) and was observed defeated
+# entirely on 2026-05-20 by an OpenRouter response that dripped ~700 lines of
+# whitespace keep-alive bytes over 8m37s before closing with malformed JSON.
+# asyncio.wait_for around llm.invoke gives us a hard wall-clock cap regardless
+# of what the underlying HTTP layer does. Slight headroom over the request
+# timeout so the cleaner per-request error fires first when possible.
+NATIVE_SEARCH_WALL_TIMEOUT: int = 420
 # Reasoning effort and verbosity for the OpenAI native-search call.
 # Override via env vars NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY.
 # Empty string disables passing the kwarg.
 NATIVE_SEARCH_REASONING_EFFORT_ENV: str = "NATIVE_SEARCH_REASONING_EFFORT"
-NATIVE_SEARCH_REASONING_EFFORT_DEFAULT: str = "medium"
+# 2026-05-20: dropped medium→low after the OpenRouter whitespace-stream incident
+# that consumed 8m37s on a single call. v3 bench (comparison_v3.md) measured
+# gpt-5.5 effort=low at ~50s vs effort=medium at ~230s, so low gives ~4.5×
+# faster wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT (420s)
+# / NATIVE_SEARCH_TIMEOUT (360s). Caveat: v3 only sanity-checked low for latency,
+# not graded quality (mini at default scored 15/25, gpt-5.5 medium 23/25, low
+# unknown). Override via NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs
+# medium quality back. Note: this default applies ONLY to the native-search
+# provider — DISAGREEMENT_ANALYZER_LLM stays at medium (llm_configs.py:182),
+# all forecasters stay at high.
+NATIVE_SEARCH_REASONING_EFFORT_DEFAULT: str = "low"
 NATIVE_SEARCH_VERBOSITY_ENV: str = "NATIVE_SEARCH_VERBOSITY"
 NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
 # Native search web options (passed to OpenRouter plugins)
@@ -279,7 +298,14 @@ GEMINI_SEARCH_TIMEOUT: int = 180
 # Gemini search. Fails soft — forecast proceeds with first-pass research alone
 # if any stage errors out.
 GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
-GAP_FILL_ANALYZER_MODEL: str = "gemini-3-flash-preview"
+# 2026-05-20: migrated analyzer from gemini-3-flash-preview (google-genai SDK
+# direct) to gpt-5.5 effort=low via OpenRouter. The analyzer is non-grounded —
+# it reads the first-pass research and emits a JSON list of factual gaps —
+# so it doesn't need Google as a search index, and OpenAI-stack consistency
+# matches the rest of the auxiliary tier (native_search, disagreement_analyzer
+# also at gpt-5.5 low). Grounded search resolution still uses google-genai
+# directly via gemini_search_provider — that path needs the search index.
+GAP_FILL_ANALYZER_MODEL: str = "openrouter/openai/gpt-5.5"
 GAP_FILL_MAX_GAPS: int = 5
 # Analyzer call is non-grounded (no Google Search) and should return quickly.
 # Use a tight timeout to prevent a single hung analyzer request from holding a

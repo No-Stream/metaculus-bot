@@ -93,3 +93,7 @@ jobs:
           # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
           # parallel grounded Gemini searches resolve each. Fails soft.
           GAP_FILL_ENABLED: 'true'
+          # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
+          # Manual workflow_dispatch runs use this for end-to-end testing in prod
+          # mode (is_benchmarking=False).
+          PREDICTION_MARKETS_ENABLED: 'true'

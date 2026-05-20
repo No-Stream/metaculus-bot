@@ -121,14 +121,13 @@ PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     reasoning={"effort": "low"},
     **DETERMINISTIC_MODEL_CONFIG,
 )
-# Researcher is only used by the base bot when internal research is invoked.
-# Our implementation uses providers, but we still set it explicitly to avoid silent defaults.
-# Migrated 2026-05-17 same rationale as SUMMARIZER_LLM above.
-RESEARCHER_LLM = build_llm_with_openrouter_fallback(
-    model="openrouter/openai/gpt-5.4-mini",
-    reasoning={"effort": "low"},
-    **DETERMINISTIC_MODEL_CONFIG,
-)
+# Researcher slot in the forecasting-tools LLM config dict. Effectively dead
+# code in our pipeline — we use research providers (AskNews/Gemini/native_search)
+# rather than the framework's researcher path — but the slot must be populated
+# to avoid silent framework defaults. Aliasing to SUMMARIZER_LLM rather than
+# constructing a duplicate config: same model, same effort, same job tier, no
+# reason to maintain two parallel definitions.
+RESEARCHER_LLM = SUMMARIZER_LLM
 
 # Stacker meta-model for conditional stacking (invoked only on high-disagreement questions).
 #
@@ -172,13 +171,14 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 }
 
 
-# Medium-effort model for identifying the crux of model disagreement (feeds into targeted research).
-# Crux text becomes the targeted-search query, so quality drives downstream retrieval quality;
-# medium effort gives faster wall-clock for a structured 1-3 sentence extraction without
-# materially hurting quality, and matches the effort tier we settled on for native search.
-# Cost is ~$0.055/disagreement-Q × ~75 Qs/tournament = ~$4/tournament — negligible.
+# Tier-B auxiliary: read-and-synthesize work that needs taste but not deep
+# reasoning. Identifies the crux of forecaster disagreement; output text seeds
+# the targeted-search query downstream. Dropped 2026-05-20 from medium→low
+# effort alongside the broader tier-B consolidation (native_search also at low):
+# 1-3 sentence crux extraction is structure-following with light judgment, not
+# deep reasoning. Cost roughly halves (~$4 → ~$1.50/tournament).
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.5",
-    reasoning={"effort": "medium"},
+    reasoning={"effort": "low"},
     **DETERMINISTIC_MODEL_CONFIG,
 )
