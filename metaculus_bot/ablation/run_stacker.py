@@ -6,9 +6,9 @@ Reads cached forecaster rationales, runs the tool-runner (per-rationale
 ``PROBABILISTIC_TOOLS_ENABLED`` env-var state at the moment we call the
 tool-runner functions:
 
-* ARM_A — flag explicitly unset; both ``run_tools_for_forecaster`` and
+* ARM_STACK — flag explicitly unset; both ``run_tools_for_forecaster`` and
   ``build_cross_model_aggregation`` early-return ``""``.
-* ARM_B — flag set to ``"1"``; both runners produce real markdown that
+* ARM_PDF — flag set to ``"1"``; both runners produce real markdown that
   gets piped into the stacker prompt.
 
 Caches per ``(qid, arm)``. On primary-stacker failure, falls back to a
@@ -65,8 +65,11 @@ from metaculus_bot.numeric_utils import bound_messages
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ARM_A = "A"  # tools OFF
-ARM_B = "B"  # tools ON
+ARM_STACK = "stack"  # LLM stacker, rationale only, no probability-math tools
+ARM_PDF = "pdf"  # LLM stacker, rationale + computed quantities + cross-model PDF aggregation
+ARM_MEDIAN = (
+    "median"  # deterministic median over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_median)
+)
 
 # Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
 # claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.5 as
@@ -138,8 +141,9 @@ def _build_default_fallback_stacker_llm() -> GeneralLlm:
 # ``forecasters.py`` and this module from importing each other.
 __all__ = [
     "ABLATION_MIN_FORECASTERS",
-    "ARM_A",
-    "ARM_B",
+    "ARM_MEDIAN",
+    "ARM_PDF",
+    "ARM_STACK",
     "DEFAULT_PARSER_MODEL",
     "DEFAULT_STACKER_FALLBACK_MODEL",
     "DEFAULT_STACKER_MODEL",
@@ -456,7 +460,7 @@ async def run_stacker_for_arm(
             "stacker_model_used": None,
             "n_forecasters_used": len(surviving),
             "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": arm == ARM_B,
+            "tools_enabled_at_runtime": arm == ARM_PDF,
             "errors": [],
         }
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
@@ -475,7 +479,7 @@ async def run_stacker_for_arm(
     if parser_llm is None:
         parser_llm = GeneralLlm(model=DEFAULT_PARSER_MODEL, allowed_tries=1)
 
-    enable_tools = arm == ARM_B
+    enable_tools = arm == ARM_PDF
 
     with probabilistic_tools_enabled(enable_tools):
         # Per-rationale "Computed quantities" augmentation. The runner
