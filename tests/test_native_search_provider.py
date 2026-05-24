@@ -1,7 +1,7 @@
 """Tests for native search research provider."""
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -205,29 +205,21 @@ class TestParallelProviderSelection:
     ) -> None:
         """Verify only primary provider returned when native search disabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
-        # Use setenv("false") rather than delenv(): on first import in isolation,
-        # `from main import ...` triggers load_environment() which re-injects
-        # FINANCIAL_DATA_ENABLED=true from .env. setenv survives that
-        # (load_dotenv defaults to override=False).
         monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-        # Mock the TemplateForecaster minimally
-        from main import TemplateForecaster
+        from forecasting_tools import GeneralLlm
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot._custom_research_provider = None
-            bot.is_benchmarking = False
-            bot.allow_research_fallback = True
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-            # Mock _select_research_provider to return a known provider
-            async def mock_provider(q: str) -> str:
-                return "primary research"
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
 
-            with patch.object(bot, "_select_research_provider", return_value=(mock_provider, "asknews")):
-                providers = bot._select_research_providers()
+        mock_provider = AsyncMock(return_value="primary research")
+
+        with patch.object(orch, "_select_research_provider", return_value=(mock_provider, "asknews")):
+            providers = orch._select_research_providers()
 
         assert len(providers) == 1
         assert providers[0][1] == "asknews"
@@ -239,24 +231,21 @@ class TestParallelProviderSelection:
         """Verify native search provider added when enabled."""
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")
         monkeypatch.setenv("NATIVE_SEARCH_MODEL", "openai/gpt-5.5")
-        # See sibling test: setenv("false") survives load_environment(), delenv doesn't.
         monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-        from main import TemplateForecaster
+        from forecasting_tools import GeneralLlm
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot._custom_research_provider = None
-            bot.is_benchmarking = False
-            bot.allow_research_fallback = True
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-            async def mock_provider(q: str) -> str:
-                return "primary research"
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
 
-            with patch.object(bot, "_select_research_provider", return_value=(mock_provider, "asknews")):
-                providers = bot._select_research_providers()
+        mock_provider = AsyncMock(return_value="primary research")
+
+        with patch.object(orch, "_select_research_provider", return_value=(mock_provider, "asknews")):
+            providers = orch._select_research_providers()
 
         assert len(providers) == 2
         provider_names = [name for _, name in providers]
@@ -268,27 +257,20 @@ class TestParallelExecution:
     """Tests for parallel provider execution."""
 
     @pytest.mark.asyncio
-    async def test_run_providers_parallel_combines_results(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    async def test_run_providers_parallel_combines_results(self) -> None:
         """Verify parallel execution combines results from multiple providers."""
-        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        from forecasting_tools import GeneralLlm
 
-        from main import TemplateForecaster
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot.allow_research_fallback = False
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-            async def provider1(q: str) -> str:
-                return "Research from provider 1"
+        provider1 = AsyncMock(return_value="Research from provider 1")
+        provider2 = AsyncMock(return_value="Research from provider 2")
 
-            async def provider2(q: str) -> str:
-                return "Research from provider 2"
-
-            providers = [(provider1, "asknews"), (provider2, "native_search")]
-            result = await bot._run_providers_parallel(_make_q("Test question"), providers)
+        providers = [(provider1, "asknews"), (provider2, "native_search")]
+        result = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from provider 1" in result
         assert "Research from provider 2" in result
@@ -296,72 +278,52 @@ class TestParallelExecution:
         assert "## Web Research (Native Search)" in result
 
     @pytest.mark.asyncio
-    async def test_run_providers_parallel_handles_provider_failure(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    async def test_run_providers_parallel_handles_provider_failure(self) -> None:
         """Verify parallel execution handles individual provider failures gracefully."""
-        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        from forecasting_tools import GeneralLlm
 
-        from main import TemplateForecaster
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot.allow_research_fallback = False
-            # __init__ was bypassed; set the counter attribute that
-            # _run_providers_parallel now increments on non-AskNews-403
-            # provider failures.
-            bot._research_provider_timeout_count = 0
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-            async def failing_provider(q: str) -> str:
-                raise RuntimeError("Provider failed")
+        failing_provider = AsyncMock(side_effect=RuntimeError("Provider failed"))
+        working_provider = AsyncMock(return_value="Research from working provider")
 
-            async def working_provider(q: str) -> str:
-                return "Research from working provider"
+        providers = [(failing_provider, "failing"), (working_provider, "working")]
+        result = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
-            providers = [(failing_provider, "failing"), (working_provider, "working")]
-            result = await bot._run_providers_parallel(_make_q("Test question"), providers)
-
-        # Should still have result from working provider
         assert "Research from working provider" in result
-        # Should not crash or include empty result from failed provider
 
     @pytest.mark.asyncio
-    async def test_run_providers_parallel_runs_concurrently(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    async def test_run_providers_parallel_runs_concurrently(self) -> None:
         """Verify providers actually run in parallel, not sequentially."""
-        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        from forecasting_tools import GeneralLlm
 
-        from main import TemplateForecaster
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
         execution_order: list[str] = []
         completion_order: list[str] = []
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot.allow_research_fallback = False
+        async def slow_provider(q):  # noqa: ASYNC910
+            execution_order.append("slow_start")
+            await asyncio.sleep(0.1)
+            completion_order.append("slow")
+            return "Slow result"
 
-            async def slow_provider(q: str) -> str:
-                execution_order.append("slow_start")
-                await asyncio.sleep(0.1)
-                completion_order.append("slow")
-                return "Slow result"
+        async def fast_provider(q):  # noqa: ASYNC910
+            execution_order.append("fast_start")
+            await asyncio.sleep(0.01)
+            completion_order.append("fast")
+            return "Fast result"
 
-            async def fast_provider(q: str) -> str:
-                execution_order.append("fast_start")
-                await asyncio.sleep(0.01)
-                completion_order.append("fast")
-                return "Fast result"
+        providers = [(slow_provider, "slow"), (fast_provider, "fast")]
+        await orch._run_providers_parallel(_make_q("Test question"), providers)
 
-            # Slow provider listed first, but fast should complete first if parallel
-            providers = [(slow_provider, "slow"), (fast_provider, "fast")]
-            await bot._run_providers_parallel(_make_q("Test question"), providers)
-
-        # Both should start before either completes (parallel execution)
         assert execution_order == ["slow_start", "fast_start"]
-        # Fast should complete before slow
         assert completion_order == ["fast", "slow"]
 
 
@@ -371,43 +333,35 @@ class TestAskNewsSubscriptionErrorHandling:
 
     The provider loop must silence only the exact subscription-inactive
     signature (class-name + message match) — every other asknews failure must
-    bump _research_provider_timeout_count so CI surfaces it.
+    bump timeout_count so CI surfaces it.
     """
 
     @pytest.mark.asyncio
     async def test_asknews_subscription_inactive_not_counted_and_info_logged(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """AskNews 403011 → counter stays 0, INFO log emitted, no WARNING."""
         import logging
 
-        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        from forecasting_tools import GeneralLlm
 
-        from main import TemplateForecaster
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-        # Local class named "ForbiddenError" so type(exc).__name__ matches the
-        # SDK's real class name that is_asknews_subscription_error looks for.
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+
         class ForbiddenError(Exception):
             pass
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot.allow_research_fallback = False
-            bot._research_provider_timeout_count = 0
+        async def asknews_provider(q):  # noqa: ASYNC910
+            raise ForbiddenError("403011 - subscription is not currently active")
 
-            async def asknews_provider(q: str) -> str:
-                raise ForbiddenError("403011 - subscription is not currently active")
-
-            with caplog.at_level(logging.INFO, logger="main"):
-                result = await bot._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research_orchestrator"):
+            result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
-        assert bot._research_provider_timeout_count == 0, (
-            "Off-season subscription-inactive must NOT count as an alertable failure."
-        )
-        # Matching INFO-level log (no WARNING) should be present.
+        assert orch.timeout_count == 0, "Off-season subscription-inactive must NOT count as an alertable failure."
         info_records = [r for r in caplog.records if r.levelno == logging.INFO and "asknews" in r.getMessage().lower()]
         warning_records = [
             r for r in caplog.records if r.levelno == logging.WARNING and "asknews" in r.getMessage().lower()
@@ -418,28 +372,24 @@ class TestAskNewsSubscriptionErrorHandling:
     @pytest.mark.asyncio
     async def test_asknews_non_subscription_error_counted_and_warning_logged(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """AskNews non-subscription failure → counter bumped, WARNING logged."""
         import logging
 
-        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        from forecasting_tools import GeneralLlm
 
-        from main import TemplateForecaster
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot.allow_research_fallback = False
-            bot._research_provider_timeout_count = 0
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
-            async def asknews_provider(q: str) -> str:
-                raise RuntimeError("connection timeout")
+        asknews_provider = AsyncMock(side_effect=RuntimeError("connection timeout"))
 
-            with caplog.at_level(logging.WARNING, logger="main"):
-                result = await bot._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research_orchestrator"):
+            result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
-        assert bot._research_provider_timeout_count == 1
+        assert orch.timeout_count == 1
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("asknews" in r.getMessage().lower() for r in warning_records)

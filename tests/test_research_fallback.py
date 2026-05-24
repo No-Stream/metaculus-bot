@@ -32,18 +32,16 @@ async def test_run_research_falls_back_to_openrouter(monkeypatch, question, base
     bot = TemplateForecaster(llms=base_llms, aggregation_strategy=AggregationStrategy.MEAN)
 
     failing_provider = AsyncMock(side_effect=RuntimeError("primary failure"))
-    # Patch the new _select_research_providers method
-    monkeypatch.setattr(bot, "_select_research_providers", lambda: [(failing_provider, "asknews")])
+    monkeypatch.setattr(bot._research, "_select_research_providers", lambda: [(failing_provider, "asknews")])
 
     fallback = AsyncMock(return_value="fallback research")
-    monkeypatch.setattr(bot, "_call_perplexity", fallback)
+    monkeypatch.setattr(bot._research, "_call_perplexity", fallback)
     monkeypatch.setenv("OPENROUTER_API_KEY", "token")
     monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
 
     result = await bot.run_research(question)
 
-    # Result now includes provider header for non-empty fallback
     assert "fallback research" in result
     assert failing_provider.await_count == 1
     fallback.assert_awaited_once_with(question.question_text, use_open_router=True)
@@ -59,17 +57,14 @@ async def test_run_research_returns_empty_when_all_providers_fail(monkeypatch, q
     )
 
     failing_provider = AsyncMock(side_effect=RuntimeError("primary failure"))
-    # Patch the new _select_research_providers method
-    monkeypatch.setattr(bot, "_select_research_providers", lambda: [(failing_provider, "asknews")])
+    monkeypatch.setattr(bot._research, "_select_research_providers", lambda: [(failing_provider, "asknews")])
 
-    monkeypatch.setattr(bot, "_call_perplexity", AsyncMock(side_effect=RuntimeError("fallback fail")))
-    monkeypatch.setattr(bot, "_call_exa_smart_searcher", AsyncMock(side_effect=RuntimeError("exa fail")))
+    monkeypatch.setattr(bot._research, "_call_perplexity", AsyncMock(side_effect=RuntimeError("fallback fail")))
+    monkeypatch.setattr(bot._research, "_call_exa_smart_searcher", AsyncMock(side_effect=RuntimeError("exa fail")))
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
 
-    # With parallel provider execution, failures are handled gracefully
-    # and return empty string rather than raising
     result = await bot.run_research(question)
     assert result == ""
     assert failing_provider.await_count == 1

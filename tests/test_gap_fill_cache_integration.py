@@ -42,7 +42,7 @@ async def test_cache_stores_research_with_gap_fill_addendum(
         research_cache=shared_cache,
         llms=test_llms,
     )
-    bot._custom_research_provider = AsyncMock(
+    bot._research._custom_provider = AsyncMock(
         return_value="first-pass research blob with enough substance to clear the length guard: "
         + ("lorem ipsum dolor sit amet " * 10)
     )
@@ -83,7 +83,7 @@ async def test_gap_fill_disabled_by_default(
         research_cache={},
         llms=test_llms,
     )
-    bot._custom_research_provider = AsyncMock(
+    bot._research._custom_provider = AsyncMock(
         return_value="first-pass research blob with enough substance to clear the length guard: "
         + ("lorem ipsum dolor sit amet " * 10)
     )
@@ -120,7 +120,7 @@ async def test_gap_fill_skipped_when_first_pass_is_tiny(
         llms=test_llms,
     )
     # Short blob — provider header + a few words, well below GAP_FILL_MIN_RESEARCH_CHARS=200.
-    bot._custom_research_provider = AsyncMock(return_value="tiny blob")
+    bot._research._custom_provider = AsyncMock(return_value="tiny blob")
 
     fake_gap_fill = AsyncMock(return_value="SHOULD_NOT_APPEAR")
     with patch("metaculus_bot.targeted_research.run_gap_fill_pass", fake_gap_fill):
@@ -155,7 +155,7 @@ async def test_gap_fill_empty_return_does_not_add_addendum(
         research_cache={},
         llms=test_llms,
     )
-    bot._custom_research_provider = AsyncMock(
+    bot._research._custom_provider = AsyncMock(
         return_value="first-pass research blob with enough substance to clear the length guard: "
         + ("lorem ipsum dolor sit amet " * 10)
     )
