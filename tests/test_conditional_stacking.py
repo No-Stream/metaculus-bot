@@ -4,6 +4,7 @@ Tests the full conditional stacking flow: spread computation -> threshold check 
 crux extraction -> targeted research -> stacking (or skip to median aggregation).
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -24,6 +25,129 @@ from tests.conftest import make_mock_numeric_question
 
 # Standard 11-percentile values used throughout numeric tests
 _STANDARD_PERCENTILES = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
+
+
+# ---------------------------------------------------------------------------
+# Shared mock helper -- most tests patch the same 6-7 objects with minor param
+# variations.  This contextmanager centralizes the setup so each test only
+# specifies what differs.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def mock_stacking_pipeline(
+    bot,
+    *,
+    predictions: list,
+    research: str = "base research text",
+    crux_return: str | None = "The crux is X",
+    crux_side_effect: BaseException | None = None,
+    targeted_search_return: str | None = "Targeted search results",
+    targeted_search_side_effect: BaseException | None = None,
+    aggregate_return=None,
+    run_stacking_return=None,
+    run_stacking_side_effect: BaseException | None = None,
+    extra_patches: list | None = None,
+):
+    """Mock the conditional stacking pipeline for testing.
+
+    Yields a dict of all mock handles keyed by short name so callers can
+    assert on call counts and args.
+
+    Parameters
+    ----------
+    predictions : list
+        The list of ReasonedPrediction objects that _gather_predictions returns.
+    research : str
+        Return value for bot.run_research.
+    crux_return / crux_side_effect : str | None / Exception | None
+        Controls extract_disagreement_crux behavior.  If side_effect is set it
+        takes precedence (simulates failure).
+    targeted_search_return / targeted_search_side_effect : same pattern for
+        run_targeted_search.
+    aggregate_return : any
+        If provided, bot._aggregate_predictions is mocked with this return_value.
+        If None, _aggregate_predictions is NOT mocked (runs for real or caller
+        provides via extra_patches).
+    run_stacking_return / run_stacking_side_effect : controls bot._run_stacking
+        mock.  If both are None, _run_stacking is NOT mocked.
+    extra_patches : list[patch context managers]
+        Additional patches to enter alongside the standard set.  Useful for
+        one-off mocks like aggregate_binary_mean.
+    """
+    crux_kwargs: dict = {"new_callable": AsyncMock}
+    if crux_side_effect is not None:
+        crux_kwargs["side_effect"] = crux_side_effect
+    else:
+        crux_kwargs["return_value"] = crux_return
+
+    search_kwargs: dict = {"new_callable": AsyncMock}
+    if targeted_search_side_effect is not None:
+        search_kwargs["side_effect"] = targeted_search_side_effect
+    else:
+        search_kwargs["return_value"] = targeted_search_return
+
+    with (
+        patch.object(bot, "_get_notepad") as mock_notepad,
+        patch.object(bot, "run_research", return_value=research) as mock_research,
+        patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+        patch.object(
+            bot,
+            "_forecaster_with_soft_deadline",
+            new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+        ),
+        patch("main.extract_disagreement_crux", **crux_kwargs) as mock_crux,
+        patch("main.run_targeted_search", **search_kwargs) as mock_targeted,
+    ):
+        mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
+        mock_gather.return_value = (predictions, [], None)
+
+        # Optional _aggregate_predictions mock
+        agg_cm = None
+        mock_aggregate = None
+        if aggregate_return is not None:
+            agg_cm = patch.object(bot, "_aggregate_predictions", return_value=aggregate_return)
+            mock_aggregate = agg_cm.__enter__()
+
+        # Optional _run_stacking mock
+        stacking_cm = None
+        mock_run_stacking = None
+        if run_stacking_return is not None or run_stacking_side_effect is not None:
+            stacking_kw = {}
+            if run_stacking_side_effect is not None:
+                stacking_kw["side_effect"] = run_stacking_side_effect
+            else:
+                stacking_kw["return_value"] = run_stacking_return
+            stacking_cm = patch.object(bot, "_run_stacking", **stacking_kw)
+            mock_run_stacking = stacking_cm.__enter__()
+
+        # Extra patches
+        extra_mocks = {}
+        extra_cms = []
+        if extra_patches:
+            for name, cm in extra_patches:
+                entered = cm.__enter__()
+                extra_cms.append(cm)
+                extra_mocks[name] = entered
+
+        try:
+            yield {
+                "notepad": mock_notepad,
+                "research": mock_research,
+                "gather": mock_gather,
+                "crux": mock_crux,
+                "targeted": mock_targeted,
+                "aggregate": mock_aggregate,
+                "run_stacking": mock_run_stacking,
+                **extra_mocks,
+            }
+        finally:
+            for cm in reversed(extra_cms):
+                cm.__exit__(None, None, None)
+            if stacking_cm is not None:
+                stacking_cm.__exit__(None, None, None)
+            if agg_cm is not None:
+                agg_cm.__exit__(None, None, None)
 
 
 def _make_bot(
@@ -51,8 +175,6 @@ def _make_bot(
         is_benchmarking=True,
         stacking_spread_thresholds=stacking_spread_thresholds,
         stacking_fallback_on_failure=stacking_fallback_on_failure,
-        # Test fixtures use 2-model ensembles for speed; allow publishing at
-        # that lower threshold so tests don't trip the production guard.
         min_forecasters_to_publish=1,
     )
 
@@ -80,286 +202,23 @@ def _make_mc_question(question_id: int = 201) -> Mock:
     return question
 
 
-class TestConditionalStackingBinaryTrigger:
-    """Tests that stacking triggers correctly for binary questions with high spread."""
+# Standard binary predictions with high spread (0.10 vs 0.85 -> range 0.75)
+_HIGH_SPREAD_BINARY = [
+    ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no."),
+    ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes."),
+]
 
-    @pytest.mark.asyncio
-    async def test_high_spread_triggers_stacking(self):
-        """High prob-range spread (>0.15) should trigger the full stacking pipeline."""
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        # Predictions: 0.10 and 0.85 -> prob range 0.75, well above 0.15 threshold
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Crux extraction was called
-            mock_crux.assert_called_once()
-            crux_call_args = mock_crux.call_args
-            assert crux_call_args[0][0] == bot._analyzer_llm
-            assert crux_call_args[0][1] == question.question_text
-
-            # Targeted search was called with the crux
-            mock_targeted.assert_called_once()
-            assert mock_targeted.call_args[0][0] == "The crux is whether X happened"
-
-            # Stacking aggregation was called with combined research
-            mock_aggregate.assert_called_once()
-            agg_kwargs = mock_aggregate.call_args[1]
-            assert "Targeted Research" in agg_kwargs["research"]
-            assert "base research text" in agg_kwargs["research"]
-
-            # The targeted-research section reaches the published comment via
-            # ResearchWithPredictions.research_report (the regression fix at
-            # main.py:880 replaced raw `research` with `combined_research`).
-            assert "## Targeted Research (addressing model disagreement)" in result.research_report
-            assert "base research text" in result.research_report
-
-            # Result has exactly 1 prediction (stacked)
-            assert len(result.predictions) == 1
-            assert result.predictions[0].prediction_value == 0.72
-
-            # Diagnostic counter incremented
-            assert bot._conditional_stacking_triggered_count == 1
-            assert bot._conditional_stacking_skipped_count == 0
-
-    @pytest.mark.asyncio
-    async def test_low_spread_skips_stacking(self):
-        """Low prob-range spread (<0.15) should skip stacking and return all individual predictions."""
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        # Predictions: 0.45 and 0.55 -> prob range 0.10, below 0.15 threshold
-        pred1 = ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nSlightly no.")
-        pred2 = ReasonedPrediction(prediction_value=0.55, reasoning="Model: m2\n\nSlightly yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-            ) as mock_targeted,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Stacking pipeline NOT invoked
-            mock_crux.assert_not_called()
-            mock_targeted.assert_not_called()
-
-            # All individual predictions preserved
-            assert len(result.predictions) == 2
-            assert result.predictions[0].prediction_value == 0.45
-            assert result.predictions[1].prediction_value == 0.55
-
-            # Skip path returns the raw research as research_report — no
-            # targeted-research header should leak into the published comment.
-            assert "## Targeted Research" not in result.research_report
-
-            # Diagnostic counter incremented
-            assert bot._conditional_stacking_skipped_count == 1
-            assert bot._conditional_stacking_triggered_count == 0
+# Standard binary predictions with low spread (0.45 vs 0.55 -> range 0.10)
+_LOW_SPREAD_BINARY = [
+    ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nSlightly no."),
+    ReasonedPrediction(prediction_value=0.55, reasoning="Model: m2\n\nSlightly yes."),
+]
 
 
-class TestConditionalStackingFallbacks:
-    """Tests for graceful degradation when pipeline components fail."""
-
-    @pytest.mark.asyncio
-    async def test_crux_extraction_failure_falls_through(self):
-        """Crux extraction failure should still proceed to stacking with base research only."""
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("Analyzer LLM timed out"),
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.65) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Crux extraction was attempted and failed
-            mock_crux.assert_called_once()
-            # Targeted search NOT called (no crux to search for)
-            mock_targeted.assert_not_called()
-
-            # Stacking still proceeded with base research only
-            mock_aggregate.assert_called_once()
-            agg_kwargs = mock_aggregate.call_args[1]
-            assert "Targeted Research" not in agg_kwargs["research"]
-
-            # No crash, result is valid
-            assert len(result.predictions) == 1
-            assert result.predictions[0].prediction_value == 0.65
-
-    @pytest.mark.asyncio
-    async def test_targeted_search_failure_falls_through(self):
-        """Targeted search failure should still proceed to stacking with base research only."""
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is about X",
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("Search API down"),
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.60) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Targeted search was attempted and failed
-            mock_targeted.assert_called_once()
-
-            # Stacking still proceeded with base research only
-            mock_aggregate.assert_called_once()
-            agg_kwargs = mock_aggregate.call_args[1]
-            assert "Targeted Research" not in agg_kwargs["research"]
-
-            # No crash, result is valid
-            assert len(result.predictions) == 1
-            assert result.predictions[0].prediction_value == 0.60
-
-    @pytest.mark.asyncio
-    async def test_stacking_failure_falls_back_to_median(self):
-        """When stacking itself fails, fallback to MEDIAN aggregation (via MEAN fallback path)."""
-        bot = _make_bot(stacking_fallback_on_failure=True)
-        question = _make_binary_question()
-
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="crux text",
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="targeted results",
-            ),
-            patch.object(
-                bot,
-                "_run_stacking",
-                side_effect=RuntimeError("Stacker LLM crashed"),
-            ),
-            patch(
-                "metaculus_bot.numeric_utils.aggregate_binary_mean",
-                return_value=0.475,
-            ),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Result should be the MEAN-fallback value
-            assert len(result.predictions) == 1
-            assert result.predictions[0].prediction_value == 0.475
-
-            # Fallback counter incremented
-            assert bot._stacking_fallback_count == 1
-
-
-class TestConditionalStackingMC:
-    """Tests for conditional stacking with multiple choice questions."""
-
-    @pytest.mark.asyncio
-    async def test_mc_high_spread_triggers(self):
-        """MC question with >0.20 max option spread should trigger stacking."""
-        bot = _make_bot()
-        question = _make_mc_question()
-
-        # Predictions where option A has 0.30 spread across models (>0.20 threshold)
-        pred1 = ReasonedPrediction(
+def _make_high_spread_mc_predictions() -> list[ReasonedPrediction]:
+    """MC predictions where option A has 0.30 spread (>0.20 threshold)."""
+    return [
+        ReasonedPrediction(
             prediction_value=PredictedOptionList(
                 predicted_options=[
                     PredictedOption(option_name="A", probability=0.60),
@@ -368,8 +227,8 @@ class TestConditionalStackingMC:
                 ]
             ),
             reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
+        ),
+        ReasonedPrediction(
             prediction_value=PredictedOptionList(
                 predicted_options=[
                     PredictedOption(option_name="A", probability=0.30),
@@ -378,172 +237,22 @@ class TestConditionalStackingMC:
                 ]
             ),
             reasoning="Model: m2\n\nOption B is stronger.",
-        )
-
-        mock_stacked_result = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="A", probability=0.45),
-                PredictedOption(option_name="B", probability=0.35),
-                PredictedOption(option_name="C", probability=0.20),
-            ]
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_result) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Full pipeline triggered
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
-
-            # Single stacked prediction returned
-            assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+        ),
+    ]
 
 
-class TestConditionalStackingThresholds:
-    """Tests for custom and boundary threshold behavior."""
-
-    @pytest.mark.asyncio
-    async def test_custom_thresholds(self):
-        """Very high custom thresholds should prevent stacking even with moderate spread."""
-        bot = _make_bot(
-            stacking_spread_thresholds={"binary": 0.95, "mc": 0.90, "numeric": 0.90},
-        )
-        question = _make_binary_question()
-
-        # Predictions: 0.20 and 0.80 -> prob range 0.60, below custom threshold 0.95
-        pred1 = ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nUnlikely.")
-        pred2 = ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nLikely.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-            ) as mock_crux,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            # Stacking NOT triggered despite moderate spread (threshold too high)
-            mock_crux.assert_not_called()
-            assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
-
-    @pytest.mark.asyncio
-    async def test_spread_just_above_threshold(self):
-        """Spread barely above threshold should trigger stacking."""
-        # Default binary threshold is 0.15 probability range (max - min).
-        # 0.40 - 0.24 = 0.16 > 0.15 -> triggers
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        pred1 = ReasonedPrediction(prediction_value=0.24, reasoning="Model: m1\n\nAnalysis 1")
-        pred2 = ReasonedPrediction(prediction_value=0.40, reasoning="Model: m2\n\nAnalysis 2")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="crux",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="search results",
-            ),
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            mock_crux.assert_called_once()
-            assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
-
-    @pytest.mark.asyncio
-    async def test_spread_just_below_threshold(self):
-        """Spread barely below threshold should skip stacking."""
-        # Default binary threshold is 0.15 probability range (max - min).
-        # 0.39 - 0.25 = 0.14 < 0.15 -> skips
-        bot = _make_bot()
-        question = _make_binary_question()
-
-        pred1 = ReasonedPrediction(prediction_value=0.25, reasoning="Model: m1\n\nAnalysis 1")
-        pred2 = ReasonedPrediction(prediction_value=0.39, reasoning="Model: m2\n\nAnalysis 2")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-            ) as mock_crux,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-            mock_crux.assert_not_called()
-            assert len(result.predictions) == 2
-            assert bot._conditional_stacking_skipped_count == 1
+def _make_stacked_mc_result() -> PredictedOptionList:
+    return PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name="A", probability=0.45),
+            PredictedOption(option_name="B", probability=0.35),
+            PredictedOption(option_name="C", probability=0.20),
+        ]
+    )
 
 
 def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) -> NumericDistribution:
-    """Build a NumericDistribution with 11 percentiles centered on median_value.
-
-    spread_factor controls how wide the percentiles are spread around the median.
-    """
+    """Build a NumericDistribution with 11 percentiles centered on median_value."""
     offsets = [-20, -17, -14, -10, -4, 0, 4, 10, 14, 17, 20]
     percentiles = [
         Percentile(value=max(0.0, min(100.0, median_value + offset * spread_factor)), percentile=pct)
@@ -557,6 +266,245 @@ def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) 
         lower_bound=0.0,
         zero_point=None,
     )
+
+
+def _make_high_spread_numeric_predictions() -> list[ReasonedPrediction]:
+    """Numeric predictions: model 1 centered at 30, model 2 at 70 -> spread 0.40 >> 0.15."""
+    return [
+        ReasonedPrediction(prediction_value=_make_numeric_distribution(30.0), reasoning="Model: m1\n\nLow estimate."),
+        ReasonedPrediction(prediction_value=_make_numeric_distribution(70.0), reasoning="Model: m2\n\nHigh estimate."),
+    ]
+
+
+class TestConditionalStackingBinaryTrigger:
+    """Tests that stacking triggers correctly for binary questions with high spread."""
+
+    @pytest.mark.asyncio
+    async def test_high_spread_triggers_stacking(self):
+        """High prob-range spread (>0.15) should trigger the full stacking pipeline."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_called_once()
+            crux_call_args = mocks["crux"].call_args
+            assert crux_call_args[0][0] == bot._analyzer_llm
+            assert crux_call_args[0][1] == question.question_text
+
+            mocks["targeted"].assert_called_once()
+            assert mocks["targeted"].call_args[0][0] == "The crux is whether X happened"
+
+            mocks["aggregate"].assert_called_once()
+            agg_kwargs = mocks["aggregate"].call_args[1]
+            assert "Targeted Research" in agg_kwargs["research"]
+            assert "base research text" in agg_kwargs["research"]
+
+            assert "## Targeted Research (addressing model disagreement)" in result.research_report
+            assert "base research text" in result.research_report
+
+            assert len(result.predictions) == 1
+            assert result.predictions[0].prediction_value == 0.72
+
+            assert bot._conditional_stacking_triggered_count == 1
+            assert bot._conditional_stacking_skipped_count == 0
+
+    @pytest.mark.asyncio
+    async def test_low_spread_skips_stacking(self):
+        """Low prob-range spread (<0.15) should skip stacking and return all individual predictions."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+
+            assert len(result.predictions) == 2
+            assert result.predictions[0].prediction_value == 0.45
+            assert result.predictions[1].prediction_value == 0.55
+
+            assert "## Targeted Research" not in result.research_report
+
+            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._conditional_stacking_triggered_count == 0
+
+
+class TestConditionalStackingFallbacks:
+    """Tests for graceful degradation when pipeline components fail."""
+
+    @pytest.mark.asyncio
+    async def test_crux_extraction_failure_falls_through(self):
+        """Crux extraction failure should still proceed to stacking with base research only."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_side_effect=RuntimeError("Analyzer LLM timed out"),
+            aggregate_return=0.65,
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_not_called()
+
+            mocks["aggregate"].assert_called_once()
+            agg_kwargs = mocks["aggregate"].call_args[1]
+            assert "Targeted Research" not in agg_kwargs["research"]
+
+            assert len(result.predictions) == 1
+            assert result.predictions[0].prediction_value == 0.65
+
+    @pytest.mark.asyncio
+    async def test_targeted_search_failure_falls_through(self):
+        """Targeted search failure should still proceed to stacking with base research only."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is about X",
+            targeted_search_side_effect=RuntimeError("Search API down"),
+            aggregate_return=0.60,
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["targeted"].assert_called_once()
+
+            mocks["aggregate"].assert_called_once()
+            agg_kwargs = mocks["aggregate"].call_args[1]
+            assert "Targeted Research" not in agg_kwargs["research"]
+
+            assert len(result.predictions) == 1
+            assert result.predictions[0].prediction_value == 0.60
+
+    @pytest.mark.asyncio
+    async def test_stacking_failure_falls_back_to_median(self):
+        """When stacking itself fails, fallback to MEDIAN aggregation (via MEAN fallback path)."""
+        bot = _make_bot(stacking_fallback_on_failure=True)
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="crux text",
+            targeted_search_return="targeted results",
+            run_stacking_side_effect=RuntimeError("Stacker LLM crashed"),
+            extra_patches=[
+                ("binary_mean", patch("metaculus_bot.numeric_utils.aggregate_binary_mean", return_value=0.475)),
+            ],
+        ):
+            result = await bot._research_and_make_predictions(question)
+
+            assert len(result.predictions) == 1
+            assert result.predictions[0].prediction_value == 0.475
+            assert bot._stacking_fallback_count == 1
+
+
+class TestConditionalStackingMC:
+    """Tests for conditional stacking with multiple choice questions."""
+
+    @pytest.mark.asyncio
+    async def test_mc_high_spread_triggers(self):
+        """MC question with >0.20 max option spread should trigger stacking."""
+        bot = _make_bot()
+        question = _make_mc_question()
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_mc_predictions(),
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=_make_stacked_mc_result(),
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
+
+            assert len(result.predictions) == 1
+            assert bot._conditional_stacking_triggered_count == 1
+
+
+class TestConditionalStackingThresholds:
+    """Tests for custom and boundary threshold behavior."""
+
+    @pytest.mark.asyncio
+    async def test_custom_thresholds(self):
+        """Very high custom thresholds should prevent stacking even with moderate spread."""
+        bot = _make_bot(stacking_spread_thresholds={"binary": 0.95, "mc": 0.90, "numeric": 0.90})
+        question = _make_binary_question()
+
+        # 0.20 and 0.80 -> range 0.60, below custom threshold 0.95
+        predictions = [
+            ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nUnlikely."),
+            ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nLikely."),
+        ]
+
+        with mock_stacking_pipeline(bot, predictions=predictions, research="research") as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_not_called()
+            assert len(result.predictions) == 2
+            assert bot._conditional_stacking_skipped_count == 1
+
+    @pytest.mark.asyncio
+    async def test_spread_just_above_threshold(self):
+        """Spread barely above threshold should trigger stacking."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        # 0.40 - 0.24 = 0.16 > 0.15 -> triggers
+        predictions = [
+            ReasonedPrediction(prediction_value=0.24, reasoning="Model: m1\n\nAnalysis 1"),
+            ReasonedPrediction(prediction_value=0.40, reasoning="Model: m2\n\nAnalysis 2"),
+        ]
+
+        with mock_stacking_pipeline(
+            bot,
+            predictions=predictions,
+            research="research",
+            crux_return="crux",
+            targeted_search_return="search results",
+            aggregate_return=0.50,
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_called_once()
+            assert len(result.predictions) == 1
+            assert bot._conditional_stacking_triggered_count == 1
+
+    @pytest.mark.asyncio
+    async def test_spread_just_below_threshold(self):
+        """Spread barely below threshold should skip stacking."""
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        # 0.39 - 0.25 = 0.14 < 0.15 -> skips
+        predictions = [
+            ReasonedPrediction(prediction_value=0.25, reasoning="Model: m1\n\nAnalysis 1"),
+            ReasonedPrediction(prediction_value=0.39, reasoning="Model: m2\n\nAnalysis 2"),
+        ]
+
+        with mock_stacking_pipeline(bot, predictions=predictions, research="research") as mocks:
+            result = await bot._research_and_make_predictions(question)
+
+            mocks["crux"].assert_not_called()
+            assert len(result.predictions) == 2
+            assert bot._conditional_stacking_skipped_count == 1
 
 
 class TestConditionalStackingNumeric:
@@ -575,45 +523,19 @@ class TestConditionalStackingNumeric:
             cdf_size=201,
         )
 
-        # Model 1 centered at 30, model 2 centered at 70
-        # At the 50th percentile (index 5): values 30 vs 70 -> raw spread 40, normalized 40/100 = 0.40 >> 0.15
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        mock_stacked_dist = _make_numeric_distribution(median_value=50.0)
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about expected sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_dist) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about expected sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(median_value=50.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -632,34 +554,15 @@ class TestConditionalStackingNumeric:
             cdf_size=201,
         )
 
-        # Model 1 centered at 48, model 2 centered at 52
-        # At 50th percentile (index 5): values 48 vs 52 -> raw spread 4, normalized 4/100 = 0.04 << 0.15
-        dist1 = _make_numeric_distribution(median_value=48.0)
-        dist2 = _make_numeric_distribution(median_value=52.0)
+        predictions = [
+            ReasonedPrediction(prediction_value=_make_numeric_distribution(48.0), reasoning="Model: m1\n\nAround 48."),
+            ReasonedPrediction(prediction_value=_make_numeric_distribution(52.0), reasoning="Model: m2\n\nAround 52."),
+        ]
 
-        pred1 = ReasonedPrediction(prediction_value=dist1, reasoning="Model: m1\n\nAround 48.")
-        pred2 = ReasonedPrediction(prediction_value=dist2, reasoning="Model: m2\n\nAround 52.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-            ) as mock_crux,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(bot, predictions=predictions, research="numeric research") as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            mock_crux.assert_not_called()
+            mocks["crux"].assert_not_called()
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
@@ -674,42 +577,20 @@ class TestConditionalStackingAggregation:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is X",
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted results about X",
-            ),
-            # Mock _run_stacking but let _aggregate_predictions run for real
-            patch.object(bot, "_run_stacking", return_value=0.65) as mock_run_stacking,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is X",
+            targeted_search_return="Targeted results about X",
+            run_stacking_return=0.65,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # _run_stacking was called by _aggregate_predictions
-            mock_run_stacking.assert_called_once()
-            call_args = mock_run_stacking.call_args
-            assert call_args[0][0] == question  # question is first arg
-            assert "Targeted Research" in call_args[0][1]  # combined research
-            assert len(call_args[0][2]) == 2  # reasoned_predictions
+            mocks["run_stacking"].assert_called_once()
+            call_args = mocks["run_stacking"].call_args
+            assert call_args[0][0] == question
+            assert "Targeted Research" in call_args[0][1]
+            assert len(call_args[0][2]) == 2
 
             assert len(result.predictions) == 1
             assert result.predictions[0].prediction_value == 0.65
@@ -720,47 +601,24 @@ class TestConditionalStackingAggregation:
         bot = _make_bot()
         question = _make_binary_question()
 
-        # 0.45, 0.50, 0.55 -> prob range 0.10, below 0.15 threshold
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot._forecaster_llms = [test_llm, test_llm, test_llm]
 
-        pred1 = ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nAnalysis 1")
-        pred2 = ReasonedPrediction(prediction_value=0.50, reasoning="Model: m2\n\nAnalysis 2")
-        pred3 = ReasonedPrediction(prediction_value=0.55, reasoning="Model: m3\n\nAnalysis 3")
+        predictions = [
+            ReasonedPrediction(prediction_value=0.45, reasoning="Model: m1\n\nAnalysis 1"),
+            ReasonedPrediction(prediction_value=0.50, reasoning="Model: m2\n\nAnalysis 2"),
+            ReasonedPrediction(prediction_value=0.55, reasoning="Model: m3\n\nAnalysis 3"),
+        ]
 
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-            ) as mock_crux,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2, pred3], [], None)
-
+        with mock_stacking_pipeline(bot, predictions=predictions, research="research") as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking not triggered
-            mock_crux.assert_not_called()
+            mocks["crux"].assert_not_called()
             assert bot._conditional_stacking_skipped_count == 1
-
-            # All 3 predictions returned for framework to aggregate
             assert len(result.predictions) == 3
 
-            # Now call _aggregate_predictions directly with asymmetric values
-            # to verify MEDIAN is used (not MEAN)
-            # MEDIAN of [0.30, 0.50, 0.60] = 0.50; MEAN = 0.467
-            aggregated = await bot._aggregate_predictions(
-                predictions=[0.30, 0.50, 0.60],
-                question=question,
-            )
+            # Verify MEDIAN is used (not MEAN): MEDIAN([0.30, 0.50, 0.60]) = 0.50
+            aggregated = await bot._aggregate_predictions(predictions=[0.30, 0.50, 0.60], question=question)
             assert aggregated == pytest.approx(0.50)
 
 
@@ -770,40 +628,21 @@ class TestConditionalStackingBenchmarkingFlag:
     @pytest.mark.asyncio
     async def test_is_benchmarking_passed_to_targeted_search(self):
         """is_benchmarking=True should be forwarded to run_targeted_search."""
-        bot = _make_bot()  # _make_bot already sets is_benchmarking=True
+        bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux",
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="targeted results",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            research="base research",
+            crux_return="The crux",
+            targeted_search_return="targeted results",
+            aggregate_return=0.50,
+        ) as mocks:
             await bot._research_and_make_predictions(question)
 
-            mock_targeted.assert_called_once()
-            assert mock_targeted.call_args.kwargs["is_benchmarking"] is True
+            mocks["targeted"].assert_called_once()
+            assert mocks["targeted"].call_args.kwargs["is_benchmarking"] is True
 
 
 class TestConditionalStackingModelTagStripping:
@@ -815,42 +654,23 @@ class TestConditionalStackingModelTagStripping:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(
-            prediction_value=0.10, reasoning="Model: gpt-5.4\n\nThis model thinks it's unlikely."
-        )
-        pred_high = ReasonedPrediction(
-            prediction_value=0.85, reasoning="Model: claude-4\n\nThis model thinks it's likely."
-        )
+        predictions = [
+            ReasonedPrediction(prediction_value=0.10, reasoning="Model: gpt-5.4\n\nThis model thinks it's unlikely."),
+            ReasonedPrediction(prediction_value=0.85, reasoning="Model: claude-4\n\nThis model thinks it's likely."),
+        ]
 
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux of disagreement",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="targeted results",
-            ),
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=predictions,
+            research="base research",
+            crux_return="The crux of disagreement",
+            targeted_search_return="targeted results",
+            aggregate_return=0.50,
+        ) as mocks:
             await bot._research_and_make_predictions(question)
 
-            mock_crux.assert_called_once()
-            # Third positional arg is base_prediction_texts
-            base_prediction_texts = mock_crux.call_args[0][2]
+            mocks["crux"].assert_called_once()
+            base_prediction_texts = mocks["crux"].call_args[0][2]
             for text in base_prediction_texts:
                 assert not text.startswith("Model:"), f"Model tag not stripped: {text[:50]}"
             assert "This model thinks it's unlikely." in base_prediction_texts[0]
@@ -866,37 +686,17 @@ class TestConditionalStackingFailureCounters:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("LLM timed out"),
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            research="base research",
+            crux_side_effect=RuntimeError("LLM timed out"),
+            aggregate_return=0.50,
+        ) as mocks:
             await bot._research_and_make_predictions(question)
 
             assert bot._conditional_stacking_crux_failures == 1
-            # Targeted search NOT called since crux failed
-            mock_targeted.assert_not_called()
+            mocks["targeted"].assert_not_called()
 
     @pytest.mark.asyncio
     async def test_search_failure_increments_counter(self):
@@ -904,33 +704,14 @@ class TestConditionalStackingFailureCounters:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux",
-            ),
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("Search API down"),
-            ),
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            research="base research",
+            crux_return="The crux",
+            targeted_search_side_effect=RuntimeError("Search API down"),
+            aggregate_return=0.50,
         ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
             await bot._research_and_make_predictions(question)
 
             assert bot._conditional_stacking_search_failures == 1
@@ -953,46 +734,25 @@ class TestConditionalStackingSixModelEnsemble:
         """Spread should be computed across all 6 models, not just the first 2."""
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = _make_bot()
-        # Override to 6 forecaster LLMs
         bot._forecaster_llms = [test_llm] * 6
-
         question = _make_binary_question()
 
-        # 6 predictions with wide spread: [0.10, 0.20, 0.30, 0.70, 0.80, 0.90]
-        # Log-odds range: log(0.90/0.10) - log(0.10/0.90) = 2*ln(9) ~= 4.39
         predictions = [
             ReasonedPrediction(prediction_value=v, reasoning=f"Model: m{i}\n\nAnalysis {i}")
             for i, v in enumerate([0.10, 0.20, 0.30, 0.70, 0.80, 0.90], start=1)
         ]
 
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="crux",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="search results",
-            ),
-            patch.object(bot, "_aggregate_predictions", return_value=0.50),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=predictions,
+            research="research",
+            crux_return="crux",
+            targeted_search_return="search results",
+            aggregate_return=0.50,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking must trigger: spread ~4.39 >> 1.2 threshold
-            mock_crux.assert_called_once()
+            mocks["crux"].assert_called_once()
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
@@ -1014,164 +774,68 @@ class TestNumericStackingEnabled:
             cdf_size=201,
         )
 
-        # Model 1 centered at 30, model 2 centered at 70 -> spread 0.40 >> 0.15 threshold
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about expected sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=dist_low) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about expected sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(30.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline NOT invoked despite high spread
-            mock_crux.assert_not_called()
-            mock_targeted.assert_not_called()
-            mock_aggregate.assert_not_called()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            # All individual predictions preserved (skip path)
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-
-            # Stacker outcome recorded as "skipped"
             assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
     async def test_binary_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
-        """NUMERIC_STACKING_ENABLED=false should NOT affect binary questions — stacking still fires."""
+        """NUMERIC_STACKING_ENABLED=false should NOT affect binary questions -- stacking still fires."""
         monkeypatch.setenv("NUMERIC_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = _make_binary_question()
 
-        # Predictions: 0.10 and 0.85 -> prob range 0.75, well above 0.15 threshold
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for binary
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
-        """NUMERIC_STACKING_ENABLED=false should NOT affect MC questions — stacking still fires."""
+        """NUMERIC_STACKING_ENABLED=false should NOT affect MC questions -- stacking still fires."""
         monkeypatch.setenv("NUMERIC_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = _make_mc_question()
 
-        # Predictions where option A has 0.30 spread across models (>0.20 threshold)
-        pred1 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.60),
-                    PredictedOption(option_name="B", probability=0.25),
-                    PredictedOption(option_name="C", probability=0.15),
-                ]
-            ),
-            reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.30),
-                    PredictedOption(option_name="B", probability=0.45),
-                    PredictedOption(option_name="C", probability=0.25),
-                ]
-            ),
-            reasoning="Model: m2\n\nOption B is stronger.",
-        )
-
-        mock_stacked_result = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="A", probability=0.45),
-                PredictedOption(option_name="B", probability=0.35),
-                PredictedOption(option_name="C", probability=0.20),
-            ]
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_result) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_mc_predictions(),
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=_make_stacked_mc_result(),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for MC
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1179,7 +843,6 @@ class TestNumericStackingEnabled:
     @pytest.mark.asyncio
     async def test_numeric_stacking_enabled_unset_defaults_to_enabled(self):
         """When NUMERIC_STACKING_ENABLED is unset (default=True), numeric high-spread still triggers stacking."""
-        # Explicitly ensure the env var is NOT set (default state)
         bot = _make_bot()
         question = make_mock_numeric_question(
             question_text="How many units will be sold?",
@@ -1190,45 +853,19 @@ class TestNumericStackingEnabled:
             cdf_size=201,
         )
 
-        # Model 1 centered at 30, model 2 centered at 70 -> spread 0.40 >> 0.15 threshold
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        mock_stacked_dist = _make_numeric_distribution(median_value=50.0)
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about expected sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_dist) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about expected sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(50.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked (env var unset = current behavior)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1248,44 +885,19 @@ class TestNumericStackingEnabled:
             cdf_size=201,
         )
 
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        mock_stacked_dist = _make_numeric_distribution(median_value=50.0)
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about expected sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_dist) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about expected sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(50.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline invoked (explicit true = enabled)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1301,47 +913,22 @@ class TestBinaryStackingEnabled:
         bot = _make_bot()
         question = _make_binary_question()
 
-        # Predictions: 0.10 and 0.85 -> prob range 0.75, well above 0.15 threshold
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline NOT invoked despite high spread
-            mock_crux.assert_not_called()
-            mock_targeted.assert_not_called()
-            mock_aggregate.assert_not_called()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            # All individual predictions preserved (skip path)
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-
-            # Stacker outcome recorded as "skipped"
             assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
@@ -1350,39 +937,18 @@ class TestBinaryStackingEnabled:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline invoked (default = enabled)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1394,46 +960,25 @@ class TestBinaryStackingEnabled:
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline invoked (explicit true = enabled)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_binary_disabled_does_not_affect_numeric(self, monkeypatch):
-        """BINARY_STACKING_ENABLED=false does NOT affect numeric questions — stacking still fires."""
+        """BINARY_STACKING_ENABLED=false does NOT affect numeric questions -- stacking still fires."""
         monkeypatch.setenv("BINARY_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = make_mock_numeric_question(
@@ -1445,114 +990,43 @@ class TestBinaryStackingEnabled:
             cdf_size=201,
         )
 
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        mock_stacked_dist = _make_numeric_distribution(median_value=50.0)
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_dist) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(50.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for numeric (binary flag doesn't affect it)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_binary_disabled_does_not_affect_mc(self, monkeypatch):
-        """BINARY_STACKING_ENABLED=false does NOT affect MC questions — stacking still fires."""
+        """BINARY_STACKING_ENABLED=false does NOT affect MC questions -- stacking still fires."""
         monkeypatch.setenv("BINARY_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = _make_mc_question()
 
-        pred1 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.60),
-                    PredictedOption(option_name="B", probability=0.25),
-                    PredictedOption(option_name="C", probability=0.15),
-                ]
-            ),
-            reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.30),
-                    PredictedOption(option_name="B", probability=0.45),
-                    PredictedOption(option_name="C", probability=0.25),
-                ]
-            ),
-            reasoning="Model: m2\n\nOption B is stronger.",
-        )
-
-        mock_stacked_result = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="A", probability=0.45),
-                PredictedOption(option_name="B", probability=0.35),
-                PredictedOption(option_name="C", probability=0.20),
-            ]
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_result) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_mc_predictions(),
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=_make_stacked_mc_result(),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for MC
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1568,64 +1042,25 @@ class TestMCStackingEnabled:
         bot = _make_bot()
         question = _make_mc_question()
 
-        pred1 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.60),
-                    PredictedOption(option_name="B", probability=0.25),
-                    PredictedOption(option_name="C", probability=0.15),
-                ]
-            ),
-            reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.30),
-                    PredictedOption(option_name="B", probability=0.45),
-                    PredictedOption(option_name="C", probability=0.25),
-                ]
-            ),
-            reasoning="Model: m2\n\nOption B is stronger.",
-        )
+        mc_preds = _make_high_spread_mc_predictions()
 
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=pred1.prediction_value) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=mc_preds,
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=mc_preds[0].prediction_value,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline NOT invoked despite high spread
-            mock_crux.assert_not_called()
-            mock_targeted.assert_not_called()
-            mock_aggregate.assert_not_called()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            # All individual predictions preserved (skip path)
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-
-            # Stacker outcome recorded as "skipped"
             assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
@@ -1634,65 +1069,19 @@ class TestMCStackingEnabled:
         bot = _make_bot()
         question = _make_mc_question()
 
-        pred1 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.60),
-                    PredictedOption(option_name="B", probability=0.25),
-                    PredictedOption(option_name="C", probability=0.15),
-                ]
-            ),
-            reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.30),
-                    PredictedOption(option_name="B", probability=0.45),
-                    PredictedOption(option_name="C", probability=0.25),
-                ]
-            ),
-            reasoning="Model: m2\n\nOption B is stronger.",
-        )
-
-        mock_stacked_result = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="A", probability=0.45),
-                PredictedOption(option_name="B", probability=0.35),
-                PredictedOption(option_name="C", probability=0.20),
-            ]
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_result) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_mc_predictions(),
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=_make_stacked_mc_result(),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline invoked (default = enabled)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
@@ -1704,116 +1093,49 @@ class TestMCStackingEnabled:
         bot = _make_bot()
         question = _make_mc_question()
 
-        pred1 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.60),
-                    PredictedOption(option_name="B", probability=0.25),
-                    PredictedOption(option_name="C", probability=0.15),
-                ]
-            ),
-            reasoning="Model: m1\n\nOption A is dominant.",
-        )
-        pred2 = ReasonedPrediction(
-            prediction_value=PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="A", probability=0.30),
-                    PredictedOption(option_name="B", probability=0.45),
-                    PredictedOption(option_name="C", probability=0.25),
-                ]
-            ),
-            reasoning="Model: m2\n\nOption B is stronger.",
-        )
-
-        mock_stacked_result = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="A", probability=0.45),
-                PredictedOption(option_name="B", probability=0.35),
-                PredictedOption(option_name="C", probability=0.20),
-            ]
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="mc research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about option A vs B",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about A vs B",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_result) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred1, pred2], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_mc_predictions(),
+            research="mc research",
+            crux_return="Disagreement about option A vs B",
+            targeted_search_return="Search results about A vs B",
+            aggregate_return=_make_stacked_mc_result(),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline invoked (explicit true = enabled)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_disabled_does_not_affect_binary(self, monkeypatch):
-        """MC_STACKING_ENABLED=false does NOT affect binary questions — stacking still fires."""
+        """MC_STACKING_ENABLED=false does NOT affect binary questions -- stacking still fires."""
         monkeypatch.setenv("MC_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = _make_binary_question()
 
-        pred_low = ReasonedPrediction(prediction_value=0.10, reasoning="Model: m1\n\nLikely no.")
-        pred_high = ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nLikely yes.")
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="base research text"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="The crux is whether X happened",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Targeted search found that X did happen",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=0.72) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            crux_return="The crux is whether X happened",
+            targeted_search_return="Targeted search found that X did happen",
+            aggregate_return=0.72,
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for binary
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
     async def test_mc_disabled_does_not_affect_numeric(self, monkeypatch):
-        """MC_STACKING_ENABLED=false does NOT affect numeric questions — stacking still fires."""
+        """MC_STACKING_ENABLED=false does NOT affect numeric questions -- stacking still fires."""
         monkeypatch.setenv("MC_STACKING_ENABLED", "false")
         bot = _make_bot()
         question = make_mock_numeric_question(
@@ -1825,44 +1147,19 @@ class TestMCStackingEnabled:
             cdf_size=201,
         )
 
-        dist_low = _make_numeric_distribution(median_value=30.0)
-        dist_high = _make_numeric_distribution(median_value=70.0)
-
-        pred_low = ReasonedPrediction(prediction_value=dist_low, reasoning="Model: m1\n\nLow estimate.")
-        pred_high = ReasonedPrediction(prediction_value=dist_high, reasoning="Model: m2\n\nHigh estimate.")
-
-        mock_stacked_dist = _make_numeric_distribution(median_value=50.0)
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="numeric research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
-            ),
-            patch(
-                "main.extract_disagreement_crux",
-                new_callable=AsyncMock,
-                return_value="Disagreement about sales volume",
-            ) as mock_crux,
-            patch(
-                "main.run_targeted_search",
-                new_callable=AsyncMock,
-                return_value="Search results about sales volume",
-            ) as mock_targeted,
-            patch.object(bot, "_aggregate_predictions", return_value=mock_stacked_dist) as mock_aggregate,
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([pred_low, pred_high], [], None)
-
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_make_high_spread_numeric_predictions(),
+            research="numeric research",
+            crux_return="Disagreement about sales volume",
+            targeted_search_return="Search results about sales volume",
+            aggregate_return=_make_numeric_distribution(50.0),
+        ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            # Stacking pipeline STILL invoked for numeric (MC flag doesn't affect it)
-            mock_crux.assert_called_once()
-            mock_targeted.assert_called_once()
-            mock_aggregate.assert_called_once()
+            mocks["crux"].assert_called_once()
+            mocks["targeted"].assert_called_once()
+            mocks["aggregate"].assert_called_once()
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1

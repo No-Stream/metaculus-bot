@@ -70,17 +70,16 @@ from metaculus_bot.ablation.qa_iterate import (
     write_manual_rejects,
 )
 from metaculus_bot.ablation.research import run_gemini_research_for_qids
-
-# Symbols used in _stage_stack for the mean arm and pdf mean variant.
-# Function-scoped imports would survive formatter stripping, but these are
-# used in multiple places across the orchestrator so top-level is cleaner.
-from metaculus_bot.ablation.run_mean import run_mean_for_qid
-from metaculus_bot.ablation.run_median import run_median_for_qid
 from metaculus_bot.ablation.run_pdf import (  # noqa: E402
     ARM_PDF_MIN1,
     ARM_PDF_MIN2,
     run_pdf_for_qid,
 )
+
+# Symbols used in _stage_stack for the mean arm and pdf mean variant.
+# Function-scoped imports would survive formatter stripping, but these are
+# used in multiple places across the orchestrator so top-level is cleaner.
+from metaculus_bot.ablation.run_simple_agg import run_mean_for_qid, run_median_for_qid
 from metaculus_bot.ablation.run_stacker import (
     ABLATION_MIN_FORECASTERS,
     ARM_MEAN,
@@ -93,9 +92,9 @@ from metaculus_bot.ablation.run_stacker import (
 from metaculus_bot.ablation.scoring import (
     PairedScore,
     aggregate_paired,
-    render_summary_markdown,
     score_arm_for_qid,
 )
+from metaculus_bot.ablation.scoring_report import render_summary_markdown
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose  # noqa: F401
 from metaculus_bot.backtest.question_prep import (
     BacktestQuestionSet,
@@ -179,13 +178,7 @@ class SpendReport:
     cached_prune_hits: int = 0
     cached_screen_hits: int = 0
     cached_forecaster_hits: int = 0
-    cached_stacker_stack_hits: int = 0
-    cached_stacker_stack_aug_hits: int = 0
-    cached_stacker_pdf_hits: int = 0
-    cached_stacker_pdf_min1_hits: int = 0
-    cached_stacker_pdf_min2_hits: int = 0
-    cached_stacker_median_hits: int = 0
-    cached_stacker_mean_hits: int = 0
+    cached_stacker_hits: dict[str, int] = field(default_factory=dict)
     fallback_stacker_stack: int = 0
     fallback_stacker_stack_aug: int = 0
     prune_validation_failures: int = 0
@@ -713,14 +706,7 @@ class WorkingSet:
     prune_metas: dict[int, dict] = field(default_factory=dict)
     leakage_verdicts: dict[int, dict] = field(default_factory=dict)
     forecaster_payloads: dict[int, dict[str, dict]] = field(default_factory=dict)
-    stacker_stack_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_stack_aug_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_pdf_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_pdf_min1_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_pdf_min2_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_pdf_min1_mean_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_median_payloads: dict[int, dict] = field(default_factory=dict)
-    stacker_mean_payloads: dict[int, dict] = field(default_factory=dict)
+    stacker_payloads: dict[str, dict[int, dict]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,20 +1215,192 @@ async def _stage_forecast(
 # ---------------------------------------------------------------------------
 
 
-_STACK_ARM_TO_TARGET_ATTR: dict[str, str] = {
-    ARM_STACK: "stacker_stack_payloads",
-    ARM_STACK_AUG: "stacker_stack_aug_payloads",
-    ARM_PDF: "stacker_pdf_payloads",
-    ARM_MEDIAN: "stacker_median_payloads",
-    ARM_MEAN: "stacker_mean_payloads",
-}
-_STACK_ARM_TO_CACHE_HIT_FIELD: dict[str, str] = {
-    ARM_STACK: "cached_stacker_stack_hits",
-    ARM_STACK_AUG: "cached_stacker_stack_aug_hits",
-    ARM_PDF: "cached_stacker_pdf_hits",
-    ARM_MEDIAN: "cached_stacker_median_hits",
-    ARM_MEAN: "cached_stacker_mean_hits",
-}
+async def _stage_simple_agg(
+    arm: str,
+    working: WorkingSet,
+    cache: AblationCache,
+    force: bool,
+    spend: SpendReport,
+) -> None:
+    """Sequential deterministic aggregation (mean/median). No LLM calls."""
+    await asyncio.sleep(0)
+    qids = sorted(working.forecaster_payloads.keys())
+
+    cached_payloads: dict[int, dict] = {}
+    needs_run: list[int] = []
+    for qid in qids:
+        if not force:
+            cached = cache.read_stacker_output(qid=qid, arm=arm)
+            if cached is not None:
+                cached_payloads[qid] = cached
+                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
+                continue
+        needs_run.append(qid)
+
+    fresh_results: dict[int, dict] = {}
+    if needs_run:
+        run_fn = run_median_for_qid if arm == ARM_MEDIAN else run_mean_for_qid
+        for qid in needs_run:
+            fresh_results[qid] = await run_fn(
+                qid=qid,
+                question=working.questions[qid],
+                forecaster_payloads=working.forecaster_payloads[qid],
+                cache=cache,
+                force=force,
+            )
+
+    working.stacker_payloads[arm] = {**cached_payloads, **fresh_results}
+
+
+async def _stage_pdf(
+    working: WorkingSet,
+    cache: AblationCache,
+    force: bool,
+    spend: SpendReport,
+) -> None:
+    """Deterministic structured-math aggregation for all PDF sub-arms."""
+    from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1_MEAN  # noqa: PLC0415
+
+    await asyncio.sleep(0)
+    qids = sorted(working.forecaster_payloads.keys())
+
+    # PDF sub-arms share a single cache-read loop for the parent ARM_PDF key.
+    cached_payloads: dict[int, dict] = {}
+    needs_run: list[int] = []
+    for qid in qids:
+        if not force:
+            cached = cache.read_stacker_output(qid=qid, arm=ARM_PDF)
+            if cached is not None:
+                cached_payloads[qid] = cached
+                spend.cached_stacker_hits[ARM_PDF] = spend.cached_stacker_hits.get(ARM_PDF, 0) + 1
+                continue
+        needs_run.append(qid)
+
+    results_min1: dict[int, dict] = {}
+    results_min2: dict[int, dict] = {}
+    for qid in needs_run:
+        result_min1 = await run_pdf_for_qid(
+            qid=qid,
+            question=working.questions[qid],
+            forecaster_payloads=working.forecaster_payloads[qid],
+            cache=cache,
+            force=force,
+            min_forecasters=1,
+            arm_label=ARM_PDF_MIN1,
+        )
+        result_min2 = await run_pdf_for_qid(
+            qid=qid,
+            question=working.questions[qid],
+            forecaster_payloads=working.forecaster_payloads[qid],
+            cache=cache,
+            force=force,
+            min_forecasters=2,
+            arm_label=ARM_PDF_MIN2,
+        )
+        # pdf_min1_mean is computed for diagnostic completeness but not scored.
+        await run_pdf_for_qid(
+            qid=qid,
+            question=working.questions[qid],
+            forecaster_payloads=working.forecaster_payloads[qid],
+            cache=cache,
+            force=force,
+            min_forecasters=1,
+            arm_label=ARM_PDF_MIN1_MEAN,
+            aggregation="mean",
+        )
+        results_min1[qid] = result_min1
+        results_min2[qid] = result_min2
+
+    working.stacker_payloads[ARM_PDF_MIN1] = {**cached_payloads, **results_min1}
+    working.stacker_payloads[ARM_PDF_MIN2] = {**cached_payloads, **results_min2}
+
+
+async def _stage_llm_stacker(
+    arm: str,
+    args: argparse.Namespace,
+    working: WorkingSet,
+    cache: AblationCache,
+    force: bool,
+    spend: SpendReport,
+) -> None:
+    """LLM stacker dispatch (stack/stack_aug). Uses run_stacker_batch."""
+    await asyncio.sleep(0)
+    qids = sorted(working.forecaster_payloads.keys())
+
+    cached_payloads: dict[int, dict] = {}
+    needs_run: list[int] = []
+    for qid in qids:
+        if not force:
+            cached = cache.read_stacker_output(qid=qid, arm=arm)
+            if cached is not None:
+                cached_payloads[qid] = cached
+                spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
+                continue
+        needs_run.append(qid)
+
+    fresh_results: dict[int, dict] = {}
+    if needs_run:
+        qid_to_data = {
+            qid: {
+                "question": working.questions[qid],
+                "research": working.research_blobs.get(qid, ""),
+                "forecaster_payloads": working.forecaster_payloads[qid],
+            }
+            for qid in needs_run
+        }
+        # Wire --plain-llm and --no-stacker-fallback into stacker construction.
+        stacker_llm_kwarg: GeneralLlm | None = None
+        fallback_llm_kwarg: GeneralLlm | None = None
+        if getattr(args, "plain_llm", False):
+            from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
+                _GPT_5_5_STACKER_KWARGS,
+                _OPUS_STACKER_KWARGS,
+                DEFAULT_STACKER_FALLBACK_MODEL,
+                DEFAULT_STACKER_MODEL,
+            )
+
+            stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
+            if not getattr(args, "no_stacker_fallback", False):
+                fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
+        elif getattr(args, "no_stacker_fallback", False):
+            # No fallback but still use the donated-key wrapper for primary.
+            fallback_llm_kwarg = None
+
+        batch_kwargs: dict[str, Any] = {
+            "force": force,
+            "concurrency": args.concurrency,
+        }
+        if stacker_llm_kwarg is not None:
+            batch_kwargs["stacker_llm"] = stacker_llm_kwarg
+        if getattr(args, "no_stacker_fallback", False):
+            batch_kwargs["fallback_stacker_llm"] = None
+        elif fallback_llm_kwarg is not None:
+            batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
+
+        fresh_results = await run_stacker_batch(
+            qid_to_data,
+            arm,
+            cache,
+            **batch_kwargs,
+        )
+
+    # Count LLM calls and fallback usage from fresh results.
+    is_arm_a = arm == ARM_STACK
+    for payload in fresh_results.values():
+        used = payload["stacker_model_used"]
+        if used in ("primary", "fallback"):
+            if is_arm_a:
+                spend.stacker_llm_calls_stack += 1
+            else:
+                spend.stacker_llm_calls_stack_aug += 1
+            spend.parser_llm_calls += 1
+        if used == "fallback":
+            if is_arm_a:
+                spend.fallback_stacker_stack += 1
+            else:
+                spend.fallback_stacker_stack_aug += 1
+
+    working.stacker_payloads[arm] = {**cached_payloads, **fresh_results}
 
 
 async def _stage_stack(
@@ -1253,169 +1411,13 @@ async def _stage_stack(
     force: bool,
     spend: SpendReport,
 ) -> None:
-    """Run the stacker for one arm. Populates ``working.stacker_{a,b,c}_payloads``.
-
-    For ARM_STACK / ARM_STACK_AUG: dispatches to ``run_stacker_batch`` (LLM stackers). Cached
-    + non-forced payloads bump ``cached_stacker_{a,b}_hits``. Each fresh stacker
-    call bumps ``stacker_llm_calls_{a,b}`` and adds 1 to ``parser_llm_calls``.
-    When the fresh payload's ``stacker_model_used`` is ``"fallback"``,
-    ``fallback_stacker_{a,b}`` increments.
-
-    For ARM_MEDIAN: dispatches per-qid to ``run_median_for_qid`` (deterministic
-    median aggregation, no LLM calls). Cached + non-forced payloads bump
-    ``cached_stacker_median_hits``; no LLM-call / parser / fallback counters fire.
-    """
-    await asyncio.sleep(0)
-    qids = sorted(working.forecaster_payloads.keys())
-
-    target_attr = _STACK_ARM_TO_TARGET_ATTR[arm]
-    cache_hit_field = _STACK_ARM_TO_CACHE_HIT_FIELD[arm]
-
-    cached_payloads: dict[int, dict] = {}
-    needs_run: list[int] = []
-    for qid in qids:
-        if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=arm)
-            if cached is not None:
-                cached_payloads[qid] = cached
-                setattr(spend, cache_hit_field, getattr(spend, cache_hit_field) + 1)
-                continue
-        needs_run.append(qid)
-
-    fresh_results: dict[int, dict] = {}
-    if needs_run:
-        if arm == ARM_MEDIAN:
-            # ARM_MEDIAN: deterministic aggregation, no LLM calls. Run per-qid; no
-            # batching benefit since there's no shared LLM client to amortize.
-            for qid in needs_run:
-                fresh_results[qid] = await run_median_for_qid(
-                    qid=qid,
-                    question=working.questions[qid],
-                    forecaster_payloads=working.forecaster_payloads[qid],
-                    cache=cache,
-                    force=force,
-                )
-        elif arm == ARM_MEAN:
-            # ARM_MEAN: deterministic mean aggregation, no LLM calls.
-            for qid in needs_run:
-                fresh_results[qid] = await run_mean_for_qid(
-                    qid=qid,
-                    question=working.questions[qid],
-                    forecaster_payloads=working.forecaster_payloads[qid],
-                    cache=cache,
-                    force=force,
-                )
-        elif arm == ARM_PDF:
-            # ARM_PDF: deterministic structured-math aggregation, no LLM calls.
-            # Produces pdf_min1 (median, any structured output), pdf_min2 (median,
-            # proper aggregation), and pdf_min1_mean (mean variant for prod-ish
-            # comparison). All cache as separate arm_label files.
-            from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1_MEAN  # noqa: PLC0415
-
-            for qid in needs_run:
-                result_min1 = await run_pdf_for_qid(
-                    qid=qid,
-                    question=working.questions[qid],
-                    forecaster_payloads=working.forecaster_payloads[qid],
-                    cache=cache,
-                    force=force,
-                    min_forecasters=1,
-                    arm_label=ARM_PDF_MIN1,
-                )
-                result_min2 = await run_pdf_for_qid(
-                    qid=qid,
-                    question=working.questions[qid],
-                    forecaster_payloads=working.forecaster_payloads[qid],
-                    cache=cache,
-                    force=force,
-                    min_forecasters=2,
-                    arm_label=ARM_PDF_MIN2,
-                )
-                result_min1_mean = await run_pdf_for_qid(
-                    qid=qid,
-                    question=working.questions[qid],
-                    forecaster_payloads=working.forecaster_payloads[qid],
-                    cache=cache,
-                    force=force,
-                    min_forecasters=1,
-                    arm_label=ARM_PDF_MIN1_MEAN,
-                    aggregation="mean",
-                )
-                working.stacker_pdf_min1_payloads[qid] = result_min1
-                working.stacker_pdf_min2_payloads[qid] = result_min2
-                working.stacker_pdf_min1_mean_payloads[qid] = result_min1_mean
-                # fresh_results used for backward-compat target assignment below
-                fresh_results[qid] = result_min2
-        else:
-            qid_to_data = {
-                qid: {
-                    "question": working.questions[qid],
-                    "research": working.research_blobs.get(qid, ""),
-                    "forecaster_payloads": working.forecaster_payloads[qid],
-                }
-                for qid in needs_run
-            }
-            # Wire --plain-llm and --no-stacker-fallback into stacker construction.
-            stacker_llm_kwarg: GeneralLlm | None = None
-            fallback_llm_kwarg: GeneralLlm | None = None
-            if getattr(args, "plain_llm", False):
-                from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
-                    _GPT_5_5_STACKER_KWARGS,
-                    _OPUS_STACKER_KWARGS,
-                    DEFAULT_STACKER_FALLBACK_MODEL,
-                    DEFAULT_STACKER_MODEL,
-                )
-
-                stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
-                if not getattr(args, "no_stacker_fallback", False):
-                    fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
-            elif getattr(args, "no_stacker_fallback", False):
-                # No fallback but still use the donated-key wrapper for primary.
-                fallback_llm_kwarg = None
-
-            # When --no-stacker-fallback is set, pass a sentinel None for
-            # fallback so run_stacker_for_arm skips the fallback chain.
-            batch_kwargs: dict[str, Any] = {
-                "force": force,
-                "concurrency": args.concurrency,
-            }
-            if stacker_llm_kwarg is not None:
-                batch_kwargs["stacker_llm"] = stacker_llm_kwarg
-            if getattr(args, "no_stacker_fallback", False):
-                batch_kwargs["fallback_stacker_llm"] = None
-            elif fallback_llm_kwarg is not None:
-                batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
-
-            fresh_results = await run_stacker_batch(
-                qid_to_data,
-                arm,
-                cache,
-                **batch_kwargs,
-            )
-
-    if arm in (ARM_STACK, ARM_STACK_AUG):
-        is_arm_a = arm == ARM_STACK
-        for payload in fresh_results.values():
-            # Stacker payload schema (run_stacker_for_arm) always has stacker_model_used:
-            # ``"primary"`` / ``"fallback"`` when a stacker LLM ran, ``None`` when
-            # the stacker was skipped (e.g. insufficient_forecasters) or both
-            # primary and fallback raised. Only count LLM calls when one actually fired.
-            used = payload["stacker_model_used"]
-            if used in ("primary", "fallback"):
-                if is_arm_a:
-                    spend.stacker_llm_calls_stack += 1
-                else:
-                    spend.stacker_llm_calls_stack_aug += 1
-                spend.parser_llm_calls += 1
-            if used == "fallback":
-                if is_arm_a:
-                    spend.fallback_stacker_stack += 1
-                else:
-                    spend.fallback_stacker_stack_aug += 1
-    # ARM_MEDIAN: no LLM-call / parser / fallback counters — deterministic aggregation.
-
-    target = {**cached_payloads, **fresh_results}
-    setattr(working, target_attr, target)
+    """Dispatcher for stacker arms. Routes to per-type implementation."""
+    if arm in (ARM_MEDIAN, ARM_MEAN):
+        await _stage_simple_agg(arm, working, cache, force, spend)
+    elif arm == ARM_PDF:
+        await _stage_pdf(working, cache, force, spend)
+    else:
+        await _stage_llm_stacker(arm, args, working, cache, force, spend)
 
 
 # ---------------------------------------------------------------------------
@@ -1581,15 +1583,13 @@ def _stage_score(
     """
     paired_scores: list[PairedScore] = []
     # Union of all qids that have ANY arm payload.
-    qids = sorted(
-        set(working.stacker_stack_payloads.keys())
-        | set(working.stacker_stack_aug_payloads.keys())
-        | set(working.stacker_pdf_min1_payloads.keys())
-        | set(working.stacker_pdf_min2_payloads.keys())
-        | set(working.stacker_median_payloads.keys())
-    )
+    all_arm_keys = [ARM_STACK, ARM_STACK_AUG, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN]
+    qid_set: set[int] = set()
+    for arm_key in all_arm_keys:
+        qid_set.update(working.stacker_payloads.get(arm_key, {}).keys())
+    qids = sorted(qid_set)
     # Determine whether 5-arm scoring mode is active (any pdf payloads present).
-    has_pdf_arms = bool(working.stacker_pdf_min1_payloads) or bool(working.stacker_pdf_min2_payloads)
+    has_pdf_arms = bool(working.stacker_payloads.get(ARM_PDF_MIN1)) or bool(working.stacker_payloads.get(ARM_PDF_MIN2))
 
     n_scored = 0
     for qid in qids:
@@ -1604,11 +1604,11 @@ def _stage_score(
                 return None
             return _build_report_shim(qid, question, payload)
 
-        payload_stack = working.stacker_stack_payloads.get(qid)
-        payload_stack_aug = working.stacker_stack_aug_payloads.get(qid)
-        payload_pdf_min1 = working.stacker_pdf_min1_payloads.get(qid)
-        payload_pdf_min2 = working.stacker_pdf_min2_payloads.get(qid)
-        payload_median = working.stacker_median_payloads.get(qid)
+        payload_stack = working.stacker_payloads.get(ARM_STACK, {}).get(qid)
+        payload_stack_aug = working.stacker_payloads.get(ARM_STACK_AUG, {}).get(qid)
+        payload_pdf_min1 = working.stacker_payloads.get(ARM_PDF_MIN1, {}).get(qid)
+        payload_pdf_min2 = working.stacker_payloads.get(ARM_PDF_MIN2, {}).get(qid)
+        payload_median = working.stacker_payloads.get(ARM_MEDIAN, {}).get(qid)
 
         report_stack = _report_or_none(payload_stack)
         report_stack_aug = _report_or_none(payload_stack_aug)
@@ -1745,41 +1745,12 @@ async def _hydrate_working_set_from_cache(
             working.forecaster_payloads[qid] = forecaster_payloads
             if spend is not None:
                 spend.cached_forecaster_hits += len(forecaster_payloads)
-        payload_stack = cache.read_stacker_output(qid=qid, arm=ARM_STACK)
-        if payload_stack is not None:
-            working.stacker_stack_payloads[qid] = payload_stack
-            if spend is not None:
-                spend.cached_stacker_stack_hits += 1
-        payload_stack_aug = cache.read_stacker_output(qid=qid, arm=ARM_STACK_AUG)
-        if payload_stack_aug is not None:
-            working.stacker_stack_aug_payloads[qid] = payload_stack_aug
-            if spend is not None:
-                spend.cached_stacker_stack_aug_hits += 1
-        payload_pdf = cache.read_stacker_output(qid=qid, arm=ARM_PDF)
-        if payload_pdf is not None:
-            working.stacker_pdf_payloads[qid] = payload_pdf
-            if spend is not None:
-                spend.cached_stacker_pdf_hits += 1
-        payload_pdf_min1 = cache.read_stacker_output(qid=qid, arm=ARM_PDF_MIN1)
-        if payload_pdf_min1 is not None:
-            working.stacker_pdf_min1_payloads[qid] = payload_pdf_min1
-            if spend is not None:
-                spend.cached_stacker_pdf_min1_hits += 1
-        payload_pdf_min2 = cache.read_stacker_output(qid=qid, arm=ARM_PDF_MIN2)
-        if payload_pdf_min2 is not None:
-            working.stacker_pdf_min2_payloads[qid] = payload_pdf_min2
-            if spend is not None:
-                spend.cached_stacker_pdf_min2_hits += 1
-        payload_median = cache.read_stacker_output(qid=qid, arm=ARM_MEDIAN)
-        if payload_median is not None:
-            working.stacker_median_payloads[qid] = payload_median
-            if spend is not None:
-                spend.cached_stacker_median_hits += 1
-        payload_mean = cache.read_stacker_output(qid=qid, arm=ARM_MEAN)
-        if payload_mean is not None:
-            working.stacker_mean_payloads[qid] = payload_mean
-            if spend is not None:
-                spend.cached_stacker_mean_hits += 1
+        for arm in (ARM_STACK, ARM_STACK_AUG, ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN):
+            payload = cache.read_stacker_output(qid=qid, arm=arm)
+            if payload is not None:
+                working.stacker_payloads.setdefault(arm, {})[qid] = payload
+                if spend is not None:
+                    spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
 
 
 def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int]:
@@ -1797,17 +1768,15 @@ def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int
         "prune_metas",
         "leakage_verdicts",
         "forecaster_payloads",
-        "stacker_stack_payloads",
-        "stacker_stack_aug_payloads",
-        "stacker_pdf_payloads",
-        "stacker_pdf_min1_payloads",
-        "stacker_pdf_min2_payloads",
-        "stacker_median_payloads",
-        "stacker_mean_payloads",
     ):
         existing = getattr(working, attr)
         filtered = {qid: v for qid, v in existing.items() if qid in requested}
         setattr(working, attr, filtered)
+    # Filter each arm's payload dict within stacker_payloads.
+    for arm_key in list(working.stacker_payloads.keys()):
+        working.stacker_payloads[arm_key] = {
+            qid: v for qid, v in working.stacker_payloads[arm_key].items() if qid in requested
+        }
     return requested - set(working.questions.keys())
 
 
@@ -1868,8 +1837,10 @@ def _print_spend_report(spend: SpendReport, working: WorkingSet, summary_path: P
         f"  Cache hits           research={spend.cached_research_hits}  "
         f"prune={spend.cached_prune_hits}  "
         f"screen={spend.cached_screen_hits}  forecast={spend.cached_forecaster_hits}  "
-        f"stack={spend.cached_stacker_stack_hits}  stack_aug={spend.cached_stacker_stack_aug_hits}  "
-        f"pdf={spend.cached_stacker_pdf_hits}  median={spend.cached_stacker_median_hits}"
+        f"stack={spend.cached_stacker_hits.get(ARM_STACK, 0)}  "
+        f"stack_aug={spend.cached_stacker_hits.get(ARM_STACK_AUG, 0)}  "
+        f"pdf={spend.cached_stacker_hits.get(ARM_PDF, 0)}  "
+        f"median={spend.cached_stacker_hits.get(ARM_MEDIAN, 0)}"
     )
     print()
     print(
@@ -1922,24 +1893,14 @@ async def run_ablation(args: argparse.Namespace) -> int:
             if missing:
                 logger.error("--qids filter: %d qids not in working set: %s", len(missing), sorted(missing))
         # Per-comparison N: only need at least some qids with >= 2 arm payloads.
-        all_arm_qids = (
-            set(working.stacker_stack_payloads.keys())
-            | set(working.stacker_stack_aug_payloads.keys())
-            | set(working.stacker_pdf_min1_payloads.keys())
-            | set(working.stacker_pdf_min2_payloads.keys())
-            | set(working.stacker_median_payloads.keys())
-            | set(working.stacker_mean_payloads.keys())
-        )
+        all_arm_qids: set[int] = set()
+        for arm_payloads in working.stacker_payloads.values():
+            all_arm_qids.update(arm_payloads.keys())
         if not all_arm_qids:
+            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
             logger.error(
-                "Cannot run 'score': zero qids have any stacker outputs "
-                "(stack=%d, stack_aug=%d, pdf_min1=%d, pdf_min2=%d, median=%d, mean=%d).",
-                len(working.stacker_stack_payloads),
-                len(working.stacker_stack_aug_payloads),
-                len(working.stacker_pdf_min1_payloads),
-                len(working.stacker_pdf_min2_payloads),
-                len(working.stacker_median_payloads),
-                len(working.stacker_mean_payloads),
+                "Cannot run 'score': zero qids have any stacker outputs %s.",
+                arm_counts,
             )
             print("ERROR: --stages score: zero qids have any arm payloads.")
             return 2
@@ -2054,7 +2015,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
         logger.info("stage=stack START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
         force = "stack" in forced
         await _stage_stack(args, cache, working, arm=ARM_STACK, force=force, spend=spend)
-        logger.info("stage=stack DONE | qids=%d", len(working.stacker_stack_payloads))
+        logger.info("stage=stack DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK, {})))
         await asyncio.sleep(sleep_seconds)
 
     if "stack_aug" in requested:
@@ -2063,7 +2024,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
         logger.info("stage=stack_aug START | est wall-clock ~%d min (n=%d)", est_seconds // 60 + 1, n)
         force = "stack_aug" in forced
         await _stage_stack(args, cache, working, arm=ARM_STACK_AUG, force=force, spend=spend)
-        logger.info("stage=stack_aug DONE | qids=%d", len(working.stacker_stack_aug_payloads))
+        logger.info("stage=stack_aug DONE | qids=%d", len(working.stacker_payloads.get(ARM_STACK_AUG, {})))
         await asyncio.sleep(sleep_seconds)
 
     if "pdf" in requested:
@@ -2071,7 +2032,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
         logger.info("stage=pdf START | est wall-clock ~1 min (n=%d, deterministic structured-math)", n)
         force = "pdf" in forced
         await _stage_stack(args, cache, working, arm=ARM_PDF, force=force, spend=spend)
-        logger.info("stage=pdf DONE | qids=%d", len(working.stacker_pdf_payloads))
+        logger.info("stage=pdf DONE | qids=%d", len(working.stacker_payloads.get(ARM_PDF_MIN2, {})))
         # No inter-stage sleep — ARM_PDF does zero API work.
 
     if "median" in requested:
@@ -2079,7 +2040,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
         logger.info("stage=median START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
         force = "median" in forced
         await _stage_stack(args, cache, working, arm=ARM_MEDIAN, force=force, spend=spend)
-        logger.info("stage=median DONE | qids=%d", len(working.stacker_median_payloads))
+        logger.info("stage=median DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEDIAN, {})))
         # No inter-stage sleep — ARM_MEDIAN does zero API work.
 
     if "mean" in requested:
@@ -2087,30 +2048,18 @@ async def run_ablation(args: argparse.Namespace) -> int:
         logger.info("stage=mean START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
         force = "mean" in forced
         await _stage_stack(args, cache, working, arm=ARM_MEAN, force=force, spend=spend)
-        logger.info("stage=mean DONE | qids=%d", len(working.stacker_mean_payloads))
+        logger.info("stage=mean DONE | qids=%d", len(working.stacker_payloads.get(ARM_MEAN, {})))
         # No inter-stage sleep — ARM_MEAN does zero API work.
 
     summary_path: Path | None = None
     if "score" in requested:
         logger.info("stage=score START")
-        all_arm_qids = (
-            set(working.stacker_stack_payloads.keys())
-            | set(working.stacker_stack_aug_payloads.keys())
-            | set(working.stacker_pdf_min1_payloads.keys())
-            | set(working.stacker_pdf_min2_payloads.keys())
-            | set(working.stacker_median_payloads.keys())
-            | set(working.stacker_mean_payloads.keys())
-        )
+        all_arm_qids: set[int] = set()
+        for arm_payloads in working.stacker_payloads.values():
+            all_arm_qids.update(arm_payloads.keys())
         if not all_arm_qids:
-            logger.warning(
-                "score | no qids have any arm payloads (stack=%d stack_aug=%d pdf_min1=%d pdf_min2=%d median=%d mean=%d); skipping",
-                len(working.stacker_stack_payloads),
-                len(working.stacker_stack_aug_payloads),
-                len(working.stacker_pdf_min1_payloads),
-                len(working.stacker_pdf_min2_payloads),
-                len(working.stacker_median_payloads),
-                len(working.stacker_mean_payloads),
-            )
+            arm_counts = {arm: len(p) for arm, p in working.stacker_payloads.items()}
+            logger.warning("score | no qids have any arm payloads %s; skipping", arm_counts)
         else:
             summary_path = _stage_score(args, cache, working)
             logger.info("stage=score DONE | summary=%s", summary_path)

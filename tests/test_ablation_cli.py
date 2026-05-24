@@ -6003,7 +6003,7 @@ class TestScoreOnlyZeroOverlapCheck:
 # * The "median" stage is wired into STAGES.
 # * ``_stage_stack(arm=ARM_MEDIAN, ...)`` writes a structurally-correct ``arm_median.json``
 #   cache file when run on a synthetic working set.
-# * ``WorkingSet.stacker_median_payloads`` is populated end-to-end.
+# * ``WorkingSet.stacker_payloads["median"]`` is populated end-to-end.
 # ---------------------------------------------------------------------------
 
 
@@ -6062,13 +6062,13 @@ class TestArmMedianStageStack:
         # read; the in-memory working set carries the raw payload _stage_stack
         # received before the cache round-trip. Compare on the structural fields
         # both should agree on rather than the full dict.
-        assert qid in working.stacker_median_payloads
+        assert qid in working.stacker_payloads.get("median", {})
         for key in ("arm", "success", "stacker_model_used", "stacker_prediction"):
-            assert working.stacker_median_payloads[qid][key] == cached[key]
+            assert working.stacker_payloads["median"][qid][key] == cached[key]
         # ARM_MEDIAN does NOT consume LLM-call counters; only cache-hit counter (zero on first run).
         assert spend.stacker_llm_calls_stack == 0
         assert spend.stacker_llm_calls_stack_aug == 0
-        assert spend.cached_stacker_median_hits == 0  # first run, no cache hit
+        assert spend.cached_stacker_hits.get("median", 0) == 0  # first run, no cache hit
 
     @pytest.mark.asyncio
     async def test_stage_stack_arm_c_uses_cache_on_second_call(
@@ -6102,7 +6102,7 @@ class TestArmMedianStageStack:
         # First call: writes cache.
         spend1 = SpendReport()
         await _stage_stack(args, cache, working, arm=ARM_MEDIAN, force=False, spend=spend1)
-        assert spend1.cached_stacker_median_hits == 0
+        assert spend1.cached_stacker_hits.get("median", 0) == 0
 
         # Second call: hits cache.
         working2 = WorkingSet()
@@ -6111,5 +6111,5 @@ class TestArmMedianStageStack:
         working2.research_blobs[qid] = "research blob"
         spend2 = SpendReport()
         await _stage_stack(args, cache, working2, arm=ARM_MEDIAN, force=False, spend=spend2)
-        assert spend2.cached_stacker_median_hits == 1
-        assert qid in working2.stacker_median_payloads
+        assert spend2.cached_stacker_hits.get("median", 0) == 1
+        assert qid in working2.stacker_payloads.get("median", {})

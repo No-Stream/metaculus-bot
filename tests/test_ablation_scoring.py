@@ -18,11 +18,11 @@ from metaculus_bot.ablation.scoring import (
     bootstrap_mean_ci,
     bootstrap_median_ci,
     is_score_saturated,
-    render_summary_markdown,
     score_arm_for_qid,
     sign_test,
     wilcoxon_signed_rank,
 )
+from metaculus_bot.ablation.scoring_report import render_summary_markdown
 from metaculus_bot.backtest.scoring import GroundTruth
 from metaculus_bot.scoring_common import PROB_CLAMP_MIN
 

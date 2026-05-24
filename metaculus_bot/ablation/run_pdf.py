@@ -34,8 +34,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import statistics
-from datetime import datetime
 from typing import Any, Literal
 
 import numpy as np
@@ -44,16 +42,14 @@ from forecasting_tools import (
     MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericQuestion,
-    PredictedOptionList,
 )
-from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.ablation.aggregation_primitives import aggregate_binary, aggregate_mc
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.forecasters import question_type_for_serialization, serialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MAX, MC_PROB_MIN
-from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
+from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
 from metaculus_bot.probabilistic_tools.mixtures import (
     MixtureComponent,
@@ -75,11 +71,10 @@ __all__ = ["ARM_PDF_MIN1_MEAN", "ARM_PDF_MIN1_MEDIAN", "run_pdf_for_qid"]
 ARM_PDF = "pdf"
 ARM_PDF_MIN1 = "pdf_min1"
 ARM_PDF_MIN2 = "pdf_min2"
-ARM_PDF_MIN1_MEDIAN = "pdf_min1_median"  # explicit alias of ARM_PDF_MIN1 for prod-ish naming
+ARM_PDF_MIN1_MEDIAN = "pdf_min1_median"
 ARM_PDF_MIN1_MEAN = "pdf_min1_mean"
 STRUCTURED_MATH_LABEL = "structured_math"
 
-# Likelihood-ratio mapping for evidence strength (used in Bayes cascade).
 _STRENGTH_TO_LR: dict[str, float] = {
     "weak": 1.5,
     "moderate": 3.0,
@@ -112,7 +107,6 @@ def _apply_evidence_lr(base_prob: float, evidence_items: list[Any]) -> float:
     """Apply sequential log-odds updates from evidence items."""
     if not evidence_items:
         return base_prob
-    # Work in log-odds space
     if base_prob <= 0.0:
         base_prob = 0.001
     if base_prob >= 1.0:
@@ -127,7 +121,6 @@ def _apply_evidence_lr(base_prob: float, evidence_items: list[Any]) -> float:
         if item.direction == "down":
             lr = 1.0 / lr
         log_odds += math.log(lr)
-    # Convert back to probability
     prob = 1.0 / (1.0 + math.exp(-log_odds))
     return prob
 
@@ -139,10 +132,8 @@ def _compute_binary_from_bayes(block: BinaryStructured) -> float | None:
         return None
     if not block.evidence:
         return None
-    # Compute Beta-binomial posterior mean
     result = beta_binomial_update(k=base_rate.k, n=base_rate.n)
     posterior_mean = result.posterior_mean
-    # Apply evidence as sequential LR updates
     return _apply_evidence_lr(posterior_mean, block.evidence)
 
 
@@ -157,19 +148,15 @@ def _compute_binary_from_prior_blend(block: BinaryStructured) -> float | None:
 
 def _compute_binary_prediction(block: BinaryStructured) -> float | None:
     """Apply the binary cascade: hazard > Bayes > prior_blend. None = drop."""
-    # Step 1: Hazard
     result = _compute_binary_from_hazard(block)
     if result is not None:
         return result
-    # Step 2: Bayes
     result = _compute_binary_from_bayes(block)
     if result is not None:
         return result
-    # Step 3: Prior blend
     result = _compute_binary_from_prior_blend(block)
     if result is not None:
         return result
-    # No applicable structured math
     return None
 
 
@@ -209,7 +196,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     fit: FitType | None = None
     try:
         if hint == "lognormal":
-            # Check all values positive
             if all(v > 0 for v in percentiles.values()):
                 fit = fit_lognormal_from_percentiles(percentiles)
             else:
@@ -217,7 +203,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
         elif hint == "normal":
             fit = fit_normal_from_percentiles(percentiles)
         else:
-            # Default: Student-t with df from block or 5.0
             df = block.student_t_df if block.student_t_df is not None else 5.0
             fit = fit_student_t_from_percentiles(percentiles, df=df)
     except (ValueError, RuntimeError):
@@ -227,7 +212,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     if fit is None:
         return None
 
-    # Build 201-point CDF on question grid
     lower = float(question.lower_bound)
     upper = float(question.upper_bound)
     open_lower = bool(question.open_lower_bound)
@@ -237,7 +221,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     grid = np.linspace(lower, upper, num_points)
     cdf_values = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
 
-    # Apply bound constraints
     from metaculus_bot.numeric_config import MIN_CDF_PROB_STEP
 
     hi_cap = 0.999 if open_upper else 1.0
@@ -274,7 +257,6 @@ def _compute_mc_prediction(block: MultipleChoiceStructured) -> dict[str, float] 
     """Extract option_probs if well-formed. None = drop."""
     if not block.option_probs:
         return None
-    # Pydantic already validated sum ~1.0 within tolerance
     return dict(block.option_probs)
 
 
@@ -335,7 +317,6 @@ async def run_pdf_for_qid(
     surviving = _surviving_forecasters(forecaster_payloads)
     qtype_label = _question_type_label(question)
 
-    # Per-forecaster structured-math predictions
     structured_predictions: list[Any] = []
 
     for slug, payload in surviving.items():
@@ -362,30 +343,28 @@ async def run_pdf_for_qid(
     n_structured = len(structured_predictions)
 
     if n_structured < min_forecasters:
-        error_payload = {
-            "success": False,
-            "arm": arm_label,
-            "reason": "insufficient_structured_forecasters",
-            "stacker_prediction": None,
-            "stacker_meta_reasoning": "",
-            "computed_quantities": {},
-            "cross_model_aggregation": None,
-            "stacker_model_used": STRUCTURED_MATH_LABEL,
-            "n_forecasters_used": n_structured,
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": False,
-            "errors": [],
-        }
+        error_payload = make_error_payload(
+            arm=arm_label,
+            reason="insufficient_structured_forecasters",
+            model_used=STRUCTURED_MATH_LABEL,
+            n_forecasters=n_structured,
+            cross_model_aggregation=None,
+        )
         cache.write_stacker_output(qid=qid, arm=arm_label, payload=error_payload)
         await asyncio.sleep(0)
         return error_payload
 
-    # Aggregate
     aggregated: Any
     if isinstance(question, BinaryQuestion):
-        aggregated = _aggregate_binary(structured_predictions, aggregation)
+        aggregated = aggregate_binary(structured_predictions, method=aggregation)
     elif isinstance(question, MultipleChoiceQuestion):
-        aggregated = _aggregate_mc(structured_predictions, question, aggregation)
+        option_order = list(question.options)
+        per_option_values: dict[str, list[float]] = {name: [] for name in option_order}
+        for pred in structured_predictions:
+            for name in option_order:
+                if name in pred:
+                    per_option_values[name].append(pred[name])
+        aggregated = aggregate_mc(per_option_values, option_order, method=aggregation)
     elif isinstance(question, NumericQuestion):
         aggregated = await _aggregate_numeric_predictions(structured_predictions, question, aggregation)
     else:
@@ -393,67 +372,22 @@ async def run_pdf_for_qid(
 
     serialized_prediction = serialize_prediction_value(aggregated, question_type_for_serialization(question))
 
-    success_payload = {
-        "success": True,
-        "arm": arm_label,
-        "stacker_prediction": serialized_prediction,
-        "stacker_meta_reasoning": "",
-        "computed_quantities": {},
-        "cross_model_aggregation": None,
-        "stacker_model_used": STRUCTURED_MATH_LABEL,
-        "n_forecasters_used": n_structured,
-        "ran_at": datetime.now().isoformat(),
-        "tools_enabled_at_runtime": False,
-        "errors": [],
-    }
+    success_payload = make_success_payload(
+        arm=arm_label,
+        prediction=serialized_prediction,
+        model_used=STRUCTURED_MATH_LABEL,
+        n_forecasters=n_structured,
+        cross_model_aggregation=None,
+    )
     cache.write_stacker_output(qid=qid, arm=arm_label, payload=success_payload)
     await asyncio.sleep(0)
     return success_payload
 
 
 # ---------------------------------------------------------------------------
-# Aggregation helpers
+# Numeric aggregation (pointwise CDF — not shared since it operates on raw
+# Percentile lists rather than the normalized per-option-values form)
 # ---------------------------------------------------------------------------
-
-
-def _aggregate_binary(predictions: list[float], aggregation: Literal["mean", "median"] = "median") -> float:
-    """Central tendency of binary probabilities, clamped to [BINARY_PROB_MIN, BINARY_PROB_MAX]."""
-    if aggregation == "mean":
-        central = statistics.mean(predictions)
-    else:
-        central = statistics.median(predictions)
-    return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, float(central)))
-
-
-def _aggregate_mc(
-    predictions: list[dict[str, float]],
-    question: MultipleChoiceQuestion,
-    aggregation: Literal["mean", "median"] = "median",
-) -> PredictedOptionList:
-    """Option-wise central tendency across forecasters, then clamp + renormalize."""
-    option_order = list(question.options)
-    per_option_values: dict[str, list[float]] = {name: [] for name in option_order}
-    for pred in predictions:
-        for name in option_order:
-            if name in pred:
-                per_option_values[name].append(pred[name])
-
-    raw_probs = {}
-    for name in option_order:
-        values = per_option_values[name]
-        if not values:
-            raw_probs[name] = 1.0 / len(option_order)
-        elif aggregation == "mean":
-            raw_probs[name] = float(statistics.mean(values))
-        else:
-            raw_probs[name] = float(statistics.median(values))
-
-    clamped = {name: max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for name, p in raw_probs.items()}
-    total = sum(clamped.values())
-    normalized = {name: (p / total) for name, p in clamped.items()} if total > 0 else clamped
-    aggregated_options = [PredictedOption(option_name=name, probability=normalized[name]) for name in option_order]
-    aggregated_list = PredictedOptionList(predicted_options=aggregated_options)
-    return clamp_and_renormalize_mc(aggregated_list)
 
 
 async def _aggregate_numeric_predictions(
@@ -471,7 +405,6 @@ async def _aggregate_numeric_predictions(
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
     from metaculus_bot.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
 
-    # All predictions have the same grid (201 points on [lower, upper])
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)
     if aggregation == "mean":
@@ -479,19 +412,14 @@ async def _aggregate_numeric_predictions(
     else:
         median_probs = np.median(prob_arrays, axis=0)
 
-    # Ensure monotonic + clipped to [0, 1]
     median_probs = np.clip(median_probs, 0.0, 1.0)
     median_probs = np.maximum.accumulate(median_probs)
 
-    # Build the result as a PchipNumericDistribution
     grid = np.linspace(float(question.lower_bound), float(question.upper_bound), n_points)
-    # declared_percentiles for the wrapper must be strictly increasing — filter
-    # to a subset that satisfies this constraint (use every 20th point as stand-in).
     stride = max(1, n_points // 10)
     subset_indices = list(range(0, n_points, stride))
     if subset_indices[-1] != n_points - 1:
         subset_indices.append(n_points - 1)
-    # Ensure strictly increasing values in subset
     declared_subset: list[Percentile] = []
     prev_p = -1.0
     for idx in subset_indices:

@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any
 
 from forecasting_tools import (
@@ -58,6 +57,7 @@ from metaculus_bot.ablation.forecasters import (
     question_type_for_serialization,
     serialize_prediction_value,
 )
+from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -461,21 +461,13 @@ async def run_stacker_for_arm(
 
     surviving = _surviving_forecasters(forecaster_payloads)
     if len(surviving) < ABLATION_MIN_FORECASTERS:
-        # Schema invariant: every stacker payload carries ``stacker_model_used``.
-        # ``None`` here means "stacker never ran" (insufficient inputs); other
-        # branches set ``"primary"``, ``"fallback"``, or leave ``None`` after a
-        # both-stackers-failed exception. Keeping the key present in every
-        # payload lets cli.py:_stage_stack read it via direct subscript.
-        error_payload = {
-            "success": False,
-            "arm": arm,
-            "reason": "insufficient_forecasters",
-            "stacker_model_used": None,
-            "n_forecasters_used": len(surviving),
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": arm == ARM_STACK_AUG,
-            "errors": [],
-        }
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="insufficient_forecasters",
+            model_used=None,
+            n_forecasters=len(surviving),
+            tools_enabled=arm == ARM_STACK_AUG,
+        )
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
         await asyncio.sleep(0)
         return error_payload
@@ -615,20 +607,16 @@ async def run_stacker_for_arm(
         # fail-fast: a borked-key scenario aborts at qid #1 instead of silently
         # failing all 88. Resume after manual fix via ``--qids <remaining>`` —
         # the cache layer auto-skips qids whose arm payload already exists.
-        error_payload = {
-            "success": False,
-            "arm": arm,
-            "reason": "stacker_failed_no_fallback",
-            "stacker_prediction": None,
-            "stacker_meta_reasoning": "",
-            "computed_quantities": per_forecaster_md,
-            "cross_model_aggregation": cross_model_md or "",
-            "stacker_model_used": stacker_model_used,
-            "n_forecasters_used": len(surviving),
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": enable_tools,
-            "errors": errors_list,
-        }
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="stacker_failed_no_fallback",
+            model_used=stacker_model_used,
+            n_forecasters=len(surviving),
+            computed_quantities=per_forecaster_md,
+            cross_model_aggregation=cross_model_md or "",
+            tools_enabled=enable_tools,
+            errors=errors_list,
+        )
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
         joined_errors = "; ".join(errors_list) if errors_list else "<no errors recorded>"
         raise RuntimeError(
@@ -647,21 +635,17 @@ async def run_stacker_for_arm(
         # outcomes.
         try:
             median_prediction = await _median_fallback_prediction(question, surviving)
-            median_payload = {
-                "success": True,
-                "arm": arm,
-                "stacker_prediction": serialize_prediction_value(
-                    median_prediction, question_type_for_serialization(question)
-                ),
-                "stacker_meta_reasoning": "median_fallback: both stackers failed",
-                "computed_quantities": per_forecaster_md,
-                "cross_model_aggregation": cross_model_md or "",
-                "stacker_model_used": "median_fallback",
-                "n_forecasters_used": len(surviving),
-                "ran_at": datetime.now().isoformat(),
-                "tools_enabled_at_runtime": enable_tools,
-                "errors": errors_list,
-            }
+            median_payload = make_success_payload(
+                arm=arm,
+                prediction=serialize_prediction_value(median_prediction, question_type_for_serialization(question)),
+                meta_reasoning="median_fallback: both stackers failed",
+                computed_quantities=per_forecaster_md,
+                cross_model_aggregation=cross_model_md or "",
+                model_used="median_fallback",
+                n_forecasters=len(surviving),
+                tools_enabled=enable_tools,
+                errors=errors_list,
+            )
             logger.warning(
                 "Median fallback engaged for qid=%s arm=%s after both stackers failed",
                 qid,
@@ -672,20 +656,16 @@ async def run_stacker_for_arm(
         except Exception as median_exc:  # noqa: BLE001 - degrade gracefully
             logger.exception("Median fallback failed for qid=%s arm=%s", qid, arm)
             errors_list.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
-            error_payload = {
-                "success": False,
-                "arm": arm,
-                "reason": "stacker_failed",
-                "stacker_prediction": None,
-                "stacker_meta_reasoning": "",
-                "computed_quantities": per_forecaster_md,
-                "cross_model_aggregation": cross_model_md or "",
-                "stacker_model_used": stacker_model_used,
-                "n_forecasters_used": len(surviving),
-                "ran_at": datetime.now().isoformat(),
-                "tools_enabled_at_runtime": enable_tools,
-                "errors": errors_list,
-            }
+            error_payload = make_error_payload(
+                arm=arm,
+                reason="stacker_failed",
+                model_used=stacker_model_used,
+                n_forecasters=len(surviving),
+                computed_quantities=per_forecaster_md,
+                cross_model_aggregation=cross_model_md or "",
+                tools_enabled=enable_tools,
+                errors=errors_list,
+            )
             cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
             await asyncio.sleep(0)
             return error_payload
@@ -702,37 +682,32 @@ async def run_stacker_for_arm(
             arm,
         )
         errors_list.append(f"{stacker_model_used}: stacker output contained NaN/inf")
-        error_payload = {
-            "success": False,
-            "arm": arm,
-            "reason": "stacker_nonfinite_output",
-            "stacker_prediction": None,
-            "stacker_meta_reasoning": stacker_meta,
-            "computed_quantities": per_forecaster_md,
-            "cross_model_aggregation": cross_model_md or "",
-            "stacker_model_used": stacker_model_used,
-            "n_forecasters_used": len(surviving),
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": enable_tools,
-            "errors": errors_list,
-        }
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="stacker_nonfinite_output",
+            meta_reasoning=stacker_meta,
+            model_used=stacker_model_used,
+            n_forecasters=len(surviving),
+            computed_quantities=per_forecaster_md,
+            cross_model_aggregation=cross_model_md or "",
+            tools_enabled=enable_tools,
+            errors=errors_list,
+        )
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
         await asyncio.sleep(0)
         return error_payload
 
-    success_payload = {
-        "success": True,
-        "arm": arm,
-        "stacker_prediction": serialized_prediction,
-        "stacker_meta_reasoning": stacker_meta,
-        "computed_quantities": per_forecaster_md,
-        "cross_model_aggregation": cross_model_md or "",
-        "stacker_model_used": stacker_model_used,
-        "n_forecasters_used": len(surviving),
-        "ran_at": datetime.now().isoformat(),
-        "tools_enabled_at_runtime": enable_tools,
-        "errors": errors_list,
-    }
+    success_payload = make_success_payload(
+        arm=arm,
+        prediction=serialized_prediction,
+        meta_reasoning=stacker_meta,
+        computed_quantities=per_forecaster_md,
+        cross_model_aggregation=cross_model_md or "",
+        model_used=stacker_model_used,
+        n_forecasters=len(surviving),
+        tools_enabled=enable_tools,
+        errors=errors_list,
+    )
     cache.write_stacker_output(qid=qid, arm=arm, payload=success_payload)
     await asyncio.sleep(0)
     return success_payload
