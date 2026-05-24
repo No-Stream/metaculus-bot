@@ -3,7 +3,7 @@ import logging
 import random
 import time
 from collections import defaultdict
-from typing import Any, Coroutine, Literal, Sequence, cast
+from typing import Any, Coroutine, Sequence, cast
 
 from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
@@ -27,24 +27,7 @@ from metaculus_bot.aggregation_strategies import (
     combine_multiple_choice_predictions,
     combine_numeric_predictions,
 )
-from metaculus_bot.calibration import (
-    BINARY_PLATT_PARAMS,
-    MC_PLATT_PARAMS,
-    apply_binary_platt,
-    apply_mc_platt,
-)
-from metaculus_bot.comment_markers import (
-    STACKED_MARKER_FALSE,
-    STACKED_MARKER_TRUE,
-    STACKER_OUTCOME_FALLBACK_LLM,
-    STACKER_OUTCOME_FALLBACK_MEAN,
-    STACKER_OUTCOME_FALLBACK_MEDIAN,
-    STACKER_OUTCOME_PRIMARY,
-    STACKER_OUTCOME_SKIPPED,
-    TOOLS_USED_MARKER_FALSE,
-    TOOLS_USED_MARKER_TRUE,
-)
-from metaculus_bot.comment_trimming import trim_comment, trim_section
+from metaculus_bot.comment_trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_STACKING_ENABLED_ENV,
@@ -58,15 +41,11 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
-    PLATT_BINARY_MAX_ABS_DEVIATION,
-    PLATT_CALIBRATION_ENABLED_ENV,
-    PLATT_MC_MAX_ABS_DEVIATION,
     STACKER_FALLBACK_SOFT_DEADLINE,
     STACKER_SOFT_DEADLINE,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
-from metaculus_bot.discrete_snap import majority_votes_discrete, snap_distribution_to_integers
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric_diagnostics import log_final_prediction
 from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
@@ -914,6 +893,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         final_cost: float,
         time_spent_in_minutes: float,
     ) -> str:
+        from metaculus_bot.comment_formatting import build_unified_explanation
+
         base_text = super()._create_unified_explanation(
             question,
             research_prediction_collections,
@@ -922,52 +903,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
             time_spent_in_minutes,
         )
         qid = question.id_of_question
-        # Always pop so per-question bookkeeping doesn't leak across runs.
-        popped = self._stacker_outcome.pop(qid, None) if qid is not None else None
-        if self.aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-            # MEAN/MEDIAN/etc were never stacking candidates — emitting a marker would misrepresent.
-            return trim_comment(base_text)
-        assert popped is not None, (
-            f"_stacker_outcome must be populated for STACKING/CONDITIONAL_STACKING qid={qid}; "
-            "every reachable code path in _aggregate_predictions sets it. Missing entry = real bug."
-        )
-        match popped:
-            case "primary":
-                outcome_marker, legacy_marker = STACKER_OUTCOME_PRIMARY, STACKED_MARKER_TRUE
-            case "fallback_llm":
-                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_LLM, STACKED_MARKER_TRUE
-            case "fallback_median":
-                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEDIAN, STACKED_MARKER_FALSE
-            case "fallback_mean":
-                # F15: STACKING budget-skip path uses MEAN base-combine (not MEDIAN).
-                # Emit a distinct marker so residual analysis can bucket the two paths.
-                outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
-            case "skipped":
-                outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
-            case other:
-                raise ValueError(f"Unknown stacker outcome {other!r}")
-
-        # Probabilistic-tools marker rides alongside the STACKER_OUTCOME + STACKED markers so
-        # residual analysis can bucket tool-augmented vs vanilla stacking runs. Marker reflects
-        # actual per-type dispatch (PROBABILISTIC_TOOLS_TYPES allow-list), not just the global
-        # flag — otherwise a numeric question with TYPES="binary,multiple_choice" would emit
-        # TOOLS_USED=true even though no tool fired (F21).
-        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            _feature_enabled as _tool_runner_feature_enabled,
-        )
-
-        if isinstance(question, BinaryQuestion):
-            qtype: Literal["binary", "numeric", "multiple_choice"] | None = "binary"
-        elif isinstance(question, NumericQuestion):
-            qtype = "numeric"
-        elif isinstance(question, MultipleChoiceQuestion):
-            qtype = "multiple_choice"
-        else:
-            qtype = None
-        tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE
-        # Append (not prepend): ForecastReport.explanation.strip() must start with '#'.
-        # STACKER_OUTCOME + STACKED both emitted for one round of back-compat with parsers reading STACKED=.
-        return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}\n")
+        stacker_outcome = self._stacker_outcome.pop(qid, None) if qid is not None else None
+        return build_unified_explanation(base_text, question, self.aggregation_strategy, stacker_outcome)
 
     async def _forecaster_with_soft_deadline(
         self,
@@ -1388,92 +1325,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return prediction
 
     def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        """Apply post-hoc Platt scaling to the final binary or MC probability.
+        from metaculus_bot.calibration import BINARY_PLATT_PARAMS, MC_PLATT_PARAMS
+        from metaculus_bot.post_processing import apply_platt_calibration
 
-        Short-circuits and returns ``prediction`` unchanged when any of:
-
-        * ``PLATT_CALIBRATION_ENABLED`` is unset;
-        * both ``BINARY_PLATT_PARAMS`` and ``MC_PLATT_PARAMS`` are still
-          identity (the checked-in default until the fit CLI populates them);
-        * ``prediction`` is a NumericDistribution (numeric calibration is
-          intentionally out of scope for this initial rollout).
-
-        Called on FRESH aggregation return points in
-        ``_aggregate_predictions`` and on the CONDITIONAL_STACKING multi-input
-        base-combine re-entry (where the inputs are RAW per-forecaster
-        predictions from the low-spread skip path — not yet calibrated).
-        Deliberately NOT called on the STACKING multi-input base-combine
-        re-entry (per-research-report stacker outputs already calibrated by
-        the fresh-aggregation path) or the single-input re-entry under
-        either strategy (single pre-stacked output already calibrated).
-        Re-applying in those cases would double-apply.
-        """
-        if not env_flag_enabled(PLATT_CALIBRATION_ENABLED_ENV):
-            return prediction
-
-        if BINARY_PLATT_PARAMS.is_identity() and MC_PLATT_PARAMS.is_identity():
-            return prediction
-
-        if isinstance(question, BinaryQuestion) and isinstance(prediction, (int, float)):
-            calibrated = apply_binary_platt(
-                float(prediction),
-                BINARY_PLATT_PARAMS,
-                max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION,
-            )
-            if calibrated != float(prediction):
-                logger.info(
-                    "PLATT_BINARY: q=%s raw=%.4f calibrated=%.4f bias=%.4f slope=%.4f cap=%.3f",
-                    question.id_of_question,
-                    float(prediction),
-                    calibrated,
-                    BINARY_PLATT_PARAMS.bias,
-                    BINARY_PLATT_PARAMS.slope,
-                    PLATT_BINARY_MAX_ABS_DEVIATION,
-                )
-            return calibrated  # type: ignore[return-value]  # float is a PredictionTypes member
-
-        if isinstance(prediction, PredictedOptionList):
-            raw_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
-            apply_mc_platt(
-                prediction,
-                MC_PLATT_PARAMS,
-                max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION,
-            )
-            calibrated_summary = {o.option_name: round(o.probability, 4) for o in prediction.predicted_options}
-            if raw_summary != calibrated_summary:
-                logger.info(
-                    "PLATT_MC: q=%s raw=%s calibrated=%s bias=%.4f slope=%.4f cap=%.3f",
-                    question.id_of_question,
-                    raw_summary,
-                    calibrated_summary,
-                    MC_PLATT_PARAMS.bias,
-                    MC_PLATT_PARAMS.slope,
-                    PLATT_MC_MAX_ABS_DEVIATION,
-                )
-            return prediction
-
-        return prediction
+        return apply_platt_calibration(prediction, question, BINARY_PLATT_PARAMS, MC_PLATT_PARAMS)
 
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        """Apply discrete integer CDF snapping if LLM majority voted DISCRETE."""
+        from metaculus_bot.post_processing import maybe_snap_to_integers
+
         if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
             return prediction
-
         qid = question.id_of_question
         if qid is None:
             return prediction
         votes = self._discrete_integer_votes.pop(qid, [])
-        if not majority_votes_discrete(votes):
-            if votes:
-                logger.info("Discrete snap skipped for Q %s: votes=%s (majority=CONTINUOUS)", qid, votes)
-            return prediction
-
-        logger.info("Discrete snap: majority voted DISCRETE for Q %s | votes=%s", qid, votes)
-        snapped = snap_distribution_to_integers(prediction, question)
-        if snapped is None:
-            logger.info("Discrete snap returned None for Q %s (guard condition), keeping original", qid)
-            return prediction
-        return snapped  # type: ignore[return-value]  # NumericDistribution is a PredictionTypes member
+        return maybe_snap_to_integers(prediction, question, votes)
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         model_name = llm_to_use.model

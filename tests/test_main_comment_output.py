@@ -278,7 +278,7 @@ class TestStackedMarkerInjection:
         assert q.id_of_question not in bot._stacker_outcome
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            with pytest.raises(AssertionError, match="_stacker_outcome must be populated"):
+            with pytest.raises(AssertionError, match="stacker_outcome must be provided"):
                 bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
     def test_qid_none_under_stacking_raises(self):
@@ -293,7 +293,7 @@ class TestStackedMarkerInjection:
         object.__setattr__(q, "id_of_question", None)
 
         with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
-            with pytest.raises(AssertionError, match="_stacker_outcome must be populated"):
+            with pytest.raises(AssertionError, match="stacker_outcome must be provided"):
                 bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
 
     def test_marker_survives_trim_comment(self):
