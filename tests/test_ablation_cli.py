@@ -5647,11 +5647,11 @@ class TestHydrationRespectsPruneFailures:
 
 class TestForceStagesCascade:
     def test_force_stages_forecast_cascades_to_stack_a_b_c(self) -> None:
-        """Forcing forecast must auto-force stack + pdf + median (otherwise stale cache served)."""
+        """Forcing forecast must auto-force stack + pdf + median + mean (otherwise stale cache served)."""
         from metaculus_bot.ablation.cli import _expand_forced_stages
 
         forced = _expand_forced_stages({"forecast"})
-        assert forced == {"forecast", "stack", "stack_aug", "pdf", "median"}
+        assert forced == {"forecast", "stack", "stack_aug", "pdf", "median", "mean"}
 
     def test_force_stages_prune_cascades_through_screen_qa_forecast_stack(self) -> None:
         """Forcing prune must invalidate every stage downstream that consumes its output."""
@@ -5705,7 +5705,7 @@ class TestForceStagesCascade:
         """Cascade must be idempotent: explicitly listing all stages doesn't double-add."""
         from metaculus_bot.ablation.cli import _expand_forced_stages
 
-        explicit = {"forecast", "stack", "stack_aug", "pdf", "median"}
+        explicit = {"forecast", "stack", "stack_aug", "pdf", "median", "mean"}
         forced = _expand_forced_stages(explicit)
         assert forced == explicit
 

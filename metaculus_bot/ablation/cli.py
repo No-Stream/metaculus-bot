@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
 from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
 from forecasting_tools.data_models.numeric_report import NumericReport
@@ -70,10 +70,20 @@ from metaculus_bot.ablation.qa_iterate import (
     write_manual_rejects,
 )
 from metaculus_bot.ablation.research import run_gemini_research_for_qids
+
+# Symbols used in _stage_stack for the mean arm and pdf mean variant.
+# Function-scoped imports would survive formatter stripping, but these are
+# used in multiple places across the orchestrator so top-level is cleaner.
+from metaculus_bot.ablation.run_mean import run_mean_for_qid
 from metaculus_bot.ablation.run_median import run_median_for_qid
-from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1, ARM_PDF_MIN2, run_pdf_for_qid
+from metaculus_bot.ablation.run_pdf import (  # noqa: E402
+    ARM_PDF_MIN1,
+    ARM_PDF_MIN2,
+    run_pdf_for_qid,
+)
 from metaculus_bot.ablation.run_stacker import (
     ABLATION_MIN_FORECASTERS,
+    ARM_MEAN,
     ARM_MEDIAN,
     ARM_PDF,
     ARM_STACK,
@@ -106,6 +116,7 @@ STAGES: list[str] = [
     "stack_aug",
     "pdf",
     "median",
+    "mean",
     "score",
 ]
 DEFAULT_TOURNAMENTS: list[str] = ["spring-aib-2026"]
@@ -119,15 +130,16 @@ DEFAULT_CACHE_DIR: str = "backtests/ablation"
 # fresh-vs-stale arms. See cli_audit_20260515.md (C1) for the operator footgun.
 _FORCE_CASCADES: dict[str, set[str]] = {
     "fetch": set(),
-    "research": {"prune", "screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median"},
-    "prune": {"screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median"},
+    "research": {"prune", "screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median", "mean"},
+    "prune": {"screen", "qa_iterate", "forecast", "stack", "stack_aug", "pdf", "median", "mean"},
     "screen": {"qa_iterate"},
     "qa_iterate": set(),
-    "forecast": {"stack", "stack_aug", "pdf", "median"},
+    "forecast": {"stack", "stack_aug", "pdf", "median", "mean"},
     "stack": set(),
     "stack_aug": set(),
     "pdf": set(),
     "median": set(),
+    "mean": set(),
     "score": set(),
 }
 
@@ -173,6 +185,7 @@ class SpendReport:
     cached_stacker_pdf_min1_hits: int = 0
     cached_stacker_pdf_min2_hits: int = 0
     cached_stacker_median_hits: int = 0
+    cached_stacker_mean_hits: int = 0
     fallback_stacker_stack: int = 0
     fallback_stacker_stack_aug: int = 0
     prune_validation_failures: int = 0
@@ -429,6 +442,38 @@ def _build_parser() -> argparse.ArgumentParser:
             "Logs are tee'd to stderr and to <cache-dir>/logs/run_<timestamp>.log."
         ),
     )
+    parser.add_argument(
+        "--lineup",
+        type=str,
+        choices=["free", "prod"],
+        default="free",
+        help=(
+            "Forecaster ensemble: 'free' for the 4-model free-tier ablation (default), "
+            "'prod' for the 3-model paid ensemble (gemini-3.1-pro, claude-opus-4.5 "
+            "medium-thinking, gpt-5.5 medium-effort)."
+        ),
+    )
+    parser.add_argument(
+        "--plain-llm",
+        action="store_true",
+        default=False,
+        help=(
+            "Construct stacker LLMs via plain GeneralLlm (no donated-key wrapper, no "
+            "fallback wrapping). Intended for paid benchmark-mode runs where fail-fast "
+            "is preferred over cost absorption."
+        ),
+    )
+    parser.add_argument(
+        "--no-stacker-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable the stacker fallback chain: on primary stacker failure, propagate "
+            "the error immediately instead of trying the fallback LLM or median fallback. "
+            "Intended for paid benchmark-mode runs where we want to see failures rather "
+            "than silently degrade."
+        ),
+    )
     return parser
 
 
@@ -673,7 +718,9 @@ class WorkingSet:
     stacker_pdf_payloads: dict[int, dict] = field(default_factory=dict)
     stacker_pdf_min1_payloads: dict[int, dict] = field(default_factory=dict)
     stacker_pdf_min2_payloads: dict[int, dict] = field(default_factory=dict)
+    stacker_pdf_min1_mean_payloads: dict[int, dict] = field(default_factory=dict)
     stacker_median_payloads: dict[int, dict] = field(default_factory=dict)
+    stacker_mean_payloads: dict[int, dict] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,19 +1156,24 @@ async def _stage_forecast(
     pre-snapshot the slugs already on disk; cells in the snapshot AND not
     forced count as ``cached_forecaster_hits``. Cells outside the snapshot
     (or all cells under force) count as ``forecaster_llm_calls``. Cell
-    granularity uses ``FREE_FORECASTER_MODELS`` as the canonical lineup so
-    the count doesn't drift if the orchestrator's coarse all-or-nothing
-    cache check changes shape later.
+    granularity uses the active lineup's model list so the count doesn't
+    drift if the orchestrator's coarse all-or-nothing cache check changes
+    shape later.
     """
+    from metaculus_bot.ablation.forecaster_lineup import get_lineup  # noqa: PLC0415
+
     await asyncio.sleep(0)
     qids = sorted(working.research_blobs.keys())
+
+    lineup_name: str = getattr(args, "lineup", "free")
+    forecaster_llms, lineup_models = get_lineup(lineup_name)
 
     cached_per_qid: dict[int, dict[str, dict]] = {}
     pre_snapshot_slugs: dict[int, set[str]] = {}
     for qid in qids:
         # m2: filter the on-disk listing to the CURRENT lineup so obsolete
         # files don't pollute cache hit accounting or downstream stacker calls.
-        on_disk = cache.list_forecaster_outputs(qid, lineup_filter=list(FREE_FORECASTER_MODELS))
+        on_disk = cache.list_forecaster_outputs(qid, lineup_filter=lineup_models)
         pre_snapshot_slugs[qid] = set(on_disk.keys())
         if force or not on_disk:
             continue
@@ -1150,6 +1202,7 @@ async def _stage_forecast(
         fresh_results = await run_forecasters_batch(
             questions_with_research,
             cache,
+            forecaster_llms=forecaster_llms,
             force=force,
             per_question_concurrency=args.concurrency,
             per_forecaster_concurrency=rate_limit_kwargs["per_forecaster_concurrency"],
@@ -1158,7 +1211,7 @@ async def _stage_forecast(
 
     for qid in qids:
         cached_slugs = pre_snapshot_slugs[qid] if not force else set()
-        for model in FREE_FORECASTER_MODELS:
+        for model in lineup_models:
             slug = model_slug_to_filename(model)
             if slug in cached_slugs:
                 spend.cached_forecaster_hits += 1
@@ -1181,12 +1234,14 @@ _STACK_ARM_TO_TARGET_ATTR: dict[str, str] = {
     ARM_STACK_AUG: "stacker_stack_aug_payloads",
     ARM_PDF: "stacker_pdf_payloads",
     ARM_MEDIAN: "stacker_median_payloads",
+    ARM_MEAN: "stacker_mean_payloads",
 }
 _STACK_ARM_TO_CACHE_HIT_FIELD: dict[str, str] = {
     ARM_STACK: "cached_stacker_stack_hits",
     ARM_STACK_AUG: "cached_stacker_stack_aug_hits",
     ARM_PDF: "cached_stacker_pdf_hits",
     ARM_MEDIAN: "cached_stacker_median_hits",
+    ARM_MEAN: "cached_stacker_mean_hits",
 }
 
 
@@ -1240,10 +1295,23 @@ async def _stage_stack(
                     cache=cache,
                     force=force,
                 )
+        elif arm == ARM_MEAN:
+            # ARM_MEAN: deterministic mean aggregation, no LLM calls.
+            for qid in needs_run:
+                fresh_results[qid] = await run_mean_for_qid(
+                    qid=qid,
+                    question=working.questions[qid],
+                    forecaster_payloads=working.forecaster_payloads[qid],
+                    cache=cache,
+                    force=force,
+                )
         elif arm == ARM_PDF:
             # ARM_PDF: deterministic structured-math aggregation, no LLM calls.
-            # Produces BOTH pdf_min1 (any structured output) and pdf_min2 (proper
-            # aggregation) cache files from the same set of structured predictions.
+            # Produces pdf_min1 (median, any structured output), pdf_min2 (median,
+            # proper aggregation), and pdf_min1_mean (mean variant for prod-ish
+            # comparison). All cache as separate arm_label files.
+            from metaculus_bot.ablation.run_pdf import ARM_PDF_MIN1_MEAN  # noqa: PLC0415
+
             for qid in needs_run:
                 result_min1 = await run_pdf_for_qid(
                     qid=qid,
@@ -1263,8 +1331,19 @@ async def _stage_stack(
                     min_forecasters=2,
                     arm_label=ARM_PDF_MIN2,
                 )
+                result_min1_mean = await run_pdf_for_qid(
+                    qid=qid,
+                    question=working.questions[qid],
+                    forecaster_payloads=working.forecaster_payloads[qid],
+                    cache=cache,
+                    force=force,
+                    min_forecasters=1,
+                    arm_label=ARM_PDF_MIN1_MEAN,
+                    aggregation="mean",
+                )
                 working.stacker_pdf_min1_payloads[qid] = result_min1
                 working.stacker_pdf_min2_payloads[qid] = result_min2
+                working.stacker_pdf_min1_mean_payloads[qid] = result_min1_mean
                 # fresh_results used for backward-compat target assignment below
                 fresh_results[qid] = result_min2
         else:
@@ -1276,12 +1355,42 @@ async def _stage_stack(
                 }
                 for qid in needs_run
             }
+            # Wire --plain-llm and --no-stacker-fallback into stacker construction.
+            stacker_llm_kwarg: GeneralLlm | None = None
+            fallback_llm_kwarg: GeneralLlm | None = None
+            if getattr(args, "plain_llm", False):
+                from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
+                    _GPT_5_5_STACKER_KWARGS,
+                    _OPUS_STACKER_KWARGS,
+                    DEFAULT_STACKER_FALLBACK_MODEL,
+                    DEFAULT_STACKER_MODEL,
+                )
+
+                stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
+                if not getattr(args, "no_stacker_fallback", False):
+                    fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
+            elif getattr(args, "no_stacker_fallback", False):
+                # No fallback but still use the donated-key wrapper for primary.
+                fallback_llm_kwarg = None
+
+            # When --no-stacker-fallback is set, pass a sentinel None for
+            # fallback so run_stacker_for_arm skips the fallback chain.
+            batch_kwargs: dict[str, Any] = {
+                "force": force,
+                "concurrency": args.concurrency,
+            }
+            if stacker_llm_kwarg is not None:
+                batch_kwargs["stacker_llm"] = stacker_llm_kwarg
+            if getattr(args, "no_stacker_fallback", False):
+                batch_kwargs["fallback_stacker_llm"] = None
+            elif fallback_llm_kwarg is not None:
+                batch_kwargs["fallback_stacker_llm"] = fallback_llm_kwarg
+
             fresh_results = await run_stacker_batch(
                 qid_to_data,
                 arm,
                 cache,
-                force=force,
-                concurrency=args.concurrency,
+                **batch_kwargs,
             )
 
     if arm in (ARM_STACK, ARM_STACK_AUG):
@@ -1666,6 +1775,11 @@ async def _hydrate_working_set_from_cache(
             working.stacker_median_payloads[qid] = payload_median
             if spend is not None:
                 spend.cached_stacker_median_hits += 1
+        payload_mean = cache.read_stacker_output(qid=qid, arm=ARM_MEAN)
+        if payload_mean is not None:
+            working.stacker_mean_payloads[qid] = payload_mean
+            if spend is not None:
+                spend.cached_stacker_mean_hits += 1
 
 
 def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int]:
@@ -1689,6 +1803,7 @@ def _filter_working_set_to_qids(working: WorkingSet, qids: list[int]) -> set[int
         "stacker_pdf_min1_payloads",
         "stacker_pdf_min2_payloads",
         "stacker_median_payloads",
+        "stacker_mean_payloads",
     ):
         existing = getattr(working, attr)
         filtered = {qid: v for qid, v in existing.items() if qid in requested}
@@ -1813,16 +1928,18 @@ async def run_ablation(args: argparse.Namespace) -> int:
             | set(working.stacker_pdf_min1_payloads.keys())
             | set(working.stacker_pdf_min2_payloads.keys())
             | set(working.stacker_median_payloads.keys())
+            | set(working.stacker_mean_payloads.keys())
         )
         if not all_arm_qids:
             logger.error(
                 "Cannot run 'score': zero qids have any stacker outputs "
-                "(stack=%d, stack_aug=%d, pdf_min1=%d, pdf_min2=%d, median=%d).",
+                "(stack=%d, stack_aug=%d, pdf_min1=%d, pdf_min2=%d, median=%d, mean=%d).",
                 len(working.stacker_stack_payloads),
                 len(working.stacker_stack_aug_payloads),
                 len(working.stacker_pdf_min1_payloads),
                 len(working.stacker_pdf_min2_payloads),
                 len(working.stacker_median_payloads),
+                len(working.stacker_mean_payloads),
             )
             print("ERROR: --stages score: zero qids have any arm payloads.")
             return 2
@@ -1963,8 +2080,15 @@ async def run_ablation(args: argparse.Namespace) -> int:
         force = "median" in forced
         await _stage_stack(args, cache, working, arm=ARM_MEDIAN, force=force, spend=spend)
         logger.info("stage=median DONE | qids=%d", len(working.stacker_median_payloads))
-        # No inter-stage sleep — ARM_MEDIAN does zero API work, so the per-question-sleep
-        # backoff (intended to space out free-tier API spend) doesn't apply.
+        # No inter-stage sleep — ARM_MEDIAN does zero API work.
+
+    if "mean" in requested:
+        n = len(working.forecaster_payloads)
+        logger.info("stage=mean START | est wall-clock ~1 min (n=%d, deterministic aggregation)", n)
+        force = "mean" in forced
+        await _stage_stack(args, cache, working, arm=ARM_MEAN, force=force, spend=spend)
+        logger.info("stage=mean DONE | qids=%d", len(working.stacker_mean_payloads))
+        # No inter-stage sleep — ARM_MEAN does zero API work.
 
     summary_path: Path | None = None
     if "score" in requested:
@@ -1975,15 +2099,17 @@ async def run_ablation(args: argparse.Namespace) -> int:
             | set(working.stacker_pdf_min1_payloads.keys())
             | set(working.stacker_pdf_min2_payloads.keys())
             | set(working.stacker_median_payloads.keys())
+            | set(working.stacker_mean_payloads.keys())
         )
         if not all_arm_qids:
             logger.warning(
-                "score | no qids have any arm payloads (stack=%d stack_aug=%d pdf_min1=%d pdf_min2=%d median=%d); skipping",
+                "score | no qids have any arm payloads (stack=%d stack_aug=%d pdf_min1=%d pdf_min2=%d median=%d mean=%d); skipping",
                 len(working.stacker_stack_payloads),
                 len(working.stacker_stack_aug_payloads),
                 len(working.stacker_pdf_min1_payloads),
                 len(working.stacker_pdf_min2_payloads),
                 len(working.stacker_median_payloads),
+                len(working.stacker_mean_payloads),
             )
         else:
             summary_path = _stage_score(args, cache, working)

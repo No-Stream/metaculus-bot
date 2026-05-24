@@ -905,6 +905,154 @@ class TestCollectorProcessSingleQuestion:
 
 
 # ---------------------------------------------------------------------------
+# per_base_model_forecasts field on collector records
+# ---------------------------------------------------------------------------
+
+
+class TestPerBaseModelForecastsOnRecord:
+    """Exercises per_base_model_forecasts field wiring in _process_post.
+
+    When a stacked binary comment contains base-model reasoning blocks with
+    probability lines, the collector must populate per_base_model_forecasts
+    with the per-base-model values so downstream stacker_detection can
+    compute the counterfactual median.
+    """
+
+    def test_stacked_binary_populates_per_base_model_forecasts(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+        from metaculus_bot.stacking import combine_stacker_and_base_reasoning
+
+        base_predictions = [
+            ReasonedPrediction(
+                prediction_value=0.72,
+                reasoning="Model: openrouter/openai/gpt-5.5\n\nAnalysis.\n\nProbability: 72%",
+            ),
+            ReasonedPrediction(
+                prediction_value=0.68,
+                reasoning="Model: openrouter/anthropic/claude-opus-4.7\n\nAnalysis.\n\nProbability: 68%",
+            ),
+            ReasonedPrediction(
+                prediction_value=0.75,
+                reasoning="Model: openrouter/google/gemini-3.1-pro-preview\n\nAnalysis.\n\nProbability: 75%",
+            ),
+        ]
+        meta_text = "Stacker meta.\n\nProbability: 71%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_predictions)
+
+        comment_text = (
+            "# SUMMARY\n"
+            "*Question*: Will X?\n\n"
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (stacker-model)*: 71.0%\n\n"
+            "### Research Summary\nresearch.\n\n"
+            "================================================================================\n"
+            "FORECAST SECTION:\n\n"
+            f"## R1: Forecaster 1 Reasoning\n{combined}\n"
+            "<!-- STACKED=true -->\n"
+        )
+
+        post_data = {
+            "id": 900,
+            "title": "Stacked binary question",
+            "projects": {"category": [{"name": "Science"}]},
+            "question": _make_binary_q_dict(qid=501, forecast_values=[0.29, 0.71]),
+        }
+        comment_lookup = {900: {"id": 8888, "on_post": 900, "text": comment_text, "created_at": "2024-05-15T00:00:00Z"}}
+
+        records = _process_post(post_data, comment_lookup)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["was_stacked"] is True
+        # The critical new field:
+        per_base = rec["per_base_model_forecasts"]
+        assert per_base != {}
+        assert per_base["gpt-5.5"] == "72.0%"
+        assert per_base["claude-opus-4.7"] == "68.0%"
+        assert per_base["gemini-3.1-pro-preview"] == "75.0%"
+
+    def test_non_stacked_binary_has_empty_per_base_model_forecasts(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        comment_text = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: 72.0%\n"
+            "*Forecaster 2 (claude-opus-4.7)*: 68.0%\n\n"
+            "### Research Summary\nresearch.\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "Analysis.\n\nProbability: 72%\n\n"
+            "## R1: Forecaster 2 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.7\n\n"
+            "Analysis.\n\nProbability: 68%\n"
+        )
+        post_data = {
+            "id": 901,
+            "title": "Non-stacked question",
+            "projects": {"category": [{"name": "Science"}]},
+            "question": _make_binary_q_dict(qid=502),
+        }
+        comment_lookup = {901: {"id": 8889, "on_post": 901, "text": comment_text, "created_at": "2024-05-15T00:00:00Z"}}
+
+        records = _process_post(post_data, comment_lookup)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["per_base_model_forecasts"] == {}
+
+    def test_stacked_mc_populates_per_base_model_option_dicts(self):
+        from metaculus_bot.performance_analysis.collector import _process_post
+        from metaculus_bot.stacking import combine_stacker_and_base_reasoning
+
+        base_predictions = [
+            ReasonedPrediction(
+                prediction_value=0.6,
+                reasoning=("Model: openrouter/openai/gpt-5.5\n\nAnalysis:\n- Option A: 60.0%\n- Option B: 40.0%"),
+            ),
+            ReasonedPrediction(
+                prediction_value=0.55,
+                reasoning=(
+                    "Model: openrouter/anthropic/claude-opus-4.7\n\nAnalysis:\n- Option A: 55.0%\n- Option B: 45.0%"
+                ),
+            ),
+        ]
+        meta_text = "Stacker:\n- Option A: 58.0%\n- Option B: 42.0%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_predictions)
+
+        comment_text = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (stacker)*: \n"
+            "- Option A: 58.0%\n"
+            "- Option B: 42.0%\n\n"
+            "### Research Summary\nresearch.\n\n"
+            "================================================================================\n"
+            "FORECAST SECTION:\n\n"
+            f"## R1: Forecaster 1 Reasoning\n{combined}\n"
+            "<!-- STACKED=true -->\n"
+        )
+
+        post_data = {
+            "id": 902,
+            "title": "Stacked MC question",
+            "projects": {"category": [{"name": "Politics"}]},
+            "question": _make_mc_q_dict(
+                qid=503,
+                options=["Option A", "Option B"],
+                forecast_values=[0.58, 0.42],
+            ),
+        }
+        comment_lookup = {902: {"id": 8890, "on_post": 902, "text": comment_text, "created_at": "2024-05-15T00:00:00Z"}}
+
+        records = _process_post(post_data, comment_lookup)
+        assert len(records) == 1
+        rec = records[0]
+        per_base = rec["per_base_model_forecasts"]
+        assert per_base["gpt-5.5"] == {"Option A": 0.60, "Option B": 0.40}
+        assert per_base["claude-opus-4.7"] == {"Option A": 0.55, "Option B": 0.45}
+
+
+# ---------------------------------------------------------------------------
 # End-to-end integration: producer (main.py) + consumer (parsing.py)
 # ---------------------------------------------------------------------------
 

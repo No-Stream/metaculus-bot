@@ -70,11 +70,13 @@ from metaculus_bot.structured_output_schema import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-__all__ = ["run_pdf_for_qid"]
+__all__ = ["ARM_PDF_MIN1_MEAN", "ARM_PDF_MIN1_MEDIAN", "run_pdf_for_qid"]
 
 ARM_PDF = "pdf"
 ARM_PDF_MIN1 = "pdf_min1"
 ARM_PDF_MIN2 = "pdf_min2"
+ARM_PDF_MIN1_MEDIAN = "pdf_min1_median"  # explicit alias of ARM_PDF_MIN1 for prod-ish naming
+ARM_PDF_MIN1_MEAN = "pdf_min1_mean"
 STRUCTURED_MATH_LABEL = "structured_math"
 
 # Likelihood-ratio mapping for evidence strength (used in Bayes cascade).
@@ -307,6 +309,7 @@ async def run_pdf_for_qid(
     force: bool = False,
     min_forecasters: int = ABLATION_MIN_FORECASTERS,
     arm_label: str = ARM_PDF,
+    aggregation: Literal["mean", "median"] = "median",
 ) -> dict:
     """Run the ARM_PDF deterministic structured-math arm for one question.
 
@@ -316,12 +319,12 @@ async def run_pdf_for_qid(
     3. For each survivor, parse structured block + compute prediction via cascade.
     4. Drop forecasters where structured math yields None.
     5. Min-forecasters guard (configurable via ``min_forecasters``, default 2).
-    6. Aggregate via pointwise median.
+    6. Aggregate via pointwise median or mean (controlled by ``aggregation``).
     7. Cache + return payload.
 
     The ``arm_label`` kwarg controls the arm name written to cache and to the
-    output payload. Use ``ARM_PDF_MIN1`` / ``ARM_PDF_MIN2`` to write separate
-    cache files for the dual-panel pdf analysis.
+    output payload. Use ``ARM_PDF_MIN1`` / ``ARM_PDF_MIN2`` / ``ARM_PDF_MIN1_MEAN``
+    to write separate cache files for the dual-panel pdf analysis.
     """
     if not force:
         cached = cache.read_stacker_output(qid=qid, arm=arm_label)
@@ -380,11 +383,11 @@ async def run_pdf_for_qid(
     # Aggregate
     aggregated: Any
     if isinstance(question, BinaryQuestion):
-        aggregated = _aggregate_binary(structured_predictions)
+        aggregated = _aggregate_binary(structured_predictions, aggregation)
     elif isinstance(question, MultipleChoiceQuestion):
-        aggregated = _aggregate_mc(structured_predictions, question)
+        aggregated = _aggregate_mc(structured_predictions, question, aggregation)
     elif isinstance(question, NumericQuestion):
-        aggregated = await _aggregate_numeric_predictions(structured_predictions, question)
+        aggregated = await _aggregate_numeric_predictions(structured_predictions, question, aggregation)
     else:
         raise ValueError(f"Unsupported question type: {type(question).__name__}")
 
@@ -413,17 +416,21 @@ async def run_pdf_for_qid(
 # ---------------------------------------------------------------------------
 
 
-def _aggregate_binary(predictions: list[float]) -> float:
-    """Median of binary probabilities, clamped to [BINARY_PROB_MIN, BINARY_PROB_MAX]."""
-    median_prob = statistics.median(predictions)
-    return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, float(median_prob)))
+def _aggregate_binary(predictions: list[float], aggregation: Literal["mean", "median"] = "median") -> float:
+    """Central tendency of binary probabilities, clamped to [BINARY_PROB_MIN, BINARY_PROB_MAX]."""
+    if aggregation == "mean":
+        central = statistics.mean(predictions)
+    else:
+        central = statistics.median(predictions)
+    return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, float(central)))
 
 
 def _aggregate_mc(
     predictions: list[dict[str, float]],
     question: MultipleChoiceQuestion,
+    aggregation: Literal["mean", "median"] = "median",
 ) -> PredictedOptionList:
-    """Option-wise median across forecasters, then clamp + renormalize."""
+    """Option-wise central tendency across forecasters, then clamp + renormalize."""
     option_order = list(question.options)
     per_option_values: dict[str, list[float]] = {name: [] for name in option_order}
     for pred in predictions:
@@ -434,7 +441,12 @@ def _aggregate_mc(
     raw_probs = {}
     for name in option_order:
         values = per_option_values[name]
-        raw_probs[name] = float(statistics.median(values)) if values else 1.0 / len(option_order)
+        if not values:
+            raw_probs[name] = 1.0 / len(option_order)
+        elif aggregation == "mean":
+            raw_probs[name] = float(statistics.mean(values))
+        else:
+            raw_probs[name] = float(statistics.median(values))
 
     clamped = {name: max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for name, p in raw_probs.items()}
     total = sum(clamped.values())
@@ -447,13 +459,14 @@ def _aggregate_mc(
 async def _aggregate_numeric_predictions(
     predictions: list[list[Percentile]],
     question: NumericQuestion,
+    aggregation: Literal["mean", "median"] = "median",
 ) -> Any:
-    """Pointwise median of per-forecaster 201-point CDFs.
+    """Pointwise central tendency of per-forecaster 201-point CDFs.
 
     Operates directly on the probability arrays rather than wrapping in
     NumericDistribution objects (which enforce strict-monotonicity on
     declared_percentiles — a constraint our 201-point CDFs can violate
-    at the tails). Takes the pointwise median, then wraps the result.
+    at the tails). Takes the pointwise median or mean, then wraps the result.
     """
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
     from metaculus_bot.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
@@ -461,7 +474,10 @@ async def _aggregate_numeric_predictions(
     # All predictions have the same grid (201 points on [lower, upper])
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)
-    median_probs = np.median(prob_arrays, axis=0)
+    if aggregation == "mean":
+        median_probs = np.mean(prob_arrays, axis=0)
+    else:
+        median_probs = np.median(prob_arrays, axis=0)
 
     # Ensure monotonic + clipped to [0, 1]
     median_probs = np.clip(median_probs, 0.0, 1.0)

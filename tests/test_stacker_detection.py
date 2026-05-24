@@ -164,6 +164,51 @@ class TestComputeProductionVsMedianDelta:
         assert compute_production_vs_median_delta(record) is None
 
 
+class TestComputeProductionVsMedianDeltaBaseModelField:
+    """Tests for per_base_model_forecasts preference in compute_production_vs_median_delta."""
+
+    def test_prefers_per_base_model_forecasts_over_collapsed_stacker(self):
+        """Stacked record: per_model_forecasts has only the stacker singleton,
+        per_base_model_forecasts has the original base models."""
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.85,
+            "per_model_forecasts": {"stacker": "85%"},
+            "per_base_model_forecasts": {"gpt-5.5": "60%", "claude": "80%", "gemini": "70%"},
+        }
+        # median of base [0.6, 0.7, 0.8] = 0.7, delta = |0.85 - 0.70| = 0.15
+        assert compute_production_vs_median_delta(record) == pytest.approx(0.15, abs=1e-6)
+
+    def test_empty_per_base_model_falls_back_to_per_model(self):
+        """Empty per_base_model_forecasts should fall back to per_model_forecasts."""
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.85,
+            "per_model_forecasts": {"a": "60%", "b": "80%", "c": "70%"},
+            "per_base_model_forecasts": {},
+        }
+        # median of [0.6, 0.7, 0.8] = 0.7, delta = |0.85 - 0.70| = 0.15
+        assert compute_production_vs_median_delta(record) == pytest.approx(0.15, abs=1e-6)
+
+    def test_missing_per_base_model_falls_back_to_per_model(self):
+        """Older records without per_base_model_forecasts still work."""
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.85,
+            "per_model_forecasts": {"a": "60%", "b": "80%", "c": "70%"},
+        }
+        assert compute_production_vs_median_delta(record) == pytest.approx(0.15, abs=1e-6)
+
+    def test_stacker_singleton_without_base_returns_none(self):
+        """Stacked record with collapsed singleton and no base field → None (< 2 probs)."""
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.85,
+            "per_model_forecasts": {"stacker": "85%"},
+        }
+        assert compute_production_vs_median_delta(record) is None
+
+
 class TestExceededSpreadThreshold:
     def test_binary_high_spread(self):
         record = {
@@ -232,6 +277,48 @@ class TestExceededSpreadThreshold:
         }
         # max option spread: A = 0.65-0.6=0.05, B = 0.4-0.35=0.05. max=0.05 < 0.20
         assert exceeded_spread_threshold(record) is False
+
+
+class TestExceededSpreadThresholdBaseModelField:
+    """Tests for per_base_model_forecasts preference in exceeded_spread_threshold."""
+
+    def test_prefers_base_models_high_spread(self):
+        """Spread computed over base models even when per_model_forecasts is a singleton."""
+        record = {
+            "type": "binary",
+            "per_model_forecasts": {"stacker": "75%"},
+            "per_base_model_forecasts": {"gpt-5.5": "90%", "claude": "50%", "gemini": "70%"},
+        }
+        # spread over base = 0.9 - 0.5 = 0.4 > 0.15
+        assert exceeded_spread_threshold(record) is True
+
+    def test_prefers_base_models_low_spread(self):
+        """Low spread among base models → False."""
+        record = {
+            "type": "binary",
+            "per_model_forecasts": {"stacker": "72%"},
+            "per_base_model_forecasts": {"gpt-5.5": "70%", "claude": "74%", "gemini": "72%"},
+        }
+        # spread = 0.74 - 0.70 = 0.04 < 0.15
+        assert exceeded_spread_threshold(record) is False
+
+    def test_empty_base_field_falls_back(self):
+        """Empty per_base_model_forecasts falls back to per_model_forecasts for spread."""
+        record = {
+            "type": "binary",
+            "per_model_forecasts": {"gpt-5.5": "90%", "claude": "50%"},
+            "per_base_model_forecasts": {},
+        }
+        # spread = 0.9 - 0.5 = 0.4 > 0.15
+        assert exceeded_spread_threshold(record) is True
+
+    def test_singleton_stacker_without_base_returns_none(self):
+        """Collapsed stacker singleton with no base field → None (< 2 probs)."""
+        record = {
+            "type": "binary",
+            "per_model_forecasts": {"stacker": "75%"},
+        }
+        assert exceeded_spread_threshold(record) is None
 
 
 # ---------------------------------------------------------------------------
@@ -390,3 +477,32 @@ class TestDetectStackerFired:
             ),
         }
         assert detect_stacker_fired(record) == "confirmed_stacker"
+
+    def test_cross_signal_rescues_via_per_base_model_forecasts(self):
+        """Cross-signal fires correctly: no explicit flags, but per_base_model_forecasts
+        shows real disagreement and production differs from base median → likely_stacker.
+
+        This is the key scenario where the old code would return 'unknown' because
+        per_model_forecasts collapsed to a stacker singleton (< 2 entries → None
+        for both spread and delta). With per_base_model_forecasts populated, the
+        cross-signal now correctly identifies the stacking.
+        """
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.82,
+            "per_model_forecasts": {"stacker": "82%"},
+            "per_base_model_forecasts": {"gpt-5.5": "60%", "claude": "90%", "gemini": "70%"},
+        }
+        # Base median = 0.70, spread = 0.9-0.6 = 0.30 > 0.15, |0.82-0.70| = 0.12 > 0.05
+        assert detect_stacker_fired(record) == "likely_stacker"
+
+    def test_cross_signal_base_models_agree_likely_median(self):
+        """Base models agree (low spread) even though per_model_forecasts is a singleton."""
+        record = {
+            "type": "binary",
+            "our_prob_yes": 0.71,
+            "per_model_forecasts": {"stacker": "71%"},
+            "per_base_model_forecasts": {"gpt-5.5": "70%", "claude": "72%", "gemini": "71%"},
+        }
+        # spread = 0.72-0.70 = 0.02 < 0.15 → likely_median
+        assert detect_stacker_fired(record) == "likely_median"

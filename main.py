@@ -57,6 +57,7 @@ from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
+    BINARY_STACKING_ENABLED_ENV,
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
@@ -68,10 +69,11 @@ from metaculus_bot.constants import (
     GAP_FILL_MIN_RESEARCH_CHARS,
     GEMINI_SEARCH_ENABLED_ENV,
     GEMINI_SEARCH_MODEL_ENV,
+    MC_STACKING_ENABLED_ENV,
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
-    NUMERIC_STACKING_DISABLED_ENV,
+    NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     PLATT_BINARY_MAX_ABS_DEVIATION,
     PLATT_CALIBRATION_ENABLED_ENV,
@@ -964,13 +966,20 @@ class TemplateForecaster(CompactLoggingForecastBot):
             spread = compute_spread(question, prediction_values)
             threshold = self._get_threshold_for_question(question)
 
-            # Per-question-type stacking disable: numeric questions bypass the LLM
-            # stacker entirely when NUMERIC_STACKING_DISABLED is set, forcing them
-            # through the same median/skipped path that low-spread questions use.
-            # See scratch_docs_and_planning/disable_numeric_stacking_plan.md.
+            # Per-question-type stacking gates. All three default to ENABLED. Set
+            # <TYPE>_STACKING_ENABLED=false in deploy env to bypass stacking for that
+            # type (forces median/skipped path).
             spread_exceeds_threshold = spread > threshold
-            if isinstance(question, NumericQuestion) and env_flag_enabled(NUMERIC_STACKING_DISABLED_ENV):
-                spread_exceeds_threshold = False
+            type_to_stacking_env = {
+                BinaryQuestion: BINARY_STACKING_ENABLED_ENV,
+                MultipleChoiceQuestion: MC_STACKING_ENABLED_ENV,
+                NumericQuestion: NUMERIC_STACKING_ENABLED_ENV,
+            }
+            for q_type, env_name in type_to_stacking_env.items():
+                if isinstance(question, q_type):
+                    if not env_flag_enabled(env_name, default=True):
+                        spread_exceeds_threshold = False
+                    break
 
             if spread_exceeds_threshold:
                 self._conditional_stacking_triggered_count += 1

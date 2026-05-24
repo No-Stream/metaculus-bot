@@ -113,6 +113,11 @@ def compute_production_vs_median_delta(record: dict) -> float | None:
     """Compute |production_probability - median_of_per_model_probabilities|.
 
     Only works for binary records currently. Returns None if insufficient data.
+
+    When ``per_base_model_forecasts`` is present (populated for stacked records
+    by the collector), prefer it for the median computation since
+    ``per_model_forecasts`` on stacked records collapses to the stacker's single
+    aggregated value.
     """
     question_type = record.get("type", "")
 
@@ -121,7 +126,8 @@ def compute_production_vs_median_delta(record: dict) -> float | None:
         if prod_prob is None:
             return None
 
-        per_model = record.get("per_model_forecasts") or {}
+        per_base_model = record.get("per_base_model_forecasts") or {}
+        per_model = per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
         probs = [_parse_probability(v) for v in per_model.values()]
         probs = [p for p in probs if p is not None]
         if len(probs) < 2:
@@ -149,7 +155,8 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
     question_type = record.get("type", "")
 
     if question_type == "binary":
-        per_model = record.get("per_model_forecasts") or {}
+        per_base_model = record.get("per_base_model_forecasts") or {}
+        per_model = per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
         probs = [_parse_probability(v) for v in per_model.values()]
         probs = [p for p in probs if p is not None]
         if len(probs) < 2:
@@ -158,6 +165,8 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
         return spread > CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD
 
     if question_type == "multiple_choice":
+        # TODO: MC likely has the same collapse-on-stacking issue as binary — once
+        # per_base_model_forecasts is populated for MC records, prefer it here too.
         per_model_mc = record.get("per_model_mc_forecasts") or {}
         if len(per_model_mc) < 2:
             return None

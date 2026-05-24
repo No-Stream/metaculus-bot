@@ -2701,6 +2701,71 @@ class TestDefaultStackerWiredViaDonatedKey:
 # ===========================================================================
 
 
+class TestNoStackerFallback:
+    """Fail-fast contract for ``--no-stacker-fallback`` (paid prod-ish runs).
+
+    When ``fallback_stacker_llm=None`` is passed explicitly (the new sentinel
+    semantics), a primary-stacker failure must:
+      1. Write a failure payload to cache (so resume-from-cache sees the state).
+      2. Raise ``RuntimeError`` so the orchestrator aborts the run.
+
+    This is true fail-fast: a borked-key scenario aborts at qid #1 instead of
+    silently writing failure payloads for all 88 questions. Prior behavior
+    (``fallback_stacker_llm=None`` meant "build default fallback") is now
+    triggered by omitting the kwarg or passing the ``_UNSET`` sentinel.
+    """
+
+    def test_primary_failure_with_no_fallback_raises_and_writes_failure_payload(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+    ) -> None:
+        forecasters = {
+            model_slug_to_filename("openrouter/test/m1"): _binary_payload("openrouter/test/m1", 0.6),
+            model_slug_to_filename("openrouter/test/m2"): _binary_payload("openrouter/test/m2", 0.5),
+            model_slug_to_filename("openrouter/test/m3"): _binary_payload("openrouter/test/m3", 0.4),
+        }
+
+        def _primary_fails(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
+            raise RuntimeError("primary boom")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_primary_fails),
+            ),
+            pytest.raises(RuntimeError, match="--no-stacker-fallback"),
+        ):
+            _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=3001),
+                    research_blob="R",
+                    forecaster_payloads=forecasters,
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=None,  # explicit None = --no-stacker-fallback
+                    parser_llm=parser_llm,
+                )
+            )
+
+        # Failure payload must be on disk for resume-from-cache to see it.
+        cached = cache.read_stacker_output(qid=3001, arm=ARM_STACK)
+        assert cached is not None
+        assert cached["success"] is False
+        assert cached["reason"] == "stacker_failed_no_fallback"
+        assert cached["stacker_prediction"] is None
+
+
 class TestMedianFallback:
     def test_both_stackers_fail_falls_back_to_median_binary(
         self,

@@ -646,6 +646,80 @@ def parse_per_model_mc_option_probs(
     return result
 
 
+_PROBABILITY_LINE_RE: re.Pattern[str] = re.compile(
+    r"(?i)(?:final\s+)?probability\s*:\s*(.+)",
+)
+
+
+def parse_per_base_model_forecasts(
+    comment_text: str,
+    q_type: str,
+) -> dict[str, str | dict[str, float]]:
+    """Extract per-base-model forecasts from a stacker-combined reasoning body.
+
+    For binary questions: returns ``{model_name: "XX.X%"}`` — one entry per
+    base-model sub-block, extracted from the LAST "Probability: X%" or
+    "Final probability: X%" line in each block's prose.
+
+    For MC questions: returns ``{model_name: {option: probability}}`` — one
+    entry per base-model sub-block, extracted from ``- Option: XX.X%`` lines.
+
+    For numeric/discrete: returns ``{}`` — those question types use
+    ``parse_per_model_numeric_percentiles`` which already handles stacked bodies.
+
+    Returns ``{}`` for non-stacked comments (no base-model sub-blocks found).
+    """
+    if not comment_text:
+        return {}
+    if q_type in ("numeric", "discrete"):
+        return {}
+
+    result: dict[str, str | dict[str, float]] = {}
+    for model_name, body_text, is_stacker_meta in _iter_per_model_blocks(comment_text):
+        if is_stacker_meta:
+            continue
+
+        if q_type == "binary":
+            prob = _extract_last_probability_from_body(body_text)
+            if prob is not None:
+                result[model_name] = f"{prob * 100:.1f}%"
+
+        elif q_type == "multiple_choice":
+            options: dict[str, float] = {}
+            for opt_match in _MC_OPTION_LINE_RE.finditer(body_text):
+                option_name = opt_match.group(1).strip()
+                prob_pct = float(opt_match.group(2))
+                options[option_name] = prob_pct / 100.0
+            if options:
+                result[model_name] = options
+
+    # Only return non-empty if we found a stacker-combined body (i.e., there
+    # was at least one is_stacker_meta=True block). For non-stacked comments,
+    # _iter_per_model_blocks yields blocks but none with is_stacker_meta=True,
+    # so we'd be extracting from plain per-forecaster blocks (which are already
+    # captured by parse_per_model_forecasts). Return empty to avoid duplication.
+    has_stacker_meta = any(is_meta for _, _, is_meta in _iter_per_model_blocks(comment_text))
+    if not has_stacker_meta:
+        return {}
+    return result
+
+
+def _extract_last_probability_from_body(body_text: str) -> float | None:
+    """Extract the LAST probability value from a base-model reasoning body.
+
+    Scans for lines matching "Probability: X%" or "Final probability: X%"
+    (case-insensitive) and returns the last one found — that's typically the
+    model's final answer after any intermediate estimates.
+    """
+    last_prob: float | None = None
+    for match in _PROBABILITY_LINE_RE.finditer(body_text):
+        raw_value = match.group(1).strip()
+        parsed = _parse_probability(raw_value)
+        if parsed is not None:
+            last_prob = parsed
+    return last_prob
+
+
 def parse_resolution(
     resolution_raw: str,
     question_type: str,
