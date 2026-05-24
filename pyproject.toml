@@ -42,6 +42,15 @@ ignore = ["E501"]
 # Supply chain safety: ignore packages published in the last 7 days.
 exclude-newer = "1 week"
 
+[tool.pytest.ini_options]
+markers = [
+    "live: requires real API keys and makes real LLM calls (deselected by default)",
+    "e2e: end-to-end pipeline tests with mocked LLMs",
+    "integration: cross-component contract tests",
+]
+addopts = "-m 'not live'"
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

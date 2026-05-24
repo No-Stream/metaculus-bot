@@ -1,4 +1,4 @@
-.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score check_credits
+.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -143,6 +143,15 @@ ablation_medium:
 ablation_score:
 	# Re-runs scoring against existing caches (no API spend).
 	$(call RUN_UNBUFFERED,-m metaculus_bot.ablation.cli --stages score)
+
+test_e2e:
+	$(call RUN_UNBUFFERED,-m pytest -m e2e -v --tb=short)
+
+test_live:
+	$(call RUN_UNBUFFERED,-m pytest -m live -v --tb=short --timeout=300)
+
+test_fast:
+	$(call RUN_UNBUFFERED,-m pytest -m "not live and not e2e" --tb=short)
 
 # Check OpenRouter key balances. Pass ARGS="--key donated" or ARGS="--key personal"
 # to limit which key is queried (default: both).
