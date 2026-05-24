@@ -684,6 +684,96 @@ class TestCollectorProcessSingleQuestion:
         assert rec["mc_log_score"] is not None
         assert rec["was_stacked"] is None
 
+    def test_mc_question_stores_full_option_probs_via_process_post(self):
+        """_process_post stores full option probability dicts for MC questions.
+
+        This is the load-bearing fix: previously only the first option line was
+        captured, making MC residual analysis impossible.
+        """
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        mc_comment_text = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Option A: 60.0%\n"
+            "- Option B: 25.0%\n"
+            "- Option C: 15.0%\n"
+            "\n"
+            "*Forecaster 2 (claude-opus-4.7)*: \n"
+            "- Option A: 55.0%\n"
+            "- Option B: 30.0%\n"
+            "- Option C: 15.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "research here\n"
+        )
+        post_data = {
+            "id": 888,
+            "title": "Which option wins?",
+            "projects": {"category": [{"name": "Politics"}]},
+            "question": {
+                "id": 444,
+                "type": "multiple_choice",
+                "resolution": "Option A",
+                "my_forecasts": {"latest": {"forecast_values": [0.6, 0.25, 0.15]}},
+                "scaling": {},
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "options": ["Option A", "Option B", "Option C"],
+                "title": "Which option wins?",
+                "nr_forecasters": 50,
+                "open_time": "2024-01-01T00:00:00Z",
+                "actual_resolve_time": "2024-06-01T00:00:00Z",
+                "scheduled_resolve_time": "2024-06-01T00:00:00Z",
+            },
+        }
+        comment_lookup = {
+            888: {"id": 9999, "on_post": 888, "text": mc_comment_text, "created_at": "2024-05-01T00:00:00Z"}
+        }
+
+        records = _process_post(post_data, comment_lookup)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["type"] == "multiple_choice"
+        # The fix: per_model_forecasts should contain full option dicts, not single strings.
+        per_model = rec["per_model_forecasts"]
+        assert "gpt-5.5" in per_model
+        assert "claude-opus-4.7" in per_model
+        assert per_model["gpt-5.5"] == {"Option A": 0.60, "Option B": 0.25, "Option C": 0.15}
+        assert per_model["claude-opus-4.7"] == {"Option A": 0.55, "Option B": 0.30, "Option C": 0.15}
+
+    def test_binary_question_per_model_unchanged_with_mc_fix(self):
+        """Binary per_model_forecasts remains as raw strings (regression guard)."""
+        from metaculus_bot.performance_analysis.collector import _process_post
+
+        binary_comment_text = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: 72.0%\n"
+            "*Forecaster 2 (claude-opus-4.7)*: 68.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "research here\n"
+        )
+        post_data = {
+            "id": 889,
+            "title": "Will X happen?",
+            "projects": {"category": [{"name": "Science"}]},
+            "question": _make_binary_q_dict(),
+        }
+        comment_lookup = {
+            889: {"id": 9998, "on_post": 889, "text": binary_comment_text, "created_at": "2024-05-01T00:00:00Z"}
+        }
+
+        records = _process_post(post_data, comment_lookup)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["type"] == "binary"
+        per_model = rec["per_model_forecasts"]
+        # Binary: values remain as raw strings (the existing contract).
+        assert per_model == {"gpt-5.5": "72.0%", "claude-opus-4.7": "68.0%"}
+
     @pytest.mark.parametrize("flag", [True, False, None])
     def test_was_stacked_carried_verbatim(self, flag: bool | None):
         post = _make_post_data()

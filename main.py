@@ -71,6 +71,7 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    NUMERIC_STACKING_DISABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     PLATT_BINARY_MAX_ABS_DEVIATION,
     PLATT_CALIBRATION_ENABLED_ENV,
@@ -963,7 +964,15 @@ class TemplateForecaster(CompactLoggingForecastBot):
             spread = compute_spread(question, prediction_values)
             threshold = self._get_threshold_for_question(question)
 
-            if spread > threshold:
+            # Per-question-type stacking disable: numeric questions bypass the LLM
+            # stacker entirely when NUMERIC_STACKING_DISABLED is set, forcing them
+            # through the same median/skipped path that low-spread questions use.
+            # See scratch_docs_and_planning/disable_numeric_stacking_plan.md.
+            spread_exceeds_threshold = spread > threshold
+            if isinstance(question, NumericQuestion) and env_flag_enabled(NUMERIC_STACKING_DISABLED_ENV):
+                spread_exceeds_threshold = False
+
+            if spread_exceeds_threshold:
                 self._conditional_stacking_triggered_count += 1
                 logger.info(
                     "Conditional stacking TRIGGERED: spread=%.3f > threshold=%.3f for question %s",

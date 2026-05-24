@@ -330,7 +330,7 @@ class TestNumeric:
 
 
 # ===========================================================================
-# Surviving-filter parity with ARM_STACK / ARM_PDF
+# Surviving-filter parity with ARM_STACK / ARM_STACK_AUG
 # ===========================================================================
 
 
@@ -426,7 +426,7 @@ class TestMinForecastersGuard:
         assert payload["success"] is False
         assert payload["arm"] == "median"
         assert payload["n_forecasters_used"] == 1
-        # The same threshold used for ARM_STACK/ARM_PDF applies here too — verifies
+        # The same threshold used for ARM_STACK/ARM_STACK_AUG applies here too — verifies
         # ARM_MEDIAN uses ABLATION_MIN_FORECASTERS, not a different constant.
         assert ABLATION_MIN_FORECASTERS == 2
 

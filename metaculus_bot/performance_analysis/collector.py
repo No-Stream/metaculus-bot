@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from metaculus_bot.performance_analysis.parsing import (
     parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
+    parse_per_model_mc_option_probs,
     parse_per_model_numeric_percentiles,
     parse_resolution,
     parse_stacked_marker,
@@ -178,8 +179,17 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
     comment_id = comment["id"] if comment else None
     comment_created_at = comment.get("created_at") if comment else None
-    per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
+    # MC questions need full per-option probability vectors (not just the top
+    # option line which the legacy single-string parser returned). Detect MC by
+    # checking whether the parser found any option lines; if so, use the dict
+    # values from parse_per_model_mc_option_probs as per_model_forecasts.
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
+    per_model_mc_option_probs = parse_per_model_mc_option_probs(comment_text) if comment_text else {}
+    if per_model_mc_option_probs:
+        # MC question: use the full option-probability dicts.
+        per_model = per_model_mc_option_probs
+    else:
+        per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
     # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
     # the legacy STACKED= marker, then to historical body-shape detection for

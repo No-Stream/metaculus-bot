@@ -571,6 +571,81 @@ def parse_per_model_forecasts(
     return result
 
 
+# Matches MC option lines like: ``- Option A: 40.0%`` or ``- Yes (>50%): 60.0%``
+# Captures (option_name, numeric_value). The option name runs from after ``- ``
+# to the last ``:`` before the numeric value. Anchored at start-of-line.
+_MC_OPTION_LINE_RE: re.Pattern[str] = re.compile(r"(?m)^[ \t]*-\s+(.+?):\s+([0-9]+(?:\.[0-9]+)?)\s*%")
+
+
+def parse_per_model_mc_option_probs(
+    comment_text: str,
+    model_names: list[str] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Extract per-forecaster MC option probability vectors from a comment.
+
+    For multiple-choice questions the bot emits multi-line bullets::
+
+        *Forecaster 1 (gpt-5.5)*:
+        - Option A: 40.0%
+        - Option B: 30.0%
+        ...
+
+    This function captures ALL option lines per forecaster and returns
+    ``{model_display_name: {option_name: probability}}`` where probability
+    is in [0, 1].
+
+    Returns an empty dict for binary/numeric comments (no option lines found)
+    or for empty input.
+
+    Attribution uses the same fallback chain as ``parse_per_model_forecasts``:
+    inline name in bullet > ``Model:`` line in R1 section > ``Forecaster N``.
+    """
+    if not comment_text:
+        return {}
+
+    if model_names is not None:
+        fallback_map: dict[int, str] = {i + 1: name for i, name in enumerate(model_names)}
+    else:
+        fallback_map = parse_forecaster_model_map(comment_text)
+
+    summary_text = _summary_section_for_bullets(comment_text)
+
+    # Find all forecaster bullet positions, then collect option lines between them.
+    bullet_matches = list(_FORECASTER_RE.finditer(summary_text))
+    if not bullet_matches:
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for i, match in enumerate(bullet_matches):
+        idx = int(match.group(1))
+        inline_name = match.group(2)
+
+        if inline_name is not None:
+            key = inline_name.strip()
+        else:
+            key = fallback_map.get(idx) or f"Forecaster {idx}"
+
+        # Region: the captured first-line value (group 3) plus everything
+        # until the next bullet or end of summary. Group 3 matters because for
+        # MC the regex consumes the first option line (e.g. "- Option A: 40.0%")
+        # as part of the (.+) capture.
+        first_line = match.group(3)
+        after_match_end = bullet_matches[i + 1].start() if i + 1 < len(bullet_matches) else len(summary_text)
+        region = first_line + "\n" + summary_text[match.end() : after_match_end]
+
+        # Parse option lines in this region.
+        options: dict[str, float] = {}
+        for opt_match in _MC_OPTION_LINE_RE.finditer(region):
+            option_name = opt_match.group(1).strip()
+            prob_pct = float(opt_match.group(2))
+            options[option_name] = prob_pct / 100.0
+
+        if options:
+            result[key] = options
+
+    return result
+
+
 def parse_resolution(
     resolution_raw: str,
     question_type: str,

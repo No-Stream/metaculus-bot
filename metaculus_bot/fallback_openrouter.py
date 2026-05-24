@@ -143,6 +143,10 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     Decide whether a failure likely indicates a key-scoped issue where falling back is appropriate.
 
     Triggers fallback on:
+    - 429 Too Many Requests (rate limit) — donated and personal keys have
+      independent BYOK quotas per-provider, so a 429 on the primary key does
+      NOT imply the secondary is also throttled. Fall back immediately; the
+      SDK already retried internally before raising, so no wrapper-level retry.
     - 401 Unauthorized (invalid/disabled key),
     - 402 Payment Required (insufficient credits),
     - 404 with "no allowed providers" — donated key has server-side
@@ -153,8 +157,11 @@ def should_retry_with_general_key(exc: Exception) -> bool:
 
     Avoids fallback on:
     - Plain 403 Forbidden (moderation/blocked, both keys would refuse),
-    - 429 Too Many Requests (rate limit, both keys would hit it),
-    - 502/503 upstream/provider outages.
+    - 502/503 upstream/provider outages (infrastructure, not key-scoped).
+
+    Note: direct google-genai SDK 429s (google.genai.errors.ClientError with
+    code=429) are out of scope for this wrapper — they don't flow through
+    OpenRouter. The gemini search provider handles those separately.
     """
     msg_raw = str(exc)
     # Deprecation tripwire: record the alert before classifying retry behavior.
@@ -164,7 +171,22 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # wrapper's invoke() carries the slug; this is a safety net for any other
     # call site that routes through this predicate.
     _record_deprecation_if_matched("<unknown>", msg_raw)
+
+    # 429 rate-limit: BYOK quotas are per-key, so primary being throttled does
+    # NOT imply secondary is also throttled. Fall back immediately — litellm
+    # already exhausted its internal retry budget before raising.
+    import litellm  # noqa: PLC0415  # function-scoped: avoids formatter stripping unused top-level import
+
+    if isinstance(exc, litellm.RateLimitError):
+        return True
+
     msg = msg_raw.lower()
+
+    # Belt-and-suspenders textual detection for 429 edge cases where litellm
+    # doesn't raise the typed exception (e.g., class drift, non-standard wrapping).
+    if "429" in msg or "too many requests" in msg or "rate limit" in msg or "rate-limited upstream" in msg:
+        return True
+
     # Positive signals: credentials/credits
     if "401" in msg or "unauthorized" in msg or "invalid api key" in msg or "disabled api key" in msg:
         return True
@@ -197,8 +219,6 @@ def should_retry_with_general_key(exc: Exception) -> bool:
 
     # Negative signals: do not swap keys for these
     if "403" in msg or "forbidden" in msg or "moderation" in msg:
-        return False
-    if "429" in msg or "too many requests" in msg or "rate limit" in msg:
         return False
     if "502" in msg or "bad gateway" in msg:
         return False

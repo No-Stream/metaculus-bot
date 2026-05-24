@@ -41,7 +41,26 @@ BOOTSTRAP_MIN_N: int = 5
 
 # Comparison labels — every PairedScore row carries one of these and Δ is the
 # corresponding signed difference.
-COMPARISONS: tuple[str, ...] = ("pdf-stack", "median-stack", "median-pdf")
+# 3-arm comparisons (backward compat for callers that pass 3 arms).
+COMPARISONS_3ARM: tuple[str, ...] = ("stack_aug-stack", "median-stack", "median-stack_aug")
+
+# 5-arm comparisons (full 10 pairwise for pdf_min1/pdf_min2 dual-panel analysis).
+COMPARISONS_5ARM: tuple[str, ...] = (
+    "stack_aug-stack",
+    "pdf_min1-stack",
+    "pdf_min2-stack",
+    "median-stack",
+    "pdf_min1-stack_aug",
+    "pdf_min2-stack_aug",
+    "median-stack_aug",
+    "pdf_min2-pdf_min1",
+    "median-pdf_min1",
+    "median-pdf_min2",
+)
+
+# Default: 3-arm for backward compatibility. Active comparison set is determined
+# by whether score_arm_for_qid receives 3 or 5 arm tuples.
+COMPARISONS: tuple[str, ...] = COMPARISONS_3ARM
 
 METRIC_DIRECTION: dict[str, bool] = {
     "brier": False,
@@ -136,31 +155,40 @@ class PairedScore:
     qid: int
     question_type: str  # "binary" | "multiple_choice" | "numeric"
     metric: str  # "brier" | "binary_log_score" | "mc_log_score" | "numeric_log_score" | "crps"
-    comparison: str  # "pdf-stack" | "median-stack" | "median-pdf"
-    # All three arm scores populated on every row regardless of comparison so per-arm
+    comparison: str  # one of COMPARISONS_3ARM or COMPARISONS_5ARM
+    # All arm scores populated on every row regardless of comparison so per-arm
     # raw stats and the per-question diagnostic can derive numbers from any subset.
     score_stack: float
-    score_pdf: float
+    score_stack_aug: float
     score_median: float
-    delta: float  # comparison-specific signed diff (pdf-stack: score_pdf - score_stack, etc.)
+    delta: float  # comparison-specific signed diff (X-Y: score_X - score_Y)
     higher_is_better: bool
+    # pdf_min1 and pdf_min2 arm scores (NaN when using 3-arm mode).
+    score_pdf_min1: float = float("nan")
+    score_pdf_min2: float = float("nan")
     # Optional confounder fields populated by score_arm_for_qid when stacker
     # payloads are supplied. None on legacy callers; surfaced into the summary
     # report when present so the user can read fallback rate, n-forecasters
     # delta, and treatment activation per question.
     stack_model_used: str | None = None
-    pdf_model_used: str | None = None
+    stack_aug_model_used: str | None = None
+    pdf_min1_model_used: str | None = None
+    pdf_min2_model_used: str | None = None
     median_model_used: str | None = None
     n_forecasters_stack: int | None = None
-    n_forecasters_pdf: int | None = None
+    n_forecasters_stack_aug: int | None = None
+    n_forecasters_pdf_min1: int | None = None
+    n_forecasters_pdf_min2: int | None = None
     n_forecasters_median: int | None = None
-    pdf_tools_fired: bool | None = None
+    stack_aug_tools_fired: bool | None = None
     median_tools_fired: bool | None = None
     # Per-arm saturation flags. True iff the score sits within ε of the
     # schema's max-confident-wrong floor (see is_score_saturated). Both-True
     # rows are mechanical Δ≈0 draws and don't carry signal.
     is_saturated_stack: bool = False
-    is_saturated_pdf: bool = False
+    is_saturated_stack_aug: bool = False
+    is_saturated_pdf_min1: bool = False
+    is_saturated_pdf_min2: bool = False
     is_saturated_median: bool = False
 
 
@@ -168,7 +196,7 @@ class PairedScore:
 class PairedStats:
     metric: str
     question_type: str | None  # None = overall (all types for this metric)
-    comparison: str  # "pdf-stack" | "median-stack" | "median-pdf"
+    comparison: str  # "stack_aug-stack" | "median-stack" | "median-stack_aug"
     n: int
     mean_delta: float
     bootstrap_ci_low: float
@@ -215,7 +243,7 @@ def _confounders_for_arm(payload: dict | None, arm: str) -> dict[str, Any]:
     """Extract the confounder fields for a single arm from its cached stacker payload.
 
     Returns the fields keyed for that arm (e.g., ``stack_model_used``,
-    ``n_forecasters_stack``, ``pdf_tools_fired``). Empty dict when payload is None.
+    ``n_forecasters_stack``, ``stack_aug_tools_fired``). Empty dict when payload is None.
     Arm median contributes ``median_tools_fired`` (always False — deterministic baseline).
     """
     if payload is None:
@@ -223,8 +251,8 @@ def _confounders_for_arm(payload: dict | None, arm: str) -> dict[str, Any]:
     out: dict[str, Any] = {f"{arm}_model_used": payload.get("stacker_model_used")}
     n_used = payload.get("n_forecasters_used")
     out[f"n_forecasters_{arm}"] = int(n_used) if n_used is not None else None
-    if arm == "pdf":
-        out["pdf_tools_fired"] = bool(payload.get("cross_model_aggregation"))
+    if arm == "stack_aug":
+        out["stack_aug_tools_fired"] = bool(payload.get("cross_model_aggregation"))
     elif arm == "median":
         # ARM_MEDIAN is deterministic — never fires LLM tools. Reflect this explicitly.
         out["median_tools_fired"] = bool(payload.get("cross_model_aggregation"))
@@ -245,23 +273,66 @@ def _build_paired_scores(
     saturation_pdf: dict[str, bool],
     saturation_median: dict[str, bool],
     confounders: dict[str, Any],
+    *,
+    metrics_pdf_min1: dict[str, float] | None = None,
+    metrics_pdf_min2: dict[str, float] | None = None,
+    saturation_pdf_min1: dict[str, bool] | None = None,
+    saturation_pdf_min2: dict[str, bool] | None = None,
 ) -> list[PairedScore]:
-    """Emit one PairedScore per (metric, comparison) — 3 comparisons per metric.
+    """Emit one PairedScore per (metric, comparison).
 
-    Every row carries all three scores + saturation flags so per-arm raw stats can be
+    In 3-arm mode (pdf_min1/pdf_min2 = None): 3 comparisons per metric.
+    In 5-arm mode: 10 comparisons per metric.
+
+    Every row carries all arm scores + saturation flags so per-arm raw stats can be
     derived from the union of rows. ``delta`` is comparison-specific.
     """
-    delta_for_comparison = {
-        "pdf-stack": lambda stack, pdf, median: pdf - stack,
-        "median-stack": lambda stack, pdf, median: median - stack,
-        "median-pdf": lambda stack, pdf, median: median - pdf,
-    }
+    is_five_arm = metrics_pdf_min1 is not None and metrics_pdf_min2 is not None
+
+    if is_five_arm:
+        comparisons = COMPARISONS_5ARM
+    else:
+        comparisons = COMPARISONS_3ARM
+
+    # Score accessor by arm label
+    def _score(metric: str, arm: str) -> float:
+        if arm == "stack":
+            return metrics_stack[metric]
+        if arm == "stack_aug":
+            return metrics_pdf[metric]
+        if arm == "pdf_min1" and metrics_pdf_min1 is not None:
+            return metrics_pdf_min1[metric]
+        if arm == "pdf_min2" and metrics_pdf_min2 is not None:
+            return metrics_pdf_min2[metric]
+        if arm == "median":
+            return metrics_median[metric]
+        raise ValueError(f"Unknown arm {arm!r}")
+
+    def _sat(metric: str, arm: str) -> bool:
+        if arm == "stack":
+            return saturation_stack[metric]
+        if arm == "stack_aug":
+            return saturation_pdf[metric]
+        if arm == "pdf_min1" and saturation_pdf_min1 is not None:
+            return saturation_pdf_min1[metric]
+        if arm == "pdf_min2" and saturation_pdf_min2 is not None:
+            return saturation_pdf_min2[metric]
+        if arm == "median":
+            return saturation_median[metric]
+        if arm in ("pdf_min1", "pdf_min2"):
+            return False
+        raise ValueError(f"Unknown arm {arm!r}")
+
     paired: list[PairedScore] = []
     for metric, s_stack in metrics_stack.items():
-        s_pdf = metrics_pdf[metric]
+        s_stack_aug = metrics_pdf[metric]
         s_median = metrics_median[metric]
-        for comparison in COMPARISONS:
-            delta = delta_for_comparison[comparison](s_stack, s_pdf, s_median)
+        s_pdf_min1 = metrics_pdf_min1[metric] if metrics_pdf_min1 else float("nan")
+        s_pdf_min2 = metrics_pdf_min2[metric] if metrics_pdf_min2 else float("nan")
+
+        for comparison in comparisons:
+            left, right = comparison.split("-", 1)
+            delta = _score(metric, left) - _score(metric, right)
             paired.append(
                 PairedScore(
                     qid=qid,
@@ -269,12 +340,16 @@ def _build_paired_scores(
                     metric=metric,
                     comparison=comparison,
                     score_stack=s_stack,
-                    score_pdf=s_pdf,
+                    score_stack_aug=s_stack_aug,
                     score_median=s_median,
+                    score_pdf_min1=s_pdf_min1,
+                    score_pdf_min2=s_pdf_min2,
                     delta=delta,
                     higher_is_better=METRIC_DIRECTION[metric],
                     is_saturated_stack=saturation_stack[metric],
-                    is_saturated_pdf=saturation_pdf[metric],
+                    is_saturated_stack_aug=saturation_pdf[metric],
+                    is_saturated_pdf_min1=_sat(metric, "pdf_min1"),
+                    is_saturated_pdf_min2=_sat(metric, "pdf_min2"),
                     is_saturated_median=saturation_median[metric],
                     **confounders,
                 )
@@ -283,68 +358,122 @@ def _build_paired_scores(
 
 
 def score_arm_for_qid(
-    arm_reports: list[tuple[str, ForecastReport, dict | None]],
+    arm_reports: list[tuple[str, ForecastReport | None, dict | None]],
     ground_truth: GroundTruth,
 ) -> list[PairedScore]:
-    """Score all three arms vs ground truth, return PairedScores for all 3 pairwise comparisons.
+    """Score arms vs ground truth, return PairedScores for pairwise comparisons where both arms are present.
 
-    ``arm_reports`` MUST be a 3-element list with labels in order [stack, pdf, median]:
-    ``[("stack", report_stack, payload_stack), ("pdf", report_pdf, payload_pdf),
-      ("median", report_median, payload_median)]``.
-    Each payload is the cached stacker payload (the dict written to
-    ``stacker_outputs/<qid>/arm_{stack,pdf,median}.json``) or None.
+    ``arm_reports`` is either a 3-element or 5-element list:
 
-    Output rows per metric per question type:
-      - Binary: 2 metrics * 3 comparisons = 6 rows.
-      - MC: 1 metric * 3 comparisons = 3 rows.
-      - Numeric: 2 metrics * 3 comparisons = 6 rows.
+    **3-arm** (backward compat): labels in order [stack, stack_aug, median].
+      - Up to 3 comparisons per metric.
 
-    Returns empty list if any arm fails to score (canceled, mismatched type, parse error).
+    **5-arm**: labels in order [stack, stack_aug, pdf_min1, pdf_min2, median].
+      - Up to 10 comparisons per metric.
+
+    Each element is ``(label, report, payload)`` where report may be None
+    (arm failed/missing for this qid) and payload is the cached stacker payload
+    dict or None.
+
+    Comparisons are only emitted when BOTH arms in the comparison have non-None
+    reports that score successfully. This enables per-comparison N rather than
+    requiring all arms to succeed for every qid.
+
+    Output rows per metric per question type (for N_present comparisons):
+      - Binary: 2 metrics * N_present rows.
+      - MC: 1 metric * N_present rows.
+      - Numeric: 2 metrics * N_present rows.
+
+    Returns empty list if fewer than 2 arms are present, or if resolution type
+    is incompatible (canceled, mismatched type, parse error).
     """
-    if len(arm_reports) != 3:
-        raise ValueError(f"score_arm_for_qid expects exactly 3 arm tuples, got {len(arm_reports)}")
-    expected_labels = ["stack", "pdf", "median"]
+    if len(arm_reports) == 3:
+        expected_labels = ["stack", "stack_aug", "median"]
+    elif len(arm_reports) == 5:
+        expected_labels = ["stack", "stack_aug", "pdf_min1", "pdf_min2", "median"]
+    else:
+        raise ValueError(f"score_arm_for_qid expects 3 or 5 arm tuples, got {len(arm_reports)}")
+
     actual_labels = [t[0] for t in arm_reports]
     if actual_labels != expected_labels:
         raise ValueError(f"score_arm_for_qid expects arms in order {expected_labels}, got {actual_labels}")
 
+    is_five_arm = len(arm_reports) == 5
+
     _, report_stack, payload_stack = arm_reports[0]
-    _, report_pdf, payload_pdf = arm_reports[1]
-    _, report_median, payload_median = arm_reports[2]
+    _, report_stack_aug, payload_stack_aug = arm_reports[1]
+    if is_five_arm:
+        _, report_pdf_min1, payload_pdf_min1 = arm_reports[2]
+        _, report_pdf_min2, payload_pdf_min2 = arm_reports[3]
+        _, report_median, payload_median = arm_reports[4]
+    else:
+        report_pdf_min1 = report_pdf_min2 = None
+        payload_pdf_min1 = payload_pdf_min2 = None
+        _, report_median, payload_median = arm_reports[2]
+
+    # Count present arms — need at least 2 for any comparison to be possible.
+    present_reports = [
+        r for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median] if r is not None
+    ]
+    if len(present_reports) < 2:
+        return []
 
     qid = ground_truth.question_id
     resolution = ground_truth.resolution
     confounders: dict[str, Any] = {}
     confounders.update(_confounders_for_arm(payload_stack, "stack"))
-    confounders.update(_confounders_for_arm(payload_pdf, "pdf"))
+    confounders.update(_confounders_for_arm(payload_stack_aug, "stack_aug"))
+    if is_five_arm:
+        confounders.update(_confounders_for_arm(payload_pdf_min1, "pdf_min1"))
+        confounders.update(_confounders_for_arm(payload_pdf_min2, "pdf_min2"))
     confounders.update(_confounders_for_arm(payload_median, "median"))
 
-    if (
-        isinstance(report_stack, BinaryReport)
-        and isinstance(report_pdf, BinaryReport)
-        and isinstance(report_median, BinaryReport)
-    ):
+    # Determine question type from the first non-None report.
+    first_report = present_reports[0]
+
+    # Validate type consistency among non-None reports. Use isinstance against
+    # concrete types rather than type() comparison, because MagicMock(spec=X)
+    # passes isinstance(_, X) but type() returns a unique MagicMock subclass.
+    if isinstance(first_report, BinaryReport):
+        expected_type = BinaryReport
+    elif isinstance(first_report, NumericReport):
+        expected_type = NumericReport
+    elif isinstance(first_report, MultipleChoiceReport):
+        expected_type = MultipleChoiceReport
+    else:
+        logger.warning(f"Q{qid}: unsupported report type: {type(first_report).__name__}")
+        return []
+    for r in present_reports[1:]:
+        if not isinstance(r, expected_type):
+            logger.warning(f"Q{qid}: mismatched report types among present arms")
+            return []
+
+    # Score each present arm; collect metrics per arm label.
+    arm_metrics: dict[str, dict[str, float] | None] = {}
+    arm_saturation: dict[str, dict[str, bool] | None] = {}
+    n_mc_options: int | None = None
+
+    if isinstance(first_report, BinaryReport):
         if not isinstance(resolution, bool):
             logger.warning(f"Q{qid}: expected bool for binary resolution, got {type(resolution).__name__}")
             return []
-        metrics_stack = _score_binary_arm(report_stack, resolution)
-        metrics_pdf = _score_binary_arm(report_pdf, resolution)
-        metrics_median = _score_binary_arm(report_median, resolution)
-        sat_stack = _saturation_for_metrics(metrics_stack)
-        sat_pdf = _saturation_for_metrics(metrics_pdf)
-        sat_median = _saturation_for_metrics(metrics_median)
-        return _build_paired_scores(
-            qid, "binary", metrics_stack, metrics_pdf, metrics_median, sat_stack, sat_pdf, sat_median, confounders
-        )
+        question_type = "binary"
+        for label, report in [
+            ("stack", report_stack),
+            ("stack_aug", report_stack_aug),
+            ("pdf_min1", report_pdf_min1),
+            ("pdf_min2", report_pdf_min2),
+            ("median", report_median),
+        ]:
+            if report is not None:
+                metrics_for_arm = _score_binary_arm(report, resolution)
+                arm_metrics[label] = metrics_for_arm
+                arm_saturation[label] = _saturation_for_metrics(metrics_for_arm)
+            else:
+                arm_metrics[label] = None
+                arm_saturation[label] = None
 
-    if (
-        isinstance(report_stack, NumericReport)
-        and isinstance(report_pdf, NumericReport)
-        and isinstance(report_median, NumericReport)
-    ):
-        # ``isinstance(True, int)`` is True in Python, so the bool check must precede
-        # the int check to avoid silently scoring bool resolutions (which would coerce
-        # to 0.0/1.0 and fall into a boundary bucket).
+    elif isinstance(first_report, NumericReport):
         if isinstance(resolution, bool):
             logger.warning(
                 f"Q{qid}: bool resolution {resolution!r} routed to numeric scorer; skipping. "
@@ -357,53 +486,125 @@ def score_arm_for_qid(
                 f"got {type(resolution).__name__}"
             )
             return []
-        metrics_stack = _score_numeric_arm(report_stack, resolution)
-        metrics_pdf = _score_numeric_arm(report_pdf, resolution)
-        metrics_median = _score_numeric_arm(report_median, resolution)
-        if metrics_stack is None or metrics_pdf is None or metrics_median is None:
-            return []
-        sat_stack = _saturation_for_metrics(metrics_stack)
-        sat_pdf = _saturation_for_metrics(metrics_pdf)
-        sat_median = _saturation_for_metrics(metrics_median)
-        return _build_paired_scores(
-            qid, "numeric", metrics_stack, metrics_pdf, metrics_median, sat_stack, sat_pdf, sat_median, confounders
-        )
+        question_type = "numeric"
+        for label, report in [
+            ("stack", report_stack),
+            ("stack_aug", report_stack_aug),
+            ("pdf_min1", report_pdf_min1),
+            ("pdf_min2", report_pdf_min2),
+            ("median", report_median),
+        ]:
+            if report is not None:
+                scored = _score_numeric_arm(report, resolution)
+                if scored is None:
+                    # Scoring failed (e.g., CDF issue) — treat this arm as absent.
+                    arm_metrics[label] = None
+                    arm_saturation[label] = None
+                else:
+                    arm_metrics[label] = scored
+                    arm_saturation[label] = _saturation_for_metrics(scored)
+            else:
+                arm_metrics[label] = None
+                arm_saturation[label] = None
 
-    if (
-        isinstance(report_stack, MultipleChoiceReport)
-        and isinstance(report_pdf, MultipleChoiceReport)
-        and isinstance(report_median, MultipleChoiceReport)
-    ):
+    elif isinstance(first_report, MultipleChoiceReport):
         if not isinstance(resolution, str):
             logger.warning(f"Q{qid}: expected str for MC resolution, got {type(resolution).__name__}")
             return []
-        metrics_stack = _score_mc_arm(report_stack, resolution)
-        metrics_pdf = _score_mc_arm(report_pdf, resolution)
-        metrics_median = _score_mc_arm(report_median, resolution)
-        if metrics_stack is None or metrics_pdf is None or metrics_median is None:
-            return []
-        n_mc_options = len(report_stack.question.options)
-        sat_stack = _saturation_for_metrics(metrics_stack, n_mc_options=n_mc_options)
-        sat_pdf = _saturation_for_metrics(metrics_pdf, n_mc_options=n_mc_options)
-        sat_median = _saturation_for_metrics(metrics_median, n_mc_options=n_mc_options)
-        return _build_paired_scores(
-            qid,
-            "multiple_choice",
-            metrics_stack,
-            metrics_pdf,
-            metrics_median,
-            sat_stack,
-            sat_pdf,
-            sat_median,
-            confounders,
-        )
+        question_type = "multiple_choice"
+        n_mc_options = len(first_report.question.options)
+        for label, report in [
+            ("stack", report_stack),
+            ("stack_aug", report_stack_aug),
+            ("pdf_min1", report_pdf_min1),
+            ("pdf_min2", report_pdf_min2),
+            ("median", report_median),
+        ]:
+            if report is not None:
+                scored = _score_mc_arm(report, resolution)
+                if scored is None:
+                    arm_metrics[label] = None
+                    arm_saturation[label] = None
+                else:
+                    arm_metrics[label] = scored
+                    arm_saturation[label] = _saturation_for_metrics(scored, n_mc_options=n_mc_options)
+            else:
+                arm_metrics[label] = None
+                arm_saturation[label] = None
+    else:
+        logger.warning(f"Q{qid}: unsupported report type: {type(first_report).__name__}")
+        return []
 
-    logger.warning(
-        f"Q{qid}: unsupported or mismatched report types: "
-        f"stack={type(report_stack).__name__}, pdf={type(report_pdf).__name__}, "
-        f"median={type(report_median).__name__}"
-    )
-    return []
+    # Determine which arms actually scored successfully.
+    scored_arms = {label for label, m in arm_metrics.items() if m is not None}
+    if len(scored_arms) < 2:
+        return []
+
+    # Choose comparison set based on mode.
+    if is_five_arm:
+        comparisons = COMPARISONS_5ARM
+    else:
+        comparisons = COMPARISONS_3ARM
+
+    # Filter to comparisons where both arms scored successfully.
+    active_comparisons = []
+    for comparison in comparisons:
+        left, right = comparison.split("-", 1)
+        if left in scored_arms and right in scored_arms:
+            active_comparisons.append(comparison)
+
+    if not active_comparisons:
+        return []
+
+    # Build PairedScore rows for active comparisons only.
+    # Collect the canonical metric set from the first scored arm.
+    first_scored_label = next(iter(scored_arms))
+    first_scored_metrics = arm_metrics[first_scored_label]
+    assert first_scored_metrics is not None  # guaranteed by scored_arms membership
+    metric_names = list(first_scored_metrics.keys())
+
+    paired: list[PairedScore] = []
+    for metric in metric_names:
+        # Extract scores for all arms (NaN for absent arms).
+        s_stack = arm_metrics["stack"][metric] if arm_metrics["stack"] else float("nan")
+        s_stack_aug = arm_metrics["stack_aug"][metric] if arm_metrics["stack_aug"] else float("nan")
+        s_pdf_min1 = arm_metrics["pdf_min1"][metric] if arm_metrics["pdf_min1"] else float("nan")
+        s_pdf_min2 = arm_metrics["pdf_min2"][metric] if arm_metrics["pdf_min2"] else float("nan")
+        s_median = arm_metrics["median"][metric] if arm_metrics["median"] else float("nan")
+
+        def _get_score(arm_label: str) -> float:
+            m = arm_metrics[arm_label]
+            return m[metric] if m else float("nan")
+
+        def _get_sat(arm_label: str) -> bool:
+            s = arm_saturation[arm_label]
+            return s[metric] if s else False
+
+        for comparison in active_comparisons:
+            left, right = comparison.split("-", 1)
+            delta = _get_score(left) - _get_score(right)
+            paired.append(
+                PairedScore(
+                    qid=qid,
+                    question_type=question_type,
+                    metric=metric,
+                    comparison=comparison,
+                    score_stack=s_stack,
+                    score_stack_aug=s_stack_aug,
+                    score_median=s_median,
+                    score_pdf_min1=s_pdf_min1,
+                    score_pdf_min2=s_pdf_min2,
+                    delta=delta,
+                    higher_is_better=METRIC_DIRECTION[metric],
+                    is_saturated_stack=_get_sat("stack"),
+                    is_saturated_stack_aug=_get_sat("stack_aug"),
+                    is_saturated_pdf_min1=_get_sat("pdf_min1"),
+                    is_saturated_pdf_min2=_get_sat("pdf_min2"),
+                    is_saturated_median=_get_sat("median"),
+                    **confounders,
+                )
+            )
+    return paired
 
 
 # ---------------------------------------------------------------------------
@@ -475,15 +676,25 @@ def wilcoxon_signed_rank(deltas: list[float]) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+def _sat_for_arm(score: PairedScore, arm: str) -> bool:
+    """Return the saturation flag for a named arm on a PairedScore row."""
+    if arm == "stack":
+        return score.is_saturated_stack
+    if arm == "stack_aug":
+        return score.is_saturated_stack_aug
+    if arm == "pdf_min1":
+        return score.is_saturated_pdf_min1
+    if arm == "pdf_min2":
+        return score.is_saturated_pdf_min2
+    if arm == "median":
+        return score.is_saturated_median
+    raise ValueError(f"Unknown arm {arm!r}")
+
+
 def _saturation_pair_for_comparison(score: PairedScore) -> bool:
     """True iff either arm in this row's comparison saturated."""
-    if score.comparison == "pdf-stack":
-        return score.is_saturated_stack or score.is_saturated_pdf
-    if score.comparison == "median-stack":
-        return score.is_saturated_stack or score.is_saturated_median
-    if score.comparison == "median-pdf":
-        return score.is_saturated_pdf or score.is_saturated_median
-    raise ValueError(f"unknown comparison {score.comparison!r}")
+    left, right = score.comparison.split("-", 1)
+    return _sat_for_arm(score, left) or _sat_for_arm(score, right)
 
 
 def _stats_for_group(
@@ -713,12 +924,12 @@ def _has_confounder_data(scores: list[PairedScore]) -> bool:
     """True iff at least one PairedScore has a confounder field populated."""
     return any(
         s.stack_model_used is not None
-        or s.pdf_model_used is not None
+        or s.stack_aug_model_used is not None
         or s.median_model_used is not None
-        or s.pdf_tools_fired is not None
+        or s.stack_aug_tools_fired is not None
         or s.median_tools_fired is not None
         or s.n_forecasters_stack is not None
-        or s.n_forecasters_pdf is not None
+        or s.n_forecasters_stack_aug is not None
         or s.n_forecasters_median is not None
         for s in scores
     )
@@ -746,8 +957,8 @@ def _per_question_diagnostic_table(scores: list[PairedScore]) -> list[str]:
     if show_confounders:
         lines = [
             (
-                "| qid | type | metric | stack | pdf | median | Δ_pdf-stack | Δ_median-stack | Δ_median-pdf "
-                "| sat_stack | sat_pdf | sat_median | stack_model | pdf_model | median_model | pdf_tools | median_tools |"
+                "| qid | type | metric | stack | stack_aug | median | Δ_stack_aug-stack | Δ_median-stack | Δ_median-stack_aug "
+                "| sat_stack | sat_stack_aug | sat_median | stack_model | stack_aug_model | median_model | stack_aug_tools | median_tools |"
             ),
             (
                 "|-----|------|--------|-------|-----|--------|-------------|----------------|-------------"
@@ -757,8 +968,8 @@ def _per_question_diagnostic_table(scores: list[PairedScore]) -> list[str]:
     else:
         lines = [
             (
-                "| qid | type | metric | stack | pdf | median | Δ_pdf-stack | Δ_median-stack | Δ_median-pdf "
-                "| sat_stack | sat_pdf | sat_median |"
+                "| qid | type | metric | stack | stack_aug | median | Δ_stack_aug-stack | Δ_median-stack | Δ_median-stack_aug "
+                "| sat_stack | sat_stack_aug | sat_median |"
             ),
             (
                 "|-----|------|--------|-------|-----|--------|-------------|----------------|-------------"
@@ -773,37 +984,37 @@ def _per_question_diagnostic_table(scores: list[PairedScore]) -> list[str]:
     by_key: dict[tuple[int, str], PairedScore] = {}
     for s in scores:
         key = (s.qid, s.metric)
-        if key not in by_key or s.comparison == "pdf-stack":
+        if key not in by_key or s.comparison == "stack_aug-stack":
             by_key[key] = s
 
     def _sat_label(flag: bool) -> str:
         return "Y" if flag else "n"
 
     rows = list(by_key.values())
-    rows.sort(key=lambda s: abs(s.score_pdf - s.score_stack), reverse=True)
+    rows.sort(key=lambda s: abs(s.score_stack_aug - s.score_stack), reverse=True)
     for s in rows:
-        delta_pdf_stack = s.score_pdf - s.score_stack
+        delta_pdf_stack = s.score_stack_aug - s.score_stack
         delta_median_stack = s.score_median - s.score_stack
-        delta_median_pdf = s.score_median - s.score_pdf
+        delta_median_pdf = s.score_median - s.score_stack_aug
         base_row = (
             f"| {s.qid} "
             f"| {s.question_type} "
             f"| {s.metric} "
             f"| {_format_score(s.score_stack)} "
-            f"| {_format_score(s.score_pdf)} "
+            f"| {_format_score(s.score_stack_aug)} "
             f"| {_format_score(s.score_median)} "
             f"| {_format_score(delta_pdf_stack)} "
             f"| {_format_score(delta_median_stack)} "
             f"| {_format_score(delta_median_pdf)} "
             f"| {_sat_label(s.is_saturated_stack)} "
-            f"| {_sat_label(s.is_saturated_pdf)} "
+            f"| {_sat_label(s.is_saturated_stack_aug)} "
             f"| {_sat_label(s.is_saturated_median)} "
         )
         if show_confounders:
             stack_marker = _md_escape_cell(s.stack_model_used)
-            pdf_marker = _md_escape_cell(s.pdf_model_used)
+            pdf_marker = _md_escape_cell(s.stack_aug_model_used)
             median_marker = _md_escape_cell(s.median_model_used)
-            pdf_tools_marker = "-" if s.pdf_tools_fired is None else ("yes" if s.pdf_tools_fired else "no")
+            pdf_tools_marker = "-" if s.stack_aug_tools_fired is None else ("yes" if s.stack_aug_tools_fired else "no")
             median_tools_marker = "-" if s.median_tools_fired is None else ("yes" if s.median_tools_fired else "no")
             lines.append(
                 f"{base_row}| {stack_marker} | {pdf_marker} | {median_marker} "
@@ -836,18 +1047,18 @@ def _confounder_summary_lines(scores: list[PairedScore]) -> list[str]:
 
     stack_primary = _count("stack_model_used", "primary")
     stack_fallback = _count("stack_model_used", "fallback")
-    pdf_primary = _count("pdf_model_used", "primary")
-    pdf_fallback = _count("pdf_model_used", "fallback")
+    pdf_primary = _count("stack_aug_model_used", "primary")
+    pdf_fallback = _count("stack_aug_model_used", "fallback")
     median_simple = _count("median_model_used", "simple_aggregation")
 
     n_stack_values = [s.n_forecasters_stack for s in sample if s.n_forecasters_stack is not None]
-    n_pdf_values = [s.n_forecasters_pdf for s in sample if s.n_forecasters_pdf is not None]
+    n_pdf_values = [s.n_forecasters_stack_aug for s in sample if s.n_forecasters_stack_aug is not None]
     n_median_values = [s.n_forecasters_median for s in sample if s.n_forecasters_median is not None]
     avg_n_stack = sum(n_stack_values) / len(n_stack_values) if n_stack_values else None
     avg_n_pdf = sum(n_pdf_values) / len(n_pdf_values) if n_pdf_values else None
     avg_n_median = sum(n_median_values) / len(n_median_values) if n_median_values else None
 
-    pdf_tools_observations = [s.pdf_tools_fired for s in sample if s.pdf_tools_fired is not None]
+    pdf_tools_observations = [s.stack_aug_tools_fired for s in sample if s.stack_aug_tools_fired is not None]
     pdf_tools_fired_count = sum(1 for fired in pdf_tools_observations if fired)
     pdf_tools_total = len(pdf_tools_observations)
 
@@ -857,17 +1068,19 @@ def _confounder_summary_lines(scores: list[PairedScore]) -> list[str]:
 
     lines: list[str] = ["", "## Confounder summary"]
     lines.append(f"- stack: {stack_primary}/{total} primary, {stack_fallback}/{total} fallback.")
-    lines.append(f"- pdf: {pdf_primary}/{total} primary, {pdf_fallback}/{total} fallback.")
+    lines.append(f"- stack_aug: {pdf_primary}/{total} primary, {pdf_fallback}/{total} fallback.")
     if median_simple > 0:
         lines.append(f"- median: {median_simple}/{total} simple_aggregation (deterministic, no fallback).")
     if avg_n_stack is not None and avg_n_pdf is not None and avg_n_median is not None:
         lines.append(
-            f"- Average n_forecasters_used: stack {avg_n_stack:.2f}, pdf {avg_n_pdf:.2f}, median {avg_n_median:.2f}."
+            f"- Average n_forecasters_used: stack {avg_n_stack:.2f}, stack_aug {avg_n_pdf:.2f}, median {avg_n_median:.2f}."
         )
     elif avg_n_stack is not None and avg_n_pdf is not None:
-        lines.append(f"- Average n_forecasters_used: stack {avg_n_stack:.2f}, pdf {avg_n_pdf:.2f}.")
+        lines.append(f"- Average n_forecasters_used: stack {avg_n_stack:.2f}, stack_aug {avg_n_pdf:.2f}.")
     if pdf_tools_total > 0:
-        line_pdf = f"- Treatment activation: pdf fired tools on {pdf_tools_fired_count}/{pdf_tools_total} questions"
+        line_pdf = (
+            f"- Treatment activation: stack_aug fired tools on {pdf_tools_fired_count}/{pdf_tools_total} questions"
+        )
         empty = pdf_tools_total - pdf_tools_fired_count
         if empty > 0:
             line_pdf += f" ({empty} had empty cross_model_aggregation — likely structured-block parse failures)"
@@ -895,12 +1108,18 @@ def _per_arm_raw_stats_lines(scores: list[PairedScore]) -> list[str]:
     if not by_key:
         return []
 
+    # Detect 5-arm mode: any score has non-NaN pdf_min1/pdf_min2.
+    has_pdf_arms = any(not math.isnan(s.score_pdf_min1) for s in by_key.values())
+
     # (arm, metric, type) → list[score]. Type "overall" aggregates across types.
-    arm_extractors = {
+    arm_extractors: dict[str, Any] = {
         "stack": lambda s: s.score_stack,
-        "pdf": lambda s: s.score_pdf,
+        "stack_aug": lambda s: s.score_stack_aug,
         "median": lambda s: s.score_median,
     }
+    if has_pdf_arms:
+        arm_extractors["pdf_min1"] = lambda s: s.score_pdf_min1
+        arm_extractors["pdf_min2"] = lambda s: s.score_pdf_min2
     bucket: dict[tuple[str, str, str], list[float]] = {}
     for s in by_key.values():
         for arm, extractor in arm_extractors.items():
@@ -923,6 +1142,114 @@ def _per_arm_raw_stats_lines(scores: list[PairedScore]) -> list[str]:
         mean = float(np.mean(values))
         median = float(np.median(values))
         lines.append(f"| {arm} | {metric} | {qtype} | {n} | {_format_score(mean)} | {_format_score(median)} |")
+    return lines
+
+
+def _dual_panel_pdf_section(paired_scores: list[PairedScore], stats: list[PairedStats]) -> list[str]:
+    """Render the dual-panel PDF arm comparison section.
+
+    Shows two panels (min_forecasters=1 vs min_forecasters=2) side by side with
+    loud caveats about free-model structured-block emit rates.
+    """
+    lines: list[str] = []
+    lines.append("## PDF arm: dual-panel comparison")
+    lines.append("")
+    lines.append(
+        "> **Caveat:** the 'pdf' arm uses strict structured-math-only per forecaster. On the n=88 "
+        "free-OpenRouter ensemble, only ~58% of (forecaster, question) pairs emit parseable "
+        "structured blocks (mean 2.32 of 4 forecasters survive). We render two views:"
+    )
+    lines.append(">")
+    lines.append(
+        "> - **min_forecasters=1** (any-structured): qids where >=1 forecaster emitted structured math. "
+        "Single-forecaster qids are NOT aggregation -- they are that single forecaster's structured prediction."
+    )
+    lines.append(
+        "> - **min_forecasters=2** (proper aggregation): qids where >=2 forecasters survived. "
+        "These are honest pointwise-median aggregations."
+    )
+    lines.append(">")
+    lines.append(
+        "> A re-run on the prod ensemble (Opus 4.6/4.7, GPT-5.5, Gemini 3 Pro, etc.) is expected "
+        "to produce structured blocks much more reliably -- these free-model results should be "
+        "interpreted as a lower bound on what the pdf arm can do."
+    )
+    lines.append("")
+
+    # Filter stats to pdf-relevant comparisons
+    pdf_min1_comparisons = {"pdf_min1-stack", "pdf_min1-stack_aug", "median-pdf_min1"}
+    pdf_min2_comparisons = {"pdf_min2-stack", "pdf_min2-stack_aug", "median-pdf_min2"}
+
+    # Count N for each panel from per-type stats
+    overall_stats = [s for s in stats if s.question_type is None]
+
+    # Panel 1: min_forecasters=1
+    min1_stats = [s for s in overall_stats if s.comparison in pdf_min1_comparisons]
+    if min1_stats:
+        n_min1 = min1_stats[0].n if min1_stats else 0
+        lines.append(f"### min_forecasters=1 panel (n={n_min1})")
+        lines.extend(_stats_table_header())
+        for s in sorted(min1_stats, key=lambda x: (x.comparison, x.metric)):
+            lines.append(_stats_row(s))
+        lines.append("")
+
+    # Panel 2: min_forecasters=2
+    min2_stats = [s for s in overall_stats if s.comparison in pdf_min2_comparisons]
+    if min2_stats:
+        n_min2 = min2_stats[0].n if min2_stats else 0
+        lines.append(f"### min_forecasters=2 panel (n={n_min2})")
+        lines.extend(_stats_table_header())
+        for s in sorted(min2_stats, key=lambda x: (x.comparison, x.metric)):
+            lines.append(_stats_row(s))
+        lines.append("")
+
+    # Survival-rate table: shows the underlying data shape driving the policy
+    # difference between min_forecasters=1 and min_forecasters=2.
+    # pdf_min1 and pdf_min2 produce identical predictions on qids where both
+    # succeed (>=2 surviving forecasters); they only differ on qids where
+    # exactly 1 forecaster survived, which pdf_min1 keeps and pdf_min2 drops.
+    lines.append("### Structured-forecaster survival distribution")
+    lines.append("")
+    lines.append(
+        "Shows per-qid structured-forecaster survival counts and which policy "
+        "(min=1 vs min=2) produces a prediction. On qids where both succeed, "
+        "predictions are identical by construction (same forecasters, same aggregation)."
+    )
+    lines.append("")
+
+    # Dedupe to one observation per qid using the first metric row.
+    by_qid_pdf: dict[int, PairedScore] = {}
+    for s in paired_scores:
+        if s.qid not in by_qid_pdf:
+            by_qid_pdf[s.qid] = s
+
+    # Classify each qid by pdf arm availability.
+    n_both_fail = 0
+    n_min1_only = 0
+    n_both_succeed = 0
+    for s in by_qid_pdf.values():
+        has_min1 = not math.isnan(s.score_pdf_min1)
+        has_min2 = not math.isnan(s.score_pdf_min2)
+        if has_min1 and has_min2:
+            n_both_succeed += 1
+        elif has_min1 and not has_min2:
+            n_min1_only += 1
+        else:
+            n_both_fail += 1
+
+    lines.append("| Survival | n_qids | pdf_min1 | pdf_min2 |")
+    lines.append("|----------|--------|----------|----------|")
+    lines.append(f"| 0 surviving forecasters | {n_both_fail} | fail | fail |")
+    lines.append(f"| 1 surviving forecaster | {n_min1_only} | success (single) | fail |")
+    lines.append(f"| 2+ surviving forecasters | {n_both_succeed} | success | success |")
+    lines.append("")
+    lines.append(
+        f"Policy impact: pdf_min1 covers {n_min1_only + n_both_succeed} qids, "
+        f"pdf_min2 covers {n_both_succeed} qids. The {n_min1_only} single-forecaster "
+        "qids are the policy-relevant difference."
+    )
+    lines.append("")
+
     return lines
 
 
@@ -967,9 +1294,12 @@ def render_summary_markdown(stats: list[PairedStats], paired_scores: list[Paired
     overall_stats = [s for s in stats if s.question_type is None]
     per_type_stats = [s for s in stats if s.question_type is not None]
 
+    # Derive active comparisons from the data (supports both 3-arm and 5-arm).
+    active_comparisons = sorted({s.comparison for s in stats}) if stats else list(COMPARISONS_3ARM)
+
     lines.append("## Overall summary")
     if overall_stats:
-        for comparison in COMPARISONS:
+        for comparison in active_comparisons:
             comp_stats = [s for s in overall_stats if s.comparison == comparison]
             if not comp_stats:
                 continue
@@ -984,7 +1314,7 @@ def render_summary_markdown(stats: list[PairedStats], paired_scores: list[Paired
 
     lines.append("## Per-type breakdown")
     if per_type_stats:
-        for comparison in COMPARISONS:
+        for comparison in active_comparisons:
             comp_stats = [s for s in per_type_stats if s.comparison == comparison]
             if not comp_stats:
                 continue
@@ -997,8 +1327,54 @@ def render_summary_markdown(stats: list[PairedStats], paired_scores: list[Paired
         lines.append("(no per-type scores; n=0)")
         lines.append("")
 
+    # Saturation-excluded panels: re-aggregate on rows where neither arm in the
+    # comparison saturated. Per-comparison filter (a stack-saturated row drops
+    # from pdf-stack and median-stack but NOT from median-pdf, etc.). N varies
+    # by comparison — that's the point.
+    nosat_scores = [s for s in paired_scores if not _saturation_pair_for_comparison(s)]
+    if nosat_scores:
+        nosat_stats = aggregate_paired(nosat_scores, n_bootstrap=5000, seed=0)
+        nosat_overall = [s for s in nosat_stats if s.question_type is None]
+        nosat_per_type = [s for s in nosat_stats if s.question_type is not None]
+
+        lines.append("## Overall summary (saturation-excluded)")
+        if nosat_overall:
+            for comparison in active_comparisons:
+                comp_stats = [s for s in nosat_overall if s.comparison == comparison]
+                if not comp_stats:
+                    continue
+                lines.append(f"### Comparison: {comparison}")
+                lines.extend(_stats_table_header())
+                for s in sorted(comp_stats, key=lambda x: x.metric):
+                    lines.append(_stats_row(s))
+                lines.append("")
+        else:
+            lines.append("(no non-saturated scores; n=0)")
+            lines.append("")
+
+        lines.append("## Per-type breakdown (saturation-excluded)")
+        if nosat_per_type:
+            for comparison in active_comparisons:
+                comp_stats = [s for s in nosat_per_type if s.comparison == comparison]
+                if not comp_stats:
+                    continue
+                lines.append(f"### Comparison: {comparison}")
+                lines.extend(_stats_table_header())
+                for s in sorted(comp_stats, key=lambda x: (x.question_type, x.metric)):
+                    lines.append(_stats_row(s))
+                lines.append("")
+        else:
+            lines.append("(no non-saturated per-type scores; n=0)")
+            lines.append("")
+
     if paired_scores:
         lines.extend(_per_arm_raw_stats_lines(paired_scores))
+        lines.append("")
+
+    # Dual-panel PDF section: only rendered when pdf_min1/pdf_min2 scores are present.
+    has_pdf_scores = any(not math.isnan(s.score_pdf_min1) for s in paired_scores)
+    if has_pdf_scores:
+        lines.extend(_dual_panel_pdf_section(paired_scores, stats))
         lines.append("")
 
     lines.append("## Per-question diagnostic")
@@ -1052,6 +1428,13 @@ def render_summary_markdown(stats: list[PairedStats], paired_scores: list[Paired
         "schema). Both-saturated rows are mechanical Δ≈0 draws and don't carry signal; they inflate "
         "sign-test power without informing direction. The `NoSat Δ (n_clean)` column reports the mean "
         "Δ over only the pairs where neither arm in the comparison saturated."
+    )
+    lines.append(
+        "- **(saturation-excluded) panels** filter rows per comparison: a row is dropped if either "
+        "arm in that comparison saturated (numeric_log_score near -220, brier near 1.0, etc., where "
+        "the schema's max-confident-wrong floor is hit). Use these panels when interpreting numeric "
+        "metrics — saturation can dominate means without reflecting calibration differences. N varies "
+        "by comparison because saturation patterns differ across arms."
     )
     lines.append("- Higher is better for log scores; lower is better for Brier and CRPS.")
     lines.append("- Δ for comparison X-Y = score_X - score_Y. Bootstrap is paired (resampling qids with replacement).")

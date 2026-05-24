@@ -44,8 +44,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import (
-    ARM_PDF,
     ARM_STACK,
+    ARM_STACK_AUG,
     probabilistic_tools_enabled,
     run_stacker_batch,
     run_stacker_for_arm,
@@ -395,7 +395,7 @@ class TestArmEnvVarSemantics:
                     question=_make_binary_q(),
                     research_blob="research",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -403,7 +403,7 @@ class TestArmEnvVarSemantics:
                 )
             )
         assert payload["success"] is True
-        assert payload["arm"] == ARM_PDF
+        assert payload["arm"] == ARM_STACK_AUG
         assert payload["tools_enabled_at_runtime"] is True
         assert seen_flag_states
         for state in seen_flag_states:
@@ -448,7 +448,7 @@ class TestAggregatedToolOutputPassing:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -540,7 +540,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -583,7 +583,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_PDF,  # even in arm B
+                    arm=ARM_STACK_AUG,  # even in arm B
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -668,7 +668,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2189,7 +2189,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_binary_q(qid=1),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2338,7 +2338,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_binary_q(qid=3),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2465,7 +2465,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_numeric_q(qid=4),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2538,7 +2538,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_mc_q(qid=5),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_PDF,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,

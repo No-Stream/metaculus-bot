@@ -1246,3 +1246,122 @@ class TestFallAib2025Fixture:
         # Fall-aib-2025 comments use the legacy STACKED= marker. Confirm
         # the marker reader still picks it up.
         assert parse_stacked_marker(FALL_AIB_2025_FIXTURE) is False
+
+
+# ---------------------------------------------------------------------------
+# parse_per_model_mc_option_probs — MC full option vector extraction
+# ---------------------------------------------------------------------------
+
+
+class TestParsePerModelMcOptionProbs:
+    """Extracts per-forecaster option probability vectors from MC comment bullets.
+
+    The bug: parse_per_model_forecasts only captures the first line after
+    ``*Forecaster N*:``, which for MC is just the first option (e.g.
+    ``- Option A: 40.0%``). This parser captures ALL option lines per
+    forecaster and returns ``{model: {option: probability}}``.
+    """
+
+    def test_basic_mc_two_forecasters(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Option A: 40.0%\n"
+            "- Option B: 30.0%\n"
+            "- Option C: 20.0%\n"
+            "- Option D: 10.0%\n"
+            "\n"
+            "*Forecaster 2 (claude-opus-4.7)*: \n"
+            "- Option A: 35.0%\n"
+            "- Option B: 25.0%\n"
+            "- Option C: 25.0%\n"
+            "- Option D: 15.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "Some research here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {
+            "gpt-5.5": {"Option A": 0.40, "Option B": 0.30, "Option C": 0.20, "Option D": 0.10},
+            "claude-opus-4.7": {"Option A": 0.35, "Option B": 0.25, "Option C": 0.25, "Option D": 0.15},
+        }
+
+    def test_returns_empty_for_binary_comment(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: 72.0%\n"
+            "*Forecaster 2 (claude-opus-4.7)*: 68.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "Some research here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {}
+
+    def test_empty_comment(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        assert parse_per_model_mc_option_probs("") == {}
+
+    def test_options_with_special_characters_in_name(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Yes (>50%): 60.0%\n"
+            "- No (<=50%): 30.0%\n"
+            "- Ambiguous / unclear: 10.0%\n"
+            "\n"
+            "### Research Summary\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {
+            "gpt-5.5": {"Yes (>50%)": 0.60, "No (<=50%)": 0.30, "Ambiguous / unclear": 0.10},
+        }
+
+    def test_model_map_from_rationales(self):
+        """Attribution uses Model: lines from R1 sections when inline name is absent."""
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1*: \n"
+            "- Yes: 70.0%\n"
+            "- No: 30.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "stuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "reasoning here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {"gpt-5.5": {"Yes": 0.70, "No": 0.30}}
+
+    def test_probabilities_sum_approximately_one(self):
+        """Sanity: parsed probabilities should sum to ~1.0 for well-formed comments."""
+        from metaculus_bot.performance_analysis.parsing import parse_per_model_mc_option_probs
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- A: 25.0%\n"
+            "- B: 25.0%\n"
+            "- C: 25.0%\n"
+            "- D: 25.0%\n"
+            "\n"
+            "### Research Summary\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        total = sum(result["gpt-5.5"].values())
+        assert abs(total - 1.0) < 0.01

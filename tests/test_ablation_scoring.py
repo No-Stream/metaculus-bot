@@ -111,12 +111,12 @@ def _make_mc_report(option_probs: dict[str, float]) -> MagicMock:
 
 
 def _three_arm_inputs(
-    report_stack, report_pdf, report_median, payload_stack=None, payload_pdf=None, payload_median=None
+    report_stack, report_stack_aug, report_median, payload_stack=None, payload_stack_aug=None, payload_median=None
 ):
     """Build the [(label, report, payload), ...] list that score_arm_for_qid expects."""
     return [
         ("stack", report_stack, payload_stack),
-        ("pdf", report_pdf, payload_pdf),
+        ("stack_aug", report_stack_aug, payload_stack_aug),
         ("median", report_median, payload_median),
     ]
 
@@ -125,7 +125,7 @@ class TestScoreArmForQid:
     def test_score_arm_binary_returns_three_comparisons_per_metric(self):
         """Binary: 2 metrics * 3 pairwise comparisons = 6 PairedScore rows."""
         report_stack = _make_binary_report(0.3)
-        report_pdf = _make_binary_report(0.8)
+        report_stack_aug = _make_binary_report(0.8)
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=42,
@@ -137,14 +137,14 @@ class TestScoreArmForQid:
             question_text="binary?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         # 2 metrics x 3 comparisons = 6 rows.
         assert len(scores) == 6
         metrics = {s.metric for s in scores}
         assert metrics == {"brier", "binary_log_score"}
         comparisons = {s.comparison for s in scores}
-        assert comparisons == {"pdf-stack", "median-stack", "median-pdf"}
+        assert comparisons == {"stack_aug-stack", "median-stack", "median-stack_aug"}
 
         for s in scores:
             assert isinstance(s, PairedScore)
@@ -152,20 +152,20 @@ class TestScoreArmForQid:
             assert s.question_type == "binary"
             # Each row carries all three scores so per-arm raw stats can be derived.
             assert s.score_stack is not None
-            assert s.score_pdf is not None
+            assert s.score_stack_aug is not None
             assert s.score_median is not None
             # Delta matches the comparison.
-            if s.comparison == "pdf-stack":
-                assert s.delta == pytest.approx(s.score_pdf - s.score_stack)
+            if s.comparison == "stack_aug-stack":
+                assert s.delta == pytest.approx(s.score_stack_aug - s.score_stack)
             elif s.comparison == "median-stack":
                 assert s.delta == pytest.approx(s.score_median - s.score_stack)
-            elif s.comparison == "median-pdf":
-                assert s.delta == pytest.approx(s.score_median - s.score_pdf)
+            elif s.comparison == "median-stack_aug":
+                assert s.delta == pytest.approx(s.score_median - s.score_stack_aug)
 
     def test_score_arm_numeric_returns_log_score_and_crps(self):
         """Numeric: 2 metrics * 3 comparisons = 6 PairedScore rows."""
         report_stack = _uniform_numeric_report()
-        report_pdf = _logistic_numeric_report(center=5.0, sharpness=0.3)
+        report_stack_aug = _logistic_numeric_report(center=5.0, sharpness=0.3)
         report_median = _logistic_numeric_report(center=5.0, sharpness=1.0)
         gt = GroundTruth(
             question_id=99,
@@ -177,7 +177,7 @@ class TestScoreArmForQid:
             question_text="numeric?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         assert len(scores) == 6
         metrics = {s.metric for s in scores}
@@ -186,18 +186,18 @@ class TestScoreArmForQid:
         for s in scores:
             assert s.qid == 99
             assert s.question_type == "numeric"
-            assert s.comparison in {"pdf-stack", "median-stack", "median-pdf"}
+            assert s.comparison in {"stack_aug-stack", "median-stack", "median-stack_aug"}
 
         # Concentrated CDF at resolution should be better on both metrics for B-A.
-        ba_log = next(s for s in scores if s.metric == "numeric_log_score" and s.comparison == "pdf-stack")
-        ba_crps = next(s for s in scores if s.metric == "crps" and s.comparison == "pdf-stack")
-        assert ba_log.score_pdf > ba_log.score_stack  # higher log score = better
-        assert ba_crps.score_pdf < ba_crps.score_stack  # lower CRPS = better
+        ba_log = next(s for s in scores if s.metric == "numeric_log_score" and s.comparison == "stack_aug-stack")
+        ba_crps = next(s for s in scores if s.metric == "crps" and s.comparison == "stack_aug-stack")
+        assert ba_log.score_stack_aug > ba_log.score_stack  # higher log score = better
+        assert ba_crps.score_stack_aug < ba_crps.score_stack  # lower CRPS = better
 
     def test_score_arm_multiple_choice_returns_one_score(self):
         """MC: 1 metric * 3 comparisons = 3 PairedScore rows."""
         report_stack = _make_mc_report({"a": 0.4, "b": 0.3, "c": 0.3})
-        report_pdf = _make_mc_report({"a": 0.8, "b": 0.1, "c": 0.1})
+        report_stack_aug = _make_mc_report({"a": 0.8, "b": 0.1, "c": 0.1})
         report_median = _make_mc_report({"a": 0.6, "b": 0.2, "c": 0.2})
         gt = GroundTruth(
             question_id=7,
@@ -209,17 +209,17 @@ class TestScoreArmForQid:
             question_text="mc?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         assert len(scores) == 3
         assert all(s.metric == "mc_log_score" for s in scores)
         assert all(s.question_type == "multiple_choice" for s in scores)
-        ba = next(s for s in scores if s.comparison == "pdf-stack")
-        assert ba.score_pdf > ba.score_stack  # higher = better
+        ba = next(s for s in scores if s.comparison == "stack_aug-stack")
+        assert ba.score_stack_aug > ba.score_stack  # higher = better
 
     def test_score_arm_canceled_resolution_returns_empty(self):
         report_stack = _make_binary_report(0.3)
-        report_pdf = _make_binary_report(0.7)
+        report_stack_aug = _make_binary_report(0.7)
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=1,
@@ -231,12 +231,12 @@ class TestScoreArmForQid:
             question_text="?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
         assert scores == []
 
     def test_paired_score_higher_is_better_set_correctly(self):
         report_stack = _make_binary_report(0.4)
-        report_pdf = _make_binary_report(0.9)
+        report_stack_aug = _make_binary_report(0.9)
         report_median = _make_binary_report(0.7)
         binary_gt = GroundTruth(
             question_id=1,
@@ -248,7 +248,7 @@ class TestScoreArmForQid:
             question_text="?",
         )
 
-        binary_scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), binary_gt)
+        binary_scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), binary_gt)
         for s in binary_scores:
             if s.metric == "brier":
                 assert s.higher_is_better is False
@@ -306,7 +306,7 @@ class TestScoreArmForQid:
         checked before int because ``isinstance(True, int)`` is True.
         """
         report_stack = _uniform_numeric_report()
-        report_pdf = _logistic_numeric_report(center=5.0)
+        report_stack_aug = _logistic_numeric_report(center=5.0)
         report_median = _logistic_numeric_report(center=4.0)
         gt = GroundTruth(
             question_id=99,
@@ -319,7 +319,7 @@ class TestScoreArmForQid:
         )
 
         with caplog.at_level("WARNING", logger="metaculus_bot.ablation.scoring"):
-            scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+            scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         assert scores == []
         warning_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
@@ -333,7 +333,7 @@ class TestScoreArmForQid:
         # little below the lower bound. Resolution=BELOW_LOWER_BOUND should yield a
         # finite log score (negative because the prediction had little mass there).
         report_stack = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
-        report_pdf = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
+        report_stack_aug = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
         report_median = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
         gt = GroundTruth(
             question_id=43129,
@@ -345,7 +345,7 @@ class TestScoreArmForQid:
             question_text="below-bound numeric?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         # 2 metrics x 3 comparisons.
         assert len(scores) == 6
@@ -353,13 +353,13 @@ class TestScoreArmForQid:
         assert metrics == {"numeric_log_score", "crps"}
         for s in scores:
             assert math.isfinite(s.score_stack)
-            assert math.isfinite(s.score_pdf)
+            assert math.isfinite(s.score_stack_aug)
             assert math.isfinite(s.score_median)
 
     def test_score_arm_numeric_with_above_upper_bound_resolution_scores_correctly(self):
         """M4: OutOfBoundsResolution.ABOVE_UPPER_BOUND maps to upper-bound bucket."""
         report_stack = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
-        report_pdf = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
+        report_stack_aug = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
         report_median = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
         gt = GroundTruth(
             question_id=43171,
@@ -371,14 +371,14 @@ class TestScoreArmForQid:
             question_text="above-bound numeric?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         assert len(scores) == 6
         metrics = {s.metric for s in scores}
         assert metrics == {"numeric_log_score", "crps"}
         for s in scores:
             assert math.isfinite(s.score_stack)
-            assert math.isfinite(s.score_pdf)
+            assert math.isfinite(s.score_stack_aug)
             assert math.isfinite(s.score_median)
 
 
@@ -529,22 +529,22 @@ class TestWilcoxonSignedRank:
 def _binary_paired_score(
     qid: int,
     score_stack: float,
-    score_pdf: float,
+    score_stack_aug: float,
     score_median: float | None = None,
-    comparison: str = "pdf-stack",
+    comparison: str = "stack_aug-stack",
 ) -> PairedScore:
     """Build a binary PairedScore for a given pairwise comparison.
 
-    Defaults: comparison="pdf-stack", score_median=mean(a,b) if not given. score_median is always populated
+    Defaults: comparison="stack_aug-stack", score_median=mean(a,b) if not given. score_median is always populated
     on every row so per-arm raw stats can be derived regardless of which comparison the row
     represents.
     """
     if score_median is None:
-        score_median = (score_stack + score_pdf) / 2.0
+        score_median = (score_stack + score_stack_aug) / 2.0
     delta_map = {
-        "pdf-stack": score_pdf - score_stack,
+        "stack_aug-stack": score_stack_aug - score_stack,
         "median-stack": score_median - score_stack,
-        "median-pdf": score_median - score_pdf,
+        "median-stack_aug": score_median - score_stack_aug,
     }
     return PairedScore(
         qid=qid,
@@ -552,7 +552,7 @@ def _binary_paired_score(
         metric="binary_log_score",
         comparison=comparison,
         score_stack=score_stack,
-        score_pdf=score_pdf,
+        score_stack_aug=score_stack_aug,
         score_median=score_median,
         delta=delta_map[comparison],
         higher_is_better=True,
@@ -563,17 +563,17 @@ def _numeric_paired_score(
     qid: int,
     metric: str,
     score_stack: float,
-    score_pdf: float,
+    score_stack_aug: float,
     hib: bool,
     score_median: float | None = None,
-    comparison: str = "pdf-stack",
+    comparison: str = "stack_aug-stack",
 ) -> PairedScore:
     if score_median is None:
-        score_median = (score_stack + score_pdf) / 2.0
+        score_median = (score_stack + score_stack_aug) / 2.0
     delta_map = {
-        "pdf-stack": score_pdf - score_stack,
+        "stack_aug-stack": score_stack_aug - score_stack,
         "median-stack": score_median - score_stack,
-        "median-pdf": score_median - score_pdf,
+        "median-stack_aug": score_median - score_stack_aug,
     }
     return PairedScore(
         qid=qid,
@@ -581,7 +581,7 @@ def _numeric_paired_score(
         metric=metric,
         comparison=comparison,
         score_stack=score_stack,
-        score_pdf=score_pdf,
+        score_stack_aug=score_stack_aug,
         score_median=score_median,
         delta=delta_map[comparison],
         higher_is_better=hib,
@@ -590,7 +590,7 @@ def _numeric_paired_score(
 
 class TestAggregatePaired:
     def test_aggregate_paired_groups_by_metric_type_and_comparison(self):
-        # All scores carry comparison="pdf-stack" by default → only one comparison group is exercised.
+        # All scores carry comparison="stack_aug-stack" by default → only one comparison group is exercised.
         # 3 binary log-score (B-A), 3 numeric crps (B-A) → expect:
         # 1 per-type row per (metric, type, comparison) + 1 overall row per (metric, comparison).
         # = 2 per-type rows + 2 overall rows = 4 PairedStats.
@@ -612,12 +612,12 @@ class TestAggregatePaired:
 
         per_type_keys = {(s.metric, s.question_type, s.comparison) for s in per_type}
         assert per_type_keys == {
-            ("binary_log_score", "binary", "pdf-stack"),
-            ("crps", "numeric", "pdf-stack"),
+            ("binary_log_score", "binary", "stack_aug-stack"),
+            ("crps", "numeric", "stack_aug-stack"),
         }
 
         overall_keys = {(s.metric, s.comparison) for s in overall}
-        assert overall_keys == {("binary_log_score", "pdf-stack"), ("crps", "pdf-stack")}
+        assert overall_keys == {("binary_log_score", "stack_aug-stack"), ("crps", "stack_aug-stack")}
 
         for s in stats:
             assert s.n == 3
@@ -627,7 +627,7 @@ class TestAggregatePaired:
         """Each of B-A, C-A, C-B gets its own stats group per (metric, qtype)."""
         scores: list[PairedScore] = []
         for qid, (a, b, c) in enumerate([(0.0, 0.1, 0.2), (0.0, 0.2, 0.4), (0.0, 0.3, 0.6)]):
-            for comparison in ("pdf-stack", "median-stack", "median-pdf"):
+            for comparison in ("stack_aug-stack", "median-stack", "median-stack_aug"):
                 scores.append(_binary_paired_score(qid, a, b, score_median=c, comparison=comparison))
 
         stats = aggregate_paired(scores, n_bootstrap=200, seed=0)
@@ -637,11 +637,11 @@ class TestAggregatePaired:
 
         per_type = [s for s in stats if s.question_type is not None]
         overall = [s for s in stats if s.question_type is None]
-        assert {s.comparison for s in per_type} == {"pdf-stack", "median-stack", "median-pdf"}
-        assert {s.comparison for s in overall} == {"pdf-stack", "median-stack", "median-pdf"}
+        assert {s.comparison for s in per_type} == {"stack_aug-stack", "median-stack", "median-stack_aug"}
+        assert {s.comparison for s in overall} == {"stack_aug-stack", "median-stack", "median-stack_aug"}
 
         # Mean Δ should differ across comparisons (B-A=0.2, C-A=0.4, C-B=0.2 on these data).
-        ba = next(s for s in overall if s.comparison == "pdf-stack")
+        ba = next(s for s in overall if s.comparison == "stack_aug-stack")
         ca = next(s for s in overall if s.comparison == "median-stack")
         assert ba.mean_delta == pytest.approx(0.2)
         assert ca.mean_delta == pytest.approx(0.4)
@@ -661,7 +661,7 @@ class TestAggregatePaired:
         overall_binary = next(
             s
             for s in stats
-            if s.metric == "binary_log_score" and s.question_type is None and s.comparison == "pdf-stack"
+            if s.metric == "binary_log_score" and s.question_type is None and s.comparison == "stack_aug-stack"
         )
         assert overall_binary.n == 2
         assert overall_binary.mean_delta == pytest.approx(0.3)
@@ -683,9 +683,9 @@ class TestAggregatePairedNanDeltas:
                 qid=1,
                 question_type="binary",
                 metric="binary_log_score",
-                comparison="pdf-stack",
+                comparison="stack_aug-stack",
                 score_stack=0.0,
-                score_pdf=float("nan"),
+                score_stack_aug=float("nan"),
                 score_median=0.0,
                 delta=float("nan"),
                 higher_is_better=True,
@@ -698,7 +698,7 @@ class TestAggregatePairedNanDeltas:
             stats = aggregate_paired(scores, n_bootstrap=200, seed=0)
 
         # Filter to the B-A comparison's binary group.
-        per_type = next(s for s in stats if s.question_type == "binary" and s.comparison == "pdf-stack")
+        per_type = next(s for s in stats if s.question_type == "binary" and s.comparison == "stack_aug-stack")
         # n reflects the FILTERED count (NaN dropped).
         assert per_type.n == 5
         # Mean is computed over the 5 non-NaN deltas (0.1..0.5) → 0.3.
@@ -720,9 +720,9 @@ class TestAggregatePairedNanDeltas:
                 qid=qid,
                 question_type="binary",
                 metric="binary_log_score",
-                comparison="pdf-stack",
+                comparison="stack_aug-stack",
                 score_stack=0.0,
-                score_pdf=float("nan"),
+                score_stack_aug=float("nan"),
                 score_median=0.0,
                 delta=float("nan"),
                 higher_is_better=True,
@@ -733,7 +733,7 @@ class TestAggregatePairedNanDeltas:
         with caplog.at_level("WARNING", logger="metaculus_bot.ablation.scoring"):
             stats = aggregate_paired(scores, n_bootstrap=200, seed=0)
 
-        per_type = next(s for s in stats if s.question_type == "binary" and s.comparison == "pdf-stack")
+        per_type = next(s for s in stats if s.question_type == "binary" and s.comparison == "stack_aug-stack")
         assert per_type.n == 0
         assert math.isnan(per_type.mean_delta)
         assert math.isnan(per_type.bootstrap_ci_low)
@@ -790,7 +790,7 @@ class TestRenderSummary:
 class TestScoreArmConfounderFields:
     def test_score_arm_populates_confounder_fields_when_payloads_provided(self):
         report_stack = _make_binary_report(0.3)
-        report_pdf = _make_binary_report(0.8)
+        report_stack_aug = _make_binary_report(0.8)
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=42,
@@ -806,7 +806,7 @@ class TestScoreArmConfounderFields:
             "n_forecasters_used": 4,
             "cross_model_aggregation": "",
         }
-        payload_pdf = {
+        payload_stack_aug = {
             "stacker_model_used": "primary",
             "n_forecasters_used": 5,
             "cross_model_aggregation": "## Cross-model aggregation\nstuff\n",
@@ -818,7 +818,9 @@ class TestScoreArmConfounderFields:
         }
 
         scores = score_arm_for_qid(
-            _three_arm_inputs(report_stack, report_pdf, report_median, payload_stack, payload_pdf, payload_median),
+            _three_arm_inputs(
+                report_stack, report_stack_aug, report_median, payload_stack, payload_stack_aug, payload_median
+            ),
             gt,
         )
 
@@ -826,17 +828,17 @@ class TestScoreArmConfounderFields:
         assert len(scores) == 6
         for s in scores:
             assert s.stack_model_used == "fallback"
-            assert s.pdf_model_used == "primary"
+            assert s.stack_aug_model_used == "primary"
             assert s.median_model_used == "simple_aggregation"
             assert s.n_forecasters_stack == 4
-            assert s.n_forecasters_pdf == 5
+            assert s.n_forecasters_stack_aug == 5
             assert s.n_forecasters_median == 5
-            assert s.pdf_tools_fired is True
+            assert s.stack_aug_tools_fired is True
             assert s.median_tools_fired is False
 
     def test_score_arm_tools_b_fired_false_when_cross_model_empty(self):
         report_stack = _make_binary_report(0.3)
-        report_pdf = _make_binary_report(0.8)
+        report_stack_aug = _make_binary_report(0.8)
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=43,
@@ -852,7 +854,7 @@ class TestScoreArmConfounderFields:
             "n_forecasters_used": 5,
             "cross_model_aggregation": "",
         }
-        payload_pdf = {
+        payload_stack_aug = {
             "stacker_model_used": "primary",
             "n_forecasters_used": 5,
             "cross_model_aggregation": "",
@@ -864,16 +866,18 @@ class TestScoreArmConfounderFields:
         }
 
         scores = score_arm_for_qid(
-            _three_arm_inputs(report_stack, report_pdf, report_median, payload_stack, payload_pdf, payload_median),
+            _three_arm_inputs(
+                report_stack, report_stack_aug, report_median, payload_stack, payload_stack_aug, payload_median
+            ),
             gt,
         )
 
-        assert all(s.pdf_tools_fired is False for s in scores)
+        assert all(s.stack_aug_tools_fired is False for s in scores)
         assert all(s.median_tools_fired is False for s in scores)
 
     def test_score_arm_omits_confounder_fields_when_payloads_not_provided(self):
         report_stack = _make_binary_report(0.3)
-        report_pdf = _make_binary_report(0.8)
+        report_stack_aug = _make_binary_report(0.8)
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=44,
@@ -885,25 +889,25 @@ class TestScoreArmConfounderFields:
             question_text="?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         # 2 metrics * 3 comparisons = 6 rows.
         assert len(scores) == 6
         for s in scores:
             assert s.stack_model_used is None
-            assert s.pdf_model_used is None
+            assert s.stack_aug_model_used is None
             assert s.median_model_used is None
             assert s.n_forecasters_stack is None
-            assert s.n_forecasters_pdf is None
+            assert s.n_forecasters_stack_aug is None
             assert s.n_forecasters_median is None
-            assert s.pdf_tools_fired is None
+            assert s.stack_aug_tools_fired is None
             assert s.median_tools_fired is None
 
 
 def _binary_paired_score_with_confounders(
     qid: int,
     score_stack: float,
-    score_pdf: float,
+    score_stack_aug: float,
     *,
     a_used: str,
     b_used: str,
@@ -914,14 +918,14 @@ def _binary_paired_score_with_confounders(
     c_used: str = "simple_aggregation",
     n_c: int = 5,
     tools_c: bool = False,
-    comparison: str = "pdf-stack",
+    comparison: str = "stack_aug-stack",
 ) -> PairedScore:
     if score_median is None:
-        score_median = (score_stack + score_pdf) / 2.0
+        score_median = (score_stack + score_stack_aug) / 2.0
     delta_map = {
-        "pdf-stack": score_pdf - score_stack,
+        "stack_aug-stack": score_stack_aug - score_stack,
         "median-stack": score_median - score_stack,
-        "median-pdf": score_median - score_pdf,
+        "median-stack_aug": score_median - score_stack_aug,
     }
     return PairedScore(
         qid=qid,
@@ -929,17 +933,17 @@ def _binary_paired_score_with_confounders(
         metric="binary_log_score",
         comparison=comparison,
         score_stack=score_stack,
-        score_pdf=score_pdf,
+        score_stack_aug=score_stack_aug,
         score_median=score_median,
         delta=delta_map[comparison],
         higher_is_better=True,
         stack_model_used=a_used,
-        pdf_model_used=b_used,
+        stack_aug_model_used=b_used,
         median_model_used=c_used,
         n_forecasters_stack=n_a,
-        n_forecasters_pdf=n_b,
+        n_forecasters_stack_aug=n_b,
         n_forecasters_median=n_c,
-        pdf_tools_fired=tools_b,
+        stack_aug_tools_fired=tools_b,
         median_tools_fired=tools_c,
     )
 
@@ -947,7 +951,7 @@ def _binary_paired_score_with_confounders(
 def _emit_three_comparisons_with_confounders(
     qid: int,
     score_stack: float,
-    score_pdf: float,
+    score_stack_aug: float,
     score_median: float,
     *,
     a_used: str,
@@ -964,7 +968,7 @@ def _emit_three_comparisons_with_confounders(
         _binary_paired_score_with_confounders(
             qid,
             score_stack,
-            score_pdf,
+            score_stack_aug,
             a_used=a_used,
             b_used=b_used,
             n_a=n_a,
@@ -976,7 +980,7 @@ def _emit_three_comparisons_with_confounders(
             tools_c=tools_c,
             comparison=comparison,
         )
-        for comparison in ("pdf-stack", "median-stack", "median-pdf")
+        for comparison in ("stack_aug-stack", "median-stack", "median-stack_aug")
     ]
 
 
@@ -998,8 +1002,8 @@ class TestRenderSummaryConfounderSection:
         assert "stack:" in md
         assert "2/3 primary" in md
         assert "1/3 fallback" in md
-        # pdf: 2/3 primary, 1/3 fallback (qids 1, 2 primary; 3 fallback)
-        assert "pdf:" in md
+        # stack_aug: 2/3 primary, 1/3 fallback (qids 1, 2 primary; 3 fallback)
+        assert "stack_aug:" in md
         # median: deterministic baseline.
         assert "median:" in md
         assert "simple_aggregation" in md
@@ -1026,7 +1030,7 @@ class TestRenderSummaryConfounderSection:
 
         # The activation line is per-question (3 unique qids, 2 fired pdf).
         assert "Treatment activation" in md
-        assert "pdf fired tools on 2/3 questions" in md
+        assert "stack_aug fired tools on 2/3 questions" in md
         # median never fires tools (deterministic).
         assert "median fired tools on 0/3" in md
 
@@ -1039,14 +1043,14 @@ class TestRenderSummaryConfounderSection:
 
         # Three-arm diagnostic columns.
         assert "stack_model" in md
-        assert "pdf_model" in md
+        assert "stack_aug_model" in md
         assert "median_model" in md
-        assert "pdf_tools" in md.lower()
+        assert "stack_aug_tools" in md.lower()
         assert "median_tools" in md.lower()
         # All three deltas should appear as columns.
-        assert "Δ_pdf-stack" in md or "delta_ba" in md.lower()
+        assert "Δ_stack_aug-stack" in md or "delta_ba" in md.lower()
         assert "Δ_median-stack" in md or "delta_ca" in md.lower()
-        assert "Δ_median-pdf" in md or "delta_cb" in md.lower()
+        assert "Δ_median-stack_aug" in md or "delta_cb" in md.lower()
         # Both labels should appear.
         assert "primary" in md
         assert "fallback" in md
@@ -1060,7 +1064,7 @@ class TestRenderSummaryConfounderSection:
         assert "Confounder summary" not in md
         assert "Treatment activation" not in md
         assert "stack_model" not in md
-        assert "pdf_model" not in md
+        assert "stack_aug_model" not in md
         assert "median_model" not in md
 
     def test_render_summary_escapes_pipe_in_stacker_model_name(self):
@@ -1113,9 +1117,9 @@ class TestPerGroupBootstrapSeeding:
                     qid=qid,
                     question_type="binary",
                     metric="brier",
-                    comparison="pdf-stack",
+                    comparison="stack_aug-stack",
                     score_stack=a,
-                    score_pdf=b,
+                    score_stack_aug=b,
                     score_median=(a + b) / 2.0,
                     delta=b - a,
                     higher_is_better=False,
@@ -1128,9 +1132,9 @@ class TestPerGroupBootstrapSeeding:
                     qid=qid,
                     question_type="numeric",
                     metric="crps",
-                    comparison="pdf-stack",
+                    comparison="stack_aug-stack",
                     score_stack=a,
-                    score_pdf=b,
+                    score_stack_aug=b,
                     score_median=(a + b) / 2.0,
                     delta=b - a,
                     higher_is_better=False,
@@ -1191,8 +1195,8 @@ class TestPerGroupBootstrapSeeding:
             from metaculus_bot.ablation.scoring import PairedScore, aggregate_paired
             scores = [
                 PairedScore(qid=i, question_type="binary", metric="brier",
-                            comparison="pdf-stack",
-                            score_stack=0.0, score_pdf=0.1 * (i + 1),
+                            comparison="stack_aug-stack",
+                            score_stack=0.0, score_stack_aug=0.1 * (i + 1),
                             score_median=0.05 * (i + 1),
                             delta=0.1 * (i + 1), higher_is_better=False)
                 for i in range(8)
@@ -1244,7 +1248,7 @@ class TestRenderSummaryWarnings:
         per_type_binary = PairedStats(
             metric="brier",
             question_type="binary",
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             n=5,
             mean_delta=0.01,
             bootstrap_ci_low=-0.02,
@@ -1256,7 +1260,7 @@ class TestRenderSummaryWarnings:
         per_type_numeric = PairedStats(
             metric="brier",
             question_type="numeric",
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             n=45,
             mean_delta=0.01,
             bootstrap_ci_low=-0.02,
@@ -1268,7 +1272,7 @@ class TestRenderSummaryWarnings:
         overall = PairedStats(
             metric="brier",
             question_type=None,
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             n=50,
             mean_delta=0.01,
             bootstrap_ci_low=-0.01,
@@ -1298,7 +1302,7 @@ class TestRenderSummaryWarnings:
         per_type = PairedStats(
             metric="brier",
             question_type="binary",
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             n=10,
             mean_delta=0.0,
             bootstrap_ci_low=0.0,
@@ -1310,7 +1314,7 @@ class TestRenderSummaryWarnings:
         overall = PairedStats(
             metric="brier",
             question_type=None,
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             n=10,
             mean_delta=0.0,
             bootstrap_ci_low=0.0,
@@ -1466,7 +1470,7 @@ class TestScoreArmSaturationFlags:
         # Uniform CDF over [0,100], resolution=1000 → falls in above-bound bucket
         # which has min-step PMF mass → log-score near floor.
         report_stack = _logistic_numeric_report(center=50.0, sharpness=10.0, lower=0.0, upper=100.0)
-        report_pdf = _saturating_numeric_report(lower=0.0, upper=100.0)
+        report_stack_aug = _saturating_numeric_report(lower=0.0, upper=100.0)
         report_median = _saturating_numeric_report(lower=0.0, upper=100.0)
         gt = GroundTruth(
             question_id=43171,
@@ -1478,18 +1482,18 @@ class TestScoreArmSaturationFlags:
             question_text="numeric?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
         # 2 metrics * 3 comparisons.
         assert len(scores) == 6
-        log_score_ba = next(s for s in scores if s.metric == "numeric_log_score" and s.comparison == "pdf-stack")
+        log_score_ba = next(s for s in scores if s.metric == "numeric_log_score" and s.comparison == "stack_aug-stack")
         # Arm B's uniform CDF hits floor cleanly when resolution falls in the above-bound bucket.
-        assert log_score_ba.is_saturated_pdf is True
+        assert log_score_ba.is_saturated_stack_aug is True
 
     def test_binary_arm_saturation_when_predicting_wrong_with_high_confidence(self):
         # Predicting prob=0.0001 but outcome=True → binary log score at floor.
         report_stack = _make_binary_report(0.5)
-        report_pdf = _make_binary_report(0.0001)  # extremely confident wrong
+        report_stack_aug = _make_binary_report(0.0001)  # extremely confident wrong
         report_median = _make_binary_report(0.5)
         gt = GroundTruth(
             question_id=99,
@@ -1501,13 +1505,13 @@ class TestScoreArmSaturationFlags:
             question_text="?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
 
-        log_score_ba = next(s for s in scores if s.metric == "binary_log_score" and s.comparison == "pdf-stack")
-        brier_ba = next(s for s in scores if s.metric == "brier" and s.comparison == "pdf-stack")
+        log_score_ba = next(s for s in scores if s.metric == "binary_log_score" and s.comparison == "stack_aug-stack")
+        brier_ba = next(s for s in scores if s.metric == "brier" and s.comparison == "stack_aug-stack")
 
-        assert log_score_ba.is_saturated_pdf is True
-        assert brier_ba.is_saturated_pdf is True
+        assert log_score_ba.is_saturated_stack_aug is True
+        assert brier_ba.is_saturated_stack_aug is True
         # Arm A (0.5 prob) should not saturate.
         assert log_score_ba.is_saturated_stack is False
         assert brier_ba.is_saturated_stack is False
@@ -1520,7 +1524,7 @@ class TestScoreArmSaturationFlags:
         # Note: probabilities in the report don't need to be normalized for this test;
         # what matters is what mc_log_score sees.
         report_stack = _make_mc_report({"a": 0.4, "b": 0.2, "c": 0.2, "d": 0.2})
-        report_pdf = _make_mc_report({"a": PROB_CLAMP_MIN, "b": 0.4, "c": 0.3, "d": 0.3 - PROB_CLAMP_MIN})
+        report_stack_aug = _make_mc_report({"a": PROB_CLAMP_MIN, "b": 0.4, "c": 0.3, "d": 0.3 - PROB_CLAMP_MIN})
         report_median = _make_mc_report({"a": 0.4, "b": 0.2, "c": 0.2, "d": 0.2})
         gt = GroundTruth(
             question_id=7,
@@ -1532,11 +1536,11 @@ class TestScoreArmSaturationFlags:
             question_text="?",
         )
 
-        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_pdf, report_median), gt)
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
         # 1 metric * 3 comparisons.
         assert len(scores) == 3
-        ba = next(s for s in scores if s.comparison == "pdf-stack")
-        assert ba.is_saturated_pdf is True
+        ba = next(s for s in scores if s.comparison == "stack_aug-stack")
+        assert ba.is_saturated_stack_aug is True
         assert ba.is_saturated_stack is False
         assert ba.is_saturated_median is False
 
@@ -1545,15 +1549,15 @@ class TestScoreArmSaturationFlags:
             qid=1,
             question_type="binary",
             metric="brier",
-            comparison="pdf-stack",
+            comparison="stack_aug-stack",
             score_stack=0.1,
-            score_pdf=0.2,
+            score_stack_aug=0.2,
             score_median=0.15,
             delta=0.1,
             higher_is_better=False,
         )
         assert ps.is_saturated_stack is False
-        assert ps.is_saturated_pdf is False
+        assert ps.is_saturated_stack_aug is False
         assert ps.is_saturated_median is False
 
 
@@ -1626,19 +1630,19 @@ class TestMedianDelta:
 def _binary_paired_score_with_sat(
     qid: int,
     score_stack: float,
-    score_pdf: float,
+    score_stack_aug: float,
     sat_a: bool = False,
     sat_b: bool = False,
     sat_c: bool = False,
     score_median: float | None = None,
-    comparison: str = "pdf-stack",
+    comparison: str = "stack_aug-stack",
 ) -> PairedScore:
     if score_median is None:
-        score_median = (score_stack + score_pdf) / 2.0
+        score_median = (score_stack + score_stack_aug) / 2.0
     delta_map = {
-        "pdf-stack": score_pdf - score_stack,
+        "stack_aug-stack": score_stack_aug - score_stack,
         "median-stack": score_median - score_stack,
-        "median-pdf": score_median - score_pdf,
+        "median-stack_aug": score_median - score_stack_aug,
     }
     return PairedScore(
         qid=qid,
@@ -1646,19 +1650,19 @@ def _binary_paired_score_with_sat(
         metric="binary_log_score",
         comparison=comparison,
         score_stack=score_stack,
-        score_pdf=score_pdf,
+        score_stack_aug=score_stack_aug,
         score_median=score_median,
         delta=delta_map[comparison],
         higher_is_better=True,
         is_saturated_stack=sat_a,
-        is_saturated_pdf=sat_b,
+        is_saturated_stack_aug=sat_b,
         is_saturated_median=sat_c,
     )
 
 
 class TestPairedStatsCleanMean:
     def test_n_clean_excludes_saturated_pairs(self):
-        # 5 pairs: 3 clean, 2 saturated (1 a-sat, 1 b-sat). All comparison="pdf-stack" so
+        # 5 pairs: 3 clean, 2 saturated (1 a-sat, 1 b-sat). All comparison="stack_aug-stack" so
         # the per-pair clean filter checks (sat_a or sat_b).
         scores = [
             _binary_paired_score_with_sat(1, 0.0, 0.1, sat_a=False, sat_b=False),
@@ -1699,9 +1703,9 @@ class TestPairedStatsCleanMean:
     def test_n_clean_per_pair_saturation_isolates_arm_c(self):
         """Arm A saturated should NOT pollute the C-B clean filter.
 
-        For comparison="pdf-stack": clean ↔ not (sat_a or sat_b).
+        For comparison="stack_aug-stack": clean ↔ not (sat_a or sat_b).
         For comparison="median-stack": clean ↔ not (sat_a or sat_c).
-        For comparison="median-pdf": clean ↔ not (sat_b or sat_c).
+        For comparison="median-stack_aug": clean ↔ not (sat_b or sat_c).
 
         Three rows with sat_a=True, sat_b=False, sat_c=False:
           - B-A: dirty (sat_a) → n_clean=0
@@ -1710,7 +1714,7 @@ class TestPairedStatsCleanMean:
         """
         scores: list[PairedScore] = []
         for qid in (1, 2, 3):
-            for comparison in ("pdf-stack", "median-stack", "median-pdf"):
+            for comparison in ("stack_aug-stack", "median-stack", "median-stack_aug"):
                 scores.append(
                     _binary_paired_score_with_sat(
                         qid, 0.0, 0.1, sat_a=True, sat_b=False, sat_c=False, score_median=0.05, comparison=comparison
@@ -1719,9 +1723,9 @@ class TestPairedStatsCleanMean:
 
         stats = aggregate_paired(scores, n_bootstrap=200, seed=0)
 
-        ba = next(s for s in stats if s.question_type is None and s.comparison == "pdf-stack")
+        ba = next(s for s in stats if s.question_type is None and s.comparison == "stack_aug-stack")
         ca = next(s for s in stats if s.question_type is None and s.comparison == "median-stack")
-        cb = next(s for s in stats if s.question_type is None and s.comparison == "median-pdf")
+        cb = next(s for s in stats if s.question_type is None and s.comparison == "median-stack_aug")
 
         assert ba.n_clean == 0  # sat_a poisons B-A
         assert ca.n_clean == 0  # sat_a poisons C-A
@@ -1745,7 +1749,7 @@ class TestSummaryWithSaturation:
 
         # Per-question diagnostic must include per-arm saturation columns (sat_A, sat_B, sat_C).
         assert "sat_stack" in md
-        assert "sat_pdf" in md
+        assert "sat_stack_aug" in md
         assert "sat_median" in md
 
     def test_summary_per_question_diagnostic_carries_saturation_flags_per_arm(self):
@@ -1789,3 +1793,310 @@ class TestSummaryWithSaturation:
         assert NUMERIC_LOG_SCORE_FLOOR == pytest.approx(-220.0, abs=1e-9)
         assert BINARY_LOG_SCORE_FLOOR < NUMERIC_LOG_SCORE_FLOOR  # binary much more negative
         assert 0.9 < BRIER_FLOOR < 1.0
+
+
+# ---------------------------------------------------------------------------
+# 5-arm scoring (pdf_min1 + pdf_min2 extension)
+# ---------------------------------------------------------------------------
+
+
+def _five_arm_inputs(
+    report_stack,
+    report_stack_aug,
+    report_pdf_min1,
+    report_pdf_min2,
+    report_median,
+    payload_stack=None,
+    payload_stack_aug=None,
+    payload_pdf_min1=None,
+    payload_pdf_min2=None,
+    payload_median=None,
+):
+    """Build the [(label, report, payload), ...] list for the 5-arm score_arm_for_qid."""
+    return [
+        ("stack", report_stack, payload_stack),
+        ("stack_aug", report_stack_aug, payload_stack_aug),
+        ("pdf_min1", report_pdf_min1, payload_pdf_min1),
+        ("pdf_min2", report_pdf_min2, payload_pdf_min2),
+        ("median", report_median, payload_median),
+    ]
+
+
+class TestFiveArmScoring:
+    def test_score_arm_five_arm_binary_returns_ten_comparisons_per_metric(self):
+        """Binary 5-arm: 2 metrics * 10 pairwise comparisons = 20 PairedScore rows."""
+
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=42,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median),
+            gt,
+        )
+
+        # 2 metrics x 10 comparisons = 20 rows.
+        assert len(scores) == 20
+        comparisons_found = {s.comparison for s in scores}
+        # Should have all 10 pairwise comparisons
+        assert len(comparisons_found) == 10
+        assert "stack_aug-stack" in comparisons_found
+        assert "pdf_min1-stack" in comparisons_found
+        assert "pdf_min2-stack" in comparisons_found
+        assert "median-stack" in comparisons_found
+        assert "pdf_min1-stack_aug" in comparisons_found
+        assert "pdf_min2-stack_aug" in comparisons_found
+        assert "median-stack_aug" in comparisons_found
+        assert "pdf_min2-pdf_min1" in comparisons_found
+        assert "median-pdf_min1" in comparisons_found
+        assert "median-pdf_min2" in comparisons_found
+
+    def test_five_arm_delta_signs_correct(self):
+        """Delta for X-Y should equal score_X - score_Y for higher-is-better metric."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.7)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=50,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median),
+            gt,
+        )
+
+        # Check a few specific deltas for binary_log_score
+        for s in scores:
+            if s.metric != "binary_log_score":
+                continue
+            if s.comparison == "pdf_min1-stack":
+                assert s.delta == pytest.approx(s.score_pdf_min1 - s.score_stack)
+            elif s.comparison == "pdf_min2-pdf_min1":
+                assert s.delta == pytest.approx(s.score_pdf_min2 - s.score_pdf_min1)
+            elif s.comparison == "median-pdf_min2":
+                assert s.delta == pytest.approx(s.score_median - s.score_pdf_min2)
+
+    def test_five_arm_paired_score_has_all_score_fields(self):
+        """PairedScore for 5-arm should carry all 5 arm scores."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=51,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median),
+            gt,
+        )
+
+        for s in scores:
+            assert hasattr(s, "score_pdf_min1")
+            assert hasattr(s, "score_pdf_min2")
+            assert s.score_pdf_min1 is not None
+            assert s.score_pdf_min2 is not None
+
+    def test_five_arm_backward_compat_three_arm_still_works(self):
+        """Old 3-arm signature still works (backward compat)."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=52,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
+        # Old 3-arm: 2 metrics * 3 comparisons = 6 rows.
+        assert len(scores) == 6
+
+
+# ---------------------------------------------------------------------------
+# Per-comparison N: partial arm availability (Fix 1 + Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestPerComparisonPartialArms:
+    """Fix 1+2: score_arm_for_qid with None reports should emit only comparisons
+    where both arms in the comparison are present.
+    """
+
+    def test_five_arm_pdf_min2_none_emits_only_non_pdf_min2_comparisons(self):
+        """5-arm input where pdf_min2 is None: emit comparisons that don't involve pdf_min2.
+
+        10 total comparisons - 3 involving pdf_min2 = 7 comparisons that survive.
+        For binary: 2 metrics * 7 = 14 PairedScore rows.
+        """
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=100,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, None, report_median),
+            gt,
+        )
+
+        # Comparisons involving pdf_min2: "pdf_min2-stack", "pdf_min2-stack_aug",
+        # "pdf_min2-pdf_min1", "median-pdf_min2" = 4 comparisons skipped.
+        # Remaining: 10 - 4 = 6 comparisons. Binary has 2 metrics. 6 * 2 = 12 rows.
+        assert len(scores) == 12
+        comparisons_found = {s.comparison for s in scores}
+        # pdf_min2-involving comparisons must be absent
+        assert "pdf_min2-stack" not in comparisons_found
+        assert "pdf_min2-stack_aug" not in comparisons_found
+        assert "pdf_min2-pdf_min1" not in comparisons_found
+        assert "median-pdf_min2" not in comparisons_found
+        # All non-pdf_min2 comparisons present
+        assert "stack_aug-stack" in comparisons_found
+        assert "pdf_min1-stack" in comparisons_found
+        assert "median-stack" in comparisons_found
+        assert "pdf_min1-stack_aug" in comparisons_found
+        assert "median-stack_aug" in comparisons_found
+        assert "median-pdf_min1" in comparisons_found
+
+    def test_five_arm_only_stack_and_median_emits_one_comparison(self):
+        """5-arm input where ONLY stack and median succeed: emit only `median-stack`.
+
+        For binary: 2 metrics * 1 comparison = 2 PairedScore rows.
+        """
+        report_stack = _make_binary_report(0.3)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=101,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, None, None, None, report_median),
+            gt,
+        )
+
+        # Only 1 comparison (median-stack) * 2 metrics = 2 rows.
+        assert len(scores) == 2
+        comparisons_found = {s.comparison for s in scores}
+        assert comparisons_found == {"median-stack"}
+
+    def test_five_arm_zero_or_one_arm_present_returns_empty(self):
+        """5-arm input where 0 or 1 arm succeed: return empty list."""
+        gt = GroundTruth(
+            question_id=102,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        # Zero arms present
+        scores = score_arm_for_qid(
+            _five_arm_inputs(None, None, None, None, None),
+            gt,
+        )
+        assert scores == []
+
+        # One arm present (stack only)
+        scores = score_arm_for_qid(
+            _five_arm_inputs(_make_binary_report(0.5), None, None, None, None),
+            gt,
+        )
+        assert scores == []
+
+    def test_five_arm_partial_deltas_correct(self):
+        """When pdf_min2 is None, other deltas are still computed correctly."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=103,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, None, report_median),
+            gt,
+        )
+
+        # Check that pdf_min1-stack delta is correct
+        for s in scores:
+            if s.metric == "binary_log_score" and s.comparison == "pdf_min1-stack":
+                assert s.delta == pytest.approx(s.score_pdf_min1 - s.score_stack)
+            elif s.metric == "binary_log_score" and s.comparison == "median-stack":
+                assert s.delta == pytest.approx(s.score_median - s.score_stack)
+
+    def test_three_arm_partial_stack_aug_none_emits_only_non_stack_aug_comparisons(self):
+        """3-arm input where stack_aug is None: only emit median-stack comparison."""
+        report_stack = _make_binary_report(0.3)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=104,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _three_arm_inputs(report_stack, None, report_median),
+            gt,
+        )
+
+        # Only median-stack survives. 2 metrics * 1 = 2 rows.
+        assert len(scores) == 2
+        comparisons_found = {s.comparison for s in scores}
+        assert comparisons_found == {"median-stack"}

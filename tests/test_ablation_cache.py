@@ -97,7 +97,7 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
         "ran_at": "2026-05-13T13:00:00",
         "stacker_model_used": "primary",
     }
-    payload_pdf = {
+    payload_stack_aug = {
         "stacker_prediction": 0.60,
         "meta_reasoning": "Arm B reasoning.",
         "computed_quantities": "## Computed quantities\n\nPooled = 0.58",
@@ -107,10 +107,10 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
     }
 
     cache.write_stacker_output(qid=42, arm="stack", payload=payload_stack)
-    cache.write_stacker_output(qid=42, arm="pdf", payload=payload_pdf)
+    cache.write_stacker_output(qid=42, arm="stack_aug", payload=payload_stack_aug)
 
     a = cache.read_stacker_output(qid=42, arm="stack")
-    b = cache.read_stacker_output(qid=42, arm="pdf")
+    b = cache.read_stacker_output(qid=42, arm="stack_aug")
     assert a is not None and b is not None
     assert a["stacker_prediction"] == 0.55
     assert b["stacker_prediction"] == 0.60

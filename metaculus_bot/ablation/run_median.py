@@ -19,7 +19,7 @@ the confounder section of the summary.
 Cost: zero LLM calls. Wall-clock: O(milliseconds per qid).
 
 Surviving-forecaster filter is single-sourced from
-``metaculus_bot.ablation.run_stacker._surviving_forecasters`` so ARM_STACK/ARM_PDF/ARM_MEDIAN
+``metaculus_bot.ablation.run_stacker._surviving_forecasters`` so ARM_STACK/ARM_STACK_AUG/ARM_MEDIAN
 all start from an identical surviving set. Min-forecasters threshold mirrors
 ``ABLATION_MIN_FORECASTERS`` (= 2) for the same reason.
 """
@@ -115,7 +115,7 @@ async def run_median_for_qid(
     Steps:
     1. Cache check (``read_stacker_output(qid, ARM_MEDIAN)``). Hit + not ``force`` returns as-is.
     2. Filter to surviving forecasters via ``_surviving_forecasters`` from run_stacker
-       (same filter ARM_STACK / ARM_PDF use — drops ``prediction_value=None``, errors,
+       (same filter ARM_STACK / ARM_STACK_AUG use — drops ``prediction_value=None``, errors,
        NaN/inf). Need >= ``ABLATION_MIN_FORECASTERS`` (2).
     3. Deserialize each surviving ``prediction_value`` to its native type.
     4. Aggregate deterministically by question type (median).

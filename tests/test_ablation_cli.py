@@ -567,7 +567,7 @@ def _populate_full_cache_for_qid(cache: AblationCache, qid: int) -> None:
         slug = model_slug_to_filename(f"openrouter/test/m{i}")
         cache.write_forecaster_output(qid=qid, model_slug=slug, payload=_binary_forecaster_payload(f"m{i}", 0.5))
     cache.write_stacker_output(qid=qid, arm="stack", payload=_binary_stacker_payload("stack", 0.6))
-    cache.write_stacker_output(qid=qid, arm="pdf", payload=_binary_stacker_payload("pdf", 0.7))
+    cache.write_stacker_output(qid=qid, arm="stack_aug", payload=_binary_stacker_payload("stack_aug", 0.7))
     cache.write_stacker_output(qid=qid, arm="median", payload=_binary_stacker_payload("median", 0.65))
 
 
@@ -913,7 +913,7 @@ class TestStageResearchKwargs:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={3001: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={3001: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={3001: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -978,7 +978,7 @@ class TestStageResearchKwargs:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={3010: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={3010: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={3010: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1035,7 +1035,7 @@ class TestStageResearchKwargs:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={3020: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={3020: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={3020: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1091,7 +1091,7 @@ class TestStageResearchKwargs:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={3030: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={3030: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={3030: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1183,8 +1183,8 @@ class TestFullPipeline:
             102: _numeric_stacker_payload("stack", 50.0),
         }
         stacker_b = {
-            101: _binary_stacker_payload("pdf", 0.75),
-            102: _numeric_stacker_payload("pdf", 52.0),
+            101: _binary_stacker_payload("stack_aug", 0.75),
+            102: _numeric_stacker_payload("stack_aug", 52.0),
         }
 
         mocks = _install_full_stack_mocks(
@@ -1294,7 +1294,7 @@ class TestPruneStage:
         }
 
         stacker_a = {2001: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {2001: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {2001: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -1373,7 +1373,7 @@ class TestPruneStage:
                 },
             },
             stacker_a_results={2002: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={2002: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={2002: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1443,7 +1443,7 @@ class TestPruneStage:
         }
 
         stacker_a = {2010: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {2010: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {2010: _binary_stacker_payload("stack_aug", 0.7)}
 
         prune_meta = {
             "qid": 2010,
@@ -1521,7 +1521,7 @@ class TestPruneStage:
         }
 
         stacker_a = {2020: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {2020: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {2020: _binary_stacker_payload("stack_aug", 0.7)}
 
         _install_full_stack_mocks(
             monkeypatch,
@@ -1738,7 +1738,7 @@ class TestQaIterateStage:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8300: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8300: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8300: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1808,7 +1808,7 @@ class TestQaIterateStage:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={7001: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={7001: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={7001: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -1889,8 +1889,8 @@ class TestQaIterateStage:
                 7011: _binary_stacker_payload("stack", 0.6),
             },
             stacker_b_results={
-                7010: _binary_stacker_payload("pdf", 0.7),
-                7011: _binary_stacker_payload("pdf", 0.7),
+                7010: _binary_stacker_payload("stack_aug", 0.7),
+                7011: _binary_stacker_payload("stack_aug", 0.7),
             },
         )
         monkeypatch.setattr(
@@ -2071,7 +2071,7 @@ class TestQaIterateStage:
             f"when qa_iterate is in --stages; got: {message}"
         )
         # Must include the resume command.
-        assert "forecast,stack,pdf,median,score" in message
+        assert "forecast,stack,stack_aug,pdf,median,score" in message
 
     @pytest.mark.asyncio
     async def test_advisory_mode_writes_per_qid_qa_report(
@@ -2120,7 +2120,7 @@ class TestQaIterateStage:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={7030: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={7030: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={7030: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2194,8 +2194,8 @@ class TestQaIterateStage:
                 7041: _binary_stacker_payload("stack", 0.6),
             },
             stacker_b_results={
-                7040: _binary_stacker_payload("pdf", 0.7),
-                7041: _binary_stacker_payload("pdf", 0.7),
+                7040: _binary_stacker_payload("stack_aug", 0.7),
+                7041: _binary_stacker_payload("stack_aug", 0.7),
             },
         )
         monkeypatch.setattr(
@@ -2314,7 +2314,7 @@ class TestPatientModeForcesConcurrencyOne:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8500: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8500: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8500: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2399,7 +2399,7 @@ class TestEstimatedWallClockAtStageStart:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8400: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8400: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8400: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2500,7 +2500,7 @@ class TestScreenCacheBlobHashCheck:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8200: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8200: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8200: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2591,7 +2591,7 @@ class TestScreenCacheBlobHashCheck:
             },
             forecaster_results=forecaster_results,
             stacker_a_results={8210: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8210: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8210: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2667,7 +2667,7 @@ class TestScreenCacheBlobHashCheck:
             },
             forecaster_results=forecaster_results,
             stacker_a_results={8220: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8220: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8220: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2736,7 +2736,7 @@ class TestForceStagesQaIterateArchivesManualRejects:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8100: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8100: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8100: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -2900,7 +2900,7 @@ class TestAtomicWritesForNonCacheFiles:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={8050: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={8050: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={8050: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -3091,7 +3091,7 @@ class TestIdempotency:
         }
 
         stacker_a = {401: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {401: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {401: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -3177,7 +3177,7 @@ class TestForceStages:
         }
 
         stacker_a = {501: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {501: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {501: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -3289,7 +3289,7 @@ class TestForecastCacheContentAware:
             fetch_question_set=question_set,
             forecaster_results=forecaster_results,
             stacker_a_results={12001: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={12001: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={12001: _binary_stacker_payload("stack_aug", 0.7)},
         )
         monkeypatch.setattr("metaculus_bot.ablation.cli.asyncio.sleep", AsyncMock(return_value=None))
 
@@ -3297,7 +3297,7 @@ class TestForecastCacheContentAware:
         args = _build_parser().parse_args(
             [
                 "--stages",
-                "forecast,stack,pdf,median,score",
+                "forecast,stack,stack_aug,pdf,median,score",
                 "--cache-dir",
                 str(cache_dir),
             ]
@@ -3402,7 +3402,7 @@ class TestStagesScoreOnly:
                 qid=601, model_slug=slug, payload=_binary_forecaster_payload(f"openrouter/test/m{i}", 0.5)
             )
         cache.write_stacker_output(qid=601, arm="stack", payload=_binary_stacker_payload("stack", 0.6))
-        cache.write_stacker_output(qid=601, arm="pdf", payload=_binary_stacker_payload("pdf", 0.7))
+        cache.write_stacker_output(qid=601, arm="stack_aug", payload=_binary_stacker_payload("stack_aug", 0.7))
         cache.write_stacker_output(qid=601, arm="median", payload=_binary_stacker_payload("median", 0.65))
 
         # Mocks installed; none should fire.
@@ -3519,7 +3519,7 @@ class TestQidsBypassesFetch:
             for qid in (100, 200)
         }
         stacker_a = {qid: _binary_stacker_payload("stack", 0.6) for qid in (100, 200)}
-        stacker_b = {qid: _binary_stacker_payload("pdf", 0.7) for qid in (100, 200)}
+        stacker_b = {qid: _binary_stacker_payload("stack_aug", 0.7) for qid in (100, 200)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -3624,7 +3624,7 @@ class TestManifestExpansion:
             1003: _numeric_stacker_payload("A"),
         }
         stacker_b_first = {
-            1001: _binary_stacker_payload("pdf", 0.7),
+            1001: _binary_stacker_payload("stack_aug", 0.7),
             1002: _mc_stacker_payload("B"),
             1003: _numeric_stacker_payload("B"),
         }
@@ -3710,7 +3710,7 @@ class TestManifestExpansion:
         stacker_b_second = {}
         for q in new_binary_qs:
             stacker_a_second[q.id_of_question] = _binary_stacker_payload("stack", 0.6)
-            stacker_b_second[q.id_of_question] = _binary_stacker_payload("pdf", 0.7)
+            stacker_b_second[q.id_of_question] = _binary_stacker_payload("stack_aug", 0.7)
         for q in new_mc_qs:
             stacker_a_second[q.id_of_question] = _mc_stacker_payload("A")
             stacker_b_second[q.id_of_question] = _mc_stacker_payload("B")
@@ -3806,7 +3806,7 @@ class TestLeakedQidDropped:
         }
 
         stacker_a = {701: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {701: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {701: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -3899,7 +3899,7 @@ class TestSpendReport:
         }
 
         stacker_a = {qid: _binary_stacker_payload("stack", 0.6) for qid in (801, 802)}
-        stacker_b = {qid: _binary_stacker_payload("pdf", 0.7) for qid in (801, 802)}
+        stacker_b = {qid: _binary_stacker_payload("stack_aug", 0.7) for qid in (801, 802)}
 
         # Research with gap-fill used (3 gaps each).
         research_results: dict[int, tuple[str, dict] | None] = {
@@ -3943,7 +3943,7 @@ class TestSpendReport:
         assert f"Forecasters          {expected_forecaster} LLM calls" in out
         # 2 qids per arm.
         assert "Stacker (stack)      2 calls (0 fallback)" in out
-        assert "Stacker (pdf)        2 calls (0 fallback)" in out
+        assert "Stacker (stack_aug)        2 calls (0 fallback)" in out
         # 4 stacker calls -> 4 parser calls.
         assert "Parser               4 calls" in out
         # All cache hits zero on first fresh run.
@@ -3951,7 +3951,7 @@ class TestSpendReport:
         assert "screen=0" in out
         assert "forecast=0" in out
         assert "stack=0" in out
-        assert "pdf=0" in out
+        assert "stack_aug=0" in out
 
         # Second run with same args: every artifact cached, every fresh-call counter zero.
         args2 = _build_parser().parse_args(
@@ -3968,7 +3968,7 @@ class TestSpendReport:
         assert "Leakage detector     0 LLM calls" in out2
         assert "Forecasters          0 LLM calls" in out2
         assert "Stacker (stack)      0 calls (0 fallback)" in out2
-        assert "Stacker (pdf)        0 calls (0 fallback)" in out2
+        assert "Stacker (stack_aug)        0 calls (0 fallback)" in out2
         assert "Parser               0 calls" in out2
 
         # Cache hits reflect what was cached: 2 qids fully cached at every stage.
@@ -3976,7 +3976,7 @@ class TestSpendReport:
         assert "screen=2" in out2
         assert f"forecast={2 * n_forecasters}" in out2
         assert "stack=2" in out2
-        assert "pdf=2" in out2
+        assert "stack_aug=2" in out2
 
     @pytest.mark.asyncio
     async def test_spend_report_counts_fallback_stacker(
@@ -4013,8 +4013,8 @@ class TestSpendReport:
         # Arm A used the fallback stacker; arm B used primary.
         payload_stack = _binary_stacker_payload("stack", 0.6)
         payload_stack["stacker_model_used"] = "fallback"
-        payload_pdf = _binary_stacker_payload("pdf", 0.7)
-        payload_pdf["stacker_model_used"] = "primary"
+        payload_stack_aug = _binary_stacker_payload("stack_aug", 0.7)
+        payload_stack_aug["stacker_model_used"] = "primary"
 
         _install_full_stack_mocks(
             monkeypatch,
@@ -4023,7 +4023,7 @@ class TestSpendReport:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={810: payload_stack},
-            stacker_b_results={810: payload_pdf},
+            stacker_b_results={810: payload_stack_aug},
         )
         monkeypatch.setattr(
             "metaculus_bot.ablation.cli.asyncio.sleep",
@@ -4038,7 +4038,7 @@ class TestSpendReport:
         captured = capsys.readouterr()
         out = captured.out
         assert "Stacker (stack)      1 calls (1 fallback)" in out
-        assert "Stacker (pdf)        1 calls (0 fallback)" in out
+        assert "Stacker (stack_aug)        1 calls (0 fallback)" in out
 
     @pytest.mark.asyncio
     async def test_spend_report_skips_empty_research_in_leakage_count(
@@ -4085,7 +4085,7 @@ class TestSpendReport:
         }
 
         stacker_a = {qid: _binary_stacker_payload("stack", 0.6) for qid in (820, 821)}
-        stacker_b = {qid: _binary_stacker_payload("pdf", 0.7) for qid in (820, 821)}
+        stacker_b = {qid: _binary_stacker_payload("stack_aug", 0.7) for qid in (820, 821)}
 
         _install_full_stack_mocks(
             monkeypatch,
@@ -4343,7 +4343,7 @@ class TestFailedResearchDropped:
         }
 
         stacker_a = {901: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {901: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {901: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -4411,7 +4411,7 @@ class TestPerQuestionSleep:
         }
 
         stacker_a = {1101: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {1101: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {1101: _binary_stacker_payload("stack_aug", 0.7)}
 
         _install_full_stack_mocks(
             monkeypatch,
@@ -4487,7 +4487,7 @@ class TestPerQuestionSleep:
             leakage_verdicts=verdicts,
             forecaster_results=forecaster_results,
             stacker_a_results={11201: _binary_stacker_payload("stack", 0.6)},
-            stacker_b_results={11201: _binary_stacker_payload("pdf", 0.7)},
+            stacker_b_results={11201: _binary_stacker_payload("stack_aug", 0.7)},
         )
 
         sleep_mock = AsyncMock(return_value=None)
@@ -4558,7 +4558,7 @@ class TestSummaryContent:
         }
 
         stacker_a = {1201: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {1201: _binary_stacker_payload("pdf", 0.8)}
+        stacker_b = {1201: _binary_stacker_payload("stack_aug", 0.8)}
 
         _install_full_stack_mocks(
             monkeypatch,
@@ -4637,12 +4637,12 @@ class TestStagePassesPayloadsToScoring:
         # Q1301 — both arms primary, arm B has cross_model_aggregation (tools fired).
         # Q1302 — arm A used fallback, arm B used primary, arm B has empty cross_model_aggregation.
         a1 = _binary_stacker_payload("stack", 0.6)
-        b1 = _binary_stacker_payload("pdf", 0.7)
+        b1 = _binary_stacker_payload("stack_aug", 0.7)
         b1["cross_model_aggregation"] = "## Cross-model aggregation\n(numbers)\n"
         a2 = _binary_stacker_payload("stack", 0.55)
         a2["stacker_model_used"] = "fallback"
         a2["n_forecasters_used"] = 4
-        b2 = _binary_stacker_payload("pdf", 0.65)
+        b2 = _binary_stacker_payload("stack_aug", 0.65)
         b2["cross_model_aggregation"] = ""
         b2["n_forecasters_used"] = 5
 
@@ -4674,14 +4674,14 @@ class TestStagePassesPayloadsToScoring:
         assert "1/2 primary" in text
         assert "1/2 fallback" in text
         # Treatment activation: pdf arm fired tools on 1/2.
-        assert "pdf fired tools on 1/2 questions" in text
+        assert "stack_aug fired tools on 1/2 questions" in text
         # The empty-aggregation count message should mention the empty case.
         assert "empty cross_model_aggregation" in text
         # Per-question diagnostic table includes the marker columns.
         assert "stack_model" in text
-        assert "pdf_model" in text
-        # Renamed from "B_tools" to "pdf_tools" in the 3-arm summary refactor.
-        assert "pdf_tools" in text
+        assert "stack_aug_model" in text
+        # Renamed from "B_tools" to "stack_aug_tools" in the 3-arm summary refactor.
+        assert "stack_aug_tools" in text
 
 
 # ---------------------------------------------------------------------------
@@ -5651,7 +5651,7 @@ class TestForceStagesCascade:
         from metaculus_bot.ablation.cli import _expand_forced_stages
 
         forced = _expand_forced_stages({"forecast"})
-        assert forced == {"forecast", "stack", "pdf", "median"}
+        assert forced == {"forecast", "stack", "stack_aug", "pdf", "median"}
 
     def test_force_stages_prune_cascades_through_screen_qa_forecast_stack(self) -> None:
         """Forcing prune must invalidate every stage downstream that consumes its output."""
@@ -5662,6 +5662,7 @@ class TestForceStagesCascade:
         assert "qa_iterate" in forced
         assert "forecast" in forced
         assert "stack" in forced
+        assert "stack_aug" in forced
         assert "pdf" in forced
         assert "median" in forced
 
@@ -5675,6 +5676,7 @@ class TestForceStagesCascade:
         assert "qa_iterate" in forced
         assert "forecast" in forced
         assert "stack" in forced
+        assert "stack_aug" in forced
         assert "pdf" in forced
         assert "median" in forced
 
@@ -5695,7 +5697,7 @@ class TestForceStagesCascade:
         """stack, pdf, median, score, fetch are terminal — no downstream invalidation."""
         from metaculus_bot.ablation.cli import _expand_forced_stages
 
-        for terminal in ("stack", "pdf", "median", "score", "fetch", "qa_iterate"):
+        for terminal in ("stack", "stack_aug", "pdf", "median", "score", "fetch", "qa_iterate"):
             forced = _expand_forced_stages({terminal})
             assert forced == {terminal}, f"--force-stages {terminal} should not auto-cascade; got {forced}"
 
@@ -5703,7 +5705,7 @@ class TestForceStagesCascade:
         """Cascade must be idempotent: explicitly listing all stages doesn't double-add."""
         from metaculus_bot.ablation.cli import _expand_forced_stages
 
-        explicit = {"forecast", "stack", "pdf", "median"}
+        explicit = {"forecast", "stack", "stack_aug", "pdf", "median"}
         forced = _expand_forced_stages(explicit)
         assert forced == explicit
 
@@ -5744,7 +5746,7 @@ class TestForceStagesCascade:
         }
 
         stacker_a = {11001: _binary_stacker_payload("stack", 0.6)}
-        stacker_b = {11001: _binary_stacker_payload("pdf", 0.7)}
+        stacker_b = {11001: _binary_stacker_payload("stack_aug", 0.7)}
 
         mocks = _install_full_stack_mocks(
             monkeypatch,
@@ -5772,7 +5774,7 @@ class TestForceStagesCascade:
             "--qa-iterate-mode",
             "advisory",
             "--stages",
-            "fetch,research,prune,screen,qa_iterate,forecast,stack,pdf,median",
+            "fetch,research,prune,screen,qa_iterate,forecast,stack,stack_aug,pdf,median",
         ]
         await run_ablation(_build_parser().parse_args(argv))
         forecaster_count_after_run1 = mocks["forecasters"].await_count
@@ -5928,28 +5930,33 @@ class TestQidsFilterAppliedAfterHydration:
 
 class TestScoreOnlyZeroOverlapCheck:
     @pytest.mark.asyncio
-    async def test_score_only_errors_when_arm_a_arm_b_disjoint(
+    async def test_score_only_succeeds_with_zero_comparisons_when_disjoint(
         self,
         cache_dir: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Disjoint arm_A and arm_B sets must exit code != 0, not produce an empty summary."""
+        """Disjoint single-arm sets produce 0 comparisons but exit 0 (valid empty result).
+
+        With per-comparison N, a qid needs >= 2 arms for any comparison. When
+        each qid only has 1 arm, no comparisons are possible — the summary is
+        empty but the run succeeds (exit 0). This is correct: the data simply
+        doesn't support any pairwise comparison.
+        """
         from metaculus_bot.ablation.cli import _build_parser, run_ablation
 
         cache = AblationCache(cache_dir)
         # Pre-populate manifests for all 6 qids; only arm_A for {1,2,3} and arm_B for {4,5,6}.
-        # ARM_MEDIAN is wiped so the three-way overlap is empty (hits the disjoint-arms branch).
         for qid in (1, 2, 3, 4, 5, 6):
             _populate_full_cache_for_qid(cache, qid)
-        # Wipe stacker outputs and rewrite them as disjoint sets.
+        # Wipe stacker outputs and rewrite them as disjoint single-arm sets.
         for qid in (1, 2, 3, 4, 5, 6):
             (cache.root / "stacker_outputs" / str(qid) / "arm_stack.json").unlink(missing_ok=True)
-            (cache.root / "stacker_outputs" / str(qid) / "arm_pdf.json").unlink(missing_ok=True)
+            (cache.root / "stacker_outputs" / str(qid) / "arm_stack_aug.json").unlink(missing_ok=True)
             (cache.root / "stacker_outputs" / str(qid) / "arm_median.json").unlink(missing_ok=True)
         for qid in (1, 2, 3):
             cache.write_stacker_output(qid=qid, arm="stack", payload=_binary_stacker_payload("stack", 0.6))
         for qid in (4, 5, 6):
-            cache.write_stacker_output(qid=qid, arm="pdf", payload=_binary_stacker_payload("pdf", 0.7))
+            cache.write_stacker_output(qid=qid, arm="stack_aug", payload=_binary_stacker_payload("stack_aug", 0.7))
 
         question_set = _build_question_set([])
         _install_full_stack_mocks(monkeypatch, fetch_question_set=question_set)
@@ -5958,10 +5965,9 @@ class TestScoreOnlyZeroOverlapCheck:
         args = _build_parser().parse_args(["--stages", "score", "--cache-dir", str(cache_dir)])
         exit_code = await run_ablation(args)
 
-        assert exit_code != 0, (
-            "score_only with disjoint arm_A/arm_B sets must exit non-zero; "
-            "the prereq check must use intersection, not 'either empty'."
-        )
+        # Per-comparison N: each qid has only 1 arm, so no comparisons are
+        # possible. Exit 0 is correct — it's not a config error, just empty data.
+        assert exit_code == 0
 
     @pytest.mark.asyncio
     async def test_score_only_succeeds_when_arms_overlap(
@@ -6008,7 +6014,7 @@ class TestArmMedianStageStack:
         assert "median" in STAGES
         # median sits between pdf and score in the canonical pipeline order
         # so the orchestrator runs it after both LLM stackers but before scoring.
-        stack_b_idx = STAGES.index("pdf")
+        stack_b_idx = STAGES.index("stack_aug")
         stack_c_idx = STAGES.index("median")
         score_idx = STAGES.index("score")
         assert stack_b_idx < stack_c_idx < score_idx
@@ -6061,7 +6067,7 @@ class TestArmMedianStageStack:
             assert working.stacker_median_payloads[qid][key] == cached[key]
         # ARM_MEDIAN does NOT consume LLM-call counters; only cache-hit counter (zero on first run).
         assert spend.stacker_llm_calls_stack == 0
-        assert spend.stacker_llm_calls_pdf == 0
+        assert spend.stacker_llm_calls_stack_aug == 0
         assert spend.cached_stacker_median_hits == 0  # first run, no cache hit
 
     @pytest.mark.asyncio

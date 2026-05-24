@@ -418,6 +418,13 @@ BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
 LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
 
+# --- Numeric stacking disable ---
+# Disable LLM stacking on numeric questions (forces them through the median/skipped
+# path even when spread exceeds threshold). Set NUMERIC_STACKING_DISABLED=true in prod.
+# Background: n=88 ablation + n=25 historical residual both show stacker hurts numeric
+# CRPS; see scratch_docs_and_planning/disable_numeric_stacking_plan.md.
+NUMERIC_STACKING_DISABLED_ENV: str = "NUMERIC_STACKING_DISABLED"
+
 # --- Prediction-market provider (Workstream G) ---
 # Env-gated so backtests can opt in explicitly. Resolved markets on all three
 # platforms retain their last-trade price after resolution — without the
