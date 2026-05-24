@@ -8,7 +8,6 @@ from typing import Any, Coroutine, Literal, Sequence, cast
 
 from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
-    BinaryPrediction,
     BinaryQuestion,
     GeneralLlm,
     MetaculusQuestion,
@@ -19,13 +18,10 @@ from forecasting_tools import (  # AskNewsSearcher,
     ReasonedPrediction,
     SmartSearcher,
     clean_indents,
-    structure_output,
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
-from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import DateQuestion
-from pydantic import ValidationError
 
 from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_strategies import (
@@ -55,8 +51,6 @@ from metaculus_bot.comment_markers import (
 from metaculus_bot.comment_trimming import trim_comment, trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
-    BINARY_PROB_MAX,
-    BINARY_PROB_MIN,
     BINARY_STACKING_ENABLED_ENV,
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
@@ -84,9 +78,8 @@ from metaculus_bot.constants import (
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
-from metaculus_bot.discrete_snap import OutcomeTypeResult, majority_votes_discrete, snap_distribution_to_integers
+from metaculus_bot.discrete_snap import majority_votes_discrete, snap_distribution_to_integers
 from metaculus_bot.llm_setup import prepare_llm_config
-from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric_diagnostics import log_final_prediction
 from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric_utils import bound_messages
@@ -96,13 +89,11 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
-from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.research_providers import (
     ResearchCallable,
     choose_provider_with_name,
     native_search_provider,
 )
-from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
 
@@ -1670,249 +1661,29 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[float]:
-        prompt = binary_prompt(question, research)
-        reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
-        # Provide strict parsing guidance so the parser returns a decimal in [0,1]
-        binary_parse_instructions = (
-            "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
-            "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
-            "Do not return percentages, strings, or any extra fields."
-        )
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=binary_parse_instructions,
-        )
-        decimal_pred = max(
-            BINARY_PROB_MIN,
-            min(BINARY_PROB_MAX, binary_prediction.prediction_in_decimal),
-        )
+        from metaculus_bot.forecaster_runners import run_binary_forecast
 
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}")
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return await run_binary_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = multiple_choice_prompt(question, research)
-        reasoning = await llm_to_use.invoke(prompt)
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
+        from metaculus_bot.forecaster_runners import run_mc_forecast
 
-        # Build parsing instructions (used in strict path and fallback)
-        parsing_instructions = clean_indents(
-            f"""
-            Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and `probability` (decimal in [0,1]).
-            Use option names exactly from this list (case-insensitive match is OK, but prefer canonical spelling):
-            {question.options}
-            Do not include any options beyond this list. If the source text prefixes with words like 'Option A:' remove the prefix.
-            Ensure the probabilities approximately sum to 1.0; slight floating-point drift is OK.
-            """
-        )
+        return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
 
-        # Try strict PredictedOptionList first for compatibility with existing tests
-        try:
-            predicted_option_list: PredictedOptionList = await structure_output(
-                text_to_structure=reasoning,
-                output_type=PredictedOptionList,
-                model=self.get_llm("parser", "llm"),
-                additional_instructions=parsing_instructions,
-            )
-            # Clamp and renormalize to avoid edge cases
-            from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
-
-            try:
-                predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-            except ValueError as e:
-                logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
-        except (ValidationError, ValueError) as exc:
-            logger.warning(f"Primary MC parse failed: {exc}")
-            # Fallback tolerant parse: simple options then build final list
-            raw_options: list[OptionProbability] = await structure_output(
-                text_to_structure=reasoning,
-                output_type=list[OptionProbability],
-                model=self.get_llm("parser", "llm"),
-                additional_instructions=parsing_instructions,
-            )
-            predicted_option_list = build_mc_prediction(raw_options, list(question.options))
-
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}")
-        return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
-
-    # TODO: current monolithic numeric logic is disgusting and needs to be refactored
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = bound_messages(question)
-        prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
-        reasoning = await llm_to_use.invoke(prompt)
+        from metaculus_bot.forecaster_runners import run_numeric_forecast
 
-        self._log_llm_output(llm_to_use, question.id_of_question, reasoning)
-
-        # Parse discrete integer classification from reasoning via parser LLM
+        prediction, discrete_vote = await run_numeric_forecast(
+            question, research, llm_to_use, self.get_llm("parser", "llm")
+        )
         qid = question.id_of_question
-        discrete_vote: bool | None = None
-        try:
-            outcome_result: OutcomeTypeResult = await structure_output(
-                reasoning,
-                OutcomeTypeResult,
-                model=self.get_llm("parser", "llm"),
-                additional_instructions=(
-                    "The forecaster classified whether this question's resolution values are discrete "
-                    "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
-                    "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
-                ),
-            )
-            discrete_vote = outcome_result.is_discrete_integer
-        except (ValidationError, ValueError) as e:
-            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, llm_to_use.model, e)
-
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
-        if qid is not None:
-            vote_labels = {True: "DISCRETE", False: "CONTINUOUS"}
-            vote_label = vote_labels.get(discrete_vote, "PARSE_FAILED")  # type: ignore[arg-type]  # dict keyed on bool; None key falls through to default
-            logger.info(
-                "Discrete vote for Q %s | model=%s | vote=%s",
-                qid,
-                llm_to_use.model,
-                vote_label,
-            )
-
-        unit_str = getattr(question, "unit_of_measure", None) or "base unit"
-        parse_notes = (
-            (
-                "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
-                "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
-                f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
-                "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
-            )
-            .replace("{lower}", str(getattr(question, "lower_bound", 0)))
-            .replace("{upper}", str(getattr(question, "upper_bound", 0)))
-        )
-        # Try to parse the trailing percentile lines. Workstream E: a
-        # mixture-only rationale legitimately has no percentile lines, so a
-        # parser failure is only non-fatal when the rationale carries a
-        # populated mixture_components block (router will use it). Otherwise
-        # the exception propagates so the caller still sees the parse failure.
-        from metaculus_bot.numeric_format_router import (
-            detect_numeric_format,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        )
-
-        percentile_list: list[Percentile] | None
-        try:
-            percentile_list = await structure_output(
-                reasoning,
-                list[Percentile],
-                model=self.get_llm("parser", "llm"),
-                additional_instructions=parse_notes,
-            )
-        except (ValidationError, ValueError) as e:
-            detected = detect_numeric_format(reasoning)
-            if detected in ("mixture", "both"):
-                logger.info(
-                    "Numeric percentile parser found no percentile lines for Q %s | model=%s: %s "
-                    "(rationale carries mixture_components — using mixture branch)",
-                    qid,
-                    llm_to_use.model,
-                    e,
-                )
-                percentile_list = None
-            else:
-                # No mixture fallback — reraise so the malformed forecast is
-                # surfaced rather than silently degrading.
-                raise
-
-        # Workstream E: route between mixture and percentile paths.
-        from metaculus_bot.numeric_format_router import (
-            route_numeric_output,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        )
-
-        routed = route_numeric_output(
-            rationale=reasoning,
-            declared_percentiles=percentile_list,
-            question=question,
-        )
-        logger.info(
-            "numeric_format=%s for Q %s | model=%s | mixture_components=%s",
-            routed.format,
-            qid,
-            llm_to_use.model,
-            (len(routed.mixture.components) if routed.mixture is not None else 0),
-        )
-
-        if routed.mixture is not None:
-            # Mixture branch: percentiles_to_metaculus_cdf_via_mixture already
-            # produced a constraint-enforced 201-point CDF. Wrap as a
-            # PchipNumericDistribution so .cdf returns the pre-computed values
-            # rather than re-deriving from declared_percentiles.
-            #
-            # detect_unit_mismatch is intentionally NOT called on this branch.
-            # The heuristic checks declared-percentile spread against the
-            # question's bound range; mixture_declared (synthesized below) is
-            # built by walking the mixture CDF for each STANDARD_PERCENTILE,
-            # so its values always span [lower, upper] and the heuristic can
-            # never fire. The percentile branch below still runs the guard
-            # because raw LLM-declared percentiles can plausibly land in the
-            # wrong unit.
-            from metaculus_bot.pchip_processing import (
-                create_pchip_numeric_distribution,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            )
-
-            mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
-            # Synthesize the canonical 11 declared-percentile anchors from the
-            # mixture CDF so the upstream NumericDistribution shape matches the
-            # percentile-branch contract. This is presentational only — the
-            # PCHIP override means .cdf returns the mixture-derived 201 points.
-            mixture_declared: list[Percentile] = []
-            from metaculus_bot.numeric_config import (
-                STANDARD_PERCENTILES,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            )
-
-            for target_pct in STANDARD_PERCENTILES:
-                # Find first cdf entry whose probability >= target.
-                hit = next(
-                    (p for p in routed.cdf_percentiles if p.percentile >= target_pct),
-                    routed.cdf_percentiles[-1],
-                )
-                mixture_declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
-
-            prediction = create_pchip_numeric_distribution(
-                mixture_cdf_values,
-                mixture_declared,
-                question,
-                zero_point=None,
-            )
-            log_final_prediction(prediction, question)
-            return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-
-        # Percentile branch (default): existing pipeline.
-        assert routed.declared_percentiles is not None, (
-            "route_numeric_output returned a non-mixture result without declared_percentiles; "
-            "this is a router bug — mixture-fallback should have raised ValueError instead."
-        )
-        sanitized_percentiles, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
-
-        prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
-
-        # Unit mismatch guard (bail without posting if triggered) — run late to avoid disrupting
-        # diagnostic tests that exercise fallback and CDF validation paths.
-        mismatch, reason = detect_unit_mismatch(sanitized_percentiles, question)
-        if mismatch:
-            from metaculus_bot.exceptions import UnitMismatchError
-
-            logger.error(
-                f"Unit mismatch likely for Q {getattr(question, 'id_of_question', 'N/A')} | "
-                f"URL {getattr(question, 'page_url', '<unknown>')} | reason={reason}. Withholding prediction."
-            )
-            raise UnitMismatchError(
-                f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in sanitized_percentiles]}"
-            )
-
-        # Log final prediction
-        log_final_prediction(prediction, question)
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        return prediction
 
     def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         """Apply post-hoc Platt scaling to the final binary or MC probability.

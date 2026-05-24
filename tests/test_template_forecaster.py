@@ -331,7 +331,7 @@ async def test_run_forecast_on_binary_uses_provided_llm(mock_binary_question, mo
 
     # Mock structured_output to avoid external parsing LLM calls
     with patch(
-        "main.structure_output",
+        "metaculus_bot.forecaster_runners.structure_output",
         return_value=type("_Bin", (), {"prediction_in_decimal": 0.65})(),
     ) as mock_struct:
         result = await bot._run_forecast_on_binary(mock_binary_question, "some research", mock_general_llm)
@@ -353,7 +353,7 @@ async def test_run_forecast_on_multiple_choice_uses_provided_llm(mock_metaculus_
     mock_metaculus_question.options = ["A", "B"]
 
     # Mock structured_output for multiple-choice
-    with patch("main.structure_output", return_value=MagicMock()) as mock_struct:
+    with patch("metaculus_bot.forecaster_runners.structure_output", return_value=MagicMock()) as mock_struct:
         result = await bot._run_forecast_on_multiple_choice(mock_metaculus_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
         mock_struct.assert_called_once()
@@ -390,9 +390,9 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     mock_metaculus_question.cdf_size = 201
 
     with (
-        patch("main.bound_messages", return_value=("", "")) as mock_bounds,
+        patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("", "")) as mock_bounds,
         patch(
-            "main.structure_output",
+            "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
         ) as mock_struct,
     ):
