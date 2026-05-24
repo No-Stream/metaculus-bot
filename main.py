@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 import time
 from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
@@ -21,11 +20,9 @@ from forecasting_tools.data_models.forecast_report import ForecastReport, Resear
 from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot import stacking as stacking
+from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
-    combine_binary_predictions,
-    combine_multiple_choice_predictions,
-    combine_numeric_predictions,
 )
 from metaculus_bot.comment_trimming import trim_section
 from metaculus_bot.config import load_environment
@@ -41,16 +38,10 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
-    STACKER_FALLBACK_SOFT_DEADLINE,
-    STACKER_SOFT_DEADLINE,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
 from metaculus_bot.llm_setup import prepare_llm_config
-from metaculus_bot.numeric_diagnostics import log_final_prediction
-from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
-from metaculus_bot.numeric_utils import bound_messages
-from metaculus_bot.numeric_validation import detect_unit_mismatch
 from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
@@ -107,7 +98,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
 
         self._forecaster_llms: list[GeneralLlm] = setup.forecaster_llms
-        self._stacker_llm: GeneralLlm | None = setup.stacker_llm
+        self.__stacker_llm: GeneralLlm | None = setup.stacker_llm
         self._analyzer_llm: GeneralLlm | None = setup.analyzer_llm
         normalized_llms: dict[str, str | GeneralLlm] = setup.normalized_llms
         predictions_per_research_report = setup.predictions_per_report
@@ -140,40 +131,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
         self.stacking_fallback_on_failure: bool = stacking_fallback_on_failure
         self.stacking_randomize_order: bool = stacking_randomize_order
-        # Per-question storage for stacker meta-analysis reasoning text
-        self._stack_meta_reasoning: dict[int, str] = {}
-        # Per-question outcome for the stacker pipeline. One of:
-        #   "primary"          — primary stacker LLM produced the value
-        #   "fallback_llm"     — primary failed, fallback stacker LLM succeeded
-        #   "fallback_median"  — both stacker LLMs failed; MEDIAN aggregation used
-        #   "skipped"          — conditional-stacking spread <= threshold
-        # Must be set on the path that actually produced the aggregated value
-        # (not at branch entry), so median-fallback isn't mislabeled as stacked.
-        self._stacker_outcome: dict[int, str] = {}
-        # Diagnostics + state for STACKING base aggregation behavior
-        # Tracks per-question expectation that the base aggregator will be called to combine
-        # per-research-report, already-stacked outputs.
-        self._stack_expected_base_combine: set[int] = set()
-        # Counters for expected vs unexpected base-combine calls during STACKING
-        self._stacking_expected_combine_count: int = 0
-        self._stacking_unexpected_combine_count: int = 0
-        self._stacking_fallback_count: int = 0
-
-        # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
-        # Forecasters dropped by the per-call soft deadline (see FORECASTER_SOFT_DEADLINE).
-        self._forecasters_dropped_count: int = 0
-        # Questions that couldn't be published because fewer than
-        # MIN_FORECASTERS_TO_PUBLISH base forecasters succeeded.
-        self._questions_failed_to_publish: int = 0
-        # Primary stacker failed (timeout or exception). Counts regardless of
-        # whether fallback eventually succeeded.
-        self._stacker_primary_failed_count: int = 0
-        # Stacker fallback model was invoked.
-        self._stacker_fallback_used_count: int = 0
-        # Stacker fallback also failed; median aggregation used.
-        self._stacker_fallback_failed_count: int = 0
-        # Research provider failures other than AskNews subscription-inactive
-        # (which is expected in off-season). Backed by self._research.timeout_count.
 
         # Per-question votes from each LLM on whether outcomes are discrete integers
         self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
@@ -190,6 +147,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
             "mc": CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
             "numeric": CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
         } | (stacking_spread_thresholds or {})
+
+        # Aggregation pipeline owns stacking state, counters, and dispatch
+        self._pipeline = AggregationPipeline(
+            strategy=self.aggregation_strategy,
+            stacker_llm=self._stacker_llm,
+            parser_llm=GeneralLlm(model="placeholder"),  # replaced after super().__init__
+            stacking_fallback_on_failure=stacking_fallback_on_failure,
+            stacking_randomize_order=stacking_randomize_order,
+            stacking_spread_thresholds=self._stacking_spread_thresholds,
+            discrete_integer_votes=self._discrete_integer_votes,
+        )
+
+        # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
+        self._forecasters_dropped_count: int = 0
+        self._questions_failed_to_publish: int = 0
+
         self._conditional_stacking_triggered_count: int = 0
         self._conditional_stacking_skipped_count: int = 0
         self._conditional_stacking_crux_failures: int = 0
@@ -211,6 +184,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
             llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
         )
+
+        # Now that super().__init__ has run, resolve the parser LLM and wire the
+        # stacking function so that mocking bot._run_stacking flows through.
+        # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
+        self._pipeline.parser_llm = self.get_llm("parser", "llm")
+        self._pipeline.run_stacking_fn = lambda *args, **kwargs: self._run_stacking(*args, **kwargs)
 
         self._research = ResearchOrchestrator(
             default_llm=self.get_llm("default", "llm"),
@@ -254,27 +233,80 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
 
     def _get_threshold_for_question(self, question: MetaculusQuestion) -> float:
-        """Return the spread threshold for the given question type."""
-        if isinstance(question, BinaryQuestion):
-            return self._stacking_spread_thresholds["binary"]
-        if isinstance(question, MultipleChoiceQuestion):
-            return self._stacking_spread_thresholds["mc"]
-        if isinstance(question, NumericQuestion):
-            return self._stacking_spread_thresholds["numeric"]
-        raise ValueError(f"No spread threshold for question type: {type(question).__name__}")
+        return self._pipeline.get_threshold_for_question(question)
 
     def _register_expected_base_combine(self, question: MetaculusQuestion) -> None:
-        """Register that the framework's base aggregator should expect a combine call for this question.
+        self._pipeline.register_expected_base_combine(question)
 
-        Relies on the assertion at the top of ``_research_and_make_predictions`` that
-        ``question.id_of_question is not None`` — so that upstream stacking state-dict
-        ops (``self._stacker_outcome[qid]``, ``self._stack_meta_reasoning[qid]``)
-        and this set's key stay consistent. A silent fallback to ``id(question)`` here
-        would let the keys desync if upstream keying ever changed.
-        """
-        qid = question.id_of_question
-        assert qid is not None, "_register_expected_base_combine requires question.id_of_question"
-        self._stack_expected_base_combine.add(qid)
+    @property
+    def _stacker_llm(self) -> GeneralLlm | None:
+        return self.__stacker_llm
+
+    @_stacker_llm.setter
+    def _stacker_llm(self, value: GeneralLlm | None) -> None:
+        self.__stacker_llm = value
+        if hasattr(self, "_pipeline"):
+            self._pipeline.stacker_llm = value
+
+    @property
+    def _stack_meta_reasoning(self) -> dict[int, str]:
+        return self._pipeline.meta_reasoning
+
+    @property
+    def _stacker_outcome(self) -> dict[int, str]:
+        return self._pipeline.outcomes
+
+    @property
+    def _stack_expected_base_combine(self) -> set[int]:
+        return self._pipeline.expected_base_combines
+
+    @property
+    def _stacking_expected_combine_count(self) -> int:
+        return self._pipeline.counters.stacking_expected_combine_count
+
+    @_stacking_expected_combine_count.setter
+    def _stacking_expected_combine_count(self, value: int) -> None:
+        self._pipeline.counters.stacking_expected_combine_count = value
+
+    @property
+    def _stacking_unexpected_combine_count(self) -> int:
+        return self._pipeline.counters.stacking_unexpected_combine_count
+
+    @_stacking_unexpected_combine_count.setter
+    def _stacking_unexpected_combine_count(self, value: int) -> None:
+        self._pipeline.counters.stacking_unexpected_combine_count = value
+
+    @property
+    def _stacking_fallback_count(self) -> int:
+        return self._pipeline.counters.stacking_fallback_count
+
+    @_stacking_fallback_count.setter
+    def _stacking_fallback_count(self, value: int) -> None:
+        self._pipeline.counters.stacking_fallback_count = value
+
+    @property
+    def _stacker_primary_failed_count(self) -> int:
+        return self._pipeline.counters.stacker_primary_failed_count
+
+    @_stacker_primary_failed_count.setter
+    def _stacker_primary_failed_count(self, value: int) -> None:
+        self._pipeline.counters.stacker_primary_failed_count = value
+
+    @property
+    def _stacker_fallback_used_count(self) -> int:
+        return self._pipeline.counters.stacker_fallback_used_count
+
+    @_stacker_fallback_used_count.setter
+    def _stacker_fallback_used_count(self, value: int) -> None:
+        self._pipeline.counters.stacker_fallback_used_count = value
+
+    @property
+    def _stacker_fallback_failed_count(self) -> int:
+        return self._pipeline.counters.stacker_fallback_failed_count
+
+    @_stacker_fallback_failed_count.setter
+    def _stacker_fallback_failed_count(self, value: int) -> None:
+        self._pipeline.counters.stacker_fallback_failed_count = value
 
     async def forecast_questions(
         self,
@@ -364,103 +396,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
-        """Run stacking to aggregate multiple model predictions using a meta-model.
-
-        ``stacker_llm_override`` lets the aggregation layer invoke a fallback
-        stacker (e.g. gpt-5.5) without swapping ``self._stacker_llm`` — keeping
-        fallback behavior local to the call site and avoiding state mutation
-        that could race with concurrent questions.
-
-        ``aggregated_tool_output`` is the optional markdown block produced
-        upstream by ``build_cross_model_aggregation``; threaded into
-        ``run_stacking_*`` so the stacker sees deterministic cross-model
-        math at the top of its prompt.
-        """
-        if stacker_llm_override is not None:
-            stacker_llm = stacker_llm_override
-        else:
-            if self._stacker_llm is None:
-                raise ValueError("No stacker LLM configured")
-            stacker_llm = self._stacker_llm
-
-        page_url = question.page_url or "<unknown>"
-        qid = question.id_of_question
-        assert qid is not None, "_run_stacking requires question.id_of_question (upstream guarantees this)"
-
-        # Strip model names from reasoning and prepare base predictions
-        base_predictions = [stacking.strip_model_tag(pred.reasoning) for pred in reasoned_predictions]
-
-        # Optionally randomize order to avoid position bias
-        if self.stacking_randomize_order:
-            combined = list(zip(base_predictions, reasoned_predictions))
-            random.shuffle(combined)
-            base_predictions = [bp for bp, _ in combined]
-            reasoned_predictions = [rp for _, rp in combined]
-
-        # Generate appropriate stacking call based on question type
-        if isinstance(question, BinaryQuestion):
-            value, meta_text = await stacking.run_stacking_binary(
-                stacker_llm,
-                self.get_llm("parser", "llm"),
-                question,
-                research,
-                base_predictions,
-                aggregated_tool_output=aggregated_tool_output,
-            )
-            self._log_llm_output(stacker_llm, qid, meta_text)
-            self._stack_meta_reasoning[qid] = meta_text
-            logger.info(f"Stacked binary prediction for {page_url}: {value}")
-            return value
-        elif isinstance(question, MultipleChoiceQuestion):
-            pol, meta_text = await stacking.run_stacking_mc(
-                stacker_llm,
-                self.get_llm("parser", "llm"),
-                question,
-                research,
-                base_predictions,
-                aggregated_tool_output=aggregated_tool_output,
-            )
-            self._log_llm_output(stacker_llm, qid, meta_text)
-            self._stack_meta_reasoning[qid] = meta_text
-            logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
-            return pol
-        elif isinstance(question, NumericQuestion):
-            upper_msg, lower_msg = bound_messages(question)
-            perc_list, meta_text = await stacking.run_stacking_numeric(
-                stacker_llm,
-                self.get_llm("parser", "llm"),
-                question,
-                research,
-                base_predictions,
-                lower_msg,
-                upper_msg,
-                aggregated_tool_output=aggregated_tool_output,
-            )
-            self._log_llm_output(stacker_llm, qid, meta_text)
-            self._stack_meta_reasoning[qid] = meta_text
-
-            # Use same validation and processing logic as base numeric forecasting
-            percentile_list, zero_point = sanitize_percentiles(list(perc_list), question)
-
-            # question is narrowed to NumericQuestion by the elif, but the type checker
-            # only sees MetaculusQuestion from the method signature
-            mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
-            if mismatch:
-                from metaculus_bot.exceptions import UnitMismatchError
-
-                logger.error(
-                    f"Unit mismatch likely for Q {qid} | URL {page_url} | reason={reason}. Withholding prediction."
-                )
-                raise UnitMismatchError(
-                    f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
-                )
-
-            prediction = build_numeric_distribution(percentile_list, question, zero_point)
-            log_final_prediction(prediction, question)
-            logger.info(f"Stacked numeric prediction for {page_url}")
-            return prediction
-        else:
-            raise ValueError(f"Unsupported question type for stacking: {type(question)}")
+        return await self._pipeline.run_stacking(
+            question,
+            research,
+            reasoned_predictions,
+            stacker_llm_override=stacker_llm_override,
+            aggregated_tool_output=aggregated_tool_output,
+        )
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         return await self._research.run_research(question)
@@ -1002,300 +944,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]] | None = None,
         aggregated_tool_output: str | None = None,
     ) -> PredictionTypes:
-        if not predictions:
-            raise ValueError("Cannot aggregate empty list of predictions")
-
-        # Base aggregator calls when using STACKING.
-        # If the base class calls aggregation after we've already stacked per research-report,
-        # there will be no reasoned_predictions/research context provided here.
-        # Treat this as a base-combine. Distinguish expected vs unexpected for logging.
-        if (
-            self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
-            and reasoned_predictions is None
-            and research is None
-        ):
-            qkey = question.id_of_question
-
-            expected = qkey in self._stack_expected_base_combine
-            if expected:
-                self._stack_expected_base_combine.discard(qkey)
-                self._stacking_expected_combine_count += 1
-            else:
-                self._stacking_unexpected_combine_count += 1
-
-            # Single pre-stacked prediction – return as-is
-            if len(predictions) == 1:
-                if expected:
-                    logger.info("STACKING base combine: single pre-stacked output; returning as-is")
-                else:
-                    logger.warning(
-                        "Unexpected STACKING combine: single input without stacking context; returning as-is"
-                    )
-                return predictions[0]
-            # Multiple predictions – combine them. CONDITIONAL_STACKING uses MEDIAN (its low-spread
-            # skip path returns all individual predictions); regular STACKING uses MEAN.
-            base_combine_strategy = (
-                AggregationStrategy.MEDIAN
-                if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
-                else AggregationStrategy.MEAN
-            )
-            strategy_name = base_combine_strategy.value
-            if expected:
-                logger.info(
-                    "STACKING base combine: %d pre-stacked outputs; aggregating by %s for final output",
-                    len(predictions),
-                    strategy_name,
-                )
-            else:
-                logger.warning(
-                    "Unexpected STACKING combine: %d inputs without stacking context; aggregating by %s",
-                    len(predictions),
-                    strategy_name,
-                )
-            first = predictions[0]
-            # F16: under CONDITIONAL_STACKING the multi-input re-entry case is the
-            # low-spread skip path, where `predictions` are RAW per-forecaster
-            # outputs (not yet Platt-calibrated). Apply Platt to the combined
-            # value so low-spread vs. high-spread questions have symmetric
-            # calibration treatment. STACKING's multi-input case is per-research-
-            # report stacker outputs that were already calibrated by the fresh-
-            # aggregation path that produced them — re-applying would double-
-            # apply, so leave that branch alone.
-            apply_platt_after_combine = self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
-            # In the branches below, isinstance narrows `first` but the checker can't
-            # narrow the full `predictions` list or know that combine_* returns a
-            # PredictionTypes member.  The return-value ignores are safe because each
-            # concrete type (float, PredictedOptionList, NumericDistribution) IS a
-            # member of PredictionTypes.
-            if isinstance(first, (int, float)):
-                values = [float(p) for p in predictions if isinstance(p, (int, float))]
-                result = combine_binary_predictions(values, base_combine_strategy)
-                logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
-                if apply_platt_after_combine:
-                    return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
-                return result  # type: ignore[return-value]
-            if isinstance(first, PredictedOptionList):
-                mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
-                summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
-                logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
-                if apply_platt_after_combine:
-                    return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]
-                return aggregated  # type: ignore[return-value]
-            if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
-                numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-                aggregated = await combine_numeric_predictions(numeric_preds, question, base_combine_strategy)
-                logger.info(
-                    "STACKING base combine: numeric %s aggregation | CDF points=%d",
-                    strategy_name,
-                    len(getattr(aggregated, "cdf", [])),
-                )
-                snapped = self._maybe_snap_to_integers(aggregated, question)
-                if apply_platt_after_combine:
-                    return self._apply_platt_calibration(snapped, question)  # type: ignore[arg-type]
-                return snapped  # type: ignore[return-value]
-            raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
-
-        # Handle stacking strategy
-        if self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-            if self._stacker_llm is None:
-                raise ValueError("STACKING aggregation strategy requires a stacker LLM to be configured")
-            if reasoned_predictions is None:
-                raise ValueError("STACKING aggregation strategy requires reasoned predictions")
-            if research is None:
-                raise ValueError("STACKING aggregation strategy requires research context")
-
-            # Stacker fallback chain:
-            #   1. Primary stacker (opus-4.7) under STACKER_SOFT_DEADLINE.
-            #   2. On failure/timeout: secondary stacker (gpt-5.5, different
-            #      provider so Anthropic-API thrash doesn't take us down) under
-            #      STACKER_FALLBACK_SOFT_DEADLINE.
-            #   3. On both failing: MEDIAN aggregation (not MEAN — MEAN on
-            #      disagreeing opus/gpt/gemini distributions can produce a weird
-            #      multi-modal numeric output; MEDIAN is robust).
-            #
-            # stacking_fallback_on_failure=False (used in benchmarks) preserves
-            # hard-fail behavior end-to-end so benchmark runs surface stacker
-            # regressions loudly.
-            # CancelledError is BaseException in 3.11+ — intentionally not caught here.
-            # _research_and_make_predictions asserts id_of_question is not None
-            # before this is reachable, so the qid is guaranteed populated.
-            qid_for_outcome = question.id_of_question
-            assert qid_for_outcome is not None
-            try:
-                stacked = await asyncio.wait_for(
-                    self._run_stacking(
-                        question,
-                        research,
-                        reasoned_predictions,
-                        aggregated_tool_output=aggregated_tool_output,
-                    ),
-                    timeout=STACKER_SOFT_DEADLINE,
-                )
-                self._stacker_outcome[qid_for_outcome] = "primary"
-                return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
-            except Exception as primary_exc:
-                if not self.stacking_fallback_on_failure:
-                    raise
-
-                self._stacker_primary_failed_count += 1
-                logger.warning(
-                    "STACKER_PRIMARY_FAILED: primary stacker failed on Q %s (%s: %s); trying fallback model",
-                    question.id_of_question,
-                    type(primary_exc).__name__,
-                    primary_exc,
-                )
-
-                # Try fallback stacker LLM (lazy import to avoid circular deps)
-                from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
-
-                try:
-                    self._stacker_fallback_used_count += 1
-                    stacked = await asyncio.wait_for(
-                        self._run_stacking(
-                            question,
-                            research,
-                            reasoned_predictions,
-                            stacker_llm_override=STACKER_FALLBACK_LLM,
-                            aggregated_tool_output=aggregated_tool_output,
-                        ),
-                        timeout=STACKER_FALLBACK_SOFT_DEADLINE,
-                    )
-                    logger.info(
-                        "STACKER_FALLBACK_SUCCEEDED: fallback stacker succeeded on Q %s",
-                        question.id_of_question,
-                    )
-                    self._stacker_outcome[qid_for_outcome] = "fallback_llm"
-                    return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
-                except Exception as fallback_exc:
-                    self._stacker_fallback_failed_count += 1
-                    self._stacking_fallback_count += 1
-                    logger.error(
-                        "STACKER_FALLBACK_FAILED: fallback stacker also failed on Q %s (%s: %s); "
-                        "falling back to MEDIAN aggregation",
-                        question.id_of_question,
-                        type(fallback_exc).__name__,
-                        fallback_exc,
-                    )
-                    self._stacker_outcome[qid_for_outcome] = "fallback_median"
-                    # Direct per-type MEDIAN dispatch. We deliberately do NOT
-                    # mutate self.aggregation_strategy here: forecast_questions
-                    # runs questions concurrently via asyncio.gather on the same
-                    # bot instance, so a mutation during the await would let
-                    # another concurrent question observe the wrong strategy
-                    # and mis-route its dispatch.
-                    first_prediction = predictions[0]
-                    if isinstance(first_prediction, (int, float)):
-                        float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-                        return self._apply_platt_calibration(
-                            combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # float is a PredictionTypes member
-                            question,
-                        )
-                    if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
-                        numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-                        median_numeric = await combine_numeric_predictions(
-                            numeric_preds, question, AggregationStrategy.MEDIAN
-                        )
-                        return self._apply_platt_calibration(
-                            self._maybe_snap_to_integers(median_numeric, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
-                            question,
-                        )
-                    if isinstance(first_prediction, PredictedOptionList):
-                        mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-                        return self._apply_platt_calibration(
-                            combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
-                            question,
-                        )
-                    raise ValueError(
-                        f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}"
-                    ) from fallback_exc
-
-        # High-level aggregation log for clarity
-        qtype = (
-            "binary"
-            if isinstance(predictions[0], (int, float))
-            else (
-                "numeric"
-                if isinstance(predictions[0], NumericDistribution)
-                else (
-                    "multiple-choice"
-                    if isinstance(predictions[0], PredictedOptionList)
-                    else type(predictions[0]).__name__
-                )
-            )
+        return await self._pipeline.aggregate(
+            predictions, question, research, reasoned_predictions, aggregated_tool_output
         )
-        logger.info("Aggregating %s predictions with %s", qtype, self.aggregation_strategy.value)
-
-        # CONDITIONAL_STACKING uses MEDIAN for the low-spread (no-stack) path
-        effective_strategy = (
-            AggregationStrategy.MEDIAN
-            if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
-            else self.aggregation_strategy
-        )
-
-        # Binary aggregation - strategy-based dispatch
-        # Same return-value pattern as stacking branch above: each concrete type IS a
-        # PredictionTypes member but the checker can't prove it through isinstance on first.
-        first_prediction = predictions[0]
-        if isinstance(first_prediction, (int, float)):
-            float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-            result = combine_binary_predictions(float_preds, effective_strategy)
-            if effective_strategy == AggregationStrategy.MEAN:
-                logger.info(
-                    "Binary question ensembling: mean of %s = %.3f (rounded)",
-                    float_preds,
-                    result,
-                )
-            elif effective_strategy == AggregationStrategy.MEDIAN:
-                logger.info(
-                    "Binary question ensembling: median of %s = %.3f",
-                    float_preds,
-                    result,
-                )
-            else:
-                logger.info(
-                    "Binary question ensembling: %s of %s = %.3f",
-                    effective_strategy.value,
-                    float_preds,
-                    result,
-                )
-            return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]  # float is a PredictionTypes member
-
-        if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
-            numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            aggregated = await combine_numeric_predictions(
-                numeric_preds,
-                question,
-                effective_strategy,
-            )
-            lb = getattr(question, "lower_bound", None)
-            ub = getattr(question, "upper_bound", None)
-            logger.info(
-                "Numeric aggregation=%s | preserved bounds [%s, %s] | CDF points=%d",
-                effective_strategy.value,
-                lb,
-                ub,
-                len(getattr(aggregated, "cdf", [])),
-            )
-            return self._apply_platt_calibration(
-                self._maybe_snap_to_integers(aggregated, question),  # type: ignore[arg-type]  # NumericDistribution is a PredictionTypes member
-                question,
-            )
-
-        # Multiple choice aggregation - strategy-based dispatch
-        if isinstance(first_prediction, PredictedOptionList):
-            mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, effective_strategy)
-            summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
-            logger.info(
-                "MC %s aggregation; renormalized to 1.0 | %s",
-                effective_strategy.value,
-                summary,
-            )
-            return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]  # PredictedOptionList is a PredictionTypes member
-
-        # Fallback for unexpected prediction types
-        raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm
