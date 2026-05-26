@@ -91,6 +91,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Exclude models by substring match (case-insensitive)",
     )
+    parser.add_argument(
+        "--research-dir",
+        type=str,
+        default=None,
+        help="Path to pre-cached research archive (e.g. backtests/research_archive/latest). "
+        "When set, skips live research + leakage screening and replays stored research.",
+    )
     return parser
 
 
@@ -119,6 +126,35 @@ def _filter_bots(
     return filtered
 
 
+def _load_research_from_archive(research_dir: str, questions: list) -> dict[int, str]:
+    """Load pre-cached research from a local archive directory into a research_cache dict."""
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    cache: dict[int, str] = {}
+    archive_path = Path(research_dir)
+    if not archive_path.exists():
+        logger.warning(f"Research archive dir does not exist: {research_dir}")
+        return cache
+
+    loaded = 0
+    for q in questions:
+        qid = getattr(q, "id_of_question", None)
+        if qid is None:
+            continue
+        record_file = archive_path / f"{qid}.json"
+        if record_file.exists():
+            record = json.loads(record_file.read_text())
+            cache[qid] = record.get("research_text", "")
+            loaded += 1
+
+    uncached = len(questions) - loaded
+    logger.info(f"Loaded {loaded} cached research records from {research_dir} ({uncached} questions uncached)")
+    if uncached > 0:
+        logger.warning(f"{uncached} question(s) have no cached research — they will run live research")
+    return cache
+
+
 async def run_backtest(args: argparse.Namespace) -> None:
     """Run the full backtest pipeline."""
     # 1. Fetch resolved questions and extract ground truths
@@ -138,16 +174,21 @@ async def run_backtest(args: argparse.Namespace) -> None:
         f"Prepared {len(question_set.questions)} questions with {len(question_set.ground_truths)} ground truths"
     )
 
-    # 2. Leakage pre-screening
-    clean_questions, clean_ground_truths, research_cache = await screen_research_for_leakage(
-        question_set.questions,
-        question_set.ground_truths,
-    )
-    question_set.questions = clean_questions
-    question_set.ground_truths = clean_ground_truths
-    question_set.research_cache = research_cache
+    # 2. Research: either load from pre-cached archive or run live with leakage screening
+    if args.research_dir:
+        research_cache = _load_research_from_archive(args.research_dir, question_set.questions)
+        clean_questions = question_set.questions
+        clean_ground_truths = question_set.ground_truths
+    else:
+        clean_questions, clean_ground_truths, research_cache = await screen_research_for_leakage(
+            question_set.questions,
+            question_set.ground_truths,
+        )
+        question_set.questions = clean_questions
+        question_set.ground_truths = clean_ground_truths
 
-    logger.info(f"After leakage screening: {len(clean_questions)} clean questions")
+    question_set.research_cache = research_cache
+    logger.info(f"After research setup: {len(clean_questions)} questions, {len(research_cache)} cached")
 
     # 3. Create bots
     bots: list[ForecastBot] = create_individual_bots(

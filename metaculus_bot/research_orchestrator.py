@@ -8,6 +8,7 @@ to an instance of this class.
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 
 from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
 from forecasting_tools.data_models.questions import MetaculusQuestion
@@ -47,6 +48,7 @@ class ResearchOrchestrator:
         is_benchmarking: bool = False,
         allow_research_fallback: bool = True,
         max_concurrent_research: int = DEFAULT_MAX_CONCURRENT_RESEARCH,
+        research_sink: Callable[..., None] | None = None,
     ) -> None:
         self._default_llm = default_llm
         self._summarizer_llm = summarizer_llm
@@ -55,6 +57,7 @@ class ResearchOrchestrator:
         self._is_benchmarking = is_benchmarking
         self._allow_research_fallback = allow_research_fallback
         self._concurrency_limiter = asyncio.Semaphore(max_concurrent_research)
+        self._research_sink = research_sink
         self.timeout_count: int = 0
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -88,6 +91,23 @@ class ResearchOrchestrator:
 
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+
+            if self._research_sink is not None:
+                qid = getattr(question, "id_of_question", None)
+                if qid is not None:
+                    try:
+                        gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
+                        self._research_sink(
+                            qid=qid,
+                            page_url=question.page_url,
+                            question_text=question.question_text,
+                            research_text=research,
+                            providers_used=provider_names,
+                            gap_fill_used=gap_fill_used,
+                        )
+                    except Exception:
+                        logger.exception("Research sink failed for qid=%d; continuing", qid)
+
             return research
 
     async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:

@@ -179,6 +179,9 @@ cython_debug/
 # Benchmark and ablation outputs — never committed; per-operator local state
 backtests/
 
+# Research persistence outputs (uploaded as GHA artifacts, not committed)
+research_outputs/
+
 # Agentic coding tool steering files other than reference AGENTS.md
 AGENTS.md:Zone.Identifier
 .roo/*

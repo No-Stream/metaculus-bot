@@ -86,6 +86,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacking_randomize_order: bool = True,
         stacking_spread_thresholds: dict[str, float] | None = None,
         min_forecasters_to_publish: int | None = None,
+        research_sink: Any | None = None,
     ) -> None:
         if not isinstance(aggregation_strategy, AggregationStrategy):
             raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
@@ -199,6 +200,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             is_benchmarking=is_benchmarking,
             allow_research_fallback=allow_research_fallback,
             max_concurrent_research=max_concurrent_research,
+            research_sink=research_sink,
         )
 
         # Log ensemble + aggregation configuration once on init

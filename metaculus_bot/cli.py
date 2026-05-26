@@ -3,6 +3,7 @@ import asyncio
 
 # ruff: noqa: F401
 import logging
+import os
 import sys
 from typing import Literal
 
@@ -10,7 +11,13 @@ from forecasting_tools import MetaculusApi
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.constants import METACULUS_CUP_ID, TOURNAMENT_ID, check_tournament_dates
+from metaculus_bot.constants import (
+    METACULUS_CUP_ID,
+    PERSIST_RESEARCH_ENABLED_ENV,
+    TOURNAMENT_ID,
+    check_tournament_dates,
+    env_flag_enabled,
+)
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_donated_404_fallback_count,
@@ -68,6 +75,19 @@ def main() -> None:
     args = parser.parse_args()
     run_mode: Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"] = args.mode
 
+    # Wire research persistence if enabled (production GHA runs set this env var)
+    research_writer = None
+    research_sink = None
+    if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
+        from metaculus_bot.research_persistence import ResearchPersistenceWriter  # noqa: PLC0415
+
+        research_writer = ResearchPersistenceWriter(
+            run_mode=run_mode,
+            tournament_id=str(TOURNAMENT_ID),
+            run_id=os.environ.get("GITHUB_RUN_ID", "local"),
+        )
+        research_sink = research_writer.record
+
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
@@ -76,6 +96,7 @@ def main() -> None:
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+        research_sink=research_sink,
         llms={
             "forecasters": FORECASTER_LLMS,
             "stacker": STACKER_LLM,
@@ -115,6 +136,9 @@ def main() -> None:
         forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
     else:
         raise ValueError(f"Invalid run mode: {run_mode}")
+
+    if research_writer is not None:
+        research_writer.flush()
 
     TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
 

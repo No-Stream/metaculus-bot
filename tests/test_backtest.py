@@ -191,6 +191,7 @@ def test_run_backtest_full_flow(
         tournament="fall-aib-2025",
         include_models=None,
         exclude_models=None,
+        research_dir=None,
     )
 
     asyncio.run(backtest.run_backtest(args))

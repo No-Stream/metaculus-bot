@@ -1,4 +1,4 @@
-.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits
+.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research backfill_research download_research backfill_comments backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -152,6 +152,39 @@ test_live:
 
 test_fast:
 	$(call RUN_UNBUFFERED,-m pytest -m "not live and not e2e" --tb=short)
+
+# --- Research persistence (backtest replay) ---
+
+# Sync research archive: download GHA artifacts (source of truth) + backfill
+# from Metaculus comments for anything missing. Run before backtests.
+sync_research:
+	@echo "=== Downloading GHA artifacts ==="
+	$(PY_ABS) scripts/download_research.py $(ARGS)
+	@echo ""
+	@echo "=== Backfilling from Metaculus comments (historical) ==="
+	$(PY_ABS) scripts/backfill_research_from_comments.py
+	@echo ""
+	@echo "=== Rebuilding archive ==="
+	$(PY_ABS) scripts/download_research.py --skip-download
+	@echo ""
+	@echo "Archive ready at backtests/research_archive/latest/"
+
+# Backfill research from existing GitHub Actions logs (Nov 2025 onward).
+# Pass ARGS="--limit 100 --status completed" to customize.
+backfill_research:
+	$(PY_ABS) scripts/backfill_research_from_logs.py $(ARGS)
+
+# Download research artifacts from recent GHA runs into local archive.
+download_research:
+	$(PY_ABS) scripts/download_research.py $(ARGS)
+
+# Backfill from Metaculus bot comments (historical, covers full tournament).
+backfill_comments:
+	$(PY_ABS) scripts/backfill_research_from_comments.py $(ARGS)
+
+# Run backtest using cached (non-leaky) research from the archive.
+backtest_with_cache:
+	$(call RUN_UNBUFFERED,backtest.py --num-questions 20 --research-dir backtests/research_archive/latest $(ARGS))
 
 # Check OpenRouter key balances. Pass ARGS="--key donated" or ARGS="--key personal"
 # to limit which key is queried (default: both).

@@ -110,3 +110,13 @@ jobs:
           # is_benchmarking=False in the prod path (this workflow), so the
           # provider's own benchmarking guard doesn't suppress it here.
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Persist research outputs as JSONL for offline backtest replay.
+          PERSIST_RESEARCH_ENABLED: 'true'
+      - name: Upload research outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-${{ github.run_id }}
+          path: research_outputs/
+          retention-days: 180
+          if-no-files-found: ignore
