@@ -97,3 +97,5 @@ jobs:
           # Manual workflow_dispatch runs use this for end-to-end testing in prod
           # mode (is_benchmarking=False).
           PREDICTION_MARKETS_ENABLED: 'true'
+          NUMERIC_STACKING_ENABLED: 'false'
+          OPENAI_AGENTS_DISABLE_TRACING: 'true'

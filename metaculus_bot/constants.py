@@ -91,7 +91,7 @@ load_environment()
 
 # Concurrency tuning for research providers (e.g., AskNews, Exa)
 # Start conservatively for AskNews; adjust after observing rate limits.
-DEFAULT_MAX_CONCURRENT_RESEARCH: int = 1
+DEFAULT_MAX_CONCURRENT_RESEARCH: int = 6
 
 # Benchmark driver settings
 # Default batch size for benchmarking runs
@@ -298,10 +298,13 @@ GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
 # No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
 # Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
 # capping either caused silent truncations in the past.
-# 3 min. Observed p99 of Gemini grounded calls (first-pass + gap-fill) ≈ 52s;
-# 180s leaves ~3x headroom. Previously 600s, which was enough to sit behind a
-# stuck upstream for the full worst-case batch budget.
-GEMINI_SEARCH_TIMEOUT: int = 180
+# 6 min. AFC (Automatic Function Calling) can chain up to 10 tool round-trips
+# internally (search → model → URL fetch → model → ...), each ~15-20s. A full
+# 10-round chain takes 150-200s, so 180s was too tight — observed timeouts on
+# legitimate deep-research calls. 360s gives 2x headroom over worst-case AFC.
+# Gap-fill runs overlapped with forecaster LLM calls, so higher timeout adds
+# zero wall-clock cost. Observed p99 of non-AFC calls ≈ 52s.
+GEMINI_SEARCH_TIMEOUT: int = 360
 
 # --- Second-pass gap-fill ---
 # After first-pass research completes, a cheap analyzer identifies up to
@@ -452,6 +455,12 @@ NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
 # quality and leakage defense. Flip ON in production workflows after that
 # gate. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
+
+# Outer wall-clock timeout for the full prediction-market snapshot (keyword
+# extraction + HTTP fan-out to all platforms). Runs inside asyncio.gather
+# alongside other research providers, so increasing this does not add
+# wall-clock time to the overall research phase.
+PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "30.0"))
 
 # Keyword-extraction strategy for matching Metaculus questions to market
 # listings. Default ``s4_s5_union`` is the empirical best on a 15-question

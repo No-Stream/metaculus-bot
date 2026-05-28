@@ -51,6 +51,7 @@ from rapidfuzz import fuzz
 from metaculus_bot.constants import (
     PREDICTION_MARKET_KEYWORD_STRATEGY_ENV,
     PREDICTION_MARKET_KEYWORD_STRATEGY_VALID,
+    PREDICTION_MARKET_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
@@ -284,15 +285,21 @@ class KeywordExtractor:
 
 
 async def _read_json_capped(resp: Any, label: str) -> Any | None:
-    """Parse a response body as JSON, capping the read at MAX_RESPONSE_BYTES.
+    """Parse a response body as JSON, rejecting responses over MAX_RESPONSE_BYTES.
 
-    Real aiohttp exposes `.content.read(n)` which short-circuits the body;
-    test stubs only implement `.json()`. Falls back transparently when the
-    cap path isn't available. Returns None on decode failure (caller logs).
+    Uses `resp.read()` (which reads the full decompressed body) then checks
+    size, rather than `resp.content.read(n)` which returns only whatever is in
+    the internal buffer -- causing silent truncation on chunked/brotli responses.
+
+    Test stubs that only implement `.json()` are handled via the fallback path.
+    Returns None on decode failure or oversized response (caller logs).
     """
-    content_attr = getattr(resp, "content", None)
-    if content_attr is not None and hasattr(content_attr, "read"):
-        raw = await content_attr.read(MAX_RESPONSE_BYTES)
+    read_method = getattr(resp, "read", None)
+    if read_method is not None and callable(read_method):
+        raw = await read_method()
+        if len(raw) > MAX_RESPONSE_BYTES:
+            logger.warning(f"{label} response too large ({len(raw)} bytes > {MAX_RESPONSE_BYTES}); dropping")
+            return None  # noqa: ASYNC910
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
@@ -922,7 +929,7 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
         else:
             as_of = datetime.now(timezone.utc)
 
-        snapshot = await fetch_market_snapshot(question, as_of=as_of)
+        snapshot = await fetch_market_snapshot(question, as_of=as_of, timeout=PREDICTION_MARKET_TIMEOUT)
         return format_snapshot_for_research(snapshot)
 
     return _fetch

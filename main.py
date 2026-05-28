@@ -61,6 +61,8 @@ from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+logging.getLogger("openai.agents").setLevel(logging.ERROR)
+
 load_environment()
 
 

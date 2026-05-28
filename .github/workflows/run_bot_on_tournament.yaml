@@ -112,6 +112,10 @@ jobs:
           # disabled under is_benchmarking=True to prevent backtest leakage
           # (the prod path is_benchmarking=False, so this fires here).
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Disable numeric stacking (n=88 ablation showed it hurts CRPS).
+          NUMERIC_STACKING_ENABLED: 'false'
+          # Suppress openai-agents trace-export background thread (unused).
+          OPENAI_AGENTS_DISABLE_TRACING: 'true'
           # Persist research outputs as JSONL for offline backtest replay.
           PERSIST_RESEARCH_ENABLED: 'true'
       - name: Upload research outputs
