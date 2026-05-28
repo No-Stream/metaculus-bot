@@ -298,10 +298,13 @@ GEMINI_SEARCH_DEFAULT_MODEL: str = "gemini-3-flash-preview"
 # No temperature / top_p / max_tokens overrides — use google-genai SDK defaults.
 # Gemini 3 Flash is a thinking model; Google's defaults are tuned for it and
 # capping either caused silent truncations in the past.
-# 3 min. Observed p99 of Gemini grounded calls (first-pass + gap-fill) ≈ 52s;
-# 180s leaves ~3x headroom. Previously 600s, which was enough to sit behind a
-# stuck upstream for the full worst-case batch budget.
-GEMINI_SEARCH_TIMEOUT: int = 180
+# 6 min. AFC (Automatic Function Calling) can chain up to 10 tool round-trips
+# internally (search → model → URL fetch → model → ...), each ~15-20s. A full
+# 10-round chain takes 150-200s, so 180s was too tight — observed timeouts on
+# legitimate deep-research calls. 360s gives 2x headroom over worst-case AFC.
+# Gap-fill runs overlapped with forecaster LLM calls, so higher timeout adds
+# zero wall-clock cost. Observed p99 of non-AFC calls ≈ 52s.
+GEMINI_SEARCH_TIMEOUT: int = 360
 
 # --- Second-pass gap-fill ---
 # After first-pass research completes, a cheap analyzer identifies up to
