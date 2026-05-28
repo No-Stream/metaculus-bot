@@ -51,6 +51,7 @@ from rapidfuzz import fuzz
 from metaculus_bot.constants import (
     PREDICTION_MARKET_KEYWORD_STRATEGY_ENV,
     PREDICTION_MARKET_KEYWORD_STRATEGY_VALID,
+    PREDICTION_MARKET_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
@@ -922,7 +923,7 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
         else:
             as_of = datetime.now(timezone.utc)
 
-        snapshot = await fetch_market_snapshot(question, as_of=as_of)
+        snapshot = await fetch_market_snapshot(question, as_of=as_of, timeout=PREDICTION_MARKET_TIMEOUT)
         return format_snapshot_for_research(snapshot)
 
     return _fetch

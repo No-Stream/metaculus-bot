@@ -91,7 +91,7 @@ load_environment()
 
 # Concurrency tuning for research providers (e.g., AskNews, Exa)
 # Start conservatively for AskNews; adjust after observing rate limits.
-DEFAULT_MAX_CONCURRENT_RESEARCH: int = 1
+DEFAULT_MAX_CONCURRENT_RESEARCH: int = 6
 
 # Benchmark driver settings
 # Default batch size for benchmarking runs
@@ -452,6 +452,12 @@ NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
 # quality and leakage defense. Flip ON in production workflows after that
 # gate. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
+
+# Outer wall-clock timeout for the full prediction-market snapshot (keyword
+# extraction + HTTP fan-out to all platforms). Runs inside asyncio.gather
+# alongside other research providers, so increasing this does not add
+# wall-clock time to the overall research phase.
+PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "30.0"))
 
 # Keyword-extraction strategy for matching Metaculus questions to market
 # listings. Default ``s4_s5_union`` is the empirical best on a 15-question
