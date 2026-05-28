@@ -81,7 +81,7 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
     ]
 
     with patch(
-        "main.structure_output",
+        "metaculus_bot.forecaster_runners.structure_output",
         side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
     ):
         result = await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
@@ -101,7 +101,7 @@ async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
     q = make_dummy_numeric_question()
     llm = DummyLLM(rationale)
     with patch(
-        "main.structure_output",
+        "metaculus_bot.forecaster_runners.structure_output",
         side_effect=ValidationError.from_exception_data("NumericDistribution", []),
     ):
         with pytest.raises(ValidationError):

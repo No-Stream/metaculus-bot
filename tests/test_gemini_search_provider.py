@@ -343,19 +343,16 @@ class TestParallelProviderSelectionGemini:
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-        from main import TemplateForecaster
+        from forecasting_tools import GeneralLlm
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot._custom_research_provider = None
-            bot.is_benchmarking = False
-            bot.allow_research_fallback = True
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-            async def mock_provider(q: str) -> str:
-                return "primary research"
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
+        mock_provider = AsyncMock(return_value="primary research")
 
-            with patch.object(bot, "_select_research_provider", return_value=(mock_provider, "asknews")):
-                providers = bot._select_research_providers()
+        with patch.object(orch, "_select_research_provider", return_value=(mock_provider, "asknews")):
+            providers = orch._select_research_providers()
 
         provider_names = [name for _, name in providers]
         assert "gemini_search" in provider_names
@@ -370,19 +367,16 @@ class TestParallelProviderSelectionGemini:
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
         monkeypatch.setenv("ASKNEWS_SECRET", "secret")
 
-        from main import TemplateForecaster
+        from forecasting_tools import GeneralLlm
 
-        with patch.object(TemplateForecaster, "__init__", lambda self: None):
-            bot = TemplateForecaster.__new__(TemplateForecaster)
-            bot._custom_research_provider = None
-            bot.is_benchmarking = False
-            bot.allow_research_fallback = True
+        from metaculus_bot.research_orchestrator import ResearchOrchestrator
 
-            async def mock_provider(q: str) -> str:
-                return "primary research"
+        mock_llm = GeneralLlm(model="test/model", temperature=0.0)
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
+        mock_provider = AsyncMock(return_value="primary research")
 
-            with patch.object(bot, "_select_research_provider", return_value=(mock_provider, "asknews")):
-                providers = bot._select_research_providers()
+        with patch.object(orch, "_select_research_provider", return_value=(mock_provider, "asknews")):
+            providers = orch._select_research_providers()
 
         provider_names = [name for _, name in providers]
         assert "gemini_search" not in provider_names

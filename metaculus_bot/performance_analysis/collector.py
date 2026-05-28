@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 
 from metaculus_bot.performance_analysis.parsing import (
     parse_inferred_stacker_outcome,
+    parse_per_base_model_forecasts,
     parse_per_model_forecasts,
+    parse_per_model_mc_option_probs,
     parse_per_model_numeric_percentiles,
     parse_resolution,
     parse_stacked_marker,
@@ -178,8 +180,17 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
     comment_id = comment["id"] if comment else None
     comment_created_at = comment.get("created_at") if comment else None
-    per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
+    # MC questions need full per-option probability vectors (not just the top
+    # option line which the legacy single-string parser returned). Detect MC by
+    # checking whether the parser found any option lines; if so, use the dict
+    # values from parse_per_model_mc_option_probs as per_model_forecasts.
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
+    per_model_mc_option_probs = parse_per_model_mc_option_probs(comment_text) if comment_text else {}
+    if per_model_mc_option_probs:
+        # MC question: use the full option-probability dicts.
+        per_model = per_model_mc_option_probs
+    else:
+        per_model = parse_per_model_forecasts(comment_text) if comment_text else {}
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
     # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
     # the legacy STACKED= marker, then to historical body-shape detection for
@@ -203,6 +214,12 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
 
     records: list[dict] = []
     for q in questions:
+        # Recover per-base-model forecasts from the stacker-combined R1 body.
+        # Empty for non-stacked comments; binary returns {model: "XX.X%"}, MC
+        # returns {model: {option: prob}}, numeric returns {} (use
+        # per_model_numeric_percentiles instead — it already handles stacking).
+        q_type_for_base = q.get("type", "") if q else ""
+        per_base_model_forecasts = parse_per_base_model_forecasts(comment_text, q_type_for_base) if comment_text else {}
         record = _process_single_question(
             post_id,
             title,
@@ -216,6 +233,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             comment_created_at=comment_created_at,
             stacker_outcome=stacker_outcome,
             stacker_outcome_source=stacker_outcome_source,
+            per_base_model_forecasts=per_base_model_forecasts,
         )
         if record is not None:
             records.append(record)
@@ -228,7 +246,7 @@ def _process_single_question(
     q: dict,
     comment_text: str | None,
     comment_id: int | None,
-    per_model: dict[str, str],
+    per_model: dict[str, str] | dict[str, dict[str, float]],
     per_model_numeric_percentiles: dict[str, list[tuple[float, float]]],
     was_stacked: bool | None,
     post_data: dict,
@@ -236,6 +254,7 @@ def _process_single_question(
     comment_created_at: str | None = None,
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
+    per_base_model_forecasts: dict[str, str] | dict[str, dict[str, float]] | None = None,
 ) -> dict | None:
     """Process a single question dict into a scored record."""
     question_id = q.get("id")
@@ -298,6 +317,15 @@ def _process_single_question(
         "our_forecast_values": forecast_values,
         "our_prob_yes": prob_yes,
         "per_model_forecasts": per_model,
+        # Per-base-model forecasts recovered from stacker-combined R1 reasoning
+        # bodies. Empty for non-stacked comments. Binary: dict[str, str] like
+        # ``{"gpt-5.5": "72.0%"}``. MC: dict[str, dict[str, float]] (per-base-
+        # model option dicts). Numeric/discrete: empty dict — those question
+        # types use ``per_model_numeric_percentiles`` which already handles
+        # stacker-combined bodies. Downstream stacker_detection prefers this
+        # field for median/spread computations on stacked records, where
+        # ``per_model_forecasts`` collapses to the stacker's single aggregate.
+        "per_base_model_forecasts": per_base_model_forecasts or {},
         # Per-forecaster percentile lists for numeric/discrete questions.
         # {model_name: [(percentile, value), ...]}. Empty for binary/MC.
         "per_model_numeric_percentiles": per_model_numeric_percentiles,

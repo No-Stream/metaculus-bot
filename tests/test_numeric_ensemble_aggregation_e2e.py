@@ -161,7 +161,7 @@ async def _drive_forecast(
     parser_percentiles: list[Percentile] | None,
 ) -> NumericDistribution:
     """Run a single forecaster end-to-end through _run_forecast_on_numeric."""
-    with patch("main.structure_output", new=_structure_output_mock(parser_percentiles)):
+    with patch("metaculus_bot.forecaster_runners.structure_output", new=_structure_output_mock(parser_percentiles)):
         with patch.object(GeneralLlm, "invoke", new=AsyncMock(return_value=rationale)):
             pred = await bot._run_forecast_on_numeric(question, research="r", llm_to_use=GeneralLlm(model="test-model"))
     assert isinstance(pred.prediction_value, NumericDistribution)

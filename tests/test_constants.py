@@ -9,12 +9,16 @@ update and reason about.
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
+    BINARY_STACKING_ENABLED_ENV,
     MC_PROB_MAX,
     MC_PROB_MIN,
+    MC_STACKING_ENABLED_ENV,
     NATIVE_SEARCH_DEFAULT_MODEL,
     NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
     NATIVE_SEARCH_TIMEOUT,
     NATIVE_SEARCH_VERBOSITY_DEFAULT,
+    NUMERIC_STACKING_ENABLED_ENV,
+    env_flag_enabled,
 )
 
 
@@ -83,3 +87,65 @@ class TestNativeSearchDefaults:
     def test_native_search_timeout_is_360s(self):
         """360s cap leaves ~130s headroom on top of observed p99 (~230s)."""
         assert NATIVE_SEARCH_TIMEOUT == 360
+
+
+class TestEnvFlagEnabledDefaultKwarg:
+    """Tests for the ``default`` keyword argument on ``env_flag_enabled``."""
+
+    def test_unset_env_returns_default_true(self, monkeypatch):
+        """When env var is unset, returns the provided default (True)."""
+        monkeypatch.delenv("_TEST_FLAG_NONEXISTENT_XYZ", raising=False)
+        assert env_flag_enabled("_TEST_FLAG_NONEXISTENT_XYZ", default=True) is True
+
+    def test_unset_env_returns_default_false(self, monkeypatch):
+        """When env var is unset and default=False, returns False."""
+        monkeypatch.delenv("_TEST_FLAG_NONEXISTENT_XYZ", raising=False)
+        assert env_flag_enabled("_TEST_FLAG_NONEXISTENT_XYZ", default=False) is False
+
+    def test_unset_env_returns_false_when_no_default_specified(self, monkeypatch):
+        """Backward compat: no default kwarg means default=False."""
+        monkeypatch.delenv("_TEST_FLAG_NONEXISTENT_XYZ", raising=False)
+        assert env_flag_enabled("_TEST_FLAG_NONEXISTENT_XYZ") is False
+
+    def test_explicit_false_overrides_default_true(self, monkeypatch):
+        """Explicit 'false' always returns False regardless of default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "false")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=True) is False
+
+    def test_explicit_true_overrides_default_false(self, monkeypatch):
+        """Explicit 'true' always returns True regardless of default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "true")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=False) is True
+
+    def test_explicit_zero_overrides_default_true(self, monkeypatch):
+        """'0' is falsy regardless of default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "0")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=True) is False
+
+    def test_explicit_one_overrides_default_false(self, monkeypatch):
+        """'1' is truthy regardless of default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "1")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=False) is True
+
+    def test_empty_string_treated_as_unset(self, monkeypatch):
+        """Empty string env var treated same as unset — returns default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=True) is True
+
+    def test_unrecognized_value_returns_default(self, monkeypatch):
+        """Garbage value falls through to default."""
+        monkeypatch.setenv("_TEST_FLAG_XYZ", "maybe")
+        assert env_flag_enabled("_TEST_FLAG_XYZ", default=True) is True
+
+
+class TestPerTypeStackingEnvVarNames:
+    """Pin the env var name constants for per-type stacking gates."""
+
+    def test_binary_stacking_enabled_env_name(self):
+        assert BINARY_STACKING_ENABLED_ENV == "BINARY_STACKING_ENABLED"
+
+    def test_mc_stacking_enabled_env_name(self):
+        assert MC_STACKING_ENABLED_ENV == "MC_STACKING_ENABLED"
+
+    def test_numeric_stacking_enabled_env_name(self):
+        assert NUMERIC_STACKING_ENABLED_ENV == "NUMERIC_STACKING_ENABLED"

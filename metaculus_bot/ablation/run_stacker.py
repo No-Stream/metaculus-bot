@@ -6,9 +6,9 @@ Reads cached forecaster rationales, runs the tool-runner (per-rationale
 ``PROBABILISTIC_TOOLS_ENABLED`` env-var state at the moment we call the
 tool-runner functions:
 
-* ARM_A — flag explicitly unset; both ``run_tools_for_forecaster`` and
+* ARM_STACK — flag explicitly unset; both ``run_tools_for_forecaster`` and
   ``build_cross_model_aggregation`` early-return ``""``.
-* ARM_B — flag set to ``"1"``; both runners produce real markdown that
+* ARM_STACK_AUG — flag set to ``"1"``; both runners produce real markdown that
   gets piped into the stacker prompt.
 
 Caches per ``(qid, arm)``. On primary-stacker failure, falls back to a
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any
 
 from forecasting_tools import (
@@ -58,6 +57,7 @@ from metaculus_bot.ablation.forecasters import (
     question_type_for_serialization,
     serialize_prediction_value,
 )
+from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -65,8 +65,15 @@ from metaculus_bot.numeric_utils import bound_messages
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ARM_A = "A"  # tools OFF
-ARM_B = "B"  # tools ON
+ARM_STACK = "stack"  # LLM stacker, rationale only, no probability-math tools
+ARM_STACK_AUG = "stack_aug"  # LLM stacker, rationale + computed quantities + cross-model aggregation (augmented)
+ARM_PDF = "pdf"  # deterministic structured-math aggregation, no LLM (see metaculus_bot.ablation.run_pdf)
+ARM_PDF_MIN1 = "pdf_min1"  # pdf arm with min_forecasters=1 (any structured output qualifies)
+ARM_PDF_MIN2 = "pdf_min2"  # pdf arm with min_forecasters=2 (proper aggregation)
+ARM_MEDIAN = (
+    "median"  # deterministic median over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_median)
+)
+ARM_MEAN = "mean"  # deterministic mean over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_mean)
 
 # Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
 # claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.5 as
@@ -138,8 +145,13 @@ def _build_default_fallback_stacker_llm() -> GeneralLlm:
 # ``forecasters.py`` and this module from importing each other.
 __all__ = [
     "ABLATION_MIN_FORECASTERS",
-    "ARM_A",
-    "ARM_B",
+    "ARM_MEAN",
+    "ARM_MEDIAN",
+    "ARM_PDF",
+    "ARM_PDF_MIN1",
+    "ARM_PDF_MIN2",
+    "ARM_STACK_AUG",
+    "ARM_STACK",
     "DEFAULT_PARSER_MODEL",
     "DEFAULT_STACKER_FALLBACK_MODEL",
     "DEFAULT_STACKER_MODEL",
@@ -165,6 +177,11 @@ ABLATION_MIN_FORECASTERS = 2
 # from both arms. Truncating per-rationale (tail-preserving so the
 # conclusion survives) is far cheaper than losing both arms.
 APPROX_STACKER_CHAR_LIMIT = 4 * (128_000 - 30_000)
+
+# Sentinel to distinguish "caller didn't pass a value" from "caller explicitly
+# passed None" for the fallback_stacker_llm parameter. When None is passed
+# explicitly (--no-stacker-fallback), we respect it and skip the fallback chain.
+_UNSET: object = object()
 
 
 def _truncate_long_rationales(base_texts: list[str], char_limit: int) -> list[str]:
@@ -401,7 +418,7 @@ async def run_stacker_for_arm(
     cache: AblationCache,
     *,
     stacker_llm: GeneralLlm | None = None,
-    fallback_stacker_llm: GeneralLlm | None = None,
+    fallback_stacker_llm: GeneralLlm | None | object = _UNSET,
     parser_llm: GeneralLlm | None = None,
     force: bool = False,
 ) -> dict:
@@ -444,21 +461,13 @@ async def run_stacker_for_arm(
 
     surviving = _surviving_forecasters(forecaster_payloads)
     if len(surviving) < ABLATION_MIN_FORECASTERS:
-        # Schema invariant: every stacker payload carries ``stacker_model_used``.
-        # ``None`` here means "stacker never ran" (insufficient inputs); other
-        # branches set ``"primary"``, ``"fallback"``, or leave ``None`` after a
-        # both-stackers-failed exception. Keeping the key present in every
-        # payload lets cli.py:_stage_stack read it via direct subscript.
-        error_payload = {
-            "success": False,
-            "arm": arm,
-            "reason": "insufficient_forecasters",
-            "stacker_model_used": None,
-            "n_forecasters_used": len(surviving),
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": arm == ARM_B,
-            "errors": [],
-        }
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="insufficient_forecasters",
+            model_used=None,
+            n_forecasters=len(surviving),
+            tools_enabled=arm == ARM_STACK_AUG,
+        )
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
         await asyncio.sleep(0)
         return error_payload
@@ -470,12 +479,14 @@ async def run_stacker_for_arm(
     # key; see module docstring for cost expectations.
     if stacker_llm is None:
         stacker_llm = _build_default_stacker_llm()
-    if fallback_stacker_llm is None:
+    # _UNSET means "caller didn't specify" → build default. Explicit None means
+    # "no fallback" (--no-stacker-fallback) → leave as None.
+    if fallback_stacker_llm is _UNSET:
         fallback_stacker_llm = _build_default_fallback_stacker_llm()
     if parser_llm is None:
         parser_llm = GeneralLlm(model=DEFAULT_PARSER_MODEL, allowed_tries=1)
 
-    enable_tools = arm == ARM_B
+    enable_tools = arm == ARM_STACK_AUG
 
     with probabilistic_tools_enabled(enable_tools):
         # Per-rationale "Computed quantities" augmentation. The runner
@@ -564,26 +575,55 @@ async def run_stacker_for_arm(
                 except Exception as primary_exc:  # noqa: BLE001 - translated to cached error payload
                     logger.exception("Primary stacker failed for qid=%s arm=%s", qid, arm)
                     errors_list.append(f"primary: {type(primary_exc).__name__}: {primary_exc!r}")
-                    try:
-                        # Tighter deadline on fallback mirrors production
-                        # main.py:1271 — by the time we're falling back,
-                        # we're already late on the critical path.
-                        result = await asyncio.wait_for(
-                            _dispatch_stacker(
-                                question=question,
-                                research=research_blob,
-                                base_texts=augmented_base_texts,
-                                stacker_llm=fallback_stacker_llm,
-                                parser_llm=parser_llm,
-                                aggregated_tool_output=aggregated_for_stacker,
-                            ),
-                            timeout=STACKER_FALLBACK_SOFT_DEADLINE,
-                        )
-                        stacker_model_used = "fallback"
-                    except Exception as fallback_exc:  # noqa: BLE001 - translated to cached error payload
-                        logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
-                        errors_list.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
+                    if fallback_stacker_llm is not None:
+                        try:
+                            # Tighter deadline on fallback mirrors production
+                            # main.py:1271 — by the time we're falling back,
+                            # we're already late on the critical path.
+                            result = await asyncio.wait_for(
+                                _dispatch_stacker(
+                                    question=question,
+                                    research=research_blob,
+                                    base_texts=augmented_base_texts,
+                                    stacker_llm=fallback_stacker_llm,
+                                    parser_llm=parser_llm,
+                                    aggregated_tool_output=aggregated_for_stacker,
+                                ),
+                                timeout=STACKER_FALLBACK_SOFT_DEADLINE,
+                            )
+                            stacker_model_used = "fallback"
+                        except Exception as fallback_exc:  # noqa: BLE001 - translated to cached error payload
+                            logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
+                            errors_list.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
+                            result = None
+                    else:
+                        # --no-stacker-fallback: skip fallback chain entirely.
                         result = None
+
+    if result is None and fallback_stacker_llm is None:
+        # --no-stacker-fallback mode: primary failed, no fallback chain available.
+        # Write the failure payload to cache so the per-question state is preserved
+        # for resume, then RAISE so the orchestrator aborts the run. This is true
+        # fail-fast: a borked-key scenario aborts at qid #1 instead of silently
+        # failing all 88. Resume after manual fix via ``--qids <remaining>`` —
+        # the cache layer auto-skips qids whose arm payload already exists.
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="stacker_failed_no_fallback",
+            model_used=stacker_model_used,
+            n_forecasters=len(surviving),
+            computed_quantities=per_forecaster_md,
+            cross_model_aggregation=cross_model_md or "",
+            tools_enabled=enable_tools,
+            errors=errors_list,
+        )
+        cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
+        joined_errors = "; ".join(errors_list) if errors_list else "<no errors recorded>"
+        raise RuntimeError(
+            f"Stacker failed for qid={qid} arm={arm} with --no-stacker-fallback set. "
+            f"Aborting run. Errors: {joined_errors}. "
+            f"Resume after fixing root cause; cache has the failure payload."
+        )
 
     if result is None:
         # Tertiary MEDIAN fallback (mirror of main.py:1287-1322): both stackers
@@ -595,21 +635,17 @@ async def run_stacker_for_arm(
         # outcomes.
         try:
             median_prediction = await _median_fallback_prediction(question, surviving)
-            median_payload = {
-                "success": True,
-                "arm": arm,
-                "stacker_prediction": serialize_prediction_value(
-                    median_prediction, question_type_for_serialization(question)
-                ),
-                "stacker_meta_reasoning": "median_fallback: both stackers failed",
-                "computed_quantities": per_forecaster_md,
-                "cross_model_aggregation": cross_model_md or "",
-                "stacker_model_used": "median_fallback",
-                "n_forecasters_used": len(surviving),
-                "ran_at": datetime.now().isoformat(),
-                "tools_enabled_at_runtime": enable_tools,
-                "errors": errors_list,
-            }
+            median_payload = make_success_payload(
+                arm=arm,
+                prediction=serialize_prediction_value(median_prediction, question_type_for_serialization(question)),
+                meta_reasoning="median_fallback: both stackers failed",
+                computed_quantities=per_forecaster_md,
+                cross_model_aggregation=cross_model_md or "",
+                model_used="median_fallback",
+                n_forecasters=len(surviving),
+                tools_enabled=enable_tools,
+                errors=errors_list,
+            )
             logger.warning(
                 "Median fallback engaged for qid=%s arm=%s after both stackers failed",
                 qid,
@@ -620,20 +656,16 @@ async def run_stacker_for_arm(
         except Exception as median_exc:  # noqa: BLE001 - degrade gracefully
             logger.exception("Median fallback failed for qid=%s arm=%s", qid, arm)
             errors_list.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
-            error_payload = {
-                "success": False,
-                "arm": arm,
-                "reason": "stacker_failed",
-                "stacker_prediction": None,
-                "stacker_meta_reasoning": "",
-                "computed_quantities": per_forecaster_md,
-                "cross_model_aggregation": cross_model_md or "",
-                "stacker_model_used": stacker_model_used,
-                "n_forecasters_used": len(surviving),
-                "ran_at": datetime.now().isoformat(),
-                "tools_enabled_at_runtime": enable_tools,
-                "errors": errors_list,
-            }
+            error_payload = make_error_payload(
+                arm=arm,
+                reason="stacker_failed",
+                model_used=stacker_model_used,
+                n_forecasters=len(surviving),
+                computed_quantities=per_forecaster_md,
+                cross_model_aggregation=cross_model_md or "",
+                tools_enabled=enable_tools,
+                errors=errors_list,
+            )
             cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
             await asyncio.sleep(0)
             return error_payload
@@ -650,37 +682,32 @@ async def run_stacker_for_arm(
             arm,
         )
         errors_list.append(f"{stacker_model_used}: stacker output contained NaN/inf")
-        error_payload = {
-            "success": False,
-            "arm": arm,
-            "reason": "stacker_nonfinite_output",
-            "stacker_prediction": None,
-            "stacker_meta_reasoning": stacker_meta,
-            "computed_quantities": per_forecaster_md,
-            "cross_model_aggregation": cross_model_md or "",
-            "stacker_model_used": stacker_model_used,
-            "n_forecasters_used": len(surviving),
-            "ran_at": datetime.now().isoformat(),
-            "tools_enabled_at_runtime": enable_tools,
-            "errors": errors_list,
-        }
+        error_payload = make_error_payload(
+            arm=arm,
+            reason="stacker_nonfinite_output",
+            meta_reasoning=stacker_meta,
+            model_used=stacker_model_used,
+            n_forecasters=len(surviving),
+            computed_quantities=per_forecaster_md,
+            cross_model_aggregation=cross_model_md or "",
+            tools_enabled=enable_tools,
+            errors=errors_list,
+        )
         cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
         await asyncio.sleep(0)
         return error_payload
 
-    success_payload = {
-        "success": True,
-        "arm": arm,
-        "stacker_prediction": serialized_prediction,
-        "stacker_meta_reasoning": stacker_meta,
-        "computed_quantities": per_forecaster_md,
-        "cross_model_aggregation": cross_model_md or "",
-        "stacker_model_used": stacker_model_used,
-        "n_forecasters_used": len(surviving),
-        "ran_at": datetime.now().isoformat(),
-        "tools_enabled_at_runtime": enable_tools,
-        "errors": errors_list,
-    }
+    success_payload = make_success_payload(
+        arm=arm,
+        prediction=serialized_prediction,
+        meta_reasoning=stacker_meta,
+        computed_quantities=per_forecaster_md,
+        cross_model_aggregation=cross_model_md or "",
+        model_used=stacker_model_used,
+        n_forecasters=len(surviving),
+        tools_enabled=enable_tools,
+        errors=errors_list,
+    )
     cache.write_stacker_output(qid=qid, arm=arm, payload=success_payload)
     await asyncio.sleep(0)
     return success_payload
@@ -697,7 +724,7 @@ async def run_stacker_batch(
     cache: AblationCache,
     *,
     stacker_llm: GeneralLlm | None = None,
-    fallback_stacker_llm: GeneralLlm | None = None,
+    fallback_stacker_llm: GeneralLlm | None | object = _UNSET,
     parser_llm: GeneralLlm | None = None,
     force: bool = False,
     concurrency: int = 2,
@@ -712,7 +739,7 @@ async def run_stacker_batch(
     """
     if stacker_llm is None:
         stacker_llm = _build_default_stacker_llm()
-    if fallback_stacker_llm is None:
+    if fallback_stacker_llm is _UNSET:
         fallback_stacker_llm = _build_default_fallback_stacker_llm()
     if parser_llm is None:
         parser_llm = GeneralLlm(model=DEFAULT_PARSER_MODEL, allowed_tries=1)

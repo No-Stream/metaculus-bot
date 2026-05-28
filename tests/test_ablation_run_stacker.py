@@ -44,8 +44,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import (
-    ARM_A,
-    ARM_B,
+    ARM_STACK,
+    ARM_STACK_AUG,
     probabilistic_tools_enabled,
     run_stacker_batch,
     run_stacker_for_arm,
@@ -343,7 +343,7 @@ class TestArmEnvVarSemantics:
                     question=_make_binary_q(),
                     research_blob="research",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -351,7 +351,7 @@ class TestArmEnvVarSemantics:
                 )
             )
         assert payload["success"] is True
-        assert payload["arm"] == ARM_A
+        assert payload["arm"] == ARM_STACK
         assert payload["tools_enabled_at_runtime"] is False
         # The flag was unset for every per-forecaster tool-runner call
         assert seen_flag_states  # at least one call recorded
@@ -395,7 +395,7 @@ class TestArmEnvVarSemantics:
                     question=_make_binary_q(),
                     research_blob="research",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -403,7 +403,7 @@ class TestArmEnvVarSemantics:
                 )
             )
         assert payload["success"] is True
-        assert payload["arm"] == ARM_B
+        assert payload["arm"] == ARM_STACK_AUG
         assert payload["tools_enabled_at_runtime"] is True
         assert seen_flag_states
         for state in seen_flag_states:
@@ -448,7 +448,7 @@ class TestAggregatedToolOutputPassing:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -490,7 +490,7 @@ class TestAggregatedToolOutputPassing:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -540,7 +540,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -583,7 +583,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_B,  # even in arm B
+                    arm=ARM_STACK_AUG,  # even in arm B
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -627,7 +627,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -668,7 +668,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -711,7 +711,7 @@ class TestPerForecasterComputedQuantities:
                     question=_make_binary_q(),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -737,7 +737,7 @@ class TestCacheBehavior:
         # Pre-write a stacker output for (qid=1, arm=A)
         cached_payload = {
             "success": True,
-            "arm": ARM_A,
+            "arm": ARM_STACK,
             "stacker_prediction": 0.42,
             "stacker_meta_reasoning": "cached",
             "computed_quantities": {},
@@ -748,7 +748,7 @@ class TestCacheBehavior:
             "tools_enabled_at_runtime": False,
             "errors": [],
         }
-        cache.write_stacker_output(qid=1, arm=ARM_A, payload=cached_payload)
+        cache.write_stacker_output(qid=1, arm=ARM_STACK, payload=cached_payload)
 
         runner_mock = MagicMock(return_value="")
         agg_mock = MagicMock(return_value="")
@@ -773,7 +773,7 @@ class TestCacheBehavior:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -794,7 +794,7 @@ class TestCacheBehavior:
     ) -> None:
         cached_payload = {
             "success": True,
-            "arm": ARM_A,
+            "arm": ARM_STACK,
             "stacker_prediction": 0.42,
             "stacker_meta_reasoning": "cached",
             "computed_quantities": {},
@@ -805,7 +805,7 @@ class TestCacheBehavior:
             "tools_enabled_at_runtime": False,
             "errors": [],
         }
-        cache.write_stacker_output(qid=1, arm=ARM_A, payload=cached_payload)
+        cache.write_stacker_output(qid=1, arm=ARM_STACK, payload=cached_payload)
 
         def _fake_stacker(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
             return 0.99, "fresh meta"
@@ -829,7 +829,7 @@ class TestCacheBehavior:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -882,7 +882,7 @@ class TestInsufficientForecasters:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=forecasters,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -892,7 +892,7 @@ class TestInsufficientForecasters:
         assert payload["success"] is False
         assert payload["reason"] == "insufficient_forecasters"
         # Cached
-        on_disk = cache.read_stacker_output(qid=1, arm=ARM_A)
+        on_disk = cache.read_stacker_output(qid=1, arm=ARM_STACK)
         assert on_disk is not None
         assert on_disk["success"] is False
         # Stacker never invoked
@@ -938,7 +938,7 @@ class TestInsufficientForecasters:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=forecasters,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -993,7 +993,7 @@ class TestPrimaryFallbackChain:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1045,7 +1045,7 @@ class TestPrimaryFallbackChain:
                     question=_make_binary_q(qid=99),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1058,7 +1058,7 @@ class TestPrimaryFallbackChain:
         assert "primary boom" in str(payload["errors"])
         assert "fallback boom" in str(payload["errors"])
         # Cached payload visible for downstream confounder analysis
-        on_disk = cache.read_stacker_output(qid=99, arm=ARM_A)
+        on_disk = cache.read_stacker_output(qid=99, arm=ARM_STACK)
         assert on_disk is not None
         assert on_disk["success"] is True
         assert on_disk["stacker_model_used"] == "median_fallback"
@@ -1126,7 +1126,7 @@ class TestSoftDeadline:
                     question=_make_binary_q(qid=801),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1180,7 +1180,7 @@ class TestSoftDeadline:
                     question=_make_binary_q(qid=802),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1233,7 +1233,7 @@ class TestWindowPatchActive:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1304,7 +1304,7 @@ class TestQuestionTypeDispatch:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1363,7 +1363,7 @@ class TestQuestionTypeDispatch:
                     question=_make_mc_q(qid=2),
                     research_blob="R",
                     forecaster_payloads=_three_mc_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1425,7 +1425,7 @@ class TestQuestionTypeDispatch:
                     question=_make_numeric_q(qid=3),
                     research_blob="R",
                     forecaster_payloads=_three_numeric_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1502,7 +1502,7 @@ class TestQuestionTypeDispatch:
                     question=_make_numeric_q(qid=42),
                     research_blob="R",
                     forecaster_payloads=_three_numeric_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1567,7 +1567,7 @@ class TestPayloadShape:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1589,7 +1589,7 @@ class TestPayloadShape:
         }
         assert expected_keys.issubset(payload.keys())
         assert payload["success"] is True
-        assert payload["arm"] == ARM_A
+        assert payload["arm"] == ARM_STACK
         assert payload["stacker_prediction"] == {"type": "binary", "prob": 0.62}
         assert payload["stacker_meta_reasoning"] == "stacker meta text"
         assert payload["stacker_model_used"] == "primary"
@@ -1626,7 +1626,7 @@ class TestPayloadShape:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1698,7 +1698,7 @@ class TestPayloadShape:
                     question=question,
                     research_blob="R",
                     forecaster_payloads=_three_numeric_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1765,7 +1765,7 @@ class TestPayloadShape:
                     question=_make_mc_q(qid=2),
                     research_blob="R",
                     forecaster_payloads=_three_mc_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1830,7 +1830,7 @@ class TestRunStackerBatch:
             results = _run(
                 run_stacker_batch(
                     qid_to_data=qid_to_data,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1887,7 +1887,7 @@ class TestRunStackerBatch:
             results = _run(
                 run_stacker_batch(
                     qid_to_data=qid_to_data,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -1943,7 +1943,7 @@ class TestRunStackerBatch:
             _run(
                 run_stacker_batch(
                     qid_to_data=qid_to_data,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2014,7 +2014,7 @@ class TestConcurrentStackerLock:
                         question=_make_binary_q(qid=101),
                         research_blob="R101",
                         forecaster_payloads=_three_binary_forecasters(),
-                        arm=ARM_A,
+                        arm=ARM_STACK,
                         cache=cache,
                         stacker_llm=stacker_llm,
                         fallback_stacker_llm=fallback_stacker_llm,
@@ -2024,7 +2024,7 @@ class TestConcurrentStackerLock:
                         question=_make_binary_q(qid=102),
                         research_blob="R102",
                         forecaster_payloads=_three_binary_forecasters(),
-                        arm=ARM_A,
+                        arm=ARM_STACK,
                         cache=cache,
                         stacker_llm=stacker_llm,
                         fallback_stacker_llm=fallback_stacker_llm,
@@ -2189,7 +2189,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_binary_q(qid=1),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2259,7 +2259,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_binary_q(qid=2),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2338,7 +2338,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_binary_q(qid=3),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2465,7 +2465,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_numeric_q(qid=4),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2538,7 +2538,7 @@ class TestRealToolRunnerIntegration:
                     question=_make_mc_q(qid=5),
                     research_blob="research",
                     forecaster_payloads=forecasters,
-                    arm=ARM_B,
+                    arm=ARM_STACK_AUG,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2620,7 +2620,7 @@ class TestDefaultStackerWiredViaDonatedKey:
                     question=_make_binary_q(qid=1),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=None,  # exercise default construction
                     fallback_stacker_llm=None,
@@ -2674,7 +2674,7 @@ class TestDefaultStackerWiredViaDonatedKey:
             results = _run(
                 run_stacker_batch(
                     qid_to_data=qid_to_data,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=None,  # exercise default construction
                     fallback_stacker_llm=None,
@@ -2699,6 +2699,71 @@ class TestDefaultStackerWiredViaDonatedKey:
 # confounder analysis can distinguish it from the regular primary/fallback
 # outcomes.
 # ===========================================================================
+
+
+class TestNoStackerFallback:
+    """Fail-fast contract for ``--no-stacker-fallback`` (paid prod-ish runs).
+
+    When ``fallback_stacker_llm=None`` is passed explicitly (the new sentinel
+    semantics), a primary-stacker failure must:
+      1. Write a failure payload to cache (so resume-from-cache sees the state).
+      2. Raise ``RuntimeError`` so the orchestrator aborts the run.
+
+    This is true fail-fast: a borked-key scenario aborts at qid #1 instead of
+    silently writing failure payloads for all 88 questions. Prior behavior
+    (``fallback_stacker_llm=None`` meant "build default fallback") is now
+    triggered by omitting the kwarg or passing the ``_UNSET`` sentinel.
+    """
+
+    def test_primary_failure_with_no_fallback_raises_and_writes_failure_payload(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+    ) -> None:
+        forecasters = {
+            model_slug_to_filename("openrouter/test/m1"): _binary_payload("openrouter/test/m1", 0.6),
+            model_slug_to_filename("openrouter/test/m2"): _binary_payload("openrouter/test/m2", 0.5),
+            model_slug_to_filename("openrouter/test/m3"): _binary_payload("openrouter/test/m3", 0.4),
+        }
+
+        def _primary_fails(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
+            raise RuntimeError("primary boom")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_primary_fails),
+            ),
+            pytest.raises(RuntimeError, match="--no-stacker-fallback"),
+        ):
+            _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=3001),
+                    research_blob="R",
+                    forecaster_payloads=forecasters,
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=None,  # explicit None = --no-stacker-fallback
+                    parser_llm=parser_llm,
+                )
+            )
+
+        # Failure payload must be on disk for resume-from-cache to see it.
+        cached = cache.read_stacker_output(qid=3001, arm=ARM_STACK)
+        assert cached is not None
+        assert cached["success"] is False
+        assert cached["reason"] == "stacker_failed_no_fallback"
+        assert cached["stacker_prediction"] is None
 
 
 class TestMedianFallback:
@@ -2737,7 +2802,7 @@ class TestMedianFallback:
                     question=_make_binary_q(qid=2001),
                     research_blob="R",
                     forecaster_payloads=forecasters,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2783,7 +2848,7 @@ class TestMedianFallback:
                     question=_make_mc_q(qid=2002),
                     research_blob="R",
                     forecaster_payloads=_three_mc_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2828,7 +2893,7 @@ class TestMedianFallback:
                     question=_make_numeric_q(qid=2003),
                     research_blob="R",
                     forecaster_payloads=_three_numeric_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2904,7 +2969,7 @@ class TestStackerPromptSizeGuard:
                     question=_make_binary_q(qid=1001),
                     research_blob="research",
                     forecaster_payloads=rationales,
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -2961,7 +3026,7 @@ class TestStackerPromptSizeGuard:
                     question=_make_binary_q(qid=1002),
                     research_blob="research",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,
@@ -3076,7 +3141,7 @@ class TestNaNFiltering:
                     question=_make_binary_q(qid=950),
                     research_blob="R",
                     forecaster_payloads=_three_binary_forecasters(),
-                    arm=ARM_A,
+                    arm=ARM_STACK,
                     cache=cache,
                     stacker_llm=stacker_llm,
                     fallback_stacker_llm=fallback_stacker_llm,

@@ -1,15 +1,19 @@
-"""Free-model forecaster lineup for the probabilistic-tools ablation benchmark.
+"""Forecaster lineups for the probabilistic-tools ablation benchmark.
 
-The ablation benchmark needs cheap forecasters: we run the SAME N forecasters
-once per question against pre-cached Gemini research, then feed those rationales
-into BOTH stacker arms (tools-on, tools-off) — so the per-forecaster cost is
-amortized across two arms. We pick free OpenRouter models so a 100-question
-medium backtest doesn't burn budget on the forecaster stage.
+Two lineups are available:
 
-**Routing posture**: ablation explicitly opts out of the donated-OpenRouter-key
-path. ``build_free_forecaster_llms`` and ``build_free_parser_llm`` construct
-plain ``GeneralLlm`` instances with no ``api_key`` set, so litellm picks up
-the operator's paid ``OPENROUTER_API_KEY`` from env at invoke time. Reasons:
+* **Free-tier** (``FREE_FORECASTER_MODELS``): cheap free OpenRouter models so a
+  100-question medium backtest doesn't burn budget on the forecaster stage. The
+  same N forecasters run once per question, and their rationales feed BOTH stacker
+  arms — so per-forecaster cost is amortized across arms.
+* **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Gemini 3.1
+  Pro, Claude Opus 4.5 medium-thinking, GPT-5.5 medium-effort) for the paid
+  ablation re-run on a quality-representative ensemble.
+
+**Routing posture**: both lineups explicitly opt out of the donated-OpenRouter-key
+path. All builder functions construct plain ``GeneralLlm`` instances with no
+``api_key`` set, so litellm picks up the operator's paid ``OPENROUTER_API_KEY``
+from env at invoke time. Reasons:
 
 1. **Resource accounting.** The donated key is for production
    ensemble + stacker work; ablation runs are exploratory work charged to the
@@ -20,10 +24,10 @@ the operator's paid ``OPENROUTER_API_KEY`` from env at invoke time. Reasons:
    The donated key returns 404 (we'd burn time on transient failures + the
    alerting non-zero exit) for any model whose only provider isn't in
    ``DONATED_KEY_PROVIDERS``. Plain GeneralLlm sidesteps this entirely.
-3. **Cleaner first-light**: no fallback wrapping means failures are
+3. **Fail-fast observability**: no fallback wrapping means failures are
    directly diagnostic — what you see is what hit OpenRouter.
 
-Edit ``FREE_FORECASTER_MODELS`` to swap the lineup.
+Edit ``FREE_FORECASTER_MODELS`` / ``PROD_FORECASTER_SPECS`` to swap lineups.
 """
 
 from __future__ import annotations
@@ -31,14 +35,55 @@ from __future__ import annotations
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.benchmark.bot_factory import MODEL_CONFIG
-from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG
+from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG, REASONING_MODEL_CONFIG
 
 __all__ = [
     "FREE_FORECASTER_MODELS",
     "FREE_PARSER_MODEL",
+    "PROD_FORECASTER_MODELS",
+    "PROD_FORECASTER_SPECS",
     "build_free_forecaster_llms",
     "build_free_parser_llm",
+    "build_prod_forecaster_llms",
+    "get_lineup",
 ]
+
+# ---------------------------------------------------------------------------
+# Prod-ish lineup: 3 paid frontier models for the quality ablation re-run.
+# Plain GeneralLlm (no donated-key wrapper, no fallbacks) — benchmark-mode
+# posture per scratch_docs_and_planning/prod_ish_ablation_plan.md. litellm
+# reads OPENROUTER_API_KEY at invoke time. Failures propagate; resume manually.
+# ---------------------------------------------------------------------------
+
+PROD_FORECASTER_SPECS: list[tuple[str, dict]] = [
+    ("openrouter/google/gemini-3.1-pro-preview", {}),  # auto-reasons; mirrors prod
+    ("openrouter/anthropic/claude-opus-4.5", {"reasoning": {"max_tokens": 16_000}}),  # medium = 16k thinking
+    ("openrouter/openai/gpt-5.5", {"reasoning": {"effort": "medium"}}),
+]
+PROD_FORECASTER_MODELS: list[str] = [m for m, _ in PROD_FORECASTER_SPECS]
+
+
+def build_prod_forecaster_llms() -> list[GeneralLlm]:
+    """Construct plain GeneralLlm instances for the prod-ish 3-model ensemble.
+
+    Plain (no donated-key wrapper, no fallbacks) -- benchmark-mode posture per
+    scratch_docs_and_planning/prod_ish_ablation_plan.md. litellm reads
+    OPENROUTER_API_KEY at invoke time. Failures propagate; resume manually.
+    """
+    return [GeneralLlm(model=model, **{**REASONING_MODEL_CONFIG, **kwargs}) for model, kwargs in PROD_FORECASTER_SPECS]
+
+
+def get_lineup(name: str) -> tuple[list[GeneralLlm], list[str]]:
+    """Return (llms, model_names) for the named lineup. Raises on unknown name.
+
+    Lineups: ``"free"`` (4 OpenRouter free models), ``"prod"`` (3 paid frontier models).
+    """
+    if name == "free":
+        return build_free_forecaster_llms(), list(FREE_FORECASTER_MODELS)
+    if name == "prod":
+        return build_prod_forecaster_llms(), list(PROD_FORECASTER_MODELS)
+    raise ValueError(f"Unknown lineup: {name!r}. Valid: 'free', 'prod'.")
+
 
 # Lineup history:
 # * ``openrouter/openai/gpt-oss-120b:free`` was originally in this list but

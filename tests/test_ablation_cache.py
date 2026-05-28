@@ -89,7 +89,7 @@ def test_atomic_write_round_trip_forecaster_output(cache: AblationCache) -> None
 
 
 def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
-    payload_a = {
+    payload_stack = {
         "stacker_prediction": 0.55,
         "meta_reasoning": "Arm A reasoning.",
         "computed_quantities": "",
@@ -97,7 +97,7 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
         "ran_at": "2026-05-13T13:00:00",
         "stacker_model_used": "primary",
     }
-    payload_b = {
+    payload_stack_aug = {
         "stacker_prediction": 0.60,
         "meta_reasoning": "Arm B reasoning.",
         "computed_quantities": "## Computed quantities\n\nPooled = 0.58",
@@ -106,11 +106,11 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
         "stacker_model_used": "fallback",
     }
 
-    cache.write_stacker_output(qid=42, arm="A", payload=payload_a)
-    cache.write_stacker_output(qid=42, arm="B", payload=payload_b)
+    cache.write_stacker_output(qid=42, arm="stack", payload=payload_stack)
+    cache.write_stacker_output(qid=42, arm="stack_aug", payload=payload_stack_aug)
 
-    a = cache.read_stacker_output(qid=42, arm="A")
-    b = cache.read_stacker_output(qid=42, arm="B")
+    a = cache.read_stacker_output(qid=42, arm="stack")
+    b = cache.read_stacker_output(qid=42, arm="stack_aug")
     assert a is not None and b is not None
     assert a["stacker_prediction"] == 0.55
     assert b["stacker_prediction"] == 0.60
@@ -169,7 +169,7 @@ def test_cache_miss_returns_none(cache: AblationCache) -> None:
     assert cache.read_research(qid=999) is None
     assert cache.read_leakage_screen(qid=999) is None
     assert cache.read_forecaster_output(qid=999, model_slug="anything") is None
-    assert cache.read_stacker_output(qid=999, arm="A") is None
+    assert cache.read_stacker_output(qid=999, arm="stack") is None
     assert cache.list_forecaster_outputs(qid=999) == {}
     assert cache.read_pruned_research(qid=999) is None
 

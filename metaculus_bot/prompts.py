@@ -251,10 +251,17 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
             • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
-            ── STRUCTURED FORECAST (machine-readable; required) ──
-            After the analysis, emit a fenced ```json block summarizing your forecast
-            in machine-readable form. Downstream deterministic tools consume this.
-            Schema (all fields except `posterior_prob` are optional; omit if not applicable):
+            ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+            You MUST emit a fenced ```json block below, immediately after your analysis
+            and BEFORE your final answer line(s). This block is required for scoring —
+            responses without it are discarded. Downstream tools use these fields to
+            compute calibrated aggregations across forecasters.
+            Schema (all fields except `posterior_prob` are optional — populate as follows):
+            - `prior`: populate if you stated an outside-view base rate in Phase 1.
+            - `base_rate`: populate with k/n if you identified a reference-class frequency.
+            - `hazard`: populate if you computed a conditional-hazard rate (recurring events).
+            - `evidence`: populate with your Phase 2 evidence items (include `likelihood_ratio` if you can estimate one; it strengthens the math).
+            - `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal).
 
             ```json
             {{
@@ -262,11 +269,13 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
               "prior": {{"prob": 0.15, "source": "annual incidence 2015-2024"}},
               "base_rate": {{"k": 3, "n": 12, "ref_class": "years matching condition"}},
               "hazard": {{"rate_per_unit": 0.25, "unit": "year", "window_duration_units": 1.0, "elapsed_fraction": 0.33, "remaining_fraction": 0.67}},
-              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate"}}],
+              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate", "likelihood_ratio": 2.5}}],
               "scenarios": [],
               "posterior_prob": 0.28
             }}
             ```
+
+            Emit the JSON block BEFORE the final Probability line below.
 
             [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
             An example response is: "Probability: 50%"
@@ -359,9 +368,11 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
 
-        ── STRUCTURED FORECAST (machine-readable; required) ──
-        After the analysis, emit a fenced ```json block summarizing your forecast
-        in machine-readable form. Downstream deterministic tools consume this.
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        You MUST emit a fenced ```json block below, immediately after your analysis
+        and BEFORE your final answer line(s). This block is required for scoring —
+        responses without it are discarded. Downstream tools use these fields to
+        compute calibrated aggregations across forecasters.
         Schema (all fields except `option_probs` are optional; omit if not applicable):
 
         ```json
@@ -519,9 +530,11 @@ def numeric_prompt(
             - Forecastability check: does your interval width match the forecastability classification?
             - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
-        ── STRUCTURED FORECAST (machine-readable; required) ──
-        After the analysis, emit a fenced ```json block summarizing your forecast
-        in machine-readable form. Downstream deterministic tools consume this.
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        You MUST emit a fenced ```json block below, immediately after your analysis
+        and BEFORE your final answer line(s). This block is required for scoring —
+        responses without it are discarded. Downstream tools use these fields to
+        compute calibrated aggregations across forecasters.
         Schema (all fields except `declared_percentiles` are optional; omit if not applicable):
 
         ```json

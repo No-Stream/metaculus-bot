@@ -39,7 +39,6 @@ from forecasting_tools.data_models.multiple_choice_report import (
     PredictedOptionList,
 )
 
-import main
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
@@ -168,7 +167,7 @@ async def test_calibration_off_no_change_binary(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.delenv("PLATT_CALIBRATION_ENABLED", raising=False)
     # Non-identity params, deliberately set, to prove the flag (not the
     # params) is what gates the no-op.
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", PlattParams(bias=0.5, slope=1.5))
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", PlattParams(bias=0.5, slope=1.5))
 
     bot = _make_median_bot()
     question = _make_binary_question()
@@ -196,7 +195,7 @@ async def test_calibration_on_identity_no_change_binary(monkeypatch: pytest.Monk
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     # main.BINARY_PLATT_PARAMS is identity by default in params.py, but pin it
     # explicitly so the test doesn't silently regress if defaults change.
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", PlattParams.identity())
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", PlattParams.identity())
 
     bot = _make_median_bot()
     question = _make_binary_question()
@@ -224,7 +223,7 @@ async def test_calibration_on_nonidentity_applies_binary(monkeypatch: pytest.Mon
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_median_bot()
     question = _make_binary_question()
@@ -262,7 +261,7 @@ async def test_calibration_on_nonidentity_applies_mc(monkeypatch: pytest.MonkeyP
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.3, slope=1.4)
-    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.MC_PLATT_PARAMS", params)
 
     bot = _make_median_bot()
     question = _make_mc_question()
@@ -321,13 +320,13 @@ async def test_mc_many_options_can_fall_below_binary_floor(monkeypatch: pytest.M
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.0, slope=1.2)
-    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.MC_PLATT_PARAMS", params)
     # Keep the cap loose so the per-option Platt math, not the cap, is what
     # produces sub-0.02 outputs. The shipping cap is small enough that it
     # would otherwise pin tiny options to within 0.02-ish of their input.
     # 1.0 is loose enough that the cap never binds for any p in [0, 1].
     loose_cap = 1.0
-    monkeypatch.setattr(main, "PLATT_MC_MAX_ABS_DEVIATION", loose_cap)
+    monkeypatch.setattr("metaculus_bot.post_processing.PLATT_MC_MAX_ABS_DEVIATION", loose_cap)
 
     bot = _make_median_bot()
     question = _make_mc_question(n_options=10)
@@ -398,7 +397,7 @@ async def test_stacker_median_fallback_applies_calibration_binary(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot()
     question = _make_binary_question()
@@ -454,7 +453,7 @@ async def test_stacking_base_combine_reentry_does_not_double_apply(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.STACKING)
     question = _make_binary_question()
@@ -488,7 +487,7 @@ async def test_calibration_on_primary_stacker_success_applies_binary(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot()
     question = _make_binary_question()
@@ -518,7 +517,7 @@ async def test_calibration_on_fallback_llm_success_applies_binary(
     """Primary stacker fails, fallback LLM succeeds → calibration applies (line 1295)."""
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot()
     question = _make_binary_question()
@@ -559,7 +558,7 @@ async def test_stacker_median_fallback_applies_calibration_mc(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.3, slope=1.4)
-    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.MC_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot()
     question = _make_mc_question()
@@ -599,7 +598,7 @@ async def test_conditional_stacking_base_combine_reentry_does_not_double_apply(
     """Same as above for CONDITIONAL_STACKING — both strategies share the re-entry guard."""
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     question = _make_binary_question()
@@ -638,7 +637,7 @@ async def test_conditional_stacking_skip_path_applies_platt_binary(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.2)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     question = _make_binary_question()
@@ -676,7 +675,7 @@ async def test_conditional_stacking_skip_path_applies_platt_mc(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.3, slope=1.4)
-    monkeypatch.setattr(main, "MC_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.MC_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING)
     question = _make_mc_question()
@@ -716,7 +715,7 @@ async def test_stacking_base_combine_reentry_multi_input_does_not_apply(
     """
     monkeypatch.setenv("PLATT_CALIBRATION_ENABLED", "true")
     params = PlattParams(bias=0.5, slope=1.5)
-    monkeypatch.setattr(main, "BINARY_PLATT_PARAMS", params)
+    monkeypatch.setattr("metaculus_bot.calibration.BINARY_PLATT_PARAMS", params)
 
     bot = _make_stacking_bot(aggregation_strategy=AggregationStrategy.STACKING)
     question = _make_binary_question()

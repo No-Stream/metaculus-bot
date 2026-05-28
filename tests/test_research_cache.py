@@ -42,7 +42,7 @@ async def test_research_cache_enabled_in_benchmarking_mode(mock_question, test_l
 
     # Mock the research provider
     mock_provider = AsyncMock(return_value="Cached research result")
-    bot._custom_research_provider = mock_provider
+    bot._research._custom_provider = mock_provider
 
     # First call should hit provider and cache result
     result1 = await bot.run_research(mock_question)
@@ -69,7 +69,7 @@ async def test_research_cache_shared_between_bots(mock_question, test_llms):
         research_cache=shared_cache,
         llms=test_llms,
     )
-    bot1._custom_research_provider = AsyncMock(return_value="Shared research")
+    bot1._research._custom_provider = AsyncMock(return_value="Shared research")
 
     # Create second bot with same cache
     bot2 = TemplateForecaster(
@@ -77,17 +77,17 @@ async def test_research_cache_shared_between_bots(mock_question, test_llms):
         research_cache=shared_cache,
         llms=test_llms,
     )
-    bot2._custom_research_provider = AsyncMock(return_value="Different research")
+    bot2._research._custom_provider = AsyncMock(return_value="Different research")
 
     # First bot caches result
     result1 = await bot1.run_research(mock_question)
     assert "Shared research" in result1
-    assert bot1._custom_research_provider.call_count == 1
+    assert bot1._research._custom_provider.call_count == 1
 
     # Second bot should use cached result, not call its provider
     result2 = await bot2.run_research(mock_question)
     assert "Shared research" in result2  # Should get cached result
-    assert bot2._custom_research_provider.call_count == 0  # Should not be called
+    assert bot2._research._custom_provider.call_count == 0  # Should not be called
 
 
 @pytest.mark.asyncio
@@ -101,17 +101,17 @@ async def test_research_cache_disabled_in_non_benchmarking_mode(mock_question, t
         research_cache=shared_cache,
         llms=test_llms,
     )
-    bot._custom_research_provider = AsyncMock(return_value="Non-cached research")
+    bot._research._custom_provider = AsyncMock(return_value="Non-cached research")
 
     # First call
     result1 = await bot.run_research(mock_question)
     assert "Non-cached research" in result1
-    assert bot._custom_research_provider.call_count == 1
+    assert bot._research._custom_provider.call_count == 1
 
     # Second call should hit provider again, not use cache
     result2 = await bot.run_research(mock_question)
     assert "Non-cached research" in result2
-    assert bot._custom_research_provider.call_count == 2  # Should increase
+    assert bot._research._custom_provider.call_count == 2  # Should increase
 
 
 @pytest.mark.asyncio
@@ -123,12 +123,12 @@ async def test_research_cache_disabled_when_cache_is_none(mock_question, test_ll
         research_cache=None,  # No cache provided
         llms=test_llms,
     )
-    bot._custom_research_provider = AsyncMock(return_value="No cache research")
+    bot._research._custom_provider = AsyncMock(return_value="No cache research")
 
     # Should work normally without caching
     result = await bot.run_research(mock_question)
     assert "No cache research" in result
-    assert bot._custom_research_provider.call_count == 1
+    assert bot._research._custom_provider.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -160,7 +160,7 @@ async def test_research_cache_different_questions_separate_cache_entries(test_ll
         else:
             return "Research for Q2"
 
-    bot._custom_research_provider = mock_provider
+    bot._research._custom_provider = mock_provider
 
     # Research both questions
     result1 = await bot.run_research(question1)

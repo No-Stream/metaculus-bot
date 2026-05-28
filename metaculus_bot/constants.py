@@ -107,9 +107,20 @@ COMMENT_CHAR_LIMIT: int = 149_999
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
 
 
-def env_flag_enabled(env_name: str) -> bool:
-    """Return True iff env var is set to "true"/"1"/"yes" (case-insensitive)."""
-    return os.getenv(env_name, "").lower() in ("true", "1", "yes")
+def env_flag_enabled(env_name: str, *, default: bool = False) -> bool:
+    """Return True iff env var is set to "true"/"1"/"yes" (case-insensitive).
+
+    When the env var is unset (or empty string), returns ``default``.
+    Explicit "false"/"0"/"no" always returns False, regardless of default.
+    """
+    raw = os.getenv(env_name, "").lower()
+    if raw == "":
+        return default
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    return default
 
 
 def _int_env(name: str, default: int) -> int:
@@ -418,6 +429,20 @@ BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
 LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
 
+# --- Per-type stacking gates ---
+# Each question type has an independent enable/disable flag. All three default
+# to ENABLED (current prod behavior for binary + MC; numeric was previously
+# disabled via the deprecated NUMERIC_STACKING_DISABLED env var — deploy config
+# must now set NUMERIC_STACKING_ENABLED=false to preserve that behavior).
+#
+# Background: n=88 ablation + n=25 historical residual both showed stacker
+# hurts numeric CRPS; binary/MC are pending the prod-ish ablation re-run.
+# TODO: revisit defaults after prod-ish ablation results
+# (see scratch_docs_and_planning/prod_ish_ablation_plan.md).
+BINARY_STACKING_ENABLED_ENV: str = "BINARY_STACKING_ENABLED"
+MC_STACKING_ENABLED_ENV: str = "MC_STACKING_ENABLED"
+NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
+
 # --- Prediction-market provider (Workstream G) ---
 # Env-gated so backtests can opt in explicitly. Resolved markets on all three
 # platforms retain their last-trade price after resolution — without the
@@ -435,3 +460,6 @@ PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 # ``s5_only`` is cheaper at 60%; ``simple`` is the cost-floor baseline.
 PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
 PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
+
+# --- Research persistence (write path for backtest replay) ---
+PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"

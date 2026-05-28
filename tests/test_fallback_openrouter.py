@@ -64,15 +64,42 @@ class TestPredicates:
             ),
             ("matching your guardrail restrictions", True),
             ("data policy", True),
+            # 429 rate-limit: textual detection falls back (BYOK quotas are per-key).
+            ("429 Too Many Requests", True),
+            ("Rate limit exceeded", True),
+            # Belt-and-suspenders textual patterns for 429 edge cases.
+            ('{"code":429, "message": "rate limited"}', True),
+            ("rate-limited upstream by provider", True),
+            # Negative: moderation / infrastructure errors do NOT fall back.
             ("403 Forbidden moderation", False),
-            ("429 Too Many Requests", False),
-            ("Rate limit exceeded", False),
             ("502 Bad Gateway", False),
             ("503 Service Unavailable", False),
         ],
     )
     def test_should_retry_with_general_key(self, message: str, expected: bool) -> None:
         assert should_retry_with_general_key(Exception(message)) is expected
+
+    def test_litellm_rate_limit_error_triggers_fallback(self) -> None:
+        """litellm.RateLimitError (typed 429) triggers fallback — BYOK quotas are independent."""
+        import litellm
+
+        exc = litellm.RateLimitError(
+            message="Rate limit exceeded on openrouter",
+            model="openrouter/google/gemini-3.1-pro-preview",
+            llm_provider="openrouter",
+        )
+        assert should_retry_with_general_key(exc) is True
+
+    def test_litellm_service_unavailable_does_not_trigger_fallback(self) -> None:
+        """litellm.ServiceUnavailableError (503) does NOT trigger fallback — infrastructure issue."""
+        import litellm
+
+        exc = litellm.ServiceUnavailableError(
+            message="503 Service Unavailable",
+            model="openrouter/openai/gpt-5.1",
+            llm_provider="openrouter",
+        )
+        assert should_retry_with_general_key(exc) is False
 
 
 class TestFallbackOpenRouterLlm:
@@ -111,6 +138,29 @@ class TestFallbackOpenRouterLlm:
         assert out == "ok"
 
     @pytest.mark.asyncio
+    async def test_fallback_on_429_rate_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """429 on primary key falls back to secondary — BYOK quotas are independent."""
+        import litellm
+
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/google/gemini-3.1-pro-preview",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+
+        exc = litellm.RateLimitError(
+            message="Rate limit exceeded",
+            model="openrouter/google/gemini-3.1-pro-preview",
+            llm_provider="openrouter",
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_primary", AsyncMock(side_effect=exc))
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="fallback_ok"))
+
+        out = await llm.invoke("hi")
+        assert out == "fallback_ok"
+
+    @pytest.mark.asyncio
     async def test_no_fallback_on_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
@@ -126,6 +176,28 @@ class TestFallbackOpenRouterLlm:
         )
 
         with pytest.raises(Exception):
+            await llm.invoke("hi")
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_on_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """503 Service Unavailable re-raises without fallback — infrastructure issue, not key-scoped."""
+        import litellm
+
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.1",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+
+        exc = litellm.ServiceUnavailableError(
+            message="503 Service Unavailable",
+            model="openrouter/openai/gpt-5.1",
+            llm_provider="openrouter",
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_primary", AsyncMock(side_effect=exc))
+
+        with pytest.raises(litellm.ServiceUnavailableError):
             await llm.invoke("hi")
 
     @pytest.mark.asyncio

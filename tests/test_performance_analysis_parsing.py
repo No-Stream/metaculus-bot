@@ -29,6 +29,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_forecaster_model_map,
     parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
+    parse_per_model_mc_option_probs,
     parse_per_model_numeric_percentiles,
     parse_per_model_reasoning_text,
     parse_resolution,
@@ -1246,3 +1247,290 @@ class TestFallAib2025Fixture:
         # Fall-aib-2025 comments use the legacy STACKED= marker. Confirm
         # the marker reader still picks it up.
         assert parse_stacked_marker(FALL_AIB_2025_FIXTURE) is False
+
+
+# ---------------------------------------------------------------------------
+# parse_per_model_mc_option_probs — MC full option vector extraction
+# ---------------------------------------------------------------------------
+
+
+class TestParsePerModelMcOptionProbs:
+    """Extracts per-forecaster option probability vectors from MC comment bullets.
+
+    The bug: parse_per_model_forecasts only captures the first line after
+    ``*Forecaster N*:``, which for MC is just the first option (e.g.
+    ``- Option A: 40.0%``). This parser captures ALL option lines per
+    forecaster and returns ``{model: {option: probability}}``.
+    """
+
+    def test_basic_mc_two_forecasters(self):
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Option A: 40.0%\n"
+            "- Option B: 30.0%\n"
+            "- Option C: 20.0%\n"
+            "- Option D: 10.0%\n"
+            "\n"
+            "*Forecaster 2 (claude-opus-4.7)*: \n"
+            "- Option A: 35.0%\n"
+            "- Option B: 25.0%\n"
+            "- Option C: 25.0%\n"
+            "- Option D: 15.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "Some research here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {
+            "gpt-5.5": {"Option A": 0.40, "Option B": 0.30, "Option C": 0.20, "Option D": 0.10},
+            "claude-opus-4.7": {"Option A": 0.35, "Option B": 0.25, "Option C": 0.25, "Option D": 0.15},
+        }
+
+    def test_returns_empty_for_binary_comment(self):
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: 72.0%\n"
+            "*Forecaster 2 (claude-opus-4.7)*: 68.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "Some research here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {}
+
+    def test_empty_comment(self):
+
+        assert parse_per_model_mc_option_probs("") == {}
+
+    def test_options_with_special_characters_in_name(self):
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Yes (>50%): 60.0%\n"
+            "- No (<=50%): 30.0%\n"
+            "- Ambiguous / unclear: 10.0%\n"
+            "\n"
+            "### Research Summary\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {
+            "gpt-5.5": {"Yes (>50%)": 0.60, "No (<=50%)": 0.30, "Ambiguous / unclear": 0.10},
+        }
+
+    def test_model_map_from_rationales(self):
+        """Attribution uses Model: lines from R1 sections when inline name is absent."""
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1*: \n"
+            "- Yes: 70.0%\n"
+            "- No: 30.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "stuff\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "reasoning here\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        assert result == {"gpt-5.5": {"Yes": 0.70, "No": 0.30}}
+
+    def test_probabilities_sum_approximately_one(self):
+        """Sanity: parsed probabilities should sum to ~1.0 for well-formed comments."""
+
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- A: 25.0%\n"
+            "- B: 25.0%\n"
+            "- C: 25.0%\n"
+            "- D: 25.0%\n"
+            "\n"
+            "### Research Summary\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        total = sum(result["gpt-5.5"].values())
+        assert abs(total - 1.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# parse_per_base_model_forecasts — per-base-model probability recovery from
+# stacker-combined reasoning blocks. When stacking fires, the summary bullet
+# shows only the stacker's aggregate; base-model individual forecasts are
+# recoverable only from the reasoning body (each base sub-block contains a
+# "Probability: X%" or "Final probability: X%" line for binary, or option
+# lines for MC). This parser extracts those into a field that downstream
+# stacker_detection.py can use for counterfactual-median analysis.
+# ---------------------------------------------------------------------------
+
+
+class TestParsePerBaseModelForecasts:
+    """Per-base-model probability extraction from stacker-combined reasoning bodies."""
+
+    def test_binary_stacked_comment_extracts_five_base_model_probs(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_names = [
+            "openrouter/openai/gpt-5.5",
+            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/google/gemini-3.1-pro-preview",
+            "openrouter/x-ai/grok-4.1-fast",
+            "openrouter/openai/gpt-5.4",
+        ]
+        base_preds = []
+        for i, path in enumerate(base_names):
+            prob = 60 + i * 5
+            body = f"My analysis of this question.\n\nProbability: {prob}%"
+            base_preds.append(_build_base_pred(path, body))
+        meta_text = "Stacker analysis: weighted average of base models.\n\nProbability: 72%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert len(result) == 5
+        assert result["gpt-5.5"] == "60.0%"
+        assert result["claude-opus-4.7"] == "65.0%"
+        assert result["gemini-3.1-pro-preview"] == "70.0%"
+        assert result["grok-4.1-fast"] == "75.0%"
+        assert result["gpt-5.4"] == "80.0%"
+
+    def test_binary_stacked_comment_handles_decimal_probability_format(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nFinal probability: 0.72"),
+            _build_base_pred("openrouter/anthropic/claude-opus-4.7", "Analysis.\n\nProbability: 65%"),
+        ]
+        meta_text = "Meta.\n\nProbability: 70%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert len(result) == 2
+        assert result["gpt-5.5"] == "72.0%"
+        assert result["claude-opus-4.7"] == "65.0%"
+
+    def test_binary_extracts_last_probability_when_multiple_present(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        body = "Initial estimate: Probability: 40%\nAfter adjusting for base rates...\nFinal probability: 55%"
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
+        meta_text = "Meta.\n\nProbability: 55%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "binary")
+        # Should extract the LAST probability (the final answer)
+        assert result["gpt-5.5"] == "55.0%"
+
+    def test_mc_stacked_comment_extracts_per_base_model_option_dicts(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred(
+                "openrouter/openai/gpt-5.5",
+                "My analysis:\n- Option A: 60.0%\n- Option B: 25.0%\n- Option C: 15.0%",
+            ),
+            _build_base_pred(
+                "openrouter/anthropic/claude-opus-4.7",
+                "My analysis:\n- Option A: 55.0%\n- Option B: 30.0%\n- Option C: 15.0%",
+            ),
+        ]
+        meta_text = "Stacker meta:\n- Option A: 58.0%\n- Option B: 27.0%\n- Option C: 15.0%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+        assert len(result) == 2
+        assert result["gpt-5.5"] == {"Option A": 0.60, "Option B": 0.25, "Option C": 0.15}
+        assert result["claude-opus-4.7"] == {"Option A": 0.55, "Option B": 0.30, "Option C": 0.15}
+
+    def test_numeric_returns_empty_dict(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred(
+                "openrouter/openai/gpt-5.5",
+                "analysis\n\nPercentile 50: 42",
+            ),
+        ]
+        meta_text = "Stacker meta"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "numeric")
+        assert result == {}
+
+    def test_discrete_returns_empty_dict(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred(
+                "openrouter/openai/gpt-5.5",
+                "analysis\n\nPercentile 50: 10",
+            ),
+        ]
+        meta_text = "Stacker meta"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "discrete")
+        assert result == {}
+
+    def test_non_stacked_comment_returns_empty_dict(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "analysis...\n\nProbability: 72%\n\n"
+            "## R1: Forecaster 2 Reasoning\n"
+            "Model: openrouter/anthropic/claude-opus-4.7\n\n"
+            "analysis...\n\nProbability: 68%\n"
+        )
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result == {}
+
+    def test_excludes_stacker_meta_block(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nProbability: 72%"),
+        ]
+        meta_text = "Stacker analysis.\n\nProbability: 75%"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "binary")
+        # Only the base model, NOT the stacker meta
+        assert len(result) == 1
+        assert "gpt-5.5" in result
+        assert "Forecaster 1" not in result
+
+    def test_empty_comment_returns_empty_dict(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        assert parse_per_base_model_forecasts("", "binary") == {}
+        assert parse_per_base_model_forecasts("", "multiple_choice") == {}
+
+    def test_binary_with_about_prefix(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        base_preds = [
+            _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nProbability: about 72%"),
+        ]
+        meta_text = "Meta."
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        comment = _build_stacked_comment(combined)
+
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result["gpt-5.5"] == "72.0%"

@@ -2,7 +2,39 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
-from forecasting_tools import NumericQuestion
+from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+
+_OPEN = datetime(2026, 1, 1)
+_RESOLVE = datetime(2026, 5, 1)
+
+
+def make_mock_binary_question(qid: int = 1001) -> MagicMock:
+    """Return a ``MagicMock(spec=BinaryQuestion)`` with standard fields populated."""
+    q = MagicMock(spec=BinaryQuestion)
+    q.id_of_question = qid
+    q.question_text = "Will it rain?"
+    q.background_info = "bg"
+    q.resolution_criteria = "rc"
+    q.fine_print = ""
+    q.page_url = f"https://example.com/q/{qid}"
+    q.open_time = _OPEN
+    q.scheduled_resolution_time = _RESOLVE
+    return q
+
+
+def make_mock_mc_question(qid: int = 1002, options: list[str] | None = None) -> MagicMock:
+    """Return a ``MagicMock(spec=MultipleChoiceQuestion)`` with configurable options."""
+    q = MagicMock(spec=MultipleChoiceQuestion)
+    q.id_of_question = qid
+    q.question_text = "Which color?"
+    q.options = options if options is not None else ["Red", "Blue", "Green"]
+    q.background_info = "bg"
+    q.resolution_criteria = "rc"
+    q.fine_print = ""
+    q.page_url = f"https://example.com/q/{qid}"
+    q.open_time = _OPEN
+    q.scheduled_resolution_time = _RESOLVE
+    return q
 
 
 @pytest.fixture

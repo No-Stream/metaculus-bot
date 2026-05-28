@@ -175,7 +175,7 @@ class TestNumericCDFSmoothing:
         caplog.clear()
         caplog.set_level("WARNING")
         with patch(
-            "main.structure_output",
+            "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
             result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
@@ -212,7 +212,7 @@ class TestNumericCDFSmoothing:
         caplog.clear()
         caplog.set_level("WARNING")
         with patch(
-            "main.structure_output",
+            "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
             result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
