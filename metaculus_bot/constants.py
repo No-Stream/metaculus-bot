@@ -434,13 +434,14 @@ LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
 
 # --- Per-type stacking gates ---
 # Each question type has an independent enable/disable flag. All three default
-# to ENABLED (current prod behavior for binary + MC; numeric was previously
-# disabled via the deprecated NUMERIC_STACKING_DISABLED env var — deploy config
-# must now set NUMERIC_STACKING_ENABLED=false to preserve that behavior).
+# to DISABLED (see the gate in main.py, which reads these via
+# env_flag_enabled(..., default=False)). A deploy opts a type back into stacking
+# by setting <TYPE>_STACKING_ENABLED=true in its env.
 #
-# Background: n=88 ablation + n=25 historical residual both showed stacker
-# hurts numeric CRPS; binary/MC are pending the prod-ish ablation re-run.
-# TODO: revisit defaults after prod-ish ablation results
+# Background: ablation showed the stacker hurts numeric CRPS (median > stack,
+# p=0.042); numeric disable is evidence-backed. Binary was a TIE (p=0.496), so
+# binary + MC are off as a low-risk default (tie-at-best + compute), UNMEASURED on
+# the current stack. TODO: revisit after prod-ish ablation / marker-era resolutions
 # (see scratch_docs_and_planning/prod_ish_ablation_plan.md).
 BINARY_STACKING_ENABLED_ENV: str = "BINARY_STACKING_ENABLED"
 MC_STACKING_ENABLED_ENV: str = "MC_STACKING_ENABLED"

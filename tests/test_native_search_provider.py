@@ -35,7 +35,7 @@ async def test_native_search_provider_constructs_correct_model_name(
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider()
@@ -73,7 +73,7 @@ async def test_native_search_provider_uses_custom_model_slug(
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(model_slug="openai/gpt-4o")
@@ -98,7 +98,7 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=False)
@@ -124,7 +124,7 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=True)
@@ -150,7 +150,7 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", MockLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider()
@@ -188,7 +188,7 @@ async def test_native_search_provider_enforces_wall_clock_timeout(
             await asyncio.sleep(5)
             return "should never reach here"
 
-    with patch("metaculus_bot.research_providers.GeneralLlm", HangingLlm):
+    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", HangingLlm):
         from metaculus_bot.research_providers import native_search_provider
 
         provider = native_search_provider()

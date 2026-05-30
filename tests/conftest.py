@@ -103,6 +103,27 @@ def make_mock_numeric_q():
 
 
 @pytest.fixture(autouse=True)
+def _enable_per_type_stacking(monkeypatch):
+    """Force the per-type stacking gates ON for the whole test suite.
+
+    Production defaults all three ``<TYPE>_STACKING_ENABLED`` flags to DISABLED
+    (the stacker only runs when a deploy explicitly opts in). Most stacking
+    tests, however, exist to exercise the stacking MECHANISM (crux extraction,
+    targeted search, aggregation, fallbacks, thresholds) — they assume the
+    stacker is reachable. Setting the flags here keeps those tests faithful to
+    their intent without each having to opt in.
+
+    Tests that assert the production DEFAULT (off-when-unset) or a specific
+    polarity override their flag in the test body via ``monkeypatch.delenv`` /
+    ``monkeypatch.setenv``; that runs after this setup fixture, so the later
+    value wins.
+    """
+    monkeypatch.setenv("BINARY_STACKING_ENABLED", "true")
+    monkeypatch.setenv("MC_STACKING_ENABLED", "true")
+    monkeypatch.setenv("NUMERIC_STACKING_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
 def _clear_gemini_client_cache():
     """Clear the module-global genai.Client lru_cache between tests.
 

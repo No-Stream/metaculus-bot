@@ -110,7 +110,11 @@ jobs:
           # is_benchmarking=False in the prod path (this workflow), so the
           # provider's own benchmarking guard doesn't suppress it here.
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Stacking disabled on all types (ablation: stacker <= median on binary,
+          # hurts numeric CRPS; stacker base model is a weak binary forecaster).
           NUMERIC_STACKING_ENABLED: 'false'
+          BINARY_STACKING_ENABLED: 'false'
+          MC_STACKING_ENABLED: 'false'
           OPENAI_AGENTS_DISABLE_TRACING: 'true'
           # Persist research outputs as JSONL for offline backtest replay.
           PERSIST_RESEARCH_ENABLED: 'true'

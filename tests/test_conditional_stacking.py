@@ -841,8 +841,9 @@ class TestNumericStackingEnabled:
             assert bot._conditional_stacking_triggered_count == 1
 
     @pytest.mark.asyncio
-    async def test_numeric_stacking_enabled_unset_defaults_to_enabled(self):
-        """When NUMERIC_STACKING_ENABLED is unset (default=True), numeric high-spread still triggers stacking."""
+    async def test_numeric_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
+        """When NUMERIC_STACKING_ENABLED is unset (default=False), numeric high-spread SKIPS stacking."""
+        monkeypatch.delenv("NUMERIC_STACKING_ENABLED", raising=False)
         bot = _make_bot()
         question = make_mock_numeric_question(
             question_text="How many units will be sold?",
@@ -863,13 +864,14 @@ class TestNumericStackingEnabled:
         ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            mocks["crux"].assert_called_once()
-            mocks["targeted"].assert_called_once()
-            mocks["aggregate"].assert_called_once()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
-            assert bot._conditional_stacking_skipped_count == 0
+            assert len(result.predictions) == 2
+            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._conditional_stacking_triggered_count == 0
+            assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
     async def test_numeric_stacking_enabled_explicit_true(self, monkeypatch):
@@ -932,8 +934,9 @@ class TestBinaryStackingEnabled:
             assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_binary_stacking_enabled_unset_defaults_to_enabled(self):
-        """When BINARY_STACKING_ENABLED is unset (default=True), binary high-spread triggers stacking."""
+    async def test_binary_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
+        """When BINARY_STACKING_ENABLED is unset (default=False), binary high-spread SKIPS stacking."""
+        monkeypatch.delenv("BINARY_STACKING_ENABLED", raising=False)
         bot = _make_bot()
         question = _make_binary_question()
 
@@ -946,12 +949,14 @@ class TestBinaryStackingEnabled:
         ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            mocks["crux"].assert_called_once()
-            mocks["targeted"].assert_called_once()
-            mocks["aggregate"].assert_called_once()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert len(result.predictions) == 2
+            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._conditional_stacking_triggered_count == 0
+            assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
     async def test_binary_stacking_enabled_explicit_true(self, monkeypatch):
@@ -1064,14 +1069,17 @@ class TestMCStackingEnabled:
             assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_mc_stacking_enabled_unset_defaults_to_enabled(self):
-        """When MC_STACKING_ENABLED is unset (default=True), MC high-spread triggers stacking."""
+    async def test_mc_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
+        """When MC_STACKING_ENABLED is unset (default=False), MC high-spread SKIPS stacking."""
+        monkeypatch.delenv("MC_STACKING_ENABLED", raising=False)
         bot = _make_bot()
         question = _make_mc_question()
 
+        mc_preds = _make_high_spread_mc_predictions()
+
         with mock_stacking_pipeline(
             bot,
-            predictions=_make_high_spread_mc_predictions(),
+            predictions=mc_preds,
             research="mc research",
             crux_return="Disagreement about option A vs B",
             targeted_search_return="Search results about A vs B",
@@ -1079,12 +1087,14 @@ class TestMCStackingEnabled:
         ) as mocks:
             result = await bot._research_and_make_predictions(question)
 
-            mocks["crux"].assert_called_once()
-            mocks["targeted"].assert_called_once()
-            mocks["aggregate"].assert_called_once()
+            mocks["crux"].assert_not_called()
+            mocks["targeted"].assert_not_called()
+            mocks["aggregate"].assert_not_called()
 
-            assert len(result.predictions) == 1
-            assert bot._conditional_stacking_triggered_count == 1
+            assert len(result.predictions) == 2
+            assert bot._conditional_stacking_skipped_count == 1
+            assert bot._conditional_stacking_triggered_count == 0
+            assert bot._stacker_outcome[question.id_of_question] == "skipped"
 
     @pytest.mark.asyncio
     async def test_mc_stacking_enabled_explicit_true(self, monkeypatch):

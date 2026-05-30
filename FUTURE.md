@@ -62,7 +62,13 @@ After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search
 
 Bake into the quarterly review cadence.
 
-### Resolve `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search (added 2026-05-17, HIGH PRIORITY)
+### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
+
+Metaculus enabled OpenAI on the donated key. `build_native_search_llm` now routes through
+`build_llm_with_openrouter_fallback` (donated key primary, personal key fallback). Verified
+end-to-end on `openai/gpt-5-mini`: grounded result returned, donated-key 404 fallback count = 0,
+i.e. the call succeeded on the donated subsidy. The guardrail/data-policy fallback matcher stays
+in place as a safety net. Original note retained below for context.
 
 When migrating native search from `x-ai/grok-4.1-fast` (deprecated) to OpenAI native search on 2026-05-17 (final landing config: `openai/gpt-5.5` medium-effort + verbosity=low, see W-C v2), the donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) returned a 404 with:
 
@@ -327,6 +333,13 @@ Would require changes to the numeric prompt, parsing, and CDF construction pipel
 
 ### Aggregation strategy improvements
 
+> **Status 2026-05-29: STACKER NOW DISABLED ON ALL TYPES (default off in code).** Numeric was
+> already off (ablation: median > stack CRPS, p=0.042). Binary + MC now off too — the ablation
+> binary result was a *tie* (p=0.496), so this is a low-risk default (tie-at-best + compute cost),
+> NOT a measured harm; the binary/MC treatment effect is unmeasured on the current stack. The
+> code default flipped to `default=False` so the stacker only runs on explicit opt-in. **Revisit
+> when post-2026-04-27 (marker-era) resolved questions exist** to measure the real treatment effect.
+>
 > **Status 2026-05-10:** Spread-aware aggregation (item 3) is **SHIPPED** as
 > CONDITIONAL_STACKING (April 2026); the prob-range trigger metric is durably
 > justified by May ρ=0.616 disagreement-error. Post-aggregation shrinkage toward
@@ -354,22 +367,61 @@ Ideas from analysis (lower priority since prompt changes address the bigger issu
 
 Need more data (more resolved questions) to confidently evaluate these.
 
+### Per-model peer ranking: GPT-strong / Claude-weak on binary (2026-05-29, NEEDS BENCHMARK before acting)
+
+> A peer-score recompute (`scratch/residual_2026-05-29/dim_peer_recompute.md`, method validated
+> exact against `spot_baseline_score`; reviewed in `review_peer_analysis.md`) ranked base models on
+> **peer-equivalent** (the metric that matters), not Brier. On binary (spring-aib-2026, n≈150):
+
+- **GPT models carry the binary ensemble** (gpt-5.1 +19, gpt-5.2 +17 peer; CIs exclude 0). The
+  **Claude pair is the binary drag** (claude-opus-4.6 −9, claude-opus-4.5 +2.2). The confound was
+  checked and runs the *wrong way* (Claude saw slightly easier questions), so the drag is genuine.
+- **The story INVERTS on numeric** — Claude is *strong* there (opus-4.6 +24), gpt-5.1 weakest. So
+  this is a binary-specific effect, NOT "Claude is bad." A blanket roster cut would hurt numeric.
+- **Counterfactual ensembles (paired, in-sample):** dropping the Claude pair → **+5.94 binary peer
+  [+1.0, +11.7]**; dropping claude-opus-4.6 alone → +3.66 (survives jackknife, the most robust
+  sub-claim). GPT-only → +10.6 but that point estimate hinges on 1-2 questions — don't quote it clean.
+- Corrected an earlier wrong claim: gpt-5.2 is **not** high-variance (lowest binary sd); the
+  wildcards are gemini-3.1-pro (sd 96) and claude-opus-4.6 (sd 80).
+
+> **Do NOT act on this without an intense out-of-sample benchmark.** It's in-sample (n=62 paired),
+> multiple-comparisons exposed, epoch-confounded, and the roster has already rotated (current Claude
+> slot is opus-4.5 + opus-4.6; new gpt-5.4 / grok-4.1-fast have n=3-12, uninformative). The credible
+> reading is narrow: *on binary, the Claude pair is a measurable drag and the GPTs carry the
+> ensemble.* The natural next step is a **prospective per-type model-inclusion benchmark** (GPT-heavy
+> on binary, retain Claude for numeric), gated on out-of-sample peer — not a reweight off this slice.
+> Relatedly: the stacker's own model (claude-opus-4.5) being a weak base binary forecaster is part of
+> why disabling the binary stacker is low-risk (see Aggregation status above).
+
 ### Domain-aware CDF spread tuning
 
-> **Status 2026-05-10: REPLICATED — KEEP, ship next implementation cycle.** May full
-> cohort PIT 90% coverage 98.2% (ideal 90%), 50% coverage 57.1% (ideal 50%) — both
-> confirm CDFs are still too wide. Implementation gate: any specific category with
-> ≥15 numeric records and PIT std ≤0.25. Apply ~0.78× IQR sharpening factor
-> post-aggregation for non-volatile categories (suggest: science, technology,
-> geopolitics, demographics — exclude finance/markets, which had different April
-> characteristics). See `NEXT_SESSION_QUEUE.md` Priority 2A.
+> **Status 2026-05-29: HOLD — measured on a STALE pipeline; re-measure on current version before ANY narrowing.**
+> The residual analysis (`scratch/residual_2026-05-29/dim_numericpit.md`, `numeric_width_version_confound.md`)
+> re-confirmed across two independent rosters that the *analyzed* CDFs are too wide (PIT std 0.24–0.26 vs ideal
+> 0.289; 90% coverage 92–98%), and a uniform contraction k≈1.2–1.3 toward the median would hit the ideal. **BUT all
+> analyzed forecasts (≤ 2026-04-13) ran with tail-widening ON at full strength (k_tail=1.25).** Prod flipped to
+> k_tail=1.0 (identity) on **2026-05-12 (`b8d730f`)**, *after* the data — plus the mixture-distribution router went
+> live and numeric stacking was disabled. So current prod is **already narrower** than what we measured; the bot's
+> own calibration study showed widening-off moved PIT std 0.238 → 0.245. **Applying k≈1.3 on top of the current
+> pipeline would overcorrect** — the over-width is in the *body* while deep tails are *already too thin* (1.5–6% mass
+> vs 10% ideal), and the widening-off flip thinned tails further.
+>
+> **Before doing anything here:** (1) ship the PIT log-grid measurement-bug fix in `analysis.py::_interpolate_pit`
+> (it mis-scores log-scaled / `zero_point` questions by up to 0.86 PIT — version-independent, do regardless);
+> (2) add PIT std as a first-class `backtest.py` metric (it emits CRPS/log but not PIT, and doesn't persist the CDF);
+> (3) run `make backtest_large` to get a **current-version** PIT measurement on fresh predictions; (4) only then,
+> if still over-wide, choose a (smaller) narrowing factor with a per-side tail-mass floor. The *direction* (mild body
+> over-width) may survive; the *magnitude* k=1.3 will not.
+>
+> Also note the 2026 finance carve-out **inverts** the old advice: financial questions were the *most* over-wide
+> (cov90=100%), not the least — so the old "exclude finance/markets" guidance is wrong on current data.
+>
+> Reconciled along the way: the long-standing "PIT std 0.143" figure was just the April **n=11** subsample under the
+> same metric (a ~2nd-percentile draw) — retire it; population is ~0.24–0.26.
 
-Our PIT analysis found non-financial questions are 22% too wide while financial questions
-are well-calibrated. The pipeline could use the forecastability classification (now output
-by the prompt) to apply different tail-widening parameters.
-
-Could also use the FORECASTABILITY tag to adjust smoothing, tail mass allocation, or
-post-hoc CDF scaling.
+Older (2026-05-10) framing, now superseded by the version-confound note above: PIT analysis found CDFs too wide; the
+pipeline could use the forecastability classification (output by the prompt) to apply different tail-widening
+parameters, or use the FORECASTABILITY tag to adjust smoothing / tail-mass allocation / post-hoc CDF scaling.
 
 ## Longer-term (significant R&D)
 
