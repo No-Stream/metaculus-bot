@@ -62,7 +62,13 @@ After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search
 
 Bake into the quarterly review cadence.
 
-### Resolve `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search (added 2026-05-17, HIGH PRIORITY)
+### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
+
+Metaculus enabled OpenAI on the donated key. `build_native_search_llm` now routes through
+`build_llm_with_openrouter_fallback` (donated key primary, personal key fallback). Verified
+end-to-end on `openai/gpt-5-mini`: grounded result returned, donated-key 404 fallback count = 0,
+i.e. the call succeeded on the donated subsidy. The guardrail/data-policy fallback matcher stays
+in place as a safety net. Original note retained below for context.
 
 When migrating native search from `x-ai/grok-4.1-fast` (deprecated) to OpenAI native search on 2026-05-17 (final landing config: `openai/gpt-5.5` medium-effort + verbosity=low, see W-C v2), the donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) returned a 404 with:
 

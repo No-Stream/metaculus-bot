@@ -29,6 +29,7 @@ from metaculus_bot.constants import (
     ASKNEWS_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
+from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.prompts import web_research_prompt
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
@@ -351,7 +352,13 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
     if verbosity:
         kwargs["verbosity"] = verbosity
 
-    return GeneralLlm(**kwargs)
+    # Route through the donated-key wrapper. For openrouter/openai/* slugs this
+    # prefers the Metaculus-donated OAI_ANTH_OPENROUTER_KEY (OpenAI now enabled
+    # on it as of 2026-05-29) with automatic fallback to the personal
+    # OPENROUTER_API_KEY on credential/credit/guardrail errors. Non-donated
+    # providers (x-ai, etc.) get a plain GeneralLlm — same as before.
+
+    return build_llm_with_openrouter_fallback(**kwargs)
 
 
 def _native_search_provider(
