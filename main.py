@@ -644,9 +644,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             spread = compute_spread(question, prediction_values)
             threshold = self._get_threshold_for_question(question)
 
-            # Per-question-type stacking gates. All three default to ENABLED. Set
-            # <TYPE>_STACKING_ENABLED=false in deploy env to bypass stacking for that
-            # type (forces median/skipped path).
+            # Per-question-type stacking gates. All three default to DISABLED. Set
+            # <TYPE>_STACKING_ENABLED=true in deploy env to opt a type back into
+            # stacking; otherwise the stacker is bypassed (forces median/skipped path).
             spread_exceeds_threshold = spread > threshold
             type_to_stacking_env = {
                 BinaryQuestion: BINARY_STACKING_ENABLED_ENV,
@@ -655,7 +655,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             }
             for q_type, env_name in type_to_stacking_env.items():
                 if isinstance(question, q_type):
-                    if not env_flag_enabled(env_name, default=True):
+                    if not env_flag_enabled(env_name, default=False):
                         spread_exceeds_threshold = False
                     break
 
