@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
 
 def test_extract_model_name_with_new_ensemble_naming():

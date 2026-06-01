@@ -6,7 +6,7 @@ performance with diversity.
 
 ``CorrelationAnalyzer`` owns the correlation-math, ingestion, and reporting
 concerns. The identity helpers, safe-CDF cache, and ensemble simulation were
-extracted into ``benchmark_identity``, ``numeric_cdf_cache``, and
+extracted into ``benchmark_identity``, ``cdf_cache``, and
 ``ensemble_simulator`` respectively. Thin delegating wrappers are kept on the
 analyzer for every method that external callers (``analyze_correlations.py``,
 ``community_benchmark.py``) and the test suite reach into, so the split is
@@ -26,7 +26,7 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution
 from scipy.stats import pearsonr
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.benchmark_identity import (
+from metaculus_bot.ensemble_analysis.benchmark_identity import (
     extract_clean_model_name,
     extract_model_name,
     get_question_type,
@@ -35,10 +35,10 @@ from metaculus_bot.benchmark_identity import (
 )
 
 # Re-exported for back-compat: callers/tests still do
-# ``from metaculus_bot.correlation_analysis import CorrelationMatrix, EnsembleCandidate``.
-from metaculus_bot.correlation_types import CorrelationMatrix, EnsembleCandidate, ModelPrediction
-from metaculus_bot.ensemble_simulator import EnsembleSimulator
-from metaculus_bot.numeric_cdf_cache import NumericCdfCache
+# ``from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationMatrix, EnsembleCandidate``.
+from metaculus_bot.ensemble_analysis.cdf_cache import NumericCdfCache
+from metaculus_bot.ensemble_analysis.ensemble_simulator import EnsembleSimulator
+from metaculus_bot.ensemble_analysis.types import CorrelationMatrix, EnsembleCandidate, ModelPrediction
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

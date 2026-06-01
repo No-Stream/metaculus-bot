@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 
-from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 from metaculus_bot.scoring_patches import apply_scoring_patches
 
 logger = logging.getLogger(__name__)

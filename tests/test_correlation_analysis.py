@@ -81,7 +81,7 @@ def create_mock_benchmark(model_name: str, total_cost: float, num_questions: int
 
 def test_import_correlation_analysis():
     """Test that the module can be imported without errors."""
-    from metaculus_bot.correlation_analysis import (
+    from metaculus_bot.ensemble_analysis.correlation_analysis import (
         CorrelationAnalyzer,
         CorrelationMatrix,
         EnsembleCandidate,
@@ -95,7 +95,7 @@ def test_import_correlation_analysis():
 
 def test_correlation_analyzer_instantiation():
     """Test that CorrelationAnalyzer can be created and has expected attributes."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
 
@@ -107,7 +107,7 @@ def test_correlation_analyzer_instantiation():
 
 def test_add_benchmark_results():
     """Test that benchmark results can be added to the analyzer."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [
@@ -123,7 +123,7 @@ def test_add_benchmark_results():
 
 def test_calculate_correlation_matrix():
     """Test that correlation matrix calculation works with mock data."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [
@@ -143,7 +143,7 @@ def test_calculate_correlation_matrix():
 
 def test_find_optimal_ensembles():
     """Test that ensemble optimization runs without crashing."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [
@@ -167,7 +167,7 @@ def test_find_optimal_ensembles():
 
 def test_cost_adjustment_for_premium_models():
     """Test that premium models with low costs get adjusted."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [
@@ -192,7 +192,7 @@ def test_cost_adjustment_for_premium_models():
 
 def test_extract_model_name():
     """Test model name extraction from benchmark configs."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmark = create_mock_benchmark("openai/gpt-4o", 0.50, 1)
@@ -205,7 +205,7 @@ def test_extract_model_name():
 
 def test_extract_prediction_value():
     """Test prediction value extraction from different report types."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmark = create_mock_benchmark("gpt-4o", 0.50, 1)
@@ -222,7 +222,7 @@ def test_correlation_matrix_methods():
     """Test CorrelationMatrix utility methods."""
     import pandas as pd
 
-    from metaculus_bot.correlation_analysis import CorrelationMatrix
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationMatrix
 
     # Create simple correlation data
     models = ["gpt-4o", "claude-3-5-sonnet"]
@@ -248,7 +248,7 @@ def test_correlation_matrix_methods():
 
 def test_ensemble_candidate_scoring():
     """Test EnsembleCandidate scoring calculation."""
-    from metaculus_bot.correlation_analysis import EnsembleCandidate
+    from metaculus_bot.ensemble_analysis.correlation_analysis import EnsembleCandidate
 
     candidate = EnsembleCandidate(
         model_names=["gpt-4o", "claude-3-5-sonnet"],
@@ -269,7 +269,7 @@ def test_ensemble_candidate_scoring():
 
 def test_generate_correlation_report():
     """Test that correlation report generation works."""
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
     analyzer = CorrelationAnalyzer()
     benchmarks = [

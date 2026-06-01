@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
 
 class FakeQuestion:

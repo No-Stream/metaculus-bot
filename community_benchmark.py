@@ -382,7 +382,7 @@ async def benchmark_forecast_bot(
         # TODO: refactor out this logic, jank to have here.
         # Perform correlation analysis if we have multiple models
         if len(benchmarks) > 1:
-            from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+            from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
             analyzer = CorrelationAnalyzer()
             analyzer.add_benchmark_results(benchmarks)

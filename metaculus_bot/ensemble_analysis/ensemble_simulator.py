@@ -32,12 +32,12 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import NumericDistribution
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.benchmark_identity import extract_model_name, get_question_type
-from metaculus_bot.correlation_types import CorrelationMatrix, EnsembleCandidate
-from metaculus_bot.numeric_cdf_cache import NumericCdfCache
+from metaculus_bot.ensemble_analysis.benchmark_identity import extract_model_name, get_question_type
+from metaculus_bot.ensemble_analysis.cdf_cache import NumericCdfCache
+from metaculus_bot.ensemble_analysis.types import CorrelationMatrix, EnsembleCandidate
 
 if TYPE_CHECKING:
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+    from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
 logger = logging.getLogger(__name__)
 
