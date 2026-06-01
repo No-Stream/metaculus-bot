@@ -23,6 +23,7 @@ rapidfuzz = "^3.14.3"
 scipy = "^1.12.0"
 pandas = "^2.2.3"
 pydantic = "^2.9.2"
+# supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 
 
 [tool.poetry.group.dev.dependencies]
@@ -39,10 +40,6 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = ["E501"]
-
-[tool.uv]
-# Supply chain safety: ignore packages published in the last 7 days.
-exclude-newer = "1 week"
 
 [tool.pytest.ini_options]
 markers = [

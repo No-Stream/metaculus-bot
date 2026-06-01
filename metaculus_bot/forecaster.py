@@ -59,9 +59,6 @@ from metaculus_bot.targeted_research import extract_disagreement_crux, run_targe
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-logging.getLogger("openai.agents").setLevel(logging.ERROR)
 
 load_environment()
 
@@ -412,23 +409,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
     def _select_research_providers(self) -> list[tuple[ResearchCallable, str]]:
         return self._research._select_research_providers()
 
-    async def _run_providers_parallel(
-        self,
-        question: MetaculusQuestion,
-        providers: list[tuple[ResearchCallable, str]],
-    ) -> str:
-        return await self._research._run_providers_parallel(question, providers)
-
-    def _select_research_provider(self) -> tuple[ResearchCallable, str]:
-        return self._research._select_research_provider()
-
-    async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
-        return await self._research._call_perplexity(question, use_open_router=use_open_router)
-
-    async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
-        return await self._research._call_exa_smart_searcher(question)
-
-    # Override _research_and_make_predictions to support multiple LLMs
     def _remaining_budget_seconds(self, start_time: float) -> float:
         """Return remaining per-Q wall-clock budget in seconds (can go negative).
 
@@ -492,6 +472,65 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 exceptions.append(exc)
         exception_group: ExceptionGroup | None = ExceptionGroup(f"Errors: {errors}", exceptions) if exceptions else None
         return valid_predictions, errors, exception_group
+
+    async def _finalize_stacked_prediction(
+        self,
+        question: MetaculusQuestion,
+        valid_predictions: list[ReasonedPrediction[PredictionTypes]],
+        research_for_stacking: str,
+        research_report: str,
+        summary_report: str,
+        errors: list[str],
+        default_meta_reasoning: str,
+    ) -> ResearchWithPredictions[PredictionTypes]:
+        """Run the stacker and package the single aggregated prediction.
+
+        Shared by the STACKING and the CONDITIONAL_STACKING-triggered branches:
+        both compute the deterministic cross-model math, invoke
+        ``_aggregate_predictions`` (which runs the stacker LLM), then preserve
+        the stacker meta-analysis alongside the base-model reasonings so
+        residual analysis can recover per-model attribution even when stacking
+        overrode the base aggregation.
+
+        The two branches differ only in which research text feeds the stacker
+        (``research_for_stacking``), which text is surfaced in the published
+        comment (``research_report``), and the meta-reasoning fallback string.
+        ``_stacker_outcome`` is populated by ``_aggregate_predictions`` on the
+        path that actually produced ``aggregated_value``; it is not set here.
+        """
+        prediction_values = [pred.prediction_value for pred in valid_predictions]
+        # Probabilistic tools: deterministic cross-model math runs once per
+        # question and rides at the top of the stacker prompt. No-ops when
+        # PROBABILISTIC_TOOLS_ENABLED is unset.
+        from metaculus_bot.tool_runner import (
+            build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        )
+
+        aggregated_tool_output = (
+            build_cross_model_aggregation(
+                question=question,
+                rationales=[p.reasoning for p in valid_predictions],
+                prediction_values=prediction_values,
+            )
+            or None
+        )
+        aggregated_value = await self._aggregate_predictions(
+            prediction_values,
+            question,
+            research=research_for_stacking,
+            reasoned_predictions=valid_predictions,
+            aggregated_tool_output=aggregated_tool_output,
+        )
+        meta_text = self._stack_meta_reasoning.pop(question.id_of_question, default_meta_reasoning)
+        combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
+        aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
+        self._register_expected_base_combine(question)
+        return ResearchWithPredictions(
+            research_report=research_report,
+            summary_report=summary_report,
+            errors=errors,
+            predictions=[aggregated_prediction],
+        )
 
     async def _research_and_make_predictions(
         self,
@@ -561,10 +600,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         if skip_stacking_for_budget:
             # F15: the base-combine re-entry uses MEAN under STACKING and
-            # MEDIAN under CONDITIONAL_STACKING (see _aggregate_predictions:
-            # base_combine_strategy at main.py:1310-1314). The marker must
-            # match the actual aggregation method so residual analysis cuts
-            # bucket the two paths correctly.
+            # MEDIAN under CONDITIONAL_STACKING (see base_combine_strategy in
+            # aggregation_pipeline.py:226-231). The marker must match the
+            # actual aggregation method so residual analysis cuts bucket the
+            # two paths correctly.
             budget_skip_outcome = (
                 "fallback_median"
                 if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
@@ -590,46 +629,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
                     getattr(self, "research_reports_per_question", 1),
                 )
-            prediction_values = [pred.prediction_value for pred in valid_predictions]
-            # Probabilistic tools: deterministic cross-model math runs once
-            # per question and rides at the top of the stacker prompt. No-ops
-            # when PROBABILISTIC_TOOLS_ENABLED is unset.
-            from metaculus_bot.tool_runner import (
-                build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-            )
-
-            aggregated_tool_output = (
-                build_cross_model_aggregation(
-                    question=question,
-                    rationales=[p.reasoning for p in valid_predictions],
-                    prediction_values=prediction_values,
-                )
-                or None
-            )
-            aggregated_value = await self._aggregate_predictions(
-                prediction_values,
+            return await self._finalize_stacked_prediction(
                 question,
-                research=research_to_use,
-                reasoned_predictions=valid_predictions,
-                aggregated_tool_output=aggregated_tool_output,
-            )
-            # Create a single aggregated prediction, preserving the stacker meta-analysis
-            # AND the base model reasonings (so residual analysis can recover per-model
-            # attribution even when stacking overrode the base-aggregation output).
-            meta_text = self._stack_meta_reasoning.pop(
-                question.id_of_question,
-                "Stacked prediction aggregated from multiple models",
-            )
-            combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
-            aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
-            self._register_expected_base_combine(question)
-            # _stacker_outcome is populated by _aggregate_predictions on the path
-            # that actually produced aggregated_value; do not set it here.
-            return ResearchWithPredictions(
+                valid_predictions,
+                research_for_stacking=research_to_use,
                 research_report=research,
                 summary_report=summary_report,
                 errors=errors,
-                predictions=[aggregated_prediction],
+                default_meta_reasoning="Stacked prediction aggregated from multiple models",
             )
         elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
             prediction_values = [pred.prediction_value for pred in valid_predictions]
@@ -713,48 +720,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 else:
                     combined_research = research_to_use
 
-                # 4. Run stacking
-                # Cross-model aggregation for tool-augmented runs (no-op when
-                # PROBABILISTIC_TOOLS_ENABLED is unset).
-                from metaculus_bot.tool_runner import (
-                    build_cross_model_aggregation,  # noqa: PLC0415  # function-scoped: see AGENTS.md
-                )
-
-                aggregated_tool_output = (
-                    build_cross_model_aggregation(
-                        question=question,
-                        rationales=[p.reasoning for p in valid_predictions],
-                        prediction_values=prediction_values,
-                    )
-                    or None
-                )
-                aggregated_value = await self._aggregate_predictions(
-                    prediction_values,
-                    question,
-                    research=combined_research,
-                    reasoned_predictions=valid_predictions,
-                    aggregated_tool_output=aggregated_tool_output,
-                )
-                meta_text = self._stack_meta_reasoning.pop(
-                    question.id_of_question,
-                    "Conditional stacking: aggregated from multiple models after high-disagreement detected",
-                )
-                combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
-                aggregated_prediction = ReasonedPrediction(
-                    prediction_value=aggregated_value, reasoning=combined_reasoning
-                )
-                self._register_expected_base_combine(question)
-                # _stacker_outcome is populated by _aggregate_predictions on the
-                # path that actually produced aggregated_value.
+                # 4. Run stacking.
                 #
                 # research_report must be combined_research so the
                 # ## Targeted Research (addressing model disagreement) header
                 # reaches the published comment.
-                return ResearchWithPredictions(
+                return await self._finalize_stacked_prediction(
+                    question,
+                    valid_predictions,
+                    research_for_stacking=combined_research,
                     research_report=combined_research,
                     summary_report=summary_report,
                     errors=errors,
-                    predictions=[aggregated_prediction],
+                    default_meta_reasoning=(
+                        "Conditional stacking: aggregated from multiple models after high-disagreement detected"
+                    ),
                 )
             else:
                 self._conditional_stacking_skipped_count += 1
@@ -966,23 +946,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
         return prediction
-
-    def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        from metaculus_bot.calibration import BINARY_PLATT_PARAMS, MC_PLATT_PARAMS
-        from metaculus_bot.post_processing import apply_platt_calibration
-
-        return apply_platt_calibration(prediction, question, BINARY_PLATT_PARAMS, MC_PLATT_PARAMS)
-
-    def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        from metaculus_bot.post_processing import maybe_snap_to_integers
-
-        if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
-            return prediction
-        qid = question.id_of_question
-        if qid is None:
-            return prediction
-        votes = self._discrete_integer_votes.pop(qid, [])
-        return maybe_snap_to_integers(prediction, question, votes)
 
     def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
         model_name = llm_to_use.model

@@ -191,8 +191,8 @@ async def run_numeric_forecast(
             f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
             "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
         )
-        .replace("{lower}", str(getattr(question, "lower_bound", 0)))
-        .replace("{upper}", str(getattr(question, "upper_bound", 0)))
+        .replace("{lower}", str(question.lower_bound))
+        .replace("{upper}", str(question.upper_bound))
     )
 
     percentile_list: list[Percentile] | None

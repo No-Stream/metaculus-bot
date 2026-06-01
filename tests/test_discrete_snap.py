@@ -517,7 +517,7 @@ class TestSnapDistributionToIntegers:
 
 class TestMaybeSnapIntegration:
     """Test the vote-collection → majority-check → snap-application flow
-    through TemplateForecaster._maybe_snap_to_integers."""
+    through AggregationPipeline._maybe_snap_to_integers."""
 
     def _make_bot(self):
         from forecasting_tools import GeneralLlm
@@ -542,7 +542,7 @@ class TestMaybeSnapIntegration:
         qid = question.id_of_question
         bot._discrete_integer_votes[qid] = [True, True, False]
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is not distribution
         assert isinstance(result, NumericDistribution)
@@ -558,7 +558,7 @@ class TestMaybeSnapIntegration:
         qid = question.id_of_question
         bot._discrete_integer_votes[qid] = [False, False, True]
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is distribution
 
@@ -569,6 +569,6 @@ class TestMaybeSnapIntegration:
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
         distribution = create_pchip_distribution_from_cdf(cdf, question)
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is distribution

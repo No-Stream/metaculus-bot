@@ -54,6 +54,13 @@ def main() -> None:
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
+    # Forecaster module logs at DEBUG for full per-question tracing; the
+    # openai-agents logger is noisy at INFO so pin it to ERROR. Configured here
+    # (the runtime entry point) rather than at module import so test imports
+    # and library consumers don't inherit these global level mutations.
+    logging.getLogger("metaculus_bot.forecaster").setLevel(logging.DEBUG)
+    logging.getLogger("openai.agents").setLevel(logging.ERROR)
+
     # Wrap MetaculusApi publish POSTs with timeout + retry. See
     # metaculus_bot/publish_hardening.py for rationale (stock requests.post
     # has no timeout; a single hung POST blocks the whole batch).

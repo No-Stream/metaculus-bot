@@ -425,7 +425,7 @@ def numeric_prompt(
 
         ── Units & Bounds (must follow) ──
         • Base units for output values: {unit_str}
-        • Allowed range (in base units): [{getattr(question, "lower_bound", "???")}, {getattr(question, "upper_bound", "???")}]
+        • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
         • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
         • All 11 percentiles you output must be numeric values in the base unit and fall within that range.
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
@@ -806,7 +806,7 @@ def stacking_numeric_prompt(
         
         ── Units & Bounds (must follow) ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
-        • Allowed range (base units): [{getattr(question, "lower_bound", "???")}, {getattr(question, "upper_bound", "???")}]
+        • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
         • All 11 percentiles you output must be numeric values in the base unit and fall within that range.
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 

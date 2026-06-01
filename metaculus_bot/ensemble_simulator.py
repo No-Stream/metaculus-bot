@@ -33,10 +33,11 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.benchmark_identity import extract_model_name, get_question_type
+from metaculus_bot.correlation_types import CorrelationMatrix, EnsembleCandidate
 from metaculus_bot.numeric_cdf_cache import NumericCdfCache
 
 if TYPE_CHECKING:
-    from metaculus_bot.correlation_analysis import CorrelationAnalyzer, CorrelationMatrix, EnsembleCandidate
+    from metaculus_bot.correlation_analysis import CorrelationAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +158,6 @@ class EnsembleSimulator:
         aggregation_strategy: AggregationStrategy | str = AggregationStrategy.MEAN,
     ) -> EnsembleCandidate:
         """Evaluate a specific ensemble configuration with a given aggregation strategy."""
-        from metaculus_bot.correlation_analysis import EnsembleCandidate
-
         strategy = _normalize_strategy(aggregation_strategy)
         models = list(model_names)
 

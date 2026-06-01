@@ -63,13 +63,16 @@ class RoutedNumericForecast:
 def detect_numeric_format(rationale: str) -> NumericFormat | None:
     """Inspect a rationale for which format the LLM emitted.
 
-    Looks at the structured JSON block:
+    Looks at the structured JSON block. A mixture counts only when it has ≥2
+    components, matching what ``_build_mixture_from_structured`` accepts — a
+    1-component "mixture" can't build a CDF, so flagging it as ``"mixture"``
+    would route into a guaranteed ValueError.
 
-    - If both ``mixture_components`` (populated, non-null) and
+    - If both a buildable ``mixture_components`` (≥2 components) and
       ``declared_percentiles`` (always required by the schema) are present:
       ``"both"``.
-    - If only ``declared_percentiles`` is present (mixture absent or null):
-      ``"percentiles"``.
+    - If only ``declared_percentiles`` is present (mixture absent, null, or
+      under 2 components): ``"percentiles"``.
     - If only ``mixture_components`` is somehow present without
       ``declared_percentiles``, ``"mixture"``. The current schema validator
       requires ``declared_percentiles``, so this branch is unreachable in
@@ -86,7 +89,7 @@ def detect_numeric_format(rationale: str) -> NumericFormat | None:
     if structured is None or not isinstance(structured, NumericStructured):
         return None
 
-    has_mixture = structured.mixture_components is not None and len(structured.mixture_components) > 0
+    has_mixture = structured.mixture_components is not None and len(structured.mixture_components) >= 2
     has_percentiles = bool(structured.declared_percentiles)
 
     if has_mixture and has_percentiles:

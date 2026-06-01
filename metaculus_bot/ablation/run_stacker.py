@@ -70,10 +70,8 @@ ARM_STACK_AUG = "stack_aug"  # LLM stacker, rationale + computed quantities + cr
 ARM_PDF = "pdf"  # deterministic structured-math aggregation, no LLM (see metaculus_bot.ablation.run_pdf)
 ARM_PDF_MIN1 = "pdf_min1"  # pdf arm with min_forecasters=1 (any structured output qualifies)
 ARM_PDF_MIN2 = "pdf_min2"  # pdf arm with min_forecasters=2 (proper aggregation)
-ARM_MEDIAN = (
-    "median"  # deterministic median over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_median)
-)
-ARM_MEAN = "mean"  # deterministic mean over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_mean)
+ARM_MEDIAN = "median"  # deterministic median over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
+ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 
 # Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
 # claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.5 as

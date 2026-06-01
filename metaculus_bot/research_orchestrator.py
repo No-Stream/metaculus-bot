@@ -18,6 +18,7 @@ from forecasting_tools.data_models.questions import MetaculusQuestion
 from metaculus_bot.api_key_utils import get_openrouter_api_key
 from metaculus_bot.constants import (
     DEFAULT_MAX_CONCURRENT_RESEARCH,
+    EXA_API_KEY_ENV,
     FINANCIAL_DATA_ENABLED_ENV,
     GAP_FILL_ENABLED_ENV,
     GAP_FILL_MIN_RESEARCH_CHARS,
@@ -25,6 +26,8 @@ from metaculus_bot.constants import (
     GEMINI_SEARCH_MODEL_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    OPENROUTER_API_KEY_ENV,
+    PERPLEXITY_API_KEY_ENV,
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
@@ -324,14 +327,23 @@ class ResearchOrchestrator:
             raise
 
     async def _attempt_research_fallback(self, question_text: str) -> str | None:
+        # Ordering intentionally differs from the primary selector
+        # (choose_provider_with_name: AskNews -> Exa -> Perplexity -> OpenRouter).
+        # This fallback only fires when AskNews (always the primary in prod) has
+        # already failed, so AskNews is excluded. Among the remaining options we
+        # prefer the Perplexity-via-OpenRouter route first (cheap, prose-returning,
+        # routed through the donated-key wrapper), then direct Perplexity, then
+        # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
+        # expensive path). The primary selector orders by index quality, not cost,
+        # which is why the two lists diverge by design.
         try:
-            if os.getenv("OPENROUTER_API_KEY"):
+            if os.getenv(OPENROUTER_API_KEY_ENV):
                 logger.info("Falling back to openrouter/perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=True)
-            if os.getenv("PERPLEXITY_API_KEY"):
+            if os.getenv(PERPLEXITY_API_KEY_ENV):
                 logger.info("Falling back to Perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=False)
-            if os.getenv("EXA_API_KEY"):
+            if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
                 return await self._call_exa_smart_searcher(question_text)
         except Exception as fallback_exc:

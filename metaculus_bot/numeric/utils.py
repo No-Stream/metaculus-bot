@@ -137,7 +137,7 @@ def _postprocess_ensemble_cdf(
     )
 
 
-async def aggregate_numeric(
+def aggregate_numeric(
     predictions: Sequence[NumericDistribution],
     question: NumericQuestion,
     method: str | Literal["mean", "median"] = "mean",

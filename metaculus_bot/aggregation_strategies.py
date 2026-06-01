@@ -123,8 +123,14 @@ async def combine_numeric_predictions(
     question: NumericQuestion,
     strategy: AggregationStrategy,
 ) -> NumericDistribution:
-    """Combine numeric distributions according to the requested strategy."""
+    """Combine numeric distributions according to the requested strategy.
 
+    Async for API uniformity with ``combine_binary_predictions`` and
+    ``combine_multiple_choice_predictions``; ``aggregate_numeric`` is synchronous,
+    so a no-op checkpoint satisfies flake8-async.
+    """
+
+    await asyncio.sleep(0)
     if strategy in (AggregationStrategy.MEAN, AggregationStrategy.MEDIAN):
-        return await aggregate_numeric(predictions, question, strategy.value)
+        return aggregate_numeric(predictions, question, strategy.value)
     raise ValueError(f"Unsupported numeric aggregation strategy: {strategy}")

@@ -1,11 +1,11 @@
 """Integration tests for the Platt-scaling hook on ``_aggregate_predictions``.
 
-The hook itself is ``TemplateForecaster._apply_platt_calibration`` (defined in
-``main.py``). It is wired into every fresh-aggregation return point of
+The hook itself is ``AggregationPipeline._apply_platt_calibration`` (defined in
+``aggregation_pipeline.py``). It is wired into every fresh-aggregation return point of
 ``_aggregate_predictions`` (binary, MC, numeric, stacker primary, stacker
 fallback LLM, stacker MEDIAN-fallback) and DELIBERATELY NOT into the
-STACKING base-combine re-entry block (``main.py:1145-1214``) where the inputs
-were already calibrated by an upstream call to the hook.
+STACKING base-combine re-entry block (``AggregationPipeline._base_combine``)
+where the inputs were already calibrated by an upstream call to the hook.
 
 These tests pin five behaviors:
 

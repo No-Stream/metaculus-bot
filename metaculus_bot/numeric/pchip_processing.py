@@ -74,15 +74,12 @@ def generate_pchip_cdf_with_smoothing(
     """Generate PCHIP CDF with optional ramp smoothing."""
     from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 
-    # Track attempt
     global _pchip_stats
     _pchip_stats["total_attempts"] += 1
 
-    # Convert percentiles to PCHIP input format
     pchip_percentiles = percentiles_to_pchip_format(percentile_list)
 
     try:
-        # Generate robust CDF using PCHIP interpolation
         pchip_cdf, aggressive_enforcement_used = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
             open_upper_bound=question.open_upper_bound,
@@ -96,7 +93,6 @@ def generate_pchip_cdf_with_smoothing(
             question_url=getattr(question, "page_url", None),
         )
 
-        # Track success type
         if aggressive_enforcement_used:
             _pchip_stats["required_aggressive_enforcement"] += 1
         else:
@@ -106,17 +102,13 @@ def generate_pchip_cdf_with_smoothing(
         _pchip_stats["failed_entirely"] += 1
         raise
 
-    # Apply probability-side ramp smoothing if needed
     smoothing_applied = False
     try:
         smoothing_applied = _apply_ramp_smoothing(pchip_cdf, question)
     except Exception:
         logger.exception("Ramp smoothing skipped due to error")
 
-    # Validate the generated CDF
     _validate_pchip_cdf(pchip_cdf, question)
-
-    # Log success
     _log_pchip_success(pchip_cdf, question, smoothing_applied)
 
     return pchip_cdf, smoothing_applied, aggressive_enforcement_used
@@ -128,7 +120,6 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> 
     min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
 
     if min_delta_before < NUM_MIN_PROB_STEP:
-        # Apply ramp smoothing
         ramp = np.linspace(0.0, NUM_MIN_PROB_STEP * NUM_RAMP_K_FACTOR, len(pchip_cdf))
         smoothed = np.maximum.accumulate(np.array(pchip_cdf) + ramp)
 
@@ -150,7 +141,6 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> 
         )
         pchip_cdf[:] = smoothed.tolist()
 
-        # Log the smoothing
         diffs_after = np.diff(pchip_cdf)
         min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
         logger.warning(
@@ -168,30 +158,24 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> 
 
 def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> None:
     """Validate PCHIP CDF meets all requirements."""
-    # Check point count
     if len(pchip_cdf) != PCHIP_CDF_POINTS:
         raise ValueError(f"PCHIP CDF has {len(pchip_cdf)} points, expected {PCHIP_CDF_POINTS}")
 
-    # Check probability range
     if not all(0.0 <= p <= 1.0 for p in pchip_cdf):
         invalid_probs = [p for p in pchip_cdf if not (0.0 <= p <= 1.0)]
         raise ValueError(f"PCHIP CDF contains invalid probabilities outside [0,1]: {invalid_probs}")
 
-    # Check monotonicity
     if not all(a <= b for a, b in zip(pchip_cdf[:-1], pchip_cdf[1:])):
         raise ValueError("PCHIP CDF is not monotonic")
 
-    # Check minimum step requirement
     min_step = np.min(np.diff(pchip_cdf))
     if min_step < NUM_MIN_PROB_STEP - 1e-10:
         raise ValueError(f"PCHIP CDF violates minimum step requirement: {min_step:.8f} < 5e-5")
 
-    # Check maximum step requirement
     max_step = np.max(np.diff(pchip_cdf))
     if max_step > NUM_MAX_STEP + 1e-6:
         raise ValueError(f"PCHIP CDF violates maximum step requirement: {max_step:.8f} > {NUM_MAX_STEP:.8f}")
 
-    # Check boundary conditions
     if not question.open_lower_bound and abs(pchip_cdf[0]) > 1e-6:
         raise ValueError(f"PCHIP CDF closed lower bound violation: {pchip_cdf[0]} != 0.0")
 

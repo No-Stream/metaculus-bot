@@ -14,11 +14,20 @@ import aiohttp
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_SENTINEL = "_metaculus_autoclose_wrapped"
+
 
 def enable_aiohttp_session_autoclose() -> None:
     """Monkey-patch ``aiohttp.ClientSession.__init__`` to track open sessions
     and register an ``atexit`` handler that closes any still open at shutdown.
+
+    Idempotent: a sentinel on ``ClientSession`` guards against re-wrapping
+    ``__init__`` and re-registering the atexit handler on repeat calls (which
+    would otherwise stack a fresh WeakSet + atexit closure each time).
     """
+    if getattr(aiohttp.ClientSession, _SENTINEL, False):
+        return
+
     open_sessions: weakref.WeakSet[aiohttp.ClientSession] = weakref.WeakSet()
     original_init = aiohttp.ClientSession.__init__
 
@@ -60,3 +69,4 @@ def enable_aiohttp_session_autoclose() -> None:
                     new_loop.close()
 
     atexit.register(_close_open_sessions)
+    setattr(aiohttp.ClientSession, _SENTINEL, True)

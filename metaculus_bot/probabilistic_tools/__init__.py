@@ -10,7 +10,7 @@ distributions, out-of-bounds mass, consistency flags.
 Active surface, gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and
 per-question-type via ``PROBABILISTIC_TOOLS_TYPES``. See
 ``metaculus_bot/tool_runner.py`` for dispatch and
-``main.py:_make_prediction`` for the activation site.
+``metaculus_bot/forecaster.py:_make_prediction`` for the activation site.
 
 Error conventions
 -----------------

@@ -5,7 +5,11 @@ from typing import Any
 
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.constants import gemini_use_donated_openrouter_key
+from metaculus_bot.constants import (
+    OAI_ANTH_OPENROUTER_KEY_ENV,
+    OPENROUTER_API_KEY_ENV,
+    gemini_use_donated_openrouter_key,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -317,8 +321,8 @@ def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:
     ``DONATED_KEY_PROVIDERS``). For other models, returns a plain GeneralLlm.
     """
     if should_route_via_donated_key(model):
-        special_key = os.getenv("OAI_ANTH_OPENROUTER_KEY")
-        general_key = os.getenv("OPENROUTER_API_KEY")
+        special_key = os.getenv(OAI_ANTH_OPENROUTER_KEY_ENV)
+        general_key = os.getenv(OPENROUTER_API_KEY_ENV)
 
         # If both keys exist and are distinct, use the fallback wrapper
         if special_key and general_key and special_key != general_key:

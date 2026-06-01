@@ -105,6 +105,20 @@ COMMENT_CHAR_LIMIT: int = 149_999
 # Accepted values (case-insensitive): "auto", "asknews", "exa", "perplexity", "openrouter"
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
 
+# Credential env-var names. Named constants (matching the existing *_ENV
+# convention used for GOOGLE_API_KEY_ENV / FRED_API_KEY_ENV) so the literal
+# strings aren't duplicated across api_key_utils / fallback_openrouter /
+# research_providers / research_orchestrator — that duplication is exactly the
+# typo risk the convention exists to prevent. See CLAUDE.md "API keys & secrets"
+# for which of these are shared (donated) vs. personal.
+OPENROUTER_API_KEY_ENV: str = "OPENROUTER_API_KEY"
+OAI_ANTH_OPENROUTER_KEY_ENV: str = "OAI_ANTH_OPENROUTER_KEY"
+ASKNEWS_CLIENT_ID_ENV: str = "ASKNEWS_CLIENT_ID"
+ASKNEWS_SECRET_ENV: str = "ASKNEWS_SECRET"
+EXA_API_KEY_ENV: str = "EXA_API_KEY"
+PERPLEXITY_API_KEY_ENV: str = "PERPLEXITY_API_KEY"
+METACULUS_TOKEN_ENV: str = "METACULUS_TOKEN"
+
 
 def env_flag_enabled(env_name: str, *, default: bool = False) -> bool:
     """Return True iff env var is set to "true"/"1"/"yes" (case-insensitive).

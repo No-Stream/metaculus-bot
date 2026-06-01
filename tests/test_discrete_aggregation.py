@@ -1,13 +1,11 @@
 import numpy as np
-import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.utils import aggregate_numeric
 
 
-@pytest.mark.asyncio
-async def test_discrete_mean_aggregation_cdf_size_and_min_step():
+def test_discrete_mean_aggregation_cdf_size_and_min_step():
     """Mean aggregation returns exactly cdf_size values with required min step for discrete."""
     question = NumericQuestion(
         id_of_question=123,
@@ -49,7 +47,7 @@ async def test_discrete_mean_aggregation_cdf_size_and_min_step():
     dist_b = NumericDistribution(declared_percentiles=decl_b, **question.model_dump())
     dist_c = NumericDistribution(declared_percentiles=decl_c, **question.model_dump())
 
-    agg = await aggregate_numeric([dist_a, dist_b, dist_c], question, "mean")
+    agg = aggregate_numeric([dist_a, dist_b, dist_c], question, "mean")
 
     cdf = agg.cdf
     probs = np.array([p.percentile for p in cdf], dtype=float)
@@ -67,8 +65,7 @@ async def test_discrete_mean_aggregation_cdf_size_and_min_step():
     assert np.allclose(values, expected_values)
 
 
-@pytest.mark.asyncio
-async def test_discrete_median_aggregation_open_upper():
+def test_discrete_median_aggregation_open_upper():
     """Median aggregation handles open upper bound and discrete min step."""
     question = NumericQuestion(
         id_of_question=456,
@@ -102,7 +99,7 @@ async def test_discrete_median_aggregation_open_upper():
     dist_a = NumericDistribution(declared_percentiles=decl_a, **question.model_dump())
     dist_b = NumericDistribution(declared_percentiles=decl_b, **question.model_dump())
 
-    agg = await aggregate_numeric([dist_a, dist_b], question, "median")
+    agg = aggregate_numeric([dist_a, dist_b], question, "median")
 
     cdf = agg.cdf
     probs = np.array([p.percentile for p in cdf], dtype=float)
