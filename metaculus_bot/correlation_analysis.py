@@ -3,22 +3,39 @@ Correlation analysis utilities for ensemble optimization.
 
 Tracks inter-model correlations to optimize ensemble composition by balancing
 performance with diversity.
+
+``CorrelationAnalyzer`` owns the correlation-math, ingestion, and reporting
+concerns. The identity helpers, safe-CDF cache, and ensemble simulation were
+extracted into ``benchmark_identity``, ``numeric_cdf_cache``, and
+``ensemble_simulator`` respectively. Thin delegating wrappers are kept on the
+analyzer for every method that external callers (``analyze_correlations.py``,
+``community_benchmark.py``) and the test suite reach into, so the split is
+non-breaking for the public + private API surface.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from forecasting_tools.cp_benchmarking.benchmark_for_bot import BenchmarkForBot
 from forecasting_tools.data_models.multiple_choice_report import PredictedOptionList
-from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
+from forecasting_tools.data_models.numeric_report import NumericDistribution
 from scipy.stats import pearsonr
+
+from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.benchmark_identity import (
+    extract_clean_model_name,
+    extract_model_name,
+    get_question_type,
+    identifiers_for_benchmark,
+    is_stacking_benchmark,
+)
+from metaculus_bot.ensemble_simulator import EnsembleSimulator
+from metaculus_bot.numeric_cdf_cache import NumericCdfCache
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -42,7 +59,7 @@ class CorrelationMatrix:
 
     pearson_matrix: pd.DataFrame
     spearman_matrix: pd.DataFrame
-    model_names: List[str]
+    model_names: list[str]
     num_questions: int
 
     def get_correlation(self, model1: str, model2: str, method: str = "pearson") -> float:
@@ -52,7 +69,7 @@ class CorrelationMatrix:
 
     def get_least_correlated_pairs(
         self, threshold: float = 0.7, method: str = "pearson"
-    ) -> List[Tuple[str, str, float]]:
+    ) -> list[tuple[str, str, float]]:
         """Find model pairs with correlation below threshold."""
         matrix = self.pearson_matrix if method == "pearson" else self.spearman_matrix
         pairs = []
@@ -71,7 +88,7 @@ class CorrelationMatrix:
 class EnsembleCandidate:
     """Potential ensemble configuration with performance metrics."""
 
-    model_names: List[str]
+    model_names: list[str]
     avg_performance: float  # Average baseline score
     avg_cost: float
     avg_correlation: float  # Average pairwise correlation
@@ -102,35 +119,44 @@ class CorrelationAnalyzer:
     """Analyzes correlations between forecasting models for ensemble optimization."""
 
     def __init__(self):
-        self.predictions: List[ModelPrediction] = []
-        self.benchmarks: List[BenchmarkForBot] = []
-        self._model_stats_cache: Optional[Dict[str, Dict[str, float]]] = None
-        self._baseline_score_cache: Dict[
-            Tuple[int, str], Tuple[float, bool]
-        ] = {}  # (q_id, q_type) -> (score, diagnostics_logged)
+        self.predictions: list[ModelPrediction] = []
+        self.benchmarks: list[BenchmarkForBot] = []
         # Map cleaned model names to benchmark objects for later filtering (e.g., exclude stacking bots)
-        self._model_name_to_benchmark: Dict[str, BenchmarkForBot] = {}
+        self._model_name_to_benchmark: dict[str, BenchmarkForBot] = {}
         # Human-readable notes about any applied filters
-        self._filter_summary_lines: List[str] = []
-        # Safe-CDF machinery for numeric ensemble simulation
-        self._safe_cdf_cache: Dict[tuple[str, int], Optional[List[float]]] = {}
-        self._numeric_cdf_stats: Dict[str, Any] = {
-            "attempt_pairs": set(),  # set[(model, qid)]
-            "safe_cdf_built": set(),  # set[(model, qid)]
-            "safe_cdf_ramp": set(),  # set[(model, qid)]
-            "failures": set(),  # set[(model, qid)]
-            "first_warnings_emitted": set(),  # set[(model, qid)]
-        }
+        self._filter_summary_lines: list[str] = []
+        # Safe-CDF machinery and ensemble simulation are owned by extracted helpers.
+        # The simulator reads `self.benchmarks` live and owns the model-stats / baseline-score caches.
+        self._cdf_cache = NumericCdfCache()
+        self._simulator = EnsembleSimulator(self, self._cdf_cache)
 
-    def add_benchmark_results(self, benchmarks: List[BenchmarkForBot]) -> None:
+    # --- cache-sharing shims -------------------------------------------------
+    # External callers/tests historically read these caches off the analyzer; the
+    # simulator now owns them. These properties keep the old attribute access working.
+    @property
+    def _model_stats_cache(self) -> dict[str, dict[str, float]] | None:
+        return self._simulator.model_stats_cache
+
+    @_model_stats_cache.setter
+    def _model_stats_cache(self, value: dict[str, dict[str, float]] | None) -> None:
+        self._simulator.model_stats_cache = value
+
+    @property
+    def _baseline_score_cache(self) -> dict[tuple[int, str], tuple[float, bool]]:
+        return self._simulator.baseline_score_cache
+
+    def add_benchmark_results(self, benchmarks: list[BenchmarkForBot]) -> None:
         """Extract predictions from benchmark results."""
         self.benchmarks = benchmarks
         self.predictions.clear()
-        self._model_stats_cache = None  # Clear cache when data changes
-        self._baseline_score_cache.clear()  # Clear baseline score cache for new benchmarks
+        # NOTE: the safe-CDF cache (`self._cdf_cache`) is intentionally NOT cleared here.
+        # A fresh CorrelationAnalyzer is constructed per analysis run, so its (model, qid)
+        # keys never collide across benchmark sets in practice. Clear it explicitly if that
+        # assumption changes (see NumericCdfCache.clear).
+        self._simulator.invalidate_caches()  # Clear derived caches when data changes
 
         for benchmark in benchmarks:
-            model_name = self._extract_model_name(benchmark)
+            model_name = extract_model_name(benchmark)
             # Track the mapping for later filtering
             self._model_name_to_benchmark[model_name] = benchmark
 
@@ -150,52 +176,28 @@ class CorrelationAnalyzer:
 
         logger.info(f"Loaded {len(self.predictions)} predictions from {len(benchmarks)} models")
 
-    def _identifiers_for_benchmark(self, benchmark: BenchmarkForBot, model_name: str) -> List[str]:
-        """Return identifier strings used for substring matching.
+    # --- delegating wrappers: identity helpers (see benchmark_identity) ------
+    def _extract_model_name(self, benchmark: BenchmarkForBot) -> str:
+        """Delegates to ``benchmark_identity.extract_model_name``."""
+        return extract_model_name(benchmark)
 
-        Uses multiple fields for robustness without normalization beyond lowercasing:
-        - cleaned model name we derived
-        - the benchmark's own name
-        - any model path strings found in forecast_bot_config.llms (default/forecasters/stacker)
-        """
-        idents: List[str] = []
-        try:
-            idents.append(model_name)
-            if getattr(benchmark, "name", None):
-                idents.append(benchmark.name)
-            cfg = getattr(benchmark, "forecast_bot_config", {}) or {}
-            llms = cfg.get("llms", {}) if isinstance(cfg, dict) else {}
-            if isinstance(llms, dict):
-                default_cfg = llms.get("default")
-                if isinstance(default_cfg, dict) and default_cfg.get("model"):
-                    idents.append(str(default_cfg.get("model")))
-                # forecasters list
-                forecasters = llms.get("forecasters")
-                if isinstance(forecasters, list):
-                    for f in forecasters:
-                        if isinstance(f, dict):
-                            if f.get("original_model"):
-                                idents.append(str(f.get("original_model")))
-                            if f.get("model"):
-                                idents.append(str(f.get("model")))
-                # stacker model
-                stacker_cfg = llms.get("stacker")
-                if isinstance(stacker_cfg, dict) and stacker_cfg.get("model"):
-                    idents.append(str(stacker_cfg.get("model")))
-        except Exception:
-            logger.debug(f"Failed to extract identifiers for benchmark {model_name}: unexpected config structure")
-        # Deduplicate while preserving order
-        seen = set()
-        out = []
-        for s in idents:
-            if not s:
-                continue
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
+    def _extract_clean_model_name(self, model_path: str) -> str:
+        """Delegates to ``benchmark_identity.extract_clean_model_name``."""
+        return extract_clean_model_name(model_path)
 
-    def get_model_names(self) -> List[str]:
+    def _identifiers_for_benchmark(self, benchmark: BenchmarkForBot, model_name: str) -> list[str]:
+        """Delegates to ``benchmark_identity.identifiers_for_benchmark``."""
+        return identifiers_for_benchmark(benchmark, model_name)
+
+    def _is_stacking_benchmark(self, benchmark: BenchmarkForBot | None) -> bool:
+        """Delegates to ``benchmark_identity.is_stacking_benchmark``."""
+        return is_stacking_benchmark(benchmark)
+
+    def _get_question_type(self, report) -> str:
+        """Delegates to ``benchmark_identity.get_question_type``."""
+        return get_question_type(report)
+
+    def get_model_names(self) -> list[str]:
         """Return sorted unique model names present in current predictions/benchmarks."""
         if self._model_name_to_benchmark:
             names = list(self._model_name_to_benchmark.keys())
@@ -205,9 +207,9 @@ class CorrelationAnalyzer:
 
     def filter_models_inplace(
         self,
-        include: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-    ) -> Dict[str, List[str]]:
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+    ) -> dict[str, list[str]]:
         """Filter benchmarks/predictions by substring-matched include/exclude lists.
 
         Matching is case-insensitive substring on several identifiers per model.
@@ -223,13 +225,13 @@ class CorrelationAnalyzer:
             return {"included": [], "excluded": [], "unmatched_includes": [], "unmatched_excludes": []}
 
         # Compute model name -> identifiers map
-        name_to_idents: Dict[str, List[str]] = {}
+        name_to_idents: dict[str, list[str]] = {}
         for b in self.benchmarks:
-            name = self._extract_model_name(b)
-            name_to_idents[name] = self._identifiers_for_benchmark(b, name)
+            name = extract_model_name(b)
+            name_to_idents[name] = identifiers_for_benchmark(b, name)
 
         # Helpers for case-insensitive substring matching
-        def _any_token_in_idents(tokens: List[str], idents: List[str]) -> bool:
+        def _any_token_in_idents(tokens: list[str], idents: list[str]) -> bool:
             if not tokens:
                 return False
             lowers = [s.lower() for s in idents]
@@ -241,10 +243,10 @@ class CorrelationAnalyzer:
             return False
 
         # Determine included set
-        all_models: List[str] = list(name_to_idents.keys())
+        all_models: list[str] = list(name_to_idents.keys())
         included_set = set(all_models)
-        matched_includes: Dict[str, List[str]] = {t: [] for t in tokens_inc}
-        matched_excludes: Dict[str, List[str]] = {t: [] for t in tokens_exc}
+        matched_includes: dict[str, list[str]] = {t: [] for t in tokens_inc}
+        matched_excludes: dict[str, list[str]] = {t: [] for t in tokens_exc}
 
         if tokens_inc:
             included_set = set()
@@ -294,11 +296,10 @@ class CorrelationAnalyzer:
         allowed_set = set(final_allowed)
         before_bench = len(self.benchmarks)
         before_preds = len(self.predictions)
-        self.benchmarks = [b for b in self.benchmarks if self._extract_model_name(b) in allowed_set]
+        self.benchmarks = [b for b in self.benchmarks if extract_model_name(b) in allowed_set]
         self.predictions = [p for p in self.predictions if p.model_name in allowed_set]
         self._model_name_to_benchmark = {k: v for k, v in self._model_name_to_benchmark.items() if k in allowed_set}
-        self._model_stats_cache = None
-        self._baseline_score_cache.clear()
+        self._simulator.invalidate_caches()
 
         logger.info(
             f"Model filtering applied: {before_bench}→{len(self.benchmarks)} benchmarks, {before_preds}→{len(self.predictions)} predictions"
@@ -310,25 +311,6 @@ class CorrelationAnalyzer:
             "unmatched_includes": unmatched_includes,
             "unmatched_excludes": unmatched_excludes,
         }
-
-    def _is_stacking_benchmark(self, benchmark: Optional[BenchmarkForBot]) -> bool:
-        """Return True if the provided benchmark used STACKING aggregation.
-
-        Single canonical detection: forecast_bot_config['aggregation_strategy'] == 'stacking'
-        (supports enum-like objects with .value or plain strings).
-        """
-        if benchmark is None:
-            return False
-        try:
-            cfg = benchmark.forecast_bot_config or {}
-            strat = cfg.get("aggregation_strategy")
-            if isinstance(strat, Enum):
-                strat = strat.value
-            if isinstance(strat, str):
-                return strat.lower() == "stacking"
-        except Exception:
-            logger.debug(f"Failed to detect stacking strategy for benchmark: {benchmark.name}")
-        return False
 
     def calculate_correlation_matrix(self) -> CorrelationMatrix:
         """Calculate Pearson and Spearman correlations between all model pairs."""
@@ -383,7 +365,7 @@ class CorrelationAnalyzer:
             for benchmark in self.benchmarks:
                 for report_candidate in benchmark.forecast_reports:
                     if (report_candidate.question.id_of_question or 0) == q_id:
-                        if self._extract_model_name(benchmark) == pred.model_name:
+                        if extract_model_name(benchmark) == pred.model_name:
                             report = report_candidate
                             break
                 if report:
@@ -495,16 +477,16 @@ class CorrelationAnalyzer:
         max_cost_per_question: float = 1.0,
         min_performance: float = -100.0,
         use_component_analysis: bool = True,
-    ) -> List[EnsembleCandidate]:
+    ) -> list[EnsembleCandidate]:
         """Find optimal ensemble configurations using performance + correlation data."""
-        model_stats = self._calculate_model_statistics()
+        model_stats = self._simulator.calculate_model_statistics()
 
         # Exclude stacking bots from ensemble candidates using a single detection path
         if self._model_name_to_benchmark:
             model_stats = {
                 name: stats
                 for name, stats in model_stats.items()
-                if not self._is_stacking_benchmark(self._model_name_to_benchmark.get(name))
+                if not is_stacking_benchmark(self._model_name_to_benchmark.get(name))
             }
 
         # Use component-wise analysis for mixed question types if available
@@ -524,8 +506,10 @@ class CorrelationAnalyzer:
         for size in range(2, max_ensemble_size + 1):
             for model_combo in combinations(model_stats.keys(), size):
                 # Test both aggregation strategies for each model combination
-                for agg_strategy in ["mean", "median"]:
-                    candidate = self._evaluate_ensemble(model_combo, model_stats, correlation_matrix, agg_strategy)
+                for agg_strategy in (AggregationStrategy.MEAN, AggregationStrategy.MEDIAN):
+                    candidate = self._simulator.evaluate_ensemble(
+                        model_combo, model_stats, correlation_matrix, agg_strategy
+                    )
 
                     # Filter by constraints
                     if candidate.avg_cost <= max_cost_per_question and candidate.avg_performance >= min_performance:
@@ -541,96 +525,6 @@ class CorrelationAnalyzer:
         except Exception:
             logger.debug("Failed to log numeric CDF summary")
         return candidates
-
-    def _extract_model_name(self, benchmark: BenchmarkForBot) -> str:
-        """Extract clean model name from benchmark.
-
-        For the new ensemble configuration, this returns the bot name directly
-        (e.g., 'qwen3_glm_mean', 'qwen3-235b') rather than trying to parse
-        individual model names from the forecasters list.
-        """
-        try:
-            # First, try simple approach: if benchmark name looks like a model name, use it directly
-            simple_name = benchmark.name.strip()
-            # Check if it's a simple model name without complex parsing
-            if (
-                simple_name and "|" not in simple_name and " " not in simple_name and len(simple_name.split("-")) <= 3
-            ):  # Simple model names like "qwen3-235b"
-                return simple_name
-
-            # Extract from LLM config - handle both old and new formats
-            llms = benchmark.forecast_bot_config.get("llms", {})
-
-            # New format: check the "default" LLM which is used for forecasting
-            if "default" in llms and isinstance(llms["default"], dict):
-                forecaster_config = llms["default"]
-                if "model" in forecaster_config:
-                    model_path = forecaster_config["model"]
-                    return self._extract_clean_model_name(model_path)
-
-            # Legacy format: check forecasters array
-            if "forecasters" in llms and llms["forecasters"]:
-                forecasters = llms["forecasters"]
-
-                # For single model bots, use the model name
-                if len(forecasters) == 1:
-                    first_forecaster = forecasters[0]
-                    if isinstance(first_forecaster, dict):
-                        if "original_model" in first_forecaster:
-                            model_path = first_forecaster["original_model"]
-                            return self._extract_clean_model_name(model_path)
-                        elif "model" in first_forecaster:
-                            model_path = first_forecaster["model"]
-                            return self._extract_clean_model_name(model_path)
-
-                # For multi-model ensembles, generate ensemble name from components
-                elif len(forecasters) > 1:
-                    model_components = []
-                    for forecaster in forecasters:
-                        if isinstance(forecaster, dict):
-                            model_key = "original_model" if "original_model" in forecaster else "model"
-                            if model_key in forecaster:
-                                model_name = forecaster[model_key].split("/")[-1]
-                                if "qwen3" in model_name:
-                                    model_components.append("qwen3")
-                                elif "glm" in model_name:
-                                    model_components.append("glm")
-                                elif "gpt" in model_name:
-                                    model_components.append("gpt5")
-                                elif "claude" in model_name:
-                                    model_components.append("claude")
-                                elif "deepseek" in model_name:
-                                    model_components.append("deepseek")
-                                else:
-                                    # Fallback: use last part of model name
-                                    model_components.append(model_name.split("-")[0])
-
-                    if model_components:
-                        ensemble_base = "_".join(sorted(set(model_components)))
-                        config = benchmark.forecast_bot_config
-                        if "aggregation_strategy" in config:
-                            strategy = config["aggregation_strategy"]
-                            if isinstance(strategy, Enum):
-                                return f"{ensemble_base}_{strategy.value}"
-                            elif isinstance(strategy, str):
-                                return f"{ensemble_base}_{strategy}"
-                        return ensemble_base
-
-            # Fallback to benchmark name parsing
-            name_parts = benchmark.name.split(" | ")
-            if len(name_parts) >= 3:
-                return name_parts[2]  # Model name is usually third part
-
-        except Exception as e:
-            logger.warning(f"Could not extract model name from benchmark: {e}")
-
-        return f"model_{hash(benchmark.name) % 10000}"
-
-    def _extract_clean_model_name(self, model_path: str) -> str:
-        """Extract a clean model name from a model path like 'openrouter/deepseek/deepseek-r1-0528:free'."""
-        # Split by '/' and take the last part, then split by ':' to remove variant suffixes
-        model_name = model_path.split("/")[-1].split(":")[0]
-        return model_name
 
     def _extract_prediction_value(self, report) -> float:
         """Convert prediction to float for correlation analysis.
@@ -660,7 +554,7 @@ class CorrelationAnalyzer:
         # Last resort: hash the prediction for some numeric value
         return float(hash(str(prediction)) % 1000) / 1000.0
 
-    def _extract_prediction_components(self, report) -> Tuple[str, List[float]]:
+    def _extract_prediction_components(self, report) -> tuple[str, list[float]]:
         """Extract prediction components for improved correlation analysis.
 
         Returns:
@@ -720,7 +614,7 @@ class CorrelationAnalyzer:
 
         return len(question_types) > 1
 
-    def _get_question_type_breakdown(self) -> Dict[str, int]:
+    def _get_question_type_breakdown(self) -> dict[str, int]:
         """Get count of each question type in the benchmarks."""
         type_counts = {}
 
@@ -731,582 +625,61 @@ class CorrelationAnalyzer:
 
         return type_counts
 
-    def _calculate_model_statistics(self) -> Dict[str, Dict[str, float]]:
-        """Calculate performance and cost statistics per model."""
-        if self._model_stats_cache is not None:
-            return self._model_stats_cache
-
-        model_stats = {}
-
-        for benchmark in self.benchmarks:
-            model_name = self._extract_model_name(benchmark)
-            total_cost = benchmark.total_cost
-            num_questions = len(benchmark.forecast_reports)
-
-            # Fix unrealistic costs for premium models and free models
-            if model_name in ["gpt-5.1", "o3"] and total_cost < 0.10:
-                # Estimate based on average reasoning length and known pricing
-                avg_reasoning_length = self._estimate_avg_reasoning_length(benchmark)
-                estimated_tokens = (avg_reasoning_length * 0.3) + 1000  # chars*0.3 + base prompt
-
-                if model_name == "gpt-5.1":
-                    total_cost = num_questions * (
-                        estimated_tokens * 1.25 / 1_000_000
-                    )  # $1.25 input + conservative output
-                elif model_name == "o3":
-                    total_cost = num_questions * (estimated_tokens * 2.0 / 1_000_000)  # $2 input + conservative output
-
-                logger.info(
-                    f"Adjusted {model_name} cost from ${benchmark.total_cost:.4f} to ${total_cost:.4f} "
-                    f"(avg reasoning: {avg_reasoning_length} chars)"
-                )
-            elif total_cost == 0.0:
-                # Apply minimum cost for free models to enable ensemble calculations
-                total_cost = num_questions * 0.001  # $0.001 per question
-                logger.info(
-                    f"Applied minimum cost to free model {model_name}: ${total_cost:.3f} total (${0.001:.3f}/question)"
-                )
-
-            model_stats[model_name] = {
-                "avg_performance": benchmark.average_expected_baseline_score,
-                "avg_cost": total_cost / max(num_questions, 1),
-                "total_cost": total_cost,
-                "num_questions": num_questions,
-                "efficiency_ratio": benchmark.average_expected_baseline_score / max(total_cost, 0.001),
-            }
-
-        self._model_stats_cache = model_stats  # Cache the results
-        return model_stats
+    # --- delegating wrappers: ensemble simulation (see ensemble_simulator) ---
+    def _calculate_model_statistics(self) -> dict[str, dict[str, float]]:
+        """Delegates to ``EnsembleSimulator.calculate_model_statistics``."""
+        return self._simulator.calculate_model_statistics()
 
     def _estimate_avg_reasoning_length(self, benchmark: BenchmarkForBot) -> float:
-        """Estimate average reasoning text length for cost calculation."""
-        total_chars = 0
-        count = 0
-
-        for report in benchmark.forecast_reports:
-            if report.explanation:
-                total_chars += len(report.explanation)
-                count += 1
-
-        return total_chars / max(count, 1) if count > 0 else 2000  # Default estimate
+        """Delegates to ``EnsembleSimulator._estimate_avg_reasoning_length``."""
+        return self._simulator._estimate_avg_reasoning_length(benchmark)
 
     def _evaluate_ensemble(
         self,
-        model_names: Tuple[str, ...],
-        model_stats: Dict[str, Dict[str, float]],
+        model_names: tuple[str, ...],
+        model_stats: dict[str, dict[str, float]],
         corr_matrix: CorrelationMatrix,
-        aggregation_strategy: str = "mean",
+        aggregation_strategy: AggregationStrategy | str = "mean",
     ) -> EnsembleCandidate:
-        """Evaluate a specific ensemble configuration with a given aggregation strategy."""
-        models = list(model_names)
+        """Delegates to ``EnsembleSimulator.evaluate_ensemble``."""
+        return self._simulator.evaluate_ensemble(model_names, model_stats, corr_matrix, aggregation_strategy)
 
-        # Calculate ensemble performance by simulating actual aggregation
-        ensemble_performance = self._simulate_ensemble_performance(models, aggregation_strategy)
-
-        # Calculate average cost (same as before)
-        avg_cost = np.mean([model_stats[m]["avg_cost"] for m in models])
-
-        # Calculate average pairwise correlation
-        correlations = []
-        for i in range(len(models)):
-            for j in range(i + 1, len(models)):
-                try:
-                    corr = corr_matrix.get_correlation(models[i], models[j], "pearson")
-                    correlations.append(abs(corr))
-                except KeyError:
-                    # Models might not have overlapping predictions
-                    correlations.append(0.5)  # Neutral correlation
-
-        avg_correlation = np.mean(correlations) if correlations else 0.5
-        diversity_score = 1.0 - avg_correlation
-        efficiency_ratio = ensemble_performance / max(avg_cost, 0.001)
-
-        return EnsembleCandidate(
-            model_names=models,
-            avg_performance=ensemble_performance,
-            avg_cost=avg_cost,
-            avg_correlation=avg_correlation,
-            diversity_score=diversity_score,
-            efficiency_ratio=efficiency_ratio,
-            aggregation_strategy=aggregation_strategy,
-        )
-
-    def _simulate_ensemble_performance(self, models: List[str], aggregation_strategy: str) -> float:
-        """Simulate ensemble performance by aggregating actual model predictions and scoring them properly."""
-        from types import SimpleNamespace
-
-        from metaculus_bot.scoring_patches import (
-            calculate_multiple_choice_baseline_score,
-            calculate_numeric_baseline_score,
-        )
-
-        # Group data by question from benchmark reports
-        question_data = {}
-
-        for benchmark in self.benchmarks:
-            model_name = self._extract_model_name(benchmark)
-            if model_name in models:
-                for report in benchmark.forecast_reports:
-                    q_id = report.question.id_of_question
-                    if q_id not in question_data:
-                        # DEPRECATED: community_prediction_at_access_time is always None for
-                        # newly-fetched questions (Metaculus removed aggregations from list API).
-                        # This field may still have values in historical benchmark data.
-                        q_type_tmp = self._get_question_type(report)
-                        bin_cp = (
-                            getattr(
-                                report.question,
-                                "community_prediction_at_access_time",
-                                None,
-                            )
-                            if q_type_tmp == "binary"
-                            else None
-                        )
-                        question_data[q_id] = {
-                            "individual_preds": {},
-                            "community_pred": bin_cp,
-                            "question": report.question,
-                            "question_type": q_type_tmp,
-                        }
-
-                    # Store actual prediction object (not just float)
-                    question_data[q_id]["individual_preds"][model_name] = report.prediction
-
-                    # Determine question type for proper aggregation
-                    if question_data[q_id]["question_type"] is None:
-                        question_data[q_id]["question_type"] = self._get_question_type(report)
-
-        ensemble_scores = []
-
-        for q_id, data in question_data.items():
-            # Only consider questions where all models in the ensemble made predictions
-            if len(data["individual_preds"]) != len(models):
-                continue
-
-            q = data["question"]
-            q_type = data["question_type"]
-            preds = [data["individual_preds"][m] for m in models]
-
-            try:
-                if q_type == "binary":
-                    # Aggregate scalar prob and use binary baseline formula
-                    pred_vals = [float(p) for p in preds]
-                    if aggregation_strategy == "mean":
-                        agg_p = float(np.mean(pred_vals))
-                    else:
-                        agg_p = float(np.median(pred_vals))
-                    c = getattr(q, "community_prediction_at_access_time", None)
-                    score = self._calculate_baseline_score(agg_p, c, "binary")
-                    if score is not None:
-                        ensemble_scores.append(score)
-
-                elif q_type == "multiple_choice":
-                    # Aggregate per-option probabilities
-                    # Build option name list from first prediction
-                    first_pred = preds[0]
-                    if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
-                        raise ValueError("Multiple choice prediction missing predicted_options")
-                    option_names = [getattr(opt, "option_name", str(opt)) for opt in first_pred.predicted_options]
-
-                    aggregated = []
-                    for name in option_names:
-                        vals = []
-                        for pred in preds:
-                            for opt in pred.predicted_options:
-                                if getattr(opt, "option_name", str(opt)) == name:
-                                    vals.append(float(getattr(opt, "probability", 0)))
-                                    break
-                        if not vals:
-                            aggregated.append(0.0)
-                        else:
-                            aggregated.append(
-                                float(np.mean(vals)) if aggregation_strategy == "mean" else float(np.median(vals))
-                            )
-                    # Normalize
-                    s = sum(aggregated)
-                    aggregated = [x / s for x in aggregated] if s > 0 else [1.0 / len(aggregated)] * len(aggregated)
-
-                    # Build lightweight report-like object
-                    pred_obj = SimpleNamespace(
-                        predicted_options=[
-                            SimpleNamespace(option_name=n, probability=p) for n, p in zip(option_names, aggregated)
-                        ]
-                    )
-                    fake_report = SimpleNamespace(question=q, prediction=pred_obj)
-                    score = calculate_multiple_choice_baseline_score(fake_report, self._baseline_score_cache)
-                    if score is not None:
-                        ensemble_scores.append(score)
-
-                elif q_type == "numeric":
-                    # Aggregate CDFs from predictions with safe-CDF fallback
-                    # Extract CDF lists from each prediction (safe)
-                    cdfs = []
-                    for pred in preds:
-                        # Use safe CDF accessor that rebuilds from declared percentiles if needed
-                        cdf_list = self._get_safe_numeric_cdf(
-                            model_name=self._infer_model_name_from_prediction(q_id, pred),
-                            question=q,
-                            prediction=pred,
-                        )
-                        if cdf_list is None:
-                            raise ValueError("Numeric prediction missing usable cdf after fallback")
-                        cdfs.append(cdf_list)
-                    # Use x-axis from first cdf
-                    x_vals = [pt.value for pt in cdfs[0]]
-                    # Stack cdf percentiles
-                    stacks = np.array([[float(pt.percentile) for pt in c] for c in cdfs])
-                    if aggregation_strategy == "mean":
-                        agg_cdf = stacks.mean(axis=0)
-                    else:
-                        agg_cdf = np.median(stacks, axis=0)
-
-                    # Build lightweight prediction with cdf
-                    class _Perc:
-                        __slots__ = ("value", "percentile")
-
-                        def __init__(self, value: float, percentile: float):
-                            self.value = value
-                            self.percentile = percentile
-
-                    class _NumericPred:
-                        def __init__(self, x: List[float], c: List[float]):
-                            self._cdf = [_Perc(v, p) for v, p in zip(x, c)]
-
-                        @property
-                        def cdf(self):
-                            return self._cdf
-
-                    agg_pred = _NumericPred(x_vals, list(agg_cdf))
-                    fake_report = SimpleNamespace(question=q, prediction=agg_pred)
-                    score = calculate_numeric_baseline_score(fake_report, self._baseline_score_cache)
-                    if score is not None:
-                        ensemble_scores.append(score)
-
-                else:
-                    continue
-
-            except Exception as e:
-                logger.warning(f"Failed to aggregate predictions for question {q_id}: {e}")
-                continue
-
-        # Return average ensemble performance across all questions
-        result = np.mean(ensemble_scores) if ensemble_scores else 0.0
-        logger.debug(
-            f"Ensemble {models} with {aggregation_strategy}: {len(ensemble_scores)} questions, avg score {result:.2f}"
-        )
-        return result
+    def _simulate_ensemble_performance(
+        self, models: list[str], aggregation_strategy: AggregationStrategy | str
+    ) -> float:
+        """Delegates to ``EnsembleSimulator.simulate_ensemble_performance``."""
+        return self._simulator.simulate_ensemble_performance(models, aggregation_strategy)
 
     def _infer_model_name_from_prediction(self, q_id: int, pred: Any) -> str:
-        """Best-effort resolve model name for stats when only prediction object is available.
-
-        We search benchmarks mapping for a report with matching question id and same prediction object reference.
-        Fallback to 'unknown' if not found. This is only used for logging counters.
-        """
-        try:
-            for benchmark in self.benchmarks:
-                name = self._extract_model_name(benchmark)
-                for r in benchmark.forecast_reports:
-                    if r.question.id_of_question == q_id and r.prediction is pred:
-                        return name
-        except Exception:
-            logger.debug(f"Failed to infer model name for question {q_id}")
-        return "unknown"
-
-    def _get_safe_numeric_cdf(self, model_name: str, question: Any, prediction: Any) -> Optional[List[Any]]:
-        """Return a safe numeric CDF as a list of objects with `.percentile` and `.value`.
-
-        Attempts `prediction.cdf` first. If items are floats or missing `.value`, synthesize a
-        reasonable x-grid from question bounds. If `prediction.cdf` raises, rebuild from
-        declared percentiles via PCHIP; as last resort, return a monotone ramp. All paths return
-        objects convertible to the NumericDistribution "Percentile"-like shape required by
-        downstream scoring (which only reads `.percentile`).
-        """
-        # Local import to avoid module-level dependency and to satisfy linters for this scope
-        from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
-
-        qid = getattr(question, "id_of_question", None)
-        if qid is None:
-            qid = -1
-        key = (model_name, int(qid))
-
-        # Stats bookkeeping
-        stats = self._numeric_cdf_stats
-        stats["attempt_pairs"].add(key)
-
-        # Cache lookup
-        if key in self._safe_cdf_cache:
-            return self._safe_cdf_cache[key]
-
-        # Try direct access
-        try:
-            raw = getattr(prediction, "cdf")
-            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-                first = raw[0]
-                has_percentile = isinstance(first, (Percentile, SimpleNamespace)) and hasattr(first, "percentile")
-                has_value = isinstance(first, (Percentile, SimpleNamespace)) and hasattr(first, "value")
-                if has_percentile and has_value:
-                    self._safe_cdf_cache[key] = list(raw)  # type: ignore[list-item]
-                    return list(raw)  # type: ignore[return-value]
-                elif has_percentile:
-                    lower = getattr(question, "lower_bound", 0.0)
-                    upper = getattr(question, "upper_bound", 1.0)
-                    n = len(raw)
-                    x = np.linspace(float(lower), float(upper), n)
-                    out = []
-                    for xi, p in zip(x, raw):
-                        out.append(SimpleNamespace(value=float(xi), percentile=float(p.percentile)))
-                    self._safe_cdf_cache[key] = out
-                    return out
-                else:
-                    # Percentiles as bare floats
-                    lower = getattr(question, "lower_bound", 0.0)
-                    upper = getattr(question, "upper_bound", 1.0)
-                    n = len(raw)
-                    x = np.linspace(float(lower), float(upper), n)
-                    out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw)]
-                    self._safe_cdf_cache[key] = out
-                    return out
-        except Exception as e:
-            if key not in stats["first_warnings_emitted"]:
-                logger.warning(
-                    "Numeric CDF access failed for model=%s q=%s: %s — attempting safe rebuild",
-                    model_name,
-                    qid,
-                    e,
-                )
-                stats["first_warnings_emitted"].add(key)
-
-        # Rebuild from declared percentiles via PCHIP
-        try:
-            lower = getattr(question, "lower_bound", None)
-            upper = getattr(question, "upper_bound", None)
-            if lower is None or upper is None:
-                raise ValueError("missing bounds")
-
-            declared = getattr(prediction, "declared_percentiles", None)
-            if not declared:
-                raise ValueError("no declared_percentiles to rebuild from")
-
-            # Convert to pchip format and rebuild CDF values
-            pv = percentiles_to_pchip_format(declared)
-            # Use open-bound flags if available
-            open_lower = bool(getattr(question, "open_lower_bound", False))
-            open_upper = bool(getattr(question, "open_upper_bound", False))
-            # zero_point should be None for discrete or unknown
-            zero_point = getattr(question, "zero_point", None)
-            # For discrete numeric (non-201 bins), ignore zero_point to avoid singularities
-            cdf_size = int(getattr(question, "cdf_size", 201) or 201)
-            zp = None if cdf_size != 201 else zero_point
-            cdf_vals, _ = generate_pchip_cdf(
-                pv,
-                open_upper_bound=open_upper,
-                open_lower_bound=open_lower,
-                upper_bound=float(upper),
-                lower_bound=float(lower),
-                zero_point=zp,
-                num_points=201,
-                question_id=qid,
-                question_url=getattr(question, "page_url", None),
-            )
-            # Ensure monotone and within [0,1]
-            cdf_vals = list(np.maximum.accumulate(np.clip(np.array(cdf_vals, dtype=float), 0.0, 1.0)))
-            x = np.linspace(float(lower), float(upper), len(cdf_vals))
-            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, cdf_vals)]
-            self._safe_cdf_cache[key] = out
-            stats["safe_cdf_built"].add(key)
-            return out
-        except Exception as e:
-            if key not in stats["first_warnings_emitted"]:
-                logger.warning(
-                    "Numeric CDF rebuild failed for model=%s q=%s: %s — using monotone ramp",
-                    model_name,
-                    qid,
-                    e,
-                )
-                stats["first_warnings_emitted"].add(key)
-
-        # Final fallback: monotone ramp respecting min step
-        try:
-            n = 201
-            vals = list(np.linspace(0.0, 1.0, n))
-            # Enforce min step 5e-05
-            min_step = 5e-05
-            for i in range(1, n):
-                if vals[i] < vals[i - 1] + min_step:
-                    vals[i] = min(1.0, vals[i - 1] + min_step)
-            if vals[-1] > 1.0:
-                vals[-1] = 1.0
-            lower = getattr(question, "lower_bound", 0.0)
-            upper = getattr(question, "upper_bound", 1.0)
-            x = np.linspace(float(lower), float(upper), n)
-            out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, vals)]
-            self._safe_cdf_cache[key] = out
-            stats["safe_cdf_ramp"].add(key)
-            return out
-        except Exception:
-            stats["failures"].add(key)
-            self._safe_cdf_cache[key] = None
-            return None
-
-    def log_numeric_cdf_summary(self) -> None:
-        """Log a one-line summary of numeric CDF safety fallbacks to detect systemic issues."""
-        s = self._numeric_cdf_stats
-        try:
-            attempts = len(s["attempt_pairs"]) or 0
-            built = len(s["safe_cdf_built"]) or 0
-            ramp = len(s["safe_cdf_ramp"]) or 0
-            fails = len(s["failures"]) or 0
-            if attempts > 0:
-                logger.info(
-                    "Numeric CDF safety summary: attempts=%d, rebuilt=%d, ramp=%d, failures=%d",
-                    attempts,
-                    built,
-                    ramp,
-                    fails,
-                )
-        except Exception:
-            logger.debug("Failed to compute numeric CDF summary statistics")
-
-    def _get_question_type(self, report) -> str:
-        """Determine question type from report."""
-        prediction = report.prediction
-
-        if isinstance(prediction, (int, float)):
-            return "binary"
-
-        if isinstance(prediction, PredictedOptionList):
-            return "multiple_choice"
-
-        if isinstance(prediction, NumericDistribution):
-            return "numeric"
-
-        return "binary"
+        """Delegates to ``EnsembleSimulator.infer_model_name_from_prediction``."""
+        return self._simulator.infer_model_name_from_prediction(q_id, pred)
 
     def _aggregate_predictions(
         self,
-        individual_preds: Dict[str, Any],
-        models: List[str],
+        individual_preds: dict[str, Any],
+        models: list[str],
         question_type: str,
-        aggregation_strategy: str,
+        aggregation_strategy: AggregationStrategy | str,
     ) -> float:
-        """Aggregate individual model predictions based on question type and strategy."""
-        if question_type == "binary":
-            # Direct aggregation of probabilities
-            predictions = [individual_preds[model] for model in models]
-            if aggregation_strategy == "mean":
-                return float(np.mean(predictions))
-            elif aggregation_strategy == "median":
-                return float(np.median(predictions))
-            else:
-                raise ValueError(f"Unknown aggregation strategy: {aggregation_strategy}")
-
-        elif question_type == "multiple_choice":
-            # Aggregate probability distributions
-            predictions = [individual_preds[model] for model in models]
-
-            # Extract options from first prediction for consistency
-            first_pred = predictions[0]
-            if not isinstance(first_pred, PredictedOptionList) or not first_pred.predicted_options:
-                raise ValueError("Multiple choice prediction missing predicted_options")
-
-            sorted_options = sorted(
-                first_pred.predicted_options,
-                key=lambda opt: opt.option_name,
-            )
-            option_names = [opt.option_name for opt in sorted_options]
-
-            # Aggregate probabilities for each option
-            aggregated_probs = []
-            for i, option_name in enumerate(option_names):
-                option_probs = []
-                for pred in predictions:
-                    for opt in pred.predicted_options:
-                        if opt.option_name == option_name:
-                            option_probs.append(opt.probability)
-                            break
-
-                if option_probs:
-                    if aggregation_strategy == "mean":
-                        aggregated_probs.append(np.mean(option_probs))
-                    elif aggregation_strategy == "median":
-                        aggregated_probs.append(np.median(option_probs))
-                    else:
-                        raise ValueError(f"Unknown aggregation strategy: {aggregation_strategy}")
-                else:
-                    aggregated_probs.append(0.0)
-
-            # Normalize to sum to 1
-            total_prob = sum(aggregated_probs)
-            if total_prob > 0:
-                aggregated_probs = [p / total_prob for p in aggregated_probs]
-
-            # Return max probability as representative value for scoring
-            return max(aggregated_probs) if aggregated_probs else 0.5
-
-        elif question_type == "numeric":
-            # Use median values for numeric questions
-            median_values = []
-            for model in models:
-                pred = individual_preds[model]
-                if isinstance(pred, NumericDistribution) and pred.declared_percentiles:
-                    # Find 50th percentile or use mean of available percentiles
-                    percentiles = pred.declared_percentiles
-                    median_percentile = next((p for p in percentiles if p.percentile == 50), None)
-                    if median_percentile:
-                        median_values.append(float(median_percentile.value))
-                    else:
-                        median_values.append(float(np.mean([p.value for p in percentiles])))
-                else:
-                    # Fallback: treat as binary
-                    median_values.append(0.5)
-
-            if aggregation_strategy == "mean":
-                return float(np.mean(median_values))
-            elif aggregation_strategy == "median":
-                return float(np.median(median_values))
-            else:
-                raise ValueError(f"Unknown aggregation strategy: {aggregation_strategy}")
-
-        else:
-            raise ValueError(f"Unknown question type: {question_type}")
+        """Delegates to ``EnsembleSimulator.aggregate_predictions``."""
+        return self._simulator.aggregate_predictions(individual_preds, models, question_type, aggregation_strategy)
 
     def _calculate_baseline_score(
         self, prediction_value: float, community_prediction: Any, question_type: str
-    ) -> Optional[float]:
-        """Calculate baseline score using the same logic as forecasting_tools."""
-        import math
+    ) -> float | None:
+        """Delegates to ``EnsembleSimulator.calculate_baseline_score``."""
+        return self._simulator.calculate_baseline_score(prediction_value, community_prediction, question_type)
 
-        if community_prediction is None:
-            return None
+    # --- delegating wrappers: numeric CDF cache (see numeric_cdf_cache) -------
+    def _get_safe_numeric_cdf(self, model_name: str, question: Any, prediction: Any) -> list[Any] | None:
+        """Delegates to ``NumericCdfCache.get_safe_numeric_cdf``."""
+        return self._cdf_cache.get_safe_numeric_cdf(model_name, question, prediction)
 
-        try:
-            if question_type == "binary":
-                # Use the exact formula from binary_report.py line 86
-                c = float(community_prediction)
-                p = float(prediction_value)
+    def log_numeric_cdf_summary(self) -> None:
+        """Delegates to ``NumericCdfCache.log_numeric_cdf_summary``."""
+        self._cdf_cache.log_numeric_cdf_summary()
 
-                # Clamp prediction to avoid log errors (same as BinaryPrediction validation)
-                p = max(0.001, min(0.999, p))
-
-                return 100.0 * (c * (math.log2(p) + 1.0) + (1.0 - c) * (math.log2(1.0 - p) + 1.0))
-
-            elif question_type in ["multiple_choice", "numeric"]:
-                # For now, use a simplified scoring approach
-                # This could be improved by implementing full PDF-based scoring for numeric
-                # and log scoring for multiple choice, but this provides a reasonable proxy
-
-                # Use a neutral baseline score for non-binary questions
-                # This ensures ensemble comparison still works while avoiding complex scoring
-                return 15.0  # Approximate average score
-
-            else:
-                return None
-
-        except (ValueError, TypeError, ZeroDivisionError) as e:
-            logger.warning(f"Error calculating baseline score: {e}")
-            return None
-
-    def generate_correlation_report(self, output_path: Optional[str] = None) -> str:
+    def generate_correlation_report(self, output_path: str | None = None) -> str:
         """Generate human-readable correlation analysis report."""
         if not self.predictions:
             return "No prediction data available for correlation analysis."
@@ -1318,7 +691,7 @@ class CorrelationAnalyzer:
         else:
             correlation_matrix = self.calculate_correlation_matrix()
 
-        model_stats = self._calculate_model_statistics()
+        model_stats = self._simulator.calculate_model_statistics()
         optimal_ensembles = self.find_optimal_ensembles(use_component_analysis=use_component_analysis)
 
         report = []

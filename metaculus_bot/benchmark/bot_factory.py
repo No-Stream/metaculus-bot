@@ -8,9 +8,9 @@ from typing import Any
 
 from forecasting_tools import GeneralLlm
 
-from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 MODEL_CONFIG: dict[str, Any] = {

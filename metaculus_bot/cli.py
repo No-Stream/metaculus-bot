@@ -9,7 +9,6 @@ from typing import Literal
 
 from forecasting_tools import MetaculusApi
 
-from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     METACULUS_CUP_ID,
@@ -23,6 +22,7 @@ from metaculus_bot.fallback_openrouter import (
     get_donated_404_fallback_count,
 )
 from metaculus_bot.fetch_hardening import apply_fetch_hardening
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import (
     DISAGREEMENT_ANALYZER_LLM,
     FORECASTER_LLMS,

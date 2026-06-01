@@ -76,8 +76,8 @@ def _make_bot(mock_llm: MagicMock, *, n_forecasters: int = 4, **kwargs) -> Templ
 @pytest.mark.asyncio
 async def test_abort_with_three_or_more_forecasters_publishes(monkeypatch, mock_binary_question, mock_general_llm):
     """Wall-clock cap fires; at least 3 forecasters returned in time → publish path."""
-    monkeypatch.setattr("main.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.2)
-    monkeypatch.setattr("main.WALL_CLOCK_STACKING_MIN_BUDGET", 0.0)
+    monkeypatch.setattr("metaculus_bot.forecaster.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.2)
+    monkeypatch.setattr("metaculus_bot.forecaster.WALL_CLOCK_STACKING_MIN_BUDGET", 0.0)
 
     bot = _make_bot(mock_general_llm, n_forecasters=4, min_forecasters_to_publish=3)
     bot._get_notepad = AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
@@ -109,7 +109,7 @@ async def test_abort_with_three_or_more_forecasters_publishes(monkeypatch, mock_
 @pytest.mark.asyncio
 async def test_abort_with_fewer_than_min_forecasters_skips_publish(monkeypatch, mock_binary_question, mock_general_llm):
     """Wall-clock cap fires with only 1/4 forecasters returned → guard raises, counter bumps."""
-    monkeypatch.setattr("main.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.1)
+    monkeypatch.setattr("metaculus_bot.forecaster.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.1)
 
     bot = _make_bot(mock_general_llm, n_forecasters=4, min_forecasters_to_publish=3)
     bot._get_notepad = AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
@@ -137,8 +137,8 @@ async def test_abort_with_fewer_than_min_forecasters_skips_publish(monkeypatch, 
 @pytest.mark.asyncio
 async def test_tight_budget_skips_stacking_forces_fallback_median(monkeypatch, mock_binary_question, mock_general_llm):
     """Even with all forecasters returning, sub-90s budget forces fallback_median."""
-    monkeypatch.setattr("main.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.5)
-    monkeypatch.setattr("main.WALL_CLOCK_STACKING_MIN_BUDGET", 1_000_000)  # always trips
+    monkeypatch.setattr("metaculus_bot.forecaster.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.5)
+    monkeypatch.setattr("metaculus_bot.forecaster.WALL_CLOCK_STACKING_MIN_BUDGET", 1_000_000)  # always trips
 
     llms_config = {
         "forecasters": [mock_general_llm] * 3,
@@ -179,8 +179,8 @@ async def test_tight_budget_under_stacking_forces_fallback_mean(monkeypatch, moc
     residual-analysis cuts. After the F15 fix, the budget-skip path must pick
     fallback_mean for STACKING and fallback_median for CONDITIONAL_STACKING.
     """
-    monkeypatch.setattr("main.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.5)
-    monkeypatch.setattr("main.WALL_CLOCK_STACKING_MIN_BUDGET", 1_000_000)  # always trips
+    monkeypatch.setattr("metaculus_bot.forecaster.PER_QUESTION_WALL_CLOCK_DEADLINE", 0.5)
+    monkeypatch.setattr("metaculus_bot.forecaster.WALL_CLOCK_STACKING_MIN_BUDGET", 1_000_000)  # always trips
 
     llms_config = {
         "forecasters": [mock_general_llm] * 3,

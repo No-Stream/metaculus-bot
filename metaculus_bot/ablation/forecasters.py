@@ -48,7 +48,6 @@ from forecasting_tools import (
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from main import TemplateForecaster
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.env import probabilistic_tools_enabled
 from metaculus_bot.ablation.forecaster_lineup import (
@@ -58,6 +57,7 @@ from metaculus_bot.ablation.forecaster_lineup import (
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import FORECASTER_SOFT_DEADLINE
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
 
 logger = logging.getLogger(__name__)

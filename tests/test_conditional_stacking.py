@@ -96,8 +96,8 @@ def mock_stacking_pipeline(
             "_forecaster_with_soft_deadline",
             new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
         ),
-        patch("main.extract_disagreement_crux", **crux_kwargs) as mock_crux,
-        patch("main.run_targeted_search", **search_kwargs) as mock_targeted,
+        patch("metaculus_bot.forecaster.extract_disagreement_crux", **crux_kwargs) as mock_crux,
+        patch("metaculus_bot.forecaster.run_targeted_search", **search_kwargs) as mock_targeted,
     ):
         mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
         mock_gather.return_value = (predictions, [], None)

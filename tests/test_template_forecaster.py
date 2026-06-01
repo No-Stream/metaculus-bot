@@ -403,7 +403,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     # Tighten the deadline to a fraction of a second so the test is fast.
-    monkeypatch.setattr("main.FORECASTER_SOFT_DEADLINE", 0.05)
+    monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
 
     async def slow_make_prediction(question, research, llm):
         await asyncio.sleep(5)
