@@ -69,7 +69,6 @@ def _make_median_bot() -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEDIAN,
         llms={
@@ -94,7 +93,6 @@ def _make_stacking_bot(
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=aggregation_strategy,
         llms={

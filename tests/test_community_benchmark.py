@@ -68,7 +68,6 @@ def test_bot_instantiation():
     single_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,
@@ -97,7 +96,6 @@ def test_bot_instantiation():
     ensemble_mean_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,
@@ -135,7 +133,6 @@ def test_bot_instantiation():
     ensemble_median_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,

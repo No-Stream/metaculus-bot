@@ -104,7 +104,8 @@ def _forecaster_display_name(llm: GeneralLlm) -> str:
 
 FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
-# Summarizer: compresses AskNews/Perplexity research output. Migrated 2026-05-17
+# Summarizer: compresses raw AskNews article markdown into an analyst briefing
+# (AskNews-only; all other providers already emit LLM prose). Migrated 2026-05-17
 # from gemini-3-flash-preview to gpt-5.4-mini for: (1) consistency with the rest
 # of the OpenAI-based support stack (analyzer, parser, native search), (2) lower
 # rate-limit exposure than the donated-key Google route, (3) the donated-key

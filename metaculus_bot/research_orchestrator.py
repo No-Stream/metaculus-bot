@@ -1,8 +1,10 @@
 """Research orchestration extracted from TemplateForecaster.
 
 Encapsulates provider selection, parallel execution, caching, gap-fill, and
-fallback logic. The TemplateForecaster delegates run_research/summarize_research
-to an instance of this class.
+fallback logic. The TemplateForecaster delegates run_research to an instance of
+this class. AskNews output is summarized into an analyst briefing inline (it's
+the only provider that returns raw article text rather than LLM-written prose);
+all other providers pass through raw.
 """
 
 import asyncio
@@ -110,7 +112,15 @@ class ResearchOrchestrator:
 
             return research
 
-    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+    async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
+        """Compress raw AskNews article markdown into an analyst briefing.
+
+        Only AskNews output flows here — it's the one provider that returns raw
+        article text rather than LLM-written prose. Soft-fails to the raw input
+        so a summarizer hiccup never drops the news entirely.
+        """
+        if not research.strip():
+            return research
         prompt = clean_indents(
             f"""
             You are a research analyst preparing a comprehensive intelligence briefing for an expert forecaster.
@@ -122,7 +132,7 @@ class ResearchOrchestrator:
             {question.resolution_criteria or ""}
             {question.fine_print or ""}
 
-            Below is raw research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
+            Below is raw news research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
 
             1. Extracts ALL facts, statistics, data points, and quantitative information relevant to the question
             2. Identifies expert opinions and attributes them to specific people/organizations
@@ -149,7 +159,11 @@ class ResearchOrchestrator:
             </research>
             """
         )
-        return await self._summarizer_llm.invoke(prompt)
+        try:
+            return await self._summarizer_llm.invoke(prompt)
+        except Exception as exc:
+            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
+            return research
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
         cache_key = getattr(question, "id_of_question", None)
@@ -231,9 +245,21 @@ class ResearchOrchestrator:
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:
+                used_fallback = False
                 if name == "asknews" and self._allow_research_fallback:
-                    return (await self._fetch_research_with_fallback(question, provider, name), name)
-                return (await provider(question), name)
+                    raw, used_fallback = await self._fetch_research_with_fallback(question, provider, name)
+                else:
+                    raw = await provider(question)
+                # AskNews returns raw article markdown (no LLM prose); summarize it
+                # into an analyst briefing. Every other provider already emits
+                # LLM-written prose (native search, Gemini, Perplexity, Exa) or
+                # deterministic tables (financial, prediction markets), so they
+                # pass through raw — no lossy second-pass summarization. When
+                # AskNews fails and we fall back to Perplexity/Exa, that fallback
+                # is already prose, so skip summarization too.
+                if name == "asknews" and not used_fallback:
+                    raw = await self._summarize_asknews(question, raw)
+                return (raw, name)
             except Exception as e:
                 if name == "asknews" and is_asknews_subscription_error(e):
                     logger.info(
@@ -280,15 +306,21 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """Return (research_text, used_fallback).
+
+        used_fallback is True when the primary (AskNews) failed and a prose
+        fallback provider (Perplexity/Exa) supplied the result instead — the
+        caller uses this to skip AskNews summarization on already-prose output.
+        """
         try:
-            return await provider(question)
+            return (await provider(question), False)
         except Exception as exc:
             if self._allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
                 fallback = await self._attempt_research_fallback(question.question_text)
                 if fallback is not None:
-                    return fallback
+                    return (fallback, True)
             raise
 
     async def _attempt_research_fallback(self, question_text: str) -> str | None:

@@ -72,7 +72,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         *,
         research_reports_per_question: int = 1,
         predictions_per_research_report: int = 1,
-        use_research_summary_to_forecast: bool = False,
         publish_reports_to_metaculus: bool = False,
         folder_to_save_reports_to: str | None = None,
         skip_previously_forecasted_questions: bool = False,
@@ -181,7 +180,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         super().__init__(
             research_reports_per_question=research_reports_per_question,
             predictions_per_research_report=predictions_per_research_report,
-            use_research_summary_to_forecast=use_research_summary_to_forecast,
             publish_reports_to_metaculus=publish_reports_to_metaculus,
             folder_to_save_reports_to=folder_to_save_reports_to,
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
@@ -411,9 +409,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         return await self._research.run_research(question)
 
-    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
-        return await self._research.summarize_research(question, research)
-
     def _select_research_providers(self) -> list[tuple[ResearchCallable, str]]:
         return self._research._select_research_providers()
 
@@ -517,13 +512,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
-        # Only call summarizer if we plan to use the summary for forecasting
-        if self.use_research_summary_to_forecast:
-            summary_report = await self.summarize_research(question, research)
-            research_to_use = summary_report
-        else:
-            summary_report = research  # Use raw research for reporting compatibility
-            research_to_use = research
+        # AskNews is summarized inline in the orchestrator; everything else is
+        # raw LLM prose. There is no separate whole-corpus summarization pass.
+        summary_report = research
+        research_to_use = research
 
         qid_for_log = question.id_of_question
         tasks = cast(
@@ -757,11 +749,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 #
                 # research_report must be combined_research so the
                 # ## Targeted Research (addressing model disagreement) header
-                # reaches the published comment. Note: when
-                # use_research_summary_to_forecast=True, combined_research is
-                # built from summary_report (research_to_use), so the comment
-                # will show summary + targeted_research; the regular STACKING
-                # path above instead publishes raw research.
+                # reaches the published comment.
                 return ResearchWithPredictions(
                     research_report=combined_research,
                     summary_report=summary_report,

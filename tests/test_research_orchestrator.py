@@ -48,15 +48,25 @@ class TestRunResearch:
         provider_a = AsyncMock(return_value="Result from provider A")
         provider_b = AsyncMock(return_value="Result from provider B")
 
-        with patch.object(
-            orchestrator,
-            "_select_research_providers",
-            return_value=[(provider_a, "asknews"), (provider_b, "native_search")],
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(provider_a, "asknews"), (provider_b, "native_search")],
+            ),
+            # AskNews is summarized inline; the briefing replaces the raw articles.
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="AskNews briefing",
+            ),
         ):
             result = await orchestrator.run_research(question)
 
-        assert "Result from provider A" in result
-        assert "Result from provider B" in result
+        assert "AskNews briefing" in result  # AskNews summarized
+        assert "Result from provider A" not in result  # raw articles replaced
+        assert "Result from provider B" in result  # native search raw
         assert "## News Articles (AskNews)" in result
         assert "## Web Research (Native Search)" in result
 
@@ -128,13 +138,89 @@ class TestRunResearch:
         assert "ok" in result
 
 
-class TestSummarizeResearch:
+class TestAskNewsSummarization:
     @pytest.mark.asyncio
     async def test_invokes_summarizer_llm(self, orchestrator, question):
         with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"):
-            result = await orchestrator.summarize_research(question, "raw research text")
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_empty_research_skips_summarizer(self, orchestrator, question):
+        with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock) as invoke:
+            result = await orchestrator._summarize_asknews(question, "   ")
+
+        assert result == "   "
+        invoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_soft_falls_back_to_raw_on_summarizer_error(self, orchestrator, question):
+        with patch.object(
+            orchestrator._summarizer_llm,
+            "invoke",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("summarizer down"),
+        ):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert result == "raw asknews articles"
+
+    @pytest.mark.asyncio
+    async def test_only_asknews_is_summarized(self, orchestrator, question):
+        """AskNews output is summarized; every other provider passes through raw."""
+        asknews = AsyncMock(return_value="raw asknews articles")
+        native = AsyncMock(return_value="native search prose")
+
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews"), (native, "native_search")],
+            ),
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="ASKNEWS BRIEFING",
+            ) as invoke,
+        ):
+            result = await orchestrator.run_research(question)
+
+        # Summarizer ran exactly once, and on the AskNews payload specifically.
+        invoke.assert_awaited_once()
+        assert "raw asknews articles" in invoke.await_args.args[0]
+        assert "ASKNEWS BRIEFING" in result
+        assert "raw asknews articles" not in result
+        # Native search prose is delivered verbatim.
+        assert "native search prose" in result
+
+    @pytest.mark.asyncio
+    async def test_asknews_fallback_prose_is_not_summarized(self, orchestrator, question, monkeypatch):
+        """When AskNews fails and falls back to Perplexity/Exa, the fallback is
+        already LLM prose, so it must NOT be summarized (no double-summarization)."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        asknews = AsyncMock(side_effect=RuntimeError("asknews down"))
+
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews")],
+            ),
+            patch.object(
+                orchestrator,
+                "_call_perplexity",
+                new_callable=AsyncMock,
+                return_value="perplexity fallback prose",
+            ),
+            patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock) as invoke,
+        ):
+            result = await orchestrator.run_research(question)
+
+        # Fallback prose passes through verbatim; summarizer never runs.
+        invoke.assert_not_awaited()
+        assert "perplexity fallback prose" in result
 
 
 class TestProviderSelection:

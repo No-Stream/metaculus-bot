@@ -66,7 +66,6 @@ def _make_stacking_bot(strategy: AggregationStrategy = AggregationStrategy.STACK
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=strategy,
         llms=llms,
@@ -89,7 +88,6 @@ def _make_mean_bot() -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEAN,
         llms=llms,
