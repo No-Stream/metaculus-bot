@@ -1,4 +1,4 @@
-"""Tests for metaculus_bot.comment_formatting — standalone helper functions
+"""Tests for metaculus_bot.comment.formatting — standalone helper functions
 that produce the formatted comment text.
 
 These tests exercise the helpers directly (no class hierarchy patching needed).
@@ -14,7 +14,7 @@ import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.comment_markers import (
+from metaculus_bot.comment.markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,
@@ -35,7 +35,7 @@ class TestFormatResearchSummaryWithModels:
     """Test the standalone helper that injects model names and trims."""
 
     def test_injects_model_names_into_bullets(self):
-        from metaculus_bot.comment_formatting import format_research_summary_with_models
+        from metaculus_bot.comment.formatting import format_research_summary_with_models
 
         base_text = (
             "## Report 1 Summary\n"
@@ -53,7 +53,7 @@ class TestFormatResearchSummaryWithModels:
         assert "*Forecaster 2 (claude-opus-4.7)*: 68.0%" in result
 
     def test_missing_model_prefix_leaves_bullet_unannotated(self):
-        from metaculus_bot.comment_formatting import format_research_summary_with_models
+        from metaculus_bot.comment.formatting import format_research_summary_with_models
 
         base_text = "## Report 1 Summary\n### Forecasts\n*Forecaster 1*: 72.0%\n### Research Summary\nSome research.\n"
         predictions = [MagicMock(reasoning="just analysis, no model prefix")]
@@ -62,7 +62,7 @@ class TestFormatResearchSummaryWithModels:
         assert "(" not in result.split("### Forecasts")[1].split("### Research Summary")[0]
 
     def test_trims_oversized_text(self):
-        from metaculus_bot.comment_formatting import format_research_summary_with_models
+        from metaculus_bot.comment.formatting import format_research_summary_with_models
         from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 
         huge_text = "## Report 1 Summary\n" + ("X" * (REPORT_SECTION_CHAR_LIMIT + 5000))
@@ -78,7 +78,7 @@ class TestFormatResearchSummaryWithModels:
 
 class TestFormatMainResearchSection:
     def test_trims_oversized_text(self):
-        from metaculus_bot.comment_formatting import format_main_research_section
+        from metaculus_bot.comment.formatting import format_main_research_section
         from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 
         huge_text = "## Research\n" + ("Y" * (REPORT_SECTION_CHAR_LIMIT + 3000))
@@ -86,7 +86,7 @@ class TestFormatMainResearchSection:
         assert len(result) <= REPORT_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
-        from metaculus_bot.comment_formatting import format_main_research_section
+        from metaculus_bot.comment.formatting import format_main_research_section
 
         short_text = "## Research\nSome content."
         result = format_main_research_section(short_text, report_number=1)
@@ -100,7 +100,7 @@ class TestFormatMainResearchSection:
 
 class TestFormatForecasterRationalesSection:
     def test_trims_oversized_text(self):
-        from metaculus_bot.comment_formatting import format_forecaster_rationales_section
+        from metaculus_bot.comment.formatting import format_forecaster_rationales_section
         from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 
         huge_text = "## Rationale\n" + ("Z" * (REPORT_SECTION_CHAR_LIMIT + 2000))
@@ -108,7 +108,7 @@ class TestFormatForecasterRationalesSection:
         assert len(result) <= REPORT_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
-        from metaculus_bot.comment_formatting import format_forecaster_rationales_section
+        from metaculus_bot.comment.formatting import format_forecaster_rationales_section
 
         short_text = "## Rationale\nSome reasoning."
         result = format_forecaster_rationales_section(short_text, report_number=1)
@@ -129,7 +129,7 @@ class TestBuildUnifiedExplanation:
         return q
 
     def test_non_stacking_strategy_just_trims(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         base_text = "# SUMMARY\n\nBody text."
         result = build_unified_explanation(
@@ -143,7 +143,7 @@ class TestBuildUnifiedExplanation:
         assert "Body text." in result
 
     def test_median_strategy_just_trims(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         base_text = "# SUMMARY\nContent."
         result = build_unified_explanation(
@@ -155,7 +155,7 @@ class TestBuildUnifiedExplanation:
         assert "STACKED=" not in result
 
     def test_stacking_primary_emits_correct_markers(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         result = build_unified_explanation(
             base_text="# SUMMARY\nBody.",
@@ -168,7 +168,7 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_FALSE not in result
 
     def test_stacking_fallback_llm_emits_correct_markers(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         result = build_unified_explanation(
             base_text="# SUMMARY\nBody.",
@@ -180,7 +180,7 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_TRUE in result
 
     def test_stacking_fallback_median_emits_correct_markers(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         result = build_unified_explanation(
             base_text="# SUMMARY\nBody.",
@@ -193,7 +193,7 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_TRUE not in result
 
     def test_stacking_fallback_mean_emits_correct_markers(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         result = build_unified_explanation(
             base_text="# SUMMARY\nBody.",
@@ -206,7 +206,7 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_TRUE not in result
 
     def test_stacking_skipped_emits_correct_markers(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         result = build_unified_explanation(
             base_text="# SUMMARY\nBody.",
@@ -219,7 +219,7 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_TRUE not in result
 
     def test_unknown_outcome_raises_valueerror(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         with pytest.raises(ValueError, match="Unknown stacker outcome"):
             build_unified_explanation(
@@ -230,7 +230,7 @@ class TestBuildUnifiedExplanation:
             )
 
     def test_stacking_with_none_outcome_raises_assertion(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         with pytest.raises(AssertionError, match="stacker_outcome must be provided"):
             build_unified_explanation(
@@ -241,9 +241,9 @@ class TestBuildUnifiedExplanation:
             )
 
     def test_tools_used_marker_emitted_for_binary_when_enabled(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
-        with patch("metaculus_bot.comment_formatting._tool_runner_feature_enabled", return_value=True):
+        with patch("metaculus_bot.comment.formatting._tool_runner_feature_enabled", return_value=True):
             result = build_unified_explanation(
                 base_text="# SUMMARY\nBody.",
                 question=self._make_question(cls=BinaryQuestion),
@@ -253,9 +253,9 @@ class TestBuildUnifiedExplanation:
         assert TOOLS_USED_MARKER_TRUE in result
 
     def test_tools_used_marker_false_when_disabled(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
-        with patch("metaculus_bot.comment_formatting._tool_runner_feature_enabled", return_value=False):
+        with patch("metaculus_bot.comment.formatting._tool_runner_feature_enabled", return_value=False):
             result = build_unified_explanation(
                 base_text="# SUMMARY\nBody.",
                 question=self._make_question(cls=BinaryQuestion),
@@ -265,9 +265,9 @@ class TestBuildUnifiedExplanation:
         assert TOOLS_USED_MARKER_FALSE in result
 
     def test_numeric_question_type_passed_to_feature_enabled(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
-        with patch("metaculus_bot.comment_formatting._tool_runner_feature_enabled", return_value=False) as mock_fe:
+        with patch("metaculus_bot.comment.formatting._tool_runner_feature_enabled", return_value=False) as mock_fe:
             build_unified_explanation(
                 base_text="# SUMMARY\nBody.",
                 question=self._make_question(cls=NumericQuestion),
@@ -277,9 +277,9 @@ class TestBuildUnifiedExplanation:
         mock_fe.assert_called_once_with("numeric")
 
     def test_mc_question_type_passed_to_feature_enabled(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
-        with patch("metaculus_bot.comment_formatting._tool_runner_feature_enabled", return_value=False) as mock_fe:
+        with patch("metaculus_bot.comment.formatting._tool_runner_feature_enabled", return_value=False) as mock_fe:
             build_unified_explanation(
                 base_text="# SUMMARY\nBody.",
                 question=self._make_question(cls=MultipleChoiceQuestion),
@@ -289,7 +289,7 @@ class TestBuildUnifiedExplanation:
         mock_fe.assert_called_once_with("multiple_choice")
 
     def test_trims_oversized_comment(self):
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
         from metaculus_bot.constants import COMMENT_CHAR_LIMIT
 
         huge_base = "# SUMMARY\n" + ("X" * (COMMENT_CHAR_LIMIT + 5000))

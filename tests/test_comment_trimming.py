@@ -1,4 +1,4 @@
-"""Tests for comment_trimming.
+"""Tests for comment.trimming.
 
 The structured trim path (preserve summary head + tail) protects
 residual-analysis parsers that extract per-forecaster predictions and the
@@ -12,7 +12,7 @@ import math
 
 import pytest
 
-from metaculus_bot.comment_trimming import TRIM_NOTICE, TrimConfig, trim_comment, trim_section
+from metaculus_bot.comment.trimming import TRIM_NOTICE, TrimConfig, trim_comment, trim_section
 from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMIT
 
 # ---------------------------------------------------------------------------

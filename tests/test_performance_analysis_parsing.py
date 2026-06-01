@@ -19,7 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
+from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.performance_analysis.parsing import (
     _iter_per_model_blocks,
     _parse_probability,

@@ -7,7 +7,7 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MetaculusQuestion, Rea
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
 from main import TemplateForecaster
-from metaculus_bot.comment_trimming import TRIM_NOTICE
+from metaculus_bot.comment.trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 

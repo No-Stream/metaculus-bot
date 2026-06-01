@@ -24,7 +24,7 @@ from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
-from metaculus_bot.comment_trimming import trim_section
+from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
     BINARY_STACKING_ENABLED_ENV,
@@ -807,7 +807,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         final_cost: float,
         time_spent_in_minutes: float,
     ) -> str:
-        from metaculus_bot.comment_formatting import build_unified_explanation
+        from metaculus_bot.comment.formatting import build_unified_explanation
 
         base_text = super()._create_unified_explanation(
             question,

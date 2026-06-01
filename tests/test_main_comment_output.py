@@ -41,7 +41,7 @@ from forecasting_tools.data_models.forecast_report import ResearchWithPrediction
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.comment_markers import (
+from metaculus_bot.comment.markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,

@@ -15,7 +15,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.comment_markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
+from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc

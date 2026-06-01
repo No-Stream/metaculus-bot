@@ -20,7 +20,7 @@ import logging
 import statistics
 from typing import Literal
 
-from metaculus_bot.comment_markers import (
+from metaculus_bot.comment.markers import (
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_MARKER_RE,
     STACKER_OUTCOME_RE,
