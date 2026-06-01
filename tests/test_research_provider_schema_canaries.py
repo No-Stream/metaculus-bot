@@ -174,8 +174,8 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         )
         client = _make_async_client(response)
 
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
             out = await invoke_gemini_grounded("prompt about apple and tesla")
 
@@ -206,8 +206,8 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         )
         client = _make_async_client(response)
 
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
             out = await invoke_gemini_grounded("prompt")
 
@@ -235,8 +235,8 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         )
         client = _make_async_client(response)
 
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
             out = await invoke_gemini_grounded("prompt")
 
@@ -258,8 +258,8 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         response = genai_types.GenerateContentResponse(candidates=[candidate])
         client = _make_async_client(response)
 
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
             out = await invoke_gemini_grounded("prompt")
 
@@ -288,8 +288,8 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         assert response.text == "The actual response body."
 
         client = _make_async_client(response)
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
             out = await invoke_gemini_grounded("prompt")
 
@@ -315,8 +315,8 @@ class TestGeminiToolWiringAgainstRealTypes:
         response = _make_real_grounding_response(text="t", chunks=None, supports=None)
         client = _make_async_client(response)
 
-        with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=client):
-            from metaculus_bot.gemini_search_provider import gemini_search_provider
+        with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=client):
+            from metaculus_bot.research.gemini_search import gemini_search_provider
 
             provider = gemini_search_provider()
             q = MagicMock()
@@ -351,7 +351,7 @@ class TestAskNewsFormatterAgainstRealTypes:
     """
 
     def test_dual_section_formatter_renders_real_articles(self) -> None:
-        from metaculus_bot.research_providers import _format_asknews_dual_sections
+        from metaculus_bot.research.providers import _format_asknews_dual_sections
 
         hist_old = _make_real_asknews_article(
             eng_title="Background article from a year ago",
@@ -401,7 +401,7 @@ class TestAskNewsFormatterAgainstRealTypes:
 
     def test_cross_section_url_dedup_drops_duplicate_hot_articles(self) -> None:
         """Hot article duplicating a historical URL is dropped; historical wins."""
-        from metaculus_bot.research_providers import _format_asknews_dual_sections
+        from metaculus_bot.research.providers import _format_asknews_dual_sections
 
         url = "https://example.com/news/shared"
 
@@ -442,7 +442,7 @@ class TestAskNewsFormatterAgainstRealTypes:
 
     def test_empty_inputs_produce_no_articles_message(self) -> None:
         """Both lists empty → ``No articles were found...`` message instead of empty sections."""
-        from metaculus_bot.research_providers import _format_asknews_dual_sections
+        from metaculus_bot.research.providers import _format_asknews_dual_sections
 
         out = _format_asknews_dual_sections(hot_articles=[], historical_articles=[])
 
@@ -477,7 +477,7 @@ class TestAskNewsSDKResponseShapeContract:
         monkeypatch.setenv("ASKNEWS_CLIENT_ID", "test-id")
         monkeypatch.setenv("ASKNEWS_SECRET", "test-secret")
         # Skip the real wait_for retries.
-        monkeypatch.setattr("metaculus_bot.research_providers.ASKNEWS_WALL_TIMEOUT", 5.0)
+        monkeypatch.setattr("metaculus_bot.research.providers.ASKNEWS_WALL_TIMEOUT", 5.0)
 
         # Construct real SearchResponse objects (not a SimpleNamespace).
         hot_article = _make_real_asknews_article(
@@ -511,10 +511,10 @@ class TestAskNewsSDKResponseShapeContract:
 
         with (
             patch("asknews_sdk.AsyncAskNewsSDK", return_value=sdk_cm),
-            patch("metaculus_bot.research_providers.asyncio.sleep", new=_no_sleep),
-            patch("metaculus_bot.research_providers._asknews_rate_gate", new=AsyncMock()),
+            patch("metaculus_bot.research.providers.asyncio.sleep", new=_no_sleep),
+            patch("metaculus_bot.research.providers._asknews_rate_gate", new=AsyncMock()),
         ):
-            from metaculus_bot.research_providers import _asknews_provider
+            from metaculus_bot.research.providers import _asknews_provider
 
             provider = _asknews_provider()
             q = SimpleNamespace(question_text="Will the topic resolve YES?")

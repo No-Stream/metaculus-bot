@@ -31,7 +31,7 @@ from metaculus_bot.constants import (
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.research_providers import (
+from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
     native_search_provider,
@@ -84,7 +84,7 @@ class ResearchOrchestrator:
             research = await self._run_providers_parallel(question, providers)
 
             if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
-                from metaculus_bot.targeted_research import run_gap_fill_pass
+                from metaculus_bot.research.targeted import run_gap_fill_pass
 
                 addendum = await run_gap_fill_pass(
                     question,
@@ -210,7 +210,7 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
-            from metaculus_bot.gemini_search_provider import gemini_search_provider
+            from metaculus_bot.research.gemini_search import gemini_search_provider
 
             gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
             providers.append(
@@ -221,12 +221,12 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
-            from metaculus_bot.financial_data_provider import financial_data_provider
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             providers.append((financial_data_provider(), "financial_data"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
+            from metaculus_bot.research.prediction_market import prediction_market_provider  # noqa: PLC0415
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
@@ -244,7 +244,7 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
     ) -> str:
-        from metaculus_bot.research_providers import is_asknews_subscription_error
+        from metaculus_bot.research.providers import is_asknews_subscription_error
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:

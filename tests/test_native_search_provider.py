@@ -35,8 +35,8 @@ async def test_native_search_provider_constructs_correct_model_name(
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider()
         await provider(_make_q("Will X happen?"))
@@ -73,8 +73,8 @@ async def test_native_search_provider_uses_custom_model_slug(
         async def invoke(self, prompt: str) -> str:
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider(model_slug="openai/gpt-4o")
         await provider(_make_q("Will X happen?"))
@@ -98,8 +98,8 @@ async def test_native_search_provider_includes_prediction_markets_when_not_bench
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=False)
         await provider(_make_q("Will X happen?"))
@@ -124,8 +124,8 @@ async def test_native_search_provider_excludes_prediction_markets_when_benchmark
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider(is_benchmarking=True)
         await provider(_make_q("Will X happen?"))
@@ -150,8 +150,8 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
             captured_prompt = prompt
             return "Mock research response"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", MockLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider()
         await provider(_make_q("Will X happen?"))
@@ -188,8 +188,8 @@ async def test_native_search_provider_enforces_wall_clock_timeout(
             await asyncio.sleep(5)
             return "should never reach here"
 
-    with patch("metaculus_bot.research_providers.build_llm_with_openrouter_fallback", HangingLlm):
-        from metaculus_bot.research_providers import native_search_provider
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", HangingLlm):
+        from metaculus_bot.research.providers import native_search_provider
 
         provider = native_search_provider()
         with pytest.raises(asyncio.TimeoutError):
@@ -211,7 +211,7 @@ class TestParallelProviderSelection:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -237,7 +237,7 @@ class TestParallelProviderSelection:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -261,7 +261,7 @@ class TestParallelExecution:
         """Verify parallel execution combines results from multiple providers."""
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
@@ -282,7 +282,7 @@ class TestParallelExecution:
         """Verify parallel execution handles individual provider failures gracefully."""
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
@@ -300,7 +300,7 @@ class TestParallelExecution:
         """Verify providers actually run in parallel, not sequentially."""
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
@@ -346,7 +346,7 @@ class TestAskNewsSubscriptionErrorHandling:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
@@ -357,7 +357,7 @@ class TestAskNewsSubscriptionErrorHandling:
         async def asknews_provider(q):  # noqa: ASYNC910
             raise ForbiddenError("403011 - subscription is not currently active")
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research_orchestrator"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.orchestrator"):
             result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
@@ -379,14 +379,14 @@ class TestAskNewsSubscriptionErrorHandling:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
 
         asknews_provider = AsyncMock(side_effect=RuntimeError("connection timeout"))
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research_orchestrator"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.orchestrator"):
             result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""

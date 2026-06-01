@@ -38,7 +38,7 @@ def _build_integration_question() -> MagicMock:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_polymarket_real_search_returns_parseable_response():
-    from metaculus_bot.prediction_market_provider import _polymarket_search
+    from metaculus_bot.research.prediction_market import _polymarket_search
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -59,7 +59,7 @@ async def test_polymarket_real_search_returns_parseable_response():
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_manifold_real_search_returns_parseable_response():
-    from metaculus_bot.prediction_market_provider import _manifold_search
+    from metaculus_bot.research.prediction_market import _manifold_search
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -80,7 +80,7 @@ async def test_manifold_real_search_returns_parseable_response():
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
-    from metaculus_bot.prediction_market_provider import _kalshi_prefetch_events, _kalshi_search_local
+    from metaculus_bot.research.prediction_market import _kalshi_prefetch_events, _kalshi_search_local
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -102,7 +102,7 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
-    from metaculus_bot import prediction_market_provider as pmp
+    from metaculus_bot.research import prediction_market as pmp
 
     q = _build_integration_question()
     pmp._reset_session_caches()

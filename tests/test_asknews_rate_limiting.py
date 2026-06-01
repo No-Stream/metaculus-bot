@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from metaculus_bot.research_providers import _asknews_provider
+from metaculus_bot.research.providers import _asknews_provider
 
 
 def _make_q(text: str) -> MagicMock:

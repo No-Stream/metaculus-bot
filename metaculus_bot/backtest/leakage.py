@@ -8,7 +8,7 @@ from forecasting_tools import GeneralLlm, MetaculusQuestion
 
 from metaculus_bot.backtest.scoring import GroundTruth
 from metaculus_bot.constants import ASKNEWS_MAX_CONCURRENCY, LEAKAGE_DETECTOR_MODEL
-from metaculus_bot.research_providers import choose_provider_with_name
+from metaculus_bot.research.providers import choose_provider_with_name
 
 logger: logging.Logger = logging.getLogger(__name__)
 

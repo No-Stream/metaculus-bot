@@ -14,14 +14,14 @@ forecast_job\tUNKNOWN STEP\t2026-05-20T15:50:12.1234567Z 2026-05-20 15:50:12,123
 """
 
 SAMPLE_LOG_NEW_LOGGER = """\
-forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000000Z 2026-05-24 10:00:01,000 - metaculus_bot.research_orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/50001/will-ai-pass-turing-test/:
+forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000000Z 2026-05-24 10:00:01,000 - metaculus_bot.research.orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/50001/will-ai-pass-turing-test/:
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000001Z ## News Articles (AskNews)
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000002Z AI progress is accelerating.
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000003Z ## Web Research (Google Search via Gemini)
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000004Z Gemini found some relevant results.
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000005Z ## Targeted Gap-Fill (second pass)
 forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000006Z Filling knowledge gaps about timeline.
-forecast_job\tUNKNOWN STEP\t2026-05-24T10:05:00.0000000Z 2026-05-24 10:05:00,000 - metaculus_bot.research_orchestrator - INFO - Starting forecaster fan-out
+forecast_job\tUNKNOWN STEP\t2026-05-24T10:05:00.0000000Z 2026-05-24 10:05:00,000 - metaculus_bot.research.orchestrator - INFO - Starting forecaster fan-out
 """
 
 SAMPLE_LOG_COMMUNITY_URL = """\
@@ -71,7 +71,7 @@ class TestResearchStartRegex:
 
         line = (
             "forecast_job\tUNKNOWN STEP\t2026-05-24T10:00:01.0000000Z "
-            "2026-05-24 10:00:01,000 - metaculus_bot.research_orchestrator - INFO - "
+            "2026-05-24 10:00:01,000 - metaculus_bot.research.orchestrator - INFO - "
             "Found Research for URL https://www.metaculus.com/questions/50001/will-ai-pass-turing-test/:"
         )
         match = RESEARCH_START.match(line)

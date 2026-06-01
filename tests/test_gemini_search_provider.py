@@ -74,7 +74,7 @@ def test_builder_raises_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
-    from metaculus_bot.gemini_search_provider import build_gemini_client
+    from metaculus_bot.research.gemini_search import build_gemini_client
 
     with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
         build_gemini_client()
@@ -94,8 +94,8 @@ async def test_provider_uses_default_model(monkeypatch: pytest.MonkeyPatch) -> N
     response = _make_response("some research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider()
         await provider(_make_q("Will X happen?"))
@@ -116,8 +116,8 @@ async def test_provider_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> No
     response = _make_response("research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider()
         await provider(_make_q("Will X happen?"))
@@ -135,8 +135,8 @@ async def test_provider_uses_explicit_slug(monkeypatch: pytest.MonkeyPatch) -> N
     response = _make_response("research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider(model_slug="gemini-explicit-override")
         await provider(_make_q("Will X happen?"))
@@ -155,8 +155,8 @@ async def test_provider_attaches_google_search_and_url_context_tools(
     response = _make_response("research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider()
         await provider(_make_q("Will X happen?"))
@@ -186,8 +186,8 @@ async def test_benchmarking_carve_out(monkeypatch: pytest.MonkeyPatch) -> None:
     response = _make_response("research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider(is_benchmarking=True)
         await provider(_make_q("Will X happen?"))
@@ -206,8 +206,8 @@ async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.
     response = _make_response("research text")
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import gemini_search_provider
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
 
         provider = gemini_search_provider(is_benchmarking=False)
         await provider(_make_q("Will X happen?"))
@@ -235,8 +235,8 @@ async def test_citations_appended_to_response(monkeypatch: pytest.MonkeyPatch) -
     response = _make_response("body text", chunks=chunks, supports=None)
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
         out = await invoke_gemini_grounded("prompt")
 
@@ -272,8 +272,8 @@ async def test_inline_citation_markers_inserted(monkeypatch: pytest.MonkeyPatch)
     response = _make_response(text, chunks=chunks, supports=supports)
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
         out = await invoke_gemini_grounded("prompt")
 
@@ -293,8 +293,8 @@ async def test_missing_grounding_metadata_returns_plain_text(monkeypatch: pytest
     response = SimpleNamespace(text="plain response body", candidates=[])
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
         out = await invoke_gemini_grounded("prompt")
 
@@ -316,8 +316,8 @@ async def test_empty_response_text_returns_empty(monkeypatch: pytest.MonkeyPatch
     response = _make_response("", chunks=chunks, supports=supports)
     fake_client = _make_client_with_response(response)
 
-    with patch("metaculus_bot.gemini_search_provider.genai.Client", return_value=fake_client):
-        from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 
         out = await invoke_gemini_grounded("prompt")
 
@@ -345,7 +345,7 @@ class TestParallelProviderSelectionGemini:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -369,7 +369,7 @@ class TestParallelProviderSelectionGemini:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)

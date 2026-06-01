@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.research_orchestrator import ResearchOrchestrator
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
 
 @pytest.fixture
@@ -111,7 +111,7 @@ class TestRunResearch:
         with (
             patch.object(orchestrator, "_select_research_providers", return_value=[(provider, "custom")]),
             patch(
-                "metaculus_bot.targeted_research.run_gap_fill_pass",
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
                 new_callable=AsyncMock,
                 return_value="gap fill addendum",
             ) as mock_gap_fill,

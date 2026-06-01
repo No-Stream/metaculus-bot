@@ -23,7 +23,7 @@ from metaculus_bot.constants import (
     FRED_API_KEY_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.research_providers import ResearchCallable
+from metaculus_bot.research.providers import ResearchCallable
 
 logger: logging.Logger = logging.getLogger(__name__)
 

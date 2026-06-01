@@ -29,7 +29,7 @@ def _no_sleep(monkeypatch):
     async def _instant(*args, **kwargs):
         return None
 
-    monkeypatch.setattr("metaculus_bot.research_providers.asyncio.sleep", _instant)
+    monkeypatch.setattr("metaculus_bot.research.providers.asyncio.sleep", _instant)
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_gemini_search_flag_logs_provider_name(mock_os_getenv, caplog):
             return f"stub gemini research for {question_text[:0]}"
 
         with patch(
-            "metaculus_bot.gemini_search_provider.gemini_search_provider",
+            "metaculus_bot.research.gemini_search.gemini_search_provider",
             return_value=_fake_gemini,
         ):
             with caplog.at_level(logging.INFO):
@@ -150,7 +150,7 @@ async def test_gemini_search_params_passed_through(mock_os_getenv, caplog):
             return f"stub gemini research for {question_text[:0]}"
 
         with patch(
-            "metaculus_bot.gemini_search_provider.gemini_search_provider",
+            "metaculus_bot.research.gemini_search.gemini_search_provider",
             return_value=_fake_gemini,
         ) as fake_provider:
             await bot.run_research(q)
@@ -319,7 +319,7 @@ class _FakeSession:
 
 @pytest.fixture(autouse=False)
 def _reset_pm_caches():
-    from metaculus_bot.prediction_market_provider import _reset_session_caches
+    from metaculus_bot.research.prediction_market import _reset_session_caches
 
     _reset_session_caches()
     yield
@@ -385,7 +385,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
             return "Starship orbit"
 
     captured_questions: list = []
-    from metaculus_bot import prediction_market_provider as pmp
+    from metaculus_bot.research import prediction_market as pmp
 
     original_fetch = pmp.fetch_market_snapshot
 
@@ -401,7 +401,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
         with patch(
-            "metaculus_bot.gemini_search_provider.gemini_search_provider",
+            "metaculus_bot.research.gemini_search.gemini_search_provider",
             return_value=_fake_gemini,
         ):
             with (
@@ -456,7 +456,7 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
     # Sentinel: if the provider runs, it would try to instantiate a session
     # via _get_session. Patch it to a sentinel that raises AssertionError if
     # called — proving no HTTP work happens.
-    from metaculus_bot import prediction_market_provider as pmp
+    from metaculus_bot.research import prediction_market as pmp
 
     def _should_not_be_called():
         raise AssertionError("PM provider's _get_session must not be called when flag is off")
@@ -515,7 +515,7 @@ async def test_prediction_market_provider_as_of_derives_from_question(mock_os_ge
             await asyncio.sleep(0)
             return "Event X"
 
-    from metaculus_bot import prediction_market_provider as pmp
+    from metaculus_bot.research import prediction_market as pmp
 
     captured_as_ofs: list = []
     original_fetch = pmp.fetch_market_snapshot

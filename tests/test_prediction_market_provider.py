@@ -39,7 +39,7 @@ import pytest
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _reset_provider_caches():
-    from metaculus_bot.prediction_market_provider import _reset_session_caches
+    from metaculus_bot.research.prediction_market import _reset_session_caches
 
     _reset_session_caches()
     yield
@@ -218,7 +218,7 @@ def kalshi_events_payload():
 class TestPolymarket:
     @pytest.mark.asyncio
     async def test_search_and_parse_implied_prob(self, polymarket_payload):
-        from metaculus_bot.prediction_market_provider import _polymarket_search
+        from metaculus_bot.research.prediction_market import _polymarket_search
 
         session = FakeSession({"https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload)})
         matches = await _polymarket_search(session, "Starship orbit 2026")
@@ -237,7 +237,7 @@ class TestPolymarket:
         """F9: every Polymarket parse populates a real fuzzy-match confidence,
         not the legacy 0.0 placeholder. Confidence comes from token_set_ratio
         between the active query and the market title."""
-        from metaculus_bot.prediction_market_provider import _polymarket_search
+        from metaculus_bot.research.prediction_market import _polymarket_search
 
         session = FakeSession({"https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload)})
         matches = await _polymarket_search(session, "Starship orbit 2026")
@@ -251,7 +251,7 @@ class TestPolymarket:
     @pytest.mark.asyncio
     async def test_rate_limit_retry_with_backoff_then_empty(self, monkeypatch):
         """403 on every attempt -> bounded retry -> eventual empty list, no exception."""
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         call_count = {"n": 0}
 
@@ -278,7 +278,7 @@ class TestPolymarket:
 
     @pytest.mark.asyncio
     async def test_malformed_json_returns_empty_and_warns(self, caplog):
-        from metaculus_bot.prediction_market_provider import _polymarket_search
+        from metaculus_bot.research.prediction_market import _polymarket_search
 
         session = FakeSession(
             {"https://gamma-api.polymarket.com/public-search": FakeResponse(200, payload={"garbage": 1})}
@@ -288,7 +288,7 @@ class TestPolymarket:
         assert matches == []
 
     def test_parse_implied_prob_from_list_prices(self):
-        from metaculus_bot.prediction_market_provider import _parse_polymarket_matches
+        from metaculus_bot.research.prediction_market import _parse_polymarket_matches
 
         payload = {
             "events": [
@@ -312,7 +312,7 @@ class TestPolymarket:
 class TestKalshi:
     @pytest.mark.asyncio
     async def test_prefetch_and_local_fuzzy_match(self, kalshi_events_payload):
-        from metaculus_bot.prediction_market_provider import _kalshi_prefetch_events, _kalshi_search_local
+        from metaculus_bot.research.prediction_market import _kalshi_prefetch_events, _kalshi_search_local
 
         session = FakeSession(
             {"https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload)}
@@ -332,7 +332,7 @@ class TestKalshi:
 
     @pytest.mark.asyncio
     async def test_prefetch_handles_http_error(self, caplog):
-        from metaculus_bot.prediction_market_provider import _kalshi_prefetch_events
+        from metaculus_bot.research.prediction_market import _kalshi_prefetch_events
 
         session = FakeSession({"https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(500, text="boom")})
         with caplog.at_level(logging.WARNING):
@@ -344,7 +344,7 @@ class TestKalshi:
         """F6: Kalshi prefetch updates _KALSHI_CACHE after each successful page,
         not only at the end. A partial run still warms whatever pages completed.
         """
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         page_one = {
             "events": [
@@ -389,7 +389,7 @@ class TestKalshi:
 class TestManifold:
     @pytest.mark.asyncio
     async def test_search_and_parse_direct_probability(self, manifold_payload):
-        from metaculus_bot.prediction_market_provider import _manifold_search
+        from metaculus_bot.research.prediction_market import _manifold_search
 
         session = FakeSession({"https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload)})
         matches = await _manifold_search(session, "Starship orbit July 2026")
@@ -403,7 +403,7 @@ class TestManifold:
 
     @pytest.mark.asyncio
     async def test_non_list_payload_returns_empty(self, caplog):
-        from metaculus_bot.prediction_market_provider import _manifold_search
+        from metaculus_bot.research.prediction_market import _manifold_search
 
         session = FakeSession(
             {"https://api.manifold.markets/v0/search-markets": FakeResponse(200, payload={"unexpected": "shape"})}
@@ -415,7 +415,7 @@ class TestManifold:
     @pytest.mark.asyncio
     async def test_match_confidence_is_nonzero_for_strong_match(self, manifold_payload):
         """F9: Manifold parse populates real fuzzy-match confidence per row."""
-        from metaculus_bot.prediction_market_provider import _manifold_search
+        from metaculus_bot.research.prediction_market import _manifold_search
 
         session = FakeSession({"https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload)})
         matches = await _manifold_search(session, "Starship orbit July 2026")
@@ -435,7 +435,7 @@ class TestKeywordExtractor:
     async def test_extract_runs_s4_and_s5_with_max_tokens_800(self, mock_question):
         """G0 token-budget trap defense: the extractor MUST request max_tokens >= 800.
         reasoning=low gpt-5-mini burns 128-512 tokens on invisible reasoning."""
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         captured_kwargs: list[dict] = []
         calls: list[str] = []
@@ -467,7 +467,7 @@ class TestKeywordExtractor:
     @pytest.mark.asyncio
     async def test_manifold_gets_extra_s2_query(self, mock_question):
         """Per G0 findings, Manifold prefers natural-language (S2) framings."""
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         class FakeLlm:
             def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -486,7 +486,7 @@ class TestKeywordExtractor:
 
     @pytest.mark.asyncio
     async def test_cache_by_question_id(self, mock_question):
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         call_count = {"n": 0}
 
@@ -508,7 +508,7 @@ class TestKeywordExtractor:
 
     @pytest.mark.asyncio
     async def test_strategy_simple_skips_llm(self, mock_question):
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         call_count = {"n": 0}
 
@@ -538,7 +538,7 @@ class TestFetchMarketSnapshot:
     async def test_full_orchestrator_returns_matches(
         self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         handlers = {
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
@@ -572,7 +572,7 @@ class TestFetchMarketSnapshot:
         Resolved prediction markets keep a 'last trade' price after the question
         settled; using that during a resolved-question backtest is leakage.
         """
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         # Kalshi event that closes 2026-12-31 -- after as_of 2026-05-01
         late_close_payload = {
@@ -658,7 +658,7 @@ class TestFetchMarketSnapshot:
     @pytest.mark.asyncio
     async def test_timeout_returns_empty_snapshot_soft_fail(self, mock_question, caplog):
         """A per-question timeout must NOT raise -- soft-fail with empty snapshot + WARNING."""
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         class FakeLlm:
             def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -677,7 +677,7 @@ class TestFetchMarketSnapshot:
     @pytest.mark.asyncio
     async def test_orchestrator_soft_fails_on_any_platform_error(self, mock_question, manifold_payload, caplog):
         """If one platform errors, other platforms' matches still come through."""
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         def _boom(_params):
             raise RuntimeError("connection refused")
@@ -715,7 +715,7 @@ class TestFetchMarketSnapshot:
         as_of=A doesn't reuse a snapshot computed at as_of=B."""
         from datetime import datetime, timezone
 
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         handlers = {
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
@@ -751,7 +751,7 @@ class TestFetchMarketSnapshot:
     async def test_max_matches_per_platform_respected(
         self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         handlers = {
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
@@ -790,7 +790,7 @@ class TestProviderFactory:
     async def test_disabled_flag_returns_empty_at_orchestrator_level(self, monkeypatch, mock_question):
         """When PREDICTION_MARKETS_ENABLED is not set, the provider returns ''.
         This is a defense-in-depth check at the research-provider entrypoint."""
-        from metaculus_bot.prediction_market_provider import prediction_market_provider
+        from metaculus_bot.research.prediction_market import prediction_market_provider
 
         monkeypatch.delenv("PREDICTION_MARKETS_ENABLED", raising=False)
 
@@ -812,7 +812,7 @@ class TestProviderFactory:
         mirrors the contract used by ``gemini_search_provider`` and
         ``native_search_provider``.
         """
-        from metaculus_bot.prediction_market_provider import prediction_market_provider
+        from metaculus_bot.research.prediction_market import prediction_market_provider
 
         # Set the env flag so we'd otherwise enable the provider — the
         # is_benchmarking guard must override.
@@ -830,7 +830,7 @@ class TestProviderFactory:
         behavior (which would silence the provider in prod where
         is_benchmarking is False).
         """
-        from metaculus_bot.prediction_market_provider import prediction_market_provider
+        from metaculus_bot.research.prediction_market import prediction_market_provider
 
         monkeypatch.delenv("PREDICTION_MARKETS_ENABLED", raising=False)
 
@@ -849,7 +849,7 @@ class TestProviderFactory:
         supply as_of explicitly."""
         from datetime import datetime, timezone
 
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         # Set scheduled_resolution_time so the provider derives a real as_of.
         mock_question.scheduled_resolution_time = datetime(2026, 8, 1, tzinfo=timezone.utc)
@@ -896,7 +896,7 @@ class TestProviderFactory:
     async def test_enabled_flag_fetches_and_formats(
         self, monkeypatch, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
     ):
-        from metaculus_bot import prediction_market_provider as pmp
+        from metaculus_bot.research import prediction_market as pmp
 
         monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
 
@@ -933,7 +933,7 @@ class TestProviderFactory:
 
 class TestFormatter:
     def test_formatter_emits_caveat_and_columns(self):
-        from metaculus_bot.prediction_market_provider import (
+        from metaculus_bot.research.prediction_market import (
             MarketMatch,
             MarketSnapshot,
             format_snapshot_for_research,
@@ -971,12 +971,12 @@ class TestFormatter:
         assert "orbital velocity" in formatted.lower()
 
     def test_formatter_empty_snapshot_returns_empty_string(self):
-        from metaculus_bot.prediction_market_provider import MarketSnapshot, format_snapshot_for_research
+        from metaculus_bot.research.prediction_market import MarketSnapshot, format_snapshot_for_research
 
         assert format_snapshot_for_research(MarketSnapshot(matches=[])) == ""
 
     def test_formatter_truncates_long_raw_rules(self):
-        from metaculus_bot.prediction_market_provider import (
+        from metaculus_bot.research.prediction_market import (
             MarketMatch,
             MarketSnapshot,
             format_snapshot_for_research,

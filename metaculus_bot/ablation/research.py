@@ -22,7 +22,7 @@ from typing import Iterator
 
 from forecasting_tools import MetaculusQuestion
 
-from metaculus_bot import constants, targeted_research
+from metaculus_bot import constants
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.window_patch import patched_gap_fill_year_for_question
 from metaculus_bot.constants import (
@@ -30,8 +30,9 @@ from metaculus_bot.constants import (
     GEMINI_SEARCH_DEFAULT_MODEL,
     GEMINI_SEARCH_MODEL_ENV,
 )
-from metaculus_bot.gemini_search_provider import gemini_search_provider
-from metaculus_bot.targeted_research import run_gap_fill_pass
+from metaculus_bot.research import targeted
+from metaculus_bot.research.gemini_search import gemini_search_provider
+from metaculus_bot.research.targeted import run_gap_fill_pass
 
 __all__ = ["run_gemini_only_research", "run_gemini_research_for_qids"]
 
@@ -42,22 +43,22 @@ _GAP_FILL_HEADER = "\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n"
 
 @contextmanager
 def _patched_gap_fill_max_gaps(value: int) -> Iterator[None]:
-    """Override ``GAP_FILL_MAX_GAPS`` in both ``constants`` and ``targeted_research``.
+    """Override ``GAP_FILL_MAX_GAPS`` in both ``constants`` and ``research.targeted``.
 
-    ``targeted_research`` does ``from metaculus_bot.constants import GAP_FILL_MAX_GAPS``
+    ``research.targeted`` does ``from metaculus_bot.constants import GAP_FILL_MAX_GAPS``
     at import time, binding the integer in its own namespace; patching only
     ``constants`` would leave the analyzer call seeing the old value. Patch both
     and restore both in ``finally`` so tests don't leak state across the suite.
     """
     original_constants = constants.GAP_FILL_MAX_GAPS
-    original_tr = targeted_research.GAP_FILL_MAX_GAPS
+    original_tr = targeted.GAP_FILL_MAX_GAPS
     constants.GAP_FILL_MAX_GAPS = value
-    targeted_research.GAP_FILL_MAX_GAPS = value
+    targeted.GAP_FILL_MAX_GAPS = value
     try:
         yield
     finally:
         constants.GAP_FILL_MAX_GAPS = original_constants
-        targeted_research.GAP_FILL_MAX_GAPS = original_tr
+        targeted.GAP_FILL_MAX_GAPS = original_tr
 
 
 @contextmanager

@@ -15,7 +15,7 @@ import pytest
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.constants import GAP_FILL_MAX_GAPS
-from metaculus_bot.targeted_research import _parse_gap_list, run_gap_fill_pass
+from metaculus_bot.research.targeted import _parse_gap_list, run_gap_fill_pass
 
 
 @dataclass
@@ -169,8 +169,8 @@ async def test_empty_gaps_returns_empty_string() -> None:
 
     fake_search = AsyncMock(return_value="should not be called")
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=[])),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -209,8 +209,8 @@ async def test_two_gaps_run_in_parallel() -> None:
     fake_search = AsyncMock(side_effect=search_side_effect)
 
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -239,8 +239,8 @@ async def test_run_gap_fill_pass_does_not_clip_analyzer_output() -> None:
     fake_search = AsyncMock(side_effect=[f"res{i}" for i in range(oversized_count)])
 
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -260,8 +260,8 @@ async def test_malformed_analyzer_output_soft_fails() -> None:
 
     fake_search = AsyncMock(return_value="should not be called")
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=[])),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -293,9 +293,9 @@ async def test_partial_search_failure_returns_successful_results(
         raise AssertionError(f"unexpected prompt: {prompt!r}")
 
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", side_effect=search_side_effect),
-        caplog.at_level(logging.WARNING, logger="metaculus_bot.targeted_research"),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", side_effect=search_side_effect),
+        caplog.at_level(logging.WARNING, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -325,9 +325,9 @@ async def test_all_searches_fail_returns_empty(caplog: pytest.LogCaptureFixture)
     fake_search = AsyncMock(side_effect=RuntimeError("all fail"))
 
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
-        caplog.at_level(logging.WARNING, logger="metaculus_bot.targeted_research"),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        caplog.at_level(logging.WARNING, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -354,8 +354,8 @@ async def test_benchmarking_flag_threaded_to_analyzer_and_searches() -> None:
     fake_search = AsyncMock(side_effect=["r1", "r2"])
 
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", fake_analyzer),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", fake_analyzer),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         await run_gap_fill_pass(_q(question), "first-pass", is_benchmarking=True)
 
@@ -376,8 +376,8 @@ async def test_analyzer_timeout_returns_empty() -> None:
 
     fake_search = AsyncMock()
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(side_effect=asyncio.TimeoutError())),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=asyncio.TimeoutError())),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -393,10 +393,10 @@ async def test_analyzer_missing_key_returns_empty() -> None:
     fake_search = AsyncMock()
     with (
         patch(
-            "metaculus_bot.targeted_research._run_analyzer",
+            "metaculus_bot.research.targeted._run_analyzer",
             AsyncMock(side_effect=ValueError("GOOGLE_API_KEY must be set")),
         ),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -421,8 +421,8 @@ async def test_analyzer_gemini_api_error_returns_empty() -> None:
 
     fake_search = AsyncMock()
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", AsyncMock(side_effect=fake_exc)),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=fake_exc)),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -439,10 +439,10 @@ async def test_analyzer_httpx_error_returns_empty() -> None:
     fake_search = AsyncMock()
     with (
         patch(
-            "metaculus_bot.targeted_research._run_analyzer",
+            "metaculus_bot.research.targeted._run_analyzer",
             AsyncMock(side_effect=httpx.ConnectError("connection refused")),
         ),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -457,10 +457,10 @@ async def test_analyzer_os_error_returns_empty() -> None:
     fake_search = AsyncMock()
     with (
         patch(
-            "metaculus_bot.targeted_research._run_analyzer",
+            "metaculus_bot.research.targeted._run_analyzer",
             AsyncMock(side_effect=OSError("name resolution failed")),
         ),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -485,8 +485,8 @@ async def test_analyzer_receives_resolution_criteria_and_fine_print() -> None:
     fake_analyzer = AsyncMock(return_value=[])
     fake_search = AsyncMock()
     with (
-        patch("metaculus_bot.targeted_research._run_analyzer", fake_analyzer),
-        patch("metaculus_bot.targeted_research.invoke_gemini_grounded", fake_search),
+        patch("metaculus_bot.research.targeted._run_analyzer", fake_analyzer),
+        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
     ):
         await run_gap_fill_pass(_q(question), "some first-pass research")
 

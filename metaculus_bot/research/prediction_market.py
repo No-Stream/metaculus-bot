@@ -57,7 +57,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
-from metaculus_bot.research_providers import ResearchCallable
+from metaculus_bot.research.providers import ResearchCallable
 
 logger = logging.getLogger(__name__)
 

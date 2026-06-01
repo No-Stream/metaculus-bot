@@ -86,7 +86,7 @@ def main() -> None:
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research_persistence import ResearchPersistenceWriter  # noqa: PLC0415
+        from metaculus_bot.research.persistence import ResearchPersistenceWriter  # noqa: PLC0415
 
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,

@@ -47,12 +47,12 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
-from metaculus_bot.research_orchestrator import ResearchOrchestrator
-from metaculus_bot.research_providers import (
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
+from metaculus_bot.research.providers import (
     ResearchCallable,
 )
+from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
 from metaculus_bot.spread_metrics import compute_spread
-from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
 
 # Probabilistic-tools wiring (Workstream C activation). The feature flag is
 # re-exported under a descriptive local alias so call sites read clearly.
