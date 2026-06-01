@@ -170,7 +170,7 @@ async def test_calibration_off_no_change_binary(monkeypatch: pytest.MonkeyPatch)
     bot = _make_median_bot()
     question = _make_binary_question()
 
-    raw_expected = combine_binary_predictions([0.6, 0.7], AggregationStrategy.MEDIAN)
+    raw_expected = await combine_binary_predictions([0.6, 0.7], AggregationStrategy.MEDIAN)
     result = await bot._aggregate_predictions([0.6, 0.7], question)
 
     assert result == raw_expected, f"flag unset should be a bytewise no-op; got {result!r}, expected {raw_expected!r}"
@@ -198,7 +198,7 @@ async def test_calibration_on_identity_no_change_binary(monkeypatch: pytest.Monk
     bot = _make_median_bot()
     question = _make_binary_question()
 
-    raw_expected = combine_binary_predictions([0.6, 0.7], AggregationStrategy.MEDIAN)
+    raw_expected = await combine_binary_predictions([0.6, 0.7], AggregationStrategy.MEDIAN)
     result = await bot._aggregate_predictions([0.6, 0.7], question)
 
     assert result == raw_expected, (
@@ -227,7 +227,7 @@ async def test_calibration_on_nonidentity_applies_binary(monkeypatch: pytest.Mon
     question = _make_binary_question()
 
     preds = [0.6, 0.7]
-    raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
+    raw_median = await combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
     result = await bot._aggregate_predictions(preds, question)
 
@@ -271,7 +271,7 @@ async def test_calibration_on_nonidentity_applies_mc(monkeypatch: pytest.MonkeyP
     # place (via apply_mc_platt → option.probability = ...), so deep-copy the
     # inputs separately for the reference build.
     ref_inputs = [deepcopy(pred_a), deepcopy(pred_b)]
-    combined = combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
+    combined = await combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
     expected_pol = apply_mc_platt(combined, params, max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION)
     expected_probs = {o.option_name: o.probability for o in expected_pol.predicted_options}
 
@@ -288,7 +288,9 @@ async def test_calibration_on_nonidentity_applies_mc(monkeypatch: pytest.MonkeyP
 
     # And calibration should actually move the result vs. the raw combination
     # (else the test is vacuous).
-    raw_combined = combine_multiple_choice_predictions([deepcopy(pred_a), deepcopy(pred_b)], AggregationStrategy.MEDIAN)
+    raw_combined = await combine_multiple_choice_predictions(
+        [deepcopy(pred_a), deepcopy(pred_b)], AggregationStrategy.MEDIAN
+    )
     raw_probs = {o.option_name: o.probability for o in raw_combined.predicted_options}
     assert any(abs(result_probs[n] - raw_probs[n]) > 1e-9 for n in result_probs), (
         "non-identity MC params should change at least one option probability."
@@ -343,7 +345,9 @@ async def test_mc_many_options_can_fall_below_binary_floor(monkeypatch: pytest.M
     # Platt math by hand, apply the loose cap (no-op for p in [0, 1]), then
     # clamp to MC bounds and renormalize. Hand-rolled rather than calling
     # apply_mc_platt to avoid circularity with the code under test.
-    combined = combine_multiple_choice_predictions([deepcopy(pred_a), deepcopy(pred_b)], AggregationStrategy.MEDIAN)
+    combined = await combine_multiple_choice_predictions(
+        [deepcopy(pred_a), deepcopy(pred_b)], AggregationStrategy.MEDIAN
+    )
     raw_combined = [o.probability for o in combined.predicted_options]
     per_option_unclipped = [
         1.0 / (1.0 + math.exp(-(params.bias + params.slope * math.log(p / (1.0 - p))))) for p in raw_combined
@@ -401,7 +405,7 @@ async def test_stacker_median_fallback_applies_calibration_binary(
     question = _make_binary_question()
 
     preds = [0.4, 0.6]
-    raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
+    raw_median = await combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
 
     # Force both the primary and the fallback _run_stacking calls to fail so
@@ -567,7 +571,7 @@ async def test_stacker_median_fallback_applies_calibration_mc(
     # Reference: combine + apply MC Platt with the cap. Deep-copy inputs so
     # the bot's in-place mutation doesn't pollute the reference build.
     ref_inputs = [deepcopy(pred_a), deepcopy(pred_b)]
-    combined = combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
+    combined = await combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
     expected_pol = apply_mc_platt(combined, params, max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION)
     expected_probs = {o.option_name: o.probability for o in expected_pol.predicted_options}
 
@@ -642,7 +646,7 @@ async def test_conditional_stacking_skip_path_applies_platt_binary(
     bot._register_expected_base_combine(question)
 
     preds = [0.45, 0.50, 0.55]
-    raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
+    raw_median = await combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
 
     result = await bot._aggregate_predictions(
@@ -683,7 +687,7 @@ async def test_conditional_stacking_skip_path_applies_platt_mc(
     pred_b = _make_mc_pred([0.40, 0.35, 0.20, 0.05])
 
     ref_inputs = [deepcopy(pred_a), deepcopy(pred_b)]
-    combined = combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
+    combined = await combine_multiple_choice_predictions(ref_inputs, AggregationStrategy.MEDIAN)
     expected_pol = apply_mc_platt(combined, params, max_abs_deviation=PLATT_MC_MAX_ABS_DEVIATION)
     expected_probs = {o.option_name: o.probability for o in expected_pol.predicted_options}
 
@@ -720,7 +724,7 @@ async def test_stacking_base_combine_reentry_multi_input_does_not_apply(
     bot._register_expected_base_combine(question)
 
     preds = [0.42, 0.48]
-    raw_mean = combine_binary_predictions(preds, AggregationStrategy.MEAN)
+    raw_mean = await combine_binary_predictions(preds, AggregationStrategy.MEAN)
 
     result = await bot._aggregate_predictions(
         predictions=preds,

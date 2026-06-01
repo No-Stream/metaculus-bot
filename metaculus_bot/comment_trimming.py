@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Final, Tuple
+from typing import Final
 
 from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMIT
 
@@ -34,7 +34,7 @@ class TrimConfig:
     head_budget: int = _COMMENT_HEAD_BUDGET
 
 
-def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bool) -> Tuple[str, bool]:
+def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bool) -> tuple[str, bool]:
     if limit <= 0:
         return "", bool(text)
     if len(text) <= limit:
@@ -74,7 +74,7 @@ def trim_section(text: str, section_name: str, *, config: TrimConfig | None = No
     return trimmed
 
 
-def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> Tuple[str, bool]:
+def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> tuple[str, bool]:
     """Trim the middle, keep the summary head and the tail.
 
     The bot's published comment has the structure:

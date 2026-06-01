@@ -147,7 +147,6 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion) -> 
             smoothed,
             open_lower=question.open_lower_bound,
             open_upper=question.open_upper_bound,
-            min_step=NUM_MIN_PROB_STEP,
         )
         pchip_cdf[:] = smoothed.tolist()
 

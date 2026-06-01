@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Union
 
 import numpy as np
 from scipy import optimize, stats
@@ -43,7 +42,7 @@ class TailMassResult:
     interior_mass: float
 
 
-FitType = Union[NormalFit, LognormalFit, StudentTFit]
+FitType = NormalFit | LognormalFit | StudentTFit
 
 
 def _validate_percentile_dict(percentile_values: dict[float, float]) -> list[tuple[float, float]]:

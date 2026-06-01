@@ -392,14 +392,10 @@ async def _median_fallback_prediction(
     deserialized = [
         deserialize_prediction_value(payload["prediction_value"], question) for payload in surviving.values()
     ]
-    # Cooperative yield so flake8-async ASYNC910 sees a checkpoint on the
-    # binary/MC sync-aggregation branches without changing observable
-    # behavior. The numeric branch already awaits inside combine_numeric_predictions.
-    await asyncio.sleep(0)
     if isinstance(question, BinaryQuestion):
-        return combine_binary_predictions([float(v) for v in deserialized], AggregationStrategy.MEDIAN)
+        return await combine_binary_predictions([float(v) for v in deserialized], AggregationStrategy.MEDIAN)
     if isinstance(question, MultipleChoiceQuestion):
-        return combine_multiple_choice_predictions(deserialized, AggregationStrategy.MEDIAN)
+        return await combine_multiple_choice_predictions(deserialized, AggregationStrategy.MEDIAN)
     if isinstance(question, NumericQuestion):
         return await combine_numeric_predictions(deserialized, question, AggregationStrategy.MEDIAN)
     raise ValueError(f"Unsupported question type for median fallback: {type(question).__name__}")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
@@ -50,9 +49,9 @@ logger = logging.getLogger(__name__)
 
 
 def sanitize_percentiles(
-    percentile_list: List[Percentile],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
-) -> Tuple[List[Percentile], float | None]:
+) -> tuple[list[Percentile], float | None]:
     """Filter, validate, sort, jitter, and optionally widen percentile declarations."""
 
     filtered = filter_to_standard_percentiles(percentile_list)
@@ -70,7 +69,7 @@ def sanitize_percentiles(
 
 
 def build_numeric_distribution(
-    percentile_list: List[Percentile],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
     zero_point: float | None,
 ) -> NumericDistribution:
@@ -122,7 +121,7 @@ def build_numeric_distribution(
     return prediction
 
 
-def _apply_jitter_and_clamp(percentile_list: List[Percentile], question: NumericQuestion) -> List[Percentile]:
+def _apply_jitter_and_clamp(percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
     range_size = question.upper_bound - question.lower_bound
     buffer = calculate_bounds_buffer(question)
 
@@ -132,9 +131,6 @@ def _apply_jitter_and_clamp(percentile_list: List[Percentile], question: Numeric
     count_like = detect_count_like_pattern(values)
     span = (max(values) - min(values)) if values else 0.0
     value_eps, base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
-
-    pre_deltas = [b - a for a, b in zip(values, values[1:])]
-    min(pre_deltas) if pre_deltas else float("inf")  # keep behaviour identical for potential side effects
 
     modified_values, clusters_applied = apply_cluster_spreading(
         modified_values,
@@ -163,7 +159,7 @@ def _apply_jitter_and_clamp(percentile_list: List[Percentile], question: Numeric
     return [Percentile(value=v, percentile=p.percentile) for v, p in zip(modified_values, percentile_list)]
 
 
-def _maybe_widen_tails(percentile_list: List[Percentile], question: NumericQuestion) -> List[Percentile]:
+def _maybe_widen_tails(percentile_list: list[Percentile], question: NumericQuestion) -> list[Percentile]:
     if not TAIL_WIDENING_ENABLE:
         return percentile_list
     return widen_declared_percentiles(

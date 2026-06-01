@@ -338,7 +338,7 @@ async def benchmark_forecast_bot(
         try:
             log_bot_lineup(bots)
         except Exception:
-            pass
+            logger.debug("log_bot_lineup failed", exc_info=True)
 
         logger.info("📊 Entering Benchmarker.run_benchmark() - this may take a while...")
         sys.stdout.flush()
@@ -404,7 +404,7 @@ async def benchmark_forecast_bot(
                             logger.info(f"  unmatched exclude tokens: {summary['unmatched_excludes']}")
                     logger.info(f"  remaining models: {analyzer.get_model_names()}")
                 except Exception:
-                    pass
+                    logger.debug("Model filter logging failed", exc_info=True)
 
             # Generate and log correlation report
             report = analyzer.generate_correlation_report("benchmarks/correlation_analysis.md")
@@ -445,7 +445,7 @@ async def benchmark_forecast_bot(
         try:
             log_stacking_summaries(stacking_bots)
         except Exception:
-            pass
+            logger.debug("log_stacking_summaries failed", exc_info=True)
 
 
 if __name__ == "__main__":

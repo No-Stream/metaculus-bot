@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Tuple
 
 from metaculus_bot.config import load_environment
 
@@ -420,7 +419,7 @@ CRUX_SOFT_DEADLINE: int = 180
 HEARTBEAT_INTERVAL: int = 60
 FETCH_RETRY_BACKOFFS: list[int] = [5, 15]
 # Distribution mix: (binary, numeric, multiple_choice)
-TYPE_MIX: Tuple[float, float, float] = (0.5, 0.25, 0.25)
+TYPE_MIX: tuple[float, float, float] = (0.5, 0.25, 0.25)
 FETCH_PACING_SECONDS: int = 2
 
 # =============================================================================

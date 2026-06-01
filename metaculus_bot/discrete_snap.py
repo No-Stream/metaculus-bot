@@ -126,7 +126,7 @@ def snap_cdf_to_integers(
 
     # --- Step 4: Max-step redistribution + boundary pinning ---
     # safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
-    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound, NUM_MIN_PROB_STEP)
+    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound)
 
     result = enforced_cdf.tolist()
 

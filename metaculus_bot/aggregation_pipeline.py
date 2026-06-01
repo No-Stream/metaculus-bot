@@ -200,7 +200,7 @@ class AggregationPipeline:
         # Simple MEAN/MEDIAN path
         return await self._simple_aggregate(predictions, question)
 
-    async def _base_combine(  # noqa: ASYNC910 - awaits only on numeric path
+    async def _base_combine(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -219,6 +219,7 @@ class AggregationPipeline:
                 logger.info("STACKING base combine: single pre-stacked output; returning as-is")
             else:
                 logger.warning("Unexpected STACKING combine: single input without stacking context; returning as-is")
+            await asyncio.sleep(0)
             return predictions[0]
 
         # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
@@ -246,14 +247,14 @@ class AggregationPipeline:
         first = predictions[0]
         if isinstance(first, (int, float)):
             values = [float(p) for p in predictions if isinstance(p, (int, float))]
-            result = combine_binary_predictions(values, base_combine_strategy)
+            result = await combine_binary_predictions(values, base_combine_strategy)
             logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
             if apply_platt_after_combine:
                 return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
             return result  # type: ignore[return-value]
         if isinstance(first, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
+            aggregated = await combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
             summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
             logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
             if apply_platt_after_combine:
@@ -364,7 +365,7 @@ class AggregationPipeline:
         if isinstance(first_prediction, (int, float)):
             float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
             return self._apply_platt_calibration(
-                combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
+                await combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
                 question,
             )
         if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
@@ -377,7 +378,7 @@ class AggregationPipeline:
         if isinstance(first_prediction, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
             return self._apply_platt_calibration(
-                combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
+                await combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
                 question,
             )
         raise ValueError(f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}")
@@ -409,7 +410,7 @@ class AggregationPipeline:
         first_prediction = predictions[0]
         if isinstance(first_prediction, (int, float)):
             float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-            result = combine_binary_predictions(float_preds, effective_strategy)
+            result = await combine_binary_predictions(float_preds, effective_strategy)
             if effective_strategy == AggregationStrategy.MEAN:
                 logger.info("Binary question ensembling: mean of %s = %.3f (rounded)", float_preds, result)
             elif effective_strategy == AggregationStrategy.MEDIAN:
@@ -439,7 +440,7 @@ class AggregationPipeline:
 
         if isinstance(first_prediction, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, effective_strategy)
+            aggregated = await combine_multiple_choice_predictions(mc_preds, effective_strategy)
             summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
             logger.info("MC %s aggregation; renormalized to 1.0 | %s", effective_strategy.value, summary)
             return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]

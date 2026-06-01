@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
@@ -34,10 +33,10 @@ def _choose_transform(
     - Both open: identity.
     """
 
-    L = float(getattr(question, "lower_bound", 0.0))
-    U = float(getattr(question, "upper_bound", 0.0))
-    open_low = bool(getattr(question, "open_lower_bound", False))
-    open_up = bool(getattr(question, "open_upper_bound", False))
+    L = float(question.lower_bound)
+    U = float(question.upper_bound)
+    open_low = bool(question.open_lower_bound)
+    open_up = bool(question.open_upper_bound)
 
     if not open_low and not open_up:
         # Bounded both sides → normalize and use logit
@@ -93,13 +92,13 @@ def _tail_weight(p: float, tail_start: float) -> float:
 
 
 def widen_declared_percentiles(
-    percentile_list: List[Percentile],
+    percentile_list: list[Percentile],
     question: NumericQuestion,
     *,
     k_tail: float = 1.0,
     tail_start: float = 0.2,
     span_floor_gamma: float = 0.0,
-) -> List[Percentile]:
+) -> list[Percentile]:
     """
     Widen tails by scaling distances from the median in a transformed space.
 
@@ -140,8 +139,8 @@ def widen_declared_percentiles(
     if not percentile_list or (k_tail <= 1.0 and span_floor_gamma <= 0.0):
         return percentile_list
 
-    L = float(getattr(question, "lower_bound", -np.inf))
-    U = float(getattr(question, "upper_bound", np.inf))
+    L = float(question.lower_bound)
+    U = float(question.upper_bound)
     rng = max(U - L, 1e-12)
 
     eps = max(1e-12, rng * 1e-12)
@@ -227,8 +226,8 @@ def widen_declared_percentiles(
     updated = ensure_strictly_increasing_bounded(updated, question, range_size)
 
     # For open bounds, nudge tails away from exact bounds to avoid near-duplicates against range
-    open_low = bool(getattr(question, "open_lower_bound", False))
-    open_up = bool(getattr(question, "open_upper_bound", False))
+    open_low = bool(question.open_lower_bound)
+    open_up = bool(question.open_upper_bound)
     # Use a modest floor to avoid unit-mismatch detector (relative to range)
     value_floor = max(range_size * 1e-6, 1e-8)
     if open_low:

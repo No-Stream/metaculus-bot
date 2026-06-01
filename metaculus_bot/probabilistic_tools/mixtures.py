@@ -291,6 +291,6 @@ def percentiles_to_metaculus_cdf_via_mixture(
 
     # Final monotonicity safety + apply boundary constraints + max-step redistribution.
     cdf = np.maximum.accumulate(cdf)
-    cdf = safe_cdf_bounds(cdf, open_lower, open_upper, MIN_CDF_PROB_STEP)
+    cdf = safe_cdf_bounds(cdf, open_lower, open_upper)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf[i])) for i in range(num_points)]

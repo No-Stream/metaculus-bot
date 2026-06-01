@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -356,7 +356,7 @@ class DiscreteCountStructured(BaseModel):
 
 
 StructuredBlock = Annotated[
-    Union[BinaryStructured, NumericStructured, MultipleChoiceStructured],
+    BinaryStructured | NumericStructured | MultipleChoiceStructured,
     Field(discriminator="question_type"),
 ]
 

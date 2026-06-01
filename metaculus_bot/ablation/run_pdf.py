@@ -235,7 +235,7 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     cdf_values = np.maximum.accumulate(cdf_values)
     cdf_values = enforce_min_steps(cdf_values, MIN_CDF_PROB_STEP, upper_cap=hi_cap, lower_cap=lo_cap)
     cdf_values = np.maximum.accumulate(cdf_values)
-    cdf_values = safe_cdf_bounds(cdf_values, open_lower, open_upper, MIN_CDF_PROB_STEP)
+    cdf_values = safe_cdf_bounds(cdf_values, open_lower, open_upper)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf_values[i])) for i in range(num_points)]
 

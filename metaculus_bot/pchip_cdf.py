@@ -67,7 +67,7 @@ def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.nda
     return new_cdf
 
 
-def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool, min_step: float) -> np.ndarray:
+def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
     • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
@@ -173,24 +173,10 @@ def generate_pchip_cdf(
     """
     Generate a robust continuous CDF using PCHIP interpolation with strict constraint enforcement.
 
-    Based on the panchul implementation with enhancements for robustness.
-
-    Args:
-        percentile_values: Dictionary mapping percentiles (0-100) to values
-        open_upper_bound: Whether the upper bound is open
-        open_lower_bound: Whether the lower bound is open
-        upper_bound: Maximum possible value
-        lower_bound: Minimum possible value
-        zero_point: Reference point for non-linear scaling (optional)
-        min_step: Minimum step size between adjacent CDF points (default: 5.0e-5)
-        num_points: Number of points in the output CDF (default: 201)
-        question_id: Optional question identifier for logging context
-        question_url: Optional question URL for logging context
-
-    Returns:
-        Tuple of (CDF values, aggressive_enforcement_used) where:
-        - CDF values: List of probability values with strictly enforced monotonicity and step size
-        - aggressive_enforcement_used: True if aggressive step enforcement was required
+    Based on the panchul implementation with enhancements for robustness. ``percentile_values``
+    maps percentiles in (0, 100) to values; ``zero_point`` enables non-linear grid scaling.
+    Returns ``(cdf_values, aggressive_enforcement_used)`` where the second element flags whether
+    aggressive step enforcement was required to satisfy the min-step constraint.
 
     Raises:
         ValueError: If input validation fails
@@ -264,9 +250,8 @@ def generate_pchip_cdf(
     # Create interpolator with fallback
     try:
         spline = PchipInterpolator(x_vals, percentiles, extrapolate=True)
-    except Exception as e:
-        # Fallback to linear interpolation
-        print(f"PchipInterpolator failed ({str(e)}), falling back to linear interpolation")
+    except Exception:
+        logger.warning("PchipInterpolator failed, falling back to linear interpolation", exc_info=True)
 
         def spline(x):
             return np.interp(x, x_vals, percentiles)
@@ -352,7 +337,7 @@ def generate_pchip_cdf(
                                 cdf_y[j] = max_allowed
 
     # Apply boundary constraints and max jump rules
-    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step)
+    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound)
 
     # Check if we have enough room for minimum steps
     required_range = (len(cdf_y) - 1) * min_step
