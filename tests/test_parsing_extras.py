@@ -8,7 +8,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
 from main import TemplateForecaster
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 
 
 def _stub_open_time() -> datetime:

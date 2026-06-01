@@ -1022,7 +1022,7 @@ class CorrelationAnalyzer:
         downstream scoring (which only reads `.percentile`).
         """
         # Local import to avoid module-level dependency and to satisfy linters for this scope
-        from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+        from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 
         qid = getattr(question, "id_of_question", None)
         if qid is None:

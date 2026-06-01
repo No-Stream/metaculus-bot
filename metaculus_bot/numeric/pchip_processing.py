@@ -10,10 +10,10 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
-from metaculus_bot.numeric_config import (
+from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
 )
-from metaculus_bot.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def generate_pchip_cdf_with_smoothing(
     zero_point: float | None,
 ) -> tuple[list[float], bool, bool]:
     """Generate PCHIP CDF with optional ramp smoothing."""
-    from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+    from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 
     # Track attempt
     global _pchip_stats

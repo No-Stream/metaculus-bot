@@ -25,7 +25,7 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution, Pe
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy, combine_numeric_predictions
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from tests.conftest import make_mock_numeric_question
 
 # ---------------------------------------------------------------------------

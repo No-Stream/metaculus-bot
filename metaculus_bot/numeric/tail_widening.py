@@ -14,7 +14,7 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.cluster_processing import ensure_strictly_increasing_bounded
+from metaculus_bot.numeric.cluster_processing import ensure_strictly_increasing_bounded
 from metaculus_bot.prob_math_utils import logit, sigmoid
 
 logger = logging.getLogger(__name__)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from scipy import stats
 
-from metaculus_bot.numeric_config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 logger = logging.getLogger(__name__)
 

@@ -365,7 +365,7 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
             )
         # Local import keeps pchip_processing out of the import-time graph for
         # binary/MC paths (lighter cold-start when only those types are exercised).
-        from metaculus_bot.pchip_processing import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.numeric.pchip_processing import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             create_pchip_numeric_distribution,
         )
 

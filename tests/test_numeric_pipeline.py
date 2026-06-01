@@ -4,7 +4,7 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
 
 def _build_question(**overrides) -> NumericQuestion:
@@ -73,15 +73,15 @@ def test_build_numeric_distribution_fallback(monkeypatch):
     validate = MagicMock()
 
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.generate_pchip_cdf_with_smoothing",
+        "metaculus_bot.numeric.pipeline.generate_pchip_cdf_with_smoothing",
         failing,
     )
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.create_fallback_numeric_distribution",
+        "metaculus_bot.numeric.pipeline.create_fallback_numeric_distribution",
         fallback,
     )
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.validate_cdf_construction",
+        "metaculus_bot.numeric.pipeline.validate_cdf_construction",
         validate,
     )
 
@@ -105,15 +105,15 @@ def test_build_numeric_distribution_success(monkeypatch):
     validate = MagicMock()
 
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.generate_pchip_cdf_with_smoothing",
+        "metaculus_bot.numeric.pipeline.generate_pchip_cdf_with_smoothing",
         generator,
     )
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.create_pchip_numeric_distribution",
+        "metaculus_bot.numeric.pipeline.create_pchip_numeric_distribution",
         create_dist,
     )
     monkeypatch.setattr(
-        "metaculus_bot.numeric_pipeline.validate_cdf_construction",
+        "metaculus_bot.numeric.pipeline.validate_cdf_construction",
         validate,
     )
 

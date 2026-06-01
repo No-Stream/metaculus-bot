@@ -178,8 +178,8 @@ def _compute_numeric_from_mixture(block: NumericStructured, question: NumericQue
 
 def _compute_numeric_from_percentiles(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
     """Path 2: Fit parametric family to declared percentiles, build CDF on grid."""
-    from metaculus_bot.numeric_config import PCHIP_CDF_POINTS
-    from metaculus_bot.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+    from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
+    from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
     from metaculus_bot.probabilistic_tools.distributions import (
         FitType,
         eval_cdf,
@@ -221,7 +221,7 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     grid = np.linspace(lower, upper, num_points)
     cdf_values = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
 
-    from metaculus_bot.numeric_config import MIN_CDF_PROB_STEP
+    from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP
 
     hi_cap = 0.999 if open_upper else 1.0
     lo_cap = 0.001 if open_lower else 0.0
@@ -403,7 +403,7 @@ async def _aggregate_numeric_predictions(
     at the tails). Takes the pointwise median or mean, then wraps the result.
     """
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
+    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415
 
     n_points = len(predictions[0])
     prob_arrays = np.array([[p.percentile for p in perc_list] for perc_list in predictions], dtype=float)

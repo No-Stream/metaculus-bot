@@ -39,7 +39,7 @@ from metaculus_bot.ablation.run_stacker import (
     _surviving_forecasters,
 )
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
-from metaculus_bot.numeric_utils import aggregate_numeric
+from metaculus_bot.numeric.utils import aggregate_numeric
 
 logger: logging.Logger = logging.getLogger(__name__)
 

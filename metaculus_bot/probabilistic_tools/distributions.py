@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import optimize, stats
 
-from metaculus_bot.numeric_config import STANDARD_PERCENTILES
-from metaculus_bot.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 
 CdfFn = Callable[[np.ndarray, float, float], np.ndarray]
 

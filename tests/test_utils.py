@@ -14,7 +14,7 @@ from forecasting_tools.data_models.questions import (
 )
 from pydantic import Field
 
-from metaculus_bot.numeric_utils import (
+from metaculus_bot.numeric.utils import (
     aggregate_binary_mean,
     aggregate_numeric,
     bound_messages,

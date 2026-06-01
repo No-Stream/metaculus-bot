@@ -19,7 +19,7 @@ import random
 from pathlib import Path
 from typing import Literal
 
-from metaculus_bot.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.performance_analysis.collector import load_dataset, resolve_numeric_record_to_score_inputs
 from metaculus_bot.performance_analysis.parsing import (
     _parse_probability,

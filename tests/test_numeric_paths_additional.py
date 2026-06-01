@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.discrete_snap import OutcomeTypeResult
-from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
 
 
 def _stub_open_time() -> datetime:
@@ -67,8 +67,8 @@ class DummyLLM:
 
 
 @pytest.mark.asyncio
-@patch("metaculus_bot.pchip_cdf.generate_pchip_cdf", side_effect=RuntimeError("boom"))
-@patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format", return_value={})
+@patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf", side_effect=RuntimeError("boom"))
+@patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format", return_value={})
 async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     f = _make_forecaster()
     q = _make_question()
@@ -100,8 +100,8 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
 
 
 @pytest.mark.asyncio
-@patch("metaculus_bot.pchip_cdf.generate_pchip_cdf", side_effect=RuntimeError("boom"))
-@patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format", return_value={})
+@patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf", side_effect=RuntimeError("boom"))
+@patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format", return_value={})
 async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, caplog):
     f = _make_forecaster()
     q = _make_question()
@@ -128,7 +128,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
             "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
         ),
-        patch("metaculus_bot.pchip_processing.NumericDistribution", FakeND),
+        patch("metaculus_bot.numeric.pchip_processing.NumericDistribution", FakeND),
     ):
         caplog.clear()
         caplog.set_level("ERROR")
@@ -142,7 +142,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
 
 
 @pytest.mark.asyncio
-@patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format", return_value={})
+@patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format", return_value={})
 async def test_smoothing_respects_open_bounds(mock_format, caplog):
     f = _make_forecaster()
     # Open bounds question
@@ -153,7 +153,7 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
     base[50:55] = base[50] + np.linspace(0, 1e-8, 5)
 
     with patch(
-        "metaculus_bot.pchip_cdf.generate_pchip_cdf",
+        "metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf",
         return_value=(base.tolist(), False),
     ):
         plist = [
@@ -201,8 +201,8 @@ async def test_numeric_percentile_set_validation():
 
 
 @pytest.mark.asyncio
-@patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-@patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format", return_value={})
+@patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+@patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format", return_value={})
 async def test_discrete_zero_point_override(mock_format, mock_generate):
     f = _make_forecaster()
     # Discrete (non-201) and zero_point provided → should pass zero_point=None into pchip

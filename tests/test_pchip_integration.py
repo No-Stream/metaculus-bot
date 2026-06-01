@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 
-from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
 
 
 class TestPchipIntegration:

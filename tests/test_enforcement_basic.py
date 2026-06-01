@@ -2,8 +2,8 @@ import types
 
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.cluster_processing import compute_cluster_parameters
-from metaculus_bot.numeric_validation import detect_unit_mismatch
+from metaculus_bot.numeric.cluster_processing import compute_cluster_parameters
+from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 
 def _fake_question(lower: float, upper: float) -> types.SimpleNamespace:

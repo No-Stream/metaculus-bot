@@ -21,8 +21,8 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from scipy import optimize
 from scipy.stats import norm
 
-from metaculus_bot.numeric_config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
-from metaculus_bot.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
+from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
 
 
 @dataclass(frozen=True)

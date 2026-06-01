@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.cluster_processing import (
+from metaculus_bot.numeric.cluster_processing import (
     apply_cluster_spreading,
     apply_jitter_for_duplicates,
     compute_cluster_parameters,

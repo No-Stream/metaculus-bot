@@ -61,7 +61,7 @@ from metaculus_bot.ablation.stage_payload import make_error_payload, make_succes
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.numeric_utils import bound_messages
+from metaculus_bot.numeric.utils import bound_messages
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -323,11 +323,11 @@ async def _dispatch_stacker(
         # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
         # function-scoped imports for the same reason.
         from metaculus_bot.exceptions import UnitMismatchError  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        from metaculus_bot.numeric_pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             build_numeric_distribution,
             sanitize_percentiles,
         )
-        from metaculus_bot.numeric_validation import (
+        from metaculus_bot.numeric.validation import (
             detect_unit_mismatch,  # noqa: PLC0415  # function-scoped: see AGENTS.md
         )
 

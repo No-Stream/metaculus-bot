@@ -42,7 +42,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.llm_setup import prepare_llm_config
-from metaculus_bot.pchip_processing import log_pchip_summary, reset_pchip_stats
+from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,

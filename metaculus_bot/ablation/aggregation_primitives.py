@@ -14,7 +14,7 @@ from forecasting_tools import PredictedOptionList
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MAX, MC_PROB_MIN
-from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
+from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 
 __all__ = ["aggregate_binary", "aggregate_mc"]
 

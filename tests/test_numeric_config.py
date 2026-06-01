@@ -9,7 +9,7 @@ so the default was dropped to 0.0 (the floor enforcement at tail_widening.py:171
 stays correctly gated on `> 0` and re-enables if a forecaster sets it back).
 """
 
-from metaculus_bot import numeric_config
+from metaculus_bot.numeric import config as numeric_config
 
 
 def test_tail_widen_k_tail_default_is_one():

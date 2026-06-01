@@ -28,8 +28,8 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import BaseModel
 
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
-from metaculus_bot.pchip_cdf import safe_cdf_bounds
-from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 logger = logging.getLogger(__name__)
 

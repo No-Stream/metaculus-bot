@@ -9,7 +9,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
-from metaculus_bot.pchip_cdf import (
+from metaculus_bot.numeric.pchip_cdf import (
     enforce_min_steps,
     enforce_strict_increasing,
     generate_pchip_cdf,

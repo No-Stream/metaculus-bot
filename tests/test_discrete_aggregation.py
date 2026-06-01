@@ -3,7 +3,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric_utils import aggregate_numeric
+from metaculus_bot.numeric.utils import aggregate_numeric
 
 
 @pytest.mark.asyncio

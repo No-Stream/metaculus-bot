@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.discrete_snap import OutcomeTypeResult
-from metaculus_bot.tail_widening import widen_declared_percentiles
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
 
 
 def _stub_open_time() -> datetime:
@@ -190,7 +190,7 @@ class TestTailWideningIntegration:
     @pytest.mark.asyncio
     async def test_integration_discrete_enabled(self, monkeypatch):
         # Enable tail widening globally for this test
-        from metaculus_bot import numeric_config as cfg
+        from metaculus_bot.numeric import config as cfg
 
         monkeypatch.setattr(cfg, "TAIL_WIDENING_ENABLE", True, raising=False)
         monkeypatch.setattr(cfg, "TAIL_WIDEN_K_TAIL", 1.35, raising=False)

@@ -401,7 +401,7 @@ class TestConditionalStackingFallbacks:
             targeted_search_return="targeted results",
             run_stacking_side_effect=RuntimeError("Stacker LLM crashed"),
             extra_patches=[
-                ("binary_mean", patch("metaculus_bot.numeric_utils.aggregate_binary_mean", return_value=0.475)),
+                ("binary_mean", patch("metaculus_bot.numeric.utils.aggregate_binary_mean", return_value=0.475)),
             ],
         ):
             result = await bot._research_and_make_predictions(question)

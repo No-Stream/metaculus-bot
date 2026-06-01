@@ -27,7 +27,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.numeric_config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,7 +141,7 @@ def _build_numeric_distribution(
     open_upper: bool = True,
 ):
     """Build a proper 201-point CDF using the real PCHIP pipeline."""
-    from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
+    from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
     lo, hi = bounds
     question = NumericQuestion(
@@ -246,7 +246,7 @@ class TestNumericMixtureBranch:
         bot.min_forecasters_to_publish = 1
         question = _make_numeric_question()
 
-        from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
         from metaculus_bot.probabilistic_tools.mixtures import (
             MixtureComponent,
             MixtureOfNormals,
@@ -380,7 +380,7 @@ class TestNumericUnitMismatch:
             )
         ]
 
-        from metaculus_bot.numeric_validation import detect_unit_mismatch
+        from metaculus_bot.numeric.validation import detect_unit_mismatch
 
         mismatch, reason = detect_unit_mismatch(bad_percentiles, question)
         assert mismatch is True
@@ -503,7 +503,7 @@ class TestMCClampingAndRenormalization:
 
     @pytest.mark.e2e
     def test_mc_clamping_and_renormalization(self):
-        from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
+        from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 
         extreme_prediction = _mc_option_list([0.99, 0.005, 0.005])
         clamped = clamp_and_renormalize_mc(extreme_prediction)

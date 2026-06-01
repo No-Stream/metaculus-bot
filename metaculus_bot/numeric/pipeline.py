@@ -8,42 +8,42 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.bounds_clamping import (
+from metaculus_bot.constants import NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.bounds_clamping import (
     calculate_bounds_buffer,
     clamp_values_to_bounds,
     log_cluster_spreading_summary,
     log_corrections_summary,
     log_heavy_clamping_diagnostics,
 )
-from metaculus_bot.cluster_processing import (
+from metaculus_bot.numeric.cluster_processing import (
     apply_cluster_spreading,
     apply_jitter_for_duplicates,
     compute_cluster_parameters,
     detect_count_like_pattern,
     ensure_strictly_increasing_bounded,
 )
-from metaculus_bot.constants import NUM_MIN_PROB_STEP
-from metaculus_bot.numeric_config import (
+from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
     TAIL_WIDEN_K_TAIL,
     TAIL_WIDEN_SPAN_FLOOR_GAMMA,
     TAIL_WIDEN_TAIL_START,
     TAIL_WIDENING_ENABLE,
 )
-from metaculus_bot.numeric_diagnostics import log_pchip_fallback, validate_cdf_construction
-from metaculus_bot.numeric_validation import (
+from metaculus_bot.numeric.diagnostics import log_pchip_fallback, validate_cdf_construction
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
+from metaculus_bot.numeric.pchip_processing import (
+    create_fallback_numeric_distribution,
+    create_pchip_numeric_distribution,
+    generate_pchip_cdf_with_smoothing,
+)
+from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
+from metaculus_bot.numeric.validation import (
     check_discrete_question_properties,
     filter_to_standard_percentiles,
     sort_percentiles_by_value,
     validate_percentile_count_and_values,
 )
-from metaculus_bot.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
-from metaculus_bot.pchip_processing import (
-    create_fallback_numeric_distribution,
-    create_pchip_numeric_distribution,
-    generate_pchip_cdf_with_smoothing,
-)
-from metaculus_bot.tail_widening import widen_declared_percentiles
 
 logger = logging.getLogger(__name__)
 

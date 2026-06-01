@@ -8,7 +8,7 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import NumericDistribution
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric_utils import aggregate_binary_mean, aggregate_numeric
+from metaculus_bot.numeric.utils import aggregate_binary_mean, aggregate_numeric
 
 
 class AggregationStrategy(Enum):
