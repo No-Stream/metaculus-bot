@@ -149,16 +149,16 @@ def test_aggregation_strategy_enum():
     assert "stacking" in strategies
 
 
-async def test_combine_binary_predictions_mean_and_median():
+def test_combine_binary_predictions_mean_and_median():
     probs = [0.2, 0.3, 0.4]
-    assert await combine_binary_predictions(probs, AggregationStrategy.MEAN) == pytest.approx(0.3)
-    assert await combine_binary_predictions(probs, AggregationStrategy.MEDIAN) == pytest.approx(0.3)
+    assert combine_binary_predictions(probs, AggregationStrategy.MEAN) == pytest.approx(0.3)
+    assert combine_binary_predictions(probs, AggregationStrategy.MEDIAN) == pytest.approx(0.3)
 
     with pytest.raises(ValueError):
-        await combine_binary_predictions(probs, AggregationStrategy.STACKING)
+        combine_binary_predictions(probs, AggregationStrategy.STACKING)
 
 
-async def test_combine_multiple_choice_predictions_dispatch():
+def test_combine_multiple_choice_predictions_dispatch():
     pred1 = PredictedOptionList(
         predicted_options=[
             PredictedOption(option_name="A", probability=0.6),
@@ -172,18 +172,17 @@ async def test_combine_multiple_choice_predictions_dispatch():
         ]
     )
 
-    mean_result = await combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEAN)
+    mean_result = combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEAN)
     assert {opt.option_name: opt.probability for opt in mean_result.predicted_options}["A"] == pytest.approx(0.7)
 
-    median_result = await combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEDIAN)
+    median_result = combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.MEDIAN)
     assert {opt.option_name: opt.probability for opt in median_result.predicted_options}["A"] == pytest.approx(0.7)
 
     with pytest.raises(ValueError):
-        await combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.STACKING)
+        combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.STACKING)
 
 
-@pytest.mark.asyncio
-async def test_combine_numeric_predictions_dispatch(monkeypatch):
+def test_combine_numeric_predictions_dispatch(monkeypatch):
     predictions = ["pred1", "pred2"]
     question = "question"
 
@@ -193,15 +192,15 @@ async def test_combine_numeric_predictions_dispatch(monkeypatch):
         fake_aggregate,
     )
 
-    result = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEDIAN)
+    result = combine_numeric_predictions(predictions, question, AggregationStrategy.MEDIAN)
     fake_aggregate.assert_called_once_with(predictions, question, "median")
     assert result == "result"
 
     fake_aggregate.reset_mock()
     fake_aggregate.return_value = "mean_result"
-    result_mean = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEAN)
+    result_mean = combine_numeric_predictions(predictions, question, AggregationStrategy.MEAN)
     fake_aggregate.assert_called_once_with(predictions, question, "mean")
     assert result_mean == "mean_result"
 
     with pytest.raises(ValueError):
-        await combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)
+        combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)

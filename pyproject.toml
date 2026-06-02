@@ -40,6 +40,10 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = ["E501"]
+# flake8-async (ASYNC*) and flake8-pydantic (PYD*) run via the pre-commit flake8
+# hook, not ruff. Declaring their codes as external stops ruff from warning
+# "Invalid rule code" on the # noqa suppressions those linters consume.
+external = ["ASYNC", "PYD"]
 
 [tool.pytest.ini_options]
 markers = [

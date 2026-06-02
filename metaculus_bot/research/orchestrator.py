@@ -12,6 +12,7 @@ import logging
 import os
 from collections.abc import Callable
 
+import openai
 from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
@@ -38,6 +39,17 @@ from metaculus_bot.research.providers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Summarizer failures that legitimately soft-fail to the raw AskNews articles:
+# transient LLM-provider hiccups (``openai.APIError`` is the common base for
+# litellm's connection/timeout/rate-limit/service-unavailable wrappers) and
+# asyncio timeouts. Anything outside this set — a prompt-construction bug, an
+# AttributeError from a refactor, a credential-routing regression — is a real
+# bug and must propagate rather than silently degrade every forecast's research.
+_SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    openai.APIError,
+)
 
 
 class ResearchOrchestrator:
@@ -164,7 +176,7 @@ class ResearchOrchestrator:
         )
         try:
             return await self._summarizer_llm.invoke(prompt)
-        except Exception as exc:
+        except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
             logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
             return research
 

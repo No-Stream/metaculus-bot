@@ -155,16 +155,28 @@ class TestAskNewsSummarization:
         invoke.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_soft_falls_back_to_raw_on_summarizer_error(self, orchestrator, question):
+    async def test_soft_falls_back_to_raw_on_transient_summarizer_error(self, orchestrator, question):
+        """Transient LLM-provider errors (timeouts, API hiccups) soft-fail to the raw articles."""
         with patch.object(
             orchestrator._summarizer_llm,
             "invoke",
             new_callable=AsyncMock,
-            side_effect=RuntimeError("summarizer down"),
+            side_effect=asyncio.TimeoutError("summarizer timed out"),
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "raw asknews articles"
+
+    async def test_non_transient_summarizer_error_propagates(self, orchestrator, question):
+        """A genuine bug (not a transient API error) must crash, not silently degrade."""
+        with patch.object(
+            orchestrator._summarizer_llm,
+            "invoke",
+            new_callable=AsyncMock,
+            side_effect=AttributeError("prompt builder bug"),
+        ):
+            with pytest.raises(AttributeError):
+                await orchestrator._summarize_asknews(question, "raw asknews articles")
 
     @pytest.mark.asyncio
     async def test_only_asknews_is_summarized(self, orchestrator, question):

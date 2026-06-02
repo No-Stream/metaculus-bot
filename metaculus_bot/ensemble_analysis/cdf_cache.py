@@ -82,8 +82,8 @@ class NumericCdfCache:
                     self._safe_cdf_cache[key] = list(raw)
                     return list(raw)
                 elif has_percentile:
-                    lower = getattr(question, "lower_bound", 0.0)
-                    upper = getattr(question, "upper_bound", 1.0)
+                    lower = question.lower_bound
+                    upper = question.upper_bound
                     n = len(raw)
                     x = np.linspace(float(lower), float(upper), n)
                     out = []
@@ -93,8 +93,8 @@ class NumericCdfCache:
                     return out
                 else:
                     # Percentiles as bare floats
-                    lower = getattr(question, "lower_bound", 0.0)
-                    upper = getattr(question, "upper_bound", 1.0)
+                    lower = question.lower_bound
+                    upper = question.upper_bound
                     n = len(raw)
                     x = np.linspace(float(lower), float(upper), n)
                     out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, raw)]
@@ -170,8 +170,8 @@ class NumericCdfCache:
                     vals[i] = min(1.0, vals[i - 1] + min_step)
             if vals[-1] > 1.0:
                 vals[-1] = 1.0
-            lower = getattr(question, "lower_bound", 0.0)
-            upper = getattr(question, "upper_bound", 1.0)
+            lower = question.lower_bound
+            upper = question.upper_bound
             x = np.linspace(float(lower), float(upper), n)
             out = [SimpleNamespace(value=float(xi), percentile=float(pi)) for xi, pi in zip(x, vals)]
             self._safe_cdf_cache[key] = out

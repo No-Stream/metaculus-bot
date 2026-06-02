@@ -27,7 +27,6 @@ from scipy.stats import pearsonr
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.ensemble_analysis.benchmark_identity import (
-    extract_clean_model_name,
     extract_model_name,
     get_question_type,
     identifiers_for_benchmark,
@@ -109,14 +108,6 @@ class CorrelationAnalyzer:
     def _extract_model_name(self, benchmark: BenchmarkForBot) -> str:
         """Delegates to ``benchmark_identity.extract_model_name``."""
         return extract_model_name(benchmark)
-
-    def _extract_clean_model_name(self, model_path: str) -> str:
-        """Delegates to ``benchmark_identity.extract_clean_model_name``."""
-        return extract_clean_model_name(model_path)
-
-    def _identifiers_for_benchmark(self, benchmark: BenchmarkForBot, model_name: str) -> list[str]:
-        """Delegates to ``benchmark_identity.identifiers_for_benchmark``."""
-        return identifiers_for_benchmark(benchmark, model_name)
 
     def _is_stacking_benchmark(self, benchmark: BenchmarkForBot | None) -> bool:
         """Delegates to ``benchmark_identity.is_stacking_benchmark``."""
@@ -563,25 +554,11 @@ class CorrelationAnalyzer:
         """Delegates to ``EnsembleSimulator._estimate_avg_reasoning_length``."""
         return self._simulator._estimate_avg_reasoning_length(benchmark)
 
-    def _evaluate_ensemble(
-        self,
-        model_names: tuple[str, ...],
-        model_stats: dict[str, dict[str, float]],
-        corr_matrix: CorrelationMatrix,
-        aggregation_strategy: AggregationStrategy | str = "mean",
-    ) -> EnsembleCandidate:
-        """Delegates to ``EnsembleSimulator.evaluate_ensemble``."""
-        return self._simulator.evaluate_ensemble(model_names, model_stats, corr_matrix, aggregation_strategy)
-
     def _simulate_ensemble_performance(
         self, models: list[str], aggregation_strategy: AggregationStrategy | str
     ) -> float:
         """Delegates to ``EnsembleSimulator.simulate_ensemble_performance``."""
         return self._simulator.simulate_ensemble_performance(models, aggregation_strategy)
-
-    def _infer_model_name_from_prediction(self, q_id: int, pred: Any) -> str:
-        """Delegates to ``EnsembleSimulator.infer_model_name_from_prediction``."""
-        return self._simulator.infer_model_name_from_prediction(q_id, pred)
 
     def _aggregate_predictions(
         self,

@@ -189,7 +189,7 @@ class AggregationPipeline:
             and reasoned_predictions is None
             and research is None
         ):
-            return await self._base_combine(predictions, question)
+            return self._base_combine(predictions, question)
 
         # Stacking path
         if self.strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
@@ -198,9 +198,9 @@ class AggregationPipeline:
             )
 
         # Simple MEAN/MEDIAN path
-        return await self._simple_aggregate(predictions, question)
+        return self._simple_aggregate(predictions, question)
 
-    async def _base_combine(
+    def _base_combine(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -219,7 +219,6 @@ class AggregationPipeline:
                 logger.info("STACKING base combine: single pre-stacked output; returning as-is")
             else:
                 logger.warning("Unexpected STACKING combine: single input without stacking context; returning as-is")
-            await asyncio.sleep(0)
             return predictions[0]
 
         # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
@@ -245,7 +244,7 @@ class AggregationPipeline:
         apply_platt_after_combine = self.strategy == AggregationStrategy.CONDITIONAL_STACKING
 
         first = predictions[0]
-        combined = await self._combine_by_type(
+        combined = self._combine_by_type(
             predictions, question, base_combine_strategy, error_context="STACKING base combine"
         )
         if isinstance(first, (int, float)):
@@ -346,19 +345,19 @@ class AggregationPipeline:
                     fallback_exc,
                 )
                 self.outcomes[qid_for_outcome] = "fallback_median"
-                return await self._median_fallback(predictions, question)
+                return self._median_fallback(predictions, question)
 
-    async def _median_fallback(
+    def _median_fallback(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
     ) -> PredictionTypes:
-        combined = await self._combine_by_type(
+        combined = self._combine_by_type(
             predictions, question, AggregationStrategy.MEDIAN, error_context="MEDIAN fallback"
         )
         return self._apply_platt_calibration(self._maybe_snap_to_integers(combined, question), question)
 
-    async def _simple_aggregate(
+    def _simple_aggregate(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -372,7 +371,7 @@ class AggregationPipeline:
             AggregationStrategy.MEDIAN if self.strategy == AggregationStrategy.CONDITIONAL_STACKING else self.strategy
         )
 
-        combined = await self._combine_by_type(predictions, question, effective_strategy, error_context="aggregation")
+        combined = self._combine_by_type(predictions, question, effective_strategy, error_context="aggregation")
         if isinstance(first_prediction, (int, float)):
             float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
             if effective_strategy == AggregationStrategy.MEAN:
@@ -409,7 +408,7 @@ class AggregationPipeline:
             return "multiple-choice"
         return type(prediction).__name__
 
-    async def _combine_by_type(
+    def _combine_by_type(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -424,13 +423,13 @@ class AggregationPipeline:
         first = predictions[0]
         if isinstance(first, (int, float)):
             values = [float(p) for p in predictions if isinstance(p, (int, float))]
-            return await combine_binary_predictions(values, strategy)  # type: ignore[return-value]
+            return combine_binary_predictions(values, strategy)  # type: ignore[return-value]
         if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            return await combine_numeric_predictions(numeric_preds, question, strategy)  # type: ignore[return-value]
+            return combine_numeric_predictions(numeric_preds, question, strategy)  # type: ignore[return-value]
         if isinstance(first, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            return await combine_multiple_choice_predictions(mc_preds, strategy)  # type: ignore[return-value]
+            return combine_multiple_choice_predictions(mc_preds, strategy)  # type: ignore[return-value]
         raise ValueError(f"Unsupported prediction type for {error_context}: {type(first)}")
 
     def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:

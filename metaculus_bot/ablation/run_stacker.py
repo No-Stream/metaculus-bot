@@ -362,7 +362,7 @@ async def _dispatch_stacker(
 # ---------------------------------------------------------------------------
 
 
-async def _median_fallback_prediction(
+def _median_fallback_prediction(
     question: MetaculusQuestion,
     surviving: dict[str, dict],
 ) -> Any:
@@ -391,11 +391,11 @@ async def _median_fallback_prediction(
         deserialize_prediction_value(payload["prediction_value"], question) for payload in surviving.values()
     ]
     if isinstance(question, BinaryQuestion):
-        return await combine_binary_predictions([float(v) for v in deserialized], AggregationStrategy.MEDIAN)
+        return combine_binary_predictions([float(v) for v in deserialized], AggregationStrategy.MEDIAN)
     if isinstance(question, MultipleChoiceQuestion):
-        return await combine_multiple_choice_predictions(deserialized, AggregationStrategy.MEDIAN)
+        return combine_multiple_choice_predictions(deserialized, AggregationStrategy.MEDIAN)
     if isinstance(question, NumericQuestion):
-        return await combine_numeric_predictions(deserialized, question, AggregationStrategy.MEDIAN)
+        return combine_numeric_predictions(deserialized, question, AggregationStrategy.MEDIAN)
     raise ValueError(f"Unsupported question type for median fallback: {type(question).__name__}")
 
 
@@ -628,7 +628,7 @@ async def run_stacker_for_arm(
         # analysis bucket these separately from the regular primary/fallback
         # outcomes.
         try:
-            median_prediction = await _median_fallback_prediction(question, surviving)
+            median_prediction = _median_fallback_prediction(question, surviving)
             median_payload = make_success_payload(
                 arm=arm,
                 prediction=serialize_prediction_value(median_prediction, question_type_for_serialization(question)),

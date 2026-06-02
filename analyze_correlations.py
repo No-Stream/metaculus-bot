@@ -119,38 +119,18 @@ class _NumericFallbackFilter(logging.Filter):
 
 
 def _model_name_for(analyzer: CorrelationAnalyzer, benchmark: Any) -> str:
-    """Clean model name for a benchmark, falling back to its raw name on failure."""
-    try:
-        return str(analyzer._extract_model_name(benchmark))  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Failed to extract model name; using benchmark.name", exc_info=True)
-        return str(getattr(benchmark, "name", "unknown"))
+    """Clean model name for a benchmark."""
+    return str(analyzer._extract_model_name(benchmark))  # type: ignore[attr-defined]
 
 
 def _is_stacking_bench(analyzer: CorrelationAnalyzer, benchmark: Any) -> bool:
-    """True if the benchmark used STACKING aggregation; defensive fallback on config parse."""
-    try:
-        return bool(analyzer._is_stacking_benchmark(benchmark))  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Analyzer stacking check failed; parsing config directly", exc_info=True)
-        try:
-            cfg = getattr(benchmark, "forecast_bot_config", {}) or {}
-            strat = cfg.get("aggregation_strategy")
-            if hasattr(strat, "value"):
-                strat = strat.value
-            return isinstance(strat, str) and strat.lower() == "stacking"
-        except Exception:
-            logger.debug("Direct stacking-config parse failed", exc_info=True)
-            return False
+    """True if the benchmark used STACKING aggregation."""
+    return bool(analyzer._is_stacking_benchmark(benchmark))  # type: ignore[attr-defined]
 
 
 def _detect_type_from_report(analyzer: CorrelationAnalyzer, report: Any) -> str:
     """Question type for a report; delegates to analyzer's helper (avoids touching .cdf)."""
-    try:
-        return analyzer._get_question_type(report)  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Analyzer question-type check failed; defaulting to binary", exc_info=True)
-        return "binary"
+    return analyzer._get_question_type(report)  # type: ignore[attr-defined]
 
 
 def _summary_stats(vals: list[float]) -> dict[str, float]:
