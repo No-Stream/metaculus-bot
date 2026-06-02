@@ -175,10 +175,14 @@ class ResearchOrchestrator:
             """
         )
         try:
-            return await self._summarizer_llm.invoke(prompt)
+            summary = await self._summarizer_llm.invoke(prompt)
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
             logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
             return research
+        if not summary.strip():
+            logger.warning("AskNews summarization returned blank output; using raw articles")
+            return research
+        return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
         cache_key = getattr(question, "id_of_question", None)
