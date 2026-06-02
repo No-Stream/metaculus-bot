@@ -35,7 +35,7 @@ Per question (`forecaster.py:_research_and_make_predictions`):
 
 ### Ensemble (6 forecasters)
 
-See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.4, gpt-5.5, claude-opus-4.7, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.1-fast. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
+See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.4, gpt-5.5, claude-opus-4.8, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.3. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
 
 Support models (also in `llm_configs.py`):
 

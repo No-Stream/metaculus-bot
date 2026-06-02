@@ -63,7 +63,7 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         **REASONING_MODEL_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.7",
+        model="openrouter/anthropic/claude-opus-4.8",
         reasoning={"enabled": True},
         extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
@@ -73,7 +73,6 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         # Explicit max_tokens forces budget-based thinking. Without it, Opus 4.6 defaults to
         # "adaptive thinking" (OpenRouter 4.6 migration guide) which is unbounded and has
         # caused silent 600s soft-deadline stalls on hard questions (e.g. Q14333 on 2026-05-07).
-        # Opus 4.7 is unaffected by the default change per the migration guide's scope.
         reasoning={"max_tokens": 32_000},
         extra_body={"verbosity": "high"},
         **REASONING_MODEL_CONFIG,
