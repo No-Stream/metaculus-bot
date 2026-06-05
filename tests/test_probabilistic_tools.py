@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from scipy import stats
 
-from metaculus_bot.numeric_config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,

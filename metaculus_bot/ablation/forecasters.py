@@ -48,7 +48,6 @@ from forecasting_tools import (
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from main import TemplateForecaster
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.env import probabilistic_tools_enabled
 from metaculus_bot.ablation.forecaster_lineup import (
@@ -58,6 +57,7 @@ from metaculus_bot.ablation.forecaster_lineup import (
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import FORECASTER_SOFT_DEADLINE
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
 
 logger = logging.getLogger(__name__)
@@ -365,7 +365,7 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
             )
         # Local import keeps pchip_processing out of the import-time graph for
         # binary/MC paths (lighter cold-start when only those types are exercised).
-        from metaculus_bot.pchip_processing import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.numeric.pchip_processing import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             create_pchip_numeric_distribution,
         )
 
@@ -415,7 +415,6 @@ def _build_bot(
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,

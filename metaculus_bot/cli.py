@@ -9,7 +9,6 @@ from typing import Literal
 
 from forecasting_tools import MetaculusApi
 
-from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     METACULUS_CUP_ID,
@@ -23,6 +22,7 @@ from metaculus_bot.fallback_openrouter import (
     get_donated_404_fallback_count,
 )
 from metaculus_bot.fetch_hardening import apply_fetch_hardening
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import (
     DISAGREEMENT_ANALYZER_LLM,
     FORECASTER_LLMS,
@@ -54,6 +54,13 @@ def main() -> None:
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
+    # Forecaster module logs at DEBUG for full per-question tracing; the
+    # openai-agents logger is noisy at INFO so pin it to ERROR. Configured here
+    # (the runtime entry point) rather than at module import so test imports
+    # and library consumers don't inherit these global level mutations.
+    logging.getLogger("metaculus_bot.forecaster").setLevel(logging.DEBUG)
+    logging.getLogger("openai.agents").setLevel(logging.ERROR)
+
     # Wrap MetaculusApi publish POSTs with timeout + retry. See
     # metaculus_bot/publish_hardening.py for rationale (stock requests.post
     # has no timeout; a single hung POST blocks the whole batch).
@@ -79,7 +86,7 @@ def main() -> None:
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research_persistence import ResearchPersistenceWriter  # noqa: PLC0415
+        from metaculus_bot.research.persistence import ResearchPersistenceWriter  # noqa: PLC0415
 
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
@@ -91,7 +98,6 @@ def main() -> None:
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
-        use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,

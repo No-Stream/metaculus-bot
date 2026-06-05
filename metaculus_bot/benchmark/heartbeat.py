@@ -24,26 +24,22 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
     async def _run_with_heartbeat(self, batch, _orig=original_run):  # type: ignore[no-untyped-def]
         start_time = datetime.now()
         task = asyncio.create_task(_orig(self, batch))
-        try:
-            while not task.done():
-                await asyncio.sleep(interval_seconds)
-                elapsed_min = (datetime.now() - start_time).total_seconds() / 60.0
-                try:
-                    if progress_state.get("pbar") is not None:
-                        update_progress_estimate(batch, progress_state)
-                    logger.info(
-                        f"[HB] {batch.benchmark.name} | {len(batch.questions)} questions | elapsed {elapsed_min:.1f}m"
-                    )
-                except Exception as e:
-                    logger.debug(f"Heartbeat progress update failed: {e}")
+        while not task.done():
+            await asyncio.sleep(interval_seconds)
+            elapsed_min = (datetime.now() - start_time).total_seconds() / 60.0
+            try:
+                if progress_state.get("pbar") is not None:
+                    update_progress_estimate(batch, progress_state)
+                logger.info(
+                    f"[HB] {batch.benchmark.name} | {len(batch.questions)} questions | elapsed {elapsed_min:.1f}m"
+                )
+            except Exception as e:
+                logger.debug(f"Heartbeat progress update failed: {e}")
 
-            # Mark batch as completed
-            progress_state["completed_batches"] = progress_state.get("completed_batches", 0) + 1
-            if progress_state.get("pbar") is not None:
-                update_progress_final(progress_state)
-            return await task
-        except Exception:
-            raise
+        progress_state["completed_batches"] = progress_state.get("completed_batches", 0) + 1
+        if progress_state.get("pbar") is not None:
+            update_progress_final(progress_state)
+        return await task
 
     setattr(_run_with_heartbeat, "_has_heartbeat", True)
     Benchmarker._run_a_batch = _run_with_heartbeat  # type: ignore[assignment]

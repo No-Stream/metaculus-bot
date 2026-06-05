@@ -23,14 +23,14 @@ from metaculus_bot.constants import (
     GAP_FILL_MAX_GAPS,
     NATIVE_SEARCH_WALL_TIMEOUT,
 )
-from metaculus_bot.gemini_search_provider import invoke_gemini_grounded
 from metaculus_bot.prompts import (
     disagreement_crux_prompt,
     gap_fill_analyzer_prompt,
     gap_fill_search_prompt,
     targeted_search_prompt,
 )
-from metaculus_bot.research_providers import build_native_search_llm
+from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+from metaculus_bot.research.providers import build_native_search_llm
 from metaculus_bot.structured_output_schema import extract_first_balanced_braces, extract_json_block
 
 __all__ = [

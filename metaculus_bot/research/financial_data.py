@@ -23,7 +23,7 @@ from metaculus_bot.constants import (
     FRED_API_KEY_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.research_providers import ResearchCallable
+from metaculus_bot.research.providers import ResearchCallable
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -230,7 +230,7 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
         if data.empty:
             return ""
 
-        # Try to get series title
+        # Title is best-effort enrichment; fall back to the raw series_id if FRED metadata lookup fails.
         title = series_id
         try:
             info_df = fred.get_series_info(series_id)
@@ -239,7 +239,7 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
             elif isinstance(info_df, pd.Series) and "title" in info_df.index:
                 title = info_df["title"]
         except Exception:
-            pass
+            logger.debug(f"FRED series title lookup failed for {series_id=}", exc_info=True)
 
         parts = [f"### {series_id} ({title})"]
 

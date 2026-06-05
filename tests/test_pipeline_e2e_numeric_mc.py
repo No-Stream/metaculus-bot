@@ -27,7 +27,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.numeric_config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -105,7 +105,6 @@ def _make_bot(n_forecasters: int = 3, strategy: AggregationStrategy = Aggregatio
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=strategy,
         llms={
@@ -142,7 +141,7 @@ def _build_numeric_distribution(
     open_upper: bool = True,
 ):
     """Build a proper 201-point CDF using the real PCHIP pipeline."""
-    from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
+    from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
     lo, hi = bounds
     question = NumericQuestion(
@@ -247,7 +246,7 @@ class TestNumericMixtureBranch:
         bot.min_forecasters_to_publish = 1
         question = _make_numeric_question()
 
-        from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
         from metaculus_bot.probabilistic_tools.mixtures import (
             MixtureComponent,
             MixtureOfNormals,
@@ -381,7 +380,7 @@ class TestNumericUnitMismatch:
             )
         ]
 
-        from metaculus_bot.numeric_validation import detect_unit_mismatch
+        from metaculus_bot.numeric.validation import detect_unit_mismatch
 
         mismatch, reason = detect_unit_mismatch(bad_percentiles, question)
         assert mismatch is True
@@ -423,8 +422,12 @@ class TestNumericHighSpreadTriggersStacking:
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
-            patch("main.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text") as mock_crux,
-            patch("main.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results") as mock_search,
+            patch(
+                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text"
+            ) as mock_crux,
+            patch(
+                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results"
+            ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_dist) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
@@ -504,7 +507,7 @@ class TestMCClampingAndRenormalization:
 
     @pytest.mark.e2e
     def test_mc_clamping_and_renormalization(self):
-        from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
+        from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 
         extreme_prediction = _mc_option_list([0.99, 0.005, 0.005])
         clamped = clamp_and_renormalize_mc(extreme_prediction)
@@ -552,8 +555,12 @@ class TestMCHighSpreadTriggersStacking:
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
-            patch("main.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux") as mock_crux,
-            patch("main.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted") as mock_search,
+            patch(
+                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux"
+            ) as mock_crux,
+            patch(
+                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
+            ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_result) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)

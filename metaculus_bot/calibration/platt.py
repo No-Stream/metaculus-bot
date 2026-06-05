@@ -41,7 +41,7 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from scipy.optimize import minimize
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
-from metaculus_bot.numeric_utils import clamp_and_renormalize_mc
+from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prob_math_utils import PROB_CLAMP_EPS, clamp_prob, logit, sigmoid
 
 logger: logging.Logger = logging.getLogger(__name__)

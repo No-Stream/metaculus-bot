@@ -39,7 +39,7 @@ from metaculus_bot.ablation.run_stacker import (
     _surviving_forecasters,
 )
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
-from metaculus_bot.numeric_utils import aggregate_numeric
+from metaculus_bot.numeric.utils import aggregate_numeric
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ async def _run_simple_agg_for_qid(
         per_option_values, option_order = _accumulate_mc_options(deserialized, question)
         aggregated = aggregate_mc(per_option_values, option_order, method=method)
     elif isinstance(question, NumericQuestion):
-        aggregated = await aggregate_numeric(deserialized, question, method=method)
+        aggregated = aggregate_numeric(deserialized, question, method=method)
     else:
         raise ValueError(f"Unsupported question type for {arm}: {type(question).__name__}")
 
@@ -113,9 +113,7 @@ async def _run_simple_agg_for_qid(
         n_forecasters=len(surviving),
     )
     cache.write_stacker_output(qid=qid, arm=arm, payload=success_payload)
-    # Cooperative yield (ASYNC910 compliance): binary and MC branches are sync;
-    # only the numeric branch contains an await above.
-    await asyncio.sleep(0)
+    await asyncio.sleep(0)  # cooperative yield for ASYNC910; all aggregation branches are sync
     return success_payload
 
 

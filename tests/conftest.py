@@ -139,7 +139,7 @@ def _clear_gemini_client_cache():
     cost is negligible — leaving the autouse global is the simpler,
     safer choice.
     """
-    from metaculus_bot import gemini_search_provider as gsp
+    from metaculus_bot.research import gemini_search as gsp
 
     gsp._cached_client_for_key.cache_clear()
     yield

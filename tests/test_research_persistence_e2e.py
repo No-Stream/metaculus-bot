@@ -12,7 +12,7 @@ import types
 from pathlib import Path
 
 from backtest import _load_research_from_archive
-from metaculus_bot.research_persistence import ResearchPersistenceWriter
+from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
 from scripts.download_research import build_archive, deduplicate_records
 
@@ -56,19 +56,19 @@ The Montreal Protocol (ozone) achieved near-universal compliance via trade sanct
 The Paris Agreement's "ratchet mechanism" produced increased ambition in 72% of NDC updates."""
 
 MULTI_QUESTION_LOG = """\
-forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234567Z 2026-05-22 14:00:00,123 - metaculus_bot.research_orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/43613/will-climate-target-be-met/:
+forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234567Z 2026-05-22 14:00:00,123 - metaculus_bot.research.orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/43613/will-climate-target-be-met/:
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234568Z ## News Articles (AskNews)
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234569Z Climate summit reached agreement on emissions targets.
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234570Z ## Web Research (Native Search)
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234571Z Historical compliance rates suggest 60-75% probability.
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234572Z ## Targeted Gap-Fill (second pass)
 forecast_job\tRun forecasts\t2026-05-22T14:00:00.1234573Z Enforcement mechanisms are stronger than Paris Accord.
-forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000000Z 2026-05-22 14:05:00,000 - metaculus_bot.research_orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/50001/will-ai-achieve-agi-by-2030/:
+forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000000Z 2026-05-22 14:05:00,000 - metaculus_bot.research.orchestrator - INFO - Found Research for URL https://www.metaculus.com/questions/50001/will-ai-achieve-agi-by-2030/:
 forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000001Z ## News Articles (AskNews)
 forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000002Z Leading AI labs report breakthrough in reasoning.
 forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000003Z ## Web Research (Google Search via Gemini)
 forecast_job\tRun forecasts\t2026-05-22T14:05:00.0000004Z Expert surveys show wide disagreement on timelines.
-forecast_job\tRun forecasts\t2026-05-22T14:10:00.0000000Z 2026-05-22 14:10:00,000 - metaculus_bot.research_orchestrator - INFO - Starting forecaster fan-out
+forecast_job\tRun forecasts\t2026-05-22T14:10:00.0000000Z 2026-05-22 14:10:00,000 - metaculus_bot.research.orchestrator - INFO - Starting forecaster fan-out
 """
 
 

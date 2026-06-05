@@ -21,7 +21,7 @@ RESEARCH_START = re.compile(
     r"^forecast_job\t[^\t]*\t"
     r"(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+"
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - "
-    r"(?:main|metaculus_bot\.research_orchestrator) - INFO - "
+    r"(?:main|metaculus_bot\.research_orchestrator|metaculus_bot\.research\.orchestrator) - INFO - "
     r"Found Research for URL (https://www\.metaculus\.com/(?:questions|c)/[^:]+):"
 )
 

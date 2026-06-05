@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.bounds_clamping import (
+from metaculus_bot.numeric.bounds_clamping import (
     calculate_bounds_buffer,
     clamp_values_to_bounds,
     log_cluster_spreading_summary,

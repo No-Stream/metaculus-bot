@@ -8,7 +8,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
-from metaculus_bot.numeric_config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def detect_unit_mismatch(
             return True, f"values tiny vs range (max_mag_ratio={vmax_ratio:.3e} < {max_magnitude_ratio_threshold:.1e})"
 
         return False, ""
-    except Exception as e:  # robust: if detector fails, do not block
+    except (AttributeError, TypeError, ValueError) as e:
         logger.warning(f"Unit mismatch detection failed: {e}")
         return False, ""
 

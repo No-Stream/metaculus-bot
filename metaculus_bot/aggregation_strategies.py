@@ -7,7 +7,7 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import NumericDistribution
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric_utils import aggregate_binary_mean, aggregate_numeric
+from metaculus_bot.numeric.utils import aggregate_binary_mean, aggregate_numeric
 
 
 class AggregationStrategy(Enum):
@@ -83,10 +83,9 @@ def aggregate_multiple_choice_median(
 
 def combine_binary_predictions(
     predictions: Sequence[float],
-    strategy: "AggregationStrategy",
+    strategy: AggregationStrategy,
 ) -> float:
     """Combine binary predictions according to the requested strategy."""
-
     if strategy == AggregationStrategy.MEAN:
         return aggregate_binary_mean(list(predictions))
     if strategy == AggregationStrategy.MEDIAN:
@@ -96,10 +95,9 @@ def combine_binary_predictions(
 
 def combine_multiple_choice_predictions(
     predictions: Sequence[PredictedOptionList],
-    strategy: "AggregationStrategy",
+    strategy: AggregationStrategy,
 ) -> PredictedOptionList:
     """Combine multiple-choice predictions according to the requested strategy."""
-
     if strategy == AggregationStrategy.MEAN:
         return aggregate_multiple_choice_mean(predictions)
     if strategy == AggregationStrategy.MEDIAN:
@@ -107,15 +105,12 @@ def combine_multiple_choice_predictions(
     raise ValueError(f"Unsupported multiple-choice aggregation strategy: {strategy}")
 
 
-async def combine_numeric_predictions(
+def combine_numeric_predictions(
     predictions: Sequence[NumericDistribution],
     question: NumericQuestion,
-    strategy: "AggregationStrategy",
+    strategy: AggregationStrategy,
 ) -> NumericDistribution:
     """Combine numeric distributions according to the requested strategy."""
-
-    if strategy == AggregationStrategy.MEAN:
-        return await aggregate_numeric(predictions, question, "mean")
-    if strategy == AggregationStrategy.MEDIAN:
-        return await aggregate_numeric(predictions, question, "median")
+    if strategy in (AggregationStrategy.MEAN, AggregationStrategy.MEDIAN):
+        return aggregate_numeric(predictions, question, strategy.value)
     raise ValueError(f"Unsupported numeric aggregation strategy: {strategy}")

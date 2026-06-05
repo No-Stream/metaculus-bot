@@ -66,7 +66,6 @@ def _make_stacking_bot(strategy: AggregationStrategy = AggregationStrategy.STACK
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=strategy,
         llms=llms,
@@ -89,7 +88,6 @@ def _make_mean_bot() -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEAN,
         llms=llms,
@@ -403,8 +401,8 @@ class TestNumericStackingCrossModelAggregation:
 
         # Build NumericDistributions to feed _aggregate_predictions. We
         # reuse the public router path for fidelity.
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
         from metaculus_bot.numeric_format_router import route_numeric_output
-        from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
 
         numeric_predictions = []
         for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
@@ -417,7 +415,7 @@ class TestNumericStackingCrossModelAggregation:
             # For the percentile branch the router returns the raw declared list
             # — wrap in a NumericDistribution via the same builder ``main.py``
             # uses on the percentile path.
-            from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
+            from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
             sanitized, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
             pred = build_numeric_distribution(sanitized, question, zero_point)
@@ -487,8 +485,8 @@ class TestNumericStackingCrossModelAggregation:
         ]
 
         # Build numeric predictions via the router (mixture branch).
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
         from metaculus_bot.numeric_format_router import route_numeric_output
-        from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
 
         numeric_predictions = []
         for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
@@ -497,7 +495,7 @@ class TestNumericStackingCrossModelAggregation:
             # mixture or both branches set declared_percentiles to None and
             # cdf_percentiles to a 201-pt CDF.
             mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
-            from metaculus_bot.numeric_config import STANDARD_PERCENTILES
+            from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
             mixture_declared: list[Percentile] = []
             for target_pct in STANDARD_PERCENTILES:

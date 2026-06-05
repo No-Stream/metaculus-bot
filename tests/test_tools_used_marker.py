@@ -19,7 +19,7 @@ from forecasting_tools import BinaryQuestion, ForecastBot, GeneralLlm, MultipleC
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.comment_markers import TOOLS_USED_MARKER_FALSE, TOOLS_USED_MARKER_TRUE
+from metaculus_bot.comment.markers import TOOLS_USED_MARKER_FALSE, TOOLS_USED_MARKER_TRUE
 from metaculus_bot.tool_runner import FEATURE_FLAG_ENV, TYPES_ENV
 
 
@@ -37,7 +37,6 @@ def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=strategy,
         llms=llms,  # type: ignore[arg-type]

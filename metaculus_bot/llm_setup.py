@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 
 from forecasting_tools import GeneralLlm
 
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 class ForecasterSetup:
     """Container describing the prepared LLM configuration for the forecaster."""
 
-    normalized_llms: Dict[str, Any]
-    forecaster_llms: List[GeneralLlm]
+    normalized_llms: dict[str, Any]
+    forecaster_llms: list[GeneralLlm]
     stacker_llm: GeneralLlm | None
     analyzer_llm: GeneralLlm | None
     predictions_per_report: int
@@ -26,7 +26,7 @@ class ForecasterSetup:
 
 def prepare_llm_config(
     *,
-    llms: Dict[str, Any] | None,
+    llms: dict[str, Any] | None,
     aggregation_strategy: AggregationStrategy,
     predictions_per_report: int,
 ) -> ForecasterSetup:
@@ -45,9 +45,9 @@ def prepare_llm_config(
     if llms is None:
         raise ValueError("Either 'forecasters' or a 'default' LLM must be provided.")
 
-    normalized_llms: Dict[str, Any] = dict(llms)
+    normalized_llms: dict[str, Any] = dict(llms)
 
-    forecaster_llms: List[GeneralLlm] = []
+    forecaster_llms: list[GeneralLlm] = []
     effective_predictions = predictions_per_report
 
     if "forecasters" in normalized_llms:

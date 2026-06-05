@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from metaculus_bot.prompts import disagreement_crux_prompt, targeted_search_prompt
-from metaculus_bot.targeted_research import extract_disagreement_crux, run_targeted_search
+from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
 
 
 class TestDisagreementCruxPrompt:
@@ -85,7 +85,7 @@ class TestRunTargetedSearch:
         mock_llm_instance = AsyncMock()
         mock_llm_instance.invoke.return_value = "Search results"
 
-        with patch("metaculus_bot.targeted_research.build_native_search_llm", return_value=mock_llm_instance):
+        with patch("metaculus_bot.research.targeted.build_native_search_llm", return_value=mock_llm_instance):
             result = await run_targeted_search("crux text", "question text")
 
         assert result == "Search results"
@@ -97,9 +97,9 @@ class TestRunTargetedSearch:
         mock_llm_instance.invoke.return_value = "results"
 
         with (
-            patch("metaculus_bot.targeted_research.build_native_search_llm", return_value=mock_llm_instance),
+            patch("metaculus_bot.research.targeted.build_native_search_llm", return_value=mock_llm_instance),
             patch(
-                "metaculus_bot.targeted_research.targeted_search_prompt", wraps=targeted_search_prompt
+                "metaculus_bot.research.targeted.targeted_search_prompt", wraps=targeted_search_prompt
             ) as mock_prompt,
         ):
             await run_targeted_search("crux", "q", is_benchmarking=True)
@@ -119,7 +119,7 @@ class TestRunTargetedSearch:
         # Override the wall-clock cap to a short value via the constants module
         # (run_targeted_search reads it at import time, but patching the
         # already-imported reference in targeted_research is what takes effect).
-        monkeypatch.setattr("metaculus_bot.targeted_research.NATIVE_SEARCH_WALL_TIMEOUT", 0.05)
+        monkeypatch.setattr("metaculus_bot.research.targeted.NATIVE_SEARCH_WALL_TIMEOUT", 0.05)
 
         class HangingLlm:
             model = "mock-native-search"
@@ -130,6 +130,6 @@ class TestRunTargetedSearch:
                 await asyncio.sleep(5)
                 return "should never reach here"
 
-        with patch("metaculus_bot.targeted_research.build_native_search_llm", return_value=HangingLlm()):
+        with patch("metaculus_bot.research.targeted.build_native_search_llm", return_value=HangingLlm()):
             with pytest.raises(asyncio.TimeoutError):
                 await run_targeted_search("crux", "question text")

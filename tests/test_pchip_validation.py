@@ -11,7 +11,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 
 
 def _stub_open_time() -> datetime:
@@ -73,8 +73,8 @@ class TestPchipValidation:
         )
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_valid_pchip_cdf_passes_validation(self, mock_format, mock_generate):
         """Test that a valid PCHIP CDF passes all validation checks."""
         forecaster = self.create_mock_template_forecaster()
@@ -109,8 +109,8 @@ class TestPchipValidation:
             assert result is not None
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_wrong_length_cdf_fails_validation(self, mock_format, mock_generate):
         """Test that CDF with wrong length fails validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -123,14 +123,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to PCHIP validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_invalid_probabilities_fail_validation(self, mock_format, mock_generate):
         """Test that CDF with probabilities outside [0,1] fails validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -143,14 +143,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_non_monotonic_cdf_fails_validation(self, mock_format, mock_generate):
         """Test that non-monotonic CDF fails validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -163,14 +163,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_step_size_violation_fails_validation(self, mock_format, mock_generate):
         """Test that CDF violating minimum step size fails validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -184,14 +184,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_max_step_violation_fails_validation(self, mock_format, mock_generate):
         """Test that CDF violating maximum step size fails validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -204,14 +204,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_closed_bound_violations_fail_validation(self, mock_format, mock_generate):
         """Test that closed bound violations fail validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -224,14 +224,14 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_open_bound_violations_fail_validation(self, mock_format, mock_generate):
         """Test that open bound violations fail validation."""
         forecaster = self.create_mock_template_forecaster()
@@ -244,7 +244,7 @@ class TestPchipValidation:
 
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
-        with patch("metaculus_bot.numeric_pipeline._apply_jitter_and_clamp", return_value=percentiles):
+        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))

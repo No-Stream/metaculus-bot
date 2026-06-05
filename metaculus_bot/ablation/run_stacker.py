@@ -61,7 +61,7 @@ from metaculus_bot.ablation.stage_payload import make_error_payload, make_succes
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.numeric_utils import bound_messages
+from metaculus_bot.numeric.utils import bound_messages
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -70,10 +70,8 @@ ARM_STACK_AUG = "stack_aug"  # LLM stacker, rationale + computed quantities + cr
 ARM_PDF = "pdf"  # deterministic structured-math aggregation, no LLM (see metaculus_bot.ablation.run_pdf)
 ARM_PDF_MIN1 = "pdf_min1"  # pdf arm with min_forecasters=1 (any structured output qualifies)
 ARM_PDF_MIN2 = "pdf_min2"  # pdf arm with min_forecasters=2 (proper aggregation)
-ARM_MEDIAN = (
-    "median"  # deterministic median over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_median)
-)
-ARM_MEAN = "mean"  # deterministic mean over base-forecaster predictions, no LLM (see metaculus_bot.ablation.run_mean)
+ARM_MEDIAN = "median"  # deterministic median over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
+ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 
 # Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
 # claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.5 as
@@ -323,11 +321,11 @@ async def _dispatch_stacker(
         # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
         # function-scoped imports for the same reason.
         from metaculus_bot.exceptions import UnitMismatchError  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        from metaculus_bot.numeric_pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
             build_numeric_distribution,
             sanitize_percentiles,
         )
-        from metaculus_bot.numeric_validation import (
+        from metaculus_bot.numeric.validation import (
             detect_unit_mismatch,  # noqa: PLC0415  # function-scoped: see AGENTS.md
         )
 
@@ -364,7 +362,7 @@ async def _dispatch_stacker(
 # ---------------------------------------------------------------------------
 
 
-async def _median_fallback_prediction(
+def _median_fallback_prediction(
     question: MetaculusQuestion,
     surviving: dict[str, dict],
 ) -> Any:
@@ -392,16 +390,12 @@ async def _median_fallback_prediction(
     deserialized = [
         deserialize_prediction_value(payload["prediction_value"], question) for payload in surviving.values()
     ]
-    # Cooperative yield so flake8-async ASYNC910 sees a checkpoint on the
-    # binary/MC sync-aggregation branches without changing observable
-    # behavior. The numeric branch already awaits inside combine_numeric_predictions.
-    await asyncio.sleep(0)
     if isinstance(question, BinaryQuestion):
         return combine_binary_predictions([float(v) for v in deserialized], AggregationStrategy.MEDIAN)
     if isinstance(question, MultipleChoiceQuestion):
         return combine_multiple_choice_predictions(deserialized, AggregationStrategy.MEDIAN)
     if isinstance(question, NumericQuestion):
-        return await combine_numeric_predictions(deserialized, question, AggregationStrategy.MEDIAN)
+        return combine_numeric_predictions(deserialized, question, AggregationStrategy.MEDIAN)
     raise ValueError(f"Unsupported question type for median fallback: {type(question).__name__}")
 
 
@@ -634,7 +628,7 @@ async def run_stacker_for_arm(
         # analysis bucket these separately from the regular primary/fallback
         # outcomes.
         try:
-            median_prediction = await _median_fallback_prediction(question, surviving)
+            median_prediction = _median_fallback_prediction(question, surviving)
             median_payload = make_success_payload(
                 arm=arm,
                 prediction=serialize_prediction_value(median_prediction, question_type_for_serialization(question)),

@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 from forecasting_tools.data_models.multiple_choice_report import (
@@ -182,26 +182,25 @@ def test_combine_multiple_choice_predictions_dispatch():
         combine_multiple_choice_predictions([pred1, pred2], AggregationStrategy.STACKING)
 
 
-@pytest.mark.asyncio
-async def test_combine_numeric_predictions_dispatch(monkeypatch):
+def test_combine_numeric_predictions_dispatch(monkeypatch):
     predictions = ["pred1", "pred2"]
     question = "question"
 
-    fake_aggregate = AsyncMock(return_value="result")
+    fake_aggregate = MagicMock(return_value="result")
     monkeypatch.setattr(
         "metaculus_bot.aggregation_strategies.aggregate_numeric",
         fake_aggregate,
     )
 
-    result = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEDIAN)
-    fake_aggregate.assert_awaited_once_with(predictions, question, "median")
+    result = combine_numeric_predictions(predictions, question, AggregationStrategy.MEDIAN)
+    fake_aggregate.assert_called_once_with(predictions, question, "median")
     assert result == "result"
 
     fake_aggregate.reset_mock()
     fake_aggregate.return_value = "mean_result"
-    result_mean = await combine_numeric_predictions(predictions, question, AggregationStrategy.MEAN)
-    fake_aggregate.assert_awaited_once_with(predictions, question, "mean")
+    result_mean = combine_numeric_predictions(predictions, question, AggregationStrategy.MEAN)
+    fake_aggregate.assert_called_once_with(predictions, question, "mean")
     assert result_mean == "mean_result"
 
     with pytest.raises(ValueError):
-        await combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)
+        combine_numeric_predictions(predictions, question, AggregationStrategy.STACKING)

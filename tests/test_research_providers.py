@@ -1,4 +1,4 @@
-"""Tests for metaculus_bot.research_providers helpers."""
+"""Tests for metaculus_bot.research.providers helpers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from metaculus_bot.research_providers import is_asknews_subscription_error
+from metaculus_bot.research.providers import is_asknews_subscription_error
 
 
 class _FakeForbiddenError(Exception):

@@ -33,10 +33,10 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
-from metaculus_bot.numeric_diagnostics import log_final_prediction
-from metaculus_bot.numeric_pipeline import build_numeric_distribution, sanitize_percentiles
-from metaculus_bot.numeric_utils import bound_messages
-from metaculus_bot.numeric_validation import detect_unit_mismatch
+from metaculus_bot.numeric.diagnostics import log_final_prediction
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.utils import bound_messages
+from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ class AggregationPipeline:
             and reasoned_predictions is None
             and research is None
         ):
-            return await self._base_combine(predictions, question)
+            return self._base_combine(predictions, question)
 
         # Stacking path
         if self.strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
@@ -198,9 +198,9 @@ class AggregationPipeline:
             )
 
         # Simple MEAN/MEDIAN path
-        return await self._simple_aggregate(predictions, question)
+        return self._simple_aggregate(predictions, question)
 
-    async def _base_combine(  # noqa: ASYNC910 - awaits only on numeric path
+    def _base_combine(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
@@ -244,34 +244,26 @@ class AggregationPipeline:
         apply_platt_after_combine = self.strategy == AggregationStrategy.CONDITIONAL_STACKING
 
         first = predictions[0]
+        combined = self._combine_by_type(
+            predictions, question, base_combine_strategy, error_context="STACKING base combine"
+        )
         if isinstance(first, (int, float)):
             values = [float(p) for p in predictions if isinstance(p, (int, float))]
-            result = combine_binary_predictions(values, base_combine_strategy)
-            logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, result)
-            if apply_platt_after_combine:
-                return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
-            return result  # type: ignore[return-value]
-        if isinstance(first, PredictedOptionList):
-            mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, base_combine_strategy)
-            summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
+            logger.info("STACKING base combine: binary %s of %s = %.3f", strategy_name, values, combined)
+        elif isinstance(combined, PredictedOptionList):
+            summary = {o.option_name: round(o.probability, 4) for o in combined.predicted_options}
             logger.info("STACKING base combine: MC %s aggregation | %s", strategy_name, summary)
-            if apply_platt_after_combine:
-                return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]
-            return aggregated  # type: ignore[return-value]
-        if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
-            numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            aggregated = await combine_numeric_predictions(numeric_preds, question, base_combine_strategy)
+        else:
             logger.info(
                 "STACKING base combine: numeric %s aggregation | CDF points=%d",
                 strategy_name,
-                len(getattr(aggregated, "cdf", [])),
+                len(getattr(combined, "cdf", [])),
             )
-            snapped = self._maybe_snap_to_integers(aggregated, question)
-            if apply_platt_after_combine:
-                return self._apply_platt_calibration(snapped, question)  # type: ignore[arg-type]
-            return snapped  # type: ignore[return-value]
-        raise ValueError(f"Unsupported prediction type for STACKING base combine: {type(first)}")
+            combined = self._maybe_snap_to_integers(combined, question)
+
+        if apply_platt_after_combine:
+            return self._apply_platt_calibration(combined, question)
+        return combined
 
     def _get_stacking_fn(self) -> Callable[..., Awaitable[PredictionTypes]]:
         if self.run_stacking_fn is not None:
@@ -353,98 +345,92 @@ class AggregationPipeline:
                     fallback_exc,
                 )
                 self.outcomes[qid_for_outcome] = "fallback_median"
-                return await self._median_fallback(predictions, question)
+                return self._median_fallback(predictions, question)
 
-    async def _median_fallback(
+    def _median_fallback(
+        self,
+        predictions: list[PredictionTypes],
+        question: MetaculusQuestion,
+    ) -> PredictionTypes:
+        combined = self._combine_by_type(
+            predictions, question, AggregationStrategy.MEDIAN, error_context="MEDIAN fallback"
+        )
+        return self._apply_platt_calibration(self._maybe_snap_to_integers(combined, question), question)
+
+    def _simple_aggregate(
         self,
         predictions: list[PredictionTypes],
         question: MetaculusQuestion,
     ) -> PredictionTypes:
         first_prediction = predictions[0]
-        if isinstance(first_prediction, (int, float)):
-            float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-            return self._apply_platt_calibration(
-                combine_binary_predictions(float_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
-                question,
-            )
-        if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
-            numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            median_numeric = await combine_numeric_predictions(numeric_preds, question, AggregationStrategy.MEDIAN)
-            return self._apply_platt_calibration(
-                self._maybe_snap_to_integers(median_numeric, question),  # type: ignore[arg-type]
-                question,
-            )
-        if isinstance(first_prediction, PredictedOptionList):
-            mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            return self._apply_platt_calibration(
-                combine_multiple_choice_predictions(mc_preds, AggregationStrategy.MEDIAN),  # type: ignore[arg-type]
-                question,
-            )
-        raise ValueError(f"Unknown prediction type for MEDIAN fallback: {type(first_prediction)}")
-
-    async def _simple_aggregate(
-        self,
-        predictions: list[PredictionTypes],
-        question: MetaculusQuestion,
-    ) -> PredictionTypes:
-        qtype = (
-            "binary"
-            if isinstance(predictions[0], (int, float))
-            else (
-                "numeric"
-                if isinstance(predictions[0], NumericDistribution)
-                else (
-                    "multiple-choice"
-                    if isinstance(predictions[0], PredictedOptionList)
-                    else type(predictions[0]).__name__
-                )
-            )
+        logger.info(
+            "Aggregating %s predictions with %s", self._prediction_type_label(first_prediction), self.strategy.value
         )
-        logger.info("Aggregating %s predictions with %s", qtype, self.strategy.value)
 
         effective_strategy = (
             AggregationStrategy.MEDIAN if self.strategy == AggregationStrategy.CONDITIONAL_STACKING else self.strategy
         )
 
-        first_prediction = predictions[0]
+        combined = self._combine_by_type(predictions, question, effective_strategy, error_context="aggregation")
         if isinstance(first_prediction, (int, float)):
             float_preds = [float(p) for p in predictions if isinstance(p, (int, float))]
-            result = combine_binary_predictions(float_preds, effective_strategy)
             if effective_strategy == AggregationStrategy.MEAN:
-                logger.info("Binary question ensembling: mean of %s = %.3f (rounded)", float_preds, result)
+                logger.info("Binary question ensembling: mean of %s = %.3f (rounded)", float_preds, combined)
             elif effective_strategy == AggregationStrategy.MEDIAN:
-                logger.info("Binary question ensembling: median of %s = %.3f", float_preds, result)
+                logger.info("Binary question ensembling: median of %s = %.3f", float_preds, combined)
             else:
                 logger.info(
-                    "Binary question ensembling: %s of %s = %.3f", effective_strategy.value, float_preds, result
+                    "Binary question ensembling: %s of %s = %.3f", effective_strategy.value, float_preds, combined
                 )
-            return self._apply_platt_calibration(result, question)  # type: ignore[arg-type]
+            return self._apply_platt_calibration(combined, question)
 
-        if isinstance(first_prediction, NumericDistribution) and isinstance(question, NumericQuestion):
-            numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            aggregated = await combine_numeric_predictions(numeric_preds, question, effective_strategy)
-            lb = getattr(question, "lower_bound", None)
-            ub = getattr(question, "upper_bound", None)
-            logger.info(
-                "Numeric aggregation=%s | preserved bounds [%s, %s] | CDF points=%d",
-                effective_strategy.value,
-                lb,
-                ub,
-                len(getattr(aggregated, "cdf", [])),
-            )
-            return self._apply_platt_calibration(
-                self._maybe_snap_to_integers(aggregated, question),  # type: ignore[arg-type]
-                question,
-            )
-
-        if isinstance(first_prediction, PredictedOptionList):
-            mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
-            aggregated = combine_multiple_choice_predictions(mc_preds, effective_strategy)
-            summary = {o.option_name: round(o.probability, 4) for o in aggregated.predicted_options}
+        if isinstance(combined, PredictedOptionList):
+            summary = {o.option_name: round(o.probability, 4) for o in combined.predicted_options}
             logger.info("MC %s aggregation; renormalized to 1.0 | %s", effective_strategy.value, summary)
-            return self._apply_platt_calibration(aggregated, question)  # type: ignore[arg-type]
+            return self._apply_platt_calibration(combined, question)
 
-        raise ValueError(f"Unknown prediction type for aggregation: {type(predictions[0])}")
+        logger.info(
+            "Numeric aggregation=%s | preserved bounds [%s, %s] | CDF points=%d",
+            effective_strategy.value,
+            getattr(question, "lower_bound", None),
+            getattr(question, "upper_bound", None),
+            len(getattr(combined, "cdf", [])),
+        )
+        return self._apply_platt_calibration(self._maybe_snap_to_integers(combined, question), question)
+
+    @staticmethod
+    def _prediction_type_label(prediction: PredictionTypes) -> str:
+        if isinstance(prediction, (int, float)):
+            return "binary"
+        if isinstance(prediction, NumericDistribution):
+            return "numeric"
+        if isinstance(prediction, PredictedOptionList):
+            return "multiple-choice"
+        return type(prediction).__name__
+
+    def _combine_by_type(
+        self,
+        predictions: list[PredictionTypes],
+        question: MetaculusQuestion,
+        strategy: AggregationStrategy,
+        error_context: str,
+    ) -> PredictionTypes:
+        """Filter predictions to the first one's type and run the matching combiner.
+
+        Shared dispatch core for ``_base_combine`` / ``_median_fallback`` / ``_simple_aggregate``;
+        callers layer their own logging and post-processing (snap/platt) around the result.
+        """
+        first = predictions[0]
+        if isinstance(first, (int, float)):
+            values = [float(p) for p in predictions if isinstance(p, (int, float))]
+            return combine_binary_predictions(values, strategy)  # type: ignore[return-value]
+        if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
+            numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
+            return combine_numeric_predictions(numeric_preds, question, strategy)  # type: ignore[return-value]
+        if isinstance(first, PredictedOptionList):
+            mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
+            return combine_multiple_choice_predictions(mc_preds, strategy)  # type: ignore[return-value]
+        raise ValueError(f"Unsupported prediction type for {error_context}: {type(first)}")
 
     def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
         from metaculus_bot.calibration import BINARY_PLATT_PARAMS, MC_PLATT_PARAMS

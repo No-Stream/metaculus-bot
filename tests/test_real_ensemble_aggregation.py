@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test real ensemble prediction aggregation."""
 
-from metaculus_bot.correlation_analysis import CorrelationAnalyzer
+from metaculus_bot.ensemble_analysis.correlation_analysis import CorrelationAnalyzer
 
 
 def test_binary_prediction_aggregation():

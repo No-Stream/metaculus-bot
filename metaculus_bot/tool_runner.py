@@ -6,8 +6,8 @@ base forecaster emits (priors, base rates, hazards, percentiles, scenarios,
 etc.) and returns markdown-ready strings for injection into the stacker's
 view.
 
-Active surface: wired into ``main.py:_make_prediction`` (per-forecaster
-``## Computed quantities``) and into the stacker prompt via
+Active surface: wired into ``metaculus_bot/forecaster.py:_make_prediction``
+(per-forecaster ``## Computed quantities``) and into the stacker prompt via
 ``build_cross_model_aggregation``. Per-question-type gating uses
 ``_feature_enabled(qtype)`` against ``PROBABILISTIC_TOOLS_TYPES`` so
 numeric/binary/MC can be enabled independently.

@@ -15,7 +15,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.backtest.scoring import numeric_log_score
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, NUM_MAX_STEP, NUM_MIN_PROB_STEP
-from metaculus_bot.discrete_snap import (
+from metaculus_bot.numeric.discrete_snap import (
     OutcomeTypeResult,
     majority_votes_discrete,
     snap_cdf_to_integers,
@@ -184,7 +184,7 @@ class TestBoundaryHandling:
 def create_pchip_distribution_from_cdf(
     cdf: list[float], question: NumericQuestion, zero_point: float | None = None
 ) -> NumericDistribution:
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
     return create_pchip_numeric_distribution(
         pchip_cdf=cdf,
@@ -264,7 +264,7 @@ class TestEdgeCases:
             "nominal_lower_bound",
         ]:
             dist_kwargs.pop(field, None)
-        from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
         dist = create_pchip_numeric_distribution(
             pchip_cdf=cdf,
@@ -412,7 +412,7 @@ class TestRoundTripValidation:
 
     def test_roundtrip_framework_validation(self):
         """Snapped CDF passes the framework's _validate_pchip_cdf()."""
-        from metaculus_bot.pchip_processing import _validate_pchip_cdf
+        from metaculus_bot.numeric.pchip_processing import _validate_pchip_cdf
 
         question = _make_question(lower_bound=0.0, upper_bound=10.0)
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
@@ -517,7 +517,7 @@ class TestSnapDistributionToIntegers:
 
 class TestMaybeSnapIntegration:
     """Test the vote-collection → majority-check → snap-application flow
-    through TemplateForecaster._maybe_snap_to_integers."""
+    through AggregationPipeline._maybe_snap_to_integers."""
 
     def _make_bot(self):
         from forecasting_tools import GeneralLlm
@@ -542,7 +542,7 @@ class TestMaybeSnapIntegration:
         qid = question.id_of_question
         bot._discrete_integer_votes[qid] = [True, True, False]
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is not distribution
         assert isinstance(result, NumericDistribution)
@@ -558,7 +558,7 @@ class TestMaybeSnapIntegration:
         qid = question.id_of_question
         bot._discrete_integer_votes[qid] = [False, False, True]
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is distribution
 
@@ -569,6 +569,6 @@ class TestMaybeSnapIntegration:
         cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
         distribution = create_pchip_distribution_from_cdf(cdf, question)
 
-        result = bot._maybe_snap_to_integers(distribution, question)
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
 
         assert result is distribution

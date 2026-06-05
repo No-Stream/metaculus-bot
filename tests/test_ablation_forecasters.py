@@ -190,7 +190,7 @@ def test_serialize_numeric_prediction_value() -> None:
     from forecasting_tools import NumericDistribution
 
     from metaculus_bot.ablation.forecasters import deserialize_prediction_value, serialize_prediction_value
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
     percentiles = [
         Percentile(value=v, percentile=p)
@@ -658,7 +658,7 @@ async def test_runner_serializes_numeric_prediction_value(
     from forecasting_tools import NumericDistribution
 
     from metaculus_bot.ablation.forecasters import deserialize_prediction_value, run_forecasters_for_question
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
     q = _make_numeric_question(qid=1012)
     percentiles = [
@@ -721,7 +721,7 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
     healthy forecaster's payload still lands.
     """
     from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-    from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
     q = _make_numeric_question(qid=1014)
     two_llms = _make_forecaster_llms(count=2)

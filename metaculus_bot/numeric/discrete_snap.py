@@ -28,8 +28,8 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import BaseModel
 
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
-from metaculus_bot.pchip_cdf import safe_cdf_bounds
-from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ def snap_cdf_to_integers(
 
     # --- Step 4: Max-step redistribution + boundary pinning ---
     # safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
-    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound, NUM_MIN_PROB_STEP)
+    enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound)
 
     result = enforced_cdf.tolist()
 

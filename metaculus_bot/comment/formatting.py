@@ -13,7 +13,7 @@ from typing import Literal, Sequence
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.comment_markers import (
+from metaculus_bot.comment.markers import (
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,
@@ -24,7 +24,7 @@ from metaculus_bot.comment_markers import (
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
 )
-from metaculus_bot.comment_trimming import trim_comment, trim_section
+from metaculus_bot.comment.trimming import trim_comment, trim_section
 from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,

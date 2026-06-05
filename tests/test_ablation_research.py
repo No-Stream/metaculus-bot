@@ -319,8 +319,9 @@ async def test_gap_fill_max_gaps_monkey_patched(
     """gap_fill_max_gaps overrides constants.GAP_FILL_MAX_GAPS in BOTH modules during the call,
     and restores both after the call returns.
     """
-    from metaculus_bot import constants, targeted_research
+    from metaculus_bot import constants
     from metaculus_bot.ablation.research import run_gemini_only_research
+    from metaculus_bot.research import targeted
 
     question = _make_question(qid=6)
     long_first_pass = "first pass " * 30
@@ -329,7 +330,7 @@ async def test_gap_fill_max_gaps_monkey_patched(
 
     async def capture_max_gaps(*_args: object, **_kwargs: object) -> str:
         captured["constants"] = constants.GAP_FILL_MAX_GAPS
-        captured["targeted_research"] = targeted_research.GAP_FILL_MAX_GAPS
+        captured["targeted_research"] = targeted.GAP_FILL_MAX_GAPS
         await asyncio.sleep(0)
         return "addendum"
 
@@ -343,7 +344,7 @@ async def test_gap_fill_max_gaps_monkey_patched(
     )
 
     original_constants = constants.GAP_FILL_MAX_GAPS
-    original_tr = targeted_research.GAP_FILL_MAX_GAPS
+    original_tr = targeted.GAP_FILL_MAX_GAPS
 
     await run_gemini_only_research(question, cache, gap_fill_max_gaps=2)
 
@@ -353,7 +354,7 @@ async def test_gap_fill_max_gaps_monkey_patched(
 
     # After the call, both are restored to original values.
     assert constants.GAP_FILL_MAX_GAPS == original_constants
-    assert targeted_research.GAP_FILL_MAX_GAPS == original_tr
+    assert targeted.GAP_FILL_MAX_GAPS == original_tr
 
 
 @pytest.mark.asyncio
@@ -362,8 +363,9 @@ async def test_gap_fill_max_gaps_restored_on_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Even if gap-fill raises, the GAP_FILL_MAX_GAPS patch is reverted (try/finally)."""
-    from metaculus_bot import constants, targeted_research
+    from metaculus_bot import constants
     from metaculus_bot.ablation.research import run_gemini_only_research
+    from metaculus_bot.research import targeted
 
     question = _make_question(qid=8)
     long_first_pass = "first pass " * 30
@@ -378,13 +380,13 @@ async def test_gap_fill_max_gaps_restored_on_exception(
     )
 
     original_constants = constants.GAP_FILL_MAX_GAPS
-    original_tr = targeted_research.GAP_FILL_MAX_GAPS
+    original_tr = targeted.GAP_FILL_MAX_GAPS
 
     # Gap-fill failure is absorbed (matches production soft-fail), so this returns normally.
     await run_gemini_only_research(question, cache, gap_fill_max_gaps=2)
 
     assert constants.GAP_FILL_MAX_GAPS == original_constants
-    assert targeted_research.GAP_FILL_MAX_GAPS == original_tr
+    assert targeted.GAP_FILL_MAX_GAPS == original_tr
 
 
 @pytest.mark.asyncio

@@ -26,7 +26,7 @@ from metaculus_bot.constants import (
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
-from metaculus_bot.research_providers import ResearchCallable
+from metaculus_bot.research.providers import ResearchCallable
 
 logger = logging.getLogger(__name__)
 

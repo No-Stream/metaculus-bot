@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.discrete_snap import OutcomeTypeResult
-from metaculus_bot.numeric_pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
 
 
 def _stub_open_time() -> datetime:
@@ -146,8 +146,8 @@ class TestNumericCDFSmoothing:
         assert any("Cluster spread applied" in m for m in msgs)
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_ramp_smoothing_triggered(self, mock_format, mock_generate, caplog):
         f = _make_forecaster()
         q = _make_question(open_upper=False, open_lower=False)
@@ -185,8 +185,8 @@ class TestNumericCDFSmoothing:
         assert any("CDF ramp smoothing" in rec.message for rec in caplog.records)
 
     @pytest.mark.asyncio
-    @patch("metaculus_bot.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.pchip_cdf.percentiles_to_pchip_format")
+    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
+    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
     async def test_noop_when_cdf_is_good(self, mock_format, mock_generate, caplog):
         f = _make_forecaster()
         q = _make_question(open_upper=False, open_lower=False)

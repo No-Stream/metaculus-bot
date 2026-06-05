@@ -31,7 +31,7 @@ async def test_run_research_priority():
 
         # Mock the provider function returned by choose_provider_with_name
         mock_asknews_func = AsyncMock(return_value="AskNews Research")
-        with patch("metaculus_bot.research_orchestrator.choose_provider_with_name") as mock_choose:
+        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
             mock_choose.return_value = (mock_asknews_func, "asknews")
 
             research = await forecaster.run_research(question)
@@ -50,7 +50,7 @@ async def test_run_research_priority():
 
         # Mock the provider function returned by choose_provider_with_name
         mock_exa_func = AsyncMock(return_value="Exa Research")
-        with patch("metaculus_bot.research_orchestrator.choose_provider_with_name") as mock_choose:
+        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
             mock_choose.return_value = (mock_exa_func, "exa")
 
             research = await forecaster.run_research(question)
@@ -67,7 +67,7 @@ async def test_run_research_priority():
 
         # Mock the provider function returned by choose_provider_with_name
         mock_perplexity_func = AsyncMock(return_value="Perplexity Research")
-        with patch("metaculus_bot.research_orchestrator.choose_provider_with_name") as mock_choose:
+        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
             mock_choose.return_value = (mock_perplexity_func, "perplexity")
 
             research = await forecaster.run_research(question)
@@ -83,7 +83,7 @@ async def test_run_research_priority():
 
         # Mock the provider function returned by choose_provider_with_name
         mock_openrouter_func = AsyncMock(return_value="OpenRouter Research")
-        with patch("metaculus_bot.research_orchestrator.choose_provider_with_name") as mock_choose:
+        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
             mock_choose.return_value = (mock_openrouter_func, "openrouter")
 
             research = await forecaster.run_research(question)
@@ -97,7 +97,7 @@ async def test_run_research_priority():
 
         # Mock the provider function to return empty string fallback
         mock_empty_func = AsyncMock(return_value="")
-        with patch("metaculus_bot.research_orchestrator.choose_provider_with_name") as mock_choose:
+        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
             mock_choose.return_value = (mock_empty_func, "fallback")
 
             research = await forecaster.run_research(question)

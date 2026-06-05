@@ -3,6 +3,31 @@
 General coding guidelines (style, testing, error handling, etc.) are in `~/.claude/CLAUDE.md`.
 This file covers **repo-specific** context only.
 
+## ⚠️ Cost discipline — never run a paid run without asking
+
+**Any command that hits live LLM / research APIs spends real money (OpenRouter
+credits, AskNews, Exa, Perplexity, Google). NEVER launch one autonomously — ask
+first, every time, even after a clean build / passing tests / clean `/forge`.**
+This is a hard gate, not a courtesy: a single broad run can burn meaningful
+credits, and `--mode test_questions` also **publishes comments to Metaculus**
+(a visible external action that pings nothing but is hard to retract).
+
+Paid / external-effecting commands (ask before each):
+
+- `python main.py` / `make run` in any live mode (`--mode test_questions`,
+  `tournament`, `metaculus_cup`, `minibench`) — spends API credits AND publishes.
+- `make backtest_*` (`smoke`/`small`/`medium`/`large`) — spends API credits on
+  every forecaster + research call (no publish, but real money; `large`=100 Qs).
+- Anything invoking research providers or the ensemble against real questions.
+
+Free / safe (run freely): `make test`, `make lint`, `make format`,
+`make check_credits`, `make benchmark_display` (views old results), and any
+unit/integration test — the suite is self-contained and hits no paid APIs.
+
+When verification needs a paid run, surface the exact command + rough cost and
+let the user decide. Unit/integration coverage is the default proof of
+correctness; live runs are opt-in.
+
 ## Repo-Specific Overrides
 
 - **Python**: 3.11+ (see `pyproject.toml`)
@@ -15,7 +40,7 @@ Fork of the Metaculus starter template. Runs a multi-LLM ensemble with a meta-st
 
 ## Core architecture
 
-- `main.py`: primary bot implementation using `forecasting-tools` framework.
+- `main.py`: thin entrypoint shim that re-exports `TemplateForecaster` from `metaculus_bot/forecaster.py` (the primary bot implementation, using the `forecasting-tools` framework) and invokes the CLI.
 - `backtest.py`: primary benchmarking — scores bot predictions against actual resolutions.
 - `community_benchmark.py`: **DEPRECATED** (Metaculus removed `aggregations` from list API; `make benchmark_display` still works for old runs).
 - `metaculus_bot/`: core utilities — LLM configs, prompts, research providers, aggregation, numeric CDF pipeline, probabilistic_tools (dormant), stacking.
@@ -26,16 +51,16 @@ Fork of the Metaculus starter template. Runs a multi-LLM ensemble with a meta-st
 
 ## Forecasting pipeline (current)
 
-Per question (`main.py:_research_and_make_predictions`):
+Per question (`forecaster.py:_research_and_make_predictions`):
 
-1. **Research** — `run_research` (`main.py:459`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`targeted_research.run_gap_fill_pass`, `main.py:478`) identifies factual gaps and resolves them via parallel grounded Gemini searches.
+1. **Research** — `run_research` (`forecaster.py:406`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:89`) identifies factual gaps and resolves them via parallel grounded Gemini searches.
 2. **Forecaster fan-out** — N forecaster LLMs run in parallel via `_forecaster_with_soft_deadline` (10-min cap each) → `_make_prediction` → type-specific runner (binary/MC/numeric).
-3. **Min-forecasters guard** (`main.py:738`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction.
+3. **Min-forecasters guard** (`forecaster.py:580`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction.
 4. **Aggregation** — see CONDITIONAL_STACKING below.
 
 ### Ensemble (6 forecasters)
 
-See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.4, gpt-5.5, claude-opus-4.7, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.1-fast. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
+See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.4, gpt-5.5, claude-opus-4.8, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.3. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
 
 Support models (also in `llm_configs.py`):
 
@@ -49,9 +74,9 @@ Support models (also in `llm_configs.py`):
 `AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:62`). Behavior:
 
 - Compute spread across the N forecasters via `spread_metrics.compute_spread`.
-- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_aggregate_predictions`, `main.py:1037`).
+- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_aggregate_predictions`, `aggregation_pipeline.py:203`).
 - If spread > threshold → extract the **disagreement crux**, run **targeted search** (OpenAI native search via `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity="low"`, 360s timeout), then invoke the **stacker LLM** with the full base-model reasonings + targeted research (`stacking.run_stacking_{binary,mc,numeric}`).
-- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`main.py:1148-1223`.)
+- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`aggregation_pipeline.py:274-357`.)
 
 Thresholds (`metaculus_bot/constants.py:166-175`):
 
@@ -61,36 +86,36 @@ Thresholds (`metaculus_bot/constants.py:166-175`):
 
 ### Clamps / bounds
 
-- **Binary**: `[BINARY_PROB_MIN=0.02, BINARY_PROB_MAX=0.98]` (`constants.py`). Applied per-model in `main.py` and on stacker output in `stacking.py`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
-- **MC**: `[0.005, 0.995]`, clamp-then-renormalize via `clamp_and_renormalize_mc` (`numeric_utils.py`).
-- **Numeric CDF**: 201 points, `min_step ≥ 5e-5`, `max_step ≤ 0.2`, open bounds clipped to `[0.001, 0.999]`, closed bounds pinned to `{0.0, 1.0}`. Enforced in `pchip_cdf.generate_pchip_cdf` with aggressive repair + `safe_cdf_bounds` redistribution on max-step violations.
+- **Binary**: `[BINARY_PROB_MIN=0.02, BINARY_PROB_MAX=0.98]` (`constants.py`). Applied per-model in `forecaster_runners.py` and on stacker output in `stacking.py`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
+- **MC**: `[0.005, 0.995]`, clamp-then-renormalize via `clamp_and_renormalize_mc` (`numeric/utils.py`).
+- **Numeric CDF**: 201 points, `min_step ≥ 5e-5`, `max_step ≤ 0.2`, open bounds clipped to `[0.001, 0.999]`, closed bounds pinned to `{0.0, 1.0}`. Enforced in `numeric/pchip_cdf.py` `generate_pchip_cdf` with aggressive repair + `safe_cdf_bounds` redistribution on max-step violations.
 
 ### Numeric pipeline (percentiles → PCHIP CDF)
 
 Each forecaster emits the 11 standard percentiles `{2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5}` as plain text (prompt example in `prompts.numeric_prompt`). Per-model stages:
 
 1. Parser LLM extracts `list[Percentile]`.
-2. `sanitize_percentiles` (`numeric_pipeline.py`): filter to the 11, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
-3. `widen_declared_percentiles` (`tail_widening.py`): bound-aware stretch of distance-from-median by `k_tail=1.0` (identity by default; widening only kicks in when callers raise `k_tail` above 1.0) with `span_floor_gamma=0.0` (no span-floor enforcement by default). Both knobs are configurable per-call.
+2. `sanitize_percentiles` (`numeric/pipeline.py`): filter to the 11, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
+3. `widen_declared_percentiles` (`numeric/tail_widening.py`): bound-aware stretch of distance-from-median by `k_tail=1.0` (identity by default; widening only kicks in when callers raise `k_tail` above 1.0) with `span_floor_gamma=0.0` (no span-floor enforcement by default). Both knobs are configurable per-call.
 4. `build_numeric_distribution` → `generate_pchip_cdf_with_smoothing` produces 201-point PCHIP CDF → ramp smoothing for min-step → validation. On failure: `create_fallback_numeric_distribution` delegates CDF build to forecasting-tools.
 5. **Discrete integer snapping**: if a majority of forecasters vote DISCRETE, snap the distribution to integers.
-6. **Unit-mismatch guard** (`numeric_validation.detect_unit_mismatch`): withholds the prediction if values look off by orders of magnitude.
+6. **Unit-mismatch guard** (`numeric/validation.py` `detect_unit_mismatch`): withholds the prediction if values look off by orders of magnitude.
 
 ### Numeric format router (`numeric_format_router.py`)
 
 The router decides whether the LLM's numeric output is in OPTION A (the default 11 trailing `Percentile X.X: ...` lines) or OPTION B (a `mixture_components` list inside the JSON block). It always returns a 201-point Metaculus CDF and records which branch produced it for residual analysis (logged as `numeric_format=...`). If both formats are present, the mixture wins deterministically and a WARNING is logged so the frequency is auditable. The mixture branch flows through `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced grid evaluation of the mixture CDF).
 
-**Ensemble aggregation** (`numeric_utils.aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
+**Ensemble aggregation** (`numeric/utils.py` `aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 
 ### Research providers
 
-Orchestration in `main.py:_select_research_providers:561-606`.
+Orchestration in `research/orchestrator.py:_select_research_providers:196-240`.
 
-**Primary provider** — exactly one, chosen by priority in `research_providers.choose_provider_with_name:352-415`:
+**Primary provider** — exactly one, chosen by priority in `research/providers.py` `choose_provider_with_name:405-475`:
 
-1. **AskNews** if `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set (the prod case): dual-phase search (HOT + HISTORICAL), rate-limited with retry/dedup (`research_providers.py:71-197`).
-2. **Exa.ai SmartSearcher** if `EXA_API_KEY` set (fallback when AskNews absent): generic rundown (`research_providers.py:252-269`).
-3. **Perplexity direct** if `PERPLEXITY_API_KEY` set: `research_providers.py:272-289`. Prompt explicitly requests prediction-market consideration unless benchmarking.
+1. **AskNews** if `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set (the prod case): dual-phase search (HOT + HISTORICAL), rate-limited with retry/dedup (`research/providers.py:82-210`).
+2. **Exa.ai SmartSearcher** if `EXA_API_KEY` set (fallback when AskNews absent): generic rundown (`research/providers.py:263-281`).
+3. **Perplexity direct** if `PERPLEXITY_API_KEY` set: `research/providers.py:283-301`. Prompt explicitly requests prediction-market consideration unless benchmarking.
 4. **Perplexity via OpenRouter** if `OPENROUTER_API_KEY` set: same function, `use_open_router=True`.
 5. Empty stub.
 
@@ -98,12 +123,12 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 
 **Additional providers run in parallel on top of the primary** (each independently gated):
 
-- **OpenAI native search** (OpenRouter web plugin, `research_providers.py`): default model `openai/gpt-5.5` with `reasoning={"effort":"medium"}` + `extra_body={"verbosity":"low"}` and a 360s timeout (`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_TIMEOUT` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` / `NATIVE_SEARCH_VERBOSITY_DEFAULT`; overridable via the matching `NATIVE_SEARCH_*` env vars). Migrated 2026-05-17 from deprecated `x-ai/grok-4.1-fast` (initial flip to `gpt-5.4-mini`, then v3 bench at `scratch/native_search_bench_2026-05-17/comparison_v3.md` showed `gpt-5.5` medium-effort fits in ~230s under a 360s cap and produces materially deeper research; supersedes the v2 mini verdict). Gated by `NATIVE_SEARCH_ENABLED`. **Note**: donated key currently blocks OpenAI native search via data-policy guardrail; calls bill to personal `OPENROUTER_API_KEY` until resolved (see `FUTURE.md` "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block"). `FallbackOpenRouterLlm` handles the fallback transparently.
-- **Gemini grounded search** (`gemini_search_provider.py`): real Google Search grounding via `google-genai` SDK (not OpenRouter) + `url_context` tool for specific URL reads. Gated by `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`.
-- **Financial data** (`financial_data_provider.py`): LLM classifier routes to yfinance + FRED for financial/economic questions. Gated by `FINANCIAL_DATA_ENABLED` + `FRED_API_KEY`.
-- **Prediction-market snapshot** (`prediction_market_provider.py`): fans out to Polymarket Gamma, Kalshi (prefetch + local rapidfuzz match), and Manifold concurrently; aggregates the top matches into a benchmarking-safe research blurb. Gated by `PREDICTION_MARKETS_ENABLED` + a benchmarking guard (the snapshot is suppressed in `is_benchmarking=True` runs to avoid data leakage). **OFF by default in prod workflows** — flip on after a smoke + medium backtest gate.
+- **OpenAI native search** (OpenRouter web plugin, `research/providers.py`): default model `openai/gpt-5.5` with `reasoning={"effort":"medium"}` + `extra_body={"verbosity":"low"}` and a 360s timeout (`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_TIMEOUT` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` / `NATIVE_SEARCH_VERBOSITY_DEFAULT`; overridable via the matching `NATIVE_SEARCH_*` env vars). Migrated 2026-05-17 from deprecated `x-ai/grok-4.1-fast` (initial flip to `gpt-5.4-mini`, then v3 bench at `scratch/native_search_bench_2026-05-17/comparison_v3.md` showed `gpt-5.5` medium-effort fits in ~230s under a 360s cap and produces materially deeper research; supersedes the v2 mini verdict). Gated by `NATIVE_SEARCH_ENABLED`. **Note**: donated key currently blocks OpenAI native search via data-policy guardrail; calls bill to personal `OPENROUTER_API_KEY` until resolved (see `FUTURE.md` "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block"). `FallbackOpenRouterLlm` handles the fallback transparently.
+- **Gemini grounded search** (`research/gemini_search.py`): real Google Search grounding via `google-genai` SDK (not OpenRouter) + `url_context` tool for specific URL reads. Gated by `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`.
+- **Financial data** (`research/financial_data.py`): LLM classifier routes to yfinance + FRED for financial/economic questions. Gated by `FINANCIAL_DATA_ENABLED` + `FRED_API_KEY`.
+- **Prediction-market snapshot** (`research/prediction_market.py`): fans out to Polymarket Gamma, Kalshi (prefetch + local rapidfuzz match), and Manifold concurrently; aggregates the top matches into a benchmarking-safe research blurb. Gated by `PREDICTION_MARKETS_ENABLED` + a benchmarking guard (the snapshot is suppressed in `is_benchmarking=True` runs to avoid data leakage). **OFF by default in prod workflows** — flip on after a smoke + medium backtest gate.
 
-**Second-pass gap-fill** (`targeted_research.run_gap_fill_pass`): always-on when `GAP_FILL_ENABLED` + `GOOGLE_API_KEY` are set. Two stages: Gemini analyzer identifies up to `GAP_FILL_MAX_GAPS` factual gaps → parallel grounded-Gemini searches resolve each. Soft-fails (returns `""`) on any error.
+**Second-pass gap-fill** (`research/targeted.py` `run_gap_fill_pass`): always-on when `GAP_FILL_ENABLED` + `GOOGLE_API_KEY` are set. Two stages: Gemini analyzer identifies up to `GAP_FILL_MAX_GAPS` factual gaps → parallel grounded-Gemini searches resolve each. Soft-fails (returns `""`) on any error.
 
 **Production workflows** (`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) set `NATIVE_SEARCH_ENABLED=true`, `GEMINI_SEARCH_ENABLED=true`, `FINANCIAL_DATA_ENABLED=true`, `GAP_FILL_ENABLED=true`. `PREDICTION_MARKETS_ENABLED` is not yet on by default. So in prod the active stack is AskNews + OpenAI native search (`gpt-5.5` medium-effort + verbosity=low, 360s) + Gemini grounded + financial-data (when classified as financial) + always-on Gemini gap-fill, with the prediction-market provider available behind its env flag.
 
@@ -147,7 +172,7 @@ The bot uses several API keys; they fall into two buckets and the names don't al
 
 - **`OAI_ANTH_OPENROUTER_KEY` — Metaculus-donated OpenRouter key (SHARED).** Despite the name, this is the *only* shared/donated credential in the bot. Metaculus provides credits to bot operators on this key for OpenAI, Anthropic, and Google models routed via OpenRouter. It has server-side allowed-providers preferences locked to `{openai, anthropic, google}`; non-listed providers (e.g. `x-ai` for Grok) 404 on it. Wrapped by `FallbackOpenRouterLlm` (`metaculus_bot/fallback_openrouter.py`) which falls back to `OPENROUTER_API_KEY` on credential / credit / allowed-providers errors.
 - **`OPENROUTER_API_KEY` — operator's personal OpenRouter key.** Pays for everything the donated key can't (Grok via x-ai, Qwen, Perplexity-via-OpenRouter) plus serves as the fallback when the donated key fails.
-- **`GOOGLE_API_KEY` — operator's personal Google AI Studio key.** In CI it's stored as `secrets.GEMINI_API_KEY` and surfaced as `GOOGLE_API_KEY` in the workflow env so the `google-genai` SDK picks it up. **There is NO Metaculus-donated Google AI Studio key** — Google AI Studio doesn't offer one. The grounded-search side (`gemini_search_provider.py`, `targeted_research.py`) always uses this personal key. Don't confuse the OpenRouter Gemini path (which DOES have a donated route via `OAI_ANTH_OPENROUTER_KEY`) with the google-genai grounded-search path (which doesn't).
+- **`GOOGLE_API_KEY` — operator's personal Google AI Studio key.** In CI it's stored as `secrets.GEMINI_API_KEY` and surfaced as `GOOGLE_API_KEY` in the workflow env so the `google-genai` SDK picks it up. **There is NO Metaculus-donated Google AI Studio key** — Google AI Studio doesn't offer one. The grounded-search side (`research/gemini_search.py`, `research/targeted.py`) always uses this personal key. Don't confuse the OpenRouter Gemini path (which DOES have a donated route via `OAI_ANTH_OPENROUTER_KEY`) with the google-genai grounded-search path (which doesn't).
 - **`METACULUS_TOKEN`, `ASKNEWS_*`, `EXA_API_KEY`, `PERPLEXITY_API_KEY`, `FRED_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` — all personal.** No shared variants. The two direct provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are only used if you bypass OpenRouter; most flows route through OpenRouter and don't need them.
 
 **Toggle: `GEMINI_USE_DONATED_OPENROUTER_KEY`** (default `false`). Only affects OpenRouter Gemini routing; does NOT touch grounded search. When off, OpenRouter Gemini calls flow through `OPENROUTER_API_KEY` directly, bypassing the donated wrapper. Off by default because the donated-key Google route has been flaky (as of 2026-05-17; revisit if Metaculus signals the donated Google route is stable). See `metaculus_bot/fallback_openrouter.py:should_route_via_donated_key`.
@@ -174,7 +199,7 @@ The bot uses several API keys; they fall into two buckets and the names don't al
 - Question types: `BinaryQuestion`, `NumericQuestion`, `MultipleChoiceQuestion`.
 - Prediction types: `ReasonedPrediction`, `BinaryPrediction`, etc.
 - Research helpers: `AskNewsSearcher`, `SmartSearcher`.
-- Numeric: `NumericDistribution`, `Percentile`. We subclass `NumericDistribution` as `PchipNumericDistribution` (`pchip_processing.py:234`) to override `.cdf` with our pre-computed 201-point PCHIP CDF; forecasting-tools' built-in CDF builder is only used on the fallback path.
+- Numeric: `NumericDistribution`, `Percentile`. We subclass `NumericDistribution` as `PchipNumericDistribution` (`numeric/pchip_processing.py:217`) to override `.cdf` with our pre-computed 201-point PCHIP CDF; forecasting-tools' built-in CDF builder is only used on the fallback path.
 
 ## Model configuration
 
@@ -224,14 +249,14 @@ The donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) is shared and r
 
 - Never paste the full key into chat or commit it. `.env` is gitignored.
 
-### Function-scoped imports in `main.py`
+### Function-scoped imports in `forecaster.py`
 
-`main.py` keeps a handful of `from x import y` statements inside functions instead of at module scope, each tagged `# noqa: PLC0415  # function-scoped: see AGENTS.md`. Two reasons drive this:
+`forecaster.py` keeps a handful of `from x import y` statements inside functions instead of at module scope, each tagged `# noqa: PLC0415  # function-scoped: see AGENTS.md`. Two reasons drive this:
 
 1. **Optional dependency loading.** `prediction_market_provider` pulls in `rapidfuzz`; `tool_runner`, `numeric_format_router`, etc. only matter when their corresponding feature flag is on. Importing them at function scope keeps the cold-start path lean and avoids surprising errors when an optional dep isn't installed.
 2. **Ruff auto-formatter behavior.** When a usage edit is staged separately from the import edit (common during refactors and subagent dispatches), Ruff's auto-formatter strips the now-unused top-level import between cycles. Function-scoped imports survive this because the symbol is referenced in the same statement block.
 
-Don't hoist these to the top of `main.py` without first checking that both reasons no longer apply.
+Don't hoist these to the top of `forecaster.py` without first checking that both reasons no longer apply.
 
 ### Important commands
 

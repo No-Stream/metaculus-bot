@@ -10,7 +10,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
-from metaculus_bot.numeric_validation import (
+from metaculus_bot.numeric.validation import (
     check_discrete_question_properties,
     sort_percentiles_by_value,
     validate_percentile_count_and_values,

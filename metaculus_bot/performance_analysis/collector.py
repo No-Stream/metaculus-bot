@@ -10,8 +10,8 @@ import os
 import time
 
 import requests
-from dotenv import load_dotenv
 
+from metaculus_bot.config import load_environment
 from metaculus_bot.performance_analysis.parsing import (
     parse_inferred_stacker_outcome,
     parse_per_base_model_forecasts,
@@ -25,7 +25,7 @@ from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_s
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-load_dotenv()
+load_environment()
 
 BASE_URL = "https://www.metaculus.com/api"
 DEFAULT_BOT_USER_ID = 275109

@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Tuple
 
 from metaculus_bot.config import load_environment
 
@@ -105,6 +104,20 @@ COMMENT_CHAR_LIMIT: int = 149_999
 # Optional environment variable to force research provider selection.
 # Accepted values (case-insensitive): "auto", "asknews", "exa", "perplexity", "openrouter"
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
+
+# Credential env-var names. Named constants (matching the existing *_ENV
+# convention used for GOOGLE_API_KEY_ENV / FRED_API_KEY_ENV) so the literal
+# strings aren't duplicated across api_key_utils / fallback_openrouter /
+# research_providers / research_orchestrator — that duplication is exactly the
+# typo risk the convention exists to prevent. See CLAUDE.md "API keys & secrets"
+# for which of these are shared (donated) vs. personal.
+OPENROUTER_API_KEY_ENV: str = "OPENROUTER_API_KEY"
+OAI_ANTH_OPENROUTER_KEY_ENV: str = "OAI_ANTH_OPENROUTER_KEY"
+ASKNEWS_CLIENT_ID_ENV: str = "ASKNEWS_CLIENT_ID"
+ASKNEWS_SECRET_ENV: str = "ASKNEWS_SECRET"
+EXA_API_KEY_ENV: str = "EXA_API_KEY"
+PERPLEXITY_API_KEY_ENV: str = "PERPLEXITY_API_KEY"
+METACULUS_TOKEN_ENV: str = "METACULUS_TOKEN"
 
 
 def env_flag_enabled(env_name: str, *, default: bool = False) -> bool:
@@ -420,7 +433,7 @@ CRUX_SOFT_DEADLINE: int = 180
 HEARTBEAT_INTERVAL: int = 60
 FETCH_RETRY_BACKOFFS: list[int] = [5, 15]
 # Distribution mix: (binary, numeric, multiple_choice)
-TYPE_MIX: Tuple[float, float, float] = (0.5, 0.25, 0.25)
+TYPE_MIX: tuple[float, float, float] = (0.5, 0.25, 0.25)
 FETCH_PACING_SECONDS: int = 2
 
 # =============================================================================

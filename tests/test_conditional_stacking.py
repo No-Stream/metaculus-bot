@@ -96,8 +96,8 @@ def mock_stacking_pipeline(
             "_forecaster_with_soft_deadline",
             new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
         ),
-        patch("main.extract_disagreement_crux", **crux_kwargs) as mock_crux,
-        patch("main.run_targeted_search", **search_kwargs) as mock_targeted,
+        patch("metaculus_bot.forecaster.extract_disagreement_crux", **crux_kwargs) as mock_crux,
+        patch("metaculus_bot.forecaster.run_targeted_search", **search_kwargs) as mock_targeted,
     ):
         mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
         mock_gather.return_value = (predictions, [], None)
@@ -160,7 +160,6 @@ def _make_bot(
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
         llms={
@@ -402,7 +401,7 @@ class TestConditionalStackingFallbacks:
             targeted_search_return="targeted results",
             run_stacking_side_effect=RuntimeError("Stacker LLM crashed"),
             extra_patches=[
-                ("binary_mean", patch("metaculus_bot.numeric_utils.aggregate_binary_mean", return_value=0.475)),
+                ("binary_mean", patch("metaculus_bot.numeric.utils.aggregate_binary_mean", return_value=0.475)),
             ],
         ):
             result = await bot._research_and_make_predictions(question)

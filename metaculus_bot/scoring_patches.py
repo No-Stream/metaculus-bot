@@ -7,14 +7,15 @@ for numeric and multiple choice questions that currently have NotImplementedErro
 NOTE: Metaculus removed the ``aggregations`` field from their list API, so
 ``community_prediction_at_access_time`` and all community-prediction-based
 baseline scoring (``expected_baseline_score``) is broken for newly-fetched questions.
-This entire module is used by the deprecated ``community_benchmark.py`` path.
+This module is used by ``community_benchmark.py`` AND the active
+``backtest.py`` / ``analyze_correlations.py`` scoring paths.
 Prefer ``backtest.py`` + ``metaculus_bot/backtest/scoring.py`` which score against
 actual question resolutions.
 """
 
 import logging
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -33,14 +34,14 @@ _MC_SUCCESSES = 0
 _MC_MISSING_API_JSON = 0
 _MC_MISSING_QUESTION_NODE = 0
 _MC_MISSING_AGGREGATIONS = 0
-_MC_MISSING_PYC = 0
+_MC_MISSING_PROB_YES_PER_CATEGORY = 0
 
 
 def reset_scoring_path_stats() -> None:
     global _NUMERIC_PMF_ATTEMPTS, _NUMERIC_PMF_SUCCESSES
     global _NUMERIC_FALLBACK_ATTEMPTS, _NUMERIC_FALLBACK_SUCCESSES
     global _MC_ATTEMPTS, _MC_MISSING_COMMUNITY, _MC_SUCCESSES
-    global _MC_MISSING_API_JSON, _MC_MISSING_QUESTION_NODE, _MC_MISSING_AGGREGATIONS, _MC_MISSING_PYC
+    global _MC_MISSING_API_JSON, _MC_MISSING_QUESTION_NODE, _MC_MISSING_AGGREGATIONS, _MC_MISSING_PROB_YES_PER_CATEGORY
     _NUMERIC_PMF_ATTEMPTS = 0
     _NUMERIC_PMF_SUCCESSES = 0
     _NUMERIC_FALLBACK_ATTEMPTS = 0
@@ -51,7 +52,7 @@ def reset_scoring_path_stats() -> None:
     _MC_MISSING_API_JSON = 0
     _MC_MISSING_QUESTION_NODE = 0
     _MC_MISSING_AGGREGATIONS = 0
-    _MC_MISSING_PYC = 0
+    _MC_MISSING_PROB_YES_PER_CATEGORY = 0
 
 
 def get_scoring_path_stats() -> dict[str, float | int]:
@@ -72,7 +73,7 @@ def get_scoring_path_stats() -> dict[str, float | int]:
         "mc_missing_api_json": _MC_MISSING_API_JSON,
         "mc_missing_question_node": _MC_MISSING_QUESTION_NODE,
         "mc_missing_aggregations": _MC_MISSING_AGGREGATIONS,
-        "mc_missing_pyc": _MC_MISSING_PYC,
+        "mc_missing_prob_yes_per_category": _MC_MISSING_PROB_YES_PER_CATEGORY,
     }
 
 
@@ -96,11 +97,11 @@ def log_scoring_path_stats() -> None:
         stats["mc_missing_rate"],
     )
     logger.info(
-        "MC missing breakdown: api_json=%d question_node=%d aggregations=%d pyc=%d",
+        "MC missing breakdown: api_json=%d question_node=%d aggregations=%d prob_yes_per_category=%d",
         stats["mc_missing_api_json"],
         stats["mc_missing_question_node"],
         stats["mc_missing_aggregations"],
-        stats["mc_missing_pyc"],
+        stats["mc_missing_prob_yes_per_category"],
     )
 
     # Bright warnings when fallbacks dominate
@@ -165,7 +166,7 @@ def extract_multiple_choice_probabilities(
     return [opt.probability for opt in sorted_options], option_names
 
 
-def extract_numeric_percentiles(prediction: Any) -> List[Tuple[float, float]]:
+def extract_numeric_percentiles(prediction: Any) -> list[tuple[float, float]]:
     """
     Extract (percentile, value) pairs from a numeric prediction.
 
@@ -225,19 +226,19 @@ def log_mc_vector_mismatch(
         logger.warning("  → Cannot determine root cause without question.options")
 
 
-def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], str]:
-    global \
-        _MC_MISSING_API_JSON, \
-        _MC_MISSING_QUESTION_NODE, \
-        _MC_MISSING_AGGREGATIONS, \
-        _MC_MISSING_PYC, \
-        _MC_MISSING_COMMUNITY
+def _extract_mc_community_probs(question: Any) -> tuple[list[float] | None, str]:
     """Extract community option probabilities for an MC question from api_json.
 
     According to the Metaculus API, community MC aggregations expose
     `probability_yes_per_category` under `aggregations.recency_weighted.latest`.
     We align the resulting vector to `question.options` order.
     """
+    global \
+        _MC_MISSING_API_JSON, \
+        _MC_MISSING_QUESTION_NODE, \
+        _MC_MISSING_AGGREGATIONS, \
+        _MC_MISSING_PROB_YES_PER_CATEGORY, \
+        _MC_MISSING_COMMUNITY
     try:
         # Basic fingerprint
         post_id = getattr(question, "id_of_post", None)
@@ -250,7 +251,6 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
                 post_id,
                 type(api_json).__name__,
             )
-            global _MC_MISSING_API_JSON, _MC_MISSING_COMMUNITY
             _MC_MISSING_API_JSON += 1
             _MC_MISSING_COMMUNITY += 1
             return None, "missing_api_json"
@@ -266,7 +266,6 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
                 api_has_question,
                 type(question_obj).__name__,
             )
-            global _MC_MISSING_QUESTION_NODE
             _MC_MISSING_QUESTION_NODE += 1
             _MC_MISSING_COMMUNITY += 1
             return None, "missing_question_node"
@@ -284,7 +283,6 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
                 qtype,
                 list(question_obj.keys()),
             )
-            global _MC_MISSING_AGGREGATIONS
             _MC_MISSING_AGGREGATIONS += 1
             _MC_MISSING_COMMUNITY += 1
             return None, "missing_aggregations"
@@ -301,8 +299,7 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
 
         if not isinstance(rw_latest, dict):
             logger.info("MC q=%s: recency_weighted.latest missing", qid)
-            global _MC_MISSING_PYC
-            _MC_MISSING_PYC += 1
+            _MC_MISSING_PROB_YES_PER_CATEGORY += 1
             _MC_MISSING_COMMUNITY += 1
             return None, "missing_rw_latest"
 
@@ -320,26 +317,26 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
                     len(fv),
                     len(options),
                 )
-                _MC_MISSING_PYC += 1
+                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
                 _MC_MISSING_COMMUNITY += 1
                 return None, "forecast_values_length_mismatch"
             try:
                 probs = [float(x) for x in fv]
             except Exception as e:
                 logger.warning("MC q=%s: forecast_values cast error: %s", qid, e)
-                _MC_MISSING_PYC += 1
+                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
                 _MC_MISSING_COMMUNITY += 1
                 return None, "forecast_values_cast_error"
             within = all(0.0 <= p <= 1.0 for p in probs)
             total = sum(probs)
             if not within:
                 logger.warning("MC q=%s: forecast_values contain out-of-range probabilities", qid)
-                _MC_MISSING_PYC += 1
+                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
                 _MC_MISSING_COMMUNITY += 1
                 return None, "forecast_values_out_of_range"
             if abs(total - 1.0) > 1e-3:
                 logger.warning("MC q=%s: forecast_values sum %.6f far from 1.0", qid, total)
-                _MC_MISSING_PYC += 1
+                _MC_MISSING_PROB_YES_PER_CATEGORY += 1
                 _MC_MISSING_COMMUNITY += 1
                 return None, "forecast_values_bad_sum"
             if abs(total - 1.0) > 1e-6:
@@ -369,7 +366,7 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
                     probs = [p / total for p in probs]
                 elif abs(total - 1.0) > 1e-3:
                     logger.warning("MC q=%s: pyc sum %.6f far from 1.0", qid, total)
-                    _MC_MISSING_PYC += 1
+                    _MC_MISSING_PROB_YES_PER_CATEGORY += 1
                     _MC_MISSING_COMMUNITY += 1
                     return None, "pyc_bad_sum"
                 logger.debug("MC q=%s: using rw.latest.probability_yes_per_category", qid)
@@ -384,7 +381,7 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
             qid,
             rw_keys,
         )
-        _MC_MISSING_PYC += 1
+        _MC_MISSING_PROB_YES_PER_CATEGORY += 1
         _MC_MISSING_COMMUNITY += 1
         return None, "no_forecast_data"
 
@@ -394,7 +391,7 @@ def _extract_mc_community_probs(question: Any) -> tuple[Optional[List[float]], s
     return None, "exception"
 
 
-def calculate_multiple_choice_baseline_score(report: Any, cache: Optional[dict] = None) -> Optional[float]:
+def calculate_multiple_choice_baseline_score(report: Any, cache: dict | None = None) -> float | None:
     """
     Calculate baseline score for multiple choice questions.
 
@@ -509,7 +506,7 @@ def calculate_multiple_choice_baseline_score(report: Any, cache: Optional[dict] 
         return None
 
 
-def _extract_numeric_community_cdf(question: Any) -> Optional[List[float]]:
+def _extract_numeric_community_cdf(question: Any) -> list[float] | None:
     """Extract community CDF (forecast_values) from api_json with structured logging; no fallback."""
     try:
         post_id = getattr(question, "id_of_post", None)
@@ -591,7 +588,7 @@ def _extract_numeric_community_cdf(question: Any) -> Optional[List[float]]:
     return None
 
 
-def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) -> Optional[float]:
+def calculate_numeric_baseline_score(report: Any, cache: dict | None = None) -> float | None:
     """
     Calculate baseline score for numeric questions relative to community distribution.
 
@@ -672,7 +669,6 @@ def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) 
                     return None
 
                 # Convert percentiles to CDF approximation
-                [float(p.value) for p in declared]
                 percs = [
                     float(getattr(p, "percentile", 0)) / (100.0 if getattr(p, "percentile", 1) > 1 else 1.0)
                     for p in declared
@@ -749,7 +745,7 @@ def calculate_numeric_baseline_score(report: Any, cache: Optional[dict] = None) 
 
 
 def _calculate_relative_numeric_score(
-    bot_pmf: np.ndarray, community_pmf: np.ndarray, total_range: float, q_id: Optional[int], cache: Optional[dict]
+    bot_pmf: np.ndarray, community_pmf: np.ndarray, total_range: float, q_id: int | None, cache: dict | None
 ) -> float | None:
     """
     Calculate relative numeric score using community PMF as expectation weights.
@@ -815,7 +811,7 @@ def patch_multiple_choice_scoring():
             MultipleChoiceReport,
         )
 
-        def expected_baseline_score_mc(self) -> Optional[float]:
+        def expected_baseline_score_mc(self) -> float | None:
             return calculate_multiple_choice_baseline_score(self)
 
         MultipleChoiceReport.expected_baseline_score = property(expected_baseline_score_mc)
@@ -832,7 +828,7 @@ def patch_numeric_scoring():
     try:
         from forecasting_tools.data_models.numeric_report import NumericReport
 
-        def expected_baseline_score_numeric(self) -> Optional[float]:
+        def expected_baseline_score_numeric(self) -> float | None:
             return calculate_numeric_baseline_score(self)
 
         NumericReport.expected_baseline_score = property(expected_baseline_score_numeric)
@@ -859,7 +855,7 @@ def patch_error_handling():
             assert len(reports) > 0, "Must have at least one report to calculate average expected baseline score"
 
             try:
-                scores: List[Optional[float]] = [report.expected_baseline_score for report in reports]
+                scores: list[float | None] = [report.expected_baseline_score for report in reports]
                 # Filter out None scores
                 valid_scores = [score for score in scores if score is not None]
 
@@ -867,7 +863,7 @@ def patch_error_handling():
                     logger.warning("All baseline scores are None, cannot calculate average")
                     return 0.0
 
-                validated_scores: List[float] = typeguard.check_type(valid_scores, list[float])
+                validated_scores: list[float] = typeguard.check_type(valid_scores, list[float])
                 average_score = sum(validated_scores) / len(validated_scores)
 
                 none_count = len([score for score in scores if score is None])
@@ -894,7 +890,7 @@ def patch_error_handling():
         logger.error(f"Error patching ForecastReport: {e}")
 
 
-def log_score_scale_validation(benchmarks: List[Any]) -> None:
+def log_score_scale_validation(benchmarks: list[Any]) -> None:
     """
     Log score distributions by question type to verify consistent scaling.
 

@@ -30,7 +30,7 @@ import logging
 import re
 from collections.abc import Iterator
 
-from metaculus_bot.comment_markers import (
+from metaculus_bot.comment.markers import (
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
@@ -127,7 +127,7 @@ _FORECASTER_RE: re.Pattern[str] = re.compile(r"(?m)^\*Forecaster\s+(\d+)(?:\s*\(
 # Header that follows the summary section (``### Forecasts``) and marks the
 # end of the bullet region. Comments are structured as
 # ``## Report 1 Summary / ### Forecasts / *Forecaster N*: ... / ### Research
-# Summary / ...`` (see ``metaculus_bot.comment_trimming._SUMMARY_END_MARKER``).
+# Summary / ...`` (see ``metaculus_bot.comment.trimming._SUMMARY_END_MARKER``).
 # Splitting on this boundary prevents the parser from picking up bullet-shaped
 # strings inside research prose or rationale bodies.
 _SUMMARY_END_MARKER: str = "### Research Summary"

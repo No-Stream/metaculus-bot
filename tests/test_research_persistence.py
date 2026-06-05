@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from metaculus_bot.research_persistence import RESEARCH_SCHEMA_VERSION, ResearchPersistenceWriter
+from metaculus_bot.research.persistence import RESEARCH_SCHEMA_VERSION, ResearchPersistenceWriter
 
 
 class TestResearchPersistenceWriter:

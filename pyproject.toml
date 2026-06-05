@@ -8,19 +8,22 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
-python-decouple = "^3.8"
 requests = "^2.32.3"
 asknews = "^0.11.2"
 numpy = "^2.3.0"
 openai = "^1.57.4"
 python-dotenv = "^1.0.1"
 forecasting-tools = "0.2.54"
-litellm = {extras = ["proxy"], version = "^1.0.0"}
+litellm = "^1.59.1"
 aiohttp = "^3.12.15"
 yfinance = "^0.2.48"
 fredapi = "^0.5.2"
 google-genai = "^1.74.0"
 rapidfuzz = "^3.14.3"
+scipy = "^1.12.0"
+pandas = "^2.2.3"
+pydantic = "^2.9.2"
+# supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 
 
 [tool.poetry.group.dev.dependencies]
@@ -37,10 +40,10 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = ["E501"]
-
-[tool.uv]
-# Supply chain safety: ignore packages published in the last 7 days.
-exclude-newer = "1 week"
+# flake8-async (ASYNC*) and flake8-pydantic (PYD*) run via the pre-commit flake8
+# hook, not ruff. Declaring their codes as external stops ruff from warning
+# "Invalid rule code" on the # noqa suppressions those linters consume.
+external = ["ASYNC", "PYD"]
 
 [tool.pytest.ini_options]
 markers = [

@@ -7,7 +7,7 @@ import logging
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric_config import BOUNDARY_SAFETY_MARGIN, MIN_BOUNDARY_DISTANCE
+from metaculus_bot.numeric.config import BOUNDARY_SAFETY_MARGIN, MIN_BOUNDARY_DISTANCE
 
 logger = logging.getLogger(__name__)
 

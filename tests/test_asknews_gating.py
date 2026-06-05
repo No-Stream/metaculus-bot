@@ -69,7 +69,7 @@ async def test_asknews_rate_gate_runs_before_both_calls(
         monkeypatch,
         on_search=lambda strategy: types.SimpleNamespace(as_dicts=[]),
     )
-    import metaculus_bot.research_providers as rp
+    import metaculus_bot.research.providers as rp
 
     monkeypatch.setattr(rp, "_ASKNEWS_GLOBAL_SEMAPHORE", None, raising=False)
     monkeypatch.setattr(rp, "_ASKNEWS_LAST_CALL_TS", 0.0, raising=False)
@@ -107,7 +107,7 @@ async def test_global_semaphore_serializes_concurrent_requests(
         return types.SimpleNamespace(as_dicts=[])
 
     _install_asknews_stub(monkeypatch, on_search=_record)
-    import metaculus_bot.research_providers as rp
+    import metaculus_bot.research.providers as rp
 
     # Force concurrency 1 and neutralize gating/sleeps to keep the test fast
     monkeypatch.setattr(rp, "ASKNEWS_MAX_CONCURRENCY", 1, raising=False)
@@ -143,7 +143,7 @@ async def test_rps_gate_sleeps_before_historical_call(
         monkeypatch,
         on_search=lambda strategy: types.SimpleNamespace(as_dicts=[]),
     )
-    import metaculus_bot.research_providers as rp
+    import metaculus_bot.research.providers as rp
 
     # Use a low RPS so the second call must sleep
     monkeypatch.setattr(rp, "ASKNEWS_MAX_RPS", 0.5, raising=False)  # min interval = 2.0s

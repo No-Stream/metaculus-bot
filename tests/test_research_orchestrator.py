@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.research_orchestrator import ResearchOrchestrator
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
 
 @pytest.fixture
@@ -48,15 +48,25 @@ class TestRunResearch:
         provider_a = AsyncMock(return_value="Result from provider A")
         provider_b = AsyncMock(return_value="Result from provider B")
 
-        with patch.object(
-            orchestrator,
-            "_select_research_providers",
-            return_value=[(provider_a, "asknews"), (provider_b, "native_search")],
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(provider_a, "asknews"), (provider_b, "native_search")],
+            ),
+            # AskNews is summarized inline; the briefing replaces the raw articles.
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="AskNews briefing",
+            ),
         ):
             result = await orchestrator.run_research(question)
 
-        assert "Result from provider A" in result
-        assert "Result from provider B" in result
+        assert "AskNews briefing" in result  # AskNews summarized
+        assert "Result from provider A" not in result  # raw articles replaced
+        assert "Result from provider B" in result  # native search raw
         assert "## News Articles (AskNews)" in result
         assert "## Web Research (Native Search)" in result
 
@@ -101,7 +111,7 @@ class TestRunResearch:
         with (
             patch.object(orchestrator, "_select_research_providers", return_value=[(provider, "custom")]),
             patch(
-                "metaculus_bot.targeted_research.run_gap_fill_pass",
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
                 new_callable=AsyncMock,
                 return_value="gap fill addendum",
             ) as mock_gap_fill,
@@ -128,13 +138,101 @@ class TestRunResearch:
         assert "ok" in result
 
 
-class TestSummarizeResearch:
+class TestAskNewsSummarization:
     @pytest.mark.asyncio
     async def test_invokes_summarizer_llm(self, orchestrator, question):
         with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"):
-            result = await orchestrator.summarize_research(question, "raw research text")
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_empty_research_skips_summarizer(self, orchestrator, question):
+        with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock) as invoke:
+            result = await orchestrator._summarize_asknews(question, "   ")
+
+        assert result == "   "
+        invoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_soft_falls_back_to_raw_on_transient_summarizer_error(self, orchestrator, question):
+        """Transient LLM-provider errors (timeouts, API hiccups) soft-fail to the raw articles."""
+        with patch.object(
+            orchestrator._summarizer_llm,
+            "invoke",
+            new_callable=AsyncMock,
+            side_effect=asyncio.TimeoutError("summarizer timed out"),
+        ):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert result == "raw asknews articles"
+
+    async def test_non_transient_summarizer_error_propagates(self, orchestrator, question):
+        """A genuine bug (not a transient API error) must crash, not silently degrade."""
+        with patch.object(
+            orchestrator._summarizer_llm,
+            "invoke",
+            new_callable=AsyncMock,
+            side_effect=AttributeError("prompt builder bug"),
+        ):
+            with pytest.raises(AttributeError):
+                await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+    @pytest.mark.asyncio
+    async def test_only_asknews_is_summarized(self, orchestrator, question):
+        """AskNews output is summarized; every other provider passes through raw."""
+        asknews = AsyncMock(return_value="raw asknews articles")
+        native = AsyncMock(return_value="native search prose")
+
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews"), (native, "native_search")],
+            ),
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="ASKNEWS BRIEFING",
+            ) as invoke,
+        ):
+            result = await orchestrator.run_research(question)
+
+        # Summarizer ran exactly once, and on the AskNews payload specifically.
+        invoke.assert_awaited_once()
+        assert "raw asknews articles" in invoke.await_args.args[0]
+        assert "ASKNEWS BRIEFING" in result
+        assert "raw asknews articles" not in result
+        # Native search prose is delivered verbatim.
+        assert "native search prose" in result
+
+    @pytest.mark.asyncio
+    async def test_asknews_fallback_prose_is_not_summarized(self, orchestrator, question, monkeypatch):
+        """When AskNews fails and falls back to Perplexity/Exa, the fallback is
+        already LLM prose, so it must NOT be summarized (no double-summarization)."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        asknews = AsyncMock(side_effect=RuntimeError("asknews down"))
+
+        with (
+            patch.object(
+                orchestrator,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews")],
+            ),
+            patch.object(
+                orchestrator,
+                "_call_perplexity",
+                new_callable=AsyncMock,
+                return_value="perplexity fallback prose",
+            ),
+            patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock) as invoke,
+        ):
+            result = await orchestrator.run_research(question)
+
+        # Fallback prose passes through verbatim; summarizer never runs.
+        invoke.assert_not_awaited()
+        assert "perplexity fallback prose" in result
 
 
 class TestProviderSelection:
@@ -261,3 +359,52 @@ class TestIntegrationWithTemplateForecaster:
         )
         bot._research.timeout_count = 5
         assert bot._research_provider_timeout_count == 5
+
+
+class TestDemoteInnerHeadings:
+    """Provider bodies must not carry headings at/above the h2 provider header.
+
+    Otherwise the framework's report_sections_to_markdown raises ("First section
+    must be at the highest heading level") and degrades to the [Hashtag] fallback.
+    """
+
+    def test_demotes_h1_and_h2_to_at_least_h3(self) -> None:
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = "# Historical Context\nbody\n## Recent Developments\nmore\n### Already deep\nkept"
+        out = _demote_inner_headings(body)
+        assert "### Historical Context" in out  # h1 -> h3
+        assert "#### Recent Developments" in out  # h2 -> h4
+        assert "### Already deep" in out  # h3 untouched
+        assert not out.startswith("# "), "must not start with h1"
+        assert "\n# " not in out, "no h1 on any line"
+        assert not out.startswith("## "), "must not start with h2"
+        assert "\n## " not in out, "no h2 on any line"
+
+    def test_inline_hash_not_treated_as_heading(self) -> None:
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = "Issue #42 and C# are not headings\n# Real Heading"
+        out = _demote_inner_headings(body)
+        assert "Issue #42 and C# are not headings" in out
+        assert "### Real Heading" in out
+
+    def test_combined_research_first_section_is_minimum_level(self) -> None:
+        """After normalization, every provider's h2 header outranks its body.
+
+        The first section of the combined string must be the minimum heading
+        level so the framework wouldn't raise on it.
+        """
+        import re
+
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        # Simulate the assembly: h2 provider header + a body that had its own h1.
+        provider_body = "# Historical Context\nstuff\n## Recent\nmore"
+        combined = f"## News Articles (AskNews)\n{_demote_inner_headings(provider_body)}"
+
+        heading_levels = [len(m.group(1)) for m in re.finditer(r"^(#+)\s", combined, re.MULTILINE)]
+        assert heading_levels, "precondition: combined must contain headings"
+        # The first heading (provider header, h2) must be the minimum.
+        assert heading_levels[0] == min(heading_levels)
+        assert heading_levels[0] == 2

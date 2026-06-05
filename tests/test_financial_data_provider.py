@@ -28,7 +28,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL, MSFT\nFRED_SERIES: NONE"
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will Apple stock price exceed $200 by end of 2026?", mock_llm)
 
@@ -41,7 +41,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: UNRATE, CPIAUCSL"
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will US unemployment rate exceed 5% in 2026?", mock_llm)
 
@@ -54,7 +54,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: ^GSPC\nFRED_SERIES: FEDFUNDS"
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will the S&P 500 drop if the Fed raises rates?", mock_llm)
 
@@ -67,7 +67,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
 
@@ -78,7 +78,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("LLM timeout")
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
@@ -89,7 +89,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "I don't understand the question format."
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
@@ -101,7 +101,7 @@ class TestClassifyFinancialQuestion:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: NONE"
 
-        from metaculus_bot.financial_data_provider import _classify_financial_question
+        from metaculus_bot.research.financial_data import _classify_financial_question
 
         result = await _classify_financial_question("Will the economy improve?", mock_llm)
 
@@ -139,10 +139,10 @@ class TestFetchYfinanceData:
             "forwardEps": 7.5,
         }
 
-        with patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf:
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker_instance
 
-            from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+            from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
             result = _fetch_yfinance_data("AAPL")
 
@@ -155,10 +155,10 @@ class TestFetchYfinanceData:
         assert "volatil" in result.lower()
 
     def test_yfinance_exception_returns_empty_string(self) -> None:
-        with patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf:
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.side_effect = Exception("Network error")
 
-            from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+            from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
             result = _fetch_yfinance_data("INVALID")
 
@@ -169,10 +169,10 @@ class TestFetchYfinanceData:
         mock_ticker_instance.history.return_value = pd.DataFrame()
         mock_ticker_instance.info = {}
 
-        with patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf:
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker_instance
 
-            from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+            from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
             result = _fetch_yfinance_data("FAKE")
 
@@ -198,10 +198,10 @@ class TestFetchFredData:
             {"title": ["Unemployment Rate"]}, index=["UNRATE"]
         )
 
-        with patch("metaculus_bot.financial_data_provider.Fred") as mock_fred_class:
+        with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
             mock_fred_class.return_value = mock_fred_instance
 
-            from metaculus_bot.financial_data_provider import _fetch_fred_data
+            from metaculus_bot.research.financial_data import _fetch_fred_data
 
             result = _fetch_fred_data("UNRATE", "fake_api_key")
 
@@ -211,10 +211,10 @@ class TestFetchFredData:
         assert "4.2" in result or "4.20" in result
 
     def test_fred_exception_returns_empty_string(self) -> None:
-        with patch("metaculus_bot.financial_data_provider.Fred") as mock_fred_class:
+        with patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class:
             mock_fred_class.return_value.get_series.side_effect = Exception("API error")
 
-            from metaculus_bot.financial_data_provider import _fetch_fred_data
+            from metaculus_bot.research.financial_data import _fetch_fred_data
 
             result = _fetch_fred_data("INVALID", "fake_api_key")
 
@@ -258,14 +258,14 @@ class TestFinancialDataProviderIntegration:
         )
 
         with (
-            patch("metaculus_bot.financial_data_provider.build_llm_with_openrouter_fallback", return_value=mock_llm),
-            patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf,
-            patch("metaculus_bot.financial_data_provider.Fred") as mock_fred_class,
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
+            patch("metaculus_bot.research.financial_data.Fred") as mock_fred_class,
         ):
             mock_yf.Ticker.return_value = mock_ticker
             mock_fred_class.return_value = mock_fred_instance
 
-            from metaculus_bot.financial_data_provider import financial_data_provider
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setenv("FRED_API_KEY", "fake_key")
@@ -287,8 +287,8 @@ class TestFinancialDataProviderIntegration:
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
 
-        with patch("metaculus_bot.financial_data_provider.build_llm_with_openrouter_fallback", return_value=mock_llm):
-            from metaculus_bot.financial_data_provider import financial_data_provider
+        with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             provider = financial_data_provider()
             result = await provider(_make_q("Will it rain in London tomorrow?"))
@@ -319,12 +319,12 @@ class TestFinancialDataProviderIntegration:
             return bad_ticker
 
         with (
-            patch("metaculus_bot.financial_data_provider.build_llm_with_openrouter_fallback", return_value=mock_llm),
-            patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf,
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
         ):
             mock_yf.Ticker.side_effect = ticker_factory
 
-            from metaculus_bot.financial_data_provider import financial_data_provider
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             provider = financial_data_provider()
             result = await provider(_make_q("Compare Apple and BADTICKER stock performance"))
@@ -347,12 +347,12 @@ class TestFinancialDataProviderIntegration:
         mock_ticker.info = {"shortName": "Apple Inc.", "regularMarketPrice": 200.0}
 
         with (
-            patch("metaculus_bot.financial_data_provider.build_llm_with_openrouter_fallback", return_value=mock_llm),
-            patch("metaculus_bot.financial_data_provider.yfinance") as mock_yf,
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
-            from metaculus_bot.financial_data_provider import financial_data_provider
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.delenv("FRED_API_KEY", raising=False)
@@ -383,12 +383,12 @@ class TestProviderSelection:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
 
         with patch(
-            "metaculus_bot.financial_data_provider.build_llm_with_openrouter_fallback",
+            "metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback",
             return_value=AsyncMock(),
         ):
             orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -408,7 +408,7 @@ class TestProviderSelection:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
@@ -428,7 +428,7 @@ class TestProviderSelection:
 
         from forecasting_tools import GeneralLlm
 
-        from metaculus_bot.research_orchestrator import ResearchOrchestrator
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator
 
         mock_llm = GeneralLlm(model="test/model", temperature=0.0)
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)

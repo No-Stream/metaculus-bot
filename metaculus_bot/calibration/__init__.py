@@ -1,9 +1,9 @@
 """Post-hoc calibration of the bot's final published probabilities.
 
 Implements logistic recalibration (Platt scaling) on the final binary and
-multiple-choice outputs of ``main.py:_aggregate_predictions``. The hook is
-gated by ``PLATT_CALIBRATION_ENABLED`` and reads fitted parameters from
-``params.py``.
+multiple-choice outputs of the aggregation pipeline
+(``metaculus_bot/aggregation_pipeline.py``). The hook is gated by
+``PLATT_CALIBRATION_ENABLED`` and reads fitted parameters from ``params.py``.
 
 Currently shipped with identity parameters by deliberate choice — see
 ``params.py`` for the rationale (in-sample benefit too small to justify

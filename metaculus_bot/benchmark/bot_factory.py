@@ -8,9 +8,9 @@ from typing import Any
 
 from forecasting_tools import GeneralLlm
 
-from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
 MODEL_CONFIG: dict[str, Any] = {
@@ -25,7 +25,6 @@ MODEL_CONFIG: dict[str, Any] = {
 BENCHMARK_BOT_CONFIG: dict[str, Any] = {
     "research_reports_per_question": 1,
     "predictions_per_research_report": 1,
-    "use_research_summary_to_forecast": False,
     "publish_reports_to_metaculus": False,
     "folder_to_save_reports_to": None,
     "skip_previously_forecasted_questions": False,

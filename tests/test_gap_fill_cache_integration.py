@@ -49,7 +49,7 @@ async def test_cache_stores_research_with_gap_fill_addendum(
 
     # Mock run_gap_fill_pass at the point where main.py imports it (inside run_research).
     with patch(
-        "metaculus_bot.targeted_research.run_gap_fill_pass",
+        "metaculus_bot.research.targeted.run_gap_fill_pass",
         AsyncMock(return_value="MOCK_ADDENDUM"),
     ):
         result = await bot.run_research(mock_question)
@@ -89,7 +89,7 @@ async def test_gap_fill_disabled_by_default(
     )
 
     fake_gap_fill = AsyncMock(return_value="SHOULD_NOT_APPEAR")
-    with patch("metaculus_bot.targeted_research.run_gap_fill_pass", fake_gap_fill):
+    with patch("metaculus_bot.research.targeted.run_gap_fill_pass", fake_gap_fill):
         result = await bot.run_research(mock_question)
 
     fake_gap_fill.assert_not_called()
@@ -123,7 +123,7 @@ async def test_gap_fill_skipped_when_first_pass_is_tiny(
     bot._research._custom_provider = AsyncMock(return_value="tiny blob")
 
     fake_gap_fill = AsyncMock(return_value="SHOULD_NOT_APPEAR")
-    with patch("metaculus_bot.targeted_research.run_gap_fill_pass", fake_gap_fill):
+    with patch("metaculus_bot.research.targeted.run_gap_fill_pass", fake_gap_fill):
         result = await bot.run_research(mock_question)
 
     fake_gap_fill.assert_not_called()
@@ -161,7 +161,7 @@ async def test_gap_fill_empty_return_does_not_add_addendum(
     )
 
     with patch(
-        "metaculus_bot.targeted_research.run_gap_fill_pass",
+        "metaculus_bot.research.targeted.run_gap_fill_pass",
         AsyncMock(return_value=""),
     ):
         result = await bot.run_research(mock_question)

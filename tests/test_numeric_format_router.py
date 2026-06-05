@@ -448,7 +448,7 @@ class TestRouteNumericOutput:
 
         # Drive the downstream pipeline that main.py runs on the percentile
         # branch. Both calls must succeed without raising.
-        from metaculus_bot.numeric_pipeline import (
+        from metaculus_bot.numeric.pipeline import (
             build_numeric_distribution,
             sanitize_percentiles,
         )

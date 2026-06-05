@@ -17,8 +17,8 @@ from forecasting_tools.data_models.numeric_report import (
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
-from metaculus_bot.pchip_cdf import generate_pchip_cdf
-from metaculus_bot.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 __all__ = [
     "aggregate_numeric",
@@ -137,7 +137,7 @@ def _postprocess_ensemble_cdf(
     )
 
 
-async def aggregate_numeric(
+def aggregate_numeric(
     predictions: Sequence[NumericDistribution],
     question: NumericQuestion,
     method: str | Literal["mean", "median"] = "mean",

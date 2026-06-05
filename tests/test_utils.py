@@ -14,7 +14,7 @@ from forecasting_tools.data_models.questions import (
 )
 from pydantic import Field
 
-from metaculus_bot.numeric_utils import (
+from metaculus_bot.numeric.utils import (
     aggregate_binary_mean,
     aggregate_numeric,
     bound_messages,
@@ -145,8 +145,7 @@ def test_numeric_prompt_includes_p5_and_p95():
 # ---------- Numeric utils ---------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_aggregate_numeric_mean_and_median():
+def test_aggregate_numeric_mean_and_median():
     question = NumericQuestion(
         id_of_question=1,
         id_of_post=1,
@@ -170,8 +169,8 @@ async def test_aggregate_numeric_mean_and_median():
     dist_a = NumericDistribution(declared_percentiles=percentiles, **question.model_dump())
     dist_b = NumericDistribution(declared_percentiles=percentiles, **question.model_dump())
 
-    mean_result = await aggregate_numeric([dist_a, dist_b], question, "mean")
-    median_result = await aggregate_numeric([dist_a, dist_b], question, "median")
+    mean_result = aggregate_numeric([dist_a, dist_b], question, "mean")
+    median_result = aggregate_numeric([dist_a, dist_b], question, "median")
 
     # Both mean and median aggregations now return a full 201-point distribution.
     # Since we are aggregating two identical distributions, the result should be

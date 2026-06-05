@@ -65,7 +65,9 @@ make run
 
 ### Main Components
 
-- **`main.py`**: Primary bot implementation using the `forecasting-tools` framework
+- **`main.py`**: Thin CLI entry shim — re-exports `TemplateForecaster` and dispatches to `metaculus_bot/cli.py`
+- **`metaculus_bot/forecaster.py`**: Primary `TemplateForecaster` implementation (research → forecaster fan-out → aggregation)
+- **`metaculus_bot/aggregation_pipeline.py`**: Aggregation pipeline (MEDIAN / stacking / conditional-stacking, Platt calibration hook)
 - **`backtest.py`**: Primary benchmarking system — scores predictions against actual resolutions
 - **`community_benchmark.py`**: DEPRECATED benchmarking CLI (community prediction baseline broken)
 - **`metaculus_bot/`**: Core utilities and configurations
@@ -73,15 +75,14 @@ make run
 ### Key modules
 
 - **`llm_configs.py`**: LLM ensemble + stacker + support-model configuration (single source of truth; rotates frequently)
-- **`research_providers.py`**: AskNews, Perplexity, Exa, native-search orchestration
-- **`gemini_search_provider.py`**: Gemini 3 with first-party Google Search grounding
-- **`financial_data_provider.py`**: yfinance + FRED for financial/economic questions
-- **`targeted_research.py`**: disagreement-crux targeted search + always-on gap-fill second pass
+- **`research/`**: research-provider subpackage — `providers.py` (AskNews / Perplexity / Exa / native-search), `orchestrator.py` (parallel fan-out + fallback), `gemini_search.py` (first-party Google Search grounding), `financial_data.py` (yfinance + FRED), `prediction_market.py` (Polymarket / Kalshi / Manifold), `targeted.py` (disagreement-crux search + gap-fill second pass), `persistence.py`
 - **`stacking.py`** and **`aggregation_strategies.py`**: CONDITIONAL_STACKING / STACKING / MEAN / MEDIAN
 - **`spread_metrics.py`**: per-type spread computation that triggers CONDITIONAL_STACKING
 - **`prompts.py`**: prompts for base forecasting, stacking, gap-fill, targeted research
-- **`numeric_pipeline.py`** / **`pchip_cdf.py`** / **`tail_widening.py`**: percentile → 201-point CDF pipeline
-- **`probabilistic_tools/`** and **`tool_runner.py`**: deterministic probability math for structured forecaster JSON blocks (dormant — see `scratch_docs_and_planning/probabilistic_tools_activation.md`)
+- **`numeric/pipeline.py`** / **`numeric/pchip_cdf.py`** / **`numeric/tail_widening.py`**: percentile → 201-point CDF pipeline
+- **`comment/`**: published-comment assembly — `formatting.py`, `markers.py`, `trimming.py`
+- **`ensemble_analysis/`**: offline correlation + ensemble-simulation tooling — `correlation_analysis.py`, `ensemble_simulator.py`, `cdf_cache.py`, `benchmark_identity.py`, `types.py`
+- **`probabilistic_tools/`** and **`tool_runner.py`**: deterministic probability math for structured forecaster JSON blocks (active, gated by `PROBABILISTIC_TOOLS_ENABLED`)
 
 ## Usage Examples
 
@@ -241,22 +242,24 @@ make precommit_all
 
 ```
 metaculus-bot/
-├── main.py                     # Primary bot implementation
+├── main.py                     # Thin CLI entry shim (re-exports TemplateForecaster, dispatches to cli.py)
 ├── backtest.py                 # Resolved-question backtester (primary benchmarking)
 ├── community_benchmark.py      # DEPRECATED community-prediction benchmarker
 ├── metaculus_bot/              # Core utilities
+│   ├── forecaster.py               # Primary TemplateForecaster implementation
+│   ├── aggregation_pipeline.py     # Aggregation pipeline (MEDIAN / stacking / conditional, Platt hook)
+│   ├── cli.py                      # CLI entry point + default config
 │   ├── llm_configs.py              # Forecaster + stacker + support models
-│   ├── research_providers.py       # AskNews / Perplexity / Exa / native-search orchestration
-│   ├── gemini_search_provider.py   # Gemini 3 with first-party Google Search grounding
-│   ├── financial_data_provider.py  # yfinance + FRED
-│   ├── targeted_research.py        # Disagreement-crux + gap-fill second pass
+│   ├── research/                   # providers.py, orchestrator.py, gemini_search.py, financial_data.py, prediction_market.py, targeted.py, persistence.py
 │   ├── stacking.py                 # Stacker LLM meta-prompts
 │   ├── aggregation_strategies.py   # MEAN / MEDIAN / STACKING / CONDITIONAL_STACKING
 │   ├── spread_metrics.py           # Per-type disagreement metric
 │   ├── prompts.py                  # Base / stacking / gap-fill / targeted prompts
-│   ├── numeric_pipeline.py, pchip_cdf.py, tail_widening.py  # Percentile → 201pt CDF
-│   ├── probabilistic_tools/        # (dormant) Bayesian / survival / fit helpers
-│   └── tool_runner.py              # (dormant) deterministic math over structured blocks
+│   ├── numeric/                    # pipeline.py, pchip_cdf.py, tail_widening.py — percentile → 201pt CDF
+│   ├── comment/                    # formatting.py, markers.py, trimming.py — published-comment assembly
+│   ├── ensemble_analysis/          # correlation_analysis, ensemble_simulator, cdf_cache, benchmark_identity, types (offline analysis)
+│   ├── probabilistic_tools/        # active (gated by PROBABILISTIC_TOOLS_ENABLED) Bayesian / survival / fit helpers
+│   └── tool_runner.py              # active (gated by PROBABILISTIC_TOOLS_ENABLED) deterministic math over structured blocks
 ├── tests/                      # Pytest suite
 ├── .github/workflows/          # CI + scheduled bot runs
 ├── AGENTS.md                   # Repo-specific agent/coding guidelines (CLAUDE.md is a symlink)

@@ -25,7 +25,7 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution, Pe
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from tests.conftest import make_mock_numeric_question
 
 
@@ -43,7 +43,6 @@ def _make_bot() -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEAN,
         llms=llms,  # type: ignore[arg-type]
@@ -241,7 +240,7 @@ async def test_percentile_path_with_old_k_tail_visibly_widens_tails(monkeypatch:
     """Gap 4: monkeypatch the active k_tail to the old 1.25 default and verify
     the tails *do* move. Together with the test above, this proves the new
     k_tail=1.0 default is a true no-op (not silently broken)."""
-    monkeypatch.setattr("metaculus_bot.numeric_pipeline.TAIL_WIDEN_K_TAIL", 1.25)
+    monkeypatch.setattr("metaculus_bot.numeric.pipeline.TAIL_WIDEN_K_TAIL", 1.25)
 
     bot = _make_bot()
     question = _make_numeric_question()

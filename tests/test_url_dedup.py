@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from metaculus_bot.research_providers import (
+from metaculus_bot.research.providers import (
     _dedup_articles_by_url,
     _format_asknews_dual_sections,
     _normalize_url_for_dedup,

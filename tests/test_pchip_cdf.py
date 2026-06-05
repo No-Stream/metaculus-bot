@@ -9,7 +9,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
-from metaculus_bot.pchip_cdf import (
+from metaculus_bot.numeric.pchip_cdf import (
     enforce_min_steps,
     enforce_strict_increasing,
     generate_pchip_cdf,
@@ -135,7 +135,7 @@ class TestSafeCdfBounds:
     def test_open_bounds_clamping(self):
         """Test open bounds are clamped to [0.001, 0.999]."""
         cdf = np.array([0.0, 0.1, 0.6, 0.82, 0.95, 1.0])
-        result = safe_cdf_bounds(cdf, open_lower=True, open_upper=True, min_step=5e-5)
+        result = safe_cdf_bounds(cdf, open_lower=True, open_upper=True)
 
         assert result[0] >= 0.001
         assert result[-1] <= 0.999
@@ -143,7 +143,7 @@ class TestSafeCdfBounds:
     def test_closed_bounds_preserved(self):
         """Test closed bounds preserve [0, 1] values."""
         cdf = np.array([0.0, 0.2, 0.55, 0.8, 0.95, 1.0])
-        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False, min_step=5e-5)
+        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False)
 
         assert result[0] == 0.0
         assert result[-1] == 1.0
@@ -151,7 +151,7 @@ class TestSafeCdfBounds:
     def test_max_jump_enforcement(self):
         """Test that steps > NUM_MAX_STEP are redistributed."""
         cdf = np.array([0.0, 0.1, 0.6, 0.82, 0.95, 1.0])  # Includes steps above NUM_MAX_STEP
-        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False, min_step=5e-5)
+        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False)
 
         steps = np.diff(result)
         assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps), f"Steps: {steps}"
@@ -160,7 +160,7 @@ class TestSafeCdfBounds:
     def test_iterative_max_jump_enforcement(self):
         """Ensure multiple violations are handled iteratively."""
         cdf = np.array([0.0, 0.35, 0.6, 0.82, 0.96, 1.0])  # Multiple steps above limit
-        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False, min_step=5e-5)
+        result = safe_cdf_bounds(cdf, open_lower=False, open_upper=False)
 
         steps = np.diff(result)
         assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps), f"Steps: {steps}"

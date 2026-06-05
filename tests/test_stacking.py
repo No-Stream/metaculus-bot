@@ -44,7 +44,6 @@ class TestStackingConfiguration:
         bot = TemplateForecaster(
             research_reports_per_question=1,
             predictions_per_research_report=1,
-            use_research_summary_to_forecast=False,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.STACKING,
             llms={
@@ -71,7 +70,6 @@ class TestStackingConfiguration:
         bot = TemplateForecaster(
             research_reports_per_question=1,
             predictions_per_research_report=1,
-            use_research_summary_to_forecast=False,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.STACKING,
             llms={
@@ -106,7 +104,6 @@ class TestStackingConfiguration:
         bot = TemplateForecaster(
             research_reports_per_question=1,
             predictions_per_research_report=1,
-            use_research_summary_to_forecast=False,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.MEAN,
             llms={
@@ -834,7 +831,6 @@ class TestStackingBenchmarkConfiguration:
         stacking_bot = BenchmarkForecaster(
             research_reports_per_question=1,
             predictions_per_research_report=1,
-            use_research_summary_to_forecast=False,
             publish_reports_to_metaculus=False,
             folder_to_save_reports_to=None,
             skip_previously_forecasted_questions=False,

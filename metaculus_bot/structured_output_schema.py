@@ -10,7 +10,8 @@ tool runner extracts these blocks and feeds them to probabilistic tools
 This module defines the schemas and extraction helpers. Active surface,
 gated by ``PROBABILISTIC_TOOLS_ENABLED`` env flag and per-question-type
 via ``PROBABILISTIC_TOOLS_TYPES``. See ``metaculus_bot/tool_runner.py``
-for dispatch and ``main.py:_make_prediction`` for the activation site.
+for dispatch and ``metaculus_bot/forecaster.py:_make_prediction`` for the
+activation site.
 
 Note: ``DiscreteCountStructured`` is defined here but not dispatched by the
 current tool runner — discrete-count question dispatch is phase-3 work. The
@@ -23,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -356,7 +357,7 @@ class DiscreteCountStructured(BaseModel):
 
 
 StructuredBlock = Annotated[
-    Union[BinaryStructured, NumericStructured, MultipleChoiceStructured],
+    BinaryStructured | NumericStructured | MultipleChoiceStructured,
     Field(discriminator="question_type"),
 ]
 

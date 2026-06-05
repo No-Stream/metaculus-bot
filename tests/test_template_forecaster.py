@@ -7,9 +7,9 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MetaculusQuestion, Rea
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
 
 from main import TemplateForecaster
-from metaculus_bot.comment_trimming import TRIM_NOTICE
+from metaculus_bot.comment.trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 
 
 def _stub_open_time() -> datetime:
@@ -153,7 +153,6 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
         return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
     )
     bot.run_research = AsyncMock(return_value="mock research")
-    bot.summarize_research = AsyncMock(return_value="mock summary")
     bot._make_prediction = AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test"))
     bot._gather_results_and_exceptions = AsyncMock(
         return_value=(
@@ -179,64 +178,13 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
     bot.run_research.assert_called_once_with(mock_binary_question)
-    # summarize_research is NOT called when use_research_summary_to_forecast=False (default)
-    bot.summarize_research.assert_not_called()
+    # Forecasters receive run_research output verbatim — there is no whole-corpus
+    # summarization pass. AskNews-only summarization lives in the orchestrator
+    # (see test_research_orchestrator.py).
     assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
     bot._forecaster_with_soft_deadline.assert_any_call(
         mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question
     )
-    assert isinstance(result, ResearchWithPredictions)
-    assert (
-        len(result.predictions) == 2
-    )  # The mocked _gather_results_and_exceptions returns two ReasonedPrediction objects
-
-
-@pytest.mark.asyncio
-async def test_research_and_make_predictions_with_summarization_enabled(mock_binary_question, mock_general_llm):
-    """Test that summarize_research IS called when use_research_summary_to_forecast=True"""
-    llms_config = {
-        "forecasters": [mock_general_llm, mock_general_llm],
-        "summarizer": "mock_summarizer_model",
-        "parser": "mock_parser_model",
-        "researcher": "mock_researcher_model",
-        "default": "mock_default_model",
-    }
-    bot = TemplateForecaster(llms=llms_config, use_research_summary_to_forecast=True, min_forecasters_to_publish=1)
-
-    # Mock internal methods
-    bot._get_notepad = AsyncMock(
-        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
-    )
-    bot.run_research = AsyncMock(return_value="mock research")
-    bot.summarize_research = AsyncMock(return_value="mock summary")
-    bot._make_prediction = AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test"))
-    bot._gather_results_and_exceptions = AsyncMock(
-        return_value=(
-            [
-                ReasonedPrediction(prediction_value=0.5, reasoning="test"),
-                ReasonedPrediction(prediction_value=0.6, reasoning="test2"),
-            ],
-            [],
-            None,
-        )
-    )
-
-    # See sibling test above — soft-deadline wrapper is the per-forecaster
-    # entrypoint, so assert on it rather than the inner _make_prediction.
-    bot._forecaster_with_soft_deadline = AsyncMock(
-        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test")
-    )
-
-    result = await bot._research_and_make_predictions(mock_binary_question)
-
-    bot._get_notepad.assert_called_once_with(mock_binary_question)
-    bot.run_research.assert_called_once_with(mock_binary_question)
-    # summarize_research IS called when use_research_summary_to_forecast=True
-    bot.summarize_research.assert_called_once_with(mock_binary_question, "mock research")
-    assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
-    bot._forecaster_with_soft_deadline.assert_any_call(
-        mock_binary_question, "mock summary", mock_general_llm, mock_binary_question.id_of_question
-    )  # Uses summary
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
 
@@ -455,7 +403,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     # Tighten the deadline to a fraction of a second so the test is fast.
-    monkeypatch.setattr("main.FORECASTER_SOFT_DEADLINE", 0.05)
+    monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
 
     async def slow_make_prediction(question, research, llm):
         await asyncio.sleep(5)

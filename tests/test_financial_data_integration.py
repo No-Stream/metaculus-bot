@@ -34,7 +34,7 @@ pytestmark = pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 def test_yfinance_real_fetch_returns_parseable_markdown():
     """yfinance returns markdown with all standard sections for AAPL."""
-    from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+    from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
     md = _fetch_yfinance_data("AAPL")
 
@@ -53,7 +53,7 @@ def test_yfinance_real_fetch_returns_parseable_markdown():
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 def test_yfinance_real_fetch_index_symbol():
     """yfinance handles index symbols (^GSPC) the same way it handles equities."""
-    from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+    from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
     md = _fetch_yfinance_data("^GSPC")
 
@@ -68,7 +68,7 @@ def test_yfinance_real_fetch_index_symbol():
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 def test_yfinance_real_fetch_unknown_ticker_returns_empty():
     """Unknown tickers return empty string, not a crash. Soft-fail behavior."""
-    from metaculus_bot.financial_data_provider import _fetch_yfinance_data
+    from metaculus_bot.research.financial_data import _fetch_yfinance_data
 
     md = _fetch_yfinance_data("NOSUCHTICKER12345")
 
@@ -90,7 +90,7 @@ def _fred_api_key() -> str | None:
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_returns_parseable_markdown():
     """FRED returns markdown with all standard sections for UNRATE (unemployment)."""
-    from metaculus_bot.financial_data_provider import _fetch_fred_data
+    from metaculus_bot.research.financial_data import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None  # skipif gate guarantees this; narrows for type checker
@@ -111,7 +111,7 @@ def test_fred_real_fetch_returns_parseable_markdown():
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_includes_series_title():
     """FRED's get_series_info path populates a human-readable title in the header."""
-    from metaculus_bot.financial_data_provider import _fetch_fred_data
+    from metaculus_bot.research.financial_data import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None
@@ -134,7 +134,7 @@ def test_fred_real_fetch_includes_series_title():
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_unknown_series_returns_empty():
     """Unknown FRED series return empty string. Soft-fail behavior."""
-    from metaculus_bot.financial_data_provider import _fetch_fred_data
+    from metaculus_bot.research.financial_data import _fetch_fred_data
 
     api_key = _fred_api_key()
     assert api_key is not None

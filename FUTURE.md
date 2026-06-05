@@ -300,6 +300,15 @@ Blocked on: STACKER_OUTCOME marker fix (Priority 1A in NEXT_SESSION_QUEUE.md), t
 
 ## Medium-term (requires more exploration)
 
+### Dependency hygiene: version-floor bumps + uv migration (added 2026-06-01)
+
+Deferred from the 2026-06-01 desloppify code-health pass (which did only behavior-neutral pyproject hygiene: dropped unused `python-decouple`, removed the unused `litellm[proxy]` extra, declared the directly-imported `scipy`/`pandas`/`pydantic` that were previously only transitive via `forecasting-tools`).
+
+Two follow-ups intentionally left for a separate, gated PR:
+
+1. **Raise version floors to current-installed** (e.g. `litellm ^1.80` vs the current `^1.59.1` floor, `openai` to latest, and evaluate moving `forecasting-tools` off the hard-pinned `0.2.54`). This is **forecast-affecting**: a litellm/openai/forecasting-tools behavior change can subtly shift model outputs and therefore predictions. **Gate:** run a medium backtest (`make backtest_medium`) before and after the bump and confirm scores don't regress before shipping. Do NOT bump blind.
+2. **Migrate dependency management from poetry to `uv`.** Larger refactor (pyproject `[tool.poetry]` → PEP 621 `[project]`, regenerate lockfile, update Makefile `install`/`run`/`test` targets and CI). An orphaned 136-byte `uv.lock` stub + `[tool.uv]` block (declaring a contradictory `requires-python >=3.12`) were removed in the 2026-06-01 pass so the repo has one source of truth (poetry); a real uv migration would regenerate the lockfile from scratch. Worth doing for speed + the team's broader uv standardization, but it's pure tooling churn with no forecast impact — schedule when there's appetite for a no-functional-change infra PR.
+
 ### Gemini grounding via OpenRouter — currently NOT supported (added 2026-05-17)
 
 Goal would be: route Gemini Google-Search-grounded calls (currently in `metaculus_bot/gemini_search_provider.py` via direct `google-genai` SDK + `GOOGLE_API_KEY`) through OpenRouter so the donated Metaculus credits cover them, freeing up personal Google API budget.

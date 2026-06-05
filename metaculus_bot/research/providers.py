@@ -23,10 +23,15 @@ from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
     ASKNEWS_BACKOFF_SECS,
+    ASKNEWS_CLIENT_ID_ENV,
     ASKNEWS_MAX_CONCURRENCY,
     ASKNEWS_MAX_RPS,
     ASKNEWS_MAX_TRIES,
+    ASKNEWS_SECRET_ENV,
     ASKNEWS_WALL_TIMEOUT,
+    EXA_API_KEY_ENV,
+    OPENROUTER_API_KEY_ENV,
+    PERPLEXITY_API_KEY_ENV,
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -103,8 +108,8 @@ def _asknews_provider() -> ResearchCallable:
             # Use custom AskNews integration with proper rate limiting between API calls
             from asknews_sdk import AsyncAskNewsSDK
 
-            client_id = os.getenv("ASKNEWS_CLIENT_ID")
-            secret = os.getenv("ASKNEWS_SECRET")
+            client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
+            secret = os.getenv(ASKNEWS_SECRET_ENV)
             if not client_id or not secret:
                 raise ValueError("ASKNEWS_CLIENT_ID and ASKNEWS_SECRET environment variables must be set")
 
@@ -418,7 +423,7 @@ def choose_provider_with_name(
         forced_lc = forced.strip().lower()
         if forced_lc == "asknews":
             # Fail fast if creds missing to make misconfig obvious
-            if not (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")):
+            if not (os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV)):
                 raise ValueError("RESEARCH_PROVIDER=asknews requires ASKNEWS_CLIENT_ID and ASKNEWS_SECRET to be set")
             return _asknews_provider(), "asknews"
         if forced_lc == "exa":
@@ -437,22 +442,22 @@ def choose_provider_with_name(
             return _perplexity_provider(True, is_benchmarking), "openrouter"
         # Any other value behaves as auto
 
-    if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET"):
+    if os.getenv(ASKNEWS_CLIENT_ID_ENV) and os.getenv(ASKNEWS_SECRET_ENV):
         return _asknews_provider(), "asknews"
 
-    if os.getenv("EXA_API_KEY"):
+    if os.getenv(EXA_API_KEY_ENV):
         if exa_callback is not None:
             return exa_callback, "exa"
         if default_llm is None:
             raise ValueError("default_llm must be provided for Exa research provider")
         return _exa_provider(default_llm), "exa"
 
-    if os.getenv("PERPLEXITY_API_KEY"):
+    if os.getenv(PERPLEXITY_API_KEY_ENV):
         if perplexity_callback is not None:
             return perplexity_callback, "perplexity"
         return _perplexity_provider(False, is_benchmarking), "perplexity"
 
-    if os.getenv("OPENROUTER_API_KEY"):
+    if os.getenv(OPENROUTER_API_KEY_ENV):
         if openrouter_callback is not None:
             return openrouter_callback, "openrouter"
         return _perplexity_provider(True, is_benchmarking), "openrouter"

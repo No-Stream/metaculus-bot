@@ -197,7 +197,7 @@ class TestRunNumericForecast:
         """Numeric forecast returns (prediction, discrete_vote) tuple via the percentile branch."""
         from forecasting_tools.data_models.numeric_report import Percentile
 
-        from metaculus_bot.discrete_snap import OutcomeTypeResult
+        from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
         from metaculus_bot.numeric_format_router import RoutedNumericForecast
 
         reasoning_text = "OUTCOME_TYPE: DISCRETE\n\nPercentile 2.5: 50"
@@ -260,8 +260,8 @@ class TestRunNumericForecast:
         """When detect_unit_mismatch returns True, raises UnitMismatchError."""
         from forecasting_tools.data_models.numeric_report import Percentile
 
-        from metaculus_bot.discrete_snap import OutcomeTypeResult
         from metaculus_bot.exceptions import UnitMismatchError
+        from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
         from metaculus_bot.numeric_format_router import RoutedNumericForecast
 
         percentiles = [

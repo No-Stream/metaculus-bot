@@ -25,7 +25,7 @@ from forecasting_tools.data_models.numeric_report import NumericDistribution, Pe
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy, combine_numeric_predictions
-from metaculus_bot.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from tests.conftest import make_mock_numeric_question
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,6 @@ def _make_bot() -> TemplateForecaster:
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
-        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEAN,
         llms=llms,  # type: ignore[arg-type]
@@ -233,7 +232,7 @@ class TestEnsembleMixedFormats:
             _percentile_objs(_DECLARED_PERCENTILES_C),
         )
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
         _assert_metaculus_compliant_cdf(aggregated.cdf, q)
 
     @pytest.mark.asyncio
@@ -260,7 +259,7 @@ class TestEnsembleMixedFormats:
             _percentile_objs(_DECLARED_PERCENTILES_C),
         )
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEDIAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEDIAN)
         _assert_metaculus_compliant_cdf(aggregated.cdf, q)
 
 
@@ -292,7 +291,7 @@ class TestEnsembleAllMixture:
         pred_b = await _drive_forecast(bot, q, _mixture_only_rationale(_DECLARED_PERCENTILES_B, components_b), None)
         pred_c = await _drive_forecast(bot, q, _mixture_only_rationale(_DECLARED_PERCENTILES_C, components_c), None)
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
         _assert_metaculus_compliant_cdf(aggregated.cdf, q)
 
     @pytest.mark.asyncio
@@ -318,7 +317,7 @@ class TestEnsembleAllMixture:
         pred_b = await _drive_forecast(bot, q, _mixture_only_rationale(_DECLARED_PERCENTILES_B, components_b), None)
         pred_c = await _drive_forecast(bot, q, _mixture_only_rationale(_DECLARED_PERCENTILES_C, components_c), None)
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEDIAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEDIAN)
         _assert_metaculus_compliant_cdf(aggregated.cdf, q)
 
 
@@ -350,7 +349,7 @@ class TestEnsembleAllPercentiles:
             _percentile_objs(_DECLARED_PERCENTILES_C),
         )
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
         _assert_metaculus_compliant_cdf(aggregated.cdf, q)
 
     @pytest.mark.asyncio
@@ -380,7 +379,7 @@ class TestEnsembleAllPercentiles:
             _percentile_objs(_DECLARED_PERCENTILES_C),
         )
 
-        aggregated = await combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
+        aggregated = combine_numeric_predictions([pred_a, pred_b, pred_c], q, AggregationStrategy.MEAN)
 
         agg_probs = np.array([float(p.percentile) for p in aggregated.cdf])
         pred_a_probs = np.array([float(p.percentile) for p in pred_a.cdf])

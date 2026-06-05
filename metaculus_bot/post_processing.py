@@ -15,7 +15,7 @@ from metaculus_bot.constants import (
     PLATT_MC_MAX_ABS_DEVIATION,
     env_flag_enabled,
 )
-from metaculus_bot.discrete_snap import majority_votes_discrete, snap_distribution_to_integers
+from metaculus_bot.numeric.discrete_snap import majority_votes_discrete, snap_distribution_to_integers
 
 logger = logging.getLogger(__name__)
 

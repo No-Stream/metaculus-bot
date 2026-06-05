@@ -1,21 +1,26 @@
 """Research orchestration extracted from TemplateForecaster.
 
 Encapsulates provider selection, parallel execution, caching, gap-fill, and
-fallback logic. The TemplateForecaster delegates run_research/summarize_research
-to an instance of this class.
+fallback logic. The TemplateForecaster delegates run_research to an instance of
+this class. AskNews output is summarized into an analyst briefing inline (it's
+the only provider that returns raw article text rather than LLM-written prose);
+all other providers pass through raw.
 """
 
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable
 
+import openai
 from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.api_key_utils import get_openrouter_api_key
 from metaculus_bot.constants import (
     DEFAULT_MAX_CONCURRENT_RESEARCH,
+    EXA_API_KEY_ENV,
     FINANCIAL_DATA_ENABLED_ENV,
     GAP_FILL_ENABLED_ENV,
     GAP_FILL_MIN_RESEARCH_CHARS,
@@ -23,16 +28,43 @@ from metaculus_bot.constants import (
     GEMINI_SEARCH_MODEL_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
     NATIVE_SEARCH_MODEL_ENV,
+    OPENROUTER_API_KEY_ENV,
+    PERPLEXITY_API_KEY_ENV,
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.research_providers import (
+from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
     native_search_provider,
 )
 
 logger = logging.getLogger(__name__)
+
+# Summarizer failures that legitimately soft-fail to the raw AskNews articles:
+# transient LLM-provider hiccups (``openai.APIError`` is the common base for
+# litellm's connection/timeout/rate-limit/service-unavailable wrappers) and
+# asyncio timeouts. Anything outside this set — a prompt-construction bug, an
+# AttributeError from a refactor, a credential-routing regression — is a real
+# bug and must propagate rather than silently degrade every forecast's research.
+_SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    openai.APIError,
+)
+
+_LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
+
+
+def _demote_inner_headings(text: str) -> str:
+    """Shift any in-body h1/h2 heading down by two levels (h1→h3, h2→h4).
+
+    Provider headers are h2 (``_provider_header``). If an LLM-written body emits
+    its own h1/h2 (e.g. ``# Historical Context``), it sits at/above the provider
+    header and breaks the framework's ``report_sections_to_markdown``
+    renormalization, which degrades to the ugly ``[Hashtag]`` fallback. Demoting
+    keeps every provider header the minimum-level section.
+    """
+    return _LEADING_HEADING_RE.sub(lambda m: "##" + m.group(1), text)
 
 
 class ResearchOrchestrator:
@@ -79,7 +111,7 @@ class ResearchOrchestrator:
             research = await self._run_providers_parallel(question, providers)
 
             if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
-                from metaculus_bot.targeted_research import run_gap_fill_pass
+                from metaculus_bot.research.targeted import run_gap_fill_pass
 
                 addendum = await run_gap_fill_pass(
                     question,
@@ -110,7 +142,15 @@ class ResearchOrchestrator:
 
             return research
 
-    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+    async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
+        """Compress raw AskNews article markdown into an analyst briefing.
+
+        Only AskNews output flows here — it's the one provider that returns raw
+        article text rather than LLM-written prose. Soft-fails to the raw input
+        so a summarizer hiccup never drops the news entirely.
+        """
+        if not research.strip():
+            return research
         prompt = clean_indents(
             f"""
             You are a research analyst preparing a comprehensive intelligence briefing for an expert forecaster.
@@ -122,7 +162,7 @@ class ResearchOrchestrator:
             {question.resolution_criteria or ""}
             {question.fine_print or ""}
 
-            Below is raw research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
+            Below is raw news research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
 
             1. Extracts ALL facts, statistics, data points, and quantitative information relevant to the question
             2. Identifies expert opinions and attributes them to specific people/organizations
@@ -149,7 +189,15 @@ class ResearchOrchestrator:
             </research>
             """
         )
-        return await self._summarizer_llm.invoke(prompt)
+        try:
+            summary = await self._summarizer_llm.invoke(prompt)
+        except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
+            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
+            return research
+        if not summary.strip():
+            logger.warning("AskNews summarization returned blank output; using raw articles")
+            return research
+        return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
         cache_key = getattr(question, "id_of_question", None)
@@ -193,7 +241,7 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
-            from metaculus_bot.gemini_search_provider import gemini_search_provider
+            from metaculus_bot.research.gemini_search import gemini_search_provider
 
             gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
             providers.append(
@@ -204,12 +252,12 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
-            from metaculus_bot.financial_data_provider import financial_data_provider
+            from metaculus_bot.research.financial_data import financial_data_provider
 
             providers.append((financial_data_provider(), "financial_data"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            from metaculus_bot.prediction_market_provider import prediction_market_provider  # noqa: PLC0415
+            from metaculus_bot.research.prediction_market import prediction_market_provider  # noqa: PLC0415
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
@@ -227,13 +275,25 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
     ) -> str:
-        from metaculus_bot.research_providers import is_asknews_subscription_error
+        from metaculus_bot.research.providers import is_asknews_subscription_error
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
             try:
+                used_fallback = False
                 if name == "asknews" and self._allow_research_fallback:
-                    return (await self._fetch_research_with_fallback(question, provider, name), name)
-                return (await provider(question), name)
+                    raw, used_fallback = await self._fetch_research_with_fallback(question, provider, name)
+                else:
+                    raw = await provider(question)
+                # AskNews returns raw article markdown (no LLM prose); summarize it
+                # into an analyst briefing. Every other provider already emits
+                # LLM-written prose (native search, Gemini, Perplexity, Exa) or
+                # deterministic tables (financial, prediction markets), so they
+                # pass through raw — no lossy second-pass summarization. When
+                # AskNews fails and we fall back to Perplexity/Exa, that fallback
+                # is already prose, so skip summarization too.
+                if name == "asknews" and not used_fallback:
+                    raw = await self._summarize_asknews(question, raw)
+                return (raw, name)
             except Exception as e:
                 if name == "asknews" and is_asknews_subscription_error(e):
                     logger.info(
@@ -257,7 +317,7 @@ class ResearchOrchestrator:
         for result, name in results:
             if result and result.strip():
                 header = self._provider_header(name)
-                combined_parts.append(f"{header}\n{result}")
+                combined_parts.append(f"{header}\n{_demote_inner_headings(result)}")
 
         return "\n\n---\n\n".join(combined_parts) if combined_parts else ""
 
@@ -280,26 +340,41 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """Return (research_text, used_fallback).
+
+        used_fallback is True when the primary (AskNews) failed and a prose
+        fallback provider (Perplexity/Exa) supplied the result instead — the
+        caller uses this to skip AskNews summarization on already-prose output.
+        """
         try:
-            return await provider(question)
+            return (await provider(question), False)
         except Exception as exc:
             if self._allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
                 fallback = await self._attempt_research_fallback(question.question_text)
                 if fallback is not None:
-                    return fallback
+                    return (fallback, True)
             raise
 
     async def _attempt_research_fallback(self, question_text: str) -> str | None:
+        # Ordering intentionally differs from the primary selector
+        # (choose_provider_with_name: AskNews -> Exa -> Perplexity -> OpenRouter).
+        # This fallback only fires when AskNews (always the primary in prod) has
+        # already failed, so AskNews is excluded. Among the remaining options we
+        # prefer the Perplexity-via-OpenRouter route first (cheap, prose-returning,
+        # routed through the donated-key wrapper), then direct Perplexity, then
+        # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
+        # expensive path). The primary selector orders by index quality, not cost,
+        # which is why the two lists diverge by design.
         try:
-            if os.getenv("OPENROUTER_API_KEY"):
+            if os.getenv(OPENROUTER_API_KEY_ENV):
                 logger.info("Falling back to openrouter/perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=True)
-            if os.getenv("PERPLEXITY_API_KEY"):
+            if os.getenv(PERPLEXITY_API_KEY_ENV):
                 logger.info("Falling back to Perplexity for research")
                 return await self._call_perplexity(question_text, use_open_router=False)
-            if os.getenv("EXA_API_KEY"):
+            if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
                 return await self._call_exa_smart_searcher(question_text)
         except Exception as fallback_exc:
