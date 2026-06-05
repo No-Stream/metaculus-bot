@@ -3,6 +3,31 @@
 General coding guidelines (style, testing, error handling, etc.) are in `~/.claude/CLAUDE.md`.
 This file covers **repo-specific** context only.
 
+## ⚠️ Cost discipline — never run a paid run without asking
+
+**Any command that hits live LLM / research APIs spends real money (OpenRouter
+credits, AskNews, Exa, Perplexity, Google). NEVER launch one autonomously — ask
+first, every time, even after a clean build / passing tests / clean `/forge`.**
+This is a hard gate, not a courtesy: a single broad run can burn meaningful
+credits, and `--mode test_questions` also **publishes comments to Metaculus**
+(a visible external action that pings nothing but is hard to retract).
+
+Paid / external-effecting commands (ask before each):
+
+- `python main.py` / `make run` in any live mode (`--mode test_questions`,
+  `tournament`, `metaculus_cup`, `minibench`) — spends API credits AND publishes.
+- `make backtest_*` (`smoke`/`small`/`medium`/`large`) — spends API credits on
+  every forecaster + research call (no publish, but real money; `large`=100 Qs).
+- Anything invoking research providers or the ensemble against real questions.
+
+Free / safe (run freely): `make test`, `make lint`, `make format`,
+`make check_credits`, `make benchmark_display` (views old results), and any
+unit/integration test — the suite is self-contained and hits no paid APIs.
+
+When verification needs a paid run, surface the exact command + rough cost and
+let the user decide. Unit/integration coverage is the default proof of
+correctness; live runs are opt-in.
+
 ## Repo-Specific Overrides
 
 - **Python**: 3.11+ (see `pyproject.toml`)

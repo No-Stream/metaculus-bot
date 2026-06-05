@@ -1260,3 +1260,197 @@ class TestProducerConsumerRoundTrip:
         assert "gpt body." in reasoning["gpt-5.5"]
         assert "claude body." in reasoning["claude-opus-4.7"]
         assert "gemini body." in reasoning["gemini-3.1-pro-preview"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: oversized comments must construct report objects without raising
+# the framework's "Explanation must start with a '#'" ValidationError.
+# (2026-06-05 crash: binary Q578 + MC Q20683 forecast fine but crashed on report
+# construction because the trimmed explanation lost its leading "#".)
+# ---------------------------------------------------------------------------
+
+
+class TestOversizedCommentReportConstruction:
+    """The trimmed explanation must always satisfy the framework validator.
+
+    forecast_report.py validate_explanation_starts_with_hash rejects any
+    explanation not starting with '#'. We build an oversized 6-model unified
+    explanation (research bloated past COMMENT_CHAR_LIMIT) through the real
+    build_unified_explanation path, then construct the concrete report types to
+    prove no ValidationError fires — the exact 2026-06-05 crash on Q578/Q20683.
+    """
+
+    def _oversized_explanation(self, question: object) -> str:
+        from metaculus_bot.comment.formatting import build_unified_explanation
+        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
+
+        summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
+        rationales = "\n".join(
+            f"## R1: Forecaster {i} Reasoning\nModel: openrouter/provider/m{i}\nrationale body {i}" for i in range(1, 7)
+        )
+        base = (
+            "# SUMMARY\n*Question*: will X?\n\n"
+            "## Report 1 Summary\n### Forecasts\n"
+            f"{summary}\n\n"
+            "### Research Summary\n_Full research in the RESEARCH section below._\n\n"
+            "# RESEARCH\n## Report 1 Research\n" + ("research_token " * 30_000) + "\n\n# FORECASTS\n" + rationales
+        )
+        out = build_unified_explanation(base, question, AggregationStrategy.CONDITIONAL_STACKING, "primary")
+        assert len(out) <= COMMENT_CHAR_LIMIT
+        assert out.lstrip().startswith("#")
+        return out
+
+    def test_binary_report_constructs_from_oversized_comment(self) -> None:
+        from forecasting_tools.data_models.binary_report import BinaryReport
+
+        question = BinaryQuestion(
+            question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
+        )
+        explanation = self._oversized_explanation(question)
+        # Must not raise ValidationError on the explanation field.
+        report = BinaryReport(question=question, explanation=explanation, prediction=0.73)
+        assert report.explanation.lstrip().startswith("#")
+
+    def test_mc_report_constructs_from_oversized_comment(self) -> None:
+        from forecasting_tools import MultipleChoiceQuestion
+        from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport, PredictedOptionList
+
+        question = MultipleChoiceQuestion(
+            question_text="Which option?",
+            background_info="bg",
+            resolution_criteria="rc",
+            fine_print="",
+            options=["Yes", "No"],
+        )
+        explanation = self._oversized_explanation(question)
+        prediction = PredictedOptionList(
+            predicted_options=[
+                {"option_name": "Yes", "probability": 0.6},
+                {"option_name": "No", "probability": 0.4},
+            ]
+        )
+        report = MultipleChoiceReport(question=question, explanation=explanation, prediction=prediction)
+        assert report.explanation.lstrip().startswith("#")
+
+
+class TestResearchNotDuplicatedInComment:
+    """Guard the forecaster.py dedup fix: research must appear ONCE in the
+    published comment (under # RESEARCH), not twice (also under ### Research
+    Summary). Reverting summary_report back to the full corpus would double the
+    comment size and reintroduce the trim pressure that caused the crash.
+
+    We drive the framework's real _create_unified_explanation with a stub
+    summary_report (what forecaster.py now sets) + full research_report, and
+    assert the research sentinel appears exactly once.
+    """
+
+    def test_research_appears_once_when_summary_report_is_stub(self) -> None:
+        bot = _make_bot(AggregationStrategy.MEAN)
+        q = BinaryQuestion(
+            question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
+        )
+        research_sentinel = "UNIQUE_RESEARCH_SENTINEL_42"
+        collection = ResearchWithPredictions(
+            research_report=f"## Web Research\n{research_sentinel} body text",
+            summary_report="_Full research in the RESEARCH section below._",
+            errors=[],
+            predictions=[ReasonedPrediction(prediction_value=0.6, reasoning="Model: x\nreasoning")],
+        )
+        explanation = bot._create_unified_explanation(q, [collection], 0.6, 0.01, 1.0)
+        assert explanation.count(research_sentinel) == 1, "research must not be duplicated into the summary section"
+        # The stub pointer rides in the summary section; research lives under # RESEARCH.
+        assert "_Full research in the RESEARCH section below._" in explanation
+        assert "### Research Summary" in explanation
+
+
+class TestOfflineAssemblySmoke:
+    """Full _create_unified_explanation path with a 6-model stacked collection —
+    mirrors what a real test_questions run produces for Q578/Q20683, but offline
+    (no API spend). Two cases: a healthy comment (research present once, real
+    headings, under limit) and an oversized one (validator invariant + markers +
+    report construction hold even when the trim sacrifices research).
+    """
+
+    def _bot_and_question(self):
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = BinaryQuestion(
+            question_text="Will it happen?", background_info="bg", resolution_criteria="rc", fine_print=""
+        )
+        q.id_of_question = 578  # _create_unified_explanation reads the outcome by qid
+        bot._stacker_outcome[q.id_of_question] = "primary"
+        return bot, q
+
+    def _research_report(self, sentinel: str, *, token_reps: int) -> str:
+        # Mirror the orchestrator's output: h2 provider headers with in-body
+        # headings already demoted to >= h3 (by _demote_inner_headings). The
+        # framework's report_sections_to_markdown renormalizes cleanly when the
+        # first section is the minimum level, so no [Hashtag] fallback fires.
+        provider_a = (
+            "## News Articles (AskNews)\n"
+            "### Historical Context\n"
+            + (f"{sentinel} " + "asknews_token " * token_reps)
+            + "\n### Recent Developments\nmore"
+        )
+        provider_b = "## Web Research (Native Search)\n### Findings\n" + ("native_token " * token_reps)
+        return f"{provider_a}\n\n---\n\n{provider_b}"
+
+    def _predictions(self, *, token_reps: int):
+        return [
+            ReasonedPrediction(
+                prediction_value=0.60 + i * 0.01,
+                reasoning=f"Model: openrouter/provider/model-{i}\n" + (f"rationale {i} " * token_reps),
+            )
+            for i in range(1, 7)
+        ]
+
+    def test_healthy_6model_comment_assembles_with_research_and_real_headings(self) -> None:
+        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
+
+        bot, q = self._bot_and_question()
+        sentinel = "RESEARCH_ONCE_SENTINEL"
+        collection = ResearchWithPredictions(
+            research_report=self._research_report(sentinel, token_reps=300),
+            summary_report="_Full research in the RESEARCH section below._",
+            errors=[],
+            predictions=self._predictions(token_reps=300),
+        )
+
+        explanation = bot._create_unified_explanation(q, [collection], 0.65, 1.23, 4.5)
+
+        assert explanation.lstrip().startswith("#")
+        assert len(explanation) <= COMMENT_CHAR_LIMIT
+        # Healthy comment: research carried exactly once (the dedup fix), and the
+        # provider's in-body headings render as real markdown (no degrade).
+        assert explanation.count(sentinel) == 1
+        assert "[Hashtag]" not in explanation
+        assert "### Historical Context" in explanation
+        # Residual-analysis markers present.
+        assert "<!-- STACKER_OUTCOME=primary -->" in explanation
+        assert "<!-- STACKED=true -->" in explanation
+
+    def test_oversized_6model_comment_holds_invariant_and_constructs(self) -> None:
+        from forecasting_tools.data_models.binary_report import BinaryReport
+
+        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
+
+        bot, q = self._bot_and_question()
+        # Large rationales force the comment well past the limit; research is
+        # sacrificed first by design, so we don't assert it survives — only that
+        # the invariant, markers, and report construction hold.
+        collection = ResearchWithPredictions(
+            research_report=self._research_report("dropped", token_reps=4_000),
+            summary_report="_Full research in the RESEARCH section below._",
+            errors=[],
+            predictions=self._predictions(token_reps=4_000),
+        )
+
+        explanation = bot._create_unified_explanation(q, [collection], 0.65, 1.23, 4.5)
+
+        assert explanation.lstrip().startswith("#"), "validator invariant — the crash contract"
+        assert len(explanation) <= COMMENT_CHAR_LIMIT
+        assert "[Hashtag]" not in explanation
+        assert "<!-- STACKER_OUTCOME=primary -->" in explanation
+        assert "<!-- STACKED=true -->" in explanation
+        # The exact 2026-06-05 crash: report construction must not raise.
+        report = BinaryReport(question=q, explanation=explanation, prediction=0.65)
+        assert report.explanation.lstrip().startswith("#")

@@ -551,9 +551,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
-        # AskNews is summarized inline in the orchestrator; everything else is
-        # raw LLM prose. There is no separate whole-corpus summarization pass.
-        summary_report = research
+        # A stub, not the full corpus: the framework embeds summary_report under
+        # "### Research Summary" and research_report under "# RESEARCH", so
+        # setting both to `research` duplicated it and bloated the comment past
+        # the char limit. The "### Research Summary" heading is emitted
+        # regardless of body, so the trim anchor and parser markers survive.
+        summary_report = "_Full research in the RESEARCH section below._"
         research_to_use = research
 
         qid_for_log = question.id_of_question

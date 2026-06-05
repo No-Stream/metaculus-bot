@@ -10,6 +10,7 @@ all other providers pass through raw.
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable
 
 import openai
@@ -50,6 +51,20 @@ _SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     openai.APIError,
 )
+
+_LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
+
+
+def _demote_inner_headings(text: str) -> str:
+    """Shift any in-body h1/h2 heading down by two levels (h1→h3, h2→h4).
+
+    Provider headers are h2 (``_provider_header``). If an LLM-written body emits
+    its own h1/h2 (e.g. ``# Historical Context``), it sits at/above the provider
+    header and breaks the framework's ``report_sections_to_markdown``
+    renormalization, which degrades to the ugly ``[Hashtag]`` fallback. Demoting
+    keeps every provider header the minimum-level section.
+    """
+    return _LEADING_HEADING_RE.sub(lambda m: "##" + m.group(1), text)
 
 
 class ResearchOrchestrator:
@@ -302,7 +317,7 @@ class ResearchOrchestrator:
         for result, name in results:
             if result and result.strip():
                 header = self._provider_header(name)
-                combined_parts.append(f"{header}\n{result}")
+                combined_parts.append(f"{header}\n{_demote_inner_headings(result)}")
 
         return "\n\n---\n\n".join(combined_parts) if combined_parts else ""
 

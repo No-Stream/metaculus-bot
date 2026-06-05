@@ -50,15 +50,24 @@ def test_trim_section_noop_when_within_limit() -> None:
 
 
 def test_trim_final_comment_falls_back_to_tail_when_no_marker() -> None:
-    # Payload without "### Research Summary" must take the fallback path.
-    payload = "PREFIX\n" + ("0123456789" * math.ceil((COMMENT_CHAR_LIMIT + 250) / 10))
+    # Payload with neither "### Research Summary" nor # RESEARCH / # FORECASTS
+    # structure must take the last-resort header-preserving fallback. This is
+    # the exact crash scenario from the 2026-06-05 log: a "# SUMMARY ..." blob
+    # with no recognizable sections that overflows the limit. The fallback must
+    # preserve the leading "#" line so the framework's
+    # validate_explanation_starts_with_hash validator never rejects it.
+    header = "# SUMMARY"
+    payload = header + "\n" + ("0123456789" * math.ceil((COMMENT_CHAR_LIMIT + 250) / 10))
     trimmed = trim_comment(payload)
 
-    assert trimmed.startswith(TRIM_NOTICE)
-    tail_length = COMMENT_CHAR_LIMIT - len(TRIM_NOTICE) - 1
-    assert tail_length > 0
+    assert trimmed.lstrip().startswith("#"), "output must remain '#'-leading (validator invariant)"
+    assert trimmed.startswith(header)
+    assert TRIM_NOTICE in trimmed
     assert len(trimmed) == COMMENT_CHAR_LIMIT
-    assert trimmed.endswith(payload[-tail_length:])
+    # The tail of the original payload must survive after header + notice.
+    available = COMMENT_CHAR_LIMIT - len(header) - len(TRIM_NOTICE) - 2
+    assert available > 0
+    assert trimmed.endswith(payload[-available:])
 
 
 def test_trim_final_comment_noop_when_short() -> None:
@@ -194,10 +203,13 @@ class TestStructuredTrim:
         for idx, _, value in SUMMARY_BULLETS:
             assert f"*Forecaster {idx}*: {value}" in trimmed
 
-    def test_head_over_budget_falls_back_to_tail_only(self) -> None:
+    def test_head_over_budget_falls_back_to_header_and_tail(self) -> None:
         # Absurdly-long summary head — e.g. a runaway model dump before
-        # Research Summary. The head exceeds head_budget, so we fall back
-        # to the plain tail-only trim path rather than blow the limit.
+        # Research Summary — with no # RESEARCH/# FORECASTS structure. The
+        # summary_and_tail path bails (head exceeds head_budget), so we fall
+        # through to the header-preserving last-resort trim. It must keep the
+        # leading "# SUMMARY" line (validator invariant) rather than prepend
+        # the notice and drop the header.
         cfg = TrimConfig(head_budget=500)  # tight head cap to force fallback
         bloated_summary = "*Forecaster 1*: 50%\n" + ("x" * 10_000)
         comment = (
@@ -205,8 +217,8 @@ class TestStructuredTrim:
         )
         assert len(comment) > cfg.comment_limit
         trimmed = trim_comment(comment, config=cfg)
-        # Fallback path starts with the notice, keeps the final tail.
-        assert trimmed.startswith(TRIM_NOTICE)
+        assert trimmed.startswith("# SUMMARY"), "header-preserving fallback must keep the leading '#' line"
+        assert TRIM_NOTICE in trimmed
         assert len(trimmed) <= cfg.comment_limit
 
     def test_middle_gets_dropped_not_head_or_tail(self) -> None:
@@ -231,6 +243,148 @@ class TestStructuredTrim:
         assert head_sentinel in trimmed
         assert tail_sentinel in trimmed
         assert middle_sentinel not in trimmed
+
+
+# ---------------------------------------------------------------------------
+# Section-aware research-first trim (primary strategy)
+# ---------------------------------------------------------------------------
+
+
+def _build_sectioned_comment(
+    *,
+    summary_body: str,
+    research_body: str,
+    forecasts_body: str,
+    trailing_markers: str = "<!-- STACKED=true -->\n<!-- TOOLS_USED=false -->",
+) -> str:
+    """Mirror the framework's unified comment: # SUMMARY / # RESEARCH / # FORECASTS.
+
+    Matches forecast_bot.py:538-550 — the comment always opens with # SUMMARY
+    and carries # RESEARCH and # FORECASTS as top-level (h1) sections, with the
+    residual-analysis markers trailing after the FORECASTS rationales.
+    """
+    return (
+        "# SUMMARY\n"
+        "*Question*: will X?\n\n"
+        "## Report 1 Summary\n"
+        "### Forecasts\n"
+        f"{summary_body}\n\n"
+        "### Research Summary\n"
+        "_Full research in the RESEARCH section below._\n\n"
+        "# RESEARCH\n"
+        "## Report 1 Research\n"
+        f"{research_body}\n\n"
+        "# FORECASTS\n"
+        f"{forecasts_body}\n"
+        f"{trailing_markers}\n"
+    )
+
+
+class TestResearchFirstTrim:
+    """The primary strategy: shrink # RESEARCH before SUMMARY/FORECASTS."""
+
+    def test_research_shrunk_first_summary_and_forecasts_survive(self) -> None:
+        summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
+        # Sentinel sits at the END of the research body — research is summary-
+        # style and front-loaded, so the trim keeps the front and drops the
+        # tail, taking this sentinel with it.
+        research = ("research_token " * 30_000) + " RESEARCH_SENTINEL"  # forces overflow
+        forecasts = "FORECASTS_SENTINEL\n" + "\n".join(
+            f"## R1: Forecaster {i} Reasoning\nModel: openrouter/provider/m{i}\nrationale body" for i in range(1, 7)
+        )
+        comment = _build_sectioned_comment(summary_body=summary, research_body=research, forecasts_body=forecasts)
+        assert len(comment) > COMMENT_CHAR_LIMIT, "precondition: must overflow"
+
+        trimmed = trim_comment(comment)
+
+        assert len(trimmed) <= COMMENT_CHAR_LIMIT
+        assert trimmed.lstrip().startswith("#")
+        # SUMMARY survives whole: every bullet + the Research Summary marker.
+        assert "### Research Summary" in trimmed
+        for i in range(1, 7):
+            assert f"*Forecaster {i}*: {60 + i}.0%" in trimmed
+        # FORECASTS survives whole.
+        assert "FORECASTS_SENTINEL" in trimmed
+        for i in range(1, 7):
+            assert f"## R1: Forecaster {i} Reasoning" in trimmed
+        # Research middle is sacrificed.
+        assert "RESEARCH_SENTINEL" not in trimmed
+        assert TRIM_NOTICE in trimmed
+        # Trailing residual-analysis markers survive.
+        assert "<!-- STACKED=true -->" in trimmed
+        assert "<!-- TOOLS_USED=false -->" in trimmed
+
+    def test_summary_and_tail_fallback_when_head_plus_tail_overflow(self) -> None:
+        # When head + tail alone overflow (massive FORECASTS body), research-
+        # first bails (research_budget < 0) and the summary-and-tail path takes
+        # over. The trim must still produce a valid '#'-leading string within
+        # the limit, preserving the SUMMARY head and the trailing markers.
+        summary = "\n".join(f"*Forecaster {i}*: {60 + i}.0%" for i in range(1, 7))
+        research = "research " * 5_000
+        forecasts = "FORECASTS_HEAD\n" + ("fcast_token " * 30_000)  # huge tail
+        comment = _build_sectioned_comment(summary_body=summary, research_body=research, forecasts_body=forecasts)
+        assert len(comment) > COMMENT_CHAR_LIMIT
+
+        trimmed = trim_comment(comment)
+
+        assert len(trimmed) <= COMMENT_CHAR_LIMIT
+        assert trimmed.lstrip().startswith("#")
+        # SUMMARY is preserved even in this extreme case.
+        assert "### Research Summary" in trimmed
+        for i in range(1, 7):
+            assert f"*Forecaster {i}*: {60 + i}.0%" in trimmed
+        # Research body is gone entirely.
+        assert "research research" not in trimmed
+        assert TRIM_NOTICE in trimmed
+        # Trailing residual-analysis markers (at the very end) survive.
+        assert "<!-- STACKED=true -->" in trimmed
+        assert "<!-- TOOLS_USED=false -->" in trimmed
+
+
+# ---------------------------------------------------------------------------
+# Leading-'#' invariant: for any '#'-leading input (the framework's contract —
+# every comment opens with "# SUMMARY"), trim_comment's output also starts with
+# '#', so validate_explanation_starts_with_hash can never reject it. This is the
+# contract that makes the 2026-06-05 crash structurally impossible.
+# ---------------------------------------------------------------------------
+
+
+def _invariant_shapes() -> list[str]:
+    big = COMMENT_CHAR_LIMIT + 50_000
+    return [
+        # Sectioned, with Research Summary marker, just over the limit.
+        _build_sectioned_comment(
+            summary_body="*Forecaster 1*: 50%",
+            research_body="r " * (big // 2),
+            forecasts_body="rationale",
+        ),
+        # Sectioned, no trailing markers.
+        _build_sectioned_comment(
+            summary_body="*Forecaster 1*: 50%",
+            research_body="r " * (big // 2),
+            forecasts_body="rationale",
+            trailing_markers="",
+        ),
+        # Has ### Research Summary but no # RESEARCH/# FORECASTS structure.
+        "# SUMMARY\n*Forecaster 1*: 50%\n### Research Summary\n" + ("body " * (big // 5)),
+        # The exact crash shape: # SUMMARY blob, no markers, overflowing.
+        "# SUMMARY\n" + ("x" * big),
+        # Leading "\n# SUMMARY..." with no sections — the framework's
+        # clean_indents output starts with a newline, so the last-resort trim
+        # must skip it and keep the "#" header line.
+        "\n# SUMMARY\n" + ("x" * big),
+        # Degenerate single-line '# x' that somehow overflows.
+        "# " + ("y" * big),
+        # No leading newline structure at all (still starts with #).
+        "#" + ("z" * big),
+    ]
+
+
+@pytest.mark.parametrize("shape", _invariant_shapes())
+def test_trim_comment_output_always_starts_with_hash(shape: str) -> None:
+    out = trim_comment(shape)
+    assert out.lstrip().startswith("#"), f"invariant violated for shape starting {shape[:40]!r}"
+    assert len(out) <= COMMENT_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -405,3 +559,52 @@ class TestAgainstRealHistoricalData:
         assert parse_per_model_forecasts(trimmed) == original_forecasts
         # STACKED marker behavior must match (tail is preserved either way).
         assert parse_stacked_marker(trimmed) == original_stacked
+
+    def test_every_real_comment_inflated_holds_invariant_and_parses(self) -> None:
+        """Replay over ALL stored comments, not just one hand-picked example.
+
+        For every real comment in the Q2 dataset: inflate its research section
+        past the limit, trim, and assert the trimmed output (a) stays within the
+        limit, (b) starts with '#' (the validator invariant — the exact contract
+        whose violation crashed Q578/Q20683), and (c) round-trips the per-model
+        forecasts and STACKED marker that residual analysis depends on. This is
+        the closest thing to a production replay without spending API credits.
+        """
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_per_model_forecasts,
+            parse_stacked_marker,
+        )
+
+        comments = self._load_real_comments()
+        assert comments, "precondition: some real comments must exist"
+
+        marker = "### Research Summary"
+        checked = 0
+        for original in comments:
+            # Only comments with the structured marker are inflatable in a way
+            # that mirrors production; skip the rare ones without it (already
+            # covered by the synthetic no-marker invariant test).
+            idx = original.find(marker)
+            if idx < 0:
+                continue
+
+            original_forecasts = parse_per_model_forecasts(original)
+            original_stacked = parse_stacked_marker(original)
+
+            inflated = (
+                original[: idx + len(marker)] + "\n" + ("filler_token " * 15_000) + "\n" + original[idx + len(marker) :]
+            )
+            assert len(inflated) > COMMENT_CHAR_LIMIT, "precondition: inflated must overflow"
+
+            trimmed = trim_comment(inflated)
+
+            assert len(trimmed) <= COMMENT_CHAR_LIMIT, f"trim exceeded limit ({len(trimmed)})"
+            assert trimmed.lstrip().startswith("#"), "validator invariant violated on a real comment"
+            # Per-model forecasts in the SUMMARY head must survive unchanged.
+            if original_forecasts:
+                assert parse_per_model_forecasts(trimmed) == original_forecasts
+            # STACKED marker (tail) must survive unchanged.
+            assert parse_stacked_marker(trimmed) == original_stacked
+            checked += 1
+
+        assert checked >= 50, f"expected to exercise dozens of real comments, only hit {checked}"

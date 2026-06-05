@@ -359,3 +359,52 @@ class TestIntegrationWithTemplateForecaster:
         )
         bot._research.timeout_count = 5
         assert bot._research_provider_timeout_count == 5
+
+
+class TestDemoteInnerHeadings:
+    """Provider bodies must not carry headings at/above the h2 provider header.
+
+    Otherwise the framework's report_sections_to_markdown raises ("First section
+    must be at the highest heading level") and degrades to the [Hashtag] fallback.
+    """
+
+    def test_demotes_h1_and_h2_to_at_least_h3(self) -> None:
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = "# Historical Context\nbody\n## Recent Developments\nmore\n### Already deep\nkept"
+        out = _demote_inner_headings(body)
+        assert "### Historical Context" in out  # h1 -> h3
+        assert "#### Recent Developments" in out  # h2 -> h4
+        assert "### Already deep" in out  # h3 untouched
+        assert not out.startswith("# "), "must not start with h1"
+        assert "\n# " not in out, "no h1 on any line"
+        assert not out.startswith("## "), "must not start with h2"
+        assert "\n## " not in out, "no h2 on any line"
+
+    def test_inline_hash_not_treated_as_heading(self) -> None:
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = "Issue #42 and C# are not headings\n# Real Heading"
+        out = _demote_inner_headings(body)
+        assert "Issue #42 and C# are not headings" in out
+        assert "### Real Heading" in out
+
+    def test_combined_research_first_section_is_minimum_level(self) -> None:
+        """After normalization, every provider's h2 header outranks its body.
+
+        The first section of the combined string must be the minimum heading
+        level so the framework wouldn't raise on it.
+        """
+        import re
+
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        # Simulate the assembly: h2 provider header + a body that had its own h1.
+        provider_body = "# Historical Context\nstuff\n## Recent\nmore"
+        combined = f"## News Articles (AskNews)\n{_demote_inner_headings(provider_body)}"
+
+        heading_levels = [len(m.group(1)) for m in re.finditer(r"^(#+)\s", combined, re.MULTILINE)]
+        assert heading_levels, "precondition: combined must contain headings"
+        # The first heading (provider header, h2) must be the minimum.
+        assert heading_levels[0] == min(heading_levels)
+        assert heading_levels[0] == 2
