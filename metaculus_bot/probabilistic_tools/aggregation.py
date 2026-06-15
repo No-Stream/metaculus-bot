@@ -4,7 +4,12 @@ import logging
 
 import numpy as np
 
-from metaculus_bot.probabilistic_tools._numeric_helpers import logit, resolve_weights, sigmoid
+from metaculus_bot.probabilistic_tools._numeric_helpers import (
+    logit,
+    resolve_weights,
+    sigmoid,
+    validate_option_prob_dicts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,27 +105,11 @@ def linear_pool_options(
     probability (no Dirichlet Monte Carlo is performed — the name reflects
     the actual behavior).
     """
-    if not option_prob_lists:
-        raise ValueError("option_prob_lists must be non-empty")
-
-    first_keys = set(option_prob_lists[0].keys())
-    if not first_keys:
-        raise ValueError("option_prob_lists entries must be non-empty dicts")
-    for i, d in enumerate(option_prob_lists):
-        if set(d.keys()) != first_keys:
-            raise ValueError(f"option dict {i} has keys {set(d.keys())}, expected {first_keys}")
-        total = 0.0
-        for k, v in d.items():
-            if not (0.0 <= v <= 1.0):
-                raise ValueError(f"option dict {i} probability for {k!r} not in [0,1] (got {v})")
-            total += v
-        if abs(total - 1.0) > 0.02:
-            raise ValueError(f"option dict {i} sum {total} not within 0.02 of 1.0")
+    ordered_keys = validate_option_prob_dicts(option_prob_lists)
 
     w = resolve_weights(weights, len(option_prob_lists))
     w_sum = float(w.sum())
 
-    ordered_keys = list(option_prob_lists[0].keys())
     result: dict[str, float] = {}
     for key in ordered_keys:
         vals = np.array([d[key] for d in option_prob_lists], dtype=float)

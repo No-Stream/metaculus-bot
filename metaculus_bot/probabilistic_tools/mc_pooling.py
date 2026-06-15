@@ -23,32 +23,10 @@ import logging
 import numpy as np
 
 from metaculus_bot.prob_math_utils import PROB_CLAMP_EPS, clamp_prob
+from metaculus_bot.probabilistic_tools._numeric_helpers import validate_option_prob_dicts
 from metaculus_bot.probabilistic_tools.mc_discrete import dirichlet_with_other
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_option_vectors(option_prob_vectors: list[dict[str, float]]) -> list[str]:
-    """Validate shared keys, [0,1] range, and ~1.0 normalization. Return ordered keys."""
-    if not option_prob_vectors:
-        raise ValueError("option_prob_vectors must be non-empty")
-
-    first_keys = set(option_prob_vectors[0].keys())
-    if not first_keys:
-        raise ValueError("option_prob_vectors entries must be non-empty dicts")
-
-    for i, vec in enumerate(option_prob_vectors):
-        if set(vec.keys()) != first_keys:
-            raise ValueError(f"option vector {i} has keys {set(vec.keys())}, expected {first_keys}")
-        total = 0.0
-        for k, v in vec.items():
-            if not (0.0 <= v <= 1.0):
-                raise ValueError(f"option vector {i} probability for {k!r} not in [0,1] (got {v})")
-            total += v
-        if abs(total - 1.0) > 0.02:
-            raise ValueError(f"option vector {i} sum {total} not within 0.02 of 1.0")
-
-    return list(option_prob_vectors[0].keys())
 
 
 def _smooth_toward_uniform(pooled: dict[str, float], concentration: float) -> dict[str, float]:
@@ -100,7 +78,7 @@ def pool_mc(
     Returns:
         A single {option_name -> probability} dict that sums to 1.0.
     """
-    keys = _validate_option_vectors(option_prob_vectors)
+    keys = validate_option_prob_dicts(option_prob_vectors)
     n_forecasters = len(option_prob_vectors)
 
     # Geometric mean per option in log space (floor zeros so log stays finite).

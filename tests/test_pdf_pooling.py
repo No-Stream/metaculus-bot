@@ -13,7 +13,9 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from scipy.stats import norm
 
 from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.probabilistic_tools.pdf_pooling import (
+    _question_grid,
     apply_tail_floor,
     log_pool_cdfs,
     vincentize_cdfs,
@@ -59,14 +61,19 @@ def _assert_valid_cdf(
     *,
     n_points: int = PCHIP_CDF_POINTS,
     min_step: float = MIN_CDF_PROB_STEP,
+    expected_grid: np.ndarray | None = None,
 ) -> None:
     """Validity = right length, strictly increasing probs, in [0,1], endpoints respect
-    open/closed bounds, min-step satisfied, x-grid matches the question's linspace."""
+    open/closed bounds, min-step satisfied, x-grid matches the expected grid.
+
+    ``expected_grid`` defaults to the linear ``linspace`` grid (linear-scaled questions);
+    pass the geometric grid for zero_point (log-scaled) questions."""
     assert len(cdf) == n_points
     probs = _probs(cdf)
     vals = _values(cdf)
 
-    expected_grid = np.linspace(float(question.lower_bound), float(question.upper_bound), n_points)
+    if expected_grid is None:
+        expected_grid = np.linspace(float(question.lower_bound), float(question.upper_bound), n_points)
     np.testing.assert_allclose(vals, expected_grid, rtol=0, atol=1e-9)
 
     assert np.all(probs >= 0.0 - 1e-12)
@@ -229,3 +236,63 @@ class TestLogPoolCdfs:
         x50_balanced = float(np.interp(0.5, _probs(balanced), _values(balanced)))
         x50_high = float(np.interp(0.5, _probs(high_weighted), _values(high_weighted)))
         assert x50_high > x50_balanced
+
+
+class TestQuestionGridZeroPoint:
+    """The x-value grid a pooled CDF is projected onto must match the production CDF grid:
+    geometric for zero_point (log-scaled) questions, linear otherwise. The Metaculus scorer
+    buckets resolutions on the geometric grid, so a zero_point pooled CDF projected onto a
+    linear grid would land its mass in the wrong buckets and score systematically wrong.
+    """
+
+    def test_linear_grid_matches_production_grid_when_zero_point_is_none(self):
+        # Linear branch must equal the production CDF grid (pchip_cdf.build_cdf_value_grid),
+        # which is lower + (upper-lower)*t -- equal to np.linspace up to float rounding.
+        question = make_mock_numeric_question(lower_bound=0.0, upper_bound=100.0, zero_point=None)
+        grid = _question_grid(question, PCHIP_CDF_POINTS)
+        expected = build_cdf_value_grid(0.0, 100.0, None, PCHIP_CDF_POINTS)
+        np.testing.assert_array_equal(grid, expected)
+        # And it tracks np.linspace to float tolerance (the old _question_grid form).
+        np.testing.assert_allclose(grid, np.linspace(0.0, 100.0, PCHIP_CDF_POINTS), rtol=0, atol=1e-9)
+
+    def test_grid_is_geometric_when_zero_point_set(self):
+        # A log-scaled question (zero_point set) must produce the geometric grid, NOT linspace.
+        lower, upper, zero_point = 1.0, 1000.0, 0.0
+        question = make_mock_numeric_question(lower_bound=lower, upper_bound=upper, zero_point=zero_point)
+        grid = _question_grid(question, PCHIP_CDF_POINTS)
+
+        expected_geometric = build_cdf_value_grid(lower, upper, zero_point, PCHIP_CDF_POINTS)
+        np.testing.assert_allclose(grid, expected_geometric, rtol=0, atol=1e-9)
+
+        # And it must NOT be the linear grid — guards against a regression to np.linspace.
+        linear = np.linspace(lower, upper, PCHIP_CDF_POINTS)
+        assert np.max(np.abs(grid - linear)) > 1.0
+        # Geometric spacing: early steps are tighter than late steps.
+        steps = np.diff(grid)
+        assert steps[0] < steps[-1]
+
+    def test_vincentize_emits_geometric_grid_for_zero_point_question(self):
+        # Construct per-forecaster CDFs ON the geometric grid, vincentize, and assert the
+        # pooled CDF's .value entries are the geometric grid the scorer buckets against.
+        lower, upper, zero_point = 1.0, 1000.0, 0.0
+        question = make_mock_numeric_question(lower_bound=lower, upper_bound=upper, zero_point=zero_point)
+        geom_grid = build_cdf_value_grid(lower, upper, zero_point, PCHIP_CDF_POINTS)
+
+        # Two forecasters peaked at different x-values, sampled on the geometric grid.
+        low = _normal_cdf_on_grid(geom_grid, mean=200.0, sd=60.0)
+        high = _normal_cdf_on_grid(geom_grid, mean=700.0, sd=80.0)
+
+        pooled = vincentize_cdfs([low, high], question, method="mean")
+        _assert_valid_cdf(pooled, question, expected_grid=geom_grid)
+
+    def test_log_pool_emits_geometric_grid_for_zero_point_question(self):
+        # log_pool projects onto the same _question_grid, so it must also be geometric.
+        lower, upper, zero_point = 1.0, 1000.0, 0.0
+        question = make_mock_numeric_question(lower_bound=lower, upper_bound=upper, zero_point=zero_point)
+        geom_grid = build_cdf_value_grid(lower, upper, zero_point, PCHIP_CDF_POINTS)
+        cdfs = [
+            _normal_cdf_on_grid(geom_grid, mean=300.0, sd=70.0),
+            _normal_cdf_on_grid(geom_grid, mean=400.0, sd=90.0),
+        ]
+        pooled = log_pool_cdfs(cdfs, question)
+        _assert_valid_cdf(pooled, question, expected_grid=geom_grid)

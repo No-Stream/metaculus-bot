@@ -27,7 +27,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
-from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, enforce_min_steps, safe_cdf_bounds
 
 # Probability grid for inverting a CDF to a quantile function. Dense enough that linear
 # interpolation back onto the value grid does not itself introduce visible bias.
@@ -35,11 +35,20 @@ _QUANTILE_GRID_POINTS: int = 401
 
 
 def _question_grid(question: NumericQuestion, num_points: int) -> np.ndarray:
+    """Value grid for projecting a pooled CDF back onto the question's x-axis.
+
+    Mirrors the production CDF grid (``pchip_cdf.build_cdf_value_grid``): linear for
+    linear-scaled questions, geometric when ``question.zero_point`` is set (log-scaled).
+    The geometric branch is load-bearing for zero_point questions — the Metaculus scorer
+    buckets resolutions on the geometric grid, so a pooled CDF projected onto a linear grid
+    would be scored against the wrong buckets.
+    """
     lower = float(question.lower_bound)
     upper = float(question.upper_bound)
     if upper <= lower:
         raise ValueError(f"upper_bound {upper} must be > lower_bound {lower}")
-    return np.linspace(lower, upper, num_points)
+    zero_point = float(question.zero_point) if question.zero_point is not None else None
+    return build_cdf_value_grid(lower, upper, zero_point, num_points)
 
 
 def _cdf_probs(cdf: list[Percentile]) -> np.ndarray:

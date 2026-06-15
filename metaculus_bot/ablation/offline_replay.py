@@ -64,7 +64,8 @@ from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.cli import _build_question_shim_from_manifest_entry, _deserialize_ground_truth
 from metaculus_bot.ablation.forecasters import deserialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
-from metaculus_bot.backtest.scoring import GroundTruth, numeric_crps
+from metaculus_bot.backtest.scoring import GroundTruth, _canonicalize_mc_option, numeric_crps
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.prob_math_utils import clamp_prob, logit
 from metaculus_bot.probabilistic_tools.binary_pooling import (
     adaptive_weight,
@@ -73,7 +74,12 @@ from metaculus_bot.probabilistic_tools.binary_pooling import (
     reconstruct_p_math,
 )
 from metaculus_bot.probabilistic_tools.mc_pooling import pool_mc
-from metaculus_bot.probabilistic_tools.pdf_pooling import apply_tail_floor, log_pool_cdfs, vincentize_cdfs
+from metaculus_bot.probabilistic_tools.pdf_pooling import (
+    _cdf_probs,
+    apply_tail_floor,
+    log_pool_cdfs,
+    vincentize_cdfs,
+)
 from metaculus_bot.scoring_common import binary_log_score, brier_score, mc_log_score, numeric_log_score
 from metaculus_bot.structured_output_schema import BinaryStructured, parse_structured_block
 
@@ -310,16 +316,8 @@ def _mc_correct_index(option_order: list[str], correct: Any) -> int | None:
     if correct_str in option_order:
         return option_order.index(correct_str)
 
-    def _canon(s: str) -> str:
-        stripped = s.strip()
-        try:
-            f = float(stripped)
-            return str(int(f)) if f.is_integer() else str(f)
-        except (ValueError, TypeError):
-            return stripped
-
-    canonical_correct = _canon(correct_str)
-    canonical_options = [_canon(o) for o in option_order]
+    canonical_correct = _canonicalize_mc_option(correct_str)
+    canonical_options = [_canonicalize_mc_option(o) for o in option_order]
     if canonical_correct in canonical_options:
         return canonical_options.index(canonical_correct)
     return None
@@ -348,12 +346,6 @@ def _build_numeric_record(
 BinaryConfig = Callable[[BinaryRecord], float]
 MCConfig = Callable[[MCRecord], list[float]]
 NumericConfig = Callable[[NumericRecord], list[float]]
-
-
-def _cdf_probs(cdf: list[Percentile]) -> np.ndarray:
-    """Probability array of a CDF sorted by value (matches pdf_pooling's internal sort)."""
-    pairs = sorted(((float(p.value), float(p.percentile)) for p in cdf), key=lambda t: t[0])
-    return np.array([p for _, p in pairs], dtype=float)
 
 
 # --- Binary ---------------------------------------------------------------
@@ -557,7 +549,11 @@ def score_numeric(record: NumericRecord, cdf_values: list[float]) -> tuple[float
         bool(q.open_upper_bound),
         float(q.zero_point) if q.zero_point is not None else None,
     )
-    x_values = list(np.linspace(float(q.lower_bound), float(q.upper_bound), len(cdf_values)))
+    # CRPS x-values must be the SAME grid the production CDF lives on: geometric for
+    # zero_point (log-scaled) questions, linear otherwise. A linear grid here would
+    # mis-locate the CDF mass for zero_point questions and bias CRPS.
+    zero_point = float(q.zero_point) if q.zero_point is not None else None
+    x_values = list(build_cdf_value_grid(float(q.lower_bound), float(q.upper_bound), zero_point, len(cdf_values)))
     # CRPS needs an in-range resolution; clamp the out-of-bounds sentinel back to the grid.
     crps_resolution = min(max(record.resolution_value, x_values[0]), x_values[-1])
     crps = numeric_crps(x_values, cdf_values, crps_resolution)
@@ -598,6 +594,12 @@ class ConfigCVResult:
     the PAIRED held-out delta (config minus median, per question, averaged within each fold)
     summarized across resamples. ``full_data_log_score`` is the plain mean over all questions
     (no resampling) for a headline number.
+
+    Selection-bias caveat: the harness reuses the SAME data to fit the CV bands and to pick
+    the best-delta config (no nested CV, no multiplicity correction across the 4-6 candidates
+    per type), so the winning config's reported band is conditional-on-having-won and is
+    optimistically biased toward whichever config came out ahead — read it as edge-STABILITY
+    across resamples, not as an unbiased estimate of the selected winner's true edge.
     """
 
     name: str
