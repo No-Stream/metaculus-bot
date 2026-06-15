@@ -6,9 +6,12 @@ Two lineups are available:
   100-question medium backtest doesn't burn budget on the forecaster stage. The
   same N forecasters run once per question, and their rationales feed BOTH stacker
   arms — so per-forecaster cost is amortized across arms.
-* **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Gemini 3.1
-  Pro, Claude Opus 4.5 medium-thinking, GPT-5.5 medium-effort) for the paid
-  ablation re-run on a quality-representative ensemble.
+* **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Claude
+  Opus 4.6, Claude Opus 4.8, GPT-5.4), all at medium reasoning effort, for the
+  paid ablation re-run on a quality-representative ensemble. These are reasoning
+  models, so the lineup deliberately drops sampling params (``temperature`` is
+  passed as ``None`` to keep litellm from injecting it, and ``top_p`` /
+  ``max_tokens`` are never set).
 
 **Routing posture**: both lineups explicitly opt out of the donated-OpenRouter-key
 path. All builder functions construct plain ``GeneralLlm`` instances with no
@@ -35,7 +38,7 @@ from __future__ import annotations
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.benchmark.bot_factory import MODEL_CONFIG
-from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG, REASONING_MODEL_CONFIG
+from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG
 
 __all__ = [
     "FREE_FORECASTER_MODELS",
@@ -56,11 +59,24 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 PROD_FORECASTER_SPECS: list[tuple[str, dict]] = [
-    ("openrouter/google/gemini-3.1-pro-preview", {}),  # auto-reasons; mirrors prod
-    ("openrouter/anthropic/claude-opus-4.5", {"reasoning": {"max_tokens": 16_000}}),  # medium = 16k thinking
-    ("openrouter/openai/gpt-5.5", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/anthropic/claude-opus-4.6", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/anthropic/claude-opus-4.8", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/openai/gpt-5.4", {"reasoning": {"effort": "medium"}}),
 ]
 PROD_FORECASTER_MODELS: list[str] = [m for m, _ in PROD_FORECASTER_SPECS]
+
+# Minimal litellm config for the prod-ish reasoning ensemble. Deliberately NOT
+# REASONING_MODEL_CONFIG: these are reasoning models, so we drop the sampling
+# params. ``temperature=None`` is load-bearing — GeneralLlm injects
+# ``temperature=0`` when the arg is omitted, so passing None explicitly is what
+# makes litellm omit it (and top_p). ``top_p`` / ``max_tokens`` are simply never
+# set so the provider defaults apply.
+_PROD_FORECASTER_CONFIG: dict = {
+    "temperature": None,
+    "stream": False,
+    "timeout": 480,
+    "allowed_tries": 3,
+}
 
 
 def build_prod_forecaster_llms() -> list[GeneralLlm]:
@@ -70,7 +86,7 @@ def build_prod_forecaster_llms() -> list[GeneralLlm]:
     scratch_docs_and_planning/prod_ish_ablation_plan.md. litellm reads
     OPENROUTER_API_KEY at invoke time. Failures propagate; resume manually.
     """
-    return [GeneralLlm(model=model, **{**REASONING_MODEL_CONFIG, **kwargs}) for model, kwargs in PROD_FORECASTER_SPECS]
+    return [GeneralLlm(model=model, **{**_PROD_FORECASTER_CONFIG, **kwargs}) for model, kwargs in PROD_FORECASTER_SPECS]
 
 
 def get_lineup(name: str) -> tuple[list[GeneralLlm], list[str]]:

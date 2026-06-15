@@ -39,6 +39,7 @@ import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
+from metaculus_bot.ablation.run_stacker import DEFAULT_STACKER_MODEL
 from metaculus_bot.backtest.question_prep import BacktestQuestionSet
 from metaculus_bot.backtest.scoring import GroundTruth
 
@@ -458,11 +459,14 @@ def _install_full_stack_mocks(
         **kwargs: Any,
     ) -> dict[int, dict]:
         source = arm_a if arm == "stack" else arm_b
+        # Honor the per-stacker cache slug the real run_stacker_batch threads
+        # through, so cache-hit idempotency on re-run matches production.
+        stacker_slug = kwargs.get("stacker_slug")
         out: dict[int, dict] = {}
         for qid in qid_to_data:
             payload = source.get(qid)
             if payload is not None:
-                cache.write_stacker_output(qid=qid, arm=arm, payload=payload)
+                cache.write_stacker_output(qid=qid, arm=arm, payload=payload, stacker_slug=stacker_slug)
                 out[qid] = payload
         return out
 
@@ -566,8 +570,16 @@ def _populate_full_cache_for_qid(cache: AblationCache, qid: int) -> None:
     for i in range(3):
         slug = model_slug_to_filename(f"openrouter/test/m{i}")
         cache.write_forecaster_output(qid=qid, model_slug=slug, payload=_binary_forecaster_payload(f"m{i}", 0.5))
-    cache.write_stacker_output(qid=qid, arm="stack", payload=_binary_stacker_payload("stack", 0.6))
-    cache.write_stacker_output(qid=qid, arm="stack_aug", payload=_binary_stacker_payload("stack_aug", 0.7))
+    # stack/stack_aug are slugged by the active stacker (mirrors a real run); the
+    # default `--lineup free` path reads them under the opus-4.5 DEFAULT_STACKER_MODEL
+    # slug, so seed them under that slug. The deterministic median arm stays unslugged.
+    free_stacker_slug = model_slug_to_filename(DEFAULT_STACKER_MODEL)
+    cache.write_stacker_output(
+        qid=qid, arm="stack", payload=_binary_stacker_payload("stack", 0.6), stacker_slug=free_stacker_slug
+    )
+    cache.write_stacker_output(
+        qid=qid, arm="stack_aug", payload=_binary_stacker_payload("stack_aug", 0.7), stacker_slug=free_stacker_slug
+    )
     cache.write_stacker_output(qid=qid, arm="median", payload=_binary_stacker_payload("median", 0.65))
 
 
@@ -6113,3 +6125,112 @@ class TestArmMedianStageStack:
         await _stage_stack(args, cache, working2, arm=ARM_MEDIAN, force=False, spend=spend2)
         assert spend2.cached_stacker_hits.get("median", 0) == 1
         assert qid in working2.stacker_payloads.get("median", {})
+
+
+# ---------------------------------------------------------------------------
+# _stage_score arm-count routing: 3-arm / 5-arm / 6-arm selection
+# ---------------------------------------------------------------------------
+
+
+def _build_six_arm_working_set(qids: list[int]) -> Any:
+    """A WorkingSet carrying all six arm payloads for each binary qid."""
+    from metaculus_bot.ablation.cli import WorkingSet
+    from metaculus_bot.ablation.run_stacker import (
+        ARM_MEAN,
+        ARM_MEDIAN,
+        ARM_PDF_MIN1,
+        ARM_PDF_MIN2,
+        ARM_STACK,
+        ARM_STACK_AUG,
+    )
+
+    working = WorkingSet()
+    arm_values = {
+        ARM_STACK: 0.55,
+        ARM_STACK_AUG: 0.6,
+        ARM_PDF_MIN1: 0.62,
+        ARM_PDF_MIN2: 0.64,
+        ARM_MEDIAN: 0.58,
+        ARM_MEAN: 0.59,
+    }
+    for arm in arm_values:
+        working.stacker_payloads[arm] = {}
+    for qid in qids:
+        working.questions[qid] = _make_binary_question(qid)
+        working.ground_truths[qid] = _make_binary_ground_truth(qid, outcome=True)
+        for arm, value in arm_values.items():
+            working.stacker_payloads[arm][qid] = _binary_stacker_payload(arm, value)
+    return working
+
+
+class TestStageScoreArmCountRouting:
+    def test_stage_score_routes_to_six_arm_when_pdf_and_mean_present(self, cache_dir: Path) -> None:
+        """When both pdf AND mean payloads are present, _stage_score scores the mean arm.
+
+        The rendered summary should carry the five mean comparisons and a `mean`
+        per-arm raw-stats row.
+        """
+        from metaculus_bot.ablation.cli import _build_parser, _stage_score
+
+        cache = AblationCache(cache_dir)
+        working = _build_six_arm_working_set([7001, 7002, 7003])
+        args = _build_parser().parse_args(["--num-binary", "3", "--cache-dir", str(cache_dir)])
+
+        summary_path = _stage_score(args, cache, working)
+        text = summary_path.read_text(encoding="utf-8")
+
+        for mean_comparison in (
+            "mean-median",
+            "mean-stack",
+            "mean-stack_aug",
+            "mean-pdf_min1",
+            "mean-pdf_min2",
+        ):
+            assert mean_comparison in text
+        # Per-arm raw-stats table includes a mean row.
+        assert "| mean |" in text
+
+    def test_stage_score_stays_five_arm_when_mean_absent(self, cache_dir: Path) -> None:
+        """Old free-tier data (pdf arms, NO mean) must keep using the 5-arm path.
+
+        This is the load-bearing backward-compat property: a re-run on the
+        88-question free-tier cache (0 arm_mean.json) must still score in 5-arm
+        mode without emitting mean comparisons.
+        """
+        from metaculus_bot.ablation.cli import _build_parser, _stage_score
+        from metaculus_bot.ablation.run_stacker import ARM_MEAN
+
+        cache = AblationCache(cache_dir)
+        working = _build_six_arm_working_set([7101, 7102, 7103])
+        # Drop the mean payloads entirely — emulate the old free-tier cache dir.
+        del working.stacker_payloads[ARM_MEAN]
+        args = _build_parser().parse_args(["--num-binary", "3", "--cache-dir", str(cache_dir)])
+
+        summary_path = _stage_score(args, cache, working)
+        text = summary_path.read_text(encoding="utf-8")
+
+        # No mean comparisons, no mean per-arm row.
+        assert "mean-median" not in text
+        assert "| mean |" not in text
+        # But the 5-arm pdf comparisons must still be present.
+        assert "median-pdf_min1" in text
+        assert "pdf_min1-stack" in text
+
+    def test_stage_score_stays_three_arm_when_no_pdf_or_mean(self, cache_dir: Path) -> None:
+        """Stack/stack_aug/median only (no pdf, no mean) must keep using the 3-arm path."""
+        from metaculus_bot.ablation.cli import _build_parser, _stage_score
+        from metaculus_bot.ablation.run_stacker import ARM_MEAN, ARM_PDF_MIN1, ARM_PDF_MIN2
+
+        cache = AblationCache(cache_dir)
+        working = _build_six_arm_working_set([7201, 7202, 7203])
+        for arm in (ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEAN):
+            del working.stacker_payloads[arm]
+        args = _build_parser().parse_args(["--num-binary", "3", "--cache-dir", str(cache_dir)])
+
+        summary_path = _stage_score(args, cache, working)
+        text = summary_path.read_text(encoding="utf-8")
+
+        assert "mean-median" not in text
+        assert "median-pdf_min1" not in text
+        # Core 3-arm comparison present.
+        assert "median-stack" in text

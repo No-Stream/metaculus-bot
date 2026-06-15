@@ -442,8 +442,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default="free",
         help=(
             "Forecaster ensemble: 'free' for the 4-model free-tier ablation (default), "
-            "'prod' for the 3-model paid ensemble (gemini-3.1-pro, claude-opus-4.5 "
-            "medium-thinking, gpt-5.5 medium-effort)."
+            "'prod' for the 3-model paid ensemble (claude-opus-4.6, claude-opus-4.8, "
+            "gpt-5.4, all at medium reasoning effort). The 'prod' lineup also selects "
+            "the opus-4.8 prod stacker under --plain-llm."
         ),
     )
     parser.add_argument(
@@ -1215,6 +1216,29 @@ async def _stage_forecast(
 # ---------------------------------------------------------------------------
 
 
+def _active_stacker_slug(args: argparse.Namespace) -> str:
+    """Filesystem slug for the stacker this run uses, for per-stacker cache keying.
+
+    Only the LLM-stacker arms (stack / stack_aug) are slugged so a stacker swap
+    (e.g. opus-4.5 free-tier vs opus-4.8 prod) never overwrites another stacker's
+    results, while deterministic arms (median / mean / pdf_*) stay shared. The
+    selection mirrors the stacker construction in ``_stage_llm_stacker``:
+
+    * ``--plain-llm --lineup prod`` → opus-4.8 (``PROD_STACKER_MODEL``).
+    * ``--plain-llm`` other lineups → opus-4.5 (``DEFAULT_STACKER_MODEL``).
+    * No ``--plain-llm`` → the default donated-key wrapper, whose primary is also
+      ``DEFAULT_STACKER_MODEL`` (opus-4.5).
+
+    All three callers (``_stage_llm_stacker`` write/read, ``_stage_score`` read,
+    ``_hydrate_working_set_from_cache`` read) route through here so they agree.
+    """
+    from metaculus_bot.ablation.run_stacker import DEFAULT_STACKER_MODEL, PROD_STACKER_MODEL  # noqa: PLC0415
+
+    use_prod_stacker = getattr(args, "plain_llm", False) and getattr(args, "lineup", "free") == "prod"
+    model = PROD_STACKER_MODEL if use_prod_stacker else DEFAULT_STACKER_MODEL
+    return model_slug_to_filename(model)
+
+
 async def _stage_simple_agg(
     arm: str,
     working: WorkingSet,
@@ -1327,11 +1351,15 @@ async def _stage_llm_stacker(
     await asyncio.sleep(0)
     qids = sorted(working.forecaster_payloads.keys())
 
+    # Per-stacker cache keying: stack/stack_aug payloads are slugged by the active
+    # stacker so a swap never clobbers another stacker's results.
+    stacker_slug = _active_stacker_slug(args)
+
     cached_payloads: dict[int, dict] = {}
     needs_run: list[int] = []
     for qid in qids:
         if not force:
-            cached = cache.read_stacker_output(qid=qid, arm=arm)
+            cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
             if cached is not None:
                 cached_payloads[qid] = cached
                 spend.cached_stacker_hits[arm] = spend.cached_stacker_hits.get(arm, 0) + 1
@@ -1349,17 +1377,24 @@ async def _stage_llm_stacker(
             for qid in needs_run
         }
         # Wire --plain-llm and --no-stacker-fallback into stacker construction.
+        # --lineup prod uses the opus-4.8 prod stacker (mirrors the prod-ish
+        # forecaster posture); other lineups keep the opus-4.5 default.
         stacker_llm_kwarg: GeneralLlm | None = None
         fallback_llm_kwarg: GeneralLlm | None = None
         if getattr(args, "plain_llm", False):
             from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
                 _GPT_5_5_STACKER_KWARGS,
                 _OPUS_STACKER_KWARGS,
+                _PROD_STACKER_KWARGS,
                 DEFAULT_STACKER_FALLBACK_MODEL,
                 DEFAULT_STACKER_MODEL,
+                PROD_STACKER_MODEL,
             )
 
-            stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
+            if getattr(args, "lineup", "free") == "prod":
+                stacker_llm_kwarg = GeneralLlm(model=PROD_STACKER_MODEL, **_PROD_STACKER_KWARGS)
+            else:
+                stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
             if not getattr(args, "no_stacker_fallback", False):
                 fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
         elif getattr(args, "no_stacker_fallback", False):
@@ -1367,6 +1402,7 @@ async def _stage_llm_stacker(
             fallback_llm_kwarg = None
 
         batch_kwargs: dict[str, Any] = {
+            "stacker_slug": stacker_slug,
             "force": force,
             "concurrency": args.concurrency,
         }
@@ -1583,13 +1619,17 @@ def _stage_score(
     """
     paired_scores: list[PairedScore] = []
     # Union of all qids that have ANY arm payload.
-    all_arm_keys = [ARM_STACK, ARM_STACK_AUG, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN]
+    all_arm_keys = [ARM_STACK, ARM_STACK_AUG, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN]
     qid_set: set[int] = set()
     for arm_key in all_arm_keys:
         qid_set.update(working.stacker_payloads.get(arm_key, {}).keys())
     qids = sorted(qid_set)
-    # Determine whether 5-arm scoring mode is active (any pdf payloads present).
+    # Determine scoring mode. 5-arm is active when pdf payloads are present;
+    # 6-arm adds the deterministic mean arm on top, used only when BOTH pdf AND
+    # mean payloads are present. Old free-tier cache dirs (pdf, no mean) stay on
+    # the 5-arm path; pre-pdf data stays on the 3-arm path.
     has_pdf_arms = bool(working.stacker_payloads.get(ARM_PDF_MIN1)) or bool(working.stacker_payloads.get(ARM_PDF_MIN2))
+    has_mean_arm = bool(working.stacker_payloads.get(ARM_MEAN))
 
     n_scored = 0
     for qid in qids:
@@ -1609,23 +1649,37 @@ def _stage_score(
         payload_pdf_min1 = working.stacker_payloads.get(ARM_PDF_MIN1, {}).get(qid)
         payload_pdf_min2 = working.stacker_payloads.get(ARM_PDF_MIN2, {}).get(qid)
         payload_median = working.stacker_payloads.get(ARM_MEDIAN, {}).get(qid)
+        payload_mean = working.stacker_payloads.get(ARM_MEAN, {}).get(qid)
 
         report_stack = _report_or_none(payload_stack)
         report_stack_aug = _report_or_none(payload_stack_aug)
         report_pdf_min1 = _report_or_none(payload_pdf_min1)
         report_pdf_min2 = _report_or_none(payload_pdf_min2)
         report_median = _report_or_none(payload_median)
+        report_mean = _report_or_none(payload_mean)
 
         # Count present arms — need at least 2 for any comparison.
         n_present = sum(
             1
-            for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median]
+            for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median, report_mean]
             if r is not None
         )
         if n_present < 2:
             continue
 
-        if has_pdf_arms:
+        if has_pdf_arms and has_mean_arm:
+            scores = score_arm_for_qid(
+                [
+                    ("stack", report_stack, payload_stack),
+                    ("stack_aug", report_stack_aug, payload_stack_aug),
+                    ("pdf_min1", report_pdf_min1, payload_pdf_min1),
+                    ("pdf_min2", report_pdf_min2, payload_pdf_min2),
+                    ("median", report_median, payload_median),
+                    ("mean", report_mean, payload_mean),
+                ],
+                gt,
+            )
+        elif has_pdf_arms:
             scores = score_arm_for_qid(
                 [
                     ("stack", report_stack, payload_stack),
@@ -1704,12 +1758,20 @@ async def _hydrate_working_set_from_cache(
     cache: AblationCache,
     working: WorkingSet,
     spend: SpendReport | None = None,
+    stacker_slug: str | None = None,
 ) -> None:
     """For score-only paths: load every artifact from disk.
 
     When ``spend`` is supplied (score-only path), bumps the relevant
     ``cached_*_hits`` fields so the spend report reflects what was loaded
     rather than reading as a hard zero across the board.
+
+    ``stacker_slug`` is applied ONLY to the LLM-stacker arms (stack / stack_aug)
+    so the score-only path reads the active run's stacker outputs; deterministic
+    arms (pdf / median / mean) read with ``stacker_slug=None`` (shared, unslugged).
+    The in-memory ``working.stacker_payloads`` keys stay the plain arm name —
+    only the on-disk filename carries the slug — so scoring/summary code is
+    untouched.
     """
     await asyncio.sleep(0)
     manifest = cache.read_qids_manifest()
@@ -1746,7 +1808,9 @@ async def _hydrate_working_set_from_cache(
             if spend is not None:
                 spend.cached_forecaster_hits += len(forecaster_payloads)
         for arm in (ARM_STACK, ARM_STACK_AUG, ARM_PDF, ARM_PDF_MIN1, ARM_PDF_MIN2, ARM_MEDIAN, ARM_MEAN):
-            payload = cache.read_stacker_output(qid=qid, arm=arm)
+            # Only the LLM-stacker arms are slugged; deterministic arms stay shared.
+            arm_slug = stacker_slug if arm in (ARM_STACK, ARM_STACK_AUG) else None
+            payload = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=arm_slug)
             if payload is not None:
                 working.stacker_payloads.setdefault(arm, {})[qid] = payload
                 if spend is not None:
@@ -1887,7 +1951,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
     score_only = requested == {"score"}
 
     if score_only:
-        await _hydrate_working_set_from_cache(cache, working, spend=spend)
+        await _hydrate_working_set_from_cache(cache, working, spend=spend, stacker_slug=_active_stacker_slug(args))
         if args.qids:
             missing = _filter_working_set_to_qids(working, args.qids)
             if missing:
@@ -1914,7 +1978,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
         await _stage_fetch(args, cache, working)
         logger.info("stage=fetch DONE | qids=%d", len(working.questions))
     else:
-        await _hydrate_working_set_from_cache(cache, working)
+        await _hydrate_working_set_from_cache(cache, working, stacker_slug=_active_stacker_slug(args))
         if args.qids:
             missing = _filter_working_set_to_qids(working, args.qids)
             if missing:

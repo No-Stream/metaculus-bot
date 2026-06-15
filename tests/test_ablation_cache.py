@@ -118,6 +118,82 @@ def test_atomic_write_round_trip_stacker_output(cache: AblationCache) -> None:
     assert b["stacker_model_used"] == "fallback"
 
 
+# ---------------------------------------------------------------------------
+# Per-stacker cache keying (stacker_slug)
+#
+# Deterministic arms (median / mean / pdf_*) and the free-tier cache keep the
+# legacy ``arm_<arm>.json`` filename via stacker_slug=None — this byte-compat is
+# load-bearing so the prior free-tier run stays readable. Only the LLM-stacker
+# arms (stack / stack_aug) pass a slug, so two stackers never overwrite each
+# other's results in one cache dir.
+# ---------------------------------------------------------------------------
+
+
+def _stacker_payload(prob: float) -> dict:
+    return {
+        "success": True,
+        "arm": "stack_aug",
+        "stacker_prediction": {"type": "binary", "prob": prob},
+        "stacker_model_used": "primary",
+    }
+
+
+def test_stacker_slug_none_is_byte_compatible_with_legacy_filename(cache: AblationCache) -> None:
+    """stacker_slug=None writes/reads the original arm_<arm>.json — back-compat.
+
+    This is the safety property keeping the prior free-tier run and every
+    deterministic-arm call site working unchanged.
+    """
+    payload = _stacker_payload(0.61)
+    cache.write_stacker_output(qid=42, arm="stack_aug", payload=payload)
+
+    legacy_path = cache.root / "stacker_outputs" / "42" / "arm_stack_aug.json"
+    assert legacy_path.exists(), "stacker_slug=None must use the legacy unslugged filename"
+
+    read_back = cache.read_stacker_output(qid=42, arm="stack_aug")
+    assert read_back is not None
+    assert read_back["stacker_prediction"] == {"type": "binary", "prob": 0.61}
+
+
+def test_stacker_slug_produces_slugged_filename(cache: AblationCache) -> None:
+    slug = model_slug_to_filename("openrouter/anthropic/claude-opus-4.8")
+    payload = _stacker_payload(0.58)
+    cache.write_stacker_output(qid=42, arm="stack_aug", payload=payload, stacker_slug=slug)
+
+    slugged_path = cache.root / "stacker_outputs" / "42" / f"arm_stack_aug__{slug}.json"
+    assert slugged_path.exists()
+    # The legacy unslugged path must NOT be written when a slug is supplied.
+    assert not (cache.root / "stacker_outputs" / "42" / "arm_stack_aug.json").exists()
+
+    read_back = cache.read_stacker_output(qid=42, arm="stack_aug", stacker_slug=slug)
+    assert read_back is not None
+    assert read_back["stacker_prediction"] == {"type": "binary", "prob": 0.58}
+
+
+def test_two_stackers_write_distinct_files_and_wrong_slug_misses(cache: AblationCache) -> None:
+    slug_opus45 = model_slug_to_filename("openrouter/anthropic/claude-opus-4.5")
+    slug_opus48 = model_slug_to_filename("openrouter/anthropic/claude-opus-4.8")
+
+    cache.write_stacker_output(qid=7, arm="stack_aug", payload=_stacker_payload(0.45), stacker_slug=slug_opus45)
+    cache.write_stacker_output(qid=7, arm="stack_aug", payload=_stacker_payload(0.48), stacker_slug=slug_opus48)
+
+    # Both files coexist — neither stacker clobbered the other.
+    out_dir = cache.root / "stacker_outputs" / "7"
+    assert (out_dir / f"arm_stack_aug__{slug_opus45}.json").exists()
+    assert (out_dir / f"arm_stack_aug__{slug_opus48}.json").exists()
+
+    # Each slug reads back its own payload.
+    read_opus45 = cache.read_stacker_output(qid=7, arm="stack_aug", stacker_slug=slug_opus45)
+    read_opus48 = cache.read_stacker_output(qid=7, arm="stack_aug", stacker_slug=slug_opus48)
+    assert read_opus45 is not None and read_opus48 is not None
+    assert read_opus45["stacker_prediction"] == {"type": "binary", "prob": 0.45}
+    assert read_opus48["stacker_prediction"] == {"type": "binary", "prob": 0.48}
+
+    # A read with an unrelated slug (or no slug) misses — no cross-stacker leak.
+    assert cache.read_stacker_output(qid=7, arm="stack_aug", stacker_slug="some__other-stacker") is None
+    assert cache.read_stacker_output(qid=7, arm="stack_aug") is None
+
+
 def test_atomic_write_round_trip_pruned_research(cache: AblationCache) -> None:
     sanitized_blob = "## Background\n\nGenerally relevant context, with the resolution-revealing line stripped."
     meta = {

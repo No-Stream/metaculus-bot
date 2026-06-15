@@ -9,7 +9,11 @@ organized per pipeline stage:
 * ``leakage_screens/<qid>.json`` — leakage detector verdict.
 * ``forecaster_outputs/<qid>/<model_slug>.json`` — per-model rationale + parsed
   prediction value.
-* ``stacker_outputs/<qid>/arm_{A,B}.json`` — per-arm stacker output.
+* ``stacker_outputs/<qid>/arm_<arm>.json`` — per-arm output. Deterministic arms
+  (median / mean / pdf_*) use this stacker-independent filename. The LLM-stacker
+  arms (stack / stack_aug) pass a ``stacker_slug`` and land at
+  ``arm_<arm>__<stacker_slug>.json`` so a stacker swap never clobbers another
+  stacker's results while deterministic arms stay shared.
 * ``scores/run_<ts>.json`` + ``scores/summary_<ts>.md`` — per-run analysis.
 
 Each individual JSON write is atomic: the payload is written to a tempfile
@@ -253,18 +257,30 @@ class AblationCache:
     # Stacker outputs (per arm)
     # ------------------------------------------------------------------
 
-    def _stacker_output_path(self, qid: int, arm: str) -> Path:
-        return self.root / "stacker_outputs" / str(qid) / f"arm_{arm}.json"
+    def _stacker_output_path(self, qid: int, arm: str, stacker_slug: str | None = None) -> Path:
+        """Path for one arm's cached output.
 
-    def read_stacker_output(self, qid: int, arm: str) -> dict | None:
-        path = self._stacker_output_path(qid, arm)
+        ``stacker_slug=None`` keeps the original ``arm_<arm>.json`` filename —
+        this is the back-compat path used by deterministic arms (median / mean /
+        pdf_*), forecaster-shared outputs, and every pre-existing on-disk file.
+        When ``stacker_slug`` is supplied (the LLM-stacker arms), the filename
+        becomes ``arm_<arm>__<stacker_slug>.json`` so two runs with different
+        stackers never overwrite each other's results.
+        """
+        directory = self.root / "stacker_outputs" / str(qid)
+        if stacker_slug is None:
+            return directory / f"arm_{arm}.json"
+        return directory / f"arm_{arm}__{stacker_slug}.json"
+
+    def read_stacker_output(self, qid: int, arm: str, stacker_slug: str | None = None) -> dict | None:
+        path = self._stacker_output_path(qid, arm, stacker_slug)
         if not path.exists():
             return None
         return _load_versioned_json(path)
 
-    def write_stacker_output(self, qid: int, arm: str, payload: dict) -> None:
+    def write_stacker_output(self, qid: int, arm: str, payload: dict, stacker_slug: str | None = None) -> None:
         _atomic_write_text(
-            self._stacker_output_path(qid, arm),
+            self._stacker_output_path(qid, arm, stacker_slug),
             _dump_json(_inject_version(payload)),
         )
 
