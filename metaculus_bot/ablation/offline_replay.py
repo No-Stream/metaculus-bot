@@ -358,6 +358,21 @@ ADAPTIVE_THRESHOLD: float = 0.0
 ADAPTIVE_SLOPE: float = 0.25
 ADAPTIVE_MAX_WEIGHT: float = 0.5
 
+# Tighter probability clamps swept against the prod incumbent. The cached per-forecaster
+# binary probs are ALREADY clamped to [BINARY_PROB_MIN, BINARY_PROB_MAX] = [0.02, 0.98] at
+# bench time, so ``median_baseline`` (median of those probs) is effectively the [0.02, 0.98]
+# arm: the comparison is tighter-clamp vs. the existing 0.02 clamp. The hypothesis is that a
+# tighter clamp bounds the worst-case unbounded log-loss tail on confident-wrong calls (the
+# binary "blowups") at a small, asymmetric cost on confident-correct calls. This is a pure
+# ceiling/floor on the AGGREGATE probability — it only caps the extremes, it does NOT move
+# the middle (unlike shrink-toward-p_math, which is a different hypothesis).
+#
+# Each bound is (low, high). The after-median clamp is the primary arm; a per-forecaster
+# (clamp-each-model-before-the-median) variant is added as a secondary curiosity — with the
+# probs already pinned at [0.02, 0.98], the two diverge only when an extreme value survives
+# the median, which is exactly the saturation case we care about.
+BINARY_CLAMP_BOUNDS: tuple[tuple[float, float], ...] = ((0.05, 0.95), (0.10, 0.90))
+
 
 def _binary_median_p_model(record: BinaryRecord) -> float:
     return float(np.median(record.p_models))
@@ -390,14 +405,59 @@ def _binary_adaptive_config(record: BinaryRecord) -> float:
     return pool_binary(p_model, p_math, w)
 
 
+def _make_binary_clamp_after_median_config(low: float, high: float) -> BinaryConfig:
+    """Median the per-forecaster probs (same as ``median_baseline``), then clamp to [low, high].
+
+    This is the PRIMARY clamp arm: the aggregate prediction is computed exactly as the
+    incumbent does, then a pure ceiling/floor caps the extremes. It only touches the tails;
+    a mid-range median (e.g. 0.5) passes through unchanged.
+    """
+
+    def config(record: BinaryRecord) -> float:
+        return min(max(_binary_median_p_model(record), low), high)
+
+    return config
+
+
+def _make_binary_clamp_before_median_config(low: float, high: float) -> BinaryConfig:
+    """Clamp each forecaster's prob to [low, high] FIRST, then take the median (secondary arm).
+
+    Differs from the after-median clamp only when an out-of-[low, high] value would otherwise
+    survive the median — exactly the confident-extreme case the clamp targets. With the cached
+    probs already pinned at [0.02, 0.98], clamping before vs. after the median diverges only on
+    questions where a tighter bound bites a majority of the forecasters.
+    """
+
+    def config(record: BinaryRecord) -> float:
+        clamped = [min(max(p, low), high) for p in record.p_models]
+        return float(np.median(clamped))
+
+    return config
+
+
+def _clamp_config_suffix(low: float, high: float) -> str:
+    """Compact name suffix like ``05_95`` / ``10_90`` from the [low, high] bounds."""
+    return f"{round(low * 100):02d}_{round(high * 100):02d}"
+
+
 def build_binary_configs() -> dict[str, BinaryConfig]:
-    """Binary candidate configs keyed by name. ``median_baseline`` is the incumbent."""
+    """Binary candidate configs keyed by name. ``median_baseline`` is the incumbent.
+
+    The cached per-forecaster probs are already [0.02, 0.98]-clamped at bench time, so
+    ``median_baseline`` is effectively the ``clamp_02_98`` arm; the clamp configs below test
+    whether a TIGHTER ceiling/floor (after-median primary, per-forecaster-before-median
+    secondary) bounds the saturation tail enough to win on log score.
+    """
     configs: dict[str, BinaryConfig] = {MEDIAN_BASELINE: _binary_median_p_model}
     for w in BINARY_SHRINKAGE_WEIGHTS:
         if w == 0.0:
             continue  # w=0 is identical to median_baseline; skip the redundant arm
         configs[f"shrink_w{w:g}"] = _make_binary_shrinkage_config(w)
     configs["shrink_adaptive"] = _binary_adaptive_config
+    for low, high in BINARY_CLAMP_BOUNDS:
+        suffix = _clamp_config_suffix(low, high)
+        configs[f"clamp_{suffix}"] = _make_binary_clamp_after_median_config(low, high)
+        configs[f"clamp_{suffix}_premedian"] = _make_binary_clamp_before_median_config(low, high)
     return configs
 
 

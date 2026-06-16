@@ -177,6 +177,64 @@ class TestBinaryConfigs:
         assert score_binary(confident, 0.9)[0] > score_binary(unsure, 0.5)[0]
 
 
+class TestBinaryClampConfigs:
+    """Tighter probability clamps applied to the median aggregate (after-median primary +
+    per-forecaster-before-median secondary). The cached prod probs are already [0.02, 0.98]-
+    clamped, so these test a tighter ceiling/floor vs. the incumbent."""
+
+    def test_clamp_configs_registered(self, binary_question):
+        configs = build_binary_configs()
+        for name in ("clamp_05_95", "clamp_05_95_premedian", "clamp_10_90", "clamp_10_90_premedian"):
+            assert name in configs, name
+
+    def test_after_median_clamp_caps_extreme_high(self, binary_question):
+        # Median p_model 0.99 (above every clamp ceiling) must be pulled DOWN to the ceiling.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.99, 0.99, 0.99], p_maths=[])
+        configs = build_binary_configs()
+        assert configs["clamp_05_95"](record) == pytest.approx(0.95)
+        assert configs["clamp_10_90"](record) == pytest.approx(0.90)
+
+    def test_after_median_clamp_caps_extreme_low(self, binary_question):
+        # Median p_model 0.01 (below every clamp floor) must be lifted UP to the floor.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=False, p_models=[0.01, 0.01, 0.01], p_maths=[])
+        configs = build_binary_configs()
+        assert configs["clamp_05_95"](record) == pytest.approx(0.05)
+        assert configs["clamp_10_90"](record) == pytest.approx(0.10)
+
+    def test_clamp_leaves_midrange_unchanged(self, binary_question):
+        # A mid-range median sits inside every clamp band -> the clamp is a no-op there.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.4, 0.5, 0.6], p_maths=[])
+        configs = build_binary_configs()
+        median = float(np.median(record.p_models))
+        for name in ("clamp_05_95", "clamp_05_95_premedian", "clamp_10_90", "clamp_10_90_premedian"):
+            assert configs[name](record) == pytest.approx(median), name
+
+    def test_clamp_output_never_exceeds_bounds(self, binary_question):
+        # Across a sweep of medians spanning the full [0, 1] range, no clamp config ever
+        # produces a probability outside its declared [low, high].
+        configs = build_binary_configs()
+        bounds = {"clamp_05_95": (0.05, 0.95), "clamp_10_90": (0.10, 0.90)}
+        for p in (0.0, 0.001, 0.03, 0.2, 0.5, 0.8, 0.97, 0.999, 1.0):
+            record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[p, p, p], p_maths=[])
+            for name, (low, high) in bounds.items():
+                out_after = configs[name](record)
+                out_pre = configs[f"{name}_premedian"](record)
+                assert low - 1e-9 <= out_after <= high + 1e-9, (name, p, out_after)
+                assert low - 1e-9 <= out_pre <= high + 1e-9, (name, p, out_pre)
+
+    def test_before_vs_after_median_diverge_when_clamp_shifts_median(self, binary_question):
+        # The two clamp variants differ only when capping individual members changes the
+        # even-count median average. Four probs [0.99, 0.99, 0.80, 0.10], clamp_05_95:
+        #   after-median  = clamp(median([0.99,0.99,0.80,0.10]) = 0.895) = 0.895 (in band)
+        #   before-median = median(clamp -> [0.95,0.95,0.80,0.10]) = (0.95+0.80)/2 = 0.875
+        record = BinaryRecord(
+            qid=1, question=binary_question, outcome=True, p_models=[0.99, 0.99, 0.80, 0.10], p_maths=[]
+        )
+        configs = build_binary_configs()
+        assert configs["clamp_05_95"](record) == pytest.approx(0.895)
+        assert configs["clamp_05_95_premedian"](record) == pytest.approx(0.875)
+
+
 # MC configs + scoring
 
 
