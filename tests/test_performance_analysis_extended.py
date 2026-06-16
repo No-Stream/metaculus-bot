@@ -6,14 +6,37 @@ disagreement_predicts_error.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.analysis import (
+    _interpolate_pit,
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
     no_bias_check,
+    numeric_pit_analysis,
     stacking_effectiveness,
 )
+
+
+def _old_interpolate_pit(resolution: float, lower_bound: float, upper_bound: float, cdf_values: list[float]) -> float:
+    """The pre-fix linear-index implementation, kept here only to prove the regression.
+
+    Maps the resolution to a CDF index assuming a LINEAR value grid. Correct for
+    linear-scaled questions, wrong for log-scaled (zero_point) ones.
+    """
+    total_range = upper_bound - lower_bound
+    if total_range <= 0:
+        return 0.5
+    fraction = (resolution - lower_bound) / total_range
+    n = len(cdf_values)
+    idx_float = fraction * (n - 1)
+    idx_low = max(0, min(int(idx_float // 1), n - 2))
+    idx_high = idx_low + 1
+    weight = idx_float - idx_low
+    return cdf_values[idx_low] * (1 - weight) + cdf_values[idx_high] * weight
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -384,3 +407,127 @@ class TestCollectorStackerOutcome:
         rec = self._run(9, 99, comment)
         assert rec["stacker_outcome"] == "fallback_median"
         assert rec["stacker_outcome_source"] == "marker_outcome"
+
+
+# ---------------------------------------------------------------------------
+# _interpolate_pit — value-grid-aware PIT (regression: log-scaled questions)
+# ---------------------------------------------------------------------------
+
+
+class TestInterpolatePit:
+    """PIT = F(resolution). F must be read against the ACTUAL value grid the CDF
+    lives on (linear for linear questions, geometric for zero_point questions),
+    not against a linear index map. The old linear-index map mis-buckets
+    log-scaled resolutions by up to ~0.24."""
+
+    def test_linear_question_matches_old_behavior(self):
+        # Linear grid: new value-grid interpolation must equal the old linear-index
+        # interpolation within float tolerance (mathematically equivalent).
+        lower, upper = 0.0, 100.0
+        cdf = list(np.linspace(0.0, 1.0, 201))  # straight-line CDF
+        grid = list(build_cdf_value_grid(lower, upper, None, num_points=201))
+        for resolution in (0.0, 12.3, 25.0, 50.0, 73.7, 100.0):
+            new = _interpolate_pit(resolution, lower, upper, cdf, value_grid=grid, zero_point=None)
+            old = _old_interpolate_pit(resolution, lower, upper, cdf)
+            assert new == pytest.approx(old, abs=1e-9)
+
+    def test_linear_endpoints_and_midpoint(self):
+        lower, upper = 0.0, 100.0
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        grid = list(build_cdf_value_grid(lower, upper, None, num_points=201))
+        assert _interpolate_pit(lower, lower, upper, cdf, value_grid=grid) == pytest.approx(cdf[0])
+        assert _interpolate_pit(upper, lower, upper, cdf, value_grid=grid) == pytest.approx(cdf[-1])
+        assert _interpolate_pit(50.0, lower, upper, cdf, value_grid=grid) == pytest.approx(0.5)
+
+    def test_log_scaled_question_differs_and_is_correct(self):
+        # Log-scaled (zero_point) question: the value grid is geometric, so the
+        # resolution lands on a different CDF index than the linear-index map.
+        lower, upper, zero_point = 1.0, 1000.0, 0.0
+        cdf = list(np.linspace(0.0, 1.0, 201))  # uniform-in-index CDF
+        geo_grid = build_cdf_value_grid(lower, upper, zero_point, num_points=201)
+
+        # Resolution near the low end of a log scale: linearly it's ~0.1% of the
+        # range, but on the geometric grid it's a meaningful chunk of probability.
+        resolution = 31.6  # ~10^1.5 -> roughly the geometric midpoint of [1, 1000]
+
+        new = _interpolate_pit(resolution, lower, upper, cdf, value_grid=list(geo_grid), zero_point=zero_point)
+        old = _old_interpolate_pit(resolution, lower, upper, cdf)
+
+        expected = float(np.interp(resolution, geo_grid, np.asarray(cdf, dtype=float)))
+        assert new == pytest.approx(expected, abs=1e-12)
+
+        # The fix must bite: geometric vs linear-index map differ materially here.
+        assert abs(new - old) > 0.2
+        # And the new value is the geometric-midpoint-ish PIT (~0.5), not the
+        # near-zero PIT the linear-index map produces.
+        assert new == pytest.approx(0.5, abs=0.02)
+        assert old < 0.05
+
+    def test_falls_back_to_zero_point_grid_when_value_grid_absent(self):
+        # No continuous_range supplied -> reconstruct the geometric grid from
+        # zero_point. Result must match interpolation against the rebuilt grid.
+        lower, upper, zero_point = 1.0, 1000.0, 0.0
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        resolution = 31.6
+
+        no_grid = _interpolate_pit(resolution, lower, upper, cdf, value_grid=None, zero_point=zero_point)
+        rebuilt = build_cdf_value_grid(lower, upper, zero_point, num_points=201)
+        expected = float(np.interp(resolution, rebuilt, np.asarray(cdf, dtype=float)))
+        assert no_grid == pytest.approx(expected, abs=1e-12)
+
+    def test_mismatched_value_grid_length_falls_back(self):
+        # A value_grid whose length != cdf is ignored; we rebuild from bounds/zero_point.
+        lower, upper = 0.0, 100.0
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        bad_grid = [0.0, 50.0, 100.0]  # wrong length
+        result = _interpolate_pit(50.0, lower, upper, cdf, value_grid=bad_grid, zero_point=None)
+        assert result == pytest.approx(0.5)
+
+    def test_degenerate_range_returns_half(self):
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        assert _interpolate_pit(5.0, 10.0, 10.0, cdf) == pytest.approx(0.5)
+
+
+class TestNumericPitAnalysisValueGrid:
+    """End-to-end numeric_pit_analysis on a small mixed cohort: one linear-scaled
+    record and one log-scaled (zero_point) record carrying continuous_range."""
+
+    def _record(self, post_id, cdf, resolution, lower, upper, zero_point, continuous_range):
+        return {
+            "post_id": post_id,
+            "type": "numeric",
+            "our_forecast_values": cdf,
+            "resolution_parsed": resolution,
+            "scaling": {
+                "range_min": lower,
+                "range_max": upper,
+                "zero_point": zero_point,
+                "continuous_range": continuous_range,
+            },
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "brier_score": None,
+            "log_score": None,
+            "numeric_log_score": 0.0,
+            "mc_log_score": None,
+            "per_model_forecasts": {},
+            "metadata": {"category": None},
+        }
+
+    def test_continuous_range_used_directly_for_log_scaled(self):
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        # Linear question, midpoint resolution -> PIT 0.5.
+        lin_grid = list(build_cdf_value_grid(0.0, 100.0, None, num_points=201))
+        linear_rec = self._record(1, cdf, 50.0, 0.0, 100.0, None, lin_grid)
+
+        # Log-scaled question; resolution at geometric midpoint -> PIT ~0.5,
+        # which the linear-index map would have called ~0.03.
+        geo_grid = list(build_cdf_value_grid(1.0, 1000.0, 0.0, num_points=201))
+        log_rec = self._record(2, cdf, 31.6, 1.0, 1000.0, 0.0, geo_grid)
+
+        result = numeric_pit_analysis([linear_rec, log_rec])
+        assert result["count"] == 2
+        assert result["pit_values"][0] == pytest.approx(0.5)
+        assert result["pit_values"][1] == pytest.approx(0.5, abs=0.02)
+        # Both PITs land in the central coverage band.
+        assert result["coverage_50"] == pytest.approx(1.0)
