@@ -17,18 +17,24 @@ class TestPredicates:
         assert should_route_via_donated_key("openrouter/openai/gpt-5.1") is True
         assert should_route_via_donated_key("openrouter/anthropic/claude-sonnet-4") is True
         # Google is gated on GEMINI_USE_DONATED_OPENROUTER_KEY. With the toggle on,
-        # gemini-3-pro and gemini-3-flash prefer the donated key with paid-key fallback.
+        # flash models prefer the donated key — but gemini-3.1-pro is on the
+        # DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist (free-tier BYOK → 429), so it
+        # is pinned to the personal key even with the toggle ON.
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
-        assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is True
+        assert should_route_via_donated_key("openrouter/google/gemini-3.5-flash") is True
+        assert should_route_via_donated_key("openrouter/google/gemini-3.1-flash-lite") is True
         assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is True
-        # Explicit toggle off: Google calls go through the operator's personal key only.
+        assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
+        # Explicit toggle off: ALL Google calls go through the operator's personal key only.
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
         assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
-        assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is False
-        # Default with the env var unset is OFF (personal key only): the donated key
-        # can't serve Gemini (free-tier Google BYOK attached, gemini-3.x-pro has no
-        # Google free tier → limit 0 → 429), so we don't prefer the donated key.
+        assert should_route_via_donated_key("openrouter/google/gemini-3.5-flash") is False
+        # Default with the env var unset is ON (donated key with personal fallback):
+        # after Metaculus raised the Google rate limits (2026-06-16) the donated key
+        # serves most Gemini. A flash model routes donated-first by default; the
+        # gemini-3.1-pro slug stays blocklisted (pinned to personal) regardless.
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
+        assert should_route_via_donated_key("openrouter/google/gemini-3.5-flash") is True
         assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
         # Providers NOT covered by the donated key.
         assert should_route_via_donated_key("openrouter/x-ai/grok-4.1-fast") is False
@@ -347,21 +353,44 @@ class TestBuilder:
         assert isinstance(llm, GL)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
-    def test_builder_returns_wrapper_for_google_when_donated_toggle_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Google routes via the donated wrapper only when GEMINI_USE_DONATED_OPENROUTER_KEY=true.
+    def test_builder_returns_wrapper_for_google_flash_when_donated_toggle_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Flash Google models route via the donated wrapper when the toggle is ON.
 
-        Originally added in task #12 (Google in DONATED_KEY_PROVIDERS). The
-        toggle was added later when the donated-key Google route got flaky
-        enough that we wanted to default to personal-key-only.
+        Originally added in task #12 (Google in DONATED_KEY_PROVIDERS). After the
+        2026-06-16 rate-limit bump the donated key serves the flash models, so a
+        flash slug returns a FallbackOpenRouterLlm (donated primary, personal
+        fallback). gemini-3.1-pro is handled separately by the blocklist test.
         """
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
-        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
         assert isinstance(llm, FallbackOpenRouterLlm)
 
+    def test_builder_plain_for_google_pro_blocklisted_when_toggle_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """gemini-3.1-pro is pinned to the personal key via the blocklist even with
+        the donated toggle ON — so the builder returns a plain GeneralLlm (no
+        donated attempt, no 429, no fallback-counter bump), while a flash model in
+        the same env returns a FallbackOpenRouterLlm.
+
+        Temporary workaround; see DONATED_KEY_BLOCKED_GOOGLE_MODELS
+        (``TODO(gemini-3.1-pro-donated)``) and FUTURE.md.
+        """
+        from forecasting_tools import GeneralLlm as GL
+
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
+        pro = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        assert isinstance(pro, GL)
+        assert not isinstance(pro, FallbackOpenRouterLlm)
+        flash = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
+        assert isinstance(flash, FallbackOpenRouterLlm)
+
     def test_builder_plain_for_google_when_donated_toggle_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With the donated-key toggle off (default), Google calls bypass the donated
+        """With the donated-key toggle off, ALL Google calls bypass the donated
         wrapper entirely — the resulting LLM is a plain GeneralLlm using the
         operator's general OpenRouter key.
         """
@@ -370,25 +399,24 @@ class TestBuilder:
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
-        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
         assert isinstance(llm, GL)
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
-    def test_builder_plain_for_google_when_toggle_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Default (env var unset) is OFF: Google calls bypass the donated wrapper.
+    def test_builder_returns_wrapper_for_google_flash_when_toggle_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default (env var unset) is ON: flash Google calls prefer the donated wrapper.
 
-        The donated key can't serve Gemini (free-tier Google AI Studio BYOK
-        attached, gemini-3.x-pro has no Google free tier → limit 0 → 429), so the
-        default routes Gemini through the personal key only — a plain GeneralLlm.
+        After Metaculus raised the Google rate limits (2026-06-16) the donated key
+        serves most Gemini, so with two distinct keys configured a flash slug
+        returns a FallbackOpenRouterLlm (donated primary, personal fallback).
+        gemini-3.1-pro stays blocklisted (plain GeneralLlm) — see the dedicated
+        blocklist test.
         """
-        from forecasting_tools import GeneralLlm as GL
-
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general")
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
-        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.1-pro-preview")
-        assert isinstance(llm, GL)
-        assert not isinstance(llm, FallbackOpenRouterLlm)
+        llm = build_llm_with_openrouter_fallback("openrouter/google/gemini-3.5-flash")
+        assert isinstance(llm, FallbackOpenRouterLlm)
 
 
 class TestDeprecationTripwire:

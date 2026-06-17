@@ -136,6 +136,27 @@ def reset_generic_key_fallback_count() -> None:
 # does not require changing the secret name.
 DONATED_KEY_PROVIDERS: frozenset[str] = frozenset({"openai", "anthropic", "google"})
 
+# Google models that must NOT route through the donated key even when the
+# donated-Gemini toggle is ON. Metaculus's donated OpenRouter account serves
+# these via a FREE-TIER Google AI Studio BYOK key, and gemini-3.x-pro has no
+# Google free tier (quota 0) → every donated-key call 429s (is_byok:true) and
+# falls back to the personal key. Routing them straight to the personal key
+# avoids the wasted donated→429→personal round-trip on every call AND the
+# CI-red fallback-counter bump it causes (gemini-3.1-pro-preview is a core
+# forecaster that runs on every question). Matched by prefix (startswith) so the
+# bare GA slug and every suffixed variant (-preview, -preview-customtools,
+# OpenRouter :free/route suffixes) are all covered.
+#
+# TODO(gemini-3.1-pro-donated): gemini-3.1-pro SHOULD work on the donated key.
+# The ONLY blocker is Metaculus's free-tier Google BYOK routing. Once Metaculus
+# enables Cloud billing on that BYOK key (Tier 1), removes the Google BYOK
+# integration so it uses native OpenRouter Google credits, or disables "Always
+# use for this provider" on it — REMOVE the matching entry here so Pro rejoins
+# the donated subsidy. Re-verify with one live call: the 429 should no longer
+# carry is_byok:true + free-tier limit 0. See FUTURE.md "Gemini on the donated
+# OpenRouter key".
+DONATED_KEY_BLOCKED_GOOGLE_MODELS: frozenset[str] = frozenset({"gemini-3.1-pro"})
+
 
 def should_route_via_donated_key(model: str) -> bool:
     """Whether ``model`` should prefer the Metaculus-donated key (with paid-key fallback).
@@ -145,14 +166,19 @@ def should_route_via_donated_key(model: str) -> bool:
     (e.g. ``perplexity/sonar``) and unrecognized providers (e.g. ``x-ai`` for Grok).
 
     Special case: Google routing is gated on ``GEMINI_USE_DONATED_OPENROUTER_KEY``,
-    which defaults to OFF (see ``gemini_use_donated_openrouter_key``). The donated
-    key cannot serve Gemini — the donated account has a free-tier Google AI Studio
-    BYOK key attached, and ``gemini-3.x-pro`` has no Google free tier (limit 0 →
-    429), so donated-key Gemini calls always fall back to the personal key. With
-    the default, OpenRouter Gemini calls go through the operator's personal
-    ``OPENROUTER_API_KEY`` only — no donated-key preference, no fallback. Set the
-    env var to ``"true"`` to opt in (only meaningful after the Metaculus-side BYOK
-    fix; see ``gemini_use_donated_openrouter_key``).
+    which defaults to ON (see ``gemini_use_donated_openrouter_key``). After
+    Metaculus raised the Google rate limits (2026-06-16), the donated key serves
+    most Gemini models (e.g. ``gemini-3.5-flash``, ``gemini-3.1-flash-lite``).
+
+    EXCEPTION: models matching ``DONATED_KEY_BLOCKED_GOOGLE_MODELS``
+    (``gemini-3.1-pro``) are pinned to the personal key — no donated attempt, no
+    429, no fallback-counter bump. They run through a free-tier Google AI Studio
+    BYOK key on the donated account that has no Pro free tier (limit 0 → 429), so
+    a donated attempt would always fail over to personal anyway. The pin is a
+    temporary workaround; see the ``TODO(gemini-3.1-pro-donated)`` tag on that
+    constant and FUTURE.md — remove the entry once Metaculus fixes the BYOK
+    routing. Set the env var to a false-y value to force personal-key-only routing
+    for ALL Gemini.
     """
     if not isinstance(model, str):
         return False
@@ -164,8 +190,12 @@ def should_route_via_donated_key(model: str) -> bool:
     provider = parts[1]
     if provider not in DONATED_KEY_PROVIDERS:
         return False
-    if provider == "google" and not gemini_use_donated_openrouter_key():
-        return False
+    if provider == "google":
+        if not gemini_use_donated_openrouter_key():
+            return False
+        model_name = "/".join(parts[2:])
+        if any(model_name.startswith(blocked) for blocked in DONATED_KEY_BLOCKED_GOOGLE_MODELS):
+            return False
     return True
 
 
@@ -370,8 +400,11 @@ def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:
         return GeneralLlm(model=model, api_key=api_key, **kwargs)
 
     # OpenRouter models that bypass the donated wrapper: plain GeneralLlm.
-    # Covers (a) providers not in DONATED_KEY_PROVIDERS (x-ai, qwen, etc.) and
-    # (b) Google when GEMINI_USE_DONATED_OPENROUTER_KEY is off (the default).
+    # Covers (a) providers not in DONATED_KEY_PROVIDERS (x-ai, qwen, etc.),
+    # (b) Google when GEMINI_USE_DONATED_OPENROUTER_KEY is explicitly off (the
+    # default is now ON), and (c) blocklisted Google models
+    # (DONATED_KEY_BLOCKED_GOOGLE_MODELS, e.g. gemini-3.1-pro) which are pinned to
+    # the personal key even when the toggle is ON.
     # No api_key passed — litellm picks up OPENROUTER_API_KEY from env. This
     # mirrors how Grok-via-OpenRouter has always worked in production.
     return GeneralLlm(model=model, **kwargs)

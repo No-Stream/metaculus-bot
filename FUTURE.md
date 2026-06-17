@@ -62,21 +62,32 @@ After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search
 
 Bake into the quarterly review cadence.
 
-### Gemini on the donated OpenRouter key blocked by free-tier BYOK (added 2026-06-16)
+### Gemini on the donated OpenRouter key: pro-preview still blocked by free-tier BYOK (updated 2026-06-16)
 
-Verified this session with two live `openrouter/google/gemini-3.1-pro-preview` calls: the donated OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) **cannot** serve Gemini. The donated account has a free-tier Google AI Studio **BYOK** key attached, and OpenRouter prioritizes attached BYOK endpoints first — it is **NOT overridable per-request** (confirmed against current OpenRouter docs). `gemini-3.1-pro-preview` has no Google free tier, so the BYOK quota is structurally 0; every donated-key Gemini call 429s with `RESOURCE_EXHAUSTED` (`is_byok:true` + free-tier `limit: 0`) and `FallbackOpenRouterLlm` falls back to the personal key anyway. So enabling the donated route by default (a) saves nothing — every call still bills to the personal `OPENROUTER_API_KEY` — and (b) bumps the personal-key-fallback alert counter on every question, reddening CI each run.
+**Update (2026-06-16, fresh live calls):** Metaculus raised the Google rate limits (per Ben's Discord announcement). The donated OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) now serves **most** Gemini models — verified by live call:
+
+- `openrouter/google/gemini-3.5-flash` → **SUCCESS** on the donated key.
+- `openrouter/google/gemini-3.1-flash-lite` → **SUCCESS** on the donated key.
+
+**Remaining blocker — `gemini-3.1-pro-preview` only (our forecaster slot):** that specific model is still routed through the free-tier Google AI Studio **BYOK** key on the donated account (`is_byok:true`), and Pro-preview has no Google free tier, so the BYOK quota is structurally 0. Every donated-key `gemini-3.1-pro-preview` call still 429s with `RESOURCE_EXHAUSTED` (`is_byok:true` + free-tier `limit: 0`) and `FallbackOpenRouterLlm` gracefully falls back to the personal `OPENROUTER_API_KEY`.
+
+**Resolution (this session) — SURGICAL pin, not all-or-nothing:** default flipped back to `GEMINI_USE_DONATED_OPENROUTER_KEY=true` and all four prod YAMLs (`run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) flipped on, so flash Gemini models (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) use the donated key. But `gemini-3.1-pro-preview` is **pinned to the personal key** via the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist in `metaculus_bot/fallback_openrouter.py` — `should_route_via_donated_key` returns `False` for it, so `build_llm_with_openrouter_fallback` builds a plain `GeneralLlm` on the personal key. No donated attempt, no 429, no fallback-counter bump.
+
+This avoids the **CI-red-every-run** problem: `gemini-3.1-pro-preview` is a core forecaster on every question; without the pin, each donated→429→personal fallback bumps the personal-key-fallback counter → `cli` `sys.exit(1)` → red CI on every prod run. The surgical pin removes the donated attempt entirely for Pro while keeping the donated subsidy for the flash models that actually work on it.
+
+**⚠️ TEMPORARY WORKAROUND — remove the pin once Metaculus fixes the BYOK routing.** `gemini-3.1-pro` *should* work on the donated key; the **only** blocker is Metaculus's free-tier Google BYOK routing. The pin is tagged in code as `TODO(gemini-3.1-pro-donated)` on the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` constant — delete the matching entry there (the doc-and-code source of truth for the workaround) once any one of the Metaculus-side fixes below lands, then re-verify with one live call.
 
 OpenAI / Anthropic on the donated key are **unaffected**: there's no broken BYOK key for those providers, so they route on the donated subsidy normally.
 
-**Fix (Metaculus-account-side, pick one):**
+**Fix (Metaculus-account-side, for pro-preview specifically, pick one):**
 
-1. Enable Cloud billing on the BYOK key's GCP project so it reaches Tier 1 (gemini-3.x-pro gets a non-zero quota).
+1. Enable Cloud billing on the BYOK key's GCP project so it reaches Tier 1 (gemini-3.x-pro-preview gets a non-zero quota).
 2. Remove the Google AI Studio BYOK integration so `google/*` uses native OpenRouter Google credits instead of the BYOK key.
 3. Disable "Always use for this provider" on that BYOK key.
 
-**Does NOT help:** raising OpenRouter-side native limits — the 429 is Google-side on the BYOK key, not an OpenRouter throttle.
+**Does NOT help:** raising OpenRouter-side native limits — the pro-preview 429 is Google-side on the BYOK key, not an OpenRouter throttle.
 
-**Action:** keep `GEMINI_USE_DONATED_OPENROUTER_KEY=false` (the default) until Metaculus fixes the above. Re-verify with one live `openrouter/google/gemini-3.1-pro-preview` call and confirm the error no longer carries `is_byok:true` + free-tier `limit: 0`; only then flip the default back to `true`.
+**Action:** pinged Ben. Once Metaculus applies one of the fixes above, re-verify pro-preview with one live `openrouter/google/gemini-3.1-pro-preview` call and confirm the error no longer carries `is_byok:true` + free-tier `limit: 0`; then remove the `gemini-3.1-pro` entry from `DONATED_KEY_BLOCKED_GOOGLE_MODELS` (see `TODO(gemini-3.1-pro-donated)` in `metaculus_bot/fallback_openrouter.py`) so Pro rejoins the donated subsidy.
 
 ### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
 
