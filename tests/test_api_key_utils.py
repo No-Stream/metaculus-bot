@@ -41,7 +41,12 @@ class TestApiKeyUtils:
         assert result == "general_key"
 
     def test_google_model_default_uses_general_key(self, monkeypatch):
-        """Default (env var unset) matches the toggle-off behavior."""
+        """Default (env var unset) is OFF: Google routes via the general (personal) key.
+
+        The donated key can't serve Gemini (free-tier Google AI Studio BYOK
+        attached, gemini-3.x-pro has no Google free tier → limit 0 → 429), so the
+        default sends Gemini through the operator's personal OPENROUTER_API_KEY.
+        """
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special_key")
         monkeypatch.setenv("OPENROUTER_API_KEY", "general_key")
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)

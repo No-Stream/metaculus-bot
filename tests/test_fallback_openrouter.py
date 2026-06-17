@@ -21,11 +21,13 @@ class TestPredicates:
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
         assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is True
         assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is True
-        # Default (toggle off): Google calls go through the operator's personal key only.
+        # Explicit toggle off: Google calls go through the operator's personal key only.
         monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "false")
         assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
         assert should_route_via_donated_key("openrouter/google/gemini-3-flash-preview") is False
-        # Default with the env var unset behaves like off.
+        # Default with the env var unset is OFF (personal key only): the donated key
+        # can't serve Gemini (free-tier Google BYOK attached, gemini-3.x-pro has no
+        # Google free tier → limit 0 → 429), so we don't prefer the donated key.
         monkeypatch.delenv("GEMINI_USE_DONATED_OPENROUTER_KEY", raising=False)
         assert should_route_via_donated_key("openrouter/google/gemini-3.1-pro-preview") is False
         # Providers NOT covered by the donated key.
@@ -219,6 +221,102 @@ class TestFallbackOpenRouterLlm:
             await llm.invoke("hi")
 
 
+class TestFallbackCounters:
+    """Every donated->personal fallback must be counted + logged loudly so silent
+    personal-key spend can't accumulate. ``_generic_key_fallback_count`` counts ALL
+    fallback causes; ``_donated_404_fallback_count`` is the allowed-providers-404
+    subset. cli.py folds the generic counter into its non-zero-exit alert.
+    """
+
+    def setup_method(self) -> None:
+        from metaculus_bot.fallback_openrouter import (
+            reset_donated_404_fallback_count,
+            reset_generic_key_fallback_count,
+        )
+
+        reset_generic_key_fallback_count()
+        reset_donated_404_fallback_count()
+
+    def teardown_method(self) -> None:
+        from metaculus_bot.fallback_openrouter import (
+            reset_donated_404_fallback_count,
+            reset_generic_key_fallback_count,
+        )
+
+        reset_generic_key_fallback_count()
+        reset_donated_404_fallback_count()
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_bumps_counter_and_logs_every_time(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 401/402 (non-404) fallback bumps ONLY the generic counter, not the 404 subset,
+        and logs a WARNING on EVERY fallback (no once-per-instance suppression)."""
+        from metaculus_bot.fallback_openrouter import (
+            get_donated_404_fallback_count,
+            get_generic_key_fallback_count,
+        )
+
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/anthropic/claude-opus-4.8",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("HTTP 402 Payment Required: insufficient credit")),
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
+
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.fallback_openrouter"):
+            assert await llm.invoke("hi") == "ok"
+            assert await llm.invoke("hi") == "ok"
+
+        # Generic counter bumped on both fallbacks; 404 subset untouched.
+        assert get_generic_key_fallback_count() == 2
+        assert get_donated_404_fallback_count() == 0
+        # Loud WARNING on every fallback, not just the first.
+        paid_warnings = [r for r in caplog.records if "PAID PERSONAL-KEY FALLBACK" in r.getMessage()]
+        assert len(paid_warnings) == 2
+
+    @pytest.mark.asyncio
+    async def test_donated_404_fallback_bumps_both_counters(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 404 'no allowed providers' fallback bumps BOTH the generic total and the 404 subset
+        (a 404 fallback is still a personal-key fallback)."""
+        from metaculus_bot.fallback_openrouter import (
+            get_donated_404_fallback_count,
+            get_generic_key_fallback_count,
+        )
+
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.4",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("404 No allowed providers are available for the selected model.")),
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
+
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.fallback_openrouter"):
+            assert await llm.invoke("hi") == "ok"
+
+        assert get_generic_key_fallback_count() == 1
+        assert get_donated_404_fallback_count() == 1
+        assert any("no allowed providers" in r.getMessage() for r in caplog.records)
+
+
 class TestBuilder:
     def test_builder_returns_wrapper_when_both_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
@@ -277,7 +375,12 @@ class TestBuilder:
         assert not isinstance(llm, FallbackOpenRouterLlm)
 
     def test_builder_plain_for_google_when_toggle_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Default (env var unset) matches the toggle-off behavior."""
+        """Default (env var unset) is OFF: Google calls bypass the donated wrapper.
+
+        The donated key can't serve Gemini (free-tier Google AI Studio BYOK
+        attached, gemini-3.x-pro has no Google free tier → limit 0 → 429), so the
+        default routes Gemini through the personal key only — a plain GeneralLlm.
+        """
         from forecasting_tools import GeneralLlm as GL
 
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")

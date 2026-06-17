@@ -6,9 +6,13 @@ Posture pinned by these tests:
   donated-key wrapper 404'd). ``glm-4.5-air:free`` was removed
   (Phase A.3 Package 3b, 2026-05-14, after qid 43171 hallucinated
   partial-week TSA data with σ=13K vs ensemble σ ~965K).
-* Forecaster + parser are constructed as plain ``GeneralLlm`` (no
+* The FREE forecaster + parser are constructed as plain ``GeneralLlm`` (no
   ``api_key`` set), so litellm reads ``OPENROUTER_API_KEY`` from env at
-  invoke time. Ablation explicitly opts out of the donated-key path.
+  invoke time — ``:free`` models bypass the donated key because their
+  providers aren't in ``DONATED_KEY_PROVIDERS`` (donated key 404s).
+* The PROD lineup routes through the donated-key wrapper: ablation IS Metaculus
+  work, and its anthropic/openai models are donated-covered, so they bill to the
+  donated key with personal-key fallback.
 """
 
 from __future__ import annotations
@@ -82,3 +86,27 @@ def test_build_free_parser_llm_uses_gemma_4_31b() -> None:
     assert isinstance(parser, GeneralLlm)
     assert not isinstance(parser, FallbackOpenRouterLlm)
     assert parser.model == FREE_PARSER_MODEL == "openrouter/google/gemma-4-31b-it:free"
+
+
+def test_build_prod_forecaster_llms_routes_via_donated_wrapper(monkeypatch) -> None:
+    """Prod ensemble bills to the donated key: each model is wrapped in
+    FallbackOpenRouterLlm (donated primary -> personal fallback). Ablation IS
+    Metaculus work, and these anthropic/openai models are donated-covered.
+
+    Requires both keys set + distinct for the wrapper to engage (matches
+    ``build_llm_with_openrouter_fallback``); in CI neither is set, so we inject
+    distinct placeholders.
+    """
+    from metaculus_bot.ablation.forecaster_lineup import PROD_FORECASTER_MODELS, build_prod_forecaster_llms
+    from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
+
+    monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "general")
+
+    llms = build_prod_forecaster_llms()
+    assert len(llms) == len(PROD_FORECASTER_MODELS) == 3
+    for llm, expected_model in zip(llms, PROD_FORECASTER_MODELS):
+        assert isinstance(llm, FallbackOpenRouterLlm), (
+            f"{expected_model} must route via the donated-key wrapper (Metaculus work -> donated key)"
+        )
+        assert llm.model == expected_model

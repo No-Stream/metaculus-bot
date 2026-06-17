@@ -83,14 +83,15 @@ _DEPRECATION_PATTERNS: tuple[str, ...] = (
 )
 
 
-# Module-level alerting counter. Incremented every time the donated key returns
-# a "no allowed providers / 404" error and we successfully fall back to the
-# general key. cli.py reads this via ``get_donated_404_fallback_count`` and
-# folds it into ``alertable_count`` so a run that hit this branch completes its
-# submissions but exits non-zero, prompting GitHub Actions to email the operator.
-# The donated key has server-side allowed-providers preferences set by
-# Metaculus; if that list ever changes upstream (or a new model isn't covered),
-# we want to know without losing the run.
+# Module-level diagnostic counter for the allowed-providers-404 SUBSET of
+# donated->personal fallbacks. Incremented every time the donated key returns a
+# "no allowed providers / 404" error and we successfully fall back to the general
+# key. This is NOT the alerting input — cli.py folds ``_generic_key_fallback_count``
+# (the all-causes total) into ``alertable``; adding this 404 count too would
+# double-count events already inside that total. cli.py reads this via
+# ``get_donated_404_fallback_count`` only to break it out in the end-of-run log
+# line ("... of which donated_404=N"), so a stale allowed-providers list upstream
+# is visible without losing the run.
 _donated_404_fallback_count: int = 0
 
 
@@ -103,6 +104,27 @@ def reset_donated_404_fallback_count() -> None:
     """Reset the counter to zero. Used by tests; not for production code."""
     global _donated_404_fallback_count
     _donated_404_fallback_count = 0
+
+
+# Module-level counter for EVERY successful donated->personal key fallback,
+# regardless of cause (401/402/429/guardrail/404). Distinct from
+# ``_donated_404_fallback_count`` (which counts only the allowed-providers 404
+# subset). The operator pays for every personal-key fallback, so we want a loud,
+# auditable signal whenever the donated key was supposed to cover a call but
+# didn't — cli.py folds this into the end-of-run alert so a run that quietly
+# leaked spend to the personal key still turns CI red.
+_generic_key_fallback_count: int = 0
+
+
+def get_generic_key_fallback_count() -> int:
+    """Read the module-level counter for donated->personal key fallback events (all causes)."""
+    return _generic_key_fallback_count
+
+
+def reset_generic_key_fallback_count() -> None:
+    """Reset the counter to zero. Used by tests; not for production code."""
+    global _generic_key_fallback_count
+    _generic_key_fallback_count = 0
 
 
 # Providers covered by the Metaculus-donated OpenRouter key
@@ -122,10 +144,15 @@ def should_route_via_donated_key(model: str) -> bool:
     against ``DONATED_KEY_PROVIDERS``. Returns False for non-OpenRouter slugs
     (e.g. ``perplexity/sonar``) and unrecognized providers (e.g. ``x-ai`` for Grok).
 
-    Special case: Google routing is gated on ``GEMINI_USE_DONATED_OPENROUTER_KEY``.
-    When the donated-key Google route is flaky we want OpenRouter Gemini calls to
-    flow through the operator's personal ``OPENROUTER_API_KEY`` only — no donated-
-    key preference, no paid-key fallback. Toggle is off by default.
+    Special case: Google routing is gated on ``GEMINI_USE_DONATED_OPENROUTER_KEY``,
+    which defaults to OFF (see ``gemini_use_donated_openrouter_key``). The donated
+    key cannot serve Gemini — the donated account has a free-tier Google AI Studio
+    BYOK key attached, and ``gemini-3.x-pro`` has no Google free tier (limit 0 →
+    429), so donated-key Gemini calls always fall back to the personal key. With
+    the default, OpenRouter Gemini calls go through the operator's personal
+    ``OPENROUTER_API_KEY`` only — no donated-key preference, no fallback. Set the
+    env var to ``"true"`` to opt in (only meaningful after the Metaculus-side BYOK
+    fix; see ``gemini_use_donated_openrouter_key``).
     """
     if not isinstance(model, str):
         return False
@@ -260,7 +287,6 @@ class FallbackOpenRouterLlm(GeneralLlm):
         self._secondary_llm: GeneralLlm | None = (
             GeneralLlm(model=model, api_key=secondary_api_key, **kwargs) if secondary_api_key else None
         )
-        self._has_warned_once: bool = False
 
     async def invoke(self, prompt: Any) -> str:  # type: ignore[override]
         try:
@@ -272,30 +298,36 @@ class FallbackOpenRouterLlm(GeneralLlm):
             # log is clearer with the slug.
             _record_deprecation_if_matched(self.model, str(e))
             if self._secondary_llm is not None and should_retry_with_general_key(e):
-                # Donated-key allowed-providers 404 is its own bucket: count it
-                # so cli.py can exit non-zero (alerting the operator) even
-                # though the run completes successfully via the secondary key.
+                # Every successful donated->personal fallback means a paid
+                # personal-key call happened where the free donated key was
+                # expected to cover it. Count and log ALL of them loudly so
+                # silent personal-key spend can't accumulate unnoticed. The
+                # 404 "no allowed providers" subset is ALSO tracked separately
+                # for diagnostics, but it still counts as a personal-key
+                # fallback here.
+                global _generic_key_fallback_count
+                _generic_key_fallback_count += 1
                 if _is_donated_404(e):
                     global _donated_404_fallback_count
                     _donated_404_fallback_count += 1
                     logger.warning(
                         "Donated OpenRouter key returned 404 'no allowed providers' for model=%s; "
-                        "falling back to general key. This means the donated key's server-side "
-                        "allowed-providers list does not cover this model's upstream provider. "
+                        "falling back to general (paid personal) key. This means the donated key's "
+                        "server-side allowed-providers list does not cover this model's upstream "
+                        "provider. Run will complete, then exit non-zero to alert. error=%s: %s",
+                        self.model,
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    logger.warning(
+                        "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=%s, so this "
+                        "call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
                         "Run will complete, then exit non-zero to alert. error=%s: %s",
                         self.model,
                         type(e).__name__,
                         e,
                     )
-                elif not self._has_warned_once:
-                    logger.warning(
-                        "Primary OpenRouter key failed with credential/credit error; falling back to generic key. "
-                        "model=%s; error=%s: %s",
-                        self.model,
-                        type(e).__name__,
-                        e,
-                    )
-                    self._has_warned_once = True
                 # ASYNC120: a checkpoint inside `except` can drop the active
                 # exception if the task is cancelled mid-await. That's the
                 # correct behavior here — on success we return the secondary's

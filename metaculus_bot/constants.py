@@ -30,10 +30,20 @@ METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current c
 def gemini_use_donated_openrouter_key() -> bool:
     """Whether OpenRouter Gemini calls should route through the Metaculus-donated key.
 
-    Returns True iff GEMINI_USE_DONATED_OPENROUTER_KEY=="true". Default is
-    False — the donated-key Google route has been flaky, so we prefer the
-    operator's personal OPENROUTER_API_KEY for Gemini. Read at call time (not
-    import) so workflow env changes take effect without re-importing.
+    Default is False (env unset → personal key only; only an explicit ``"true"``
+    opts in). The donated OpenRouter key CANNOT serve Gemini: the donated account
+    has a free-tier Google AI Studio BYOK key attached, and OpenRouter forces all
+    ``google/*`` traffic through that BYOK key first (not overridable per-request).
+    ``gemini-3.x-pro`` has no Google free tier, so the BYOK quota is structurally
+    0 → every donated-key Gemini call 429s (``is_byok:true`` + ``FreeTier limit:
+    0``) and falls back to the personal key anyway. So Gemini routes through the
+    operator's personal OPENROUTER_API_KEY directly. This is a Metaculus-account-
+    side fix (enable Cloud billing on the BYOK key's GCP project, or remove the
+    Google BYOK integration so native OpenRouter Google credits are used); flip
+    this default back to True only after that's done.
+
+    Read at call time (not import) so workflow env changes take effect without
+    re-importing.
 
     Scope: this toggle only affects OpenRouter routing (``fallback_openrouter``).
     The google-genai grounded-search provider has no donated path — it always

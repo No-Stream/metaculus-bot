@@ -20,6 +20,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_donated_404_fallback_count,
+    get_generic_key_fallback_count,
 )
 from metaculus_bot.fetch_hardening import apply_fetch_hardening
 from metaculus_bot.forecaster import TemplateForecaster
@@ -155,19 +156,26 @@ def main() -> None:
     # the operator knows to investigate (forecaster drops, stacker fallback
     # usage, research provider timeouts, etc. — see main.py `alertable_count`).
     bot_alertable = template_bot.alertable_count
-    # Donated-key 404 fallback: counted in fallback_openrouter at the wrapper
-    # level (process-global, since the wrapper has no link back to the bot).
-    # The fallback was successful — the run completed using the paid key —
-    # but the donated key's allowed-providers list is now stale and the
-    # operator should investigate.
+    # Donated->personal key fallback: counted in fallback_openrouter at the
+    # wrapper level (process-global, since the wrapper has no link back to the
+    # bot). Each fallback was successful — the run completed using the paid
+    # personal key — but a call that should have hit the free donated key
+    # billed to the operator instead, so the operator should investigate.
+    # ``generic_fallback`` counts ALL fallback causes (401/402/429/guardrail/
+    # 404); ``donated_404`` is the allowed-providers-404 subset of that total,
+    # broken out for diagnostics. Add only ``generic_fallback`` to ``alertable``
+    # — adding ``donated_404`` too would double-count the 404 subset.
+    generic_fallback = get_generic_key_fallback_count()
     donated_404 = get_donated_404_fallback_count()
-    alertable = bot_alertable + donated_404
+    alertable = bot_alertable + generic_fallback
     if alertable > 0:
         logger.warning(
-            "Run completed with %d alertable degradation event(s) (bot=%d, donated_404_fallback=%d); "
+            "Run completed with %d alertable degradation event(s) "
+            "(bot=%d, personal_key_fallback=%d of which donated_404=%d); "
             "exiting non-zero so CI marks this run red.",
             alertable,
             bot_alertable,
+            generic_fallback,
             donated_404,
         )
         sys.exit(1)

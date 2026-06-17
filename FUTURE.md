@@ -62,6 +62,22 @@ After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search
 
 Bake into the quarterly review cadence.
 
+### Gemini on the donated OpenRouter key blocked by free-tier BYOK (added 2026-06-16)
+
+Verified this session with two live `openrouter/google/gemini-3.1-pro-preview` calls: the donated OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) **cannot** serve Gemini. The donated account has a free-tier Google AI Studio **BYOK** key attached, and OpenRouter prioritizes attached BYOK endpoints first — it is **NOT overridable per-request** (confirmed against current OpenRouter docs). `gemini-3.1-pro-preview` has no Google free tier, so the BYOK quota is structurally 0; every donated-key Gemini call 429s with `RESOURCE_EXHAUSTED` (`is_byok:true` + free-tier `limit: 0`) and `FallbackOpenRouterLlm` falls back to the personal key anyway. So enabling the donated route by default (a) saves nothing — every call still bills to the personal `OPENROUTER_API_KEY` — and (b) bumps the personal-key-fallback alert counter on every question, reddening CI each run.
+
+OpenAI / Anthropic on the donated key are **unaffected**: there's no broken BYOK key for those providers, so they route on the donated subsidy normally.
+
+**Fix (Metaculus-account-side, pick one):**
+
+1. Enable Cloud billing on the BYOK key's GCP project so it reaches Tier 1 (gemini-3.x-pro gets a non-zero quota).
+2. Remove the Google AI Studio BYOK integration so `google/*` uses native OpenRouter Google credits instead of the BYOK key.
+3. Disable "Always use for this provider" on that BYOK key.
+
+**Does NOT help:** raising OpenRouter-side native limits — the 429 is Google-side on the BYOK key, not an OpenRouter throttle.
+
+**Action:** keep `GEMINI_USE_DONATED_OPENROUTER_KEY=false` (the default) until Metaculus fixes the above. Re-verify with one live `openrouter/google/gemini-3.1-pro-preview` call and confirm the error no longer carries `is_byok:true` + free-tier `limit: 0`; only then flip the default back to `true`.
+
 ### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
 
 Metaculus enabled OpenAI on the donated key. `build_native_search_llm` now routes through
@@ -307,7 +323,9 @@ Deferred from the 2026-06-01 desloppify code-health pass (which did only behavio
 Two follow-ups intentionally left for a separate, gated PR:
 
 1. **Raise version floors to current-installed** (e.g. `litellm ^1.80` vs the current `^1.59.1` floor, `openai` to latest, and evaluate moving `forecasting-tools` off the hard-pinned `0.2.54`). This is **forecast-affecting**: a litellm/openai/forecasting-tools behavior change can subtly shift model outputs and therefore predictions. **Gate:** run a medium backtest (`make backtest_medium`) before and after the bump and confirm scores don't regress before shipping. Do NOT bump blind.
-2. **Migrate dependency management from poetry to `uv`.** Larger refactor (pyproject `[tool.poetry]` → PEP 621 `[project]`, regenerate lockfile, update Makefile `install`/`run`/`test` targets and CI). An orphaned 136-byte `uv.lock` stub + `[tool.uv]` block (declaring a contradictory `requires-python >=3.12`) were removed in the 2026-06-01 pass so the repo has one source of truth (poetry); a real uv migration would regenerate the lockfile from scratch. Worth doing for speed + the team's broader uv standardization, but it's pure tooling churn with no forecast impact — schedule when there's appetite for a no-functional-change infra PR.
+2. **Migrate dependency management from poetry to `uv`.** Larger refactor (pyproject `[tool.poetry]` → PEP 621 `[project]`, regenerate lockfile, update Makefile `install`/`run`/`test` targets and CI). An orphaned 136-byte `uv.lock` stub + `[tool.uv]` block (declaring a contradictory `requires-python >=3.12`) were removed in the 2026-06-01 pass so the repo has one source of truth (poetry); a real uv migration would regenerate the lockfile from scratch. Worth doing for speed + the team's broader uv standardization — poetry is dated and the team is standardizing on uv, so this is the intended direction; it's pure tooling churn with no forecast impact, so schedule when there's appetite for a no-functional-change infra PR.
+
+   **Update 2026-06-16:** the contentless `uv.lock` stub re-appeared (an incidental `uv` invocation in this environment keeps regenerating it). Rather than delete-and-forget again, added `uv.lock` to `.gitignore` so it can't sneak back into a commit before the real migration lands. When the migration happens, remove that gitignore line and check in the real resolved lockfile.
 
 ### Gemini grounding via OpenRouter — currently NOT supported (added 2026-05-17)
 
