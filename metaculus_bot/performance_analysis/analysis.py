@@ -153,13 +153,14 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         elif resolution == "below_lower_bound":
             pit = 0.0
         elif isinstance(resolution, (int, float)):
+            zp_raw = scaling.get("zero_point")
             pit = _interpolate_pit(
                 float(resolution),
                 lower_bound,
                 upper_bound,
                 cdf_values,
                 value_grid=scaling.get("continuous_range"),
-                zero_point=scaling.get("zero_point"),
+                zero_point=None if zp_raw in (None, 0, 0.0) else float(zp_raw),
             )
         else:
             continue

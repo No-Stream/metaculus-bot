@@ -187,7 +187,7 @@ def build_cdf_value_grid(
     # Handle potential numerical issues
     if abs(ratio - 1.0) < 1e-10:
         return lower_bound + (upper_bound - lower_bound) * t
-    return np.array([lower_bound + (upper_bound - lower_bound) * ((ratio**tt - 1) / (ratio - 1)) for tt in t])
+    return lower_bound + (upper_bound - lower_bound) * ((ratio**t - 1) / (ratio - 1))
 
 
 def generate_pchip_cdf(

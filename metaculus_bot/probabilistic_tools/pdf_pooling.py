@@ -136,6 +136,10 @@ def vincentize_cdfs(
 
     # Re-project the averaged quantile function back to a CDF on the question grid:
     # F(x) = p where Q(p) = x, i.e. interpolate p against the (value -> prob) inverse.
+    # Quantile averaging represents the upper tail as F(upper) = max_i(cdf_i[-1]) by
+    # construction (the highest forecaster's reach into the range), which _finalize_cdf
+    # then caps to <= 0.999 for open-upper questions — a defensible property of the
+    # quantile method, not the dropped-bucket asymmetry log_pool_cdfs corrects.
     cdf_on_grid = np.interp(grid, averaged_quantiles, prob_levels)
 
     return _finalize_cdf(cdf_on_grid, grid, question)
@@ -207,23 +211,32 @@ def log_pool_cdfs(
 
     grid = _question_grid(question, PCHIP_CDF_POINTS)
 
-    # Per-forecaster PMF over the shared value grid. diff gives the n-1 interior masses;
-    # prepend the lower-tail mass (cdf[0]) so each PMF has the same length as the grid and
-    # sums to cdf[-1] (<= 1). Tiny epsilon keeps log-space pooling finite at empty buckets.
-    log_density_acc = np.zeros(len(grid), dtype=float)
+    # Per-forecaster PMF over the full 202 buckets a 201-point CDF decomposes into: the
+    # below-lower boundary mass (cdf[0]), 200 interior masses (diff(cdf)), and the above-upper
+    # boundary mass (1 - cdf[-1]). Keeping BOTH boundary buckets is what makes the pool
+    # symmetric — dropping the upper bucket (and renormalizing) would silently discard the
+    # open-upper tail mass forecasters assign above the grid. Tiny epsilon keeps log-space
+    # pooling finite at empty buckets.
+    n_buckets = len(grid) + 1
+    log_density_acc = np.zeros(n_buckets, dtype=float)
     pmf_eps = 1e-12
     for cdf, weight in zip(cdfs, w):
         probs = np.maximum.accumulate(_cdf_probs(cdf))
-        pmf = np.empty_like(probs)
-        pmf[0] = probs[0]
-        pmf[1:] = np.diff(probs)
+        pmf = np.empty(n_buckets, dtype=float)
+        pmf[0] = probs[0]  # below-lower boundary bucket
+        pmf[1:-1] = np.diff(probs)  # interior buckets
+        pmf[-1] = 1.0 - probs[-1]  # above-upper boundary bucket
         pmf = np.clip(pmf, 0.0, None) + pmf_eps
         log_density_acc += weight * np.log(pmf)
 
     pooled_pmf = np.exp(log_density_acc)
     pooled_pmf /= pooled_pmf.sum()
 
-    pooled_cdf = np.cumsum(pooled_pmf)
-    pooled_cdf /= pooled_cdf[-1]
+    # Re-integrate only the in-range portion (below-lower + interior = the first len(grid)
+    # buckets). The pooled above-upper bucket (pooled_pmf[-1]) stays out of the CDF, so the
+    # final value is cdf[-1] = 1 - that mass < 1 for open-upper questions with real tail mass.
+    # _finalize_cdf applies the open/closed-bound caps (open-upper -> <= 0.999; closed-upper
+    # -> pinned to 1.0, since the above bucket is ~eps when every input has cdf[-1] == 1).
+    pooled_cdf = np.cumsum(pooled_pmf[: len(grid)])
 
     return _finalize_cdf(pooled_cdf, grid, question)

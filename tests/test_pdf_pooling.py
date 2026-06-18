@@ -238,6 +238,60 @@ class TestLogPoolCdfs:
         assert x50_high > x50_balanced
 
 
+class TestLogPoolPreservesOpenUpperTail:
+    """Regression guard for the dropped-upper-tail bug (Finding A).
+
+    A 201-point CDF decomposes into 202 buckets: below-lower (cdf[0]), 200 interior
+    (diff(cdf)), and above-upper (1 - cdf[-1]). The old log_pool_cdfs kept the below-lower
+    bucket but DROPPED the above-upper bucket, renormalized the truncated PMF, then forced
+    cdf[-1] == 1 — destroying any open-upper tail. The fix pools all 202 buckets and leaves
+    the pooled above-upper mass out of the in-range CDF, so cdf[-1] = 1 - that mass.
+    """
+
+    def test_retains_open_upper_tail_mass(self):
+        # Open-upper question; both forecasters concentrate mass near the top of the range
+        # and assign ~10% mass ABOVE the upper bound (cdf[-1] ~= 0.90, well below the 0.999
+        # cap). The pooled distribution must keep a fat upper tail rather than renormalizing
+        # it away. Under the OLD drop-the-tail-then-renormalize code, cdf[-1] would be forced
+        # to ~1.0 (then capped to 0.999); the assertions below would fail.
+        question = make_mock_numeric_question(lower_bound=0.0, upper_bound=100.0, open_upper_bound=True)
+        grid = np.linspace(0.0, 100.0, PCHIP_CDF_POINTS)
+        # Means at/above the upper bound so a real chunk of mass sits above grid[-1]=100.
+        cdfs = [
+            _normal_cdf_on_grid(grid, mean=92.0, sd=12.0),
+            _normal_cdf_on_grid(grid, mean=98.0, sd=14.0),
+        ]
+        # Each input genuinely reserves meaningful mass above the upper bound.
+        for c in cdfs:
+            assert _probs(c)[-1] < 0.92
+
+        pooled = log_pool_cdfs(cdfs, question)
+        _assert_valid_cdf(pooled, question)
+
+        pooled_probs = _probs(pooled)
+        above_upper_mass = 1.0 - pooled_probs[-1]
+        # The retained upper-tail mass must be materially above the 0.001 open-bound floor
+        # (the value the old code would collapse to). Geometric pooling of two ~0.08-0.10
+        # tails keeps a comparable tail, so require it to clear a generous floor.
+        assert above_upper_mass > 0.02, f"open-upper tail collapsed: above_upper_mass={above_upper_mass}"
+        # And strictly below the 0.999 cap's complement, i.e. the CDF did not get forced to 1.
+        assert pooled_probs[-1] < 0.999 + 1e-9
+
+    def test_closed_upper_still_pins_cdf_to_one(self):
+        # Regression guard that the 202-bucket logic does not break closed bounds. Even with
+        # inputs that reserve real above-upper mass, _finalize_cdf pins the last CDF point to
+        # exactly 1.0 for a closed upper bound (the reserved mass is folded back into range).
+        question = make_mock_numeric_question(lower_bound=0.0, upper_bound=100.0, open_upper_bound=False)
+        grid = np.linspace(0.0, 100.0, PCHIP_CDF_POINTS)
+        cdfs = [
+            _normal_cdf_on_grid(grid, mean=92.0, sd=12.0),
+            _normal_cdf_on_grid(grid, mean=98.0, sd=14.0),
+        ]
+        pooled = log_pool_cdfs(cdfs, question)
+        _assert_valid_cdf(pooled, question)
+        assert abs(_probs(pooled)[-1] - 1.0) <= 1e-9
+
+
 class TestQuestionGridZeroPoint:
     """The x-value grid a pooled CDF is projected onto must match the production CDF grid:
     geometric for zero_point (log-scaled) questions, linear otherwise. The Metaculus scorer

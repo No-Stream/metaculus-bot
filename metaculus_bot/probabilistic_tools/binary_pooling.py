@@ -60,7 +60,7 @@ def _apply_evidence_lr(base_prob: float, evidence_items: list[Any]) -> float:
         if item.direction == "down":
             lr = 1.0 / lr
         log_odds += math.log(lr)
-    return 1.0 / (1.0 + math.exp(-log_odds))
+    return sigmoid(log_odds)
 
 
 def reconstruct_p_math(
