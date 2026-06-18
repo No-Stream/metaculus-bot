@@ -2100,3 +2100,422 @@ class TestPerComparisonPartialArms:
         assert len(scores) == 2
         comparisons_found = {s.comparison for s in scores}
         assert comparisons_found == {"median-stack"}
+
+
+# ---------------------------------------------------------------------------
+# 6-arm scoring (mean arm extension on top of the 5-arm pdf panel)
+# ---------------------------------------------------------------------------
+
+
+def _six_arm_inputs(
+    report_stack,
+    report_stack_aug,
+    report_pdf_min1,
+    report_pdf_min2,
+    report_median,
+    report_mean,
+    payload_stack=None,
+    payload_stack_aug=None,
+    payload_pdf_min1=None,
+    payload_pdf_min2=None,
+    payload_median=None,
+    payload_mean=None,
+):
+    """Build the [(label, report, payload), ...] list for the 6-arm score_arm_for_qid."""
+    return [
+        ("stack", report_stack, payload_stack),
+        ("stack_aug", report_stack_aug, payload_stack_aug),
+        ("pdf_min1", report_pdf_min1, payload_pdf_min1),
+        ("pdf_min2", report_pdf_min2, payload_pdf_min2),
+        ("median", report_median, payload_median),
+        ("mean", report_mean, payload_mean),
+    ]
+
+
+class TestSixArmScoring:
+    def test_score_arm_six_arm_binary_returns_fifteen_comparisons_per_metric(self):
+        """Binary 6-arm: 2 metrics * 15 pairwise comparisons = 30 PairedScore rows.
+
+        15 = the 10 existing 5-arm comparisons + 5 new mean comparisons.
+        """
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        report_mean = _make_binary_report(0.55)
+        gt = GroundTruth(
+            question_id=42,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(
+                report_stack,
+                report_stack_aug,
+                report_pdf_min1,
+                report_pdf_min2,
+                report_median,
+                report_mean,
+            ),
+            gt,
+        )
+
+        # 2 metrics x 15 comparisons = 30 rows.
+        assert len(scores) == 30
+        comparisons_found = {s.comparison for s in scores}
+        assert len(comparisons_found) == 15
+        # All 10 existing 5-arm comparisons still present.
+        assert "stack_aug-stack" in comparisons_found
+        assert "pdf_min1-stack" in comparisons_found
+        assert "pdf_min2-stack" in comparisons_found
+        assert "median-stack" in comparisons_found
+        assert "pdf_min1-stack_aug" in comparisons_found
+        assert "pdf_min2-stack_aug" in comparisons_found
+        assert "median-stack_aug" in comparisons_found
+        assert "pdf_min2-pdf_min1" in comparisons_found
+        assert "median-pdf_min1" in comparisons_found
+        assert "median-pdf_min2" in comparisons_found
+        # The 5 new mean comparisons.
+        assert "mean-stack" in comparisons_found
+        assert "mean-stack_aug" in comparisons_found
+        assert "mean-pdf_min1" in comparisons_found
+        assert "mean-pdf_min2" in comparisons_found
+        assert "mean-median" in comparisons_found
+
+    def test_six_arm_mean_delta_signs_correct(self):
+        """Delta for mean-Y should equal score_mean - score_Y; mean-median is the key contrast."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.7)
+        report_median = _make_binary_report(0.5)
+        report_mean = _make_binary_report(0.55)
+        gt = GroundTruth(
+            question_id=60,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(
+                report_stack,
+                report_stack_aug,
+                report_pdf_min1,
+                report_pdf_min2,
+                report_median,
+                report_mean,
+            ),
+            gt,
+        )
+
+        for s in scores:
+            if s.metric != "binary_log_score":
+                continue
+            if s.comparison == "mean-median":
+                assert s.delta == pytest.approx(s.score_mean - s.score_median)
+            elif s.comparison == "mean-stack":
+                assert s.delta == pytest.approx(s.score_mean - s.score_stack)
+            elif s.comparison == "mean-stack_aug":
+                assert s.delta == pytest.approx(s.score_mean - s.score_stack_aug)
+            elif s.comparison == "mean-pdf_min1":
+                assert s.delta == pytest.approx(s.score_mean - s.score_pdf_min1)
+            elif s.comparison == "mean-pdf_min2":
+                assert s.delta == pytest.approx(s.score_mean - s.score_pdf_min2)
+
+    def test_six_arm_paired_score_has_mean_score_field(self):
+        """PairedScore for 6-arm should carry a populated (non-NaN) score_mean on every row."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        report_mean = _make_binary_report(0.55)
+        gt = GroundTruth(
+            question_id=61,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(
+                report_stack,
+                report_stack_aug,
+                report_pdf_min1,
+                report_pdf_min2,
+                report_median,
+                report_mean,
+            ),
+            gt,
+        )
+
+        assert scores
+        for s in scores:
+            assert hasattr(s, "score_mean")
+            assert not math.isnan(s.score_mean)
+            assert hasattr(s, "is_saturated_mean")
+
+    def test_six_arm_mean_none_emits_only_non_mean_comparisons(self):
+        """6-arm input where mean is None: drop the 5 mean comparisons, keep the 10 base.
+
+        For binary: 2 metrics * 10 comparisons = 20 PairedScore rows (the 5-arm set).
+        """
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=62,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(
+                report_stack,
+                report_stack_aug,
+                report_pdf_min1,
+                report_pdf_min2,
+                report_median,
+                None,
+            ),
+            gt,
+        )
+
+        assert len(scores) == 20
+        comparisons_found = {s.comparison for s in scores}
+        assert len(comparisons_found) == 10
+        for mean_comparison in (
+            "mean-stack",
+            "mean-stack_aug",
+            "mean-pdf_min1",
+            "mean-pdf_min2",
+            "mean-median",
+        ):
+            assert mean_comparison not in comparisons_found
+        # score_mean is NaN on every row when the mean arm is absent.
+        for s in scores:
+            assert math.isnan(s.score_mean)
+
+    def test_six_arm_only_mean_and_median_emits_one_comparison(self):
+        """6-arm input where ONLY mean and median succeed: emit only `mean-median`."""
+        report_median = _make_binary_report(0.5)
+        report_mean = _make_binary_report(0.55)
+        gt = GroundTruth(
+            question_id=63,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="binary?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(None, None, None, None, report_median, report_mean),
+            gt,
+        )
+
+        assert len(scores) == 2
+        comparisons_found = {s.comparison for s in scores}
+        assert comparisons_found == {"mean-median"}
+
+    def test_six_arm_numeric_scores_mean(self):
+        """6-arm numeric: mean arm gets both numeric_log_score and crps, mean comparisons emitted."""
+        report_stack = _logistic_numeric_report(center=4.0)
+        report_stack_aug = _logistic_numeric_report(center=6.0)
+        report_pdf_min1 = _logistic_numeric_report(center=5.0)
+        report_pdf_min2 = _logistic_numeric_report(center=5.5)
+        report_median = _logistic_numeric_report(center=5.0)
+        report_mean = _logistic_numeric_report(center=5.2)
+        gt = GroundTruth(
+            question_id=64,
+            question_type="numeric",
+            resolution=5.0,
+            resolution_string="5.0",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="numeric?",
+        )
+
+        scores = score_arm_for_qid(
+            _six_arm_inputs(
+                report_stack,
+                report_stack_aug,
+                report_pdf_min1,
+                report_pdf_min2,
+                report_median,
+                report_mean,
+            ),
+            gt,
+        )
+
+        metrics_found = {s.metric for s in scores}
+        assert metrics_found == {"numeric_log_score", "crps"}
+        comparisons_found = {s.comparison for s in scores}
+        assert "mean-median" in comparisons_found
+        # 2 metrics * 15 comparisons.
+        assert len(scores) == 30
+        for s in scores:
+            assert not math.isnan(s.score_mean)
+
+    def test_six_arm_backward_compat_five_arm_still_works(self):
+        """5-arm signature still works unchanged: 2 metrics * 10 comparisons = 20 rows, no mean."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_pdf_min1 = _make_binary_report(0.6)
+        report_pdf_min2 = _make_binary_report(0.65)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=65,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(
+            _five_arm_inputs(report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median),
+            gt,
+        )
+
+        assert len(scores) == 20
+        comparisons_found = {s.comparison for s in scores}
+        assert len(comparisons_found) == 10
+        assert not any(c.startswith("mean-") for c in comparisons_found)
+        # score_mean stays NaN on the 5-arm path.
+        for s in scores:
+            assert math.isnan(s.score_mean)
+
+    def test_six_arm_backward_compat_three_arm_still_works(self):
+        """3-arm signature still works unchanged: 2 metrics * 3 comparisons = 6 rows."""
+        report_stack = _make_binary_report(0.3)
+        report_stack_aug = _make_binary_report(0.8)
+        report_median = _make_binary_report(0.5)
+        gt = GroundTruth(
+            question_id=66,
+            question_type="binary",
+            resolution=True,
+            resolution_string="yes",
+            community_prediction=None,
+            actual_resolution_time=None,
+            question_text="?",
+        )
+
+        scores = score_arm_for_qid(_three_arm_inputs(report_stack, report_stack_aug, report_median), gt)
+        assert len(scores) == 6
+        for s in scores:
+            assert math.isnan(s.score_mean)
+
+
+# ---------------------------------------------------------------------------
+# Per-arm raw stats: mean row gating
+# ---------------------------------------------------------------------------
+
+
+class TestPerArmRawStatsMean:
+    """The per-arm raw-stats table renders a `mean` row only when mean scores are present."""
+
+    def test_per_arm_raw_stats_includes_mean_row_when_present(self):
+        from metaculus_bot.ablation.scoring_report import _per_arm_raw_stats_lines
+
+        scores = [
+            PairedScore(
+                qid=qid,
+                question_type="binary",
+                metric="binary_log_score",
+                comparison="mean-median",
+                score_stack=0.1,
+                score_stack_aug=0.2,
+                score_median=0.3,
+                score_pdf_min1=0.4,
+                score_pdf_min2=0.5,
+                score_mean=0.35,
+                delta=0.05,
+                higher_is_better=True,
+            )
+            for qid in (1, 2, 3)
+        ]
+
+        lines = _per_arm_raw_stats_lines(scores)
+        text = "\n".join(lines)
+        assert "| mean |" in text
+        assert "| median |" in text
+
+    def test_per_arm_raw_stats_omits_mean_row_when_absent(self):
+        from metaculus_bot.ablation.scoring_report import _per_arm_raw_stats_lines
+
+        scores = [
+            PairedScore(
+                qid=qid,
+                question_type="binary",
+                metric="binary_log_score",
+                comparison="stack_aug-stack",
+                score_stack=0.1,
+                score_stack_aug=0.2,
+                score_median=0.3,
+                delta=0.1,
+                higher_is_better=True,
+            )
+            for qid in (1, 2, 3)
+        ]
+
+        lines = _per_arm_raw_stats_lines(scores)
+        text = "\n".join(lines)
+        assert "| mean |" not in text
+        # The deterministic baselines that ARE present still render.
+        assert "| median |" in text
+
+    def test_render_summary_with_mean_comparisons_does_not_crash(self):
+        """Full render with mean comparisons present should emit mean rows and a mean per-arm line."""
+        scores: list[PairedScore] = []
+        for qid in range(1, 7):
+            for comparison, delta in (
+                ("mean-median", 0.05),
+                ("mean-stack", 0.1),
+                ("median-stack", 0.05),
+            ):
+                scores.append(
+                    PairedScore(
+                        qid=qid,
+                        question_type="binary",
+                        metric="binary_log_score",
+                        comparison=comparison,
+                        score_stack=0.1,
+                        score_stack_aug=0.2,
+                        score_median=0.15,
+                        score_pdf_min1=0.18,
+                        score_pdf_min2=0.19,
+                        score_mean=0.2,
+                        delta=delta,
+                        higher_is_better=True,
+                    )
+                )
+
+        stats = aggregate_paired(scores, n_bootstrap=200, seed=0)
+        md = render_summary_markdown(stats, scores, {"timestamp": "now", "n_questions": 6})
+
+        assert "mean-median" in md
+        assert "| mean |" in md
+        # Per-question diagnostic must still render the stacker-vs-baseline view without crashing.
+        assert "Per-question diagnostic" in md

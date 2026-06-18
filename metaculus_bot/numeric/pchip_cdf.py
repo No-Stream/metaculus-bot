@@ -157,6 +157,39 @@ def enforce_min_steps(
     return result
 
 
+def build_cdf_value_grid(
+    lower_bound: float,
+    upper_bound: float,
+    zero_point: float | None,
+    num_points: int = 201,
+) -> np.ndarray:
+    """Build the CDF evaluation value grid: linear for linear-scaled questions, geometric
+    when ``zero_point`` is set (log-scaled questions).
+
+    This is the canonical grid the production CDF lives on and the grid the Metaculus
+    scorer buckets resolutions against (see ``scoring_common.resolution_to_bucket_index``).
+    Offline pooling primitives that consume x-values (Vincentization, CRPS) must build their
+    grid here so a zero_point question's pooled CDF aligns with the scorer's buckets.
+
+    The geometric branch matches the Metaculus backend's non-linear spacing:
+    ``x(t) = lower + (upper - lower) * (ratio**t - 1) / (ratio - 1)`` where
+    ``ratio = (upper - zero_point) / (lower - zero_point)`` and ``t`` ranges over a uniform
+    [0, 1] grid of ``num_points`` points.
+    """
+    t = np.linspace(0, 1, num_points)
+
+    if zero_point is None:
+        # Linear grid
+        return lower_bound + (upper_bound - lower_bound) * t
+
+    # Non-linear grid based on zero_point
+    ratio = (upper_bound - zero_point) / (lower_bound - zero_point)
+    # Handle potential numerical issues
+    if abs(ratio - 1.0) < 1e-10:
+        return lower_bound + (upper_bound - lower_bound) * t
+    return lower_bound + (upper_bound - lower_bound) * ((ratio**t - 1) / (ratio - 1))
+
+
 def generate_pchip_cdf(
     percentile_values: dict[int | float, float],
     open_upper_bound: bool,
@@ -256,26 +289,8 @@ def generate_pchip_cdf(
         def spline(x):
             return np.interp(x, x_vals, percentiles)
 
-    # Generate evaluation grid based on zero_point
-    def create_grid(num_points: int) -> np.ndarray:
-        t = np.linspace(0, 1, num_points)
-
-        if zero_point is None:
-            # Linear grid
-            return lower_bound + (upper_bound - lower_bound) * t
-        else:
-            # Non-linear grid based on zero_point
-            ratio = (upper_bound - zero_point) / (lower_bound - zero_point)
-            # Handle potential numerical issues
-            if abs(ratio - 1.0) < 1e-10:
-                return lower_bound + (upper_bound - lower_bound) * t
-            else:
-                return np.array(
-                    [lower_bound + (upper_bound - lower_bound) * ((ratio**tt - 1) / (ratio - 1)) for tt in t]
-                )
-
-    # Generate the grid and evaluate
-    cdf_x = create_grid(num_points)
+    # Generate the grid (linear, or geometric when zero_point is set) and evaluate.
+    cdf_x = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points)
 
     # Handle log transformation for evaluation
     eval_x = np.log(cdf_x) if use_log else cdf_x

@@ -50,6 +50,7 @@ from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.forecasters import question_type_for_serialization, serialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
+from metaculus_bot.prob_math_utils import sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
 from metaculus_bot.probabilistic_tools.mixtures import (
     MixtureComponent,
@@ -121,8 +122,7 @@ def _apply_evidence_lr(base_prob: float, evidence_items: list[Any]) -> float:
         if item.direction == "down":
             lr = 1.0 / lr
         log_odds += math.log(lr)
-    prob = 1.0 / (1.0 + math.exp(-log_odds))
-    return prob
+    return sigmoid(log_odds)
 
 
 def _compute_binary_from_bayes(block: BinaryStructured) -> float | None:

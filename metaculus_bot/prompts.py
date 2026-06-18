@@ -535,7 +535,8 @@ def numeric_prompt(
         and BEFORE your final answer line(s). This block is required for scoring —
         responses without it are discarded. Downstream tools use these fields to
         compute calibrated aggregations across forecasters.
-        Schema (all fields except `declared_percentiles` are optional; omit if not applicable):
+        Schema (supply EITHER `declared_percentiles` OR a `mixture_components` list —
+        see OUTPUT FORMAT below; all other fields are optional, omit if not applicable):
 
         ```json
         {{
@@ -550,9 +551,10 @@ def numeric_prompt(
         ```
 
         Notes:
-        - `declared_percentiles` must cover at least {{0.1, 0.5, 0.9}}. The JSON percentiles
-          should match your final Percentile lines below (tools operate on the JSON; the
-          official forecast is still read from the trailing Percentile lines).
+        - If you take OPTION A (percentiles), `declared_percentiles` must cover at least
+          {{0.1, 0.5, 0.9}} and should match your final Percentile lines below (tools operate
+          on the JSON; the official forecast is still read from the trailing Percentile lines).
+          If you take OPTION B (mixture), you may omit `declared_percentiles` entirely.
         - `distribution_family_hint` ∈ {{"normal", "lognormal", "student_t"}}.
         - `student_t_df` only meaningful if family_hint = "student_t".
         - `tails.below_min_expected` and `tails.above_max_expected` are the probability
@@ -563,22 +565,27 @@ def numeric_prompt(
 
         Emit the JSON block BEFORE the final Prediction block.
 
-        ── OUTPUT FORMAT — pick exactly one ──
+        ── OUTPUT FORMAT — pick the one that fits the SHAPE of your belief ──
 
-        OPTION A — PERCENTILES (default; what most models use):
-          Emit the trailing 11 standard percentiles as your Prediction block. Use
-          this whenever your reasoning is naturally percentile-shaped (a single
-          mode, smooth tails, no clear scenario branching). Do NOT populate
-          `mixture_components` in the JSON block.
+        Let the distribution's shape decide, not habit. A unimodal belief is best
+        described by percentiles; a genuinely multi-modal / scenario-branching
+        belief is best described by a mixture. Both options are equally valid —
+        choose by shape.
+
+        OPTION A — PERCENTILES:
+          Use when your belief has a SINGLE mode with smooth tails and no clear
+          scenario branching. Emit the trailing 11 standard percentiles as your
+          Prediction block. Do NOT populate `mixture_components` in the JSON block.
 
         OPTION B — MIXTURE OF NORMALS:
-          Use this when you naturally reason in 'underperform / baseline / breakout'
-          scenarios, or for clearly bimodal questions. Populate `mixture_components`
-          in the JSON block with at least 2 components whose weights sum to 1.0
-          (within 0.001), each with `weight`, `mean`, and `sd` (>0). Means and sds
-          are in the question's base unit. Code will build the 201-point Metaculus
-          CDF directly from your mixture; you may omit the percentile lines entirely
-          (the parser will use the mixture).
+          Use when your belief is clearly MULTI-MODAL or splits into distinct
+          scenarios (e.g. 'underperform / baseline / breakout', or any bimodal
+          outcome). Populate `mixture_components` in the JSON block with at least
+          2 components whose weights sum to 1.0 (within 0.001), each with `weight`,
+          `mean`, and `sd` (>0). Means and sds are in the question's base unit.
+          Code will build the 201-point Metaculus CDF directly from your mixture;
+          you may omit the percentile lines entirely (the parser will use the
+          mixture) and the JSON block may omit `declared_percentiles` as well.
 
         If you emit BOTH formats, the parser will use the mixture and ignore the
         percentile lines (a WARNING is logged so we can audit how often this

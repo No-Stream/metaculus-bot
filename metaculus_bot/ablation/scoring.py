@@ -58,6 +58,19 @@ COMPARISONS_5ARM: tuple[str, ...] = (
     "median-pdf_min2",
 )
 
+# 6-arm comparisons: the full 5-arm set plus mean-vs-everything. ``mean-median``
+# is the headline contrast (the two deterministic baselines head to head); the
+# remaining four pit the deterministic mean against each LLM/pdf arm. The arm
+# order in score_arm_for_qid for this mode is
+# [stack, stack_aug, pdf_min1, pdf_min2, median, mean].
+COMPARISONS_6ARM: tuple[str, ...] = COMPARISONS_5ARM + (
+    "mean-stack",
+    "mean-stack_aug",
+    "mean-pdf_min1",
+    "mean-pdf_min2",
+    "mean-median",
+)
+
 METRIC_DIRECTION: dict[str, bool] = {
     "brier": False,
     "binary_log_score": True,
@@ -162,6 +175,8 @@ class PairedScore:
     # pdf_min1 and pdf_min2 arm scores (NaN when using 3-arm mode).
     score_pdf_min1: float = float("nan")
     score_pdf_min2: float = float("nan")
+    # mean arm score (deterministic pointwise mean baseline; NaN unless 6-arm mode).
+    score_mean: float = float("nan")
     # Optional confounder fields populated by score_arm_for_qid when stacker
     # payloads are supplied. None on legacy callers; surfaced into the summary
     # report when present so the user can read fallback rate, n-forecasters
@@ -186,6 +201,7 @@ class PairedScore:
     is_saturated_pdf_min1: bool = False
     is_saturated_pdf_min2: bool = False
     is_saturated_median: bool = False
+    is_saturated_mean: bool = False
 
 
 @dataclass
@@ -265,13 +281,16 @@ def score_arm_for_qid(
 ) -> list[PairedScore]:
     """Score arms vs ground truth, return PairedScores for pairwise comparisons where both arms are present.
 
-    ``arm_reports`` is either a 3-element or 5-element list:
+    ``arm_reports`` is a 3-, 5-, or 6-element list:
 
     **3-arm** (backward compat): labels in order [stack, stack_aug, median].
       - Up to 3 comparisons per metric.
 
     **5-arm**: labels in order [stack, stack_aug, pdf_min1, pdf_min2, median].
       - Up to 10 comparisons per metric.
+
+    **6-arm**: labels in order [stack, stack_aug, pdf_min1, pdf_min2, median, mean].
+      - Up to 15 comparisons per metric (the 10 5-arm pairs + 5 mean comparisons).
 
     Each element is ``(label, report, payload)`` where report may be None
     (arm failed/missing for this qid) and payload is the cached stacker payload
@@ -293,18 +312,22 @@ def score_arm_for_qid(
         expected_labels = ["stack", "stack_aug", "median"]
     elif len(arm_reports) == 5:
         expected_labels = ["stack", "stack_aug", "pdf_min1", "pdf_min2", "median"]
+    elif len(arm_reports) == 6:
+        expected_labels = ["stack", "stack_aug", "pdf_min1", "pdf_min2", "median", "mean"]
     else:
-        raise ValueError(f"score_arm_for_qid expects 3 or 5 arm tuples, got {len(arm_reports)}")
+        raise ValueError(f"score_arm_for_qid expects 3, 5, or 6 arm tuples, got {len(arm_reports)}")
 
     actual_labels = [t[0] for t in arm_reports]
     if actual_labels != expected_labels:
         raise ValueError(f"score_arm_for_qid expects arms in order {expected_labels}, got {actual_labels}")
 
     is_five_arm = len(arm_reports) == 5
+    is_six_arm = len(arm_reports) == 6
+    has_pdf_arms = is_five_arm or is_six_arm
 
     _, report_stack, payload_stack = arm_reports[0]
     _, report_stack_aug, payload_stack_aug = arm_reports[1]
-    if is_five_arm:
+    if has_pdf_arms:
         _, report_pdf_min1, payload_pdf_min1 = arm_reports[2]
         _, report_pdf_min2, payload_pdf_min2 = arm_reports[3]
         _, report_median, payload_median = arm_reports[4]
@@ -312,10 +335,18 @@ def score_arm_for_qid(
         report_pdf_min1 = report_pdf_min2 = None
         payload_pdf_min1 = payload_pdf_min2 = None
         _, report_median, payload_median = arm_reports[2]
+    if is_six_arm:
+        # payload_mean is intentionally unused: the mean arm is a deterministic
+        # baseline with no dedicated PairedScore confounder fields.
+        _, report_mean, _payload_mean = arm_reports[5]
+    else:
+        report_mean = None
 
     # Count present arms — need at least 2 for any comparison to be possible.
     present_reports = [
-        r for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median] if r is not None
+        r
+        for r in [report_stack, report_stack_aug, report_pdf_min1, report_pdf_min2, report_median, report_mean]
+        if r is not None
     ]
     if len(present_reports) < 2:
         return []
@@ -325,10 +356,12 @@ def score_arm_for_qid(
     confounders: dict[str, Any] = {}
     confounders.update(_confounders_for_arm(payload_stack, "stack"))
     confounders.update(_confounders_for_arm(payload_stack_aug, "stack_aug"))
-    if is_five_arm:
+    if has_pdf_arms:
         confounders.update(_confounders_for_arm(payload_pdf_min1, "pdf_min1"))
         confounders.update(_confounders_for_arm(payload_pdf_min2, "pdf_min2"))
     confounders.update(_confounders_for_arm(payload_median, "median"))
+    # The mean arm is a deterministic baseline with no dedicated PairedScore
+    # confounder fields, so its payload is intentionally not surfaced here.
 
     # Determine question type from the first non-None report.
     first_report = present_reports[0]
@@ -366,6 +399,7 @@ def score_arm_for_qid(
             ("pdf_min1", report_pdf_min1),
             ("pdf_min2", report_pdf_min2),
             ("median", report_median),
+            ("mean", report_mean),
         ]:
             if report is not None:
                 metrics_for_arm = _score_binary_arm(report, resolution)
@@ -395,6 +429,7 @@ def score_arm_for_qid(
             ("pdf_min1", report_pdf_min1),
             ("pdf_min2", report_pdf_min2),
             ("median", report_median),
+            ("mean", report_mean),
         ]:
             if report is not None:
                 scored = _score_numeric_arm(report, resolution)
@@ -421,6 +456,7 @@ def score_arm_for_qid(
             ("pdf_min1", report_pdf_min1),
             ("pdf_min2", report_pdf_min2),
             ("median", report_median),
+            ("mean", report_mean),
         ]:
             if report is not None:
                 scored = _score_mc_arm(report, resolution)
@@ -443,7 +479,9 @@ def score_arm_for_qid(
         return []
 
     # Choose comparison set based on mode.
-    if is_five_arm:
+    if is_six_arm:
+        comparisons = COMPARISONS_6ARM
+    elif is_five_arm:
         comparisons = COMPARISONS_5ARM
     else:
         comparisons = COMPARISONS_3ARM
@@ -473,6 +511,7 @@ def score_arm_for_qid(
         s_pdf_min1 = arm_metrics["pdf_min1"][metric] if arm_metrics["pdf_min1"] else float("nan")
         s_pdf_min2 = arm_metrics["pdf_min2"][metric] if arm_metrics["pdf_min2"] else float("nan")
         s_median = arm_metrics["median"][metric] if arm_metrics["median"] else float("nan")
+        s_mean = arm_metrics["mean"][metric] if arm_metrics["mean"] else float("nan")
 
         def _get_score(arm_label: str) -> float:
             m = arm_metrics[arm_label]
@@ -496,6 +535,7 @@ def score_arm_for_qid(
                     score_median=s_median,
                     score_pdf_min1=s_pdf_min1,
                     score_pdf_min2=s_pdf_min2,
+                    score_mean=s_mean,
                     delta=delta,
                     higher_is_better=METRIC_DIRECTION[metric],
                     is_saturated_stack=_get_sat("stack"),
@@ -503,6 +543,7 @@ def score_arm_for_qid(
                     is_saturated_pdf_min1=_get_sat("pdf_min1"),
                     is_saturated_pdf_min2=_get_sat("pdf_min2"),
                     is_saturated_median=_get_sat("median"),
+                    is_saturated_mean=_get_sat("mean"),
                     **confounders,
                 )
             )
@@ -590,6 +631,8 @@ def _sat_for_arm(score: PairedScore, arm: str) -> bool:
         return score.is_saturated_pdf_min2
     if arm == "median":
         return score.is_saturated_median
+    if arm == "mean":
+        return score.is_saturated_mean
     raise ValueError(f"Unknown arm {arm!r}")
 
 

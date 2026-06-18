@@ -6,26 +6,35 @@ Two lineups are available:
   100-question medium backtest doesn't burn budget on the forecaster stage. The
   same N forecasters run once per question, and their rationales feed BOTH stacker
   arms — so per-forecaster cost is amortized across arms.
-* **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Gemini 3.1
-  Pro, Claude Opus 4.5 medium-thinking, GPT-5.5 medium-effort) for the paid
-  ablation re-run on a quality-representative ensemble.
+* **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Claude
+  Opus 4.6, Claude Opus 4.8, GPT-5.4), all at medium reasoning effort, for the
+  paid ablation re-run on a quality-representative ensemble. These are reasoning
+  models, so the lineup deliberately drops sampling params (``temperature`` is
+  passed as ``None`` to keep litellm from injecting it, and ``top_p`` /
+  ``max_tokens`` are never set).
 
-**Routing posture**: both lineups explicitly opt out of the donated-OpenRouter-key
-path. All builder functions construct plain ``GeneralLlm`` instances with no
-``api_key`` set, so litellm picks up the operator's paid ``OPENROUTER_API_KEY``
-from env at invoke time. Reasons:
+**Routing posture**: ablation/benchmarking the Metaculus bot IS Metaculus work,
+so it bills to the Metaculus-donated OpenRouter key wherever that key can cover
+the model — exactly like the production ensemble. The two lineups differ only
+because their models differ:
 
-1. **Resource accounting.** The donated key is for production
-   ensemble + stacker work; ablation runs are exploratory work charged to the
-   operator. Routing free-tier traffic through the donated key would
-   silently consume that quota.
-2. **The donated-key allowed-providers list trips on free-tier providers.**
-   Many ``:free`` model variants are served only by OpenInference/Venice/etc.
-   The donated key returns 404 (we'd burn time on transient failures + the
-   alerting non-zero exit) for any model whose only provider isn't in
-   ``DONATED_KEY_PROVIDERS``. Plain GeneralLlm sidesteps this entirely.
-3. **Fail-fast observability**: no fallback wrapping means failures are
-   directly diagnostic — what you see is what hit OpenRouter.
+* **Prod-ish lineup** → donated-key wrapper. Its models are anthropic/openai
+  (both in ``DONATED_KEY_PROVIDERS``), so ``build_prod_forecaster_llms`` routes
+  them through ``build_llm_with_openrouter_fallback`` (donated primary →
+  personal fallback on key-scoped errors). The free donated key absorbs the
+  cost; the personal key is only touched on credential/credit/allowed-providers
+  failures.
+* **Free-tier lineup** → plain ``GeneralLlm`` on the personal key. Reasons,
+  now that the accounting argument is gone (ablation bills to the donated key):
+
+  1. **The donated-key allowed-providers list trips on free-tier providers.**
+     Most ``:free`` model variants are served only by providers NOT in
+     ``DONATED_KEY_PROVIDERS`` (OpenInference/Venice/etc.), so the donated key
+     returns 404 "no allowed providers" — wasting a fallback attempt and
+     bumping the alerting counter. Plain GeneralLlm on the personal key
+     sidesteps this entirely (and ``:free`` models cost nothing anyway).
+  2. **Fail-fast observability**: no fallback wrapping means failures are
+     directly diagnostic — what you see is what hit OpenRouter.
 
 Edit ``FREE_FORECASTER_MODELS`` / ``PROD_FORECASTER_SPECS`` to swap lineups.
 """
@@ -35,7 +44,8 @@ from __future__ import annotations
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.benchmark.bot_factory import MODEL_CONFIG
-from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG, REASONING_MODEL_CONFIG
+from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG
 
 __all__ = [
     "FREE_FORECASTER_MODELS",
@@ -50,27 +60,49 @@ __all__ = [
 
 # ---------------------------------------------------------------------------
 # Prod-ish lineup: 3 paid frontier models for the quality ablation re-run.
-# Plain GeneralLlm (no donated-key wrapper, no fallbacks) — benchmark-mode
-# posture per scratch_docs_and_planning/prod_ish_ablation_plan.md. litellm
-# reads OPENROUTER_API_KEY at invoke time. Failures propagate; resume manually.
+# Routed through the donated-key wrapper (donated primary -> personal fallback):
+# ablation IS Metaculus work, and these anthropic/openai models are covered by
+# the donated key, so the free donated key absorbs the cost. The wrapper falls
+# back to the personal OPENROUTER_API_KEY only on key-scoped errors.
 # ---------------------------------------------------------------------------
 
 PROD_FORECASTER_SPECS: list[tuple[str, dict]] = [
-    ("openrouter/google/gemini-3.1-pro-preview", {}),  # auto-reasons; mirrors prod
-    ("openrouter/anthropic/claude-opus-4.5", {"reasoning": {"max_tokens": 16_000}}),  # medium = 16k thinking
-    ("openrouter/openai/gpt-5.5", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/anthropic/claude-opus-4.6", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/anthropic/claude-opus-4.8", {"reasoning": {"effort": "medium"}}),
+    ("openrouter/openai/gpt-5.4", {"reasoning": {"effort": "medium"}}),
 ]
 PROD_FORECASTER_MODELS: list[str] = [m for m, _ in PROD_FORECASTER_SPECS]
 
+# Minimal litellm config for the prod-ish reasoning ensemble. Deliberately NOT
+# REASONING_MODEL_CONFIG: these are reasoning models, so we drop the sampling
+# params. ``temperature=None`` is load-bearing — GeneralLlm injects
+# ``temperature=0`` when the arg is omitted, so passing None explicitly is what
+# makes litellm omit it (and top_p). ``top_p`` / ``max_tokens`` are simply never
+# set so the provider defaults apply.
+_PROD_FORECASTER_CONFIG: dict = {
+    "temperature": None,
+    "stream": False,
+    "timeout": 480,
+    "allowed_tries": 3,
+}
+
 
 def build_prod_forecaster_llms() -> list[GeneralLlm]:
-    """Construct plain GeneralLlm instances for the prod-ish 3-model ensemble.
+    """Construct the prod-ish 3-model ensemble via the donated-key wrapper.
 
-    Plain (no donated-key wrapper, no fallbacks) -- benchmark-mode posture per
-    scratch_docs_and_planning/prod_ish_ablation_plan.md. litellm reads
-    OPENROUTER_API_KEY at invoke time. Failures propagate; resume manually.
+    Ablation IS Metaculus work, so it bills to the Metaculus-donated OpenRouter
+    key. These models are anthropic/openai (covered by the donated key), so
+    ``build_llm_with_openrouter_fallback`` routes them donated primary ->
+    personal ``OPENROUTER_API_KEY`` fallback (the wrapper degrades to the
+    personal key only on key-scoped errors: 401/402/429/guardrail/404).
+    ``temperature=None`` flows through the wrapper's ``**kwargs`` to GeneralLlm
+    unchanged, so litellm still omits the sampling params for these reasoning
+    models.
     """
-    return [GeneralLlm(model=model, **{**REASONING_MODEL_CONFIG, **kwargs}) for model, kwargs in PROD_FORECASTER_SPECS]
+    return [
+        build_llm_with_openrouter_fallback(model=model, **{**_PROD_FORECASTER_CONFIG, **kwargs})
+        for model, kwargs in PROD_FORECASTER_SPECS
+    ]
 
 
 def get_lineup(name: str) -> tuple[list[GeneralLlm], list[str]]:
@@ -137,9 +169,11 @@ FREE_PARSER_MODEL: str = "openrouter/google/gemma-4-31b-it:free"
 def build_free_forecaster_llms() -> list[GeneralLlm]:
     """Construct plain ``GeneralLlm`` instances for each free forecaster model.
 
-    Plain (no ``api_key`` arg) so litellm reads ``OPENROUTER_API_KEY`` from
-    env at invoke time — the operator's paid key, not the donated one. See
-    module docstring for the routing rationale.
+    Plain (no donated-key wrapper) because most ``:free`` model variants are
+    served only by providers NOT in ``DONATED_KEY_PROVIDERS`` — the donated key
+    would 404 "no allowed providers", wasting a fallback attempt and bumping the
+    alert counter. litellm reads ``OPENROUTER_API_KEY`` from env at invoke time.
+    See the module docstring for the full routing rationale.
     """
     return [GeneralLlm(model=model, **MODEL_CONFIG) for model in FREE_FORECASTER_MODELS]
 
@@ -148,8 +182,9 @@ def build_free_parser_llm() -> GeneralLlm:
     """Plain ``GeneralLlm`` parser at deterministic config.
 
     Mirrors the production PARSER_LLM contract — low temperature, deterministic
-    output — but uses a free model so backtest runs don't burn paid-parser
-    budget. Plain (no ``api_key``) so litellm picks up ``OPENROUTER_API_KEY``
-    from env at invoke time.
+    output — but on a free model. Plain (no donated-key wrapper): see
+    ``build_free_forecaster_llms`` and the module docstring for why ``:free``
+    models bypass the donated key (allowed-providers 404). litellm picks up
+    ``OPENROUTER_API_KEY`` from env at invoke time.
     """
     return GeneralLlm(model=FREE_PARSER_MODEL, **DETERMINISTIC_MODEL_CONFIG)

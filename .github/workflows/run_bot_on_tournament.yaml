@@ -92,11 +92,14 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_SEARCH_ENABLED: 'true'
           # OpenRouter Gemini routing (forecaster, stacker, summarizer when the
-          # ensemble includes a Google model). When 'false' (default), Gemini
-          # OpenRouter calls flow through OPENROUTER_API_KEY only — bypassing
-          # the Metaculus-donated OAI_ANTH_OPENROUTER_KEY wrapper. Off because
-          # the donated-key Google route has been flaky.
-          GEMINI_USE_DONATED_OPENROUTER_KEY: 'false'
+          # ensemble includes a Google model). When 'true' (default since
+          # 2026-06-16), Gemini OpenRouter calls prefer the Metaculus-donated
+          # OAI_ANTH_OPENROUTER_KEY wrapper with personal-key fallback. On because
+          # Metaculus raised the Google rate limits — the donated key serves most
+          # Gemini now; gemini-3.1-pro-preview is pinned to the personal key
+          # (DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist; no donated attempt, no
+          # 429) pending the Metaculus BYOK fix.
+          GEMINI_USE_DONATED_OPENROUTER_KEY: 'true'
           # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
           # parallel grounded Gemini searches resolve each. Fails soft.
           GAP_FILL_ENABLED: 'true'
@@ -124,9 +127,9 @@ jobs:
           PERSIST_RESEARCH_ENABLED: 'true'
       - name: Upload research outputs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: research-${{ github.run_id }}
           path: research_outputs/
-          retention-days: 180
+          retention-days: 90
           if-no-files-found: ignore

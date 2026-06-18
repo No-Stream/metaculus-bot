@@ -89,6 +89,21 @@ DEFAULT_STACKER_MODEL = "openrouter/anthropic/claude-opus-4.5"
 DEFAULT_STACKER_FALLBACK_MODEL = "openrouter/openai/gpt-5.5"
 DEFAULT_PARSER_MODEL = "openrouter/openai/gpt-oss-120b:free"
 
+# Prod-ish ablation stacker. Mirrors the prod-ish forecaster posture (opus-4.8 at
+# medium reasoning effort, no sampling params): ``temperature=None`` keeps litellm
+# from injecting a temperature, and top_p / max_tokens are deliberately unset.
+# Selected by --lineup prod in the --plain-llm path (a plain GeneralLlm, no
+# donated-key wrapper). Does NOT replace DEFAULT_STACKER_MODEL, which mirrors prod
+# / free-tier compatibility.
+PROD_STACKER_MODEL = "openrouter/anthropic/claude-opus-4.8"
+_PROD_STACKER_KWARGS: dict[str, Any] = {
+    "reasoning": {"effort": "medium"},
+    "temperature": None,
+    "stream": False,
+    "timeout": 480,
+    "allowed_tries": 1,
+}
+
 # Reasoning config shared by both stacker LLMs. Anthropic models use
 # ``reasoning={"max_tokens": ...}`` (explicit thinking budget — see production
 # STACKER_LLM at llm_configs.py:122). OpenAI models use ``reasoning={"effort":
@@ -154,6 +169,7 @@ __all__ = [
     "DEFAULT_STACKER_FALLBACK_MODEL",
     "DEFAULT_STACKER_MODEL",
     "FEATURE_FLAG_ENV",
+    "PROD_STACKER_MODEL",
     "probabilistic_tools_enabled",
     "run_stacker_batch",
     "run_stacker_for_arm",
@@ -414,12 +430,22 @@ async def run_stacker_for_arm(
     stacker_llm: GeneralLlm | None = None,
     fallback_stacker_llm: GeneralLlm | None | object = _UNSET,
     parser_llm: GeneralLlm | None = None,
+    stacker_slug: str | None = None,
     force: bool = False,
 ) -> dict:
-    """Run the stacker for one arm of one question. Cached per ``(qid, arm)``.
+    """Run the stacker for one arm of one question. Cached per ``(qid, arm, stacker_slug)``.
+
+    ``stacker_slug`` keys the on-disk cache filename to the active stacker so a
+    stacker swap (e.g. opus-4.5 free-tier vs opus-4.8 prod) never overwrites
+    another stacker's results. The caller derives it via
+    ``model_slug_to_filename(<stacker model>)``; ``None`` preserves the legacy
+    ``arm_<arm>.json`` filename (used by the tests, which pass plain mocks). These
+    are always LLM-stacker arms (stack / stack_aug), so the slug — when supplied —
+    applies to every read/write here, including the median-fallback payload, which
+    is still this stacker arm's cell.
 
     Steps:
-    1. Cache check (``read_stacker_output(qid, arm)``). On hit and not ``force``, return as-is.
+    1. Cache check (``read_stacker_output(qid, arm, stacker_slug)``). On hit and not ``force``, return as-is.
     2. Filter to surviving forecasters (``prediction_value`` set, no errors). Need
        >= ``ABLATION_MIN_FORECASTERS`` (2) to proceed; below that, cache an
        error payload and return.
@@ -446,7 +472,7 @@ async def run_stacker_for_arm(
     assert qid is not None, "run_stacker_for_arm requires question.id_of_question"
 
     if not force:
-        cached = cache.read_stacker_output(qid=qid, arm=arm)
+        cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
         if cached is not None:
             # Yield once so flake8-async (ASYNC910) sees a guaranteed checkpoint
             # on this early-return branch. The return path is otherwise sync.
@@ -462,7 +488,7 @@ async def run_stacker_for_arm(
             n_forecasters=len(surviving),
             tools_enabled=arm == ARM_STACK_AUG,
         )
-        cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
+        cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload, stacker_slug=stacker_slug)
         await asyncio.sleep(0)
         return error_payload
 
@@ -611,7 +637,7 @@ async def run_stacker_for_arm(
             tools_enabled=enable_tools,
             errors=errors_list,
         )
-        cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
+        cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload, stacker_slug=stacker_slug)
         joined_errors = "; ".join(errors_list) if errors_list else "<no errors recorded>"
         raise RuntimeError(
             f"Stacker failed for qid={qid} arm={arm} with --no-stacker-fallback set. "
@@ -645,7 +671,7 @@ async def run_stacker_for_arm(
                 qid,
                 arm,
             )
-            cache.write_stacker_output(qid=qid, arm=arm, payload=median_payload)
+            cache.write_stacker_output(qid=qid, arm=arm, payload=median_payload, stacker_slug=stacker_slug)
             return median_payload
         except Exception as median_exc:  # noqa: BLE001 - degrade gracefully
             logger.exception("Median fallback failed for qid=%s arm=%s", qid, arm)
@@ -660,7 +686,7 @@ async def run_stacker_for_arm(
                 tools_enabled=enable_tools,
                 errors=errors_list,
             )
-            cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload)
+            cache.write_stacker_output(qid=qid, arm=arm, payload=error_payload, stacker_slug=stacker_slug)
             await asyncio.sleep(0)
             return error_payload
 
@@ -702,7 +728,7 @@ async def run_stacker_for_arm(
         tools_enabled=enable_tools,
         errors=errors_list,
     )
-    cache.write_stacker_output(qid=qid, arm=arm, payload=success_payload)
+    cache.write_stacker_output(qid=qid, arm=arm, payload=success_payload, stacker_slug=stacker_slug)
     await asyncio.sleep(0)
     return success_payload
 
@@ -720,6 +746,7 @@ async def run_stacker_batch(
     stacker_llm: GeneralLlm | None = None,
     fallback_stacker_llm: GeneralLlm | None | object = _UNSET,
     parser_llm: GeneralLlm | None = None,
+    stacker_slug: str | None = None,
     force: bool = False,
     concurrency: int = 2,
 ) -> dict[int, dict]:
@@ -730,6 +757,9 @@ async def run_stacker_batch(
     per-question runner). Per-question failure (insufficient forecasters,
     both stackers down, etc.) is recorded in that question's payload and
     the batch continues.
+
+    ``stacker_slug`` keys each per-question cache cell to the active stacker (see
+    ``run_stacker_for_arm``). ``None`` keeps the legacy unslugged filename.
     """
     if stacker_llm is None:
         stacker_llm = _build_default_stacker_llm()
@@ -751,6 +781,7 @@ async def run_stacker_batch(
                 stacker_llm=stacker_llm,
                 fallback_stacker_llm=fallback_stacker_llm,
                 parser_llm=parser_llm,
+                stacker_slug=stacker_slug,
                 force=force,
             )
         return qid, payload

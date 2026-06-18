@@ -69,14 +69,13 @@ def detect_numeric_format(rationale: str) -> NumericFormat | None:
     would route into a guaranteed ValueError.
 
     - If both a buildable ``mixture_components`` (≥2 components) and
-      ``declared_percentiles`` (always required by the schema) are present:
-      ``"both"``.
+      ``declared_percentiles`` are present: ``"both"``.
     - If only ``declared_percentiles`` is present (mixture absent, null, or
       under 2 components): ``"percentiles"``.
-    - If only ``mixture_components`` is somehow present without
-      ``declared_percentiles``, ``"mixture"``. The current schema validator
-      requires ``declared_percentiles``, so this branch is unreachable in
-      practice but kept for future schema relaxation.
+    - If only ``mixture_components`` is present without ``declared_percentiles``,
+      ``"mixture"``. The schema's ``_require_percentiles_or_mixture`` validator
+      accepts a mixture-only block (percentiles optional when a valid mixture is
+      supplied), so this branch is reachable.
     - Returns ``None`` when no JSON block is present, the JSON is malformed,
       or the JSON does not parse as ``NumericStructured`` — caller falls
       back to the trailing ``Percentile X.X:`` lines.
@@ -147,11 +146,13 @@ def route_numeric_output(
     structured_percentiles_fallback: list[Percentile] | None = None
     if structured is not None and isinstance(structured, NumericStructured):
         mixture = _build_mixture_from_structured(structured)
-        structured_has_percentiles = bool(structured.declared_percentiles)
-        if structured_has_percentiles:
+        # declared_percentiles is Optional since W4's mixture-only relaxation;
+        # bind to a local so the truthiness guard narrows away None for .items().
+        declared = structured.declared_percentiles
+        structured_has_percentiles = bool(declared)
+        if declared:
             structured_percentiles_fallback = [
-                Percentile(percentile=float(k), value=float(v))
-                for k, v in sorted(structured.declared_percentiles.items())
+                Percentile(percentile=float(k), value=float(v)) for k, v in sorted(declared.items())
             ]
 
     has_percentiles = declared_percentiles is not None and len(declared_percentiles) > 0

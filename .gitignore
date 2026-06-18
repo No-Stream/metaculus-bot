@@ -117,6 +117,12 @@ ipython_config.py
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
+# uv
+#   This repo is poetry-managed (see pyproject.toml [tool.poetry] + poetry.lock).
+#   An incidental `uv` invocation in this environment regenerates a contentless
+#   uv.lock stub (no resolution, wrong python floor). Keep it out of version control.
+uv.lock
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 

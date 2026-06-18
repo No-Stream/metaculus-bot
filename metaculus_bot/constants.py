@@ -30,16 +30,31 @@ METACULUS_CUP_ID: str = "metaculus-cup"  # Uses slug, auto-resolves to current c
 def gemini_use_donated_openrouter_key() -> bool:
     """Whether OpenRouter Gemini calls should route through the Metaculus-donated key.
 
-    Returns True iff GEMINI_USE_DONATED_OPENROUTER_KEY=="true". Default is
-    False — the donated-key Google route has been flaky, so we prefer the
-    operator's personal OPENROUTER_API_KEY for Gemini. Read at call time (not
-    import) so workflow env changes take effect without re-importing.
+    Default is now True: after Metaculus raised the Google rate limits
+    (2026-06-16), the donated OpenRouter key (``OAI_ANTH_OPENROUTER_KEY``) serves
+    most Gemini models — e.g. ``gemini-3.5-flash`` and ``gemini-3.1-flash-lite``
+    both succeed on the donated key (verified by live call this session). Set the
+    env var to a false-y value (``"false"`` / ``"0"`` / ``"no"``) to force
+    personal-key-only routing.
+
+    KNOWN EXCEPTION: ``gemini-3.1-pro-preview`` (our forecaster slot) is PINNED to
+    the personal key — not merely "falls back". It's on the
+    ``DONATED_KEY_BLOCKED_GOOGLE_MODELS`` blocklist in ``fallback_openrouter``, so
+    ``should_route_via_donated_key`` returns False for it even when this toggle is
+    True: no donated attempt, no 429, no personal-key-fallback-counter bump (which
+    would otherwise redden CI on every question). That model 429s on the donated
+    key because it routes through a free-tier Google AI Studio BYOK key with no
+    Pro free tier (quota 0). Temporary workaround pending the Metaculus-side BYOK
+    fix; see the ``TODO(gemini-3.1-pro-donated)`` tag on that constant.
+
+    Read at call time (not import) so workflow env changes take effect without
+    re-importing.
 
     Scope: this toggle only affects OpenRouter routing (``fallback_openrouter``).
     The google-genai grounded-search provider has no donated path — it always
     reads the operator's personal GOOGLE_API_KEY.
     """
-    return os.getenv(GEMINI_USE_DONATED_OPENROUTER_KEY_ENV, "false").strip().lower() == "true"
+    return env_flag_enabled(GEMINI_USE_DONATED_OPENROUTER_KEY_ENV, default=True)
 
 
 class TournamentExpiredError(Exception):
@@ -301,8 +316,12 @@ GOOGLE_API_KEY_ENV: str = "GOOGLE_API_KEY"
 # donated OpenRouter key (``OAI_ANTH_OPENROUTER_KEY``) with paid-key fallback,
 # or skip the donated wrapper entirely and route through the operator's
 # personal ``OPENROUTER_API_KEY``. Does NOT affect the google-genai grounded
-# search provider — that always uses the personal GOOGLE_API_KEY. Default off
-# because the donated-key Google route has been flaky.
+# search provider — that always uses the personal GOOGLE_API_KEY. Default ON
+# (2026-06-16): after Metaculus raised the Google rate limits, the donated key
+# serves most Gemini models (gemini-3.5-flash, gemini-3.1-flash-lite). The known
+# exception is gemini-3.1-pro-preview, which is PINNED to the personal key via the
+# DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist (no donated attempt, no 429) pending
+# the Metaculus-side BYOK fix — see TODO(gemini-3.1-pro-donated) in fallback_openrouter.
 GEMINI_USE_DONATED_OPENROUTER_KEY_ENV: str = "GEMINI_USE_DONATED_OPENROUTER_KEY"
 # Gemini 3 Flash preview model with grounding support. Requires billing enabled
 # on the Google AI Studio project to unlock; falls back to gemini-2.5-flash on

@@ -15,6 +15,7 @@ from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     DiscreteCountStructured,
     EvidenceItem,
+    MixtureComponentDeclaration,
     MultipleChoiceStructured,
     NumericStructured,
     ScenarioBranch,
@@ -1089,8 +1090,6 @@ class TestSizeCapBoundary:
 
 class TestNumericStructuredMixture:
     def test_valid_three_component_list_accepted(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         n = NumericStructured(
             question_type="numeric",
             declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
@@ -1105,8 +1104,6 @@ class TestNumericStructuredMixture:
         assert sum(c.weight for c in n.mixture_components) == pytest.approx(1.0, abs=1e-6)
 
     def test_single_component_rejected(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         with pytest.raises(ValidationError):
             NumericStructured(
                 question_type="numeric",
@@ -1115,8 +1112,6 @@ class TestNumericStructuredMixture:
             )
 
     def test_weights_sum_below_tolerance_rejected(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         with pytest.raises(ValidationError):
             NumericStructured(
                 question_type="numeric",
@@ -1128,8 +1123,6 @@ class TestNumericStructuredMixture:
             )
 
     def test_weights_sum_above_tolerance_rejected(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         with pytest.raises(ValidationError):
             NumericStructured(
                 question_type="numeric",
@@ -1141,14 +1134,10 @@ class TestNumericStructuredMixture:
             )
 
     def test_zero_sd_rejected(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         with pytest.raises(ValidationError):
             MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=0.0)
 
     def test_negative_weight_rejected(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
-
         with pytest.raises(ValidationError):
             MixtureComponentDeclaration(weight=-0.1, mean=5.0, sd=1.0)
 
@@ -1160,15 +1149,140 @@ class TestNumericStructuredMixture:
         )
         assert n.mixture_components is None
 
-    def test_numeric_without_declared_percentiles_still_fails(self) -> None:
-        from metaculus_bot.structured_output_schema import MixtureComponentDeclaration
 
-        # declared_percentiles remains required even when mixture_components is supplied.
+# ===========================================================================
+# NumericStructured: mixture-only blocks (Workstream W4)
+#
+# numeric_prompt OPTION B tells models they may omit the percentile lines
+# entirely when emitting a mixture. Before W4 such blocks failed Pydantic
+# validation (declared_percentiles was required unconditionally), so the
+# mixture was silently dropped — numeric mixtures fired 0/27 in the bench.
+# These tests pin the new contract: a valid mixture lets declared_percentiles
+# be absent, but a block with NEITHER is still rejected.
+# ===========================================================================
+
+
+class TestNumericStructuredMixtureOnly:
+    def test_mixture_only_block_parses(self) -> None:
+
+        n = NumericStructured(  # type: ignore[call-arg]
+            question_type="numeric",
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.4, mean=2.0, sd=1.0),
+                MixtureComponentDeclaration(weight=0.6, mean=5.0, sd=1.0),
+            ],
+        )
+        assert n.declared_percentiles is None
+        assert n.mixture_components is not None
+        assert len(n.mixture_components) == 2
+
+    def test_mixture_only_three_components_parses(self) -> None:
+
+        n = NumericStructured(  # type: ignore[call-arg]
+            question_type="numeric",
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.2, mean=1.0, sd=0.5),
+                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
+                MixtureComponentDeclaration(weight=0.3, mean=9.0, sd=0.8),
+            ],
+        )
+        assert n.declared_percentiles is None
+        assert n.mixture_components is not None
+        assert len(n.mixture_components) == 3
+
+    def test_explicit_empty_percentiles_with_valid_mixture_parses(self) -> None:
+        # A model that emits an empty dict alongside a valid mixture should be
+        # treated the same as omitting the field.
+
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={},
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
+                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
+            ],
+        )
+        assert not n.declared_percentiles
+        assert n.mixture_components is not None
+
+    def test_neither_percentiles_nor_mixture_rejected(self) -> None:
+        # Both absent — there is nothing to build a CDF from, so reject.
+        with pytest.raises(ValidationError, match="declared_percentiles"):
+            NumericStructured(question_type="numeric")  # type: ignore[call-arg]
+
+    def test_single_component_mixture_without_percentiles_rejected(self) -> None:
+        # A 1-component "mixture" cannot build a CDF and the field validator
+        # rejects it before the model validator runs — so the block is rejected
+        # whether or not declared_percentiles is present.
+
         with pytest.raises(ValidationError):
             NumericStructured(  # type: ignore[call-arg]
                 question_type="numeric",
+                mixture_components=[MixtureComponentDeclaration(weight=1.0, mean=5.0, sd=1.0)],
+            )
+
+    def test_bad_weight_sum_mixture_without_percentiles_rejected(self) -> None:
+
+        with pytest.raises(ValidationError):
+            NumericStructured(  # type: ignore[call-arg]
+                question_type="numeric",
+                mixture_components=[
+                    MixtureComponentDeclaration(weight=0.3, mean=2.0, sd=1.0),
+                    MixtureComponentDeclaration(weight=0.3, mean=5.0, sd=1.0),
+                ],
+            )
+
+    def test_percentiles_only_still_parses(self) -> None:
+        # Backward-compat: the legacy percentile-only block (no mixture) parses
+        # exactly as before.
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+        )
+        assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
+        assert n.mixture_components is None
+
+    def test_both_present_still_parses(self) -> None:
+
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            mixture_components=[
+                MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
+                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
+            ],
+        )
+        assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
+        assert n.mixture_components is not None
+
+    def test_partial_percentiles_with_mixture_still_validates_percentiles(self) -> None:
+        # When declared_percentiles IS supplied, the p10/p50/p90 + monotonic
+        # rules still apply even though a mixture is present.
+
+        with pytest.raises(ValidationError, match="declared_percentiles must include"):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.5: 5.0, 0.9: 9.0},  # missing p10
                 mixture_components=[
                     MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
                     MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
                 ],
             )
+
+    def test_mixture_only_parses_through_parse_structured_block(self) -> None:
+        # End-to-end: a mixture-only rationale (OPTION B taken literally — no
+        # percentile lines, no declared_percentiles in JSON) now parses instead
+        # of being silently dropped.
+        payload = {
+            "question_type": "numeric",
+            "mixture_components": [
+                {"weight": 0.4, "mean": 2.0, "sd": 1.0},
+                {"weight": 0.6, "mean": 5.0, "sd": 1.5},
+            ],
+        }
+        rationale = f"My scenario reasoning...\n```json\n{json.dumps(payload)}\n```"
+        result = parse_structured_block(rationale, "numeric")
+        assert isinstance(result, NumericStructured)
+        assert result.declared_percentiles is None
+        assert result.mixture_components is not None
+        assert len(result.mixture_components) == 2

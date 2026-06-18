@@ -131,6 +131,37 @@ class TestNumericPromptSchemaInstruction:
             "mixture_components must be present in the numeric schema example so LLMs see the OPTION B branch"
         )
 
+    def test_option_b_mixture_offered(self):
+        # Both output formats must be offered; OPTION B (mixture) is a
+        # first-class choice, not a buried fallback.
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        assert "OPTION A" in prompt
+        assert "OPTION B" in prompt
+
+    def test_option_a_not_anchored_as_default(self):
+        # W4: the "default; what most models use" anchor on OPTION A pushed
+        # nearly every model to percentiles and starved the mixture path
+        # (0/27 in the bench). The choice must be framed by question SHAPE,
+        # not by a default-arm thumb on the scale.
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        assert "default; what most models use" not in prompt
+        assert "what most models use" not in prompt
+
+    def test_option_choice_is_shape_driven(self):
+        # The A-vs-B decision must reference the distribution's SHAPE
+        # (single mode vs. multi-modal / scenario branching).
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        lowered = prompt.lower()
+        assert "single" in lowered and "mode" in lowered
+        assert "multi-modal" in lowered or "multimodal" in lowered or "bimodal" in lowered
+
+    def test_mixture_only_omission_consistent_with_schema(self):
+        # The schema now accepts mixture-only blocks (W4), so the prompt's
+        # "you may omit the percentile lines entirely" promise is TRUE and
+        # must remain.
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        assert "omit the percentile lines" in prompt
+
     def test_schema_block_precedes_percentile_answer_lines(self):
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
         schema_idx = prompt.find('"question_type"')

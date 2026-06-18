@@ -256,6 +256,7 @@ def _per_arm_raw_stats_lines(scores: list[PairedScore]) -> list[str]:
         return []
 
     has_pdf_arms = any(not math.isnan(s.score_pdf_min1) for s in by_key.values())
+    has_mean_arm = any(not math.isnan(s.score_mean) for s in by_key.values())
 
     arm_extractors: dict[str, Any] = {
         "stack": lambda s: s.score_stack,
@@ -265,6 +266,8 @@ def _per_arm_raw_stats_lines(scores: list[PairedScore]) -> list[str]:
     if has_pdf_arms:
         arm_extractors["pdf_min1"] = lambda s: s.score_pdf_min1
         arm_extractors["pdf_min2"] = lambda s: s.score_pdf_min2
+    if has_mean_arm:
+        arm_extractors["mean"] = lambda s: s.score_mean
     bucket: dict[tuple[str, str, str], list[float]] = {}
     for s in by_key.values():
         for arm, extractor in arm_extractors.items():

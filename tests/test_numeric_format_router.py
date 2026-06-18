@@ -25,6 +25,7 @@ from metaculus_bot.numeric_format_router import (
     detect_numeric_format,
     route_numeric_output,
 )
+from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from tests.conftest import make_mock_numeric_question as _make_numeric_question
 
 
@@ -46,6 +47,20 @@ _VALID_MIXTURE_PAYLOAD: dict[str, Any] = {
         {"weight": 0.3, "mean": 25.0, "sd": 8.0},
         {"weight": 0.4, "mean": 50.0, "sd": 10.0},
         {"weight": 0.3, "mean": 75.0, "sd": 6.0},
+    ],
+}
+
+
+# Post-W4 the schema makes declared_percentiles Optional when a valid mixture
+# (>=2 components, weights ~1.0) is supplied, so a mixture-ONLY block (no
+# declared_percentiles key at all) now parses cleanly through the REAL parser +
+# REAL schema. This payload exercises that production-reachable path — no
+# parser bypass / model_construct needed.
+_VALID_MIXTURE_ONLY_PAYLOAD: dict[str, Any] = {
+    "question_type": "numeric",
+    "mixture_components": [
+        {"weight": 0.4, "mean": 30.0, "sd": 8.0},
+        {"weight": 0.6, "mean": 70.0, "sd": 6.0},
     ],
 }
 
@@ -107,6 +122,21 @@ class TestDetectNumericFormat:
         rationale = _wrap_json_block(payload)
         assert detect_numeric_format(rationale) == "percentiles"
 
+    def test_mixture_only_block_real_parser_returns_mixture(self) -> None:
+        # Post-W4 a mixture-ONLY block (no declared_percentiles key) parses
+        # cleanly through the REAL parser + REAL schema, so detect must report
+        # "mixture" (not "both", not None). This is the production-reachable
+        # path the v1 schema previously dropped.
+        rationale = _wrap_json_block(_VALID_MIXTURE_ONLY_PAYLOAD)
+        # Sanity: the real schema accepts the mixture-only block and leaves
+        # declared_percentiles unset.
+        parsed = parse_structured_block(rationale, "numeric")
+        assert isinstance(parsed, NumericStructured)
+        assert parsed.declared_percentiles is None
+        assert parsed.mixture_components is not None and len(parsed.mixture_components) == 2
+
+        assert detect_numeric_format(rationale) == "mixture"
+
 
 # ---------------------------------------------------------------------------
 # route_numeric_output
@@ -134,13 +164,14 @@ class TestRouteNumericOutput:
             assert isinstance(p, Percentile)
 
     def test_pure_mixture_with_percentiles_in_json_returns_both_format(self) -> None:
-        # F2: clarify the contract. The current v1 schema requires
-        # declared_percentiles even when mixture_components is present, so a
-        # payload-with-mixture always carries percentiles in the JSON. Even
-        # when the function-arg declared_percentiles is None, the router
-        # detects percentiles inside the structured block and reports
-        # ``format == "both"``, not ``"mixture"``. The literal "mixture"
-        # branch is exercised in the next test via parser bypass.
+        # F2: clarify the contract. Post-W4 the schema PERMITS a mixture-only
+        # block (declared_percentiles Optional when a valid mixture is present),
+        # but THIS payload (_VALID_MIXTURE_PAYLOAD) deliberately carries BOTH
+        # shapes. When both are in the JSON — even with the function-arg
+        # declared_percentiles None — the router detects percentiles inside the
+        # structured block and reports ``format == "both"``, not ``"mixture"``.
+        # The literal mixture-only "mixture" branch is exercised by the
+        # mixture-only tests (real-parser + parser-bypass) below.
         rationale = _wrap_json_block(_VALID_MIXTURE_PAYLOAD)
         question = _make_numeric_question()
 
@@ -154,21 +185,53 @@ class TestRouteNumericOutput:
         assert result.mixture is not None
         assert len(result.cdf_percentiles) == 201
 
+    def test_mixture_only_no_percentiles_real_parser(self) -> None:
+        # Post-W4 real-path coverage: a mixture-ONLY rationale (no
+        # declared_percentiles key) flows through the REAL parser + REAL schema
+        # — no model_construct, no monkeypatch — and the router takes the
+        # literal "mixture" branch, producing a valid 201-point Metaculus CDF.
+        # Previously the v1 schema dropped mixture-only blocks, so this path was
+        # unreachable; the parser-bypass test below is now redundant safety.
+        rationale = _wrap_json_block(_VALID_MIXTURE_ONLY_PAYLOAD)
+        question = _make_numeric_question()
+
+        result = route_numeric_output(
+            rationale=rationale,
+            declared_percentiles=None,
+            question=question,
+        )
+
+        assert isinstance(result, RoutedNumericForecast)
+        assert result.format == "mixture"
+        assert result.mixture is not None
+        assert len(result.mixture.components) == 2
+        assert result.declared_percentiles is None
+        # A valid 201-point Metaculus CDF: right length, pinned endpoints,
+        # monotonic non-decreasing, all Percentile objects.
+        cdf = result.cdf_percentiles
+        assert len(cdf) == 201
+        assert all(isinstance(p, Percentile) for p in cdf)
+        assert cdf[0].percentile == pytest.approx(0.0, abs=1e-6)
+        assert cdf[-1].percentile == pytest.approx(1.0, abs=1e-6)
+        probs = [p.percentile for p in cdf]
+        assert all(probs[i + 1] >= probs[i] - 1e-9 for i in range(len(probs) - 1))
+
     def test_mixture_only_no_percentiles_in_json(self, monkeypatch) -> None:
-        # F2: literal "mixture" branch — only reachable when the parser
-        # returns a NumericStructured with empty declared_percentiles,
-        # which the v1 schema currently disallows but we defend against.
-        # Monkeypatch parse_structured_block so it returns a stand-in with
-        # mixture_components populated and declared_percentiles empty.
+        # F2: literal "mixture" branch — reachable when the parser returns a
+        # NumericStructured with empty declared_percentiles. Post-W4 the schema
+        # PERMITS this (declared_percentiles is Optional when a valid mixture is
+        # supplied); see test_mixture_only_no_percentiles_real_parser for the
+        # real-parser version. Here we monkeypatch parse_structured_block so the
+        # branch is isolated from parser behavior.
         from metaculus_bot import numeric_format_router
         from metaculus_bot.structured_output_schema import (
             MixtureComponentDeclaration,
             NumericStructured,
         )
 
-        # NumericStructured.model_validate would reject empty declared_percentiles,
-        # so build the instance via model_construct (skips validation) — this
-        # mimics a future schema where mixture-only payloads are legal.
+        # model_construct (skips validation) keeps this test independent of the
+        # schema's percentiles-or-mixture rule — we only want to drive the
+        # mixture-only branch of route_numeric_output.
         fake_structured = NumericStructured.model_construct(
             question_type="numeric",
             declared_percentiles={},

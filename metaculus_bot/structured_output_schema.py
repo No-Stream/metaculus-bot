@@ -227,7 +227,10 @@ class NumericStructured(BaseModel):
 
     question_type: Literal["numeric"]
     prior: StatedPrior | None = None
-    declared_percentiles: dict[float, float]
+    # Optional ONLY when a valid mixture_components is present (enforced by
+    # _require_percentiles_or_mixture). A percentile-only block must still
+    # supply this with p10/p50/p90 + strictly-increasing values.
+    declared_percentiles: dict[float, float] | None = None
     distribution_family_hint: Literal["normal", "lognormal", "student_t", "skew_normal", "beta", "other"] | None = None
     student_t_df: float | None = None
     tails: TailMass | None = None
@@ -257,7 +260,14 @@ class NumericStructured(BaseModel):
 
     @field_validator("declared_percentiles")
     @classmethod
-    def _check_percentiles(cls, v: dict[float, float]) -> dict[float, float]:
+    def _check_percentiles(cls, v: dict[float, float] | None) -> dict[float, float] | None:
+        # None / empty is allowed here so a mixture-only block can omit
+        # declared_percentiles entirely. The "at least one of percentiles or
+        # mixture" requirement is enforced by _require_percentiles_or_mixture.
+        # When percentiles ARE supplied, the full p10/p50/p90 + monotonic
+        # contract still applies.
+        if not v:
+            return v
         missing = _REQUIRED_NUMERIC_PERCENTILES - set(v.keys())
         if missing:
             raise ValueError(
@@ -278,6 +288,22 @@ class NumericStructured(BaseModel):
                 )
             prev_value = value
         return v
+
+    @model_validator(mode="after")
+    def _require_percentiles_or_mixture(self) -> NumericStructured:
+        # numeric_prompt OPTION B lets a model emit only a mixture and omit the
+        # percentile lines. By the time this runs, _check_mixture_components has
+        # already guaranteed mixture_components is None or a valid (>=2 comps,
+        # weights ~1.0) list, and _check_percentiles has enforced the p10/p50/p90
+        # contract on any supplied percentiles. So we only need to reject the
+        # block where BOTH are absent — nothing to build a CDF from.
+        if not self.declared_percentiles and self.mixture_components is None:
+            raise ValueError(
+                "NumericStructured requires either declared_percentiles (with at least "
+                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}) or a valid mixture_components "
+                "(>=2 components, weights summing to ~1.0); both were absent"
+            )
+        return self
 
     @field_validator("scenarios")
     @classmethod

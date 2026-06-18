@@ -1172,3 +1172,57 @@ class TestMCStackingEnabled:
 
             assert len(result.predictions) == 1
             assert bot._conditional_stacking_triggered_count == 1
+
+
+class TestConditionalStackingSkipLogMessage:
+    """The SKIPPED log must distinguish the two skip reasons.
+
+    Reason 1 (type-disabled): spread > threshold but the per-type stacking gate
+    is off -> the message must NOT claim ``spread <= threshold`` (that's false).
+    Reason 2 (low-spread): the gate is on and spread <= threshold -> the legacy
+    ``spread <= threshold`` wording is correct.
+    """
+
+    @pytest.mark.asyncio
+    async def test_type_disabled_skip_does_not_claim_low_spread(self, monkeypatch, caplog):
+        """High spread + disabled gate logs the type-disabled reason, never ``<= threshold``."""
+        monkeypatch.setenv("BINARY_STACKING_ENABLED", "false")
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
+            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+                await bot._research_and_make_predictions(question)
+
+        skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
+        assert len(skip_logs) == 1
+        message = skip_logs[0]
+        assert "stacking disabled for this question type" in message
+        assert "<=" not in message
+        # Real spread (0.75) and threshold (0.15) are still reported for diagnostics.
+        assert "spread=0.750" in message
+        assert "threshold=0.150" in message
+        assert str(question.id_of_question) in message
+        assert bot._conditional_stacking_skipped_count == 1
+
+    @pytest.mark.asyncio
+    async def test_low_spread_skip_keeps_le_threshold_wording(self, monkeypatch, caplog):
+        """Enabled gate + low spread keeps the accurate ``spread <= threshold`` message."""
+        monkeypatch.setenv("BINARY_STACKING_ENABLED", "true")
+        bot = _make_bot()
+        question = _make_binary_question()
+
+        with mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY):
+            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+                await bot._research_and_make_predictions(question)
+
+        skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
+        assert len(skip_logs) == 1
+        message = skip_logs[0]
+        assert "<=" in message
+        assert "stacking disabled for this question type" not in message
+        # Low spread (0.10) is below the 0.15 threshold.
+        assert "spread=0.100" in message
+        assert "threshold=0.150" in message
+        assert str(question.id_of_question) in message
+        assert bot._conditional_stacking_skipped_count == 1

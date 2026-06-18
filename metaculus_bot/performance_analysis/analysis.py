@@ -4,8 +4,10 @@ import logging
 import math
 from typing import Callable
 
+import numpy as np
 from scipy.stats import spearmanr
 
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.parsing import _parse_probability
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
 from metaculus_bot.spread_metrics import binary_prob_range_spread
@@ -151,7 +153,15 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         elif resolution == "below_lower_bound":
             pit = 0.0
         elif isinstance(resolution, (int, float)):
-            pit = _interpolate_pit(float(resolution), lower_bound, upper_bound, cdf_values)
+            zp_raw = scaling.get("zero_point")
+            pit = _interpolate_pit(
+                float(resolution),
+                lower_bound,
+                upper_bound,
+                cdf_values,
+                value_grid=scaling.get("continuous_range"),
+                zero_point=None if zp_raw in (None, 0, 0.0) else float(zp_raw),
+            )
         else:
             continue
 
@@ -182,19 +192,37 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
     }
 
 
-def _interpolate_pit(resolution: float, lower_bound: float, upper_bound: float, cdf_values: list[float]) -> float:
-    """Interpolate the PIT value for a numeric resolution given its CDF."""
+def _interpolate_pit(
+    resolution: float,
+    lower_bound: float,
+    upper_bound: float,
+    cdf_values: list[float],
+    value_grid: list[float] | None = None,
+    zero_point: float | None = None,
+) -> float:
+    """Interpolate the PIT value ``F(resolution)`` for a numeric resolution given its CDF.
+
+    The CDF is defined on a value grid that is linear for linear-scaled questions but
+    GEOMETRIC for log-scaled questions (``zero_point`` set). Evaluate ``F`` by interpolating
+    the resolution against the actual value grid the CDF lives on, not against a linear index
+    map -- the latter mis-buckets log-scaled questions (PIT off by up to ~0.24).
+
+    ``value_grid`` is the authoritative grid (``scaling.continuous_range``) when present; it
+    is used directly if its length matches ``cdf_values``. Otherwise the grid is reconstructed
+    via :func:`build_cdf_value_grid` using ``zero_point``.
+    """
     total_range = upper_bound - lower_bound
     if total_range <= 0:
         return 0.5
 
-    fraction = (resolution - lower_bound) / total_range
-    n = len(cdf_values)
-    idx_float = fraction * (n - 1)
-    idx_low = max(0, min(int(math.floor(idx_float)), n - 2))
-    idx_high = idx_low + 1
-    weight = idx_float - idx_low
-    return cdf_values[idx_low] * (1 - weight) + cdf_values[idx_high] * weight
+    if value_grid is not None and len(value_grid) == len(cdf_values):
+        grid = np.asarray(value_grid, dtype=float)
+    else:
+        grid = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points=len(cdf_values))
+
+    # np.interp clamps to the grid endpoints: a resolution at/below grid[0] reads cdf_values[0]
+    # and at/above grid[-1] reads cdf_values[-1], which is the correct PIT at the bounds.
+    return float(np.interp(resolution, grid, np.asarray(cdf_values, dtype=float)))
 
 
 def mc_summary(data: list[dict]) -> dict:
