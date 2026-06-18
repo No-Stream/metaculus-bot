@@ -650,6 +650,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # <TYPE>_STACKING_ENABLED=true in deploy env to opt a type back into
             # stacking; otherwise the stacker is bypassed (forces median/skipped path).
             spread_exceeds_threshold = spread > threshold
+            type_stacking_disabled = False
             type_to_stacking_env = {
                 BinaryQuestion: BINARY_STACKING_ENABLED_ENV,
                 MultipleChoiceQuestion: MC_STACKING_ENABLED_ENV,
@@ -657,8 +658,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             }
             for q_type, env_name in type_to_stacking_env.items():
                 if isinstance(question, q_type):
-                    if not env_flag_enabled(env_name, default=False):
+                    if spread_exceeds_threshold and not env_flag_enabled(env_name, default=False):
+                        # Disagreement was high enough to trigger stacking, but the
+                        # per-type gate is off, so we deliberately bypass it.
                         spread_exceeds_threshold = False
+                        type_stacking_disabled = True
                     break
 
             if spread_exceeds_threshold:
@@ -741,12 +745,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 )
             else:
                 self._conditional_stacking_skipped_count += 1
-                logger.info(
-                    "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
-                    spread,
-                    threshold,
-                    question.id_of_question,
-                )
+                if type_stacking_disabled:
+                    logger.info(
+                        "Conditional stacking SKIPPED: stacking disabled for this question type "
+                        "(spread=%.3f, threshold=%.3f) for question %s",
+                        spread,
+                        threshold,
+                        question.id_of_question,
+                    )
+                else:
+                    logger.info(
+                        "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
+                        spread,
+                        threshold,
+                        question.id_of_question,
+                    )
                 self._register_expected_base_combine(question)
                 self._stacker_outcome[question.id_of_question] = "skipped"
                 return ResearchWithPredictions(
