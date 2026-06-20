@@ -42,8 +42,12 @@ typecheck_ty:
 cov:
 	$(call RUN_UNBUFFERED,-m pytest --cov=metaculus_bot --cov-report=term-missing)
 
+# Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
+# PyPI package), so it can't be run via uvx — install it with
+# `brew install osv-scanner` (see https://google.github.io/osv-scanner/installation/).
+# CI runs the equivalent google/osv-scanner-action.
 audit:
-	uvx osv-scanner --lockfile=uv.lock
+	osv-scanner scan --lockfile=uv.lock
 
 # Pre-commit helpers (use local cache to avoid readonly home cache)
 precommit_install:

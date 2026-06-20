@@ -32,12 +32,14 @@ jobs:
       - name: Run tests
         run: uv run pytest --cov=metaculus_bot
 
+  # Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
+  # PyPI package), so it runs via Google's published container action rather
+  # than uvx.
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
         with:
-          enable-cache: true
-          python-version: "3.12"
-      - run: uvx osv-scanner --lockfile=uv.lock
+          scan-args: |-
+            --lockfile=uv.lock

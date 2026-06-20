@@ -28,6 +28,29 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ## Near-term (worth exploring soon)
 
+### Dependency CVEs gated by the frozen `forecasting-tools` pin
+
+`make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
+flags known CVEs we currently can't patch because the fixed versions are
+unreachable while `forecasting-tools==0.2.54` is frozen. As of 2026-06:
+
+- **litellm 1.80.0** — four high-severity CVEs (GHSA-4xpc-pv4p-pm3w 9.5,
+  GHSA-jjhc-v7c2-5hh6 9.4, GHSA-53mr/69x8 8.6–8.7), fixed in 1.83.x–1.84.0.
+  `forecasting-tools 0.2.54` resolves litellm to exactly 1.80.0; our own
+  `<2.0.0` cap is not the binding constraint. `uv tree --invert` confirms the
+  pin chain. Unreachable without bumping forecasting-tools.
+- **cryptography 45.0.4** — incl. one 9.8 (PYSEC-2026-36), pulled transitively
+  via asknews / google-auth / mcp, all ultimately under forecasting-tools.
+- **pillow 11.3.0, pydantic-settings 2.14.1, transformers 4.57.6** — lower
+  severity, also transitive.
+
+These are an accepted consequence of freezing forecasting-tools for behavioral
+stability. Revisit when forecasting-tools is next upgraded (re-run `make audit`
+after any bump); if a litellm/cryptography CVE becomes actively exploited before
+then, evaluate an out-of-tree override (`[tool.uv] override-dependencies`) and
+re-validate the numeric/stacking pipeline against the bumped litellm. CI runs
+the same scan via `google/osv-scanner-action`, so new CVEs surface on every PR.
+
 ### Promote the core pipeline to `basedpyright` strict
 
 The 2026-06 Poetry→uv migration wired `basedpyright` at **standard** mode across
