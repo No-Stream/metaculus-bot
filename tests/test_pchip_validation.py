@@ -4,10 +4,12 @@ Tests for PCHIP CDF validation (QA checks that replace forecasting-tools validat
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from forecasting_tools import GeneralLlm, NumericQuestion
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP
@@ -36,7 +38,7 @@ class TestPchipValidation:
             "researcher": MagicMock(),
             "summarizer": MagicMock(),
         }
-        return TemplateForecaster(llms=mock_llms, publish_reports_to_metaculus=False)
+        return TemplateForecaster(llms=cast(dict[str, str | GeneralLlm], mock_llms), publish_reports_to_metaculus=False)
 
     def create_dummy_llm(self):
         """Create a dummy LLM for testing."""
@@ -105,7 +107,9 @@ class TestPchipValidation:
             "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
-            result = await forecaster._run_forecast_on_numeric(question, "test research", llm)
+            result = await forecaster._run_forecast_on_numeric(
+                cast(NumericQuestion, question), "test research", cast(GeneralLlm, llm)
+            )
             assert result is not None
 
     @pytest.mark.asyncio
@@ -126,7 +130,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to PCHIP validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -146,7 +152,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -166,7 +174,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -187,7 +197,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -207,7 +219,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -227,7 +241,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
     @pytest.mark.asyncio
     @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
@@ -247,7 +263,9 @@ class TestPchipValidation:
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
             with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(question, "test", forecaster.get_llm("default"))
+                    await forecaster._run_forecast_on_numeric(
+                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
+                    )
 
 
 if __name__ == "__main__":

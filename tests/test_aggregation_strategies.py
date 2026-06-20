@@ -1,3 +1,4 @@
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -5,6 +6,8 @@ from forecasting_tools.data_models.multiple_choice_report import (
     PredictedOption,
     PredictedOptionList,
 )
+from forecasting_tools.data_models.numeric_report import NumericDistribution
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
@@ -183,8 +186,8 @@ def test_combine_multiple_choice_predictions_dispatch():
 
 
 def test_combine_numeric_predictions_dispatch(monkeypatch):
-    predictions = ["pred1", "pred2"]
-    question = "question"
+    predictions = cast(list[NumericDistribution], ["pred1", "pred2"])
+    question = cast(NumericQuestion, "question")
 
     fake_aggregate = MagicMock(return_value="result")
     monkeypatch.setattr(

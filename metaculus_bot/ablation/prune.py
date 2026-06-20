@@ -63,6 +63,18 @@ DEFAULT_CLAUDE_EXECUTABLE = "claude"
 # binary-split the batch; a singleton over the cap is fail-fast.
 APPROX_PROMPT_CHAR_LIMIT = 4 * (200_000 - 20_000)
 
+
+def _require_qid(question: MetaculusQuestion) -> int:
+    """Narrow ``MetaculusQuestion.id_of_question`` (typed ``int | None``) to ``int``.
+
+    Every resolved question flowing through the redactor stage has a server-assigned
+    id; a missing id is a programming error, not an expected runtime condition.
+    """
+    qid = question.id_of_question
+    assert qid is not None, "MetaculusQuestion.id_of_question must be set for redactor batches"
+    return qid
+
+
 REDACTOR_SYSTEM_PROMPT = """\
 You are a forensic redactor working on a forecasting backtest. The benchmark
 evaluates how well a forecaster would have done HAD it forecast a question
@@ -584,7 +596,7 @@ async def _process_batch(
     the blob upstream).
     """
     await asyncio.sleep(0)
-    qids = [q.id_of_question for q, _gt, _blob in batch]
+    qids = [_require_qid(q) for q, _gt, _blob in batch]
     out: dict[int, tuple[str, dict] | None] = {qid: None for qid in qids}
 
     prompt = _build_redactor_prompt(batch)
@@ -665,8 +677,8 @@ async def _process_batch(
         logger.error("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc, exc_info=True)
         return out
 
-    ground_truths = {q.id_of_question: gt for q, gt, _ in batch}
-    raw_blobs = {q.id_of_question: blob for q, _, blob in batch}
+    ground_truths = {_require_qid(q): gt for q, gt, _ in batch}
+    raw_blobs = {_require_qid(q): blob for q, _, blob in batch}
 
     try:
         parsed = _parse_redactor_response(raw_stdout, qids, ground_truths)
@@ -725,7 +737,7 @@ async def run_prune_for_qids(
     needs_run: list[tuple[MetaculusQuestion, GroundTruth, str]] = []
 
     for question, gt, raw_blob in questions_with_gt_and_blob:
-        qid = question.id_of_question
+        qid = _require_qid(question)
         if not force:
             cached = cache.read_pruned_research(qid)
             if cached is not None:

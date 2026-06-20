@@ -2,9 +2,11 @@
 
 import asyncio
 from datetime import datetime
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.backtest.leakage import (
     _check_single_question_leakage,
@@ -12,6 +14,10 @@ from metaculus_bot.backtest.leakage import (
     screen_research_for_leakage,
 )
 from metaculus_bot.backtest.scoring import GroundTruth
+
+
+def _as_questions(questions: list[MagicMock]) -> list[MetaculusQuestion]:
+    return cast(list[MetaculusQuestion], questions)
 
 
 def _make_question(qid: int, text: str = "Will X happen?") -> MagicMock:
@@ -86,7 +92,7 @@ class TestCheckSingleQuestionLeakage:
 
         question = _make_question(1, text="Will the sun explode?")
         gt = _make_ground_truth(1, resolution_string="No")
-        gt.resolution_criteria = "Resolves YES if sun explodes"
+        cast(Any, gt).resolution_criteria = "Resolves YES if sun explodes"
 
         await _check_single_question_leakage(question, gt, "solar research", detector_llm)
 
@@ -211,7 +217,7 @@ class TestScreenResearchForLeakage:
         ground_truths = {i: _make_ground_truth(i) for i in [1, 2, 3]}
 
         clean_questions, clean_gts, research_cache = await screen_research_for_leakage(
-            questions, ground_truths, concurrency=5
+            _as_questions(questions), ground_truths, concurrency=5
         )
 
         assert len(clean_questions) == 2
@@ -246,7 +252,7 @@ class TestScreenResearchForLeakage:
         ground_truths = {i: _make_ground_truth(i) for i in [1, 2, 3]}
 
         clean_questions, clean_gts, research_cache = await screen_research_for_leakage(
-            questions, ground_truths, concurrency=5
+            _as_questions(questions), ground_truths, concurrency=5
         )
 
         assert len(clean_questions) == 3
@@ -279,7 +285,7 @@ class TestScreenResearchForLeakage:
         ground_truths = {i: _make_ground_truth(i) for i in [1, 2, 3]}
 
         clean_questions, clean_gts, research_cache = await screen_research_for_leakage(
-            questions, ground_truths, concurrency=5
+            _as_questions(questions), ground_truths, concurrency=5
         )
 
         assert len(clean_questions) == 3
@@ -299,7 +305,7 @@ class TestScreenResearchForLeakage:
         questions[0].id_of_question = 1
         ground_truths = {1: _make_ground_truth(1)}
 
-        await screen_research_for_leakage(questions, ground_truths)
+        await screen_research_for_leakage(_as_questions(questions), ground_truths)
 
         mock_choose_provider_with_name.assert_called_once_with(is_benchmarking=True)
 

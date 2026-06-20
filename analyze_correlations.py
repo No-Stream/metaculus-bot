@@ -537,7 +537,7 @@ def _resolve_output_path(args: argparse.Namespace) -> str | Path:
 
 def _print_report(analyzer: CorrelationAnalyzer, output_file: str | Path) -> str:
     """Generate + print the correlation report, returning the report text."""
-    report = analyzer.generate_correlation_report(output_file)
+    report = analyzer.generate_correlation_report(str(output_file))
     print("=" * 60)
     print("CORRELATION ANALYSIS RESULTS")
     print("=" * 60)
@@ -640,12 +640,12 @@ def _print_correlation_highlights(analyzer: CorrelationAnalyzer, has_mixed: bool
         names = list(pm.columns)
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
-                val = pm.iloc[i, j]
+                val = float(pm.iloc[i, j])  # type: ignore[arg-type]  # pandas Scalar -> float
                 if np.isnan(val):
                     continue
                 if abs(val) >= 0.999:  # skip trivial self/near-identity
                     continue
-                pairs.append((names[i], names[j], float(val)))
+                pairs.append((names[i], names[j], val))
         pairs.sort(key=lambda x: abs(x[2]), reverse=True)
         print("\nMost Correlated Model Pairs:")
         for model1, model2, corr in pairs[:8]:

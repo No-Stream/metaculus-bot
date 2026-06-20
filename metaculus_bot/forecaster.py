@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Coroutine, Sequence, cast
+from typing import Any, Callable, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
@@ -306,7 +306,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     def _stacker_fallback_failed_count(self, value: int) -> None:
         self._pipeline.counters.stacker_fallback_failed_count = value
 
-    async def forecast_questions(
+    async def forecast_questions(  # pyright: ignore[reportIncompatibleMethodOverride]  # matches base's broadest @overload; base declares Literal overloads we deliberately don't replicate
         self,
         questions: Sequence[MetaculusQuestion],
         return_exceptions: bool = False,
@@ -469,7 +469,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             else:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 exceptions.append(exc)
-        exception_group: ExceptionGroup | None = ExceptionGroup(f"Errors: {errors}", exceptions) if exceptions else None
+        exception_group: ExceptionGroup | None = (
+            ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
+        )
         return valid_predictions, errors, exception_group
 
     async def _finalize_stacked_prediction(
@@ -520,6 +522,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             reasoned_predictions=valid_predictions,
             aggregated_tool_output=aggregated_tool_output,
         )
+        assert question.id_of_question is not None
         meta_text = self._stack_meta_reasoning.pop(question.id_of_question, default_meta_reasoning)
         combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
         aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
@@ -883,18 +886,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         actual_llm = llm_to_use if llm_to_use else self.get_llm("default", "llm")
 
+        forecast_function: Callable[..., Coroutine[Any, Any, ReasonedPrediction[Any]]]
         if isinstance(question, BinaryQuestion):
-
-            def forecast_function(q, r, llm):
-                return self._run_forecast_on_binary(q, r, llm)
+            forecast_function = lambda q, r, llm: self._run_forecast_on_binary(q, r, llm)  # noqa: E731
         elif isinstance(question, MultipleChoiceQuestion):
-
-            def forecast_function(q, r, llm):
-                return self._run_forecast_on_multiple_choice(q, r, llm)
+            forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm)  # noqa: E731
         elif isinstance(question, NumericQuestion):
-
-            def forecast_function(q, r, llm):
-                return self._run_forecast_on_numeric(q, r, llm)
+            forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm)  # noqa: E731
         elif isinstance(question, DateQuestion):
             raise NotImplementedError("Date questions not supported yet")
         else:
@@ -935,21 +933,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
             predictions, question, research, reasoned_predictions, aggregated_tool_output
         )
 
-    async def _run_forecast_on_binary(
+    async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[float]:
         from metaculus_bot.forecaster_runners import run_binary_forecast
 
         return await run_binary_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
 
-    async def _run_forecast_on_multiple_choice(
+    async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
         self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[PredictedOptionList]:
         from metaculus_bot.forecaster_runners import run_mc_forecast
 
         return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
 
-    async def _run_forecast_on_numeric(
+    async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
         self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
     ) -> ReasonedPrediction[NumericDistribution]:
         from metaculus_bot.forecaster_runners import run_numeric_forecast

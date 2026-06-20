@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -3679,13 +3679,13 @@ class TestManifestExpansion:
         new_mc_qs = [_make_mc_question(2100 + i) for i in range(4)]
         new_numeric_qs = [_make_numeric_question(2200 + i) for i in range(4)]
         new_pairs = (
-            [(q, _make_binary_ground_truth(q.id_of_question)) for q in new_binary_qs]
-            + [(q, _make_mc_ground_truth(q.id_of_question, "Red")) for q in new_mc_qs]
-            + [(q, _make_numeric_ground_truth(q.id_of_question, 50.0)) for q in new_numeric_qs]
+            [(q, _make_binary_ground_truth(cast(int, q.id_of_question))) for q in new_binary_qs]
+            + [(q, _make_mc_ground_truth(cast(int, q.id_of_question), "Red")) for q in new_mc_qs]
+            + [(q, _make_numeric_ground_truth(cast(int, q.id_of_question), 50.0)) for q in new_numeric_qs]
         )
         second_question_set = _build_question_set(new_pairs)
 
-        all_new_qids = [q.id_of_question for q, _ in new_pairs]
+        all_new_qids = [cast(int, q.id_of_question) for q, _ in new_pairs]
         second_research: dict[int, tuple[str, dict] | None] = {qid: (f"blob {qid}", {}) for qid in all_new_qids}
         second_verdicts = {
             qid: {
@@ -3699,19 +3699,19 @@ class TestManifestExpansion:
         }
         forecasters_second: dict[int, dict[str, dict]] = {}
         for q in new_binary_qs:
-            forecasters_second[q.id_of_question] = {
+            forecasters_second[cast(int, q.id_of_question)] = {
                 model_slug_to_filename(f"openrouter/test/m{i}"): _binary_forecaster_payload(
                     f"openrouter/test/m{i}", 0.5
                 )
                 for i in range(3)
             }
         for q in new_mc_qs:
-            forecasters_second[q.id_of_question] = {
+            forecasters_second[cast(int, q.id_of_question)] = {
                 model_slug_to_filename(f"openrouter/test/m{i}"): _mc_forecaster_payload(f"openrouter/test/m{i}")
                 for i in range(3)
             }
         for q in new_numeric_qs:
-            forecasters_second[q.id_of_question] = {
+            forecasters_second[cast(int, q.id_of_question)] = {
                 model_slug_to_filename(f"openrouter/test/m{i}"): _numeric_forecaster_payload(
                     f"openrouter/test/m{i}", 50.0
                 )

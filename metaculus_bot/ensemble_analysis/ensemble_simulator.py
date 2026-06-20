@@ -100,7 +100,7 @@ class EnsembleSimulator:
 
         for benchmark in self._benchmarks:
             model_name = extract_model_name(benchmark)
-            total_cost = benchmark.total_cost
+            total_cost: float = benchmark.total_cost if benchmark.total_cost is not None else 0.0
             num_questions = len(benchmark.forecast_reports)
 
             # Fix unrealistic costs for premium models and free models
@@ -165,7 +165,7 @@ class EnsembleSimulator:
         ensemble_performance = self.simulate_ensemble_performance(models, strategy)
 
         # Calculate average cost (same as before)
-        avg_cost = np.mean([model_stats[m]["avg_cost"] for m in models])
+        avg_cost = float(np.mean([model_stats[m]["avg_cost"] for m in models]))
 
         # Calculate average pairwise correlation
         correlations = []
@@ -178,7 +178,7 @@ class EnsembleSimulator:
                     # Models might not have overlapping predictions
                     correlations.append(0.5)  # Neutral correlation
 
-        avg_correlation = np.mean(correlations) if correlations else 0.5
+        avg_correlation = float(np.mean(correlations)) if correlations else 0.5
         diversity_score = 1.0 - avg_correlation
         efficiency_ratio = ensemble_performance / max(avg_cost, 0.001)
 
@@ -335,7 +335,7 @@ class EnsembleSimulator:
                 continue
 
         # Return average ensemble performance across all questions
-        result = np.mean(ensemble_scores) if ensemble_scores else 0.0
+        result = float(np.mean(ensemble_scores)) if ensemble_scores else 0.0
         logger.debug(f"Ensemble {models} with {strategy}: {len(ensemble_scores)} questions, avg score {result:.2f}")
         return result
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from forecasting_tools import (
     PredictedOptionList,
     ReasonedPrediction,
 )
+from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
@@ -138,7 +140,7 @@ class TestBaseCombineReentry:
         )
 
         # Mean of [0.30, 0.50, 0.70] = 0.50 (coincidentally same as median here)
-        assert abs(result - 0.50) < 0.01
+        assert abs(cast(float, result) - 0.50) < 0.01
 
     @pytest.mark.asyncio
     async def test_multiple_mc_uses_median_for_conditional_stacking(self):
@@ -192,8 +194,8 @@ class TestStackingFallbackChain:
     async def test_primary_success_sets_outcome(self):
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=201)
-        predictions = [0.20, 0.80, 0.50]
-        reasoned = [
+        predictions: list[PredictionTypes] = [0.20, 0.80, 0.50]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
             ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
             ReasonedPrediction(prediction_value=0.50, reasoning="Model: m3\n\nMid"),
@@ -207,15 +209,15 @@ class TestStackingFallbackChain:
                 reasoned_predictions=reasoned,
             )
 
-        assert abs(result - 0.65) < 0.01
+        assert abs(cast(float, result) - 0.65) < 0.01
         assert pipeline.outcomes[201] == "primary"
 
     @pytest.mark.asyncio
     async def test_primary_failure_invokes_fallback(self):
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=202)
-        predictions = [0.20, 0.80]
-        reasoned = [
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
             ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
         ]
@@ -237,7 +239,7 @@ class TestStackingFallbackChain:
                 reasoned_predictions=reasoned,
             )
 
-        assert abs(result - 0.55) < 0.01
+        assert abs(cast(float, result) - 0.55) < 0.01
         assert pipeline.outcomes[202] == "fallback_llm"
         assert pipeline.counters.stacker_primary_failed_count == 1
         assert pipeline.counters.stacker_fallback_used_count == 1
@@ -246,8 +248,8 @@ class TestStackingFallbackChain:
     async def test_both_fail_uses_median(self):
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=203)
-        predictions = [0.20, 0.80, 0.50]
-        reasoned = [
+        predictions: list[PredictionTypes] = [0.20, 0.80, 0.50]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
             ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
             ReasonedPrediction(prediction_value=0.50, reasoning="Model: m3\n\nMid"),
@@ -262,7 +264,7 @@ class TestStackingFallbackChain:
             )
 
         # Median of [0.20, 0.50, 0.80] = 0.50
-        assert abs(result - 0.50) < 0.01
+        assert abs(cast(float, result) - 0.50) < 0.01
         assert pipeline.outcomes[203] == "fallback_median"
         assert pipeline.counters.stacker_primary_failed_count == 1
         assert pipeline.counters.stacker_fallback_used_count == 1
@@ -272,8 +274,8 @@ class TestStackingFallbackChain:
     async def test_fallback_disabled_raises(self):
         pipeline = _make_pipeline(stacking_fallback_on_failure=False)
         question = _make_binary_question(qid=204)
-        predictions = [0.20, 0.80]
-        reasoned = [
+        predictions: list[PredictionTypes] = [0.20, 0.80]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(prediction_value=0.20, reasoning="Model: m1\n\nLow"),
             ReasonedPrediction(prediction_value=0.80, reasoning="Model: m2\n\nHigh"),
         ]
@@ -304,7 +306,7 @@ class TestSimpleAggregation:
         )
 
         # Mean of [0.20, 0.40, 0.60] = 0.40
-        assert abs(result - 0.40) < 0.01
+        assert abs(cast(float, result) - 0.40) < 0.01
 
     @pytest.mark.asyncio
     async def test_median_binary(self):
@@ -317,7 +319,7 @@ class TestSimpleAggregation:
         )
 
         # Median of [0.20, 0.40, 0.60] = 0.40
-        assert abs(result - 0.40) < 0.01
+        assert abs(cast(float, result) - 0.40) < 0.01
 
     @pytest.mark.asyncio
     async def test_mean_mc(self):
@@ -356,7 +358,7 @@ class TestRunStacking:
     async def test_binary_dispatches_to_stacking_module(self):
         pipeline = _make_pipeline()
         question = _make_binary_question(qid=401)
-        reasoned = [
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nReasons"),
             ReasonedPrediction(prediction_value=0.70, reasoning="Model: m2\n\nReasons"),
         ]
@@ -372,7 +374,7 @@ class TestRunStacking:
     async def test_mc_dispatches_to_stacking_module(self):
         pipeline = _make_pipeline()
         question = _make_mc_question(qid=402)
-        reasoned = [
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
             ReasonedPrediction(
                 prediction_value=PredictedOptionList(
                     predicted_options=[

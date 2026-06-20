@@ -1,3 +1,4 @@
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -8,7 +9,7 @@ from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_
 
 
 def _build_question(**overrides) -> NumericQuestion:
-    base_kwargs = dict(
+    base_kwargs: dict[str, Any] = dict(
         id_of_question=1,
         id_of_post=1,
         page_url="https://example.com/q/1",

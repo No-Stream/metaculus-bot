@@ -5,8 +5,10 @@ Tests for cluster detection and spreading functions extracted from main.py.
 """
 
 from types import SimpleNamespace
+from typing import cast
 
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.cluster_processing import (
     apply_cluster_spreading,
@@ -17,13 +19,16 @@ from metaculus_bot.numeric.cluster_processing import (
 )
 
 
-def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0):
-    return SimpleNamespace(
-        open_upper_bound=open_upper,
-        open_lower_bound=open_lower,
-        upper_bound=upper,
-        lower_bound=lower,
-        id_of_question=999,
+def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0) -> NumericQuestion:
+    return cast(
+        NumericQuestion,
+        SimpleNamespace(
+            open_upper_bound=open_upper,
+            open_lower_bound=open_lower,
+            upper_bound=upper,
+            lower_bound=lower,
+            id_of_question=999,
+        ),
     )
 
 

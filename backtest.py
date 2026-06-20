@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, cast
 
 import typeguard
 from forecasting_tools import Benchmarker, ForecastBot, MonetaryCostManager
@@ -37,6 +37,7 @@ from metaculus_bot.constants import (
     BENCHMARK_BATCH_SIZE,
     HEARTBEAT_INTERVAL,
 )
+from metaculus_bot.forecaster import TemplateForecaster  # noqa: F401  # used in annotations below
 from metaculus_bot.scoring_patches import apply_scoring_patches
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -102,27 +103,37 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _filter_bots(
-    bots: list[ForecastBot],
+    bots: list[TemplateForecaster],
     include_models: list[str] | None,
     exclude_models: list[str] | None,
-) -> list[ForecastBot]:
+) -> list[TemplateForecaster]:
     """Filter bots by include/exclude substring matching on bot name."""
     filtered = list(bots)
 
+    # `name` is a dynamic attribute set on each bot by create_individual_bots (bot.name = spec["name"]);
+    # ForecastBot doesn't declare it, so reads are typed via a scoped ignore (matches bot_factory.py).
     if include_models:
-        filtered = [b for b in filtered if any(token.lower() in b.name.lower() for token in include_models)]
+        filtered = [
+            b
+            for b in filtered
+            if any(token.lower() in b.name.lower() for token in include_models)  # pyright: ignore[reportAttributeAccessIssue]
+        ]
 
     if exclude_models:
-        filtered = [b for b in filtered if not any(token.lower() in b.name.lower() for token in exclude_models)]
+        filtered = [
+            b
+            for b in filtered
+            if not any(token.lower() in b.name.lower() for token in exclude_models)  # pyright: ignore[reportAttributeAccessIssue]
+        ]
 
     if not filtered:
-        available_names = [b.name for b in bots]
+        available_names = [b.name for b in bots]  # pyright: ignore[reportAttributeAccessIssue]
         raise ValueError(
             f"No bots remaining after model filtering. "
             f"Available: {available_names}, include={include_models}, exclude={exclude_models}"
         )
 
-    logger.info(f"Model filtering: {len(bots)} -> {len(filtered)} bots: {[b.name for b in filtered]}")
+    logger.info(f"Model filtering: {len(bots)} -> {len(filtered)} bots: {[b.name for b in filtered]}")  # pyright: ignore[reportAttributeAccessIssue]
     return filtered
 
 
@@ -191,14 +202,16 @@ async def run_backtest(args: argparse.Namespace) -> None:
     logger.info(f"After research setup: {len(clean_questions)} questions, {len(research_cache)} cached")
 
     # 3. Create bots
-    bots: list[ForecastBot] = create_individual_bots(
-        INDIVIDUAL_MODEL_SPECS,
+    bots: list[TemplateForecaster] = create_individual_bots(
+        # INDIVIDUAL_MODEL_SPECS values are str | GeneralLlm (the "name" key is a str); the factory
+        # reads "name"/"forecaster" by key, so the looser value type is safe to pass here.
+        cast("Any", INDIVIDUAL_MODEL_SPECS),
         DEFAULT_HELPER_LLMS,
         BENCHMARK_BOT_CONFIG,
         batch_size=BENCHMARK_BATCH_SIZE,
         research_cache=research_cache,
     )
-    bots = typeguard.check_type(bots, list[ForecastBot])
+    bots = typeguard.check_type(bots, list[TemplateForecaster])
 
     bots = _filter_bots(bots, args.include_models, args.exclude_models)
 
@@ -226,7 +239,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
 
         benchmarks = await Benchmarker(
             questions_to_use=clean_questions,
-            forecast_bots=bots,
+            forecast_bots=cast("list[ForecastBot]", bots),
             file_path_to_save_reports="backtests/",
             concurrent_question_batch_size=BENCHMARK_BATCH_SIZE,
         ).run_benchmark()

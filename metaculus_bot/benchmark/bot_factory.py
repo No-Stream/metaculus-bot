@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from forecasting_tools import GeneralLlm
 
@@ -100,7 +100,7 @@ MODEL_CATALOG: dict[str, GeneralLlm] = {
     # ),
 }
 
-INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
+INDIVIDUAL_MODEL_SPECS: tuple[Mapping[str, str | GeneralLlm], ...] = (
     MappingProxyType({"name": "qwen3-235b", "forecaster": MODEL_CATALOG["qwen3-235b"]}),
     MappingProxyType({"name": "deepseek-3.2", "forecaster": MODEL_CATALOG["deepseek-3.2"]}),
     MappingProxyType({"name": "gpt-5.1", "forecaster": MODEL_CATALOG["gpt-5.1"]}),
@@ -137,11 +137,14 @@ def create_individual_bots(
         bot = TemplateForecaster(
             **benchmark_config,
             aggregation_strategy=AggregationStrategy.MEAN,
-            llms={"forecasters": [spec["forecaster"]], **helper_llms},
+            llms=cast(
+                "dict[str, str | GeneralLlm]",
+                {"forecasters": [spec["forecaster"]], **helper_llms},
+            ),
             max_concurrent_research=batch_size,
             research_cache=research_cache,
         )
-        bot.name = spec["name"]
+        bot.name = spec["name"]  # pyright: ignore[reportAttributeAccessIssue]  # dynamic attr read via getattr(self, "name")
         bots.append(bot)
     return bots
 
@@ -160,17 +163,20 @@ def create_stacking_bots(
         bot = TemplateForecaster(
             **benchmark_config,
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": base_forecasters,
-                "stacker": spec["stacker"],
-                **helper_llms,
-            },
+            llms=cast(
+                "dict[str, str | GeneralLlm]",
+                {
+                    "forecasters": base_forecasters,
+                    "stacker": spec["stacker"],
+                    **helper_llms,
+                },
+            ),
             max_concurrent_research=batch_size,
             research_cache=research_cache,
             stacking_fallback_on_failure=False,
             stacking_randomize_order=True,
         )
-        bot.name = spec["name"]
+        bot.name = spec["name"]  # pyright: ignore[reportAttributeAccessIssue]  # dynamic attr read via getattr(self, "name")
         bots.append(bot)
     return bots
 

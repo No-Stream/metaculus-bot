@@ -6,11 +6,14 @@ Tests for numeric CDF smoothing:
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
@@ -33,7 +36,7 @@ def _make_forecaster():
         "researcher": MagicMock(),
         "summarizer": MagicMock(),
     }
-    return TemplateForecaster(llms=mock_llms, publish_reports_to_metaculus=False)
+    return TemplateForecaster(llms=cast(dict[str, str | GeneralLlm], mock_llms), publish_reports_to_metaculus=False)
 
 
 def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0):
@@ -83,7 +86,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, cast(NumericQuestion, q))
 
         vals = [p.value for p in adjusted]
         # Strictly increasing
@@ -109,7 +112,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, cast(NumericQuestion, q))
 
         vals = [p.value for p in adjusted]
         # Strictly increasing after adjustment
@@ -136,7 +139,7 @@ class TestNumericCDFSmoothing:
 
         caplog.clear()
         caplog.set_level("WARNING")
-        adjusted = apply_jitter_and_clamp(raw, q)
+        adjusted = apply_jitter_and_clamp(raw, cast(NumericQuestion, q))
         vals = [p.value for p in adjusted]
         assert all(q.lower_bound <= v <= q.upper_bound for v in vals)
         assert all(b > a for a, b in zip(vals, vals[1:])), vals
@@ -178,7 +181,9 @@ class TestNumericCDFSmoothing:
             "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
-            result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
+            result = await f._run_forecast_on_numeric(
+                cast(NumericQuestion, q), "test research", cast(GeneralLlm, DummyLLM())
+            )
             assert result is not None
 
         # Verify smoothing was logged
@@ -215,7 +220,9 @@ class TestNumericCDFSmoothing:
             "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
-            result = await f._run_forecast_on_numeric(q, "test research", DummyLLM())
+            result = await f._run_forecast_on_numeric(
+                cast(NumericQuestion, q), "test research", cast(GeneralLlm, DummyLLM())
+            )
             assert result is not None
 
         # No cluster spread or ramp smoothing messages expected

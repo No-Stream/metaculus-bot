@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,7 +93,7 @@ async def test_template_forecaster_init_without_forecasters():
 
     assert not bot._forecaster_llms
     assert bot.predictions_per_research_report == 3
-    assert bot.get_llm("default").model == "test_default"
+    assert cast(GeneralLlm, bot.get_llm("default")).model == "test_default"
 
 
 @pytest.mark.asyncio
@@ -104,7 +105,7 @@ async def test_template_forecaster_init_no_llms_provided():
 @pytest.mark.asyncio
 async def test_template_forecaster_init_missing_required_llms():
     # Test missing parser and researcher
-    incomplete_llms = {
+    incomplete_llms: dict[str, str | GeneralLlm] = {
         "default": "mock_default_model",
         "summarizer": "mock_summarizer_model",
     }
@@ -217,7 +218,7 @@ async def test_research_and_make_predictions_without_forecasters(mock_binary_que
 
 @pytest.mark.asyncio
 async def test_make_prediction_with_provided_llm(mock_binary_question, mock_general_llm):
-    llms_config = {
+    llms_config: dict[str, str | GeneralLlm] = {
         "default": "mock_default_model",
         "summarizer": "mock_summarizer_model",
         "parser": "mock_parser_model",
@@ -269,7 +270,7 @@ async def test_make_prediction_without_provided_llm(mock_binary_question):
 
 @pytest.mark.asyncio
 async def test_run_forecast_on_binary_uses_provided_llm(mock_binary_question, mock_general_llm):
-    llms_config = {
+    llms_config: dict[str, str | GeneralLlm] = {
         "default": "mock_default_model",
         "summarizer": "mock_summarizer_model",
         "parser": "mock_parser_model",
@@ -291,7 +292,7 @@ async def test_run_forecast_on_binary_uses_provided_llm(mock_binary_question, mo
 
 @pytest.mark.asyncio
 async def test_run_forecast_on_multiple_choice_uses_provided_llm(mock_metaculus_question, mock_general_llm):
-    llms_config = {
+    llms_config: dict[str, str | GeneralLlm] = {
         "default": "mock_default_model",
         "summarizer": "mock_summarizer_model",
         "parser": "mock_parser_model",
@@ -311,7 +312,7 @@ async def test_run_forecast_on_multiple_choice_uses_provided_llm(mock_metaculus_
 
 @pytest.mark.asyncio
 async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question, mock_general_llm):
-    llms_config = {
+    llms_config: dict[str, str | GeneralLlm] = {
         "default": "mock_default_model",
         "summarizer": "mock_summarizer_model",
         "parser": "mock_parser_model",
@@ -487,7 +488,7 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
             return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
         raise RuntimeError("forecaster 2 failed")
 
-    bot._forecaster_with_soft_deadline = mixed_results
+    bot._forecaster_with_soft_deadline = cast(Any, mixed_results)
 
     with pytest.raises(ExceptionGroup) as exc_info:  # noqa: F821  # 3.11+ builtin
         await bot._research_and_make_predictions(mock_binary_question)

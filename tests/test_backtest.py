@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -63,8 +64,8 @@ def test_model_filtering_include():
 
     filtered = _filter_bots([bot_a, bot_b, bot_c], include_models=["gpt", "qwen"], exclude_models=None)
     assert len(filtered) == 2
-    assert filtered[0].name == "gpt-5.1"
-    assert filtered[1].name == "qwen3-235b"
+    assert cast(Mock, filtered[0]).name == "gpt-5.1"
+    assert cast(Mock, filtered[1]).name == "qwen3-235b"
 
 
 def test_model_filtering_exclude():
@@ -80,8 +81,8 @@ def test_model_filtering_exclude():
 
     filtered = _filter_bots([bot_a, bot_b, bot_c], include_models=None, exclude_models=["deepseek"])
     assert len(filtered) == 2
-    assert filtered[0].name == "gpt-5.1"
-    assert filtered[1].name == "qwen3-235b"
+    assert cast(Mock, filtered[0]).name == "gpt-5.1"
+    assert cast(Mock, filtered[1]).name == "qwen3-235b"
 
 
 def test_model_filtering_no_filters():

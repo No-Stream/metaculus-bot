@@ -16,7 +16,7 @@ import hashlib
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from forecasting_tools.data_models.binary_report import BinaryReport
@@ -402,7 +402,7 @@ def score_arm_for_qid(
             ("mean", report_mean),
         ]:
             if report is not None:
-                metrics_for_arm = _score_binary_arm(report, resolution)
+                metrics_for_arm = _score_binary_arm(cast(BinaryReport, report), resolution)
                 arm_metrics[label] = metrics_for_arm
                 arm_saturation[label] = _saturation_for_metrics(metrics_for_arm)
             else:
@@ -432,7 +432,7 @@ def score_arm_for_qid(
             ("mean", report_mean),
         ]:
             if report is not None:
-                scored = _score_numeric_arm(report, resolution)
+                scored = _score_numeric_arm(cast(NumericReport, report), resolution)
                 if scored is None:
                     # Scoring failed (e.g., CDF issue) — treat this arm as absent.
                     arm_metrics[label] = None
@@ -459,7 +459,7 @@ def score_arm_for_qid(
             ("mean", report_mean),
         ]:
             if report is not None:
-                scored = _score_mc_arm(report, resolution)
+                scored = _score_mc_arm(cast(MultipleChoiceReport, report), resolution)
                 if scored is None:
                     arm_metrics[label] = None
                     arm_saturation[label] = None

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
+from typing import cast
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -34,6 +35,7 @@ from forecasting_tools import (
     GeneralLlm,
     MultipleChoiceQuestion,
 )
+from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import (
     PredictedOption,
     PredictedOptionList,
@@ -71,13 +73,16 @@ def _make_median_bot() -> TemplateForecaster:
         predictions_per_research_report=1,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.MEDIAN,
-        llms={
-            "forecasters": [test_llm],
-            "default": test_llm,
-            "parser": test_llm,
-            "researcher": test_llm,
-            "summarizer": test_llm,
-        },
+        llms=cast(
+            "dict[str, str | GeneralLlm]",
+            {
+                "forecasters": [test_llm],
+                "default": test_llm,
+                "parser": test_llm,
+                "researcher": test_llm,
+                "summarizer": test_llm,
+            },
+        ),
         is_benchmarking=True,
         min_forecasters_to_publish=1,
     )
@@ -95,15 +100,18 @@ def _make_stacking_bot(
         predictions_per_research_report=1,
         publish_reports_to_metaculus=False,
         aggregation_strategy=aggregation_strategy,
-        llms={
-            "forecasters": [test_llm, test_llm],
-            "stacker": test_llm,
-            "analyzer": test_llm,
-            "default": test_llm,
-            "parser": test_llm,
-            "researcher": test_llm,
-            "summarizer": test_llm,
-        },
+        llms=cast(
+            "dict[str, str | GeneralLlm]",
+            {
+                "forecasters": [test_llm, test_llm],
+                "stacker": test_llm,
+                "analyzer": test_llm,
+                "default": test_llm,
+                "parser": test_llm,
+                "researcher": test_llm,
+                "summarizer": test_llm,
+            },
+        ),
         is_benchmarking=True,
         stacking_fallback_on_failure=stacking_fallback_on_failure,
         min_forecasters_to_publish=1,
@@ -229,7 +237,7 @@ async def test_calibration_on_nonidentity_applies_binary(monkeypatch: pytest.Mon
     preds = [0.6, 0.7]
     raw_median = combine_binary_predictions(preds, AggregationStrategy.MEDIAN)
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
-    result = await bot._aggregate_predictions(preds, question)
+    result = await bot._aggregate_predictions(cast("list[PredictionTypes]", preds), question)
 
     assert result == expected, (
         f"binary aggregation should equal apply_binary_platt(raw_median, params, cap); "
@@ -410,7 +418,7 @@ async def test_stacker_median_fallback_applies_calibration_binary(
     # test_stacking.py uses in the equivalent failure-path test.
     with patch.object(bot, "_run_stacking", side_effect=RuntimeError("stacking failed")):
         result = await bot._aggregate_predictions(
-            predictions=preds,
+            predictions=cast("list[PredictionTypes]", preds),
             question=question,
             research="test research",
             reasoned_predictions=[Mock(), Mock()],
@@ -646,7 +654,7 @@ async def test_conditional_stacking_skip_path_applies_platt_binary(
     expected = apply_binary_platt(raw_median, params, max_abs_deviation=PLATT_BINARY_MAX_ABS_DEVIATION)
 
     result = await bot._aggregate_predictions(
-        predictions=preds,
+        predictions=cast("list[PredictionTypes]", preds),
         question=question,
         research=None,
         reasoned_predictions=None,
@@ -723,7 +731,7 @@ async def test_stacking_base_combine_reentry_multi_input_does_not_apply(
     raw_mean = combine_binary_predictions(preds, AggregationStrategy.MEAN)
 
     result = await bot._aggregate_predictions(
-        predictions=preds,
+        predictions=cast("list[PredictionTypes]", preds),
         question=question,
         research=None,
         reasoned_predictions=None,
