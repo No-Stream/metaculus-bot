@@ -180,6 +180,7 @@ class TestNumericStructuredHappyPath:
     def test_full_construction(self, valid_numeric_block: NumericStructured) -> None:
         n = valid_numeric_block
         assert n.question_type == "numeric"
+        assert n.declared_percentiles is not None
         assert set(n.declared_percentiles.keys()) >= {0.1, 0.5, 0.9}
         assert n.declared_percentiles[0.5] == pytest.approx(50.0)
         assert n.distribution_family_hint == "normal"
@@ -201,6 +202,7 @@ class TestNumericStructuredHappyPath:
             question_type="numeric",
             declared_percentiles={0.05: 0.5, 0.1: 1.0, 0.25: 2.5, 0.5: 5.0, 0.9: 9.0, 0.95: 9.5},
         )
+        assert n.declared_percentiles is not None
         assert len(n.declared_percentiles) == 6
 
     def test_student_t_df_valid(self) -> None:
@@ -809,6 +811,7 @@ class TestParseStructuredBlock:
         rationale = f"Analysis...\n```json\n{json.dumps(payload)}\n```"
         result = parse_structured_block(rationale, "numeric")
         assert isinstance(result, NumericStructured)
+        assert result.declared_percentiles is not None
         assert result.declared_percentiles[0.5] == pytest.approx(5.0)
 
     def test_valid_mc_rationale(self) -> None:

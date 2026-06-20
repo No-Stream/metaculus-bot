@@ -254,7 +254,7 @@ def _process_single_question(
     comment_created_at: str | None = None,
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
-    per_base_model_forecasts: dict[str, str] | dict[str, dict[str, float]] | None = None,
+    per_base_model_forecasts: dict[str, str | dict[str, float]] | None = None,
 ) -> dict | None:
     """Process a single question dict into a scored record."""
     question_id = q.get("id")

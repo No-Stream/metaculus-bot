@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -64,7 +65,25 @@ def test_bot_instantiation():
     from metaculus_bot.aggregation_strategies import AggregationStrategy
     from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
-    # Test single model bot (equivalent to new baseline configurations)
+    # Test single model bot (equivalent to new baseline configurations).
+    # `llms` accepts a "forecasters" list[GeneralLlm] at runtime (see prepare_llm_config),
+    # which is broader than the declared param type; annotate as dict[str, Any] so the splat type-checks.
+    single_bot_llms: dict[str, Any] = {
+        "forecasters": [
+            GeneralLlm(
+                model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            )
+        ],
+        "summarizer": SUMMARIZER_LLM,
+        "parser": PARSER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
     single_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -74,23 +93,35 @@ def test_bot_instantiation():
         aggregation_strategy=AggregationStrategy.MEAN,  # Unused for single model
         research_provider=None,
         max_questions_per_run=None,
-        llms={
-            "forecasters": [
-                GeneralLlm(
-                    model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-                    temperature=0.0,
-                    top_p=0.9,
-                    max_tokens=16000,
-                    stream=False,
-                    timeout=480,
-                    allowed_tries=3,
-                )
-            ],
-            "summarizer": SUMMARIZER_LLM,
-            "parser": PARSER_LLM,
-            "researcher": RESEARCHER_LLM,
-        },
+        llms=single_bot_llms,
     )
+
+    # Two-model ensemble config reused for both the mean- and median-aggregation bots.
+    ensemble_llms: dict[str, Any] = {
+        "forecasters": [
+            GeneralLlm(
+                model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            ),
+            GeneralLlm(
+                model="openrouter/z-ai/glm-4.5",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            ),
+        ],
+        "summarizer": SUMMARIZER_LLM,
+        "parser": PARSER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
 
     # Test ensemble bot with mean aggregation
     ensemble_mean_bot = TemplateForecaster(
@@ -102,31 +133,7 @@ def test_bot_instantiation():
         aggregation_strategy=AggregationStrategy.MEAN,
         research_provider=None,
         max_questions_per_run=None,
-        llms={
-            "forecasters": [
-                GeneralLlm(
-                    model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-                    temperature=0.0,
-                    top_p=0.9,
-                    max_tokens=16000,
-                    stream=False,
-                    timeout=480,
-                    allowed_tries=3,
-                ),
-                GeneralLlm(
-                    model="openrouter/z-ai/glm-4.5",
-                    temperature=0.0,
-                    top_p=0.9,
-                    max_tokens=16000,
-                    stream=False,
-                    timeout=480,
-                    allowed_tries=3,
-                ),
-            ],
-            "summarizer": SUMMARIZER_LLM,
-            "parser": PARSER_LLM,
-            "researcher": RESEARCHER_LLM,
-        },
+        llms=ensemble_llms,
     )
 
     # Test ensemble bot with median aggregation
@@ -139,31 +146,7 @@ def test_bot_instantiation():
         aggregation_strategy=AggregationStrategy.MEDIAN,
         research_provider=None,
         max_questions_per_run=None,
-        llms={
-            "forecasters": [
-                GeneralLlm(
-                    model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
-                    temperature=0.0,
-                    top_p=0.9,
-                    max_tokens=16000,
-                    stream=False,
-                    timeout=480,
-                    allowed_tries=3,
-                ),
-                GeneralLlm(
-                    model="openrouter/z-ai/glm-4.5",
-                    temperature=0.0,
-                    top_p=0.9,
-                    max_tokens=16000,
-                    stream=False,
-                    timeout=480,
-                    allowed_tries=3,
-                ),
-            ],
-            "summarizer": SUMMARIZER_LLM,
-            "parser": PARSER_LLM,
-            "researcher": RESEARCHER_LLM,
-        },
+        llms=ensemble_llms,
     )
 
     # Verify bots have required attributes
@@ -335,8 +318,9 @@ def test_individual_model_bot_generation():
     expected_individual_names = [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS]
     expected_stacking_names = [spec["name"] for spec in STACKING_MODEL_SPECS]
 
-    assert [bot.name for bot in individual_bots] == expected_individual_names
-    assert [bot.name for bot in stacking_bots] == expected_stacking_names
+    # `name` is a dynamic attribute set by the bot factory (bot_factory.py), not declared on TemplateForecaster.
+    assert [bot.name for bot in individual_bots] == expected_individual_names  # pyright: ignore[reportAttributeAccessIssue]
+    assert [bot.name for bot in stacking_bots] == expected_stacking_names  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_benchmark_config_constants_remain_unchanged_after_bot_creation():

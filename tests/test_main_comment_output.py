@@ -1313,7 +1313,11 @@ class TestOversizedCommentReportConstruction:
 
     def test_mc_report_constructs_from_oversized_comment(self) -> None:
         from forecasting_tools import MultipleChoiceQuestion
-        from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport, PredictedOptionList
+        from forecasting_tools.data_models.multiple_choice_report import (
+            MultipleChoiceReport,
+            PredictedOption,
+            PredictedOptionList,
+        )
 
         question = MultipleChoiceQuestion(
             question_text="Which option?",
@@ -1325,8 +1329,8 @@ class TestOversizedCommentReportConstruction:
         explanation = self._oversized_explanation(question)
         prediction = PredictedOptionList(
             predicted_options=[
-                {"option_name": "Yes", "probability": 0.6},
-                {"option_name": "No", "probability": 0.4},
+                PredictedOption(option_name="Yes", probability=0.6),
+                PredictedOption(option_name="No", probability=0.4),
             ]
         )
         report = MultipleChoiceReport(question=question, explanation=explanation, prediction=prediction)

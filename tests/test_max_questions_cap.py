@@ -1,6 +1,8 @@
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from forecasting_tools import MetaculusQuestion
 
 from main import TemplateForecaster
 
@@ -36,7 +38,7 @@ async def test_cap_applied_after_skip(monkeypatch):
     )
     bot.skip_previously_forecasted_questions = True
 
-    results = await bot.forecast_questions(questions)
+    results = await bot.forecast_questions(cast(list[MetaculusQuestion], questions))
 
     assert captured == [10]
     assert len(results) == 10
@@ -71,7 +73,7 @@ async def test_cap_limits_to_10(monkeypatch):
     )  # default cap = 10
     bot.skip_previously_forecasted_questions = False
 
-    results = await bot.forecast_questions(questions)
+    results = await bot.forecast_questions(cast(list[MetaculusQuestion], questions))
 
     assert captured == [10]
     assert len(results) == 10
@@ -105,7 +107,7 @@ async def test_no_cap_when_below_limit(monkeypatch):
         }
     )  # default cap = 10
 
-    results = await bot.forecast_questions(questions)
+    results = await bot.forecast_questions(cast(list[MetaculusQuestion], questions))
 
     assert captured == [7]
     assert len(results) == 7

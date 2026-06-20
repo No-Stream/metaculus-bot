@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import cast
 
 import pandas as pd
 
@@ -39,7 +40,7 @@ class CorrelationMatrix:
     def get_correlation(self, model1: str, model2: str, method: str = "pearson") -> float:
         """Get correlation coefficient between two models."""
         matrix = self.pearson_matrix if method == "pearson" else self.spearman_matrix
-        return matrix.loc[model1, model2]
+        return cast(float, matrix.loc[model1, model2])
 
     def get_least_correlated_pairs(
         self, threshold: float = 0.7, method: str = "pearson"
@@ -51,7 +52,7 @@ class CorrelationMatrix:
         for i in range(len(self.model_names)):
             for j in range(i + 1, len(self.model_names)):
                 model1, model2 = self.model_names[i], self.model_names[j]
-                corr = matrix.iloc[i, j]
+                corr = cast(float, matrix.iloc[i, j])
                 if abs(corr) < threshold:
                     pairs.append((model1, model2, corr))
 

@@ -517,7 +517,8 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     )
     original_contents = rejects_path.read_text(encoding="utf-8")
 
-    real_replace = qa_iterate.os.replace if hasattr(qa_iterate, "os") else None  # cache helper uses os.replace
+    _qa_os = getattr(qa_iterate, "os", None)  # cache helper uses os.replace
+    real_replace = _qa_os.replace if _qa_os is not None else None
 
     import os as _os
 

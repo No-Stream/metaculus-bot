@@ -260,7 +260,13 @@ def score_report(report: ForecastReport, ground_truth: GroundTruth) -> list[Ques
 
     elif isinstance(report, NumericReport):
         resolution = ground_truth.resolution
-        bot_log = numeric_log_score_from_report(report, resolution)
+        if not isinstance(resolution, (float, int, OutOfBoundsResolution)):
+            logger.warning(f"Q{qid}: expected numeric resolution for numeric, got {type(resolution)}")
+            return scores
+        resolution_value: NumericResolutionValue = (
+            resolution if isinstance(resolution, OutOfBoundsResolution) else float(resolution)
+        )
+        bot_log = numeric_log_score_from_report(report, resolution_value)
         if bot_log is not None:
             community_log = _compute_community_numeric_log_score(ground_truth, report)
             scores.append(QuestionScore(qid, "numeric", bot_log, community_log, "numeric_log_score"))

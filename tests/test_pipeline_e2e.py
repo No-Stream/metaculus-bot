@@ -57,6 +57,7 @@ class TestBinaryLowSpreadSkipsStacking:
 
         assert len(result.predictions) == 3
         qid = question.id_of_question
+        assert qid is not None
         assert bot._stacker_outcome[qid] == "skipped"
         assert bot._conditional_stacking_skipped_count == 1
 
@@ -147,6 +148,7 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
             await bot._research_and_make_predictions(question)
 
         qid = question.id_of_question
+        assert qid is not None
         assert bot._stacker_outcome[qid] == "fallback_llm"
         assert bot._stacker_primary_failed_count == 1
 
@@ -186,10 +188,12 @@ class TestBinaryBothStackersFailMedianFallback:
             result = await bot._research_and_make_predictions(question)
 
         qid = question.id_of_question
+        assert qid is not None
         assert bot._stacker_outcome[qid] == "fallback_median"
         assert bot._stacker_fallback_failed_count == 1
 
         final_prediction = result.predictions[0].prediction_value
+        assert isinstance(final_prediction, float)
         expected_median = sorted([0.30, 0.50, 0.40])[1]
         assert abs(final_prediction - expected_median) < 0.02
 

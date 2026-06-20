@@ -201,6 +201,7 @@ class TestAskNewsSummarization:
 
         # Summarizer ran exactly once, and on the AskNews payload specifically.
         invoke.assert_awaited_once()
+        assert invoke.await_args is not None
         assert "raw asknews articles" in invoke.await_args.args[0]
         assert "ASKNEWS BRIEFING" in result
         assert "raw asknews articles" not in result

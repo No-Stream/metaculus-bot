@@ -127,6 +127,7 @@ async def test_parser_llm_used_for_structured_output():
         captured["model"] = kwargs.get("model")
         # Return a minimally valid object for each call site
         out_type = kwargs.get("output_type") if "output_type" in kwargs else (args[1] if len(args) > 1 else None)
+        assert out_type is not None
         if out_type.__name__ == "BinaryPrediction":
 
             class _Bin:  # noqa: N801

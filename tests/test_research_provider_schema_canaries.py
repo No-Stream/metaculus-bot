@@ -24,12 +24,15 @@ from __future__ import annotations
 import datetime as _dt
 import uuid
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from asknews_sdk.dto.base import Entities
 from asknews_sdk.dto.news import SearchResponseDictItem
+from forecasting_tools import MetaculusQuestion
 from google.genai import types as genai_types
+from pydantic import AnyUrl
 
 # ---------------------------------------------------------------------------
 # Helpers — build realistic, real-typed payloads
@@ -108,7 +111,7 @@ def _make_real_asknews_article(
     if pub_date is None:
         pub_date = _dt.datetime(2026, 5, 12, 14, 0, tzinfo=_dt.timezone.utc)
     return SearchResponseDictItem(
-        article_url=article_url,
+        article_url=cast(AnyUrl, article_url),  # pydantic coerces str → AnyUrl at construction
         article_id=uuid.uuid4(),
         classification=["news"],
         country="US",
@@ -116,7 +119,9 @@ def _make_real_asknews_article(
         page_rank=1,
         domain_url="example.com",
         eng_title=eng_title,
-        entities=Entities(),  # all fields optional
+        # SDK declares every Entities field as Optional with a positional Field([]) default,
+        # which basedpyright/ty don't recognize as a default — all fields are optional at runtime.
+        entities=Entities(),  # pyright: ignore[reportCallIssue]
         image_url=None,
         keywords=["topic", "example"],
         language=language,
@@ -517,8 +522,9 @@ class TestAskNewsSDKResponseShapeContract:
             from metaculus_bot.research.providers import _asknews_provider
 
             provider = _asknews_provider()
+            # Provider duck-types `.question_text`; a SimpleNamespace stands in for the question.
             q = SimpleNamespace(question_text="Will the topic resolve YES?")
-            out = await provider(q)
+            out = await provider(cast(MetaculusQuestion, q))
 
         # Both articles surface, proving the .as_dicts → SearchResponseDictItem path
         # threads end-to-end with real-typed objects.

@@ -259,7 +259,7 @@ class TestBinaryStackingCrossModelAggregation:
                     posteriors,  # type: ignore[arg-type]
                     question,
                     research="research",
-                    reasoned_predictions=reasoned,
+                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
                     aggregated_tool_output=__import__(
                         "metaculus_bot.tool_runner", fromlist=["build_cross_model_aggregation"]
                     ).build_cross_model_aggregation(
@@ -319,7 +319,7 @@ class TestBinaryStackingCrossModelAggregation:
                     posteriors,  # type: ignore[arg-type]
                     question,
                     research="research",
-                    reasoned_predictions=reasoned,
+                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: float ∈ PredictionTypes
                     aggregated_tool_output=build_cross_model_aggregation(
                         question=question,
                         rationales=[r.reasoning for r in reasoned],
@@ -586,7 +586,7 @@ class TestMcStackingCrossModelAggregation:
                     prediction_values,  # type: ignore[arg-type]
                     question,
                     research="research",
-                    reasoned_predictions=reasoned,
+                    reasoned_predictions=reasoned,  # type: ignore[arg-type]  # list invariance: PredictedOptionList ∈ PredictionTypes
                     aggregated_tool_output=build_cross_model_aggregation(
                         question=question,
                         rationales=rationales,

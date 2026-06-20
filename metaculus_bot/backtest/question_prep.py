@@ -469,6 +469,10 @@ def _extract_ground_truth(question: MetaculusQuestion) -> GroundTruth | None:
         logger.warning(f"Q{qid}: unsupported question type {type(question).__name__}")
         return None
 
+    # Date questions resolve to a datetime, but they hit the unsupported-type branch above
+    # and return None; binary/numeric/MC resolutions never carry a datetime here.
+    assert not isinstance(typed_res, datetime)
+
     return GroundTruth(
         question_id=qid,
         question_type=question_type,

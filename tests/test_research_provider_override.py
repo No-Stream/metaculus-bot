@@ -8,7 +8,7 @@ from main import TemplateForecaster
 
 @pytest.mark.asyncio
 async def test_run_research_prefers_custom_provider(mock_os_getenv):
-    async def custom_provider(_: str) -> str:  # noqa: D401
+    async def custom_provider(_: MetaculusQuestion) -> str:  # noqa: D401
         return "Custom Research"
 
     bot = TemplateForecaster(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -102,12 +103,12 @@ def _make_binary_question(*, qid: int = 5003) -> BinaryQuestion:
 
 def _make_bot(n_forecasters: int = 3, strategy: AggregationStrategy = AggregationStrategy.CONDITIONAL_STACKING):
     test_llm = GeneralLlm(model="test-model", temperature=0.0)
-    return TemplateForecaster(
-        research_reports_per_question=1,
-        predictions_per_research_report=1,
-        publish_reports_to_metaculus=False,
-        aggregation_strategy=strategy,
-        llms={
+    # The "forecasters" slot accepts a list[GeneralLlm] at runtime (consumed by
+    # llm_setup), which the parent ForecastBot's dict[str, str | GeneralLlm]
+    # signature can't express; cast to satisfy the type checker.
+    llms = cast(
+        "dict[str, str | GeneralLlm]",
+        {
             "forecasters": [test_llm] * n_forecasters,
             "stacker": test_llm,
             "analyzer": test_llm,
@@ -116,6 +117,13 @@ def _make_bot(n_forecasters: int = 3, strategy: AggregationStrategy = Aggregatio
             "researcher": test_llm,
             "summarizer": test_llm,
         },
+    )
+    return TemplateForecaster(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        publish_reports_to_metaculus=False,
+        aggregation_strategy=strategy,
+        llms=llms,
         is_benchmarking=True,
         stacking_fallback_on_failure=True,
         min_forecasters_to_publish=2,
@@ -339,6 +347,7 @@ class TestNumericDiscreteIntegerSnap:
         ]
 
         qid = question.id_of_question
+        assert qid is not None
         bot._discrete_integer_votes[qid] = [True, True, True]
 
         with (
@@ -677,6 +686,7 @@ class TestCommentContainsExpectedMarkers:
             ReasonedPrediction(prediction_value=0.85, reasoning="Model: m2\n\nHigh"),
         ]
 
+        assert question.id_of_question is not None
         bot._stacker_outcome[question.id_of_question] = "primary"
 
         from forecasting_tools.data_models.forecast_report import ResearchWithPredictions

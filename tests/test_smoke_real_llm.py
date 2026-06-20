@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 from datetime import datetime, timedelta
+from typing import cast
 
 import pytest
 from forecasting_tools import (
@@ -171,19 +172,26 @@ async def test_full_pipeline_single_question_free_model():
         await asyncio.sleep(0)
         return "No relevant research found. The question is speculative."
 
-    forecaster = TemplateForecaster(
-        research_reports_per_question=1,
-        predictions_per_research_report=1,
-        publish_reports_to_metaculus=False,
-        aggregation_strategy=AggregationStrategy.MEAN,
-        research_provider=fake_research,
-        llms={
+    # The "forecasters" slot accepts a list[GeneralLlm] at runtime (consumed by
+    # llm_setup), which the parent ForecastBot's dict[str, str | GeneralLlm]
+    # signature can't express; cast to satisfy the type checker.
+    llms = cast(
+        "dict[str, str | GeneralLlm]",
+        {
             "forecasters": [llm],
             "default": llm,
             "parser": llm,
             "researcher": llm,
             "summarizer": llm,
         },
+    )
+    forecaster = TemplateForecaster(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        publish_reports_to_metaculus=False,
+        aggregation_strategy=AggregationStrategy.MEAN,
+        research_provider=fake_research,
+        llms=llms,
         min_forecasters_to_publish=1,
     )
 

@@ -41,7 +41,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Literal
+from typing import Any, Awaitable, Iterable, Literal, cast
 
 import aiohttp
 import litellm.exceptions
@@ -296,7 +296,7 @@ async def _read_json_capped(resp: Any, label: str) -> Any | None:
     """
     read_method = getattr(resp, "read", None)
     if read_method is not None and callable(read_method):
-        raw = await read_method()
+        raw = await cast("Awaitable[Any]", read_method())
         if len(raw) > MAX_RESPONSE_BYTES:
             logger.warning(f"{label} response too large ({len(raw)} bytes > {MAX_RESPONSE_BYTES}); dropping")
             return None  # noqa: ASYNC910

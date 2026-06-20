@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Literal
+from typing import Any, Literal
 
 from forecasting_tools import MetaculusApi
 
@@ -96,6 +96,18 @@ def main() -> None:
         )
         research_sink = research_writer.record
 
+    # "forecasters" holds a list[GeneralLlm]; the helper slots hold single GeneralLlm
+    # values. The parent ForecastBot.__init__ annotates llms as dict[str, str | GeneralLlm],
+    # which (being invariant) cannot express the list value, so annotate the heterogeneous
+    # dict as dict[str, Any]. prepare_llm_config consumes the "forecasters" list at runtime.
+    llms: dict[str, Any] = {
+        "forecasters": FORECASTER_LLMS,
+        "stacker": STACKER_LLM,
+        "analyzer": DISAGREEMENT_ANALYZER_LLM,
+        "summarizer": SUMMARIZER_LLM,
+        "parser": PARSER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
@@ -104,14 +116,7 @@ def main() -> None:
         skip_previously_forecasted_questions=True,
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
         research_sink=research_sink,
-        llms={
-            "forecasters": FORECASTER_LLMS,
-            "stacker": STACKER_LLM,
-            "analyzer": DISAGREEMENT_ANALYZER_LLM,
-            "summarizer": SUMMARIZER_LLM,
-            "parser": PARSER_LLM,
-            "researcher": RESEARCHER_LLM,
-        },
+        llms=llms,
     )
 
     if run_mode == "tournament":
