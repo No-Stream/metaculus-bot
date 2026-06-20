@@ -4,7 +4,6 @@ import time
 from collections import defaultdict
 from typing import Any, Coroutine, Sequence, cast
 
-from exceptiongroup import ExceptionGroup
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
     GeneralLlm,

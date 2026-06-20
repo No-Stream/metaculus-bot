@@ -1,5 +1,3 @@
-# ty type checker config — conda env not visible to ty/uv, suppress false positives
+# ty type checker config (secondary checker; basedpyright is primary)
 [rules]
-unresolved-import = "ignore"
-# ty can't validate type: ignore comments without resolved imports, so these are false positives
 unused-type-ignore-comment = "ignore"
