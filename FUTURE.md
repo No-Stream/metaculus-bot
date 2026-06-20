@@ -28,6 +28,50 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ## Near-term (worth exploring soon)
 
+### Promote the core pipeline to `basedpyright` strict
+
+The 2026-06 Poetry→uv migration wired `basedpyright` at **standard** mode across
+the whole repo and drove it to zero errors. The original intent was **strict on
+the core forecasting pipeline** (`forecaster.py`, `aggregation_pipeline.py`,
+`stacking.py`, `numeric/`, `research/`, `probabilistic_tools/`); that was
+deferred because, against an unclean base, strict surfaced ~900 findings of which
+~450 were low-value "type is partially unknown" noise at the untyped
+`forecasting-tools` boundary, and the cleaner standard-everywhere target caught
+every real type bug with no suppression hacks.
+
+Now that the base is clean, the strict promotion is much smaller. Spec:
+
+1. Add the `strict` path list back to `[tool.basedpyright]` in `pyproject.toml`:
+   ```toml
+   strict = [
+       "metaculus_bot/numeric",
+       "metaculus_bot/research",
+       "metaculus_bot/probabilistic_tools",
+       "metaculus_bot/forecaster.py",
+       "metaculus_bot/aggregation_pipeline.py",
+       "metaculus_bot/stacking.py",
+   ]
+   ```
+2. Resolve the resulting `reportUnknown*` findings (~447 last measured) by
+   **annotating our own functions** — attribution showed ~95% of the unknowns are
+   our own under-typed signatures/locals, not the library boundary. This is the
+   real "make it pretty" work and should add genuine type coverage.
+3. `forecasting-tools` is frozen and ships **no `py.typed`** marker despite having
+   inline annotations, so strict re-raises `reportMissingTypeStubs` for it.
+   `basedpyright --createstub forecasting_tools` is NOT a clean fix — it drops the
+   Pydantic-generated attributes and made things worse (892→1011). Options, in
+   order of preference: (a) hand-maintain a thin `typings/forecasting_tools/` stub
+   covering only the symbols we import; (b) a one-line `reportMissingTypeStubs`
+   override scoped to the strict execution environments (note: the global
+   `reportMissingTypeStubs = false` does not survive the `strict` promotion —
+   needs an `executionEnvironments` entry or per-file directive); (c) request a
+   `py.typed` marker upstream.
+4. Re-add the local `basedpyright` pre-commit hook in `.pre-commit-config.yaml`
+   (removed during the migration so commits weren't blocked while the codebase was
+   still dirty) and gate CI on it (the `typecheck` step already runs `basedpyright`).
+5. Do this as a heavily-parallel workflow (one agent per core module), same shape
+   as the standard-mode cleanup.
+
 ### ~~Supervisor agent for high-disagreement questions~~ DONE
 
 Implemented as conditional stacking (`AggregationStrategy.CONDITIONAL_STACKING`).

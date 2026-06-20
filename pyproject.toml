@@ -37,6 +37,10 @@ dev = [
     "basedpyright>=1.25",
     "ty",
     "ipykernel>=6.29.5",
+    "pandas-stubs>=3.0.3.260530",
+    "scipy-stubs>=1.17.1.5",
+    "types-tqdm>=4.68.0.20260608",
+    "types-requests>=2.33.0.20260518",
 ]
 
 [build-system]
@@ -108,11 +112,9 @@ exclude = [
     "build",
     "dist",
 ]
-strict = [
-    "metaculus_bot/numeric",
-    "metaculus_bot/research",
-    "metaculus_bot/probabilistic_tools",
-    "metaculus_bot/forecaster.py",
-    "metaculus_bot/aggregation_pipeline.py",
-    "metaculus_bot/stacking.py",
-]
+# Standard mode across the whole repo: catches every real type-bug class
+# (argument/return/attribute/call/optional/override) without the "type is
+# partially unknown" annotation toil that strict adds at every untyped
+# third-party (forecasting-tools) boundary for little bug yield. Promoting the
+# core pipeline to strict is a tracked follow-on (see FUTURE.md) — best done
+# on an already-clean base rather than fighting ~900 errors at once.
