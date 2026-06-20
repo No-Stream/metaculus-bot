@@ -22,6 +22,7 @@ dependencies = [
     "pandas>=2.2.3",
     "pydantic>=2.9.2,<3.0.0",
     "tqdm>=4.66", # imported at top level in backtest.py / community_benchmark.py
+    "typeguard>=4.5", # imported at top level in backtest.py / community_benchmark.py / scoring_patches.py
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`
@@ -87,9 +88,6 @@ skip_covered = false
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.12"
-# Relaxed baseline across the repo; the core forecasting pipeline is promoted to
-# strict via the `strict` path list below (basedpyright applies strict rules to
-# any file under these paths — covers both directories and single-file modules).
 typeCheckingMode = "standard"
 include = [
     "metaculus_bot",

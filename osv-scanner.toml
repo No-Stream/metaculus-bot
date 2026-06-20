@@ -1,0 +1,77 @@
+# osv-scanner ignore-list for uv.lock vulnerability scanning (`make audit` + CI audit job).
+#
+# These advisories are all in transitive dependencies pinned by the FROZEN
+# `forecasting-tools==0.2.54` (which exact-pins litellm 1.80.0 and pulls
+# cryptography/pillow/pydantic-settings/transformers via asknews / google-auth /
+# mcp / openai-agents). The fixed versions are unreachable without upgrading
+# forecasting-tools, which is deliberately frozen for behavioral stability.
+# See FUTURE.md "Dependency CVEs gated by the frozen forecasting-tools pin".
+#
+# The scan stays LIVE for any NEW CVE not listed here — only these enumerated,
+# accepted advisories are suppressed. Re-evaluate this whole list whenever
+# forecasting-tools is upgraded (re-run `make audit` and prune resolved IDs).
+#
+# review-by: 2026-09-19  (re-audit this list quarterly or at the next
+#            forecasting-tools bump, whichever comes first)
+
+# Note: PYSEC-2026-35/-36 (cryptography) and PYSEC-2026-165 (pillow) are aliases
+# of GHSA IDs already listed below; osv-scanner matches via the GHSA and reports
+# the PYSEC aliases as "unused", so they are intentionally omitted here.
+[[IgnoredVulns]]
+id = "GHSA-537c-gmf6-5ccf"
+reason = "cryptography 45.0.4 pinned via frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-m959-cc7f-wv43"
+reason = "cryptography 45.0.4 pinned via frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-p423-j2cm-9vmq"
+reason = "cryptography 45.0.4 pinned via frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-r6ph-v2qm-q3c2"
+reason = "cryptography 45.0.4 pinned via frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+
+[[IgnoredVulns]]
+id = "GHSA-4xpc-pv4p-pm3w"
+reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.x+) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-jjhc-v7c2-5hh6"
+reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.x+) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-53mr-6c8q-9789"
+reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.x+) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-69x8-hrgq-fjj8"
+reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.x+) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-v4p8-mg3p-g94g"
+reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.7+) unreachable until that pin moves"
+
+[[IgnoredVulns]]
+id = "GHSA-5xmw-vc9v-4wf2"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-cfh3-3jmp-rvhc"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-pwv6-vv43-88gr"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-r73j-pqj5-w3x7"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-whj4-6x5x-4v2j"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-wjx4-4jcj-g98j"
+reason = "pillow 11.3.0 pinned transitively under frozen forecasting-tools==0.2.54; lower severity, fix unreachable until that pin moves"
+
+[[IgnoredVulns]]
+id = "GHSA-4xgf-cpjx-pc3j"
+reason = "pydantic-settings 2.14.1 pinned transitively under frozen forecasting-tools==0.2.54; low severity, fix unreachable until that pin moves"
+
+[[IgnoredVulns]]
+id = "PYSEC-2025-217"
+reason = "transformers 4.57.6 pinned transitively under frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-69w3-r845-3855"
+reason = "transformers 4.57.6 pinned transitively under frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"

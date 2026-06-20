@@ -47,7 +47,7 @@ cov:
 # `brew install osv-scanner` (see https://google.github.io/osv-scanner/installation/).
 # CI runs the equivalent google/osv-scanner-action.
 audit:
-	osv-scanner scan --lockfile=uv.lock
+	osv-scanner scan --lockfile=uv.lock --config=osv-scanner.toml
 
 # Pre-commit helpers (use local cache to avoid readonly home cache)
 precommit_install:

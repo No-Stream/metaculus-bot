@@ -16,7 +16,7 @@ non-breaking for the public + private API surface.
 from __future__ import annotations
 
 import logging
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -95,7 +95,7 @@ class CorrelationAnalyzer:
                 prediction = ModelPrediction(
                     model_name=model_name,
                     question_id=report.question.id_of_question or 0,
-                    question_url=cast(str, report.question.page_url),
+                    question_url=report.question.page_url or "",
                     prediction_value=pred_value,
                     baseline_score=report.expected_baseline_score or 0.0,
                     cost=report.price_estimate or 0.0,

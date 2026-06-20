@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-06-13T03:41:49.923921Z"
+exclude-newer = "2026-06-13T04:50:43.082347Z"
 exclude-newer-span = "P1W"
 
 [[package]]
@@ -1595,6 +1595,7 @@ dependencies = [
     { name = "requests" },
     { name = "scipy" },
     { name = "tqdm" },
+    { name = "typeguard" },
     { name = "yfinance" },
 ]
 
@@ -1631,6 +1632,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.3" },
     { name = "scipy", specifier = ">=1.12.0" },
     { name = "tqdm", specifier = ">=4.66" },
+    { name = "typeguard", specifier = ">=4.5" },
     { name = "yfinance", specifier = ">=0.2.48" },
 ]
 

@@ -42,4 +42,5 @@ jobs:
       - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
         with:
           scan-args: |-
+            --config=osv-scanner.toml
             --lockfile=uv.lock
