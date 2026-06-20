@@ -30,9 +30,13 @@ correctness; live runs are opt-in.
 
 ## Repo-Specific Overrides
 
-- **Python**: 3.11+ (see `pyproject.toml`)
+- **Python**: 3.12+ (see `pyproject.toml` `requires-python`)
+- **Package manager**: **uv** (migrated off Poetry 2026-06). `uv.lock` is the lockfile; there is no `poetry.lock`. The package is installed editable via `uv sync`, so no `PYTHONPATH=.` is needed.
+- **Build backend**: `uv_build`, flat layout (`metaculus_bot/` at repo root, `module-root = ""`).
 - **Formatter**: Ruff with 120-char line length (not Black)
+- **Type checker**: **basedpyright** (standard mode, must stay at 0 errors); `ty` is a secondary/advisory checker. Promoting the core pipeline to strict is a tracked follow-on (see `FUTURE.md`).
 - **Testing**: Pytest + `pytest-asyncio`; all tests are self-contained (no API keys needed in CI)
+- **NEVER use `pip` or `poetry`** — both are blocked in this environment. Use `uv add <pkg>` / `uv sync` / `uv run <cmd>`.
 
 ## Project Overview
 
@@ -187,10 +191,9 @@ The bot uses several API keys; they fall into two buckets and the names don't al
 
 ### Python environment
 
-- **Conda environment**: `metaculus-bot`
-- **Python binary**: `~/miniconda3/envs/metaculus-bot/bin/python`
-- **Direct execution**: use the full python path when conda commands fail (`~/miniconda3/envs/metaculus-bot/bin/python script.py` instead of `conda run -n metaculus-bot python script.py`).
-- **NEVER use pip directly** — dependencies managed by conda + poetry. Use `make install` or `poetry install` within the conda env.
+- **Managed by uv**: `uv sync` creates/updates the in-project `.venv` from `uv.lock`. Run commands via `uv run <cmd>` (e.g. `uv run python`, `uv run pytest`).
+- **Adding dependencies**: `uv add <pkg>` (runtime) or `uv add --dev <pkg>` (dev group), then commit the updated `pyproject.toml` + `uv.lock`. NEVER use `pip` or `poetry` — both are blocked.
+- **Supply-chain freshness**: lock-time `exclude-newer` (≈1 week) is enforced via the operator's global uv config, so `uv lock` avoids packages published in the last week.
 
 ## Framework integration (`forecasting-tools`)
 
@@ -209,13 +212,13 @@ LLM ensemble lives in `metaculus_bot/llm_configs.py` — single source of truth.
 
 ### Environment setup
 
-- **Install**: `conda run -n metaculus-bot poetry install` (or `make install`).
-- **Activate environment**: `conda activate metaculus-bot`.
+- **Install**: `uv sync --dev` (or `make install`).
+- **Run any command in the env**: `uv run <cmd>` — no manual activation needed.
 
 ### Core operations
 
-- **Run bot**: `conda run -n metaculus-bot poetry run python main.py` (or `make run`).
-- **Run tests**: `conda run -n metaculus-bot poetry run pytest` (or `make test`).
+- **Run bot**: `uv run python main.py` (or `make run`).
+- **Run tests**: `uv run pytest` (or `make test`).
 
 ### Benchmarking
 
@@ -233,7 +236,9 @@ LLM ensemble lives in `metaculus_bot/llm_configs.py` — single source of truth.
 - **Lint**: `make lint` (Ruff check).
 - **Format**: `make format` (Ruff format + autofix).
 - **Pre-commit**: `make precommit_install` then `make precommit` or `make precommit_all`.
-- **Test single file**: `conda run -n metaculus-bot PYTHONPATH=. poetry run pytest tests/test_specific.py`.
+- **Typecheck**: `make typecheck` (basedpyright; `make typecheck_ty` for the secondary ty checker).
+- **Coverage**: `make cov`. **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
+- **Test single file**: `uv run pytest tests/test_specific.py`.
 
 ### Checking OpenRouter credits
 
@@ -260,11 +265,11 @@ Don't hoist these to the top of `forecaster.py` without first checking that both
 
 ### Important commands
 
-The **Makefile** has most commands (`make test`, `make format`, `make run`, etc.). In agentic CLIs, prefer the full python path (`~/miniconda3/envs/metaculus-bot/bin/python`) since conda activation can be unreliable.
+The **Makefile** has most commands (`make test`, `make format`, `make typecheck`, `make run`, etc.). In agentic CLIs, invoke through `uv run` (e.g. `uv run python script.py`); uv resolves the in-project `.venv` automatically.
 
 ## Commit & pull request guidelines
 
-- Commits: concise, imperative subject (e.g., "fix test cmd", "add conda to make"). Short body when context helps.
+- Commits: concise, imperative subject (e.g., "fix test cmd", "migrate to uv"). Short body when context helps.
 - PRs: clear description, link issues, include config/docs updates, screenshots/logs for behavior changes.
 - CI: all checks pass; code formatted and imports sorted.
 
