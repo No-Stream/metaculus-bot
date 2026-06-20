@@ -125,7 +125,7 @@ STACKING_MODEL_SPECS: tuple[Mapping[str, GeneralLlm], ...] = (
 
 
 def create_individual_bots(
-    model_specs: Iterable[Mapping[str, GeneralLlm]],
+    model_specs: Iterable[Mapping[str, str | GeneralLlm]],
     helper_llms: dict[str, GeneralLlm],
     benchmark_config: dict[str, Any],
     *,
@@ -150,8 +150,8 @@ def create_individual_bots(
 
 
 def create_stacking_bots(
-    stacking_specs: Iterable[Mapping[str, GeneralLlm]],
-    base_forecasters: list[GeneralLlm],
+    stacking_specs: Iterable[Mapping[str, str | GeneralLlm]],
+    base_forecasters: list[str | GeneralLlm],
     helper_llms: dict[str, GeneralLlm],
     benchmark_config: dict[str, Any],
     *,

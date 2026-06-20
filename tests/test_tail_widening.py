@@ -136,8 +136,7 @@ class TestTailWideningUnit:
         assert math.isclose(_get(p, 0.5), 50.0, rel_tol=0, abs_tol=1e-9)
 
         # Tail spans increased
-        base_p025, base_p05, base_p10 = 5.0, 6.0, 8.0
-        base_p10 - base_p05
+        base_p025, base_p05 = 5.0, 6.0
         base_low_span_outer = base_p05 - base_p025
         new_low_span_inner = _get(p, 0.10) - _get(p, 0.05)
         new_low_span_outer = _get(p, 0.05) - _get(p, 0.025)
@@ -145,8 +144,7 @@ class TestTailWideningUnit:
         # Inner span may adjust slightly; ensure it's still positive
         assert new_low_span_inner > 0.0
 
-        base_p90, base_p95, base_p975 = 94.0, 97.0, 98.0
-        base_p95 - base_p90
+        base_p95, base_p975 = 97.0, 98.0
         base_up_span_outer = base_p975 - base_p95
         new_up_span_inner = _get(p, 0.95) - _get(p, 0.90)
         new_up_span_outer = _get(p, 0.975) - _get(p, 0.95)
