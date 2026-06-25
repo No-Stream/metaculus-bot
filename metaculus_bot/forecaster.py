@@ -182,6 +182,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
         )
 
+        # Benchmark/backtest harnesses tag each bot instance with a display name
+        # (see benchmark/bot_factory.py, backtest.py). Declare it here so the
+        # attribute is statically known instead of needing scattered ignores.
+        self.name: str = getattr(self, "name", type(self).__name__)
+
         # Now that super().__init__ has run, resolve the parser LLM and wire the
         # stacking function so that mocking bot._run_stacking flows through.
         # Use a lambda with dynamic attribute lookup so mock.patch replaces propagate.
@@ -522,8 +527,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
             reasoned_predictions=valid_predictions,
             aggregated_tool_output=aggregated_tool_output,
         )
-        assert question.id_of_question is not None
-        meta_text = self._stack_meta_reasoning.pop(question.id_of_question, default_meta_reasoning)
+        qid = question.id_of_question
+        if qid is None:
+            raise ValueError("Question must have id_of_question to finalize stacked prediction")
+        meta_text = self._stack_meta_reasoning.pop(qid, default_meta_reasoning)
         combined_reasoning = stacking.combine_stacker_and_base_reasoning(meta_text, valid_predictions)
         aggregated_prediction = ReasonedPrediction(prediction_value=aggregated_value, reasoning=combined_reasoning)
         self._register_expected_base_combine(question)

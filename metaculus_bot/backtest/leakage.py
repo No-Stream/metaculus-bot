@@ -15,7 +15,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def _question_id(question: MetaculusQuestion) -> int:
     qid = question.id_of_question
-    assert qid is not None, "MetaculusQuestion is missing id_of_question"
+    if qid is None:
+        raise ValueError("MetaculusQuestion is missing id_of_question")
     return qid
 
 

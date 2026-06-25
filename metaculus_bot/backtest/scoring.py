@@ -260,7 +260,10 @@ def score_report(report: ForecastReport, ground_truth: GroundTruth) -> list[Ques
 
     elif isinstance(report, NumericReport):
         resolution = ground_truth.resolution
-        if not isinstance(resolution, (float, int, OutOfBoundsResolution)):
+        # ``bool`` is a subclass of ``int`` in Python, so it would slip through the
+        # ``isinstance(..., int)`` check and be silently coerced to 1.0/0.0; exclude it
+        # explicitly so a boolean resolution is reported as the type error it is.
+        if isinstance(resolution, bool) or not isinstance(resolution, (float, int, OutOfBoundsResolution)):
             logger.warning(f"Q{qid}: expected numeric resolution for numeric, got {type(resolution)}")
             return scores
         resolution_value: NumericResolutionValue = (

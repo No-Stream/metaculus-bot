@@ -71,7 +71,8 @@ def _require_qid(question: MetaculusQuestion) -> int:
     id; a missing id is a programming error, not an expected runtime condition.
     """
     qid = question.id_of_question
-    assert qid is not None, "MetaculusQuestion.id_of_question must be set for redactor batches"
+    if qid is None:
+        raise ValueError("MetaculusQuestion.id_of_question must be set for redactor batches")
     return qid
 
 

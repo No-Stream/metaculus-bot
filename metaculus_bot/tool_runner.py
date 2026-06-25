@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Literal, cast
+from typing import Literal
 
 import numpy as np
 from forecasting_tools import (
@@ -311,11 +311,10 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
 
     # Fit once, reuse for both consistency check and tail-mass computation.
     try:
+        if not block.declared_percentiles:
+            raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
-            # ``percentile_family_consistency`` raises ``ValueError`` on a falsy
-            # mapping (caught below), so passing a possibly-None value is the
-            # intended skip path; cast to satisfy the static signature.
-            declared_percentiles=cast("dict[float, float]", block.declared_percentiles),
+            declared_percentiles=block.declared_percentiles,
             claimed_family=block.distribution_family_hint,
             student_t_df=block.student_t_df,
         )
@@ -804,10 +803,10 @@ def cdf_at_threshold_for_forecaster(
     if not isinstance(block, NumericStructured):
         return None
     try:
+        if not block.declared_percentiles:
+            raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
-            # See ``_run_numeric_tools``: a falsy mapping raises ``ValueError``
-            # (caught below), so the None case is the intended skip path.
-            cast("dict[float, float]", block.declared_percentiles),
+            block.declared_percentiles,
             claimed_family=block.distribution_family_hint,
             student_t_df=block.student_t_df,
         )

@@ -144,7 +144,7 @@ def create_individual_bots(
             max_concurrent_research=batch_size,
             research_cache=research_cache,
         )
-        bot.name = spec["name"]  # pyright: ignore[reportAttributeAccessIssue]  # dynamic attr read via getattr(self, "name")
+        bot.name = str(spec["name"])
         bots.append(bot)
     return bots
 
@@ -176,7 +176,7 @@ def create_stacking_bots(
             stacking_fallback_on_failure=False,
             stacking_randomize_order=True,
         )
-        bot.name = spec["name"]  # pyright: ignore[reportAttributeAccessIssue]  # dynamic attr read via getattr(self, "name")
+        bot.name = str(spec["name"])
         bots.append(bot)
     return bots
 

@@ -45,6 +45,12 @@ reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (
 [[IgnoredVulns]]
 id = "GHSA-v4p8-mg3p-g94g"
 reason = "litellm 1.80.0 exact-pinned by frozen forecasting-tools==0.2.54; fix (1.83.7+) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-qrc4-49gv-mv9m"
+reason = "litellm 1.80.0 proxy-server RBAC CVE; we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; client-side fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-wpfp-gwwc-vwq6"
+reason = "litellm 1.80.0 proxy-server RBAC CVE; we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; client-side fix unreachable until that pin moves"
 
 [[IgnoredVulns]]
 id = "GHSA-5xmw-vc9v-4wf2"

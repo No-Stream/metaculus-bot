@@ -31,7 +31,7 @@ jobs:
         run: uv sync --no-dev --frozen
       - name: Run bot
         run: |
-          uv run python main.py --mode minibench
+          uv run --no-dev python main.py --mode minibench
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:

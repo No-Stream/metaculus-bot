@@ -25,7 +25,7 @@ jobs:
         run: uv sync --no-dev --frozen
       - name: Run bot
         run: |
-          uv run python main.py --mode test_questions
+          uv run --no-dev python main.py --mode test_questions
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:

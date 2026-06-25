@@ -110,30 +110,22 @@ def _filter_bots(
     """Filter bots by include/exclude substring matching on bot name."""
     filtered = list(bots)
 
-    # `name` is a dynamic attribute set on each bot by create_individual_bots (bot.name = spec["name"]);
-    # ForecastBot doesn't declare it, so reads are typed via a scoped ignore (matches bot_factory.py).
+    # `name` is set on each bot by create_individual_bots (bot.name = spec["name"]) and
+    # declared on TemplateForecaster, so reads are statically typed.
     if include_models:
-        filtered = [
-            b
-            for b in filtered
-            if any(token.lower() in b.name.lower() for token in include_models)  # pyright: ignore[reportAttributeAccessIssue]
-        ]
+        filtered = [b for b in filtered if any(token.lower() in b.name.lower() for token in include_models)]
 
     if exclude_models:
-        filtered = [
-            b
-            for b in filtered
-            if not any(token.lower() in b.name.lower() for token in exclude_models)  # pyright: ignore[reportAttributeAccessIssue]
-        ]
+        filtered = [b for b in filtered if not any(token.lower() in b.name.lower() for token in exclude_models)]
 
     if not filtered:
-        available_names = [b.name for b in bots]  # pyright: ignore[reportAttributeAccessIssue]
+        available_names = [b.name for b in bots]
         raise ValueError(
             f"No bots remaining after model filtering. "
             f"Available: {available_names}, include={include_models}, exclude={exclude_models}"
         )
 
-    logger.info(f"Model filtering: {len(bots)} -> {len(filtered)} bots: {[b.name for b in filtered]}")  # pyright: ignore[reportAttributeAccessIssue]
+    logger.info(f"Model filtering: {len(bots)} -> {len(filtered)} bots: {[b.name for b in filtered]}")
     return filtered
 
 
