@@ -544,7 +544,9 @@ async def test_batch_wrapper_runs_concurrently_under_semaphore(
 
     assert len(results) == 4
     for q in questions:
-        assert results[q.id_of_question] is not None
+        qid = q.id_of_question
+        assert qid is not None
+        assert results[qid] is not None
     assert max_in_flight <= 2
     # Sanity: at least 2 ran simultaneously, otherwise the semaphore is over-restricting.
     assert max_in_flight == 2
@@ -613,7 +615,9 @@ async def test_batch_wrapper_caches_each_qid_separately(
     await run_gemini_research_for_qids(questions, cache, concurrency=3)
 
     for q in questions:
-        cached = cache.read_research(qid=q.id_of_question)
+        qid = q.id_of_question
+        assert qid is not None
+        cached = cache.read_research(qid=qid)
         assert cached is not None
         cached_blob, _ = cached
         assert f"-{q.id_of_question}" in cached_blob
@@ -785,7 +789,9 @@ async def test_batch_wrapper_threads_gemini_model_and_gap_fill_flags(
 
     # Meta records the requested model and enable flag for each qid.
     for q in questions:
-        result = results[q.id_of_question]
+        qid = q.id_of_question
+        assert qid is not None
+        result = results[qid]
         assert result is not None
         _, meta = result
         assert meta["gemini_model"] == "gemini-2.5-flash"

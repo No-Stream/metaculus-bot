@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from forecasting_tools import PredictedOptionList
+from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.simple_types import OptionProbability
@@ -60,7 +61,7 @@ def build_mc_prediction(
         pairs = [(n, p / total) for n, p in pairs]
 
     # Construct PredictedOptionList (will validate sum close to 1.0)
-    pol = PredictedOptionList(predicted_options=[{"option_name": n, "probability": p} for n, p in pairs])
+    pol = PredictedOptionList(predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in pairs])
 
     # Clamp and re-normalize to our configured bounds
     # Clamp

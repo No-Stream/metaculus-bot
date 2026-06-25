@@ -15,7 +15,14 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
-from forecasting_tools import BinaryQuestion, ForecastBot, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import (
+    BinaryQuestion,
+    ForecastBot,
+    GeneralLlm,
+    MetaculusQuestion,
+    MultipleChoiceQuestion,
+    NumericQuestion,
+)
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
@@ -44,7 +51,7 @@ def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
     )
 
 
-def _make_q(spec=BinaryQuestion) -> MagicMock:
+def _make_q(spec: type[MetaculusQuestion] = BinaryQuestion) -> MagicMock:
     q = MagicMock(spec=spec)
     q.id_of_question = 99
     q.question_text = "Will X happen?"

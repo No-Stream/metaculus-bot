@@ -288,6 +288,7 @@ async def screen_research_blob(
     # still satisfy flake8-async ASYNC910. The cooperative yield is cheap.
     await asyncio.sleep(0)
 
+    assert question.id_of_question is not None
     qid = question.id_of_question
 
     if not force:
@@ -353,6 +354,7 @@ async def _screen_under_semaphore(
     force: bool,
     semaphore: asyncio.Semaphore,
 ) -> tuple[int, dict]:
+    assert question.id_of_question is not None
     qid = question.id_of_question
     async with semaphore:
         verdict = await screen_research_blob(
@@ -405,19 +407,22 @@ async def screen_batch(
             f"Q{question.id_of_question}: no research blob in cache; skipping leakage screen and excluding from clean set"
         )
 
-    tasks = [
-        _screen_under_semaphore(
-            q,
-            ground_truths[q.id_of_question],
-            research_cache_payloads[q.id_of_question],
-            cache,
-            detector_llm,
-            detector_model,
-            force,
-            semaphore,
+    tasks = []
+    for q in questions_with_research:
+        qid = q.id_of_question
+        assert qid is not None
+        tasks.append(
+            _screen_under_semaphore(
+                q,
+                ground_truths[qid],
+                research_cache_payloads[qid],
+                cache,
+                detector_llm,
+                detector_model,
+                force,
+                semaphore,
+            )
         )
-        for q in questions_with_research
-    ]
     results = await asyncio.gather(*tasks)
 
     all_verdicts: dict[int, dict] = {qid: verdict for qid, verdict in results}

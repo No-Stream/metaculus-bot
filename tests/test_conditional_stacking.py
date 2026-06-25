@@ -5,6 +5,7 @@ crux extraction -> targeted research -> stacking (or skip to median aggregation)
 """
 
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -157,20 +158,23 @@ def _make_bot(
 ) -> TemplateForecaster:
     """Create a TemplateForecaster with CONDITIONAL_STACKING and mock-compatible LLMs."""
     test_llm = GeneralLlm(model="test-model", temperature=0.0)
+    # `forecasters` holds a list at runtime (consumed by prepare_llm_config), which is
+    # wider than the declared `dict[str, str | GeneralLlm]` param; annotate as Any to match.
+    llms: dict[str, Any] = {
+        "forecasters": [test_llm, test_llm],
+        "stacker": test_llm,
+        "analyzer": test_llm,
+        "default": test_llm,
+        "parser": test_llm,
+        "researcher": test_llm,
+        "summarizer": test_llm,
+    }
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=False,
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
-        llms={
-            "forecasters": [test_llm, test_llm],
-            "stacker": test_llm,
-            "analyzer": test_llm,
-            "default": test_llm,
-            "parser": test_llm,
-            "researcher": test_llm,
-            "summarizer": test_llm,
-        },
+        llms=llms,
         is_benchmarking=True,
         stacking_spread_thresholds=stacking_spread_thresholds,
         stacking_fallback_on_failure=stacking_fallback_on_failure,

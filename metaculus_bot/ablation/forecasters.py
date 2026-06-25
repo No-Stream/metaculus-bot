@@ -34,7 +34,6 @@ import time
 from datetime import datetime
 from typing import Any
 
-import litellm
 from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
@@ -47,6 +46,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
+from litellm.exceptions import RateLimitError
 
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.env import probabilistic_tools_enabled
@@ -115,7 +115,7 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     ``rate-limited upstream``. The upstream-rate-limit text is OpenRouter-specific
     and stable across litellm versions.
     """
-    if isinstance(exc, litellm.RateLimitError):
+    if isinstance(exc, RateLimitError):
         return True
     msg = str(exc)
     if '"code":429' in msg or "code: 429" in msg:
@@ -412,18 +412,23 @@ def _build_bot(
     qid = question.id_of_question
     if qid is None:
         raise ValueError("Question must have id_of_question for ablation forecasting")
+    # ``forecasters`` legitimately holds a ``list[GeneralLlm]`` (unpacked by
+    # ``prepare_llm_config``), which the parent ``llms`` param type
+    # (``dict[str, str | GeneralLlm]``) doesn't model. Annotate ``dict[str, Any]``
+    # to match ``prepare_llm_config``'s own input type.
+    llms: dict[str, Any] = {
+        "forecasters": [forecaster_llm],
+        "parser": parser_llm,
+        "summarizer": SUMMARIZER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
     return TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,
-        llms={
-            "forecasters": [forecaster_llm],
-            "parser": parser_llm,
-            "summarizer": SUMMARIZER_LLM,
-            "researcher": RESEARCHER_LLM,
-        },
+        llms=llms,
         aggregation_strategy=AggregationStrategy.MEAN,
         research_provider=None,
         max_questions_per_run=None,
@@ -466,6 +471,7 @@ async def _run_one_forecaster(
     """
     model_slug = model_slug_to_filename(forecaster_llm.model)
     qid = question.id_of_question
+    assert qid is not None, "Question must have id_of_question for ablation forecasting"
 
     async with semaphore:
         bot = _build_bot(
@@ -748,6 +754,8 @@ async def run_forecasters_batch(
     from metaculus_bot.ablation import forecasters as _self_module
 
     async def _run_one(question: MetaculusQuestion, blob: str) -> tuple[int, dict[str, dict[str, Any]]]:
+        qid = question.id_of_question
+        assert qid is not None, "Question must have id_of_question for ablation forecasting"
         async with semaphore:
             try:
                 per_model = await _self_module.run_forecasters_for_question(
@@ -760,15 +768,15 @@ async def run_forecasters_batch(
                     per_forecaster_concurrency=per_forecaster_concurrency,
                     max_retries=max_retries,
                 )
-                return question.id_of_question, per_model
+                return qid, per_model
             except Exception as exc:
                 logger.warning(
                     "ablation forecaster batch | qid=%s failed entirely | %s: %s",
-                    question.id_of_question,
+                    qid,
                     type(exc).__name__,
                     exc,
                 )
-                return question.id_of_question, {}
+                return qid, {}
 
     tasks = [_run_one(q, blob) for q, blob in questions_with_research]
     results: dict[int, dict[str, dict[str, Any]]] = {}

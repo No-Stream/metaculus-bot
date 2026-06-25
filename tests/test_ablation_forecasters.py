@@ -52,7 +52,14 @@ def _make_binary_question(qid: int = 1234) -> BinaryQuestion:
 
 
 def _make_mc_question(qid: int = 2345) -> MultipleChoiceQuestion:
-    return MultipleChoiceQuestion(
+    # ``option_is_ordered`` is not a declared field on MultipleChoiceQuestion; pydantic
+    # ignores the extra kwarg at runtime. Splat via a ``dict[str, Any]`` so the type
+    # checker doesn't flag the undeclared field while preserving the runtime no-op.
+    from typing import (
+        Any,  # noqa: PLC0415  - kept function-scoped so the formatter cannot strip an otherwise-unused import
+    )
+
+    fields: dict[str, Any] = dict(
         question_text="Which option?",
         id_of_post=qid,
         id_of_question=qid,
@@ -65,6 +72,7 @@ def _make_mc_question(qid: int = 2345) -> MultipleChoiceQuestion:
         open_time=_OPEN,
         scheduled_resolution_time=_RESOLVE,
     )
+    return MultipleChoiceQuestion(**fields)
 
 
 def _make_numeric_question(qid: int = 3456) -> NumericQuestion:
@@ -328,6 +336,7 @@ async def test_cache_hit_skips_make_prediction(
 
     cached_model = six_forecaster_llms[0].model
     cached_slug = model_slug_to_filename(cached_model)
+    assert q.id_of_question is not None
     cache.write_forecaster_output(
         qid=q.id_of_question,
         model_slug=cached_slug,
@@ -371,6 +380,7 @@ async def test_force_true_re_runs_all_forecasters(
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="fresh rationale")
 
     # Pre-populate cache for ALL forecasters.
+    assert q.id_of_question is not None
     for llm in six_forecaster_llms:
         cache.write_forecaster_output(
             qid=q.id_of_question,
@@ -477,6 +487,7 @@ async def test_per_forecaster_failure_caches_error_and_continues(
         assert result[slug]["errors"] == []
 
     # Failed payload was persisted to cache too.
+    assert q.id_of_question is not None
     on_disk = cache.read_forecaster_output(qid=q.id_of_question, model_slug=failing_slug)
     assert on_disk is not None
     assert on_disk["prediction_value"] is None
@@ -779,6 +790,7 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
     assert "TypeError" in broken_payload["errors"][0] or "Expected NumericDistribution" in broken_payload["errors"][0]
 
     # And the broken payload was still written to cache for diagnostics.
+    assert q.id_of_question is not None
     on_disk = cache.read_forecaster_output(qid=q.id_of_question, model_slug=broken_slug)
     assert on_disk is not None
     assert on_disk["prediction_value"] is None
@@ -1103,7 +1115,10 @@ def _build_rate_limit_exc(retry_after: int | float | None = 13) -> Exception:
     Matches a real exception from /tmp/ablation_phase_a1_v3.log so the parser
     is exercised against the actual JSON shape, not a synthetic one.
     """
-    import litellm  # noqa: PLC0415  - import at use to avoid module-load cost in fixture-heavy tests
+    # Import from the public ``litellm.exceptions`` path (litellm's top-level ``__init__``
+    # re-export is untyped, which trips ``reportPrivateImportUsage``); matches the product
+    # import in metaculus_bot/ablation/forecasters.py.
+    from litellm.exceptions import RateLimitError  # noqa: PLC0415  - at use to avoid module-load cost
 
     if retry_after is None:
         # Omit the retry_after_seconds field so the parser falls back to exponential backoff.
@@ -1121,7 +1136,7 @@ def _build_rate_limit_exc(retry_after: int | float | None = 13) -> Exception:
             f'"retry_after_seconds":{retry_after},"retry_after_seconds_raw":12.315,'
             f'"headers":{{"Retry-After":"13"}}}}}}}}'
         )
-    return litellm.RateLimitError(
+    return RateLimitError(
         message=msg,
         model="openrouter/qwen/qwen3-next-80b-a3b-instruct:free",
         llm_provider="openrouter",

@@ -5,14 +5,25 @@ Concise scenarios to increase confidence in complex numeric forecast flow.
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+
+
+def _as_numeric_question(q: SimpleNamespace) -> NumericQuestion:
+    return cast(NumericQuestion, q)
+
+
+def _as_general_llm(llm: object) -> GeneralLlm:
+    return cast(GeneralLlm, llm)
 
 
 def _stub_open_time() -> datetime:
@@ -24,9 +35,11 @@ def _stub_resolve_time() -> datetime:
 
 
 def _make_forecaster():
+    from forecasting_tools import GeneralLlm
+
     from main import TemplateForecaster
 
-    mock_llms = {
+    mock_llms: dict[str, str | GeneralLlm] = {
         "default": MagicMock(),
         "parser": MagicMock(),
         "researcher": MagicMock(),
@@ -88,7 +101,7 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     ):
         caplog.clear()
         caplog.set_level("WARNING")
-        result = await f._run_forecast_on_numeric(q, "", DummyLLM())
+        result = await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
     # Fallback warning emitted
     assert any("PCHIP CDF construction failed" in rec.message for rec in caplog.records)
@@ -133,7 +146,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
         caplog.clear()
         caplog.set_level("ERROR")
         with pytest.raises(AssertionError):
-            await f._run_forecast_on_numeric(q, "", DummyLLM())
+            await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
     # Rich diagnostics logged
     msgs = [r.message for r in caplog.records]
@@ -169,7 +182,7 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
         ):
             caplog.clear()
             caplog.set_level("WARNING")
-            result = await f._run_forecast_on_numeric(q, "", DummyLLM())
+            result = await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
     # Smoothing log
     assert any("CDF ramp smoothing" in rec.message for rec in caplog.records)
@@ -197,7 +210,7 @@ async def test_numeric_percentile_set_validation():
 
     with patch("metaculus_bot.forecaster_runners.structure_output", return_value=bad):
         with pytest.raises(Exception):  # pydantic ValidationError via from_exception_data
-            await f._run_forecast_on_numeric(q, "", DummyLLM())
+            await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
 
 @pytest.mark.asyncio
@@ -223,7 +236,7 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
         "metaculus_bot.forecaster_runners.structure_output",
         side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
     ):
-        await f._run_forecast_on_numeric(q, "", DummyLLM())
+        await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
     # Capture the call arguments to ensure zero_point=None was used
     args, kwargs = mock_generate.call_args
@@ -255,7 +268,7 @@ def test_lower_bound_adjacent_cluster(caplog):
 
     caplog.clear()
     caplog.set_level("WARNING")
-    adjusted = apply_jitter_and_clamp(raw, q)
+    adjusted = apply_jitter_and_clamp(raw, _as_numeric_question(q))
 
     vals = [p.value for p in adjusted]
     assert all(q.lower_bound <= v <= q.upper_bound for v in vals)

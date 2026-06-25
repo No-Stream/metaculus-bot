@@ -60,8 +60,8 @@ def beta_binomial_update(
     a = alpha_prior + k
     b = beta_prior + n - k
     mean = a / (a + b)
-    ci_80 = stats.beta.ppf([0.10, 0.90], a, b)
-    ci_90 = stats.beta.ppf([0.05, 0.95], a, b)
+    ci_80 = np.asarray(stats.beta.ppf([0.10, 0.90], a, b))
+    ci_90 = np.asarray(stats.beta.ppf([0.05, 0.95], a, b))
     return BetaBinomialResult(
         posterior_alpha=float(a),
         posterior_beta=float(b),

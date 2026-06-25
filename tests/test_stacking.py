@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from forecasting_tools import (
     PredictedOptionList,
     ReasonedPrediction,
 )
+from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
@@ -24,6 +26,15 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+
+# Type alias matching ForecastBot.__init__'s `llms` parameter. The bot also accepts a
+# "forecasters" list value at runtime (see TemplateForecaster setup), which the upstream
+# annotation does not model, so test literals are cast to this alias at each call site.
+LlmsConfig = dict[str, str | GeneralLlm] | None
+
+# The `_run_stacking` / `_aggregate_predictions` reasoned-prediction params are typed with
+# the framework's PredictionTypes union; test fixtures build concrete float predictions.
+ReasonedPredictionList = list[ReasonedPrediction[PredictionTypes]]
 
 
 def _stub_open_time() -> datetime:
@@ -46,14 +57,17 @@ class TestStackingConfiguration:
             predictions_per_research_report=1,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm, test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm, test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             is_benchmarking=True,
         )
 
@@ -72,14 +86,17 @@ class TestStackingConfiguration:
             predictions_per_research_report=1,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                # Note: no "stacker" key
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    # Note: no "stacker" key
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         # Bot creation succeeds but _stacker_llm should be None
@@ -106,14 +123,17 @@ class TestStackingConfiguration:
             predictions_per_research_report=1,
             publish_reports_to_metaculus=False,
             aggregation_strategy=AggregationStrategy.MEAN,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": "not-an-llm",  # Invalid type
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": "not-an-llm",  # Invalid type
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         # Should not crash but stacker should be None due to warning
@@ -126,14 +146,17 @@ class TestStackingConfiguration:
         # Test default values
         bot1 = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         assert bot1.stacking_fallback_on_failure is True
@@ -142,14 +165,17 @@ class TestStackingConfiguration:
         # Test custom values
         bot2 = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_fallback_on_failure=False,
             stacking_randomize_order=False,
         )
@@ -268,14 +294,17 @@ class TestModelNameStripping:
 
         TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_randomize_order=False,  # Disable for predictable testing
         )
 
@@ -313,14 +342,17 @@ class TestModelNameStripping:
         # Test randomization enabled
         bot1 = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_randomize_order=True,
         )
         assert bot1.stacking_randomize_order is True
@@ -328,14 +360,17 @@ class TestModelNameStripping:
         # Test randomization disabled
         bot2 = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_randomize_order=False,
         )
         assert bot2.stacking_randomize_order is False
@@ -351,14 +386,17 @@ class TestStackingIntegration:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-                # Note: no stacker LLM
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                    # Note: no stacker LLM
+                },
+            ),
         )
 
         # Test missing stacker LLM
@@ -404,14 +442,17 @@ class TestStackingIntegration:
         # Create bot with fallback enabled
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_fallback_on_failure=True,
         )
 
@@ -461,14 +502,17 @@ class TestStackingIntegration:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_fallback_on_failure=True,
         )
 
@@ -498,14 +542,17 @@ class TestStackingIntegration:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             stacking_fallback_on_failure=False,  # No fallback
         )
 
@@ -548,17 +595,20 @@ class TestStackingMethods:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
-        reasoned_preds = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
+        reasoned_preds: ReasonedPredictionList = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
 
         # Mock the stacking helper functions to check routing and return values
         with (
@@ -659,14 +709,17 @@ class TestStackingMethods:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         # Create unsupported question type
@@ -675,7 +728,7 @@ class TestStackingMethods:
         unsupported_question = Mock(spec=DateQuestion)
         unsupported_question.id_of_question = 104
         unsupported_question.page_url = "https://example.com/q/104"
-        reasoned_preds = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
+        reasoned_preds: ReasonedPredictionList = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]
 
         with pytest.raises(ValueError, match="Unsupported question type for stacking"):
             await bot._run_stacking(unsupported_question, "research", reasoned_preds)
@@ -718,14 +771,17 @@ class TestStackingResearchAndMakePredictions:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm, test_llm],  # 2 forecasters
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm, test_llm],  # 2 forecasters
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             min_forecasters_to_publish=1,
         )
 
@@ -778,13 +834,16 @@ class TestStackingResearchAndMakePredictions:
 
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.MEAN,  # Not stacking
-            llms={
-                "forecasters": [test_llm, test_llm],
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm, test_llm],
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             min_forecasters_to_publish=1,
         )
 
@@ -840,14 +899,17 @@ class TestStackingBenchmarkConfiguration:
             allow_research_fallback=False,
             research_cache={},
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": base_forecasters,
-                "stacker": stacker,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": base_forecasters,
+                    "stacker": stacker,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             max_concurrent_research=2,
             stacking_fallback_on_failure=False,  # Fail in benchmarking
             stacking_randomize_order=True,  # Avoid position bias
@@ -870,12 +932,15 @@ class TestStackingGuardsAndReasoning:
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         result = await bot._aggregate_predictions(predictions=[0.42], question=Mock())
@@ -887,12 +952,15 @@ class TestStackingGuardsAndReasoning:
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
 
         result = await bot._aggregate_predictions(predictions=[0.4, 0.6], question=Mock())
@@ -904,12 +972,15 @@ class TestStackingGuardsAndReasoning:
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
         pred1 = PredictedOptionList(
             predicted_options=[
@@ -924,6 +995,7 @@ class TestStackingGuardsAndReasoning:
             ]
         )
         result = await bot._aggregate_predictions(predictions=[pred1, pred2], question=Mock())
+        assert isinstance(result, PredictedOptionList)
         # Expect mean: A=(0.7+0.5)/2=0.6, B=0.4
         a_prob = next(o.probability for o in result.predicted_options if o.option_name == "A")
         b_prob = next(o.probability for o in result.predicted_options if o.option_name == "B")
@@ -936,12 +1008,15 @@ class TestStackingGuardsAndReasoning:
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
         )
         # Build a minimal numeric question and two distributions on same bounds
         num_q = Mock(spec=NumericQuestion)
@@ -993,14 +1068,17 @@ class TestStackingGuardsAndReasoning:
         test_llm = GeneralLlm(model="test-model", temperature=0.0)
         bot = TemplateForecaster(
             aggregation_strategy=AggregationStrategy.STACKING,
-            llms={
-                "forecasters": [test_llm, test_llm],
-                "stacker": test_llm,
-                "default": test_llm,
-                "parser": test_llm,
-                "researcher": test_llm,
-                "summarizer": test_llm,
-            },
+            llms=cast(
+                LlmsConfig,
+                {
+                    "forecasters": [test_llm, test_llm],
+                    "stacker": test_llm,
+                    "default": test_llm,
+                    "parser": test_llm,
+                    "researcher": test_llm,
+                    "summarizer": test_llm,
+                },
+            ),
             min_forecasters_to_publish=1,
         )
 

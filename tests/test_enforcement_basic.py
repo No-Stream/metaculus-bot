@@ -1,6 +1,8 @@
 import types
+from typing import cast
 
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.cluster_processing import compute_cluster_parameters
 from metaculus_bot.numeric.validation import detect_unit_mismatch
@@ -22,7 +24,7 @@ def test_unit_mismatch_detector_flags_tiny_span():
     q = _fake_question(0.0, 1_000_000_000.0)
     plist = [Percentile(percentile=p, value=1.0) for p in [0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 0.90, 0.95]]
 
-    mismatch, reason = detect_unit_mismatch(plist, q)
+    mismatch, reason = detect_unit_mismatch(plist, cast(NumericQuestion, q))
     assert mismatch is True
     assert "span_ratio" in reason or "near-duplicate" in reason or "tiny" in reason
 

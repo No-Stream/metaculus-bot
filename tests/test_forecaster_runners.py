@@ -228,7 +228,7 @@ class TestRunNumericForecast:
             return percentiles
 
         routed = RoutedNumericForecast(
-            format="percentile",
+            format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
             mixture=None,
@@ -282,7 +282,7 @@ class TestRunNumericForecast:
             return percentiles
 
         routed = RoutedNumericForecast(
-            format="percentile",
+            format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
             mixture=None,
@@ -327,7 +327,7 @@ class TestRunNumericForecast:
             return percentiles
 
         routed = RoutedNumericForecast(
-            format="percentile",
+            format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
             mixture=None,

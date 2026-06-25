@@ -509,6 +509,7 @@ def _deserialize_resolution(raw: Any, question_type: str) -> Any:
     if question_type == "binary":
         return bool(raw)
     if question_type == "numeric":
+        assert not isinstance(raw, dict)
         return float(raw)
     return str(raw)
 
@@ -816,6 +817,7 @@ async def _stage_fetch(args: argparse.Namespace, cache: AblationCache, working: 
     tournament = args.tournaments[0] if args.tournaments else DEFAULT_TOURNAMENTS[0]
     for question in question_set.questions:
         qid = question.id_of_question
+        assert qid is not None
         if qid in existing:
             continue
         gt = question_set.ground_truths[qid]
@@ -2118,7 +2120,7 @@ async def run_ablation(args: argparse.Namespace) -> int:
     summary_path: Path | None = None
     if "score" in requested:
         logger.info("stage=score START")
-        all_arm_qids: set[int] = set()
+        all_arm_qids = set()
         for arm_payloads in working.stacker_payloads.values():
             all_arm_qids.update(arm_payloads.keys())
         if not all_arm_qids:

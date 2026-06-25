@@ -74,7 +74,9 @@ def create_mock_benchmark(model_name: str, total_cost: float, num_questions: int
     }.get(model_name.split("/")[-1], 12.0)
 
     # Monkey patch the property to return our test value
-    type(benchmark).average_expected_baseline_score = property(lambda self: model_score_base)
+    type(benchmark).average_expected_baseline_score = property(  # pyright: ignore[reportAttributeAccessIssue]  # test monkey-patches the read-only property at class level
+        lambda self: model_score_base
+    )
 
     return benchmark
 

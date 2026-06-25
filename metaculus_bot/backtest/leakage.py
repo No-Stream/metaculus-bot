@@ -13,6 +13,13 @@ from metaculus_bot.research.providers import choose_provider_with_name
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _question_id(question: MetaculusQuestion) -> int:
+    qid = question.id_of_question
+    if qid is None:
+        raise ValueError("MetaculusQuestion is missing id_of_question")
+    return qid
+
+
 async def screen_research_for_leakage(
     questions: list[MetaculusQuestion],
     ground_truths: dict[int, GroundTruth],
@@ -23,7 +30,7 @@ async def screen_research_for_leakage(
     semaphore = asyncio.Semaphore(concurrency)
 
     tasks = [
-        _process_single_question(q, ground_truths[q.id_of_question], research_provider, detector_llm, semaphore)
+        _process_single_question(q, ground_truths[_question_id(q)], research_provider, detector_llm, semaphore)
         for q in questions
     ]
     results = await asyncio.gather(*tasks)
@@ -61,7 +68,7 @@ async def _process_single_question(
     detector_llm: GeneralLlm,
     semaphore: asyncio.Semaphore,
 ) -> tuple[int, str | None, bool]:
-    qid = question.id_of_question
+    qid = _question_id(question)
     try:
         async with semaphore:
             research_text = await research_provider(question.question_text)

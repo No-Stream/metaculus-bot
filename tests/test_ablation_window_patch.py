@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from forecasting_tools import NumericQuestion
 
 from metaculus_bot import prompts as prompts_module
 from metaculus_bot.ablation.window_patch import (
@@ -79,7 +81,7 @@ class TestPatchedWindowForQuestion:
             scheduled_resolution_time=datetime(2026, 5, 1),
         )
         with patched_window_for_question(question):
-            output = prompts_module._forecasting_window_str(question)
+            output = prompts_module._forecasting_window_str(cast(NumericQuestion, question))
 
         # Mid-window of Jan 1 → May 1 is Mar 2.
         assert "Today: 2026-03-02" in output
@@ -117,7 +119,7 @@ class TestPatchedWindowForQuestion:
         )
 
         with patched_window_for_question(question_a):
-            output_b = prompts_module._forecasting_window_str(question_b)
+            output_b = prompts_module._forecasting_window_str(cast(NumericQuestion, question_b))
 
         today_str = datetime.now().strftime("%Y-%m-%d")
         assert f"Today: {today_str}" in output_b
@@ -129,7 +131,7 @@ class TestPatchedWindowForQuestion:
         question_b = _question(id_of_question=None)
 
         with patched_window_for_question(question_a):
-            output_b = prompts_module._forecasting_window_str(question_b)
+            output_b = prompts_module._forecasting_window_str(cast(NumericQuestion, question_b))
 
         today_str = datetime.now().strftime("%Y-%m-%d")
         assert f"Today: {today_str}" in output_b
@@ -140,7 +142,7 @@ class TestPatchedWindowForQuestion:
             scheduled_resolution_time=datetime(2026, 5, 1),
         )
         with patched_window_for_question(question):
-            output = prompts_module._forecasting_window_str(question)
+            output = prompts_module._forecasting_window_str(cast(NumericQuestion, question))
 
         assert output.startswith("Today: ")
         assert "Question opened: 2026-01-01" in output
@@ -241,7 +243,7 @@ class TestPatchedWindowAndYearForQuestion:
         current_year = str(datetime.now().year)
 
         with patched_window_and_year_for_question(question):
-            window = prompts_module._forecasting_window_str(question)
+            window = prompts_module._forecasting_window_str(cast(NumericQuestion, question))
             gap_prompt = prompts_module.gap_fill_analyzer_prompt(
                 question_text="Q?",
                 resolution_criteria="rc",

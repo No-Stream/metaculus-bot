@@ -147,6 +147,7 @@ async def run_gemini_only_research(
     alongside ``gap_fill_used`` so cached blobs are self-describing.
     """
     qid = question.id_of_question
+    assert qid is not None, "MetaculusQuestion must have id_of_question set"
 
     if not force:
         cached = cache.read_research(qid)
@@ -224,6 +225,7 @@ async def run_gemini_research_for_qids(
 
     async def _one(question: MetaculusQuestion) -> tuple[int, tuple[str, dict] | None]:
         qid = question.id_of_question
+        assert qid is not None, "MetaculusQuestion must have id_of_question set"
         async with semaphore:
             try:
                 result = await run_gemini_only_research(

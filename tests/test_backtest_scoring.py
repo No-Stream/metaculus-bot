@@ -148,15 +148,15 @@ def test_crps_perfect_step_function():
 
 
 def test_crps_uniform_cdf():
-    x_values = list(range(11))
+    x_values: list[float] = list(range(11))
     cdf_values = [i / 10 for i in range(11)]
     crps = numeric_crps(x_values, cdf_values, resolution=5.0)
     assert 0 < crps < 1
 
 
 def test_crps_wrong_side():
-    x_values = list(range(11))
-    wrong_cdf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    x_values: list[float] = list(range(11))
+    wrong_cdf: list[float] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
     crps_wrong = numeric_crps(x_values, wrong_cdf, resolution=0.0)
 
     uniform_cdf = [i / 10 for i in range(11)]

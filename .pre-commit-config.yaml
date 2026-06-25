@@ -5,3 +5,5 @@ repos:
       - id: ruff
         args: [--fix, --unsafe-fixes]
       - id: ruff-format
+  # NOTE: a local `basedpyright` hook is added back once the codebase is
+  # type-clean (Phase 4); enforcing it now would block all commits.

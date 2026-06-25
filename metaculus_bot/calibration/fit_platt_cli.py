@@ -319,10 +319,10 @@ def _try_plot(
         return "No fits ran; skipping calibration plot."
 
     try:
-        import matplotlib  # noqa: BLE001  # matplotlib genuinely optional for CLI plotting; CLI works without it
+        import matplotlib  # pyright: ignore[reportMissingImports]  # matplotlib genuinely optional for CLI plotting; CLI works without it
 
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]  # optional CLI dep, guarded by ImportError
     except ImportError as exc:
         logger.warning("matplotlib unavailable: %s; skipping plot.", exc)
         return f"matplotlib unavailable ({exc}); calibration plot skipped."

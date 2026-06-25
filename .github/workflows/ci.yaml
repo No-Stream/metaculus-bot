@@ -11,32 +11,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.11"
-      - run: pip install "ruff==0.15.1"
-      - run: ruff check .
-      - run: ruff format --check .
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run basedpyright
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.11"
-      - name: Install Poetry
-        uses: snok/install-poetry@v1
-        with:
-          version: 2.2.1
-      - name: Cache virtualenv
-        uses: actions/cache@v5
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-3.11-${{ hashFiles('poetry.lock') }}
-      - name: Install dependencies
-        run: poetry install --no-interaction --no-root
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev --frozen
       - name: Run tests
-        env:
-          PYTHONPATH: .
-        run: poetry run pytest
+        run: uv run pytest --cov=metaculus_bot
+
+  # Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
+  # PyPI package), so it runs via Google's published container action rather
+  # than uvx.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --lockfile=uv.lock

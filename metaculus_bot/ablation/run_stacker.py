@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, cast
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -605,7 +605,9 @@ async def run_stacker_for_arm(
                                     question=question,
                                     research=research_blob,
                                     base_texts=augmented_base_texts,
-                                    stacker_llm=fallback_stacker_llm,
+                                    # `_UNSET` is replaced by a real GeneralLlm above; only an explicit
+                                    # None survives, excluded by the `is not None` guard at L598.
+                                    stacker_llm=cast(GeneralLlm, fallback_stacker_llm),
                                     parser_llm=parser_llm,
                                     aggregated_tool_output=aggregated_for_stacker,
                                 ),

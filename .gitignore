@@ -102,13 +102,6 @@ ipython_config.py
 #   install all needed dependencies.
 #Pipfile.lock
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-
 # pdm
 #   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
 #pdm.lock
@@ -118,10 +111,6 @@ ipython_config.py
 .pdm.toml
 
 # uv
-#   This repo is poetry-managed (see pyproject.toml [tool.poetry] + poetry.lock).
-#   An incidental `uv` invocation in this environment regenerates a contentless
-#   uv.lock stub (no resolution, wrong python floor). Keep it out of version control.
-uv.lock
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/

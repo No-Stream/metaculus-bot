@@ -17,7 +17,7 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, cast
 
 import typeguard
 from forecasting_tools import (
@@ -58,6 +58,9 @@ from metaculus_bot.scoring_patches import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Mirror of forecasting_tools' ApiFilter.allowed_types element type (not publicly re-exported).
+type QuestionBasicType = Literal["binary", "numeric", "multiple_choice", "date", "discrete"]
 
 load_environment()
 
@@ -114,11 +117,13 @@ async def _get_mixed_question_types(total_questions: int, one_year_from_now: dat
         # Build filter per type
         filter_kwargs = base_filter_kwargs.copy()
 
-        # For numeric questions, include discrete types as well
+        # For numeric questions, include discrete types as well.
+        # question_type is always one of the QuestionBasicType literals at call sites
+        # (see types_and_counts below); cast to satisfy ApiFilter's invariant list type.
         if question_type == "numeric":
-            allowed_types = ["numeric", "discrete"]
+            allowed_types: list[QuestionBasicType] = ["numeric", "discrete"]
         else:
-            allowed_types = [question_type]
+            allowed_types = [cast(QuestionBasicType, question_type)]
 
         api_filter = ApiFilter(allowed_types=allowed_types, **filter_kwargs)
 

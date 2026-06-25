@@ -89,9 +89,9 @@ class TestPredicates:
 
     def test_litellm_rate_limit_error_triggers_fallback(self) -> None:
         """litellm.RateLimitError (typed 429) triggers fallback — BYOK quotas are independent."""
-        import litellm
+        from litellm.exceptions import RateLimitError
 
-        exc = litellm.RateLimitError(
+        exc = RateLimitError(
             message="Rate limit exceeded on openrouter",
             model="openrouter/google/gemini-3.1-pro-preview",
             llm_provider="openrouter",
@@ -100,9 +100,9 @@ class TestPredicates:
 
     def test_litellm_service_unavailable_does_not_trigger_fallback(self) -> None:
         """litellm.ServiceUnavailableError (503) does NOT trigger fallback — infrastructure issue."""
-        import litellm
+        from litellm.exceptions import ServiceUnavailableError
 
-        exc = litellm.ServiceUnavailableError(
+        exc = ServiceUnavailableError(
             message="503 Service Unavailable",
             model="openrouter/openai/gpt-5.1",
             llm_provider="openrouter",
@@ -148,7 +148,7 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_fallback_on_429_rate_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """429 on primary key falls back to secondary — BYOK quotas are independent."""
-        import litellm
+        from litellm.exceptions import RateLimitError
 
         llm = FallbackOpenRouterLlm(
             model="openrouter/google/gemini-3.1-pro-preview",
@@ -157,7 +157,7 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        exc = litellm.RateLimitError(
+        exc = RateLimitError(
             message="Rate limit exceeded",
             model="openrouter/google/gemini-3.1-pro-preview",
             llm_provider="openrouter",
@@ -189,7 +189,7 @@ class TestFallbackOpenRouterLlm:
     @pytest.mark.asyncio
     async def test_no_fallback_on_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """503 Service Unavailable re-raises without fallback — infrastructure issue, not key-scoped."""
-        import litellm
+        from litellm.exceptions import ServiceUnavailableError
 
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.1",
@@ -198,14 +198,14 @@ class TestFallbackOpenRouterLlm:
             temperature=0,
         )
 
-        exc = litellm.ServiceUnavailableError(
+        exc = ServiceUnavailableError(
             message="503 Service Unavailable",
             model="openrouter/openai/gpt-5.1",
             llm_provider="openrouter",
         )
         monkeypatch.setattr(llm, "_invoke_once_using_primary", AsyncMock(side_effect=exc))
 
-        with pytest.raises(litellm.ServiceUnavailableError):
+        with pytest.raises(ServiceUnavailableError):
             await llm.invoke("hi")
 
     @pytest.mark.asyncio

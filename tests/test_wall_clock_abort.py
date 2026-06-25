@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import requests
 from forecasting_tools import BinaryQuestion, GeneralLlm, ReasonedPrediction
+from forecasting_tools.data_models.data_organizer import PredictionTypes
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
@@ -86,7 +87,7 @@ async def test_abort_with_three_or_more_forecasters_publishes(monkeypatch, mock_
     # 3 fast, 1 slow (will be cancelled).
     call_count = {"n": 0}
 
-    async def mixed(*args, **kwargs):
+    async def mixed(*args, **kwargs) -> ReasonedPrediction[PredictionTypes]:
         call_count["n"] += 1
         if call_count["n"] <= 3:
             return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
@@ -117,7 +118,7 @@ async def test_abort_with_fewer_than_min_forecasters_skips_publish(monkeypatch, 
 
     call_count = {"n": 0}
 
-    async def mixed(*args, **kwargs):
+    async def mixed(*args, **kwargs) -> ReasonedPrediction[PredictionTypes]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
@@ -157,7 +158,7 @@ async def test_tight_budget_skips_stacking_forces_fallback_median(monkeypatch, m
     bot._get_notepad = AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
     bot.run_research = AsyncMock(return_value="research")
 
-    async def fast(*args, **kwargs):
+    async def fast(*args, **kwargs) -> ReasonedPrediction[PredictionTypes]:
         return ReasonedPrediction(prediction_value=0.6, reasoning="ok")
 
     bot._forecaster_with_soft_deadline = fast
@@ -199,7 +200,7 @@ async def test_tight_budget_under_stacking_forces_fallback_mean(monkeypatch, moc
     bot._get_notepad = AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
     bot.run_research = AsyncMock(return_value="research")
 
-    async def fast(*args, **kwargs):
+    async def fast(*args, **kwargs) -> ReasonedPrediction[PredictionTypes]:
         return ReasonedPrediction(prediction_value=0.6, reasoning="ok")
 
     bot._forecaster_with_soft_deadline = fast

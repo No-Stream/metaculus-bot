@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -1256,7 +1257,8 @@ class TestNelderMeadNonConvergenceRaises:
         from metaculus_bot.probabilistic_tools import distributions as dist_mod
 
         def _forced_fail(_objective, x0, **_kwargs):
-            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            return OptimizeResult(**fields)
 
         monkeypatch.setattr(dist_mod.optimize, "minimize", _forced_fail)
         return monkeypatch
@@ -1629,7 +1631,8 @@ class TestFitMixtureFromPercentiles:
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
         def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
         # Provide percentiles with a clean p25/p50/p75 so the IQR fallback runs.
@@ -1656,7 +1659,8 @@ class TestFitMixtureFromPercentiles:
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
         def _always_fail(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
         # Only p10 / p50 / p90 — no p25 or p75, so the IQR branch can't fire.
@@ -1682,7 +1686,8 @@ class TestFitMixtureFromPercentiles:
         from metaculus_bot.probabilistic_tools import mixtures as mixtures_mod
 
         def _always_fail(objective, x0, **kwargs):  # noqa: ARG001
-            return OptimizeResult(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            fields: dict[str, Any] = dict(success=False, message="forced", x=x0, fun=float("inf"), nit=0)
+            return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _always_fail)
         # Note: degenerate-percentiles short-circuit fires *before* the
@@ -1710,7 +1715,8 @@ class TestFitMixtureFromPercentiles:
         x_bad = np.concatenate([np.zeros(n), np.array([10.0, 20.0, 30.0]), np.full(n, bad_log_sd)])
 
         def _success_with_tiny_sd(objective, x0, **kwargs):  # noqa: ARG001 — scipy signature
-            return OptimizeResult(success=True, message="ok", x=x_bad, fun=0.0, nit=1)
+            fields: dict[str, Any] = dict(success=True, message="ok", x=x_bad, fun=0.0, nit=1)
+            return OptimizeResult(**fields)
 
         monkeypatch.setattr(mixtures_mod.optimize, "minimize", _success_with_tiny_sd)
         pcts = {0.1: 5.0, 0.25: 10.0, 0.5: 20.0, 0.75: 30.0, 0.9: 40.0}

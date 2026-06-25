@@ -123,7 +123,11 @@ class TestFormatForecasterRationalesSection:
 class TestBuildUnifiedExplanation:
     """Test the standalone build_unified_explanation helper."""
 
-    def _make_question(self, cls=BinaryQuestion, qid: int = 12345) -> MagicMock:
+    def _make_question(
+        self,
+        cls: type[BinaryQuestion | NumericQuestion | MultipleChoiceQuestion] = BinaryQuestion,
+        qid: int = 12345,
+    ) -> MagicMock:
         q = MagicMock(spec=cls)
         q.id_of_question = qid
         return q

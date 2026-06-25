@@ -814,7 +814,8 @@ def patch_multiple_choice_scoring():
         def expected_baseline_score_mc(self) -> float | None:
             return calculate_multiple_choice_baseline_score(self)
 
-        MultipleChoiceReport.expected_baseline_score = property(expected_baseline_score_mc)
+        # Monkey-patch: replace the read-only property descriptor at runtime.
+        MultipleChoiceReport.expected_baseline_score = property(expected_baseline_score_mc)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patch over property
         logger.info("Successfully patched MultipleChoiceReport.expected_baseline_score")
 
     except ImportError as e:
@@ -831,7 +832,8 @@ def patch_numeric_scoring():
         def expected_baseline_score_numeric(self) -> float | None:
             return calculate_numeric_baseline_score(self)
 
-        NumericReport.expected_baseline_score = property(expected_baseline_score_numeric)
+        # Monkey-patch: replace the read-only property descriptor at runtime.
+        NumericReport.expected_baseline_score = property(expected_baseline_score_numeric)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patch over property
         logger.info("Successfully patched NumericReport.expected_baseline_score")
 
     except ImportError as e:

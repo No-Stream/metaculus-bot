@@ -2,10 +2,12 @@ import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
@@ -20,20 +22,23 @@ def _stub_resolve_time() -> datetime:
 
 
 def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
-    return SimpleNamespace(
-        lower_bound=lower,
-        upper_bound=upper,
-        open_lower_bound=open_lower,
-        open_upper_bound=open_upper,
-        id_of_question=777,
-        page_url="https://ex/q/777",
-        question_text="tail widening test",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        unit_of_measure="units",
-        open_time=_stub_open_time(),
-        scheduled_resolution_time=_stub_resolve_time(),
+    return cast(
+        NumericQuestion,
+        SimpleNamespace(
+            lower_bound=lower,
+            upper_bound=upper,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            id_of_question=777,
+            page_url="https://ex/q/777",
+            question_text="tail widening test",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            unit_of_measure="units",
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
+        ),
     )
 
 
@@ -131,8 +136,7 @@ class TestTailWideningUnit:
         assert math.isclose(_get(p, 0.5), 50.0, rel_tol=0, abs_tol=1e-9)
 
         # Tail spans increased
-        base_p025, base_p05, base_p10 = 5.0, 6.0, 8.0
-        base_p10 - base_p05
+        base_p025, base_p05 = 5.0, 6.0
         base_low_span_outer = base_p05 - base_p025
         new_low_span_inner = _get(p, 0.10) - _get(p, 0.05)
         new_low_span_outer = _get(p, 0.05) - _get(p, 0.025)
@@ -140,8 +144,7 @@ class TestTailWideningUnit:
         # Inner span may adjust slightly; ensure it's still positive
         assert new_low_span_inner > 0.0
 
-        base_p90, base_p95, base_p975 = 94.0, 97.0, 98.0
-        base_p95 - base_p90
+        base_p95, base_p975 = 97.0, 98.0
         base_up_span_outer = base_p975 - base_p95
         new_up_span_inner = _get(p, 0.95) - _get(p, 0.90)
         new_up_span_outer = _get(p, 0.975) - _get(p, 0.95)
@@ -240,7 +243,7 @@ class TestTailWideningIntegration:
             "metaculus_bot.forecaster_runners.structure_output",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), declared],
         ):
-            result = await bot._run_forecast_on_numeric(nq, "", llm)
+            result = await bot._run_forecast_on_numeric(cast(NumericQuestion, nq), "", llm)
 
         # Ensure declared percentiles changed (tails widened)
         out_decl = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore[attr-defined]

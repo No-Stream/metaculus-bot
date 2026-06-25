@@ -7,6 +7,7 @@ Follows the same factory-function-returning-ResearchCallable pattern as other pr
 import asyncio
 import logging
 import os
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -158,7 +159,9 @@ def _fetch_yfinance_data(ticker: str) -> str:
 
         # Last 5 closing prices
         last_5 = close.tail(5)
-        closing_lines = [f"  - {date.strftime('%Y-%m-%d')}: {price:.2f}" for date, price in last_5.items()]
+        closing_lines = [
+            f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {price:.2f}" for date, price in last_5.items()
+        ]
         parts.append("- Last 5 closes:\n" + "\n".join(closing_lines))
 
         return "\n".join(parts)
@@ -235,7 +238,7 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
         try:
             info_df = fred.get_series_info(series_id)
             if isinstance(info_df, pd.DataFrame) and "title" in info_df.columns:
-                title = info_df["title"].iloc[0]
+                title = cast(pd.Series, info_df["title"]).iloc[0]
             elif isinstance(info_df, pd.Series) and "title" in info_df.index:
                 title = info_df["title"]
         except Exception:
@@ -254,19 +257,19 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
         # Month-over-month change (if monthly-ish frequency)
         if len(data) >= 2:
             mom_change = latest_value - data.iloc[-2]
-            mom_pct = (mom_change / abs(data.iloc[-2])) * 100 if data.iloc[-2] != 0 else 0
+            mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0
             parts.append(f"- Change from previous: {mom_change:+.4g} ({mom_pct:+.2f}%)")
 
         # Year-over-year change (try ~12 periods back)
         if len(data) >= 13:
             yoy_value = data.iloc[-13]
             yoy_change = latest_value - yoy_value
-            yoy_pct = (yoy_change / abs(yoy_value)) * 100 if yoy_value != 0 else 0
+            yoy_pct = (yoy_change / abs(float(yoy_value))) * 100 if yoy_value != 0 else 0
             parts.append(f"- Year-over-year change: {yoy_change:+.4g} ({yoy_pct:+.2f}%)")
 
         # Last 6 observations
         last_6 = data.tail(6)
-        obs_lines = [f"  - {date.strftime('%Y-%m-%d')}: {val:.4g}" for date, val in last_6.items()]
+        obs_lines = [f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {val:.4g}" for date, val in last_6.items()]
         parts.append("- Recent observations:\n" + "\n".join(obs_lines))
 
         return "\n".join(parts)

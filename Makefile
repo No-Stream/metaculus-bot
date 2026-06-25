@@ -1,53 +1,63 @@
-.PHONY: conda_env install test test_verbose all lint format run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research backfill_research download_research backfill_comments backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research backfill_research download_research backfill_comments backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
 
-# Absolute Python in conda env (use tilde to avoid hardcoding username)
-PY_ABS := ~/miniconda3/envs/metaculus-bot/bin/python
-
 # OS detection for cross-platform unbuffered output with PTY
 # - Linux: stdbuf + script -c "cmd" /dev/null
 # - macOS: script -q /dev/null cmd (no stdbuf needed, different script syntax)
+# `uv run` executes inside the in-project .venv that `uv sync` manages.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     # macOS: script allocates PTY; PYTHONUNBUFFERED handles Python buffering
     define RUN_UNBUFFERED
-        PYTHONUNBUFFERED=1 PYTHONPATH=. script -q /dev/null $(PY_ABS) -u $(1)
+        PYTHONUNBUFFERED=1 script -q /dev/null uv run python -u $(1)
     endef
 else
     # Linux: stdbuf for system-level line buffering + script for PTY
     define RUN_UNBUFFERED
-        PYTHONUNBUFFERED=1 PYTHONPATH=. stdbuf -oL -eL script -q -c "$(PY_ABS) -u $(1)" /dev/null
+        PYTHONUNBUFFERED=1 stdbuf -oL -eL script -q -c "uv run python -u $(1)" /dev/null
     endef
 endif
 
-# for reference, won't actually persist to the shell
-# conda_env:
-# 	conda activate metaculus-bot
-
 install:
-	conda run -n metaculus-bot poetry install
+	uv sync --dev
 
 lock:
-	conda run -n metaculus-bot poetry lock
+	uv lock
 
 lint:
-	conda run -n metaculus-bot poetry run ruff check .
+	uv run ruff check .
 
 format:
-	conda run -n metaculus-bot poetry run ruff format .
-	conda run -n metaculus-bot poetry run ruff check . --fix
+	uv run ruff format .
+	uv run ruff check . --fix
+
+typecheck:
+	uv run basedpyright
+
+typecheck_ty:
+	uv run ty check
+
+cov:
+	$(call RUN_UNBUFFERED,-m pytest --cov=metaculus_bot --cov-report=term-missing)
+
+# Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
+# PyPI package), so it can't be run via uvx — install it with
+# `brew install osv-scanner` (see https://google.github.io/osv-scanner/installation/).
+# CI runs the equivalent google/osv-scanner-action.
+audit:
+	osv-scanner scan --lockfile=uv.lock --config=osv-scanner.toml
 
 # Pre-commit helpers (use local cache to avoid readonly home cache)
 precommit_install:
-	PRE_COMMIT_HOME=.pre-commit-cache conda run -n metaculus-bot poetry run pre-commit install
+	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit install
 
 precommit:
-	PRE_COMMIT_HOME=.pre-commit-cache conda run -n metaculus-bot poetry run pre-commit run
+	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run
 
 precommit_all:
-	PRE_COMMIT_HOME=.pre-commit-cache conda run -n metaculus-bot poetry run pre-commit run -a
+	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run -a
 
 test:
 	$(call RUN_UNBUFFERED,-m pytest)
@@ -62,7 +72,7 @@ test_verbose:
 # you can see which test failed and why without wading through bare pass/fail.
 # Recipes run sequentially (default make behavior); if any step fails the
 # subsequent steps don't run, so failures surface immediately.
-all: format lint test_verbose
+all: format lint typecheck test_verbose
 
 run:
 	$(call RUN_UNBUFFERED,main.py)
@@ -159,28 +169,28 @@ test_fast:
 # from Metaculus comments for anything missing. Run before backtests.
 sync_research:
 	@echo "=== Downloading GHA artifacts ==="
-	$(PY_ABS) scripts/download_research.py $(ARGS)
+	uv run python scripts/download_research.py $(ARGS)
 	@echo ""
 	@echo "=== Backfilling from Metaculus comments (historical) ==="
-	$(PY_ABS) scripts/backfill_research_from_comments.py
+	uv run python scripts/backfill_research_from_comments.py
 	@echo ""
 	@echo "=== Rebuilding archive ==="
-	$(PY_ABS) scripts/download_research.py --skip-download
+	uv run python scripts/download_research.py --skip-download
 	@echo ""
 	@echo "Archive ready at backtests/research_archive/latest/"
 
 # Backfill research from existing GitHub Actions logs (Nov 2025 onward).
 # Pass ARGS="--limit 100 --status completed" to customize.
 backfill_research:
-	$(PY_ABS) scripts/backfill_research_from_logs.py $(ARGS)
+	uv run python scripts/backfill_research_from_logs.py $(ARGS)
 
 # Download research artifacts from recent GHA runs into local archive.
 download_research:
-	$(PY_ABS) scripts/download_research.py $(ARGS)
+	uv run python scripts/download_research.py $(ARGS)
 
 # Backfill from Metaculus bot comments (historical, covers full tournament).
 backfill_comments:
-	$(PY_ABS) scripts/backfill_research_from_comments.py $(ARGS)
+	uv run python scripts/backfill_research_from_comments.py $(ARGS)
 
 # Run backtest using cached (non-leaky) research from the archive.
 backtest_with_cache:
@@ -189,4 +199,4 @@ backtest_with_cache:
 # Check OpenRouter key balances. Pass ARGS="--key donated" or ARGS="--key personal"
 # to limit which key is queried (default: both).
 check_credits:
-	@$(PY_ABS) -m metaculus_bot.check_openrouter_credits $(ARGS)
+	@uv run python -m metaculus_bot.check_openrouter_credits $(ARGS)

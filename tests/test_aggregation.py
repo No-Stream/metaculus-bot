@@ -3,6 +3,7 @@ from typing import cast
 
 import numpy as np
 import pytest
+from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
@@ -61,7 +62,7 @@ async def test_numeric_aggregation_configurable():
     predictions: list[PredictionTypes] = [pred1, pred2, pred3]
 
     # Initialize two forecaster instances with different aggregation methods.
-    llms_min = {
+    llms_min: dict[str, str | GeneralLlm] = {
         "default": "mock",
         "parser": "mock",
         "researcher": "mock",

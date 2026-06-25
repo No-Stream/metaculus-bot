@@ -2,10 +2,12 @@
 
 import math
 import random
+from typing import cast
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from forecasting_tools.data_models.forecast_report import ForecastReport
 from forecasting_tools.data_models.questions import OutOfBoundsResolution
 
 from metaculus_bot.ablation.scoring import (
@@ -114,11 +116,14 @@ def _three_arm_inputs(
     report_stack, report_stack_aug, report_median, payload_stack=None, payload_stack_aug=None, payload_median=None
 ):
     """Build the [(label, report, payload), ...] list that score_arm_for_qid expects."""
-    return [
-        ("stack", report_stack, payload_stack),
-        ("stack_aug", report_stack_aug, payload_stack_aug),
-        ("median", report_median, payload_median),
-    ]
+    return cast(
+        list[tuple[str, ForecastReport | None, dict | None]],
+        [
+            ("stack", report_stack, payload_stack),
+            ("stack_aug", report_stack_aug, payload_stack_aug),
+            ("median", report_median, payload_median),
+        ],
+    )
 
 
 class TestScoreArmForQid:
@@ -1813,13 +1818,16 @@ def _five_arm_inputs(
     payload_median=None,
 ):
     """Build the [(label, report, payload), ...] list for the 5-arm score_arm_for_qid."""
-    return [
-        ("stack", report_stack, payload_stack),
-        ("stack_aug", report_stack_aug, payload_stack_aug),
-        ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-        ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-        ("median", report_median, payload_median),
-    ]
+    return cast(
+        list[tuple[str, ForecastReport | None, dict | None]],
+        [
+            ("stack", report_stack, payload_stack),
+            ("stack_aug", report_stack_aug, payload_stack_aug),
+            ("pdf_min1", report_pdf_min1, payload_pdf_min1),
+            ("pdf_min2", report_pdf_min2, payload_pdf_min2),
+            ("median", report_median, payload_median),
+        ],
+    )
 
 
 class TestFiveArmScoring:
@@ -2122,14 +2130,17 @@ def _six_arm_inputs(
     payload_mean=None,
 ):
     """Build the [(label, report, payload), ...] list for the 6-arm score_arm_for_qid."""
-    return [
-        ("stack", report_stack, payload_stack),
-        ("stack_aug", report_stack_aug, payload_stack_aug),
-        ("pdf_min1", report_pdf_min1, payload_pdf_min1),
-        ("pdf_min2", report_pdf_min2, payload_pdf_min2),
-        ("median", report_median, payload_median),
-        ("mean", report_mean, payload_mean),
-    ]
+    return cast(
+        list[tuple[str, ForecastReport | None, dict | None]],
+        [
+            ("stack", report_stack, payload_stack),
+            ("stack_aug", report_stack_aug, payload_stack_aug),
+            ("pdf_min1", report_pdf_min1, payload_pdf_min1),
+            ("pdf_min2", report_pdf_min2, payload_pdf_min2),
+            ("median", report_median, payload_median),
+            ("mean", report_mean, payload_mean),
+        ],
+    )
 
 
 class TestSixArmScoring:

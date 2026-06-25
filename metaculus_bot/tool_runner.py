@@ -311,6 +311,8 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
 
     # Fit once, reuse for both consistency check and tail-mass computation.
     try:
+        if not block.declared_percentiles:
+            raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             declared_percentiles=block.declared_percentiles,
             claimed_family=block.distribution_family_hint,
@@ -801,6 +803,8 @@ def cdf_at_threshold_for_forecaster(
     if not isinstance(block, NumericStructured):
         return None
     try:
+        if not block.declared_percentiles:
+            raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             block.declared_percentiles,
             claimed_family=block.distribution_family_hint,

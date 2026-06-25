@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -72,13 +73,22 @@ class FakeResponse:
         return None  # noqa: ASYNC910
 
 
+# A handler is either a ready-made response or a callable that builds one from the GET params.
+_Handler = FakeResponse | Callable[[dict[str, Any]], FakeResponse]
+# Per-URL value accepted by FakeSession: a single handler or a list of them. Mapping (not dict) so
+# call-site literals like {url: FakeResponse(...)} are accepted (dict is invariant in its value type).
+_Handlers = Mapping[str, _Handler | list[_Handler]]
+
+
 class FakeSession:
     """Simple aiohttp.ClientSession replacement that dispatches GET requests
     to handler callables keyed by URL prefix.
     """
 
-    def __init__(self, handlers: dict[str, Any]):
-        self._handlers = {k: (v if isinstance(v, list) else [v]) for k, v in handlers.items()}
+    def __init__(self, handlers: _Handlers):
+        self._handlers: dict[str, list[_Handler]] = {
+            k: (v if isinstance(v, list) else [v]) for k, v in handlers.items()
+        }
         self._call_counts: dict[str, int] = {k: 0 for k in handlers}
         self.closed = False
 

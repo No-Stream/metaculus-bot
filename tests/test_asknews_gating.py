@@ -1,5 +1,5 @@
 import types
-from typing import Callable
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,7 +20,7 @@ def _install_asknews_stub(monkeypatch: pytest.MonkeyPatch, on_search: Callable[[
     a .news.search_news coroutine returning an object with .as_dicts.
     """
 
-    module = types.ModuleType("asknews_sdk")
+    module: Any = types.ModuleType("asknews_sdk")
 
     class _News:
         async def search_news(self, *, query, n_articles, return_type, strategy):  # type: ignore[no-untyped-def]

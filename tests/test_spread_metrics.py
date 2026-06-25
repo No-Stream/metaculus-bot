@@ -1,6 +1,7 @@
 """Tests for spread_metrics module — measures forecaster disagreement."""
 
 import math
+from typing import Any
 
 import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericDistribution, NumericQuestion
@@ -53,7 +54,7 @@ class TestBinaryProbRangeSpread:
 
 
 def _make_binary_question(**overrides) -> BinaryQuestion:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         question_text="Will it rain?",
         id_of_question=1,
         page_url="https://example.com/q/1",
@@ -66,7 +67,7 @@ def _make_binary_question(**overrides) -> BinaryQuestion:
 
 
 def _make_mc_question(**overrides) -> MultipleChoiceQuestion:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         question_text="What color?",
         options=["Red", "Blue", "Green"],
         id_of_question=2,
@@ -80,7 +81,7 @@ def _make_mc_question(**overrides) -> MultipleChoiceQuestion:
 
 
 def _make_numeric_question(**overrides) -> NumericQuestion:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         question_text="How many?",
         id_of_question=3,
         page_url="https://example.com/q/3",

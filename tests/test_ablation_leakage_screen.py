@@ -11,10 +11,12 @@ import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import litellm
 import pytest
+from forecasting_tools.data_models.questions import MetaculusQuestion
+from litellm.exceptions import APIConnectionError
 
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.leakage_screen import (
@@ -25,7 +27,7 @@ from metaculus_bot.ablation.leakage_screen import (
 from metaculus_bot.backtest.scoring import GroundTruth
 
 
-def _transient_api_error(message: str) -> litellm.APIConnectionError:
+def _transient_api_error(message: str) -> APIConnectionError:
     """Realistic transient detector failure — what an actual provider blip raises.
 
     The detector retry loop only catches the narrow transient set
@@ -33,19 +35,19 @@ def _transient_api_error(message: str) -> litellm.APIConnectionError:
     a real ``litellm`` exception keeps these tests aligned with what the
     runtime actually sees, instead of papering over a buggy ``RuntimeError``.
     """
-    return litellm.APIConnectionError(message=message, llm_provider="z-ai", model="glm-4.5-air:free")
+    return APIConnectionError(message=message, llm_provider="z-ai", model="glm-4.5-air:free")
 
 
 def _blob_sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
 
 
-def _make_question(qid: int, text: str = "Will X happen?") -> MagicMock:
+def _make_question(qid: int, text: str = "Will X happen?") -> MetaculusQuestion:
     q = MagicMock()
     q.id_of_question = qid
     q.question_text = text
     q.resolution_criteria = "Resolves YES if X happens."
-    return q
+    return cast(MetaculusQuestion, q)
 
 
 def _make_ground_truth(qid: int, resolution_string: str = "Yes") -> GroundTruth:
