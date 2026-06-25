@@ -26,7 +26,9 @@ async def screen_research_for_leakage(
     concurrency: int = ASKNEWS_MAX_CONCURRENCY,
 ) -> tuple[list[MetaculusQuestion], dict[int, GroundTruth], dict[int, str]]:
     research_provider, _ = choose_provider_with_name(is_benchmarking=True)
-    detector_llm = GeneralLlm(model=LEAKAGE_DETECTOR_MODEL, temperature=0.0, max_tokens=500)
+    detector_llm = GeneralLlm(
+        model=LEAKAGE_DETECTOR_MODEL, temperature=0.0, max_tokens=500, reasoning={"effort": "low"}
+    )
     semaphore = asyncio.Semaphore(concurrency)
 
     tasks = [

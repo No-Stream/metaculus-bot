@@ -117,7 +117,7 @@ SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 )
 # Parser should be a reliable, low-latency model for structure extraction
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5-mini",
+    "openrouter/openai/gpt-5.4-mini",
     reasoning={"effort": "low"},
     **DETERMINISTIC_MODEL_CONFIG,
 )
@@ -157,13 +157,13 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 
 # Keyword-extraction LLM config for the prediction-market provider.
 # Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
-# gpt-5-mini reasoning=low burns 128-512 tokens on invisible reasoning before
+# gpt-5.4-mini reasoning=low burns 128-512 tokens on invisible reasoning before
 # emitting any visible response, so max_tokens=800 is load-bearing.
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
-    "model": "openrouter/openai/gpt-5-mini",
+    "model": "openrouter/openai/gpt-5.4-mini",
     "temperature": 0.0,
     "max_tokens": 800,
     "reasoning_effort": "low",

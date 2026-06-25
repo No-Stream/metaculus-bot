@@ -1031,8 +1031,8 @@ def gap_fill_search_prompt(
         {question_text}
 
         Search the web for CURRENT, AUTHORITATIVE evidence addressing the gap. If the gap
-        refers to a specific URL or document (e.g., a government report, an SEC filing,
-        a dataset), try to read that source directly before doing broader searches.
+        names a specific source or document (e.g., a government report, an SEC filing,
+        a dataset), search for it by name and prioritize it before broadening out.
 
         GUIDELINES:
         - Be factual and specific; report what you find, not what you think

@@ -293,6 +293,7 @@ def financial_data_provider() -> ResearchCallable:
         model=FINANCIAL_CLASSIFIER_MODEL,
         temperature=0.0,
         max_tokens=500,
+        reasoning={"effort": "low"},
         timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
     )
 

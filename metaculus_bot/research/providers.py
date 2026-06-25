@@ -300,14 +300,25 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
     return _fetch
 
 
-def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
+def build_native_search_llm(
+    model_slug: str | None = None,
+    *,
+    reasoning_effort: str | None = None,
+    verbosity: str | None = None,
+) -> GeneralLlm:
     """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
-    Shared by the native search research provider and the targeted research module.
+    Shared by the native search research provider, the targeted research module,
+    and the gap-fill resolver.
 
-    Reads NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY env at call
-    time so workflow overrides take effect without re-importing. An empty string
-    in either env var disables passing the corresponding kwarg.
+    Reasoning effort and verbosity come from the global NATIVE_SEARCH_REASONING_EFFORT
+    / NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect
+    without re-importing), UNLESS the caller passes an explicit ``reasoning_effort``
+    / ``verbosity`` override — an explicit value always wins over the env read.
+    This lets the gap-fill resolver run at medium effort without perturbing the
+    main native_search provider, which stays on the env-driven LOW. An empty
+    string (from either the override or the env) disables passing the
+    corresponding kwarg.
     """
     from metaculus_bot.constants import (
         NATIVE_SEARCH_CONTEXT_SIZE,
@@ -343,7 +354,11 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
     )
 
-    effort = os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    effort = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    )
     if effort:
         kwargs["reasoning"] = {"effort": effort}
 
@@ -353,9 +368,11 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
     # the body, but the canonical form matches the docs and survives any future
     # extra_body validation. GeneralLlm passes unknown kwargs through to
     # litellm by default (`pass_through_unknown_kwargs=True`).
-    verbosity = os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
-    if verbosity:
-        kwargs["verbosity"] = verbosity
+    verbosity_value = (
+        verbosity if verbosity is not None else os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
+    )
+    if verbosity_value:
+        kwargs["verbosity"] = verbosity_value
 
     # Route through the donated-key wrapper. For openrouter/openai/* slugs this
     # prefers the Metaculus-donated OAI_ANTH_OPENROUTER_KEY (OpenAI now enabled

@@ -2,11 +2,11 @@
 
 When base forecaster models disagree significantly, this module:
 1. Extracts the crux of disagreement using a cheap analyzer model.
-2. Runs a targeted web search via Grok native search to resolve it.
+2. Runs a targeted web search via OpenAI native search to resolve it.
 
 Also provides ``run_gap_fill_pass`` — an always-on second-pass that runs after
 first-pass research. It identifies factual gaps in the first pass and resolves
-each via a parallel grounded Gemini search.
+each via a parallel OpenAI native web search (OpenRouter, donated-key billed).
 """
 
 import asyncio
@@ -21,6 +21,8 @@ from metaculus_bot.constants import (
     GAP_FILL_ANALYZER_TIMEOUT,
     GAP_FILL_ANALYZER_WALL_TIMEOUT,
     GAP_FILL_MAX_GAPS,
+    GAP_FILL_RESOLVER_MODEL,
+    GAP_FILL_RESOLVER_REASONING_EFFORT,
     NATIVE_SEARCH_WALL_TIMEOUT,
 )
 from metaculus_bot.prompts import (
@@ -29,7 +31,6 @@ from metaculus_bot.prompts import (
     gap_fill_search_prompt,
     targeted_search_prompt,
 )
-from metaculus_bot.research.gemini_search import invoke_gemini_grounded
 from metaculus_bot.research.providers import build_native_search_llm
 from metaculus_bot.structured_output_schema import extract_first_balanced_braces, extract_json_block
 
@@ -78,8 +79,8 @@ async def extract_disagreement_crux(
 async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking: bool = False) -> str:
     """Run a targeted web search to resolve a specific factual disagreement.
 
-    Uses Grok with native search via OpenRouter to find current, authoritative
-    information about the identified crux.
+    Uses OpenAI native web search via OpenRouter (`build_native_search_llm`) to
+    find current, authoritative information about the identified crux.
 
     Args:
         crux: The factual question(s) driving forecaster disagreement.
@@ -211,9 +212,15 @@ async def _resolve_single_gap(
     *,
     is_benchmarking: bool,
 ) -> str:
-    """Run one grounded Gemini search for a single gap.
+    """Run one OpenAI native web search (via OpenRouter) for a single gap.
 
-    Raises on SDK errors — the caller uses ``asyncio.gather(..., return_exceptions=True)``
+    Migrated 2026-06-25 off direct-Google grounded Gemini (google-genai, personal
+    GOOGLE_API_KEY) to native search on the Metaculus-donated key — this is the
+    dominant cost-saving change since the resolver fans out up to GAP_FILL_MAX_GAPS
+    calls per question. Runs gpt-5.4-mini at medium effort (research-tier), distinct
+    from the global LOW the main native_search provider uses.
+
+    Raises on SDK/OpenRouter errors — the caller uses ``asyncio.gather(..., return_exceptions=True)``
     so one failure doesn't kill the rest.
     """
     prompt = gap_fill_search_prompt(
@@ -222,7 +229,11 @@ async def _resolve_single_gap(
         question_text=question_text,
         is_benchmarking=is_benchmarking,
     )
-    return await invoke_gemini_grounded(prompt)
+    llm = build_native_search_llm(GAP_FILL_RESOLVER_MODEL, reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT)
+    # Wall-clock backstop shared with the native_search provider / targeted search
+    # (same build_native_search_llm config); asyncio.wait_for is the hard cap
+    # regardless of upstream whitespace-drip behavior (2026-05-20 incident).
+    return await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
 
 
 async def run_gap_fill_pass(
@@ -236,7 +247,8 @@ async def run_gap_fill_pass(
     Two-stage flow:
     1. Analyzer call (gpt-5.5 effort=low via OpenRouter, no grounding) → JSON
        list of up to ``GAP_FILL_MAX_GAPS`` gaps.
-    2. Parallel grounded Gemini searches, one per gap, via ``asyncio.gather``.
+    2. Parallel OpenAI native web searches (gpt-5.4-mini medium effort via
+       OpenRouter), one per gap, via ``asyncio.gather``.
 
     Never raises. Returns "" on any upstream failure (missing API key, timeout,
     SDK error, network error), logging type + message. This is a deliberate

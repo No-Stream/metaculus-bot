@@ -8,9 +8,9 @@ Design anchors (from the G0 empirical study, 2026-05-12 -- see
 `scratch_docs_and_planning/prediction_market_keyword_extraction_experiment.md`):
 
 - Default keyword extraction is S4 (LLM noun phrases) + S5 (LLM entity + event
-  + deadline) run in parallel via gpt-5-mini with `max_tokens=800` and
+  + deadline) run in parallel via gpt-5.4-mini with `max_tokens=800` and
   `reasoning=low`. Hit rate 67% vs 33% for a naive baseline. The 800-token
-  budget is load-bearing: gpt-5-mini burns 128-512 tokens on invisible
+  budget is load-bearing: gpt-5.4-mini burns 128-512 tokens on invisible
   reasoning before emitting any response.
 
 - Manifold gets an extra S2 query (question text trimmed at '?') because its
@@ -202,7 +202,7 @@ def _clean_llm_query(content: str) -> str:
 class KeywordExtractor:
     """Extracts keyword queries per the configured strategy.
 
-    `s4_s5_union` (default): S4 + S5 in parallel via gpt-5-mini. Union deduped.
+    `s4_s5_union` (default): S4 + S5 in parallel via gpt-5.4-mini. Union deduped.
     `s5_only`: S5 only (cheaper, 60% hit rate vs 67% for union).
     `simple`: S2 only (no LLM cost, 40% hit rate).
     """
