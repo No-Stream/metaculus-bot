@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
 from metaculus_bot.prompts import disagreement_crux_prompt, targeted_search_prompt
 from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
 
@@ -69,12 +70,36 @@ class TestExtractDisagreementCrux:
         assert "pred2" in prompt_arg
 
     @pytest.mark.asyncio
-    async def test_propagates_errors(self):
+    async def test_propagates_errors_after_broad_retry(self):
+        """A fast retryable error is retried (broad, 30s-gated) then propagates.
+
+        Round-2: the crux invoke is wrapped in invoke_with_broad_retry. A fast
+        RuntimeError is broadly-retryable, so it retries the full backoff schedule
+        then re-raises — the propagation contract is preserved (the error surfaces,
+        not swallowed), just after retries. asyncio.sleep is patched so the
+        backoffs are instant; the awaitable is invoked len(backoffs)+1 = 4 times.
+        """
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("LLM timeout")
 
-        with pytest.raises(RuntimeError, match="LLM timeout"):
-            await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
+        with patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="LLM timeout"):
+                await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
+
+        assert mock_llm.invoke.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_slow_crux_error_not_retried(self):
+        """A crux failure past the 30s gate is NOT retried — it propagates on the first attempt."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.side_effect = RuntimeError("slow analyzer stall")
+        clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 20)
+
+        with patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)):
+            with pytest.raises(RuntimeError, match="slow analyzer stall"):
+                await extract_disagreement_crux(mock_llm, "question", ["pred1", "pred2"])
+
+        assert mock_llm.invoke.await_count == 1
 
 
 class TestRunTargetedSearch:

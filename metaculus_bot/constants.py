@@ -375,12 +375,17 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 # multiplier on the personal Google bill, the dominant unwanted spend. The
 # single first-pass grounded Gemini call stays on google-genai (operator is fine
 # paying for 1 call/question, and it uses url_context which OpenRouter can't
-# replicate). Medium effort (not the global LOW the main native_search provider
-# runs at): gap resolution is research-tier — we want the model to actually dig
-# into the search results, not skim. No "openrouter/" prefix here —
-# build_native_search_llm adds it.
+# replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
+#
+# Effort LOW (Round-2, 2026-06-25): the resolver was the ~5-min critical-path
+# bottleneck (it fans out up to GAP_FILL_MAX_GAPS medium-effort calls that gate
+# the forecast). The native_search v3 bench (comparison_v3.md) measured gpt-5.5
+# effort=low at ~50s vs medium ~230s — roughly 4.5× faster; mini scales similarly.
+# Dropping to low keeps gap-fill comfortably inside the per-question deadline.
+# Quality of low-effort gap resolution is to be spot-checked from the GHA
+# test-bot run; bump back to medium here if it skims too much.
 GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.4-mini"
-GAP_FILL_RESOLVER_REASONING_EFFORT: str = "medium"
+GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
@@ -460,6 +465,14 @@ STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 # Caps the unbounded worst case on the conditional-stacking critical path: without
 # this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
 CRUX_SOFT_DEADLINE: int = 180
+
+# Wall-clock cap for the AskNews summarizer invoke. The summarizer is set
+# allowed_tries=1 (llm_configs.py) and wrapped in the broad 30s-gated retry, which
+# previously had no wall guard at all. Matches the summarizer's litellm per-request
+# timeout (DETERMINISTIC_MODEL_CONFIG timeout=300) so the per-attempt cap aligns
+# with the underlying request budget; on breach the summarizer soft-fails to the
+# raw AskNews articles rather than hanging the question.
+SUMMARIZER_WALL_TIMEOUT: int = 300
 
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60

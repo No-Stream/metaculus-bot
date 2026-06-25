@@ -31,8 +31,10 @@ from metaculus_bot.constants import (
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
     PREDICTION_MARKETS_ENABLED_ENV,
+    SUMMARIZER_WALL_TIMEOUT,
     env_flag_enabled,
 )
+from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
@@ -190,7 +192,16 @@ class ResearchOrchestrator:
             """
         )
         try:
-            summary = await self._summarizer_llm.invoke(prompt)
+            # Broad, 30s-gated retry (SUMMARIZER_LLM is allowed_tries=1 in
+            # llm_configs.py): recovers a fast blip / empty-response while obeying
+            # the universal "no retry after 30s" deadline rule. Adds the wall-clock
+            # cap this call previously lacked. A slow/permanent failure still
+            # propagates to the soft-fail below (raw AskNews articles).
+            summary = await invoke_with_broad_retry(
+                lambda: self._summarizer_llm.invoke(prompt),
+                wall_timeout=SUMMARIZER_WALL_TIMEOUT,
+                label="asknews_summarizer",
+            )
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
             logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
             return research

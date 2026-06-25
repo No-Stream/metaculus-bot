@@ -1115,3 +1115,91 @@ class TestStackingGuardsAndReasoning:
             assert "Analysis 2" in reasoning
             assert "## Stacker Meta-Analysis" in reasoning
             assert "## Base Model Reasoning" in reasoning
+
+
+class TestStackerTransientRetry:
+    """The stacker invoke is wrapped in the elapsed-gated transient retry.
+
+    STACKER_LLM / STACKER_FALLBACK_LLM are allowed_tries=1 by design (prefer the
+    cross-provider fallback over retrying a stalled provider). The wrapper adds
+    recovery from instant aiohttp blips (litellm #14895) WITHOUT retrying a slow
+    stall — a slow stall still propagates so the fallback chain engages.
+    """
+
+    @staticmethod
+    def _binary_question() -> "BinaryQuestion":
+        q = Mock(spec=BinaryQuestion)
+        q.id_of_question = 555
+        q.page_url = "https://example.com/q/555"
+        q.question_text = "Will it rain?"
+        q.background_info = "bg"
+        q.resolution_criteria = "rc"
+        q.fine_print = "fp"
+        q.open_time = _stub_open_time()
+        q.scheduled_resolution_time = _stub_resolve_time()
+        return cast(BinaryQuestion, q)
+
+    @pytest.mark.asyncio
+    async def test_fast_stacker_blip_retries_then_succeeds(self) -> None:
+        """A fast litellm.Timeout on the stacker invoke is retried; the next call wins."""
+        import litellm.exceptions as litellm_exc
+
+        from metaculus_bot.stacking import run_stacking_binary
+
+        stacker = Mock(spec=GeneralLlm)
+        stacker.invoke = AsyncMock(
+            side_effect=[litellm_exc.Timeout("blip", model="m", llm_provider="openrouter"), "meta text"]
+        )
+        parser = Mock(spec=GeneralLlm)
+
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "metaculus_bot.stacking.structure_output",
+                new=AsyncMock(return_value=Mock(prediction_in_decimal=0.42)),
+            ),
+        ):
+            value, meta = await run_stacking_binary(
+                stacker,
+                parser,
+                self._binary_question(),
+                "research",
+                ["base reasoning"],
+                stacker_wall_timeout=500.0,
+            )
+
+        assert value == 0.42
+        assert meta == "meta text"
+        assert stacker.invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_slow_stacker_stall_not_retried(self) -> None:
+        """A stacker invoke that stalls past the elapsed gate is NOT retried — it propagates.
+
+        Patches the elapsed clock so the failure reads as slow; the stacker layer
+        must surface the exception (one invoke) so the pipeline's fallback chain
+        engages rather than the wrapper silently retrying a multi-minute stall.
+        """
+        import litellm.exceptions as litellm_exc
+
+        from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
+        from metaculus_bot.stacking import run_stacking_binary
+
+        stacker = Mock(spec=GeneralLlm)
+        stacker.invoke = AsyncMock(side_effect=litellm_exc.Timeout("stall", model="m", llm_provider="openrouter"))
+        parser = Mock(spec=GeneralLlm)
+
+        clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 10)
+
+        with patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)):
+            with pytest.raises(litellm_exc.Timeout):
+                await run_stacking_binary(
+                    stacker,
+                    parser,
+                    self._binary_question(),
+                    "research",
+                    ["base reasoning"],
+                    stacker_wall_timeout=500.0,
+                )
+
+        assert stacker.invoke.await_count == 1

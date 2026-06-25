@@ -92,8 +92,15 @@ class AggregationPipeline:
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
+        stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
     ) -> PredictionTypes:
-        """Dispatch stacker LLM per question type."""
+        """Dispatch stacker LLM per question type.
+
+        ``stacker_wall_timeout`` is the hard wall-clock cap handed to the
+        per-type stacker invoke (via ``invoke_with_transient_retry``). Callers
+        pass the deadline matching the attempt: STACKER_SOFT_DEADLINE for the
+        primary stacker, STACKER_FALLBACK_SOFT_DEADLINE for the fallback.
+        """
         if stacker_llm_override is not None:
             stacker_llm = stacker_llm_override
         else:
@@ -121,6 +128,7 @@ class AggregationPipeline:
                 research,
                 base_predictions,
                 aggregated_tool_output=aggregated_tool_output,
+                stacker_wall_timeout=stacker_wall_timeout,
             )
             self.meta_reasoning[qid] = meta_text
             logger.info(f"Stacked binary prediction for {page_url}: {value}")
@@ -133,6 +141,7 @@ class AggregationPipeline:
                 research,
                 base_predictions,
                 aggregated_tool_output=aggregated_tool_output,
+                stacker_wall_timeout=stacker_wall_timeout,
             )
             self.meta_reasoning[qid] = meta_text
             logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
@@ -148,6 +157,7 @@ class AggregationPipeline:
                 lower_msg,
                 upper_msg,
                 aggregated_tool_output=aggregated_tool_output,
+                stacker_wall_timeout=stacker_wall_timeout,
             )
             self.meta_reasoning[qid] = meta_text
 
@@ -297,6 +307,7 @@ class AggregationPipeline:
                     research,
                     reasoned_predictions,
                     aggregated_tool_output=aggregated_tool_output,
+                    stacker_wall_timeout=STACKER_SOFT_DEADLINE,
                 ),
                 timeout=STACKER_SOFT_DEADLINE,
             )
@@ -325,6 +336,7 @@ class AggregationPipeline:
                         reasoned_predictions,
                         stacker_llm_override=STACKER_FALLBACK_LLM,
                         aggregated_tool_output=aggregated_tool_output,
+                        stacker_wall_timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                     ),
                     timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                 )

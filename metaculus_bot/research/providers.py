@@ -35,6 +35,7 @@ from metaculus_bot.constants import (
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
@@ -399,11 +400,14 @@ def _native_search_provider(
             citation_style="markdown",
         )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
-        # Wall-clock backstop: see NATIVE_SEARCH_WALL_TIMEOUT in constants.py
-        # for the 2026-05-20 incident that motivated this guard. Mirrors the
-        # AskNews (research_providers.py:89) and gemini gap-fill
-        # (targeted_research.py:182) wrappers.
-        result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
+        # Wall-clock backstop (now owned by invoke_with_transient_retry): see
+        # NATIVE_SEARCH_WALL_TIMEOUT in constants.py for the 2026-05-20 incident
+        # that motivated the hard cap. The transient-retry wrapper additionally
+        # recovers from instant aiohttp blips (litellm #14895) on this
+        # allowed_tries=1 LLM without ever retrying a slow stall (elapsed gate).
+        result = await invoke_with_transient_retry(
+            lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="native_search"
+        )
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
         return result
 

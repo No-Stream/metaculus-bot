@@ -17,6 +17,7 @@ from typing import Any
 from forecasting_tools import GeneralLlm, MetaculusQuestion
 
 from metaculus_bot.constants import (
+    CRUX_SOFT_DEADLINE,
     GAP_FILL_ANALYZER_MODEL,
     GAP_FILL_ANALYZER_TIMEOUT,
     GAP_FILL_ANALYZER_WALL_TIMEOUT,
@@ -25,6 +26,7 @@ from metaculus_bot.constants import (
     GAP_FILL_RESOLVER_REASONING_EFFORT,
     NATIVE_SEARCH_WALL_TIMEOUT,
 )
+from metaculus_bot.llm_retry import invoke_with_broad_retry, invoke_with_transient_retry
 from metaculus_bot.prompts import (
     disagreement_crux_prompt,
     gap_fill_analyzer_prompt,
@@ -71,7 +73,14 @@ async def extract_disagreement_crux(
     """
     prompt = disagreement_crux_prompt(question_text, base_prediction_texts)
     logger.info(f"Extracting disagreement crux from {len(base_prediction_texts)} forecaster analyses")
-    crux = await analyzer_llm.invoke(prompt)
+    # Broad, 30s-gated retry (DISAGREEMENT_ANALYZER_LLM is allowed_tries=1 in
+    # llm_configs.py): recovers a fast blip / empty-response while obeying the
+    # universal "no retry after 30s" deadline rule. wall_timeout mirrors the
+    # CRUX_SOFT_DEADLINE asyncio.wait_for already applied at the forecaster.py
+    # call site (~697).
+    crux = await invoke_with_broad_retry(
+        lambda: analyzer_llm.invoke(prompt), wall_timeout=CRUX_SOFT_DEADLINE, label="disagreement_crux"
+    )
     logger.info(f"Disagreement crux extracted: {len(crux)} chars")
     return crux
 
@@ -93,12 +102,17 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
     llm = build_native_search_llm()
     prompt = targeted_search_prompt(crux, question_text, is_benchmarking=is_benchmarking)
     logger.info(f"Running targeted search via {llm.model} for crux: {crux[:100]}...")
-    # Wall-clock backstop: shares NATIVE_SEARCH_WALL_TIMEOUT with the
-    # native_search research provider since both call the same LLM
-    # configuration via build_native_search_llm. The 2026-05-20 OpenRouter
-    # whitespace-drip incident defeated litellm's per-HTTP-request timeout;
-    # asyncio.wait_for is the hard cap regardless of upstream behavior.
-    result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
+    # Wall-clock backstop (now owned by invoke_with_transient_retry): shares
+    # NATIVE_SEARCH_WALL_TIMEOUT with the native_search research provider since
+    # both call the same LLM configuration via build_native_search_llm. The
+    # 2026-05-20 OpenRouter whitespace-drip incident defeated litellm's
+    # per-HTTP-request timeout; the wall_timeout is the hard cap regardless of
+    # upstream behavior. The transient-retry wrapper additionally recovers from
+    # instant aiohttp blips (litellm #14895) on this allowed_tries=1 LLM without
+    # ever retrying a slow stall (elapsed gate).
+    result = await invoke_with_transient_retry(
+        lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="targeted_search"
+    )
     logger.info(f"Targeted search complete: {len(result)} chars")
     return result
 
@@ -197,10 +211,15 @@ async def _run_analyzer(
         max_gaps=GAP_FILL_MAX_GAPS,
     )
     logger.info(f"GapFill: calling analyzer {GAP_FILL_ANALYZER_MODEL} for gap identification")
-    # Wall-clock backstop has slight headroom over the litellm per-request
-    # timeout (135s vs 120s) so the cleaner per-request error fires first when
-    # possible, mirroring NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT.
-    raw_text = await asyncio.wait_for(llm.invoke(prompt), timeout=GAP_FILL_ANALYZER_WALL_TIMEOUT)
+    # Wall-clock backstop (now owned by invoke_with_transient_retry) has slight
+    # headroom over the litellm per-request timeout (135s vs 120s) so the cleaner
+    # per-request error fires first when possible, mirroring
+    # NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT. The transient-retry
+    # wrapper recovers from instant aiohttp blips (litellm #14895) on this
+    # allowed_tries=1 LLM without retrying a slow stall (elapsed gate).
+    raw_text = await invoke_with_transient_retry(
+        lambda: llm.invoke(prompt), wall_timeout=GAP_FILL_ANALYZER_WALL_TIMEOUT, label="gap_fill_analyzer"
+    )
     gaps = _parse_gap_list(raw_text, max_gaps=GAP_FILL_MAX_GAPS)
     logger.info(f"GapFill: analyzer returned {len(gaps)} gap(s)")
     return gaps
@@ -230,10 +249,15 @@ async def _resolve_single_gap(
         is_benchmarking=is_benchmarking,
     )
     llm = build_native_search_llm(GAP_FILL_RESOLVER_MODEL, reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT)
-    # Wall-clock backstop shared with the native_search provider / targeted search
-    # (same build_native_search_llm config); asyncio.wait_for is the hard cap
-    # regardless of upstream whitespace-drip behavior (2026-05-20 incident).
-    return await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
+    # Wall-clock backstop (now owned by invoke_with_transient_retry) shared with
+    # the native_search provider / targeted search (same build_native_search_llm
+    # config); the wall_timeout is the hard cap regardless of upstream
+    # whitespace-drip behavior (2026-05-20 incident). The transient-retry wrapper
+    # recovers from instant aiohttp blips (litellm #14895) on this allowed_tries=1
+    # LLM without retrying a slow stall (elapsed gate).
+    return await invoke_with_transient_retry(
+        lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="gap_fill_resolver"
+    )
 
 
 async def run_gap_fill_pass(

@@ -156,27 +156,91 @@ class TestAskNewsSummarization:
 
     @pytest.mark.asyncio
     async def test_soft_falls_back_to_raw_on_transient_summarizer_error(self, orchestrator, question):
-        """Transient LLM-provider errors (timeouts, API hiccups) soft-fail to the raw articles."""
-        with patch.object(
-            orchestrator._summarizer_llm,
-            "invoke",
-            new_callable=AsyncMock,
-            side_effect=asyncio.TimeoutError("summarizer timed out"),
+        """Transient LLM-provider errors (timeouts, API hiccups) soft-fail to the raw articles.
+
+        Round-2: the summarizer invoke is wrapped in the broad 30s-gated retry, which
+        retries this fast asyncio.TimeoutError the full backoff schedule before it
+        surfaces and is caught by _SUMMARIZER_TRANSIENT_EXCEPTIONS → raw articles.
+        asyncio.sleep is patched so the backoffs are instant.
+        """
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                side_effect=asyncio.TimeoutError("summarizer timed out"),
+            ),
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "raw asknews articles"
 
+    @pytest.mark.asyncio
     async def test_non_transient_summarizer_error_propagates(self, orchestrator, question):
-        """A genuine bug (not a transient API error) must crash, not silently degrade."""
-        with patch.object(
-            orchestrator._summarizer_llm,
-            "invoke",
-            new_callable=AsyncMock,
-            side_effect=AttributeError("prompt builder bug"),
+        """A genuine bug must ultimately crash, not silently degrade.
+
+        Round-2: the summarizer invoke is now wrapped in the broad 30s-gated retry,
+        which retries an AttributeError (not in PERMANENT_NO_RETRY_EXCEPTIONS) a few
+        times before exhausting and propagating. The key contract is unchanged —
+        the bug surfaces rather than being swallowed into a soft-fall-back to raw
+        articles (which the _SUMMARIZER_TRANSIENT_EXCEPTIONS catch would NOT do for
+        AttributeError anyway). asyncio.sleep is patched so the backoffs are instant.
+        """
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                side_effect=AttributeError("prompt builder bug"),
+            ),
         ):
             with pytest.raises(AttributeError):
                 await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+    @pytest.mark.asyncio
+    async def test_fast_blip_on_summarizer_invoke_retries_then_succeeds(self, orchestrator, question):
+        """A fast litellm.Timeout on the summarizer invoke is retried; the next call wins.
+
+        Locks the Round-2 broad-retry wiring: SUMMARIZER_LLM is allowed_tries=1, so
+        this gated wrapper is its sole retry layer.
+        """
+        import litellm.exceptions as litellm_exc
+
+        invoke = AsyncMock(side_effect=[litellm_exc.Timeout("blip", model="m", llm_provider="openrouter"), "summary"])
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(orchestrator._summarizer_llm, "invoke", new=invoke),
+        ):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert result == "summary"
+        assert invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_slow_summarizer_failure_not_retried_soft_falls_to_raw(self, orchestrator, question):
+        """A summarizer failure past the 30s gate is NOT retried; it soft-falls to raw articles.
+
+        A slow litellm.Timeout is a transient-type exception that _SUMMARIZER_TRANSIENT_
+        EXCEPTIONS catches, so after the gate blocks the retry the orchestrator returns
+        the raw articles (one invoke, no deadline-risking re-fire).
+        """
+        import litellm.exceptions as litellm_exc
+
+        from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
+
+        invoke = AsyncMock(side_effect=litellm_exc.Timeout("stall", model="m", llm_provider="openrouter"))
+        clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 20)
+
+        with (
+            patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
+            patch.object(orchestrator._summarizer_llm, "invoke", new=invoke),
+        ):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert result == "raw asknews articles"
+        assert invoke.await_count == 1
 
     @pytest.mark.asyncio
     async def test_only_asknews_is_summarized(self, orchestrator, question):

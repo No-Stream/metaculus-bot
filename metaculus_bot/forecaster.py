@@ -37,6 +37,7 @@ from metaculus_bot.constants import (
     MIN_FORECASTERS_TO_PUBLISH,
     NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
+    STACKER_SOFT_DEADLINE,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
@@ -398,6 +399,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         reasoned_predictions: list[ReasonedPrediction[PredictionTypes]],
         stacker_llm_override: GeneralLlm | None = None,
         aggregated_tool_output: str | None = None,
+        stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
     ) -> PredictionTypes:
         return await self._pipeline.run_stacking(
             question,
@@ -405,6 +407,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             reasoned_predictions,
             stacker_llm_override=stacker_llm_override,
             aggregated_tool_output=aggregated_tool_output,
+            stacker_wall_timeout=stacker_wall_timeout,
         )
 
     async def run_research(self, question: MetaculusQuestion) -> str:
