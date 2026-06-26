@@ -166,9 +166,16 @@ test_fast:
 # --- Research persistence (backtest replay) ---
 
 # Sync research archive: download GHA artifacts (source of truth) + backfill
-# from Metaculus comments for anything missing. Run before backtests.
+# from Metaculus comments for anything missing.
+#
+# WHY RUN THIS REGULARLY: GHA uploads each run's research_outputs/ artifact with
+# retention-days: 90 (run_bot_on_{tournament,metaculus_cup,minibench}.yaml). After
+# 90 days the artifact is deleted FOREVER, so backtests/research_archive/ is the
+# only durable copy. The download phase sweeps ALL THREE run-workflows and pages
+# back the full 90-day window by default. Schedule it WEEKLY (well inside 90 days);
+# see scripts/research_sync/ for the launchd job. Also run before backtests.
 sync_research:
-	@echo "=== Downloading GHA artifacts ==="
+	@echo "=== Downloading GHA artifacts (all run-workflows, 90-day window) ==="
 	uv run python scripts/download_research.py $(ARGS)
 	@echo ""
 	@echo "=== Backfilling from Metaculus comments (historical) ==="
@@ -184,7 +191,9 @@ sync_research:
 backfill_research:
 	uv run python scripts/backfill_research_from_logs.py $(ARGS)
 
-# Download research artifacts from recent GHA runs into local archive.
+# Download research artifacts from recent GHA runs into local archive. Sweeps all
+# three run-workflows (tournament + metaculus_cup + minibench) across the 90-day
+# retention window by default. Pass ARGS="--workflow X.yaml --since-days N" to scope.
 download_research:
 	uv run python scripts/download_research.py $(ARGS)
 

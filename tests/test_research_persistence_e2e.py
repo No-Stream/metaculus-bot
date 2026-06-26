@@ -9,12 +9,20 @@ Tests the full flow across all components:
 
 import json
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
-from scripts.download_research import build_archive, deduplicate_records
+from scripts.download_research import (
+    DEFAULT_WORKFLOWS,
+    build_archive,
+    deduplicate_records,
+    download_all_workflows,
+    list_runs_in_window,
+)
 
 # --- Realistic test data ---
 
@@ -400,6 +408,108 @@ class TestDownloadMergeE2E:
         assert "50001" in manifest
         assert manifest["50001"]["versions_count"] == 2
         assert sorted(manifest["50001"]["providers"]) == ["gemini_search", "native_search"]
+
+
+def _iso(dt: datetime) -> str:
+    """Render a datetime as a GH-style 'YYYY-MM-DDTHH:MM:SSZ' createdAt string."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestMultiWorkflowSweep:
+    """Test the multi-workflow download loop, date-windowing, and cross-workflow dedup.
+
+    All `gh` calls are mocked — no live GitHub access, so the suite stays self-contained.
+    """
+
+    def test_default_workflows_cover_all_three_run_workflows(self) -> None:
+        assert DEFAULT_WORKFLOWS == [
+            "run_bot_on_tournament.yaml",
+            "run_bot_on_metaculus_cup.yaml",
+            "run_bot_on_minibench.yaml",
+        ]
+
+    def test_list_runs_in_window_pages_until_cutoff(self) -> None:
+        """With a date window, paging stops once a run falls outside since_days."""
+        now = datetime.now(timezone.utc)
+        # Newest-first batch: two inside a 90-day window, one well outside it.
+        batch = [
+            {"databaseId": 3, "createdAt": _iso(now - timedelta(days=1))},
+            {"databaseId": 2, "createdAt": _iso(now - timedelta(days=10))},
+            {"databaseId": 1, "createdAt": _iso(now - timedelta(days=120))},
+        ]
+        with mock.patch("scripts.download_research.list_runs_with_artifacts", return_value=batch) as m:
+            runs = list_runs_in_window("wf.yaml", "repo", since_days=90, page_size=1000, max_runs=5000)
+
+        assert [r["databaseId"] for r in runs] == [3, 2]
+        # Oldest run was outside the window, so we stop after one page.
+        assert m.call_count == 1
+
+    def test_list_runs_in_window_disabled_uses_single_page(self) -> None:
+        """since_days <= 0 falls back to a single limit-sized page (legacy behavior)."""
+        batch = [{"databaseId": 9, "createdAt": "2026-01-01T00:00:00Z"}]
+        with mock.patch("scripts.download_research.list_runs_with_artifacts", return_value=batch) as m:
+            runs = list_runs_in_window("wf.yaml", "repo", since_days=0, page_size=200, max_runs=5000)
+
+        assert [r["databaseId"] for r in runs] == [9]
+        m.assert_called_once_with("wf.yaml", 200, "repo")
+
+    def test_download_all_workflows_loops_and_dedups(self) -> None:
+        """Sweeps every workflow, dedups run ids across workflows, aggregates records."""
+        now = datetime.now(timezone.utc)
+        # Per-workflow run lists. Run 100 appears under TWO workflows — must download once.
+        runs_by_workflow = {
+            "run_bot_on_tournament.yaml": [
+                {"databaseId": 100, "createdAt": _iso(now - timedelta(days=1))},
+                {"databaseId": 101, "createdAt": _iso(now - timedelta(days=2))},
+            ],
+            "run_bot_on_metaculus_cup.yaml": [
+                {"databaseId": 100, "createdAt": _iso(now - timedelta(days=1))},  # dup run id
+                {"databaseId": 200, "createdAt": _iso(now - timedelta(days=3))},
+            ],
+            "run_bot_on_minibench.yaml": [
+                {"databaseId": 300, "createdAt": _iso(now - timedelta(days=4))},
+            ],
+        }
+
+        records_by_run = {
+            100: [{"qid": 1, "run_id": "100", "timestamp": "t1"}],
+            101: [{"qid": 2, "run_id": "101", "timestamp": "t2"}],
+            200: [{"qid": 3, "run_id": "200", "timestamp": "t3"}],
+            300: [],  # zero-artifact run (common case)
+        }
+
+        def fake_list_in_window(workflow, *_args):  # noqa: ANN001, ANN002, ANN202
+            return runs_by_workflow[workflow]
+
+        def fake_download(run_id, *_args):  # noqa: ANN001, ANN002, ANN202
+            # Mimic download_artifact: only runs with artifacts return "files" (here, the run id).
+            return [run_id] if records_by_run.get(run_id) else []
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_runs_in_window", side_effect=fake_list_in_window),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch(
+                "scripts.download_research.load_jsonl_records",
+                side_effect=lambda f: records_by_run[f],
+            ),
+        ):
+            records = download_all_workflows(
+                workflows=DEFAULT_WORKFLOWS,
+                repo="repo",
+                since_days=90,
+                page_size=1000,
+                max_runs=5000,
+            )
+
+        # Run 100 downloaded once despite appearing under two workflows.
+        attempted = [c.args[0] for c in dl.call_args_list]
+        assert attempted.count(100) == 1
+        assert sorted(attempted) == [100, 101, 200, 300]
+
+        # Records aggregated from runs 100, 101, 200 (300 had none).
+        qids = sorted(r["qid"] for r in records)
+        assert qids == [1, 2, 3]
 
 
 class TestFullRoundTrip:
