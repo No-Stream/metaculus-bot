@@ -8,6 +8,7 @@ Tests the full flow across all components:
 """
 
 import json
+import subprocess
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,11 +18,10 @@ from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
 from scripts.download_research import (
-    DEFAULT_WORKFLOWS,
     build_archive,
     deduplicate_records,
-    download_all_workflows,
-    list_runs_in_window,
+    download_research_artifacts,
+    list_research_artifacts,
 )
 
 # --- Realistic test data ---
@@ -415,101 +415,179 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class TestMultiWorkflowSweep:
-    """Test the multi-workflow download loop, date-windowing, and cross-workflow dedup.
+def _artifact(name: str, run_id: int, created: datetime, expired: bool = False) -> dict:
+    """Build an artifact object as emitted by `list_research_artifacts`'s --jq projection."""
+    return {
+        "id": run_id * 10,
+        "name": name,
+        "created_at": _iso(created),
+        "expires_at": _iso(created + timedelta(days=90)),
+        "expired": expired,
+        "size_in_bytes": 1234,
+        "run_id": run_id,
+    }
+
+
+def _gh_stdout(artifacts: list[dict]) -> str:
+    """Mimic `gh api --paginate ... --jq` output: one JSON object per line."""
+    return "\n".join(json.dumps(a) for a in artifacts) + "\n"
+
+
+class TestArtifactsEndpointSweep:
+    """Test the complete artifacts-endpoint download path: filtering, expiry logging, dedup.
 
     All `gh` calls are mocked — no live GitHub access, so the suite stays self-contained.
     """
 
-    def test_default_workflows_cover_all_three_run_workflows(self) -> None:
-        assert DEFAULT_WORKFLOWS == [
-            "run_bot_on_tournament.yaml",
-            "run_bot_on_metaculus_cup.yaml",
-            "run_bot_on_minibench.yaml",
-        ]
-
-    def test_list_runs_in_window_pages_until_cutoff(self) -> None:
-        """With a date window, paging stops once a run falls outside since_days."""
+    def test_list_research_artifacts_parses_paginated_stream(self) -> None:
+        """`gh api --paginate ... --jq` emits one object per line; parse them all."""
         now = datetime.now(timezone.utc)
-        # Newest-first batch: two inside a 90-day window, one well outside it.
-        batch = [
-            {"databaseId": 3, "createdAt": _iso(now - timedelta(days=1))},
-            {"databaseId": 2, "createdAt": _iso(now - timedelta(days=10))},
-            {"databaseId": 1, "createdAt": _iso(now - timedelta(days=120))},
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-200", 200, now - timedelta(days=2)),
+            _artifact("some-other-artifact", 300, now - timedelta(days=3)),
         ]
-        with mock.patch("scripts.download_research.list_runs_with_artifacts", return_value=batch) as m:
-            runs = list_runs_in_window("wf.yaml", "repo", since_days=90, page_size=1000, max_runs=5000)
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=_gh_stdout(artifacts), stderr="")
+        with mock.patch("scripts.download_research.subprocess.run", return_value=completed) as run:
+            parsed = list_research_artifacts("repo")
 
-        assert [r["databaseId"] for r in runs] == [3, 2]
-        # Oldest run was outside the window, so we stop after one page.
-        assert m.call_count == 1
+        # The REST endpoint is NOT workflow-scoped: it returns ALL artifacts (filtering
+        # to research-* happens downstream), so all three rows parse.
+        assert [a["name"] for a in parsed] == ["research-100", "research-200", "some-other-artifact"]
+        # We page via the artifacts endpoint with --paginate, not `gh run list`.
+        cmd = run.call_args.args[0]
+        assert cmd[:3] == ["gh", "api", "--paginate"]
+        assert "/repos/repo/actions/artifacts?per_page=100" in cmd
 
-    def test_list_runs_in_window_disabled_uses_single_page(self) -> None:
-        """since_days <= 0 falls back to a single limit-sized page (legacy behavior)."""
-        batch = [{"databaseId": 9, "createdAt": "2026-01-01T00:00:00Z"}]
-        with mock.patch("scripts.download_research.list_runs_with_artifacts", return_value=batch) as m:
-            runs = list_runs_in_window("wf.yaml", "repo", since_days=0, page_size=200, max_runs=5000)
+    def test_list_research_artifacts_exits_on_gh_failure(self) -> None:
+        """A gh error is fail-fast (sys.exit), never silently swallowed."""
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        with mock.patch("scripts.download_research.subprocess.run", return_value=failed):
+            try:
+                list_research_artifacts("repo")
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("expected SystemExit on gh failure")
 
-        assert [r["databaseId"] for r in runs] == [9]
-        m.assert_called_once_with("wf.yaml", 200, "repo")
-
-    def test_download_all_workflows_loops_and_dedups(self) -> None:
-        """Sweeps every workflow, dedups run ids across workflows, aggregates records."""
+    def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:  # noqa: ANN001
+        """Live research-* downloaded; expired logged (not downloaded); non-research ignored."""
         now = datetime.now(timezone.utc)
-        # Per-workflow run lists. Run 100 appears under TWO workflows — must download once.
-        runs_by_workflow = {
-            "run_bot_on_tournament.yaml": [
-                {"databaseId": 100, "createdAt": _iso(now - timedelta(days=1))},
-                {"databaseId": 101, "createdAt": _iso(now - timedelta(days=2))},
-            ],
-            "run_bot_on_metaculus_cup.yaml": [
-                {"databaseId": 100, "createdAt": _iso(now - timedelta(days=1))},  # dup run id
-                {"databaseId": 200, "createdAt": _iso(now - timedelta(days=3))},
-            ],
-            "run_bot_on_minibench.yaml": [
-                {"databaseId": 300, "createdAt": _iso(now - timedelta(days=4))},
-            ],
-        }
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-200", 200, now - timedelta(days=2)),
+            _artifact("research-999", 999, now - timedelta(days=95), expired=True),  # past retention
+            _artifact("benchmark-results", 300, now - timedelta(days=1)),  # not research-*
+        ]
 
         records_by_run = {
             100: [{"qid": 1, "run_id": "100", "timestamp": "t1"}],
-            101: [{"qid": 2, "run_id": "101", "timestamp": "t2"}],
-            200: [{"qid": 3, "run_id": "200", "timestamp": "t3"}],
-            300: [],  # zero-artifact run (common case)
+            200: [{"qid": 2, "run_id": "200", "timestamp": "t2"}],
         }
 
-        def fake_list_in_window(workflow, *_args):  # noqa: ANN001, ANN002, ANN202
-            return runs_by_workflow[workflow]
-
-        def fake_download(run_id, *_args):  # noqa: ANN001, ANN002, ANN202
-            # Mimic download_artifact: only runs with artifacts return "files" (here, the run id).
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
             return [run_id] if records_by_run.get(run_id) else []
 
         with (
             mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_runs_in_window", side_effect=fake_list_in_window),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch("scripts.download_research.load_jsonl_records", side_effect=lambda f: records_by_run[f]),
+            caplog.at_level("WARNING", logger="scripts.download_research"),
+        ):
+            records = download_research_artifacts(repo="repo", since_days=0)
+
+        # Only the two LIVE research artifacts were downloaded.
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100, 200]
+
+        # The expired research artifact was NOT downloaded but WAS logged loudly by name + date.
+        assert 999 not in attempted
+        assert any("research-999" in r.message and "LOST" in r.message for r in caplog.records)
+
+        # Records aggregated only from the live downloads.
+        assert sorted(r["qid"] for r in records) == [1, 2]
+
+    def test_dedup_by_run_id_downloads_once(self) -> None:
+        """Two artifact rows sharing a workflow_run id are downloaded at most once."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-100-retry", 100, now - timedelta(hours=1)),  # same run_id
+            _artifact("research-200", 200, now - timedelta(days=2)),
+        ]
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return [run_id]
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
             mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
             mock.patch(
                 "scripts.download_research.load_jsonl_records",
-                side_effect=lambda f: records_by_run[f],
+                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
             ),
         ):
-            records = download_all_workflows(
-                workflows=DEFAULT_WORKFLOWS,
-                repo="repo",
-                since_days=90,
-                page_size=1000,
-                max_runs=5000,
-            )
+            download_research_artifacts(repo="repo", since_days=0)
 
-        # Run 100 downloaded once despite appearing under two workflows.
-        attempted = [c.args[0] for c in dl.call_args_list]
-        assert attempted.count(100) == 1
-        assert sorted(attempted) == [100, 101, 200, 300]
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100, 200]  # run 100 downloaded once despite two artifact rows
 
-        # Records aggregated from runs 100, 101, 200 (300 had none).
-        qids = sorted(r["qid"] for r in records)
-        assert qids == [1, 2, 3]
+    def test_since_days_post_filter_excludes_old_artifacts(self) -> None:
+        """--since-days windows out live artifacts created before the cutoff."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),  # inside 7-day window
+            _artifact("research-200", 200, now - timedelta(days=30)),  # outside 7-day window
+        ]
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return [run_id]
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch(
+                "scripts.download_research.load_jsonl_records",
+                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
+            ),
+        ):
+            download_research_artifacts(repo="repo", since_days=7)
+
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100]  # only the recent artifact
+
+    def test_full_flow_rebuilds_manifest(self, tmp_path: Path) -> None:
+        """The downloaded records feed build_archive and produce a manifest (rebuild intact)."""
+        now = datetime.now(timezone.utc)
+        artifacts = [_artifact("research-100", 100, now - timedelta(days=1))]
+
+        record = {
+            "qid": 43613,
+            "run_id": "100",
+            "timestamp": "2026-06-20T10:00:00Z",
+            "research_text": "Downloaded research",
+            "providers_used": ["asknews"],
+        }
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", return_value=[100]),
+            mock.patch("scripts.download_research.load_jsonl_records", return_value=[record]),
+        ):
+            records = download_research_artifacts(repo="repo", since_days=0)
+
+        deduped = deduplicate_records(records)
+        archive_dir = tmp_path / "archive"
+        build_archive(deduped, archive_dir)
+
+        manifest = json.loads((archive_dir / "manifest.json").read_text())
+        assert "43613" in manifest
+        assert manifest["43613"]["latest_timestamp"] == "2026-06-20T10:00:00Z"
+        assert manifest["43613"]["providers"] == ["asknews"]
 
 
 class TestFullRoundTrip:

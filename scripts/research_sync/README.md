@@ -20,8 +20,9 @@ weekly — well inside the 90-day window, with margin for a missed week.
 
 1. `cd`s to the repo,
 2. prepends the dirs holding `uv` and `gh` to `PATH` (launchd jobs get a minimal PATH),
-3. runs `make sync_research` (sweeps all three run-workflows across the 90-day window,
-   backfills from Metaculus comments, rebuilds the archive),
+3. runs `make sync_research` (enumerates EVERY `research-*` artifact via the complete,
+   paginated artifacts REST endpoint — no 1000-result `gh run list` cap, so nothing in
+   the 90-day window is missed — backfills from Metaculus comments, rebuilds the archive),
 4. appends a dated logfile under `scripts/research_sync/logs/`.
 
 `sync_research` hits only the **read-only, free** GitHub + Metaculus APIs — no paid
@@ -78,8 +79,23 @@ tail -n 40 /Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/lau
 
 A healthy run ends with `research-sync finished OK at ...` and the manifest under
 `backtests/research_archive/manifest.json` updates its `latest_timestamp` values. If
-the archive looks stale, check the logfile — the download phase logs per-workflow
-"checked N runs, M had artifacts, K records added" so a short or empty pull is visible.
+the archive looks stale, check the logfile — the download phase logs "Artifacts
+endpoint returned N total, M research-* artifacts", how many downloaded, records added,
+and (loudly) any EXPIRED artifact by name + created_at so a short pull or any data loss
+is visible.
+
+## Verifying maximal completeness
+
+After a sync, prove the archive captured every live artifact:
+
+```bash
+uv run python -m scripts.research_sync.verify_completeness
+```
+
+It re-enumerates every live `research-*` artifact via the same paginated endpoint, loads
+the rebuilt archive, and prints PASS / FAIL with the exact count of live artifacts vs.
+those represented in the archive — flagging any genuine gap and any expired (lost-forever)
+artifact. Read-only and free (GitHub API only).
 
 ## Logs
 
