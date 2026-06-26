@@ -169,6 +169,9 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
         f"""
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
+            Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from
+            your training that the research reports don't cover, you may rely on it. You are not required to ground
+            every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
             Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
             includes a market on this question, default to treating its price as a serious signal: if the market's
             resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
@@ -181,8 +184,6 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             its date and project to ours under a constant-hazard / base-rate-over-time assumption (or whatever simple
             model fits): a longer window to our date implies a higher cumulative probability, a shorter window a
             lower one (e.g. 30% YES by an earlier date X projects upward by our later date Y). Show the arithmetic.
-            You may still deviate from a market when the evidence has genuine gaps your expertise fills, but say what
-            the gap is.
 
             Your Metaculus question is:
             {question.question_text}
@@ -303,6 +304,9 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
         Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
         over-confidence and make sure your probabilities sum to **100%**.
+        Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
+        training that the research reports don't cover, you may rely on it. You are not required to ground every claim
+        in the research; just be clear when you're drawing on your own knowledge versus the research.
         Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
         includes a market on this question, default to treating its prices as a serious signal: if the market's
         resolution criteria, resolution date, and other material terms MATCH this question, it is extremely strong
@@ -313,8 +317,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our resolution date with a simple model and
         STATE the assumption. Treat the market price as a probability at its date and project to ours under a
         constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer window to our date
-        implies a higher cumulative probability, a shorter window a lower one. Show the arithmetic. You may still
-        deviate from a market when the evidence has genuine gaps your expertise fills, but say what the gap is.
+        implies a higher cumulative probability, a shorter window a lower one. Show the arithmetic.
 
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
@@ -429,6 +432,9 @@ def numeric_prompt(
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your prediction interval) are critical.
+        Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
+        training that the research reports don't cover, you may rely on it. You are not required to ground every claim
+        in the research; just be clear when you're drawing on your own knowledge versus the research.
         Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
         relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
         For stable, well-measured indicators with recent data (economic indices, demographic measures,
@@ -447,8 +453,7 @@ def numeric_prompt(
         simple model and STATE the assumption. Project from the market's date to ours under a constant-hazard,
         trend-continuation, or base-rate-over-time assumption (or whatever simple model fits): a longer window to our
         date generally widens the spread and shifts the implied level, a shorter window tightens it.
-        Show the arithmetic. You may still deviate from a market when the evidence has genuine gaps your expertise
-        fills, but say what the gap is.
+        Show the arithmetic.
 
         ── Question ──
         {question.question_text}

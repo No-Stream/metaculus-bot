@@ -442,7 +442,13 @@ class TestPredictionMarketFraming:
     """The forecaster prompts must frame prediction markets as STRONG EVIDENCE
     to weight heavily — not the old "not beholden" footnote — with a precise
     conditional adjustment: anchor when the market's resolution criteria AND
-    date match the question, discount proportionally to any specific mismatch.
+    date match the question, discount proportionally to any specific mismatch,
+    and extrapolate across a date-only mismatch.
+
+    The PM clause must NOT carry a "you may deviate from a market" carve-out:
+    that sentence undercut the strong-evidence framing. The general principle
+    that a forecaster may supplement the research with its own training
+    knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
 
     Leakage note: these forecaster prompts have no ``is_benchmarking`` branch —
     benchmarking suppression happens upstream at the research-data layer (the
@@ -467,6 +473,17 @@ class TestPredictionMarketFraming:
         assert "show the arithmetic" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
+        # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
+        # it undercut the strong-evidence framing. The general expertise principle is
+        # asserted separately below.
+        assert "deviate from a market" not in lowered
+
+    def _assert_general_expertise_principle(self, prompt: str) -> None:
+        """The prompt-wide directive that a forecaster may draw on its own training
+        knowledge to fill research gaps — distinct from any market-specific clause."""
+        lowered = " ".join(prompt.lower().split())
+        assert "use your own expertise and knowledge, not only the provided research" in lowered
+        assert "you are not required to ground every claim in the research" in lowered
 
     def test_binary_prompt_frames_markets_as_strong_evidence(self) -> None:
         self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research="r"))
@@ -477,6 +494,16 @@ class TestPredictionMarketFraming:
     def test_numeric_prompt_frames_markets_as_strong_evidence(self) -> None:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         self._assert_strong_evidence_framing(result)
+
+    def test_binary_prompt_carries_general_expertise_principle(self) -> None:
+        self._assert_general_expertise_principle(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_general_expertise_principle(self) -> None:
+        self._assert_general_expertise_principle(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_general_expertise_principle(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_general_expertise_principle(result)
 
     def test_strong_evidence_framing_present_non_benchmarking_absent_benchmarking(self) -> None:
         """Leakage guard: the prediction-market nudge in the research prompt is

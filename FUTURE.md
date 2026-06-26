@@ -543,14 +543,19 @@ doesn't surface the right information.
 Could prototype with selective activation (only for questions where initial research
 scores poorly on a relevance check).
 
-### Prediction market integration (read, not anchor)
+### Prediction market integration (strong evidence, criteria/date-matched)
 
 Direct API access to Polymarket, Kalshi, Metaculus community predictions (where available)
 as one research input. Currently markets show up in web search results inconsistently.
 Structured access would be more reliable.
 
-Important: should be presented as one noisy input, not an anchor. The prompt already says
-"not beholden to them" and our analysis found this works reasonably well.
+Framing: markets are STRONG EVIDENCE, not a footnote. The forecaster prompts now instruct
+models to anchor on a market whose resolution criteria and date MATCH the question, discount
+proportionally to any specific mismatch, and — when the only difference is the resolution
+DATE — explicitly extrapolate the market's probability to our date with a simple model
+(constant-hazard / base-rate-over-time) rather than applying a vague haircut. Superseded the
+old "not beholden to them" language after a referendum miss where a market sat at the correct
+answer and the bot dismissed it.
 
 ## Killed by May 2026-05 closing analysis
 
