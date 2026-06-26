@@ -863,15 +863,19 @@ def _flatten_results(results: list[Any], platform: str) -> list[MarketMatch]:
 def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     """Compact markdown block for the research prompt.
 
-    Emits a table + raw-rules section + the NOT-AN-ANCHOR caveat that tells
-    the forecaster to verify resolution-criteria alignment before leaning on
-    any market's price.
+    Emits a table + raw-rules section + a strong-evidence caveat: markets are
+    weighted heavily when their resolution criteria and date match the
+    question, and discounted proportionally to any specific mismatch.
     """
     if not snapshot.matches:
         return ""
 
     lines: list[str] = []
-    lines.append("NOT AN ANCHOR -- verify the resolution criteria match before using any market's price.")
+    lines.append(
+        "STRONG EVIDENCE -- weight these markets heavily. Verify each market's resolution criteria AND "
+        "resolution date against the question: if they match, anchor on the price; if they differ, discount "
+        "proportionally to the specific mismatch."
+    )
     lines.append("")
     lines.append("| platform | title | prob | vol | close | conf |")
     lines.append("|---|---|---|---|---|---|")

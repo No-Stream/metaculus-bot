@@ -169,7 +169,20 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
         f"""
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
-            You should consider current prediction markets when possible but not be beholden to them.
+            Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+            includes a market on this question, default to treating its price as a serious signal: if the market's
+            resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
+            strong evidence and should anchor your forecast. If the resolution date or criteria DIFFER, discount it
+            proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
+            burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off as
+            "not an anchor." When the criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the
+            resolution DATE, do NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our
+            resolution date with a simple model and STATE the assumption. Treat the market price as a probability at
+            its date and project to ours under a constant-hazard / base-rate-over-time assumption (or whatever simple
+            model fits): a longer window to our date implies a higher cumulative probability, a shorter window a
+            lower one (e.g. 30% YES by an earlier date X projects upward by our later date Y). Show the arithmetic.
+            You may still deviate from a market when the evidence has genuine gaps your expertise fills, but say what
+            the gap is.
 
             Your Metaculus question is:
             {question.question_text}
@@ -290,7 +303,18 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
         Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
         over-confidence and make sure your probabilities sum to **100%**.
-        Please consider news, research, and prediction markets, but you are not beholden to them.
+        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+        includes a market on this question, default to treating its prices as a serious signal: if the market's
+        resolution criteria, resolution date, and other material terms MATCH this question, it is extremely strong
+        evidence and should anchor your distribution. If the resolution date or criteria DIFFER, discount it
+        proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The burden
+        is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
+        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
+        vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our resolution date with a simple model and
+        STATE the assumption. Treat the market price as a probability at its date and project to ours under a
+        constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer window to our date
+        implies a higher cumulative probability, a shorter window a lower one. Show the arithmetic. You may still
+        deviate from a market when the evidence has genuine gaps your expertise fills, but say what the gap is.
 
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
@@ -412,7 +436,19 @@ def numeric_prompt(
         Do not over-hedge on quantities you can actually predict well.
         Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
         but penalties for overly wide intervals on predictable quantities also accumulate.
-        Please consider news, research, and prediction markets, but you are not beholden to them.
+        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+        includes a market on this quantity, default to treating its implied range as a serious signal: if the
+        market's resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
+        strong evidence and your percentiles should center on it. If the resolution date or criteria DIFFER, discount
+        it proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
+        burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
+        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
+        vague haircut — EXPLICITLY EXTRAPOLATE the market's implied value/probability to our resolution date with a
+        simple model and STATE the assumption. Project from the market's date to ours under a constant-hazard,
+        trend-continuation, or base-rate-over-time assumption (or whatever simple model fits): a longer window to our
+        date generally widens the spread and shifts the implied level, a shorter window tightens it.
+        Show the arithmetic. You may still deviate from a market when the evidence has genuine gaps your expertise
+        fills, but say what the gap is.
 
         ── Question ──
         {question.question_text}

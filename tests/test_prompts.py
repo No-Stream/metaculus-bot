@@ -431,3 +431,60 @@ class TestWebResearchPromptPrimarySources:
 
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
+
+
+# ---------------------------------------------------------------------------
+# Prediction-market framing (strong-evidence, criteria/date-matched weighting)
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionMarketFraming:
+    """The forecaster prompts must frame prediction markets as STRONG EVIDENCE
+    to weight heavily — not the old "not beholden" footnote — with a precise
+    conditional adjustment: anchor when the market's resolution criteria AND
+    date match the question, discount proportionally to any specific mismatch.
+
+    Leakage note: these forecaster prompts have no ``is_benchmarking`` branch —
+    benchmarking suppression happens upstream at the research-data layer (the
+    prediction-market provider is dropped, so ``{research}`` carries no market
+    prices during backtests), which makes this mode-agnostic framing inert
+    when benchmarking. The mode-dependent leakage guard lives on
+    ``web_research_prompt`` (see ``test_strong_evidence_framing_suppressed_when_benchmarking``).
+    """
+
+    def _assert_strong_evidence_framing(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "strong evidence" in lowered
+        assert "weight them heavily" in lowered
+        # The conditional adjustment: match anchors, mismatch discounts.
+        assert "resolution date" in lowered
+        assert "match" in lowered
+        assert "discount" in lowered
+        # Date-only mismatch must trigger an explicit extrapolation, not a vague haircut.
+        assert "extrapolate" in lowered
+        assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
+        assert "show the arithmetic" in lowered
+        # The old "not beholden" footnote must be gone.
+        assert "not beholden" not in lowered
+
+    def test_binary_prompt_frames_markets_as_strong_evidence(self) -> None:
+        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_frames_markets_as_strong_evidence(self) -> None:
+        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_frames_markets_as_strong_evidence(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_strong_evidence_framing(result)
+
+    def test_strong_evidence_framing_present_non_benchmarking_absent_benchmarking(self) -> None:
+        """Leakage guard: the prediction-market nudge in the research prompt is
+        present only when NOT benchmarking. This is the mode-dependent surface
+        — the forecaster prompts above are mode-agnostic because the provider
+        data is suppressed upstream during backtests."""
+        non_bench = web_research_prompt("Will X happen?", is_benchmarking=False)
+        bench = web_research_prompt("Will X happen?", is_benchmarking=True)
+
+        assert "Prediction market" in non_bench
+        assert "Prediction market" not in bench
