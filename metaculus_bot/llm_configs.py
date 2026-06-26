@@ -51,22 +51,29 @@ ACCEPTABLE_QUANTS = [
     "unknown",
 ]
 
+# Per-instance allowed_tries=1 override (Round-2): forecaster .invoke is wrapped
+# in the broad, 30s-elapsed-gated retry (forecaster_runners.py) so we can impose
+# the universal "no retry after 30s" deadline-safety rule that forecasting-tools'
+# un-gated tenacity cannot. Spread per-instance (NOT by mutating
+# REASONING_MODEL_CONFIG) so PARSER_LLM / STACKER configs are untouched.
+_FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
+
 FORECASTER_LLMS: list[GeneralLlm] = [
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.4",
         reasoning={"effort": "high"},
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.5",
         reasoning={"effort": "high"},
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
         reasoning={"enabled": True},
         extra_body={"verbosity": "high"},
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.6",
@@ -75,11 +82,11 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         # caused silent 600s soft-deadline stalls on hard questions (e.g. Q14333 on 2026-05-07).
         reasoning={"max_tokens": 32_000},
         extra_body={"verbosity": "high"},
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3.1-pro-preview",
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
     # 2026-05-18: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
     # Added explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
@@ -87,7 +94,7 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     build_llm_with_openrouter_fallback(
         model="openrouter/x-ai/grok-4.3",
         reasoning={"effort": "high"},
-        **REASONING_MODEL_CONFIG,
+        **_FORECASTER_CONFIG,
     ),
 ]
 
@@ -110,14 +117,18 @@ FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FO
 # rate-limit exposure than the donated-key Google route, (3) the donated-key
 # data-policy block on OpenAI is expected to be lifted; until then, summarizer
 # bills to personal OPENROUTER_API_KEY (~$0.01/call × every Q).
+# allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
+# 30s-gated retry (orchestrator._summarize_asknews) to impose the universal
+# "no retry after 30s" deadline rule. Per-instance override so PARSER_LLM (which
+# also uses DETERMINISTIC_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.4-mini",
     reasoning={"effort": "low"},
-    **DETERMINISTIC_MODEL_CONFIG,
+    **{**DETERMINISTIC_MODEL_CONFIG, "allowed_tries": 1},
 )
 # Parser should be a reliable, low-latency model for structure extraction
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5-mini",
+    "openrouter/openai/gpt-5.4-mini",
     reasoning={"effort": "low"},
     **DETERMINISTIC_MODEL_CONFIG,
 )
@@ -157,13 +168,13 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 
 # Keyword-extraction LLM config for the prediction-market provider.
 # Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
-# gpt-5-mini reasoning=low burns 128-512 tokens on invisible reasoning before
+# gpt-5.4-mini reasoning=low burns 128-512 tokens on invisible reasoning before
 # emitting any visible response, so max_tokens=800 is load-bearing.
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
-    "model": "openrouter/openai/gpt-5-mini",
+    "model": "openrouter/openai/gpt-5.4-mini",
     "temperature": 0.0,
     "max_tokens": 800,
     "reasoning_effort": "low",
@@ -177,8 +188,12 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 # effort alongside the broader tier-B consolidation (native_search also at low):
 # 1-3 sentence crux extraction is structure-following with light judgment, not
 # deep reasoning. Cost roughly halves (~$4 → ~$1.50/tournament).
+# allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
+# 30s-gated retry (targeted.extract_disagreement_crux) to impose the universal
+# "no retry after 30s" deadline rule on the conditional-stacking critical path.
+# Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.5",
     reasoning={"effort": "low"},
-    **DETERMINISTIC_MODEL_CONFIG,
+    **{**DETERMINISTIC_MODEL_CONFIG, "allowed_tries": 1},
 )

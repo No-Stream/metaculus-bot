@@ -547,7 +547,7 @@ class TestScreenBatch:
         assert call_kwargs["temperature"] == 0.0
         # max_tokens=32_000 is the combined reasoning+content budget for the
         # default reasoning model (glm-4.5-air:free). Production leakage.py uses
-        # 500 against gpt-5-mini, but 500 starves the reasoning budget on long
+        # 500 against gpt-5.4-mini, but 500 starves the reasoning budget on long
         # blobs and yields content=None. See _build_detector_llm docstring.
         assert call_kwargs["max_tokens"] == 32_000
         # response_format=json_object asks providers to honor JSON-mode. Replaces

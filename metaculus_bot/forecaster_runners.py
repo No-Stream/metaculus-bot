@@ -27,8 +27,9 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
+from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.diagnostics import log_final_prediction
@@ -67,7 +68,13 @@ async def run_binary_forecast(
     parser_llm: GeneralLlm,
 ) -> ReasonedPrediction[float]:
     prompt = binary_prompt(question, research)
-    reasoning = await forecaster_llm.invoke(prompt)
+    # Broad, 30s-gated retry (forecaster instances are allowed_tries=1 in
+    # llm_configs.py): recovers a fast blip / empty-response while obeying the
+    # universal "no retry after 30s" deadline rule. wall_timeout mirrors the outer
+    # FORECASTER_SOFT_DEADLINE that _forecaster_with_soft_deadline already enforces.
+    reasoning = await invoke_with_broad_retry(
+        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_binary"
+    )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
     binary_parse_instructions = (
@@ -97,7 +104,10 @@ async def run_mc_forecast(
     parser_llm: GeneralLlm,
 ) -> ReasonedPrediction[PredictedOptionList]:
     prompt = multiple_choice_prompt(question, research)
-    reasoning = await forecaster_llm.invoke(prompt)
+    # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
+    reasoning = await invoke_with_broad_retry(
+        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_mc"
+    )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
     parsing_instructions = clean_indents(
@@ -148,7 +158,10 @@ async def run_numeric_forecast(
     """
     upper_bound_message, lower_bound_message = bound_messages(question)
     prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
-    reasoning = await forecaster_llm.invoke(prompt)
+    # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
+    reasoning = await invoke_with_broad_retry(
+        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_numeric"
+    )
 
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 

@@ -16,7 +16,8 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
+from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
@@ -71,6 +72,8 @@ async def run_stacking_binary(
     research: str,
     base_texts: Sequence[str],
     aggregated_tool_output: str | None = None,
+    *,
+    stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[float, str]:
     """Invoke the stacker for a binary question and parse to a decimal probability.
 
@@ -79,6 +82,12 @@ async def run_stacking_binary(
     ``aggregated_tool_output``: optional markdown from
     ``metaculus_bot.tool_runner.build_cross_model_aggregation``; injected at
     the top of the stacker prompt. Empty / None → no section emitted.
+
+    ``stacker_wall_timeout``: hard wall-clock cap for the stacker invoke, passed
+    by the pipeline (STACKER_SOFT_DEADLINE primary / STACKER_FALLBACK_SOFT_DEADLINE
+    fallback). The invoke is wrapped in the elapsed-gated transient retry so an
+    instant aiohttp blip (litellm #14895) on this allowed_tries=1 stacker recovers,
+    while a slow stall propagates to engage the pipeline's fallback chain.
     """
     prompt = stacking_binary_prompt(
         question,
@@ -86,7 +95,9 @@ async def run_stacking_binary(
         list(base_texts),
         aggregated_tool_output=aggregated_tool_output,
     )
-    meta_reasoning = await stacker_llm.invoke(prompt)
+    meta_reasoning = await invoke_with_transient_retry(
+        lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
+    )
 
     parse_instructions = (
         "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
@@ -110,11 +121,14 @@ async def run_stacking_mc(
     research: str,
     base_texts: Sequence[str],
     aggregated_tool_output: str | None = None,
+    *,
+    stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[PredictedOptionList, str]:
     """Invoke the stacker for a multiple choice question and parse options.
 
     Returns (PredictedOptionList, meta_reasoning_text). See
-    ``run_stacking_binary`` for ``aggregated_tool_output`` semantics.
+    ``run_stacking_binary`` for ``aggregated_tool_output`` and
+    ``stacker_wall_timeout`` semantics.
     """
     prompt = stacking_multiple_choice_prompt(
         question,
@@ -122,7 +136,9 @@ async def run_stacking_mc(
         list(base_texts),
         aggregated_tool_output=aggregated_tool_output,
     )
-    meta_reasoning = await stacker_llm.invoke(prompt)
+    meta_reasoning = await invoke_with_transient_retry(
+        lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
+    )
 
     # Defined OUTSIDE the try so the fallback (except) branch can also use it
     # without Pyright flagging it as possibly-unbound. Both the strict and
@@ -166,12 +182,15 @@ async def run_stacking_numeric(
     lower_bound_message: str,
     upper_bound_message: str,
     aggregated_tool_output: str | None = None,
+    *,
+    stacker_wall_timeout: float = STACKER_SOFT_DEADLINE,
 ) -> tuple[list[Percentile], str]:
     """Invoke the stacker for a numeric question and parse percentiles.
 
     Returns (declared_percentiles, meta_reasoning_text). The caller should perform
     numeric validation, jitter/clamping, and CDF construction. See
-    ``run_stacking_binary`` for ``aggregated_tool_output`` semantics.
+    ``run_stacking_binary`` for ``aggregated_tool_output`` and
+    ``stacker_wall_timeout`` semantics.
     """
     prompt = stacking_numeric_prompt(
         question,
@@ -181,7 +200,9 @@ async def run_stacking_numeric(
         upper_bound_message,
         aggregated_tool_output=aggregated_tool_output,
     )
-    meta_reasoning = await stacker_llm.invoke(prompt)
+    meta_reasoning = await invoke_with_transient_retry(
+        lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
+    )
 
     unit_str = question.unit_of_measure or "base unit"
     parse_notes = (

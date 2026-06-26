@@ -5,7 +5,7 @@ Tests for PCHIP CDF validation (QA checks that replace forecasting-tools validat
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -32,8 +32,16 @@ class TestPchipValidation:
         # Import here to avoid circular imports in tests
         from main import TemplateForecaster
 
+        # The "default" forecaster LLM's .invoke must be an AsyncMock (awaitable):
+        # run_numeric_forecast wraps it in invoke_with_broad_retry, which awaits the
+        # result. A bare MagicMock().invoke() returns a non-awaitable, which raises a
+        # (broadly-retryable) TypeError and incurs the full ~41s retry backoff. These
+        # tests exercise CDF validation, not the LLM call, so a trivial async stub is
+        # the right fixture; structure_output is patched per-test for the parse step.
+        default_llm = MagicMock()
+        default_llm.invoke = AsyncMock(return_value="reasoning text with percentiles")
         mock_llms = {
-            "default": MagicMock(),
+            "default": default_llm,
             "parser": MagicMock(),
             "researcher": MagicMock(),
             "summarizer": MagicMock(),

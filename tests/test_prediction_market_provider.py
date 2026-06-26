@@ -13,7 +13,7 @@ Tests cover (one per behavior):
 - Kalshi prefetch + client-side fuzzy match + yes_bid/yes_ask -> implied_prob
 - Manifold search + direct probability field
 - `as_of` filter drops post-as-of matches (backtest leakage defense)
-- Keyword-extraction calls gpt-5-mini with max_tokens >= 800 (G0 token-budget trap)
+- Keyword-extraction calls gpt-5.4-mini with max_tokens >= 800 (G0 token-budget trap)
 - Malformed response -> empty snapshot + WARNING logged
 - Polymarket 403 rate-limit -> bounded retry-with-backoff -> eventual empty
 - Per-question timeout -> empty snapshot (soft-fail)
@@ -436,7 +436,7 @@ class TestManifold:
 
 
 # ---------------------------------------------------------------------------
-# Keyword extraction (S4 + S5 union, gpt-5-mini max_tokens >= 800)
+# Keyword extraction (S4 + S5 union, gpt-5.4-mini max_tokens >= 800)
 # ---------------------------------------------------------------------------
 
 
@@ -444,7 +444,7 @@ class TestKeywordExtractor:
     @pytest.mark.asyncio
     async def test_extract_runs_s4_and_s5_with_max_tokens_800(self, mock_question):
         """G0 token-budget trap defense: the extractor MUST request max_tokens >= 800.
-        reasoning=low gpt-5-mini burns 128-512 tokens on invisible reasoning."""
+        reasoning=low gpt-5.4-mini burns 128-512 tokens on invisible reasoning."""
         from metaculus_bot.research import prediction_market as pmp
 
         captured_kwargs: list[dict] = []
@@ -471,8 +471,8 @@ class TestKeywordExtractor:
         assert len(queries) >= 2
         # The constructed LLM must have max_tokens >= 800
         assert all(kw.get("max_tokens", 0) >= 800 for kw in captured_kwargs), captured_kwargs
-        # And use gpt-5-mini
-        assert all("gpt-5-mini" in kw.get("model", "") for kw in captured_kwargs)
+        # And use gpt-5.4-mini
+        assert all("gpt-5.4-mini" in kw.get("model", "") for kw in captured_kwargs)
 
     @pytest.mark.asyncio
     async def test_manifold_gets_extra_s2_query(self, mock_question):

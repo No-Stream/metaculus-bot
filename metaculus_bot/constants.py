@@ -340,9 +340,9 @@ GEMINI_SEARCH_TIMEOUT: int = 360
 
 # --- Second-pass gap-fill ---
 # After first-pass research completes, a cheap analyzer identifies up to
-# GAP_FILL_MAX_GAPS factual gaps; each is resolved by a parallel grounded
-# Gemini search. Fails soft — forecast proceeds with first-pass research alone
-# if any stage errors out.
+# GAP_FILL_MAX_GAPS factual gaps; each is resolved by a parallel OpenAI native
+# web search (see GAP_FILL_RESOLVER_MODEL below). Fails soft — forecast proceeds
+# with first-pass research alone if any stage errors out.
 GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
 # 2026-05-20: migrated analyzer from gemini-3-flash-preview (google-genai SDK
 # direct) to gpt-5.5 effort=low via OpenRouter. The analyzer is non-grounded —
@@ -368,11 +368,29 @@ GAP_FILL_ANALYZER_WALL_TIMEOUT: int = 135
 # non-whitespace characters — likely indicates all providers soft-failed and
 # gap-fill would just hallucinate gaps or burn quota.
 GAP_FILL_MIN_RESEARCH_CHARS: int = 200
+# 2026-06-25: migrated the per-gap RESOLVER off direct-Google grounded Gemini
+# (google-genai, personal GOOGLE_API_KEY) to OpenAI native web search via
+# OpenRouter, which bills the Metaculus-donated key. The resolver fanned out up
+# to GAP_FILL_MAX_GAPS parallel grounded calls per question — a 5x cost
+# multiplier on the personal Google bill, the dominant unwanted spend. The
+# single first-pass grounded Gemini call stays on google-genai (operator is fine
+# paying for 1 call/question, and it uses url_context which OpenRouter can't
+# replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
+#
+# Effort LOW (Round-2, 2026-06-25): the resolver was the ~5-min critical-path
+# bottleneck (it fans out up to GAP_FILL_MAX_GAPS medium-effort calls that gate
+# the forecast). The native_search v3 bench (comparison_v3.md) measured gpt-5.5
+# effort=low at ~50s vs medium ~230s — roughly 4.5× faster; mini scales similarly.
+# Dropping to low keeps gap-fill comfortably inside the per-question deadline.
+# Quality of low-effort gap resolution is to be spot-checked from the GHA
+# test-bot run; bump back to medium here if it skims too much.
+GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.4-mini"
+GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
 FRED_API_KEY_ENV: str = "FRED_API_KEY"
-FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5-mini"
+FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.4-mini"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
@@ -448,6 +466,14 @@ STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 # this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
 CRUX_SOFT_DEADLINE: int = 180
 
+# Wall-clock cap for the AskNews summarizer invoke. The summarizer is set
+# allowed_tries=1 (llm_configs.py) and wrapped in the broad 30s-gated retry, which
+# previously had no wall guard at all. Matches the summarizer's litellm per-request
+# timeout (DETERMINISTIC_MODEL_CONFIG timeout=300) so the per-attempt cap aligns
+# with the underlying request budget; on breach the summarizer soft-fails to the
+# raw AskNews articles rather than hanging the question.
+SUMMARIZER_WALL_TIMEOUT: int = 300
+
 # --- Benchmark driver tuning ---
 HEARTBEAT_INTERVAL: int = 60
 FETCH_RETRY_BACKOFFS: list[int] = [5, 15]
@@ -462,7 +488,7 @@ BACKTEST_DEFAULT_RESOLVED_AFTER: str = "2025-12-01"
 BACKTEST_DEFAULT_TOURNAMENT: str = "fall-aib-2025"
 BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
-LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5-mini"
+LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5.4-mini"
 
 # --- Per-type stacking gates ---
 # Each question type has an independent enable/disable flag. All three default

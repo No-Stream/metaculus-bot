@@ -1,15 +1,20 @@
 """Tests for the second-pass gap-fill pipeline in ``targeted_research``.
 
-Mocks ``_run_analyzer`` at the module level and ``invoke_gemini_grounded`` (the
-per-gap search fn). No live API calls.
+Mocks ``_run_analyzer`` at the module level and ``build_native_search_llm`` (the
+per-gap resolver now runs OpenAI native web search via OpenRouter). The helper
+``_patch_resolver`` returns an LLM whose ``.invoke`` is the supplied AsyncMock,
+so each test still captures the per-gap prompt and controls the result. No live
+API calls.
 """
 
 import asyncio
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools import MetaculusQuestion
@@ -42,6 +47,23 @@ def _q(mock: MockQuestion) -> MetaculusQuestion:
     no-op; it exists solely to keep Pyright happy about the function signature.
     """
     return cast(MetaculusQuestion, mock)
+
+
+@contextmanager
+def _patch_resolver(invoke: AsyncMock) -> Iterator[MagicMock]:
+    """Patch ``build_native_search_llm`` so the per-gap resolver uses ``invoke``.
+
+    The resolver now does ``llm = build_native_search_llm(...); await llm.invoke(prompt)``.
+    Tests historically asserted against the per-gap search AsyncMock directly, so
+    we wrap it in a stub LLM whose ``.invoke`` is that AsyncMock — the prompt is
+    still captured on ``invoke`` exactly as before. Yields the builder mock so
+    callers can assert the model slug / reasoning_effort args.
+    """
+    stub_llm = MagicMock()
+    stub_llm.invoke = invoke
+    builder = MagicMock(return_value=stub_llm)
+    with patch("metaculus_bot.research.targeted.build_native_search_llm", builder):
+        yield builder
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +192,7 @@ async def test_empty_gaps_returns_empty_string() -> None:
     fake_search = AsyncMock(return_value="should not be called")
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -180,10 +202,10 @@ async def test_empty_gaps_returns_empty_string() -> None:
 
 @pytest.mark.asyncio
 async def test_two_gaps_run_in_parallel() -> None:
-    """Analyzer returns 2 gaps → 2 grounded calls that run concurrently.
+    """Analyzer returns 2 gaps → 2 native-search calls that run concurrently.
 
     The slow-first, fast-second ordering guards against a sequential refactor: if the
-    code ever did ``for gap in gaps: await invoke_gemini_grounded(...)``, gap 1 would
+    code ever did ``for gap in gaps: await llm.invoke(...)``, gap 1 would
     finish before gap 2. With ``asyncio.gather``, the short sleep wins the race.
     """
     question = MockQuestion()
@@ -210,7 +232,7 @@ async def test_two_gaps_run_in_parallel() -> None:
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -230,7 +252,7 @@ async def test_run_gap_fill_pass_does_not_clip_analyzer_output() -> None:
 
     Clipping lives inside ``_parse_gap_list`` (see ``TestParseGapList.test_clips_at_max_gaps``).
     By patching ``_run_analyzer`` to return more than ``GAP_FILL_MAX_GAPS`` gaps we bypass the
-    parser; every gap the analyzer yields must trigger a grounded search.
+    parser; every gap the analyzer yields must trigger a native search.
     """
     question = MockQuestion()
 
@@ -240,7 +262,7 @@ async def test_run_gap_fill_pass_does_not_clip_analyzer_output() -> None:
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -261,7 +283,7 @@ async def test_malformed_analyzer_output_soft_fails() -> None:
     fake_search = AsyncMock(return_value="should not be called")
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -294,7 +316,7 @@ async def test_partial_search_failure_returns_successful_results(
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", side_effect=search_side_effect),
+        _patch_resolver(AsyncMock(side_effect=search_side_effect)),
         caplog.at_level(logging.WARNING, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
@@ -311,7 +333,7 @@ async def test_partial_search_failure_returns_successful_results(
 
 @pytest.mark.asyncio
 async def test_all_searches_fail_returns_empty(caplog: pytest.LogCaptureFixture) -> None:
-    """All grounded searches raise → addendum is "" and each failure logs a warning.
+    """All native searches raise → addendum is "" and each failure logs a warning.
 
     The soft-fail contract depends on failures being observable in logs, so we assert
     exactly one warning per failed gap with the "gap #<n>" marker.
@@ -326,7 +348,7 @@ async def test_all_searches_fail_returns_empty(caplog: pytest.LogCaptureFixture)
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
         caplog.at_level(logging.WARNING, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
@@ -355,7 +377,7 @@ async def test_benchmarking_flag_threaded_to_analyzer_and_searches() -> None:
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", fake_analyzer),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         await run_gap_fill_pass(_q(question), "first-pass", is_benchmarking=True)
 
@@ -370,6 +392,70 @@ async def test_benchmarking_flag_threaded_to_analyzer_and_searches() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolver_builds_native_search_llm_with_mini_low() -> None:
+    """The per-gap resolver runs OpenAI native search on gpt-5.4-mini at low effort.
+
+    Locks the 2026-06-25 migration off direct-Google grounded Gemini: every gap
+    resolution must build a native-search LLM with the GAP_FILL_RESOLVER_MODEL
+    slug. Effort was dropped medium→low (Round-2): the resolver was the ~5-min
+    critical-path bottleneck, and low is ~4.5× faster (native_search v3 bench).
+    Pinned to the constant so it stays a canary if the effort is changed again.
+    """
+    from metaculus_bot.constants import GAP_FILL_RESOLVER_MODEL, GAP_FILL_RESOLVER_REASONING_EFFORT
+
+    question = MockQuestion()
+    gaps = [{"gap": "g1", "search_query": "q1", "why_matters": "wm1"}]
+    fake_search = AsyncMock(return_value="resolved")
+
+    with (
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        _patch_resolver(fake_search) as builder,
+    ):
+        out = await run_gap_fill_pass(_q(question), "first-pass research")
+
+    assert "resolved" in out
+    builder.assert_called_once()
+    call = builder.call_args
+    model_arg = call.args[0] if call.args else call.kwargs.get("model_slug")
+    assert model_arg == GAP_FILL_RESOLVER_MODEL == "openai/gpt-5.4-mini"
+    assert call.kwargs["reasoning_effort"] == GAP_FILL_RESOLVER_REASONING_EFFORT == "low"
+
+
+@pytest.mark.asyncio
+async def test_resolver_enforces_wall_clock_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung per-gap resolver invoke must be bounded by NATIVE_SEARCH_WALL_TIMEOUT.
+
+    The 2026-06-25 migration added ``asyncio.wait_for(llm.invoke(...), timeout=...)``
+    to ``_resolve_single_gap`` — a backstop the old google-genai grounded path
+    lacked. It shares the build_native_search_llm config (and therefore the same
+    OpenRouter whitespace-drip pathology, 2026-05-20 incident) with the targeted
+    search and native_search provider, whose backstop is locked in by
+    test_targeted_research.test_enforces_wall_clock_timeout. This mirrors that
+    test for the gap-fill resolver: a resolver that sleeps past the cap is
+    cancelled, the TimeoutError is captured by gather(return_exceptions=True),
+    and the pass soft-fails to "" rather than hanging the whole question.
+    """
+    monkeypatch.setattr("metaculus_bot.research.targeted.NATIVE_SEARCH_WALL_TIMEOUT", 0.05)
+
+    question = MockQuestion()
+    gaps = [{"gap": "g1", "search_query": "q1", "why_matters": "wm1"}]
+
+    async def hang(_prompt: str) -> str:
+        # Sleep well past the 0.05s wall-clock cap; the test passes only if
+        # asyncio.wait_for cancels this before it returns.
+        await asyncio.sleep(5)
+        return "should never reach here"
+
+    with (
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        _patch_resolver(AsyncMock(side_effect=hang)),
+    ):
+        out = await run_gap_fill_pass(_q(question), "first-pass research")
+
+    assert out == ""
+
+
+@pytest.mark.asyncio
 async def test_analyzer_timeout_returns_empty() -> None:
     """_run_analyzer raising TimeoutError → soft-fail with "" and no search calls."""
     question = MockQuestion()
@@ -377,7 +463,7 @@ async def test_analyzer_timeout_returns_empty() -> None:
     fake_search = AsyncMock()
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=asyncio.TimeoutError())),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -387,16 +473,16 @@ async def test_analyzer_timeout_returns_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_analyzer_missing_key_returns_empty() -> None:
-    """_run_analyzer raising ValueError (e.g., missing GOOGLE_API_KEY) → "" and no searches."""
+    """_run_analyzer raising ValueError (e.g., missing API key) → "" and no searches."""
     question = MockQuestion()
 
     fake_search = AsyncMock()
     with (
         patch(
             "metaculus_bot.research.targeted._run_analyzer",
-            AsyncMock(side_effect=ValueError("GOOGLE_API_KEY must be set")),
+            AsyncMock(side_effect=ValueError("API key must be set")),
         ),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -422,7 +508,7 @@ async def test_analyzer_gemini_api_error_returns_empty() -> None:
     fake_search = AsyncMock()
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=fake_exc)),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -442,7 +528,7 @@ async def test_analyzer_httpx_error_returns_empty() -> None:
             "metaculus_bot.research.targeted._run_analyzer",
             AsyncMock(side_effect=httpx.ConnectError("connection refused")),
         ),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -460,7 +546,7 @@ async def test_analyzer_os_error_returns_empty() -> None:
             "metaculus_bot.research.targeted._run_analyzer",
             AsyncMock(side_effect=OSError("name resolution failed")),
         ),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
@@ -486,7 +572,7 @@ async def test_analyzer_receives_resolution_criteria_and_fine_print() -> None:
     fake_search = AsyncMock()
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", fake_analyzer),
-        patch("metaculus_bot.research.targeted.invoke_gemini_grounded", fake_search),
+        _patch_resolver(fake_search),
     ):
         await run_gap_fill_pass(_q(question), "some first-pass research")
 

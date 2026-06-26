@@ -35,6 +35,7 @@ from metaculus_bot.constants import (
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
@@ -300,14 +301,25 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
     return _fetch
 
 
-def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
+def build_native_search_llm(
+    model_slug: str | None = None,
+    *,
+    reasoning_effort: str | None = None,
+    verbosity: str | None = None,
+) -> GeneralLlm:
     """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
-    Shared by the native search research provider and the targeted research module.
+    Shared by the native search research provider, the targeted research module,
+    and the gap-fill resolver.
 
-    Reads NATIVE_SEARCH_REASONING_EFFORT / NATIVE_SEARCH_VERBOSITY env at call
-    time so workflow overrides take effect without re-importing. An empty string
-    in either env var disables passing the corresponding kwarg.
+    Reasoning effort and verbosity come from the global NATIVE_SEARCH_REASONING_EFFORT
+    / NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect
+    without re-importing), UNLESS the caller passes an explicit ``reasoning_effort``
+    / ``verbosity`` override — an explicit value always wins over the env read.
+    This lets the gap-fill resolver run at medium effort without perturbing the
+    main native_search provider, which stays on the env-driven LOW. An empty
+    string (from either the override or the env) disables passing the
+    corresponding kwarg.
     """
     from metaculus_bot.constants import (
         NATIVE_SEARCH_CONTEXT_SIZE,
@@ -343,7 +355,11 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
     )
 
-    effort = os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    effort = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else os.getenv(NATIVE_SEARCH_REASONING_EFFORT_ENV, NATIVE_SEARCH_REASONING_EFFORT_DEFAULT)
+    )
     if effort:
         kwargs["reasoning"] = {"effort": effort}
 
@@ -353,9 +369,11 @@ def build_native_search_llm(model_slug: str | None = None) -> GeneralLlm:
     # the body, but the canonical form matches the docs and survives any future
     # extra_body validation. GeneralLlm passes unknown kwargs through to
     # litellm by default (`pass_through_unknown_kwargs=True`).
-    verbosity = os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
-    if verbosity:
-        kwargs["verbosity"] = verbosity
+    verbosity_value = (
+        verbosity if verbosity is not None else os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
+    )
+    if verbosity_value:
+        kwargs["verbosity"] = verbosity_value
 
     # Route through the donated-key wrapper. For openrouter/openai/* slugs this
     # prefers the Metaculus-donated OAI_ANTH_OPENROUTER_KEY (OpenAI now enabled
@@ -382,11 +400,14 @@ def _native_search_provider(
             citation_style="markdown",
         )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
-        # Wall-clock backstop: see NATIVE_SEARCH_WALL_TIMEOUT in constants.py
-        # for the 2026-05-20 incident that motivated this guard. Mirrors the
-        # AskNews (research_providers.py:89) and gemini gap-fill
-        # (targeted_research.py:182) wrappers.
-        result = await asyncio.wait_for(llm.invoke(prompt), timeout=NATIVE_SEARCH_WALL_TIMEOUT)
+        # Wall-clock backstop (now owned by invoke_with_transient_retry): see
+        # NATIVE_SEARCH_WALL_TIMEOUT in constants.py for the 2026-05-20 incident
+        # that motivated the hard cap. The transient-retry wrapper additionally
+        # recovers from instant aiohttp blips (litellm #14895) on this
+        # allowed_tries=1 LLM without ever retrying a slow stall (elapsed gate).
+        result = await invoke_with_transient_retry(
+            lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="native_search"
+        )
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
         return result
 

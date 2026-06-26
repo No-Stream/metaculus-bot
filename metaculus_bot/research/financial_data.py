@@ -24,6 +24,7 @@ from metaculus_bot.constants import (
     FRED_API_KEY_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.providers import ResearchCallable
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -70,7 +71,16 @@ async def _classify_financial_question(
     """
     try:
         prompt = CLASSIFIER_PROMPT.format(question_text=question_text)
-        response = await classifier_llm.invoke(prompt)
+        # Wrapped with the elapsed-gated transient retry (litellm #14895): the
+        # classifier LLM is built allowed_tries=1, so this wrapper is its sole
+        # retry layer and also supplies the wall-clock cap the call previously
+        # lacked. FINANCIAL_CLASSIFIER_TIMEOUT doubles as the wall cap (no
+        # separate constant exists; the per-request timeout is the natural bound).
+        response = await invoke_with_transient_retry(
+            lambda: classifier_llm.invoke(prompt),
+            wall_timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
+            label="financial_classifier",
+        )
     except Exception:
         logger.warning("Financial classifier LLM call failed", exc_info=True)
         return None
@@ -293,7 +303,13 @@ def financial_data_provider() -> ResearchCallable:
         model=FINANCIAL_CLASSIFIER_MODEL,
         temperature=0.0,
         max_tokens=500,
+        reasoning={"effort": "low"},
         timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
+        # allowed_tries=1 so the elapsed-gated transient retry in
+        # _classify_financial_question is the SOLE retry layer. Without this the
+        # builder defaults to allowed_tries=2, whose unguarded tenacity would
+        # retry a slow stall — the exact failure mode the elapsed gate prevents.
+        allowed_tries=1,
     )
 
     async def _fetch(question: MetaculusQuestion) -> str:

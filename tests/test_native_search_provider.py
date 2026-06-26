@@ -196,6 +196,67 @@ async def test_native_search_provider_enforces_wall_clock_timeout(
             await provider(_make_q("Will X happen?"))
 
 
+class TestBuildNativeSearchLlmOverrides:
+    """Per-call reasoning_effort / verbosity overrides on build_native_search_llm.
+
+    The gap-fill resolver needs gpt-5.4-mini at MEDIUM effort without perturbing
+    the global NATIVE_SEARCH_REASONING_EFFORT env (which the main native_search
+    provider reads at LOW). These tests lock the override semantics: explicit
+    args win over env; None preserves the existing env-read behavior exactly.
+    """
+
+    def _captured_kwargs(self, *, model_slug=None, reasoning_effort=None, verbosity=None) -> dict:  # type: ignore[no-untyped-def]
+        captured: dict = {}
+
+        class MockLlm:
+            def __init__(self, model: str, **kwargs):  # type: ignore[no-untyped-def]
+                captured["model"] = model
+                captured.update(kwargs)
+                self.model = model
+
+        with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+            from metaculus_bot.research.providers import build_native_search_llm
+
+            build_native_search_llm(model_slug, reasoning_effort=reasoning_effort, verbosity=verbosity)
+        return captured
+
+    def test_reasoning_effort_override_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit reasoning_effort="medium" beats NATIVE_SEARCH_REASONING_EFFORT=low."""
+        monkeypatch.setenv("NATIVE_SEARCH_REASONING_EFFORT", "low")
+
+        captured = self._captured_kwargs(model_slug="openai/gpt-5.4-mini", reasoning_effort="medium")
+
+        assert "gpt-5.4-mini" in captured["model"]
+        assert captured.get("reasoning") == {"effort": "medium"}
+
+    def test_verbosity_override_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit verbosity="high" beats NATIVE_SEARCH_VERBOSITY=low."""
+        monkeypatch.setenv("NATIVE_SEARCH_VERBOSITY", "low")
+
+        captured = self._captured_kwargs(verbosity="high")
+
+        assert captured.get("verbosity") == "high"
+
+    def test_none_preserves_env_default_behavior(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Passing nothing preserves the env-read path: env value flows through."""
+        monkeypatch.setenv("NATIVE_SEARCH_REASONING_EFFORT", "medium")
+        monkeypatch.setenv("NATIVE_SEARCH_VERBOSITY", "high")
+
+        captured = self._captured_kwargs()
+
+        assert captured.get("reasoning") == {"effort": "medium"}
+        assert captured.get("verbosity") == "high"
+
+    def test_empty_string_override_disables_kwarg(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicit empty-string override disables the kwarg (matches env semantics)."""
+        monkeypatch.setenv("NATIVE_SEARCH_REASONING_EFFORT", "low")
+
+        captured = self._captured_kwargs(reasoning_effort="", verbosity="")
+
+        assert "reasoning" not in captured
+        assert "verbosity" not in captured
+
+
 class TestParallelProviderSelection:
     """Tests for parallel provider selection in main.py."""
 

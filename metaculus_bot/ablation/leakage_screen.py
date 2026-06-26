@@ -100,7 +100,7 @@ Do not include any prose outside the JSON.
 def _build_detector_llm(model: str) -> GeneralLlm:
     """Construct a detector LLM with a generous token budget for reasoning models.
 
-    Production ``leakage.py:22`` uses ``max_tokens=500`` against ``gpt-5-mini``,
+    Production ``leakage.py:22`` uses ``max_tokens=500`` against ``gpt-5.4-mini``,
     where ``max_tokens`` only bounds the visible answer. The ablation default is
     ``glm-4.5-air:free`` — a reasoning model where ``max_tokens`` is the
     *combined* budget for reasoning + content (Z.AI docs:

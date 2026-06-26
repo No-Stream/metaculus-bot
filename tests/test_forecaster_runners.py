@@ -126,6 +126,64 @@ class TestRunBinaryForecast:
         assert result.prediction_value == BINARY_PROB_MAX
 
 
+class TestForecasterBroadRetry:
+    """The forecaster invoke is wrapped in the broad, 30s-gated retry (Round-2).
+
+    Forecaster GeneralLlm instances are set allowed_tries=1 in llm_configs.py, so
+    this wrapper is their SOLE retry layer: it recovers a fast blip but obeys the
+    universal "no retry after 30s" deadline-safety rule that forecasting-tools'
+    un-gated tenacity could not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fast_blip_on_forecaster_invoke_retries_then_succeeds(
+        self, binary_question, forecaster_llm, parser_llm
+    ):
+        """A fast litellm.Timeout on forecaster_llm.invoke is retried; the next call wins."""
+        import litellm.exceptions as litellm_exc
+        from forecasting_tools import BinaryPrediction
+
+        invoke = AsyncMock(
+            side_effect=[
+                litellm_exc.Timeout("blip", model="m", llm_provider="openrouter"),
+                "Analysis: likely yes.\n\nProbability: 70%",
+            ]
+        )
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(forecaster_llm, "invoke", new=invoke),
+            patch(
+                "metaculus_bot.forecaster_runners.structure_output",
+                new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.70)),
+            ),
+        ):
+            result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert result.prediction_value == 0.70
+        assert invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_slow_forecaster_failure_not_retried(self, binary_question, forecaster_llm, parser_llm):
+        """A forecaster invoke that fails past the 30s gate is NOT retried — it propagates."""
+        import litellm.exceptions as litellm_exc
+
+        from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
+
+        invoke = AsyncMock(side_effect=litellm_exc.Timeout("stall", model="m", llm_provider="openrouter"))
+        clock = iter([0.0] + [TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0] * 20)
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch("metaculus_bot.llm_retry.time.monotonic", lambda: next(clock)),
+            patch.object(forecaster_llm, "invoke", new=invoke),
+        ):
+            with pytest.raises(litellm_exc.Timeout):
+                await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert invoke.await_count == 1
+
+
 def _make_option_list(options: list[tuple[str, float]]) -> PredictedOptionList:
     from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
