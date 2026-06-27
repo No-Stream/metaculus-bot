@@ -8,13 +8,22 @@ Tests the full flow across all components:
 """
 
 import json
+import subprocess
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
-from scripts.download_research import build_archive, deduplicate_records
+from scripts.download_research import (
+    build_archive,
+    deduplicate_records,
+    download_research_artifacts,
+    list_research_artifacts,
+)
+from scripts.download_research import main as download_research_main
 
 # --- Realistic test data ---
 
@@ -400,6 +409,320 @@ class TestDownloadMergeE2E:
         assert "50001" in manifest
         assert manifest["50001"]["versions_count"] == 2
         assert sorted(manifest["50001"]["providers"]) == ["gemini_search", "native_search"]
+
+
+def _iso(dt: datetime) -> str:
+    """Render a datetime as a GH-style 'YYYY-MM-DDTHH:MM:SSZ' createdAt string."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _artifact(name: str, run_id: int, created: datetime, expired: bool = False) -> dict:
+    """Build an artifact object as emitted by `list_research_artifacts`'s --jq projection."""
+    return {
+        "id": run_id * 10,
+        "name": name,
+        "created_at": _iso(created),
+        "expires_at": _iso(created + timedelta(days=90)),
+        "expired": expired,
+        "size_in_bytes": 1234,
+        "run_id": run_id,
+    }
+
+
+def _gh_stdout(artifacts: list[dict]) -> str:
+    """Mimic `gh api --paginate ... --jq` output: one JSON object per line."""
+    return "\n".join(json.dumps(a) for a in artifacts) + "\n"
+
+
+class TestArtifactsEndpointSweep:
+    """Test the complete artifacts-endpoint download path: filtering, expiry logging, dedup.
+
+    All `gh` calls are mocked — no live GitHub access, so the suite stays self-contained.
+    """
+
+    def test_list_research_artifacts_parses_paginated_stream(self) -> None:
+        """`gh api --paginate ... --jq` emits one object per line; parse them all."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-200", 200, now - timedelta(days=2)),
+            _artifact("some-other-artifact", 300, now - timedelta(days=3)),
+        ]
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=_gh_stdout(artifacts), stderr="")
+        with mock.patch("scripts.download_research.subprocess.run", return_value=completed) as run:
+            parsed = list_research_artifacts("repo")
+
+        # The REST endpoint is NOT workflow-scoped: it returns ALL artifacts (filtering
+        # to research-* happens downstream), so all three rows parse.
+        assert [a["name"] for a in parsed] == ["research-100", "research-200", "some-other-artifact"]
+        # We page via the artifacts endpoint with --paginate, not `gh run list`.
+        cmd = run.call_args.args[0]
+        assert cmd[:3] == ["gh", "api", "--paginate"]
+        assert "/repos/repo/actions/artifacts?per_page=100" in cmd
+
+    def test_list_research_artifacts_exits_on_gh_failure(self) -> None:
+        """A gh error is fail-fast (sys.exit), never silently swallowed."""
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        with mock.patch("scripts.download_research.subprocess.run", return_value=failed):
+            try:
+                list_research_artifacts("repo")
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("expected SystemExit on gh failure")
+
+    def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:  # noqa: ANN001
+        """Live research-* downloaded; expired logged (not downloaded); non-research ignored."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-200", 200, now - timedelta(days=2)),
+            _artifact("research-999", 999, now - timedelta(days=95), expired=True),  # past retention
+            _artifact("benchmark-results", 300, now - timedelta(days=1)),  # not research-*
+        ]
+
+        records_by_run = {
+            100: [{"qid": 1, "run_id": "100", "timestamp": "t1"}],
+            200: [{"qid": 2, "run_id": "200", "timestamp": "t2"}],
+        }
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return [run_id] if records_by_run.get(run_id) else []
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch("scripts.download_research.load_jsonl_records", side_effect=lambda f: records_by_run[f]),
+            caplog.at_level("WARNING", logger="scripts.download_research"),
+        ):
+            records = download_research_artifacts(repo="repo", since_days=0)
+
+        # Only the two LIVE research artifacts were downloaded.
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100, 200]
+
+        # The expired research artifact was NOT downloaded but WAS logged loudly by name + date.
+        assert 999 not in attempted
+        assert any("research-999" in r.message and "LOST" in r.message for r in caplog.records)
+
+        # Records aggregated only from the live downloads.
+        assert sorted(r["qid"] for r in records) == [1, 2]
+
+    def test_dedup_by_run_id_downloads_once(self) -> None:
+        """Two artifact rows sharing a workflow_run id are downloaded at most once."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),
+            _artifact("research-100-retry", 100, now - timedelta(hours=1)),  # same run_id
+            _artifact("research-200", 200, now - timedelta(days=2)),
+        ]
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return [run_id]
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch(
+                "scripts.download_research.load_jsonl_records",
+                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
+            ),
+        ):
+            download_research_artifacts(repo="repo", since_days=0)
+
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100, 200]  # run 100 downloaded once despite two artifact rows
+
+    def test_since_days_post_filter_excludes_old_artifacts(self) -> None:
+        """--since-days windows out live artifacts created before the cutoff."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=1)),  # inside 7-day window
+            _artifact("research-200", 200, now - timedelta(days=30)),  # outside 7-day window
+        ]
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return [run_id]
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
+            mock.patch(
+                "scripts.download_research.load_jsonl_records",
+                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
+            ),
+        ):
+            download_research_artifacts(repo="repo", since_days=7)
+
+        attempted = sorted(c.args[0] for c in dl.call_args_list)
+        assert attempted == [100]  # only the recent artifact
+
+    def test_full_flow_rebuilds_manifest(self, tmp_path: Path) -> None:
+        """The downloaded records feed build_archive and produce a manifest (rebuild intact)."""
+        now = datetime.now(timezone.utc)
+        artifacts = [_artifact("research-100", 100, now - timedelta(days=1))]
+
+        record = {
+            "qid": 43613,
+            "run_id": "100",
+            "timestamp": "2026-06-20T10:00:00Z",
+            "research_text": "Downloaded research",
+            "providers_used": ["asknews"],
+        }
+
+        with (
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", return_value=[100]),
+            mock.patch("scripts.download_research.load_jsonl_records", return_value=[record]),
+        ):
+            records = download_research_artifacts(repo="repo", since_days=0)
+
+        deduped = deduplicate_records(records)
+        archive_dir = tmp_path / "archive"
+        build_archive(deduped, archive_dir)
+
+        manifest = json.loads((archive_dir / "manifest.json").read_text())
+        assert "43613" in manifest
+        assert manifest["43613"]["latest_timestamp"] == "2026-06-20T10:00:00Z"
+        assert manifest["43613"]["providers"] == ["asknews"]
+
+
+class TestSyncResearchNoClobber:
+    """Regression: `make sync_research`'s final build must contain BOTH artifacts AND backfill.
+
+    The clobber bug: comment-backfill records (run_id `comment-<id>`) live in the backfill
+    dir, but freshly DOWNLOADED artifact records (numeric run_id) live only in the build's
+    in-memory list — never written to the backfill dir. A standalone `--skip-download`
+    rebuild therefore drops every artifact run_id. The fix is a single `main()` build that
+    downloads artifacts AND loads backfill, so the archive ends up with both. These tests
+    lock that invariant: every live artifact's run_id survives into the rebuilt archive.
+
+    All `gh`/subprocess access is mocked — no live GitHub calls.
+    """
+
+    @staticmethod
+    def _write_backfill(backfill_dir: Path) -> None:
+        """Populate the backfill dir as `backfill_research_from_comments.py` would.
+
+        Comment records use a `comment-<id>` run_id namespace, distinct from the numeric
+        workflow-run ids artifacts carry, so the two never collide in dedup by (qid, run_id).
+        Includes one record for qid 43613 (an artifact also covers it) and one comment-only
+        qid 90000 (no artifact) to prove both sources survive.
+        """
+        backfill_dir.mkdir(parents=True, exist_ok=True)
+        comment_records = [
+            {
+                "qid": 43613,
+                "run_id": "comment-855787",
+                "timestamp": "2026-05-19T13:58:49Z",
+                "research_text": "Older comment-sourced research for 43613",
+                "providers_used": ["asknews"],
+            },
+            {
+                "qid": 90000,
+                "run_id": "comment-999000",
+                "timestamp": "2026-05-19T14:00:00Z",
+                "research_text": "Comment-only research for 90000",
+                "providers_used": ["native_search"],
+            },
+        ]
+        with open(backfill_dir / "comments_backfill.jsonl", "w") as f:
+            for r in comment_records:
+                f.write(json.dumps(r) + "\n")
+
+    def test_full_sync_build_keeps_artifacts_and_backfill(self, tmp_path: Path) -> None:
+        """main() (download + load backfill + build) preserves artifact run_ids AND comments."""
+        backfill_dir = tmp_path / "backfill"
+        output_dir = tmp_path / "archive"
+        self._write_backfill(backfill_dir)
+
+        now = datetime.now(timezone.utc)
+        artifacts = [_artifact("research-28256121132", 28256121132, now - timedelta(days=1))]
+        artifact_record = {
+            "qid": 43613,
+            "run_id": "28256121132",  # numeric workflow-run id — must survive
+            "timestamp": "2026-06-26T18:00:00Z",
+            "research_text": "Fresh artifact research for 43613",
+            "providers_used": ["asknews", "native_search"],
+        }
+
+        # Mock only the gh-touching pieces; let load_jsonl_records run for real so it
+        # parses BOTH the downloaded artifact file and the on-disk comment backfill (the
+        # earlier mistake of mocking load_jsonl_records globally hijacked backfill loading).
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            run_dir = Path(dest_dir) / str(run_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            jsonl = run_dir / f"{artifact_name}.jsonl"
+            jsonl.write_text(json.dumps(artifact_record) + "\n")
+            return [jsonl]
+
+        argv = [
+            "download_research.py",
+            "--repo",
+            "repo",
+            "--backfill-dir",
+            str(backfill_dir),
+            "--output-dir",
+            str(output_dir),
+        ]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch("scripts.download_research.verify_gh_cli"),
+            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download),
+        ):
+            download_research_main()
+
+        manifest = json.loads((output_dir / "manifest.json").read_text())
+
+        # qid 43613 has BOTH the artifact version and the comment version (distinct run_ids).
+        assert manifest["43613"]["versions_count"] == 2
+        # latest is the fresh artifact (newer than the comment version) — no regression.
+        assert manifest["43613"]["latest_timestamp"] == "2026-06-26T18:00:00Z"
+
+        # The artifact run_id is present in the archive (this is what the clobber dropped).
+        versions_43613 = [
+            json.loads(line) for line in (output_dir / "by_qid" / "43613.jsonl").read_text().strip().splitlines()
+        ]
+        run_ids = {v["run_id"] for v in versions_43613}
+        assert "28256121132" in run_ids  # artifact survived
+        assert "comment-855787" in run_ids  # comment also survived
+
+        # Comment-only qid (no artifact) is still present too.
+        assert "90000" in manifest
+
+    def test_skip_download_alone_drops_artifacts(self, tmp_path: Path) -> None:
+        """Documents the clobber: --skip-download rebuilds from backfill ONLY (no artifacts).
+
+        This is WHY the old third sync step clobbered — it ran exactly this. The fix is to
+        not run a standalone --skip-download rebuild after the artifact download.
+        """
+        backfill_dir = tmp_path / "backfill"
+        output_dir = tmp_path / "archive"
+        self._write_backfill(backfill_dir)
+
+        argv = [
+            "download_research.py",
+            "--skip-download",
+            "--backfill-dir",
+            str(backfill_dir),
+            "--output-dir",
+            str(output_dir),
+        ]
+        with mock.patch("sys.argv", argv):
+            download_research_main()
+
+        manifest = json.loads((output_dir / "manifest.json").read_text())
+        # Only comment-sourced records — the artifact run_id is absent (the clobber).
+        assert manifest["43613"]["versions_count"] == 1
+        versions = [
+            json.loads(line) for line in (output_dir / "by_qid" / "43613.jsonl").read_text().strip().splitlines()
+        ]
+        assert {v["run_id"] for v in versions} == {"comment-855787"}
 
 
 class TestFullRoundTrip:

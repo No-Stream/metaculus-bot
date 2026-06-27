@@ -166,16 +166,28 @@ test_fast:
 # --- Research persistence (backtest replay) ---
 
 # Sync research archive: download GHA artifacts (source of truth) + backfill
-# from Metaculus comments for anything missing. Run before backtests.
+# from Metaculus comments for anything missing.
+#
+# WHY RUN THIS REGULARLY: GHA uploads each run's research_outputs/ artifact with
+# retention-days: 90 (run_bot_on_{tournament,metaculus_cup,minibench}.yaml). After
+# 90 days the artifact is deleted FOREVER, so backtests/research_archive/ is the
+# only durable copy. download_research.py enumerates EVERY research-* artifact via
+# the complete, paginated artifacts REST endpoint (no run-list cap). Schedule it
+# WEEKLY (well inside 90 days); see scripts/research_sync/ for the launchd job.
+#
+# ORDERING IS LOAD-BEARING: the comment backfill runs FIRST so it writes
+# comments_backfill.jsonl into the backfill dir, then download_research.py does ONE
+# authoritative build — download artifacts, load ALL backfill (incl. the fresh
+# comments), dedup by (qid, run_id), build. A separate --skip-download rebuild at the
+# end would CLOBBER the just-downloaded artifact records (they live only in the
+# build's in-memory records, never in the backfill dir), so we do exactly one build
+# that sees both sources.
 sync_research:
-	@echo "=== Downloading GHA artifacts ==="
-	uv run python scripts/download_research.py $(ARGS)
-	@echo ""
 	@echo "=== Backfilling from Metaculus comments (historical) ==="
 	uv run python scripts/backfill_research_from_comments.py
 	@echo ""
-	@echo "=== Rebuilding archive ==="
-	uv run python scripts/download_research.py --skip-download
+	@echo "=== Downloading GHA artifacts + building archive (artifacts + backfill) ==="
+	uv run python scripts/download_research.py $(ARGS)
 	@echo ""
 	@echo "Archive ready at backtests/research_archive/latest/"
 
@@ -184,7 +196,10 @@ sync_research:
 backfill_research:
 	uv run python scripts/backfill_research_from_logs.py $(ARGS)
 
-# Download research artifacts from recent GHA runs into local archive.
+# Download research artifacts into the local archive + rebuild. Enumerates EVERY
+# research-* artifact (all run-workflows) via the complete paginated artifacts REST
+# endpoint, merges with backfill, dedups, and builds. Pass ARGS="--since-days N" to
+# scope, or ARGS="--skip-download" to rebuild from backfill only (no artifact fetch).
 download_research:
 	uv run python scripts/download_research.py $(ARGS)
 

@@ -932,7 +932,7 @@ class TestProviderFactory:
             out = await provider(mock_question)
 
         assert isinstance(out, str)
-        assert "NOT AN ANCHOR" in out
+        assert "STRONG EVIDENCE" in out
         assert "polymarket" in out.lower() or "manifold" in out.lower() or "kalshi" in out.lower()
 
 
@@ -970,9 +970,13 @@ class TestFormatter:
 
         formatted = format_snapshot_for_research(snap)
 
-        # The NOT-AN-ANCHOR caveat is the one load-bearing guardrail for the forecaster prompt
-        assert "NOT AN ANCHOR" in formatted
+        # The strong-evidence caveat is the load-bearing framing for the forecaster prompt:
+        # markets are weighted heavily, discounted only on a specific resolution mismatch.
+        assert "STRONG EVIDENCE" in formatted
+        assert "weight these markets heavily" in formatted.lower()
         assert "verify" in formatted.lower()
+        assert "resolution date" in formatted.lower()
+        assert "discount" in formatted.lower()
         # Columns per the plan
         assert "platform" in formatted.lower()
         assert "polymarket" in formatted.lower()

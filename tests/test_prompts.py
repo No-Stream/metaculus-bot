@@ -431,3 +431,124 @@ class TestWebResearchPromptPrimarySources:
 
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
+
+
+# ---------------------------------------------------------------------------
+# Prediction-market framing (strong-evidence, criteria/date-matched weighting)
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionMarketFraming:
+    """The forecaster prompts must frame prediction markets as STRONG EVIDENCE
+    to weight heavily — not the old "not beholden" footnote — with a precise
+    conditional adjustment: anchor when the market's resolution criteria AND
+    date match the question, discount proportionally to any specific mismatch,
+    and extrapolate across a date-only mismatch.
+
+    The PM clause must NOT carry a "you may deviate from a market" carve-out:
+    that sentence undercut the strong-evidence framing. The general principle
+    that a forecaster may supplement the research with its own training
+    knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
+
+    Leakage note: these forecaster prompts have no ``is_benchmarking`` branch —
+    benchmarking suppression happens upstream at the research-data layer (the
+    prediction-market provider is dropped, so ``{research}`` carries no market
+    prices during backtests), which makes this mode-agnostic framing inert
+    when benchmarking. The mode-dependent leakage guard lives on
+    ``web_research_prompt`` (see ``test_strong_evidence_framing_suppressed_when_benchmarking``).
+    """
+
+    def _assert_strong_evidence_framing(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "strong evidence" in lowered
+        assert "weight them heavily" in lowered
+        # The conditional adjustment: match anchors, mismatch discounts.
+        assert "resolution date" in lowered
+        assert "match" in lowered
+        assert "discount" in lowered
+        # Date-only mismatch must trigger an explicit extrapolation, not a vague haircut.
+        assert "extrapolate" in lowered
+        assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
+        assert "show the arithmetic" in lowered
+        # The old "not beholden" footnote must be gone.
+        assert "not beholden" not in lowered
+        # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
+        # it undercut the strong-evidence framing. The general expertise principle is
+        # asserted separately below.
+        assert "deviate from a market" not in lowered
+
+    def _assert_general_expertise_principle(self, prompt: str) -> None:
+        """The prompt-wide directive that a forecaster may draw on its own training
+        knowledge to fill research gaps — distinct from any market-specific clause."""
+        lowered = " ".join(prompt.lower().split())
+        assert "use your own expertise and knowledge, not only the provided research" in lowered
+        assert "you are not required to ground every claim in the research" in lowered
+
+    def test_binary_prompt_frames_markets_as_strong_evidence(self) -> None:
+        self._assert_strong_evidence_framing(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_frames_markets_as_strong_evidence(self) -> None:
+        self._assert_strong_evidence_framing(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_frames_markets_as_strong_evidence(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_strong_evidence_framing(result)
+
+    def test_binary_prompt_carries_general_expertise_principle(self) -> None:
+        self._assert_general_expertise_principle(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_general_expertise_principle(self) -> None:
+        self._assert_general_expertise_principle(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_general_expertise_principle(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_general_expertise_principle(result)
+
+    def test_strong_evidence_framing_present_non_benchmarking_absent_benchmarking(self) -> None:
+        """Leakage guard: the prediction-market nudge in the research prompt is
+        present only when NOT benchmarking. This is the mode-dependent surface
+        — the forecaster prompts above are mode-agnostic because the provider
+        data is suppressed upstream during backtests."""
+        non_bench = web_research_prompt("Will X happen?", is_benchmarking=False)
+        bench = web_research_prompt("Will X happen?", is_benchmarking=True)
+
+        assert "Prediction market" in non_bench
+        assert "Prediction market" not in bench
+
+
+# ---------------------------------------------------------------------------
+# Source-provenance / motivation trust ladder
+# ---------------------------------------------------------------------------
+
+
+class TestSourceProvenanceLadder:
+    """The Source-analysis section of every forecaster prompt must carry the
+    provenance trust ladder: rank claims by proximity to the primary record and
+    adjust by source motivation (discount self-interest, treat statements
+    against interest as strong evidence). These are lightweight "did the text
+    land" guards — we expect them to break when the prompt is revised."""
+
+    def _assert_ladder_present(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "proximity to the primary record" in lowered
+        assert "against the speaker's interest" in lowered
+
+    def test_binary_prompt_carries_provenance_ladder(self) -> None:
+        self._assert_ladder_present(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_provenance_ladder(self) -> None:
+        self._assert_ladder_present(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_provenance_ladder(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_ladder_present(result)
+
+    def test_numeric_prompt_preserves_data_anchor(self) -> None:
+        """Regression: appending the ladder must not displace the load-bearing
+        data-anchor bullet in the numeric Source-analysis section."""
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        lowered = " ".join(result.lower().split())
+        assert "most recent authoritative measurement" in lowered
+        assert "centered near this value" in lowered

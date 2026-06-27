@@ -57,9 +57,9 @@ Fork of the Metaculus starter template. Runs a multi-LLM ensemble with a meta-st
 
 Per question (`forecaster.py:_research_and_make_predictions`):
 
-1. **Research** — `run_research` (`forecaster.py:406`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:89`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.4-mini`, medium effort, via OpenRouter on the donated key).
+1. **Research** — `run_research` (`forecaster.py:413`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:116`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.4-mini`, medium effort, via OpenRouter on the donated key).
 2. **Forecaster fan-out** — N forecaster LLMs run in parallel via `_forecaster_with_soft_deadline` (10-min cap each) → `_make_prediction` → type-specific runner (binary/MC/numeric).
-3. **Min-forecasters guard** (`forecaster.py:580`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction.
+3. **Min-forecasters guard** (`forecaster.py:590`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction.
 4. **Aggregation** — see CONDITIONAL_STACKING below.
 
 ### Ensemble (6 forecasters)
@@ -75,14 +75,14 @@ Support models (also in `llm_configs.py`):
 
 ### CONDITIONAL_STACKING (default)
 
-`AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:62`). Behavior:
+`AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:117`). Behavior:
 
 - Compute spread across the N forecasters via `spread_metrics.compute_spread`.
-- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_aggregate_predictions`, `aggregation_pipeline.py:203`).
+- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_base_combine`, `aggregation_pipeline.py:213`).
 - If spread > threshold → extract the **disagreement crux**, run **targeted search** (OpenAI native search via `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity="low"`, 360s timeout), then invoke the **stacker LLM** with the full base-model reasonings + targeted research (`stacking.run_stacking_{binary,mc,numeric}`).
-- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`aggregation_pipeline.py:274-357`.)
+- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`aggregation_pipeline.py:283-359`, `_stacking_aggregate`.)
 
-Thresholds (`metaculus_bot/constants.py:166-175`):
+Thresholds (`metaculus_bot/constants.py:245-249`):
 
 - Binary: probability range (max − min) ≥ **0.15**.
 - MC: max per-option spread ≥ **0.20**.
@@ -113,9 +113,9 @@ The router decides whether the LLM's numeric output is in OPTION A (the default 
 
 ### Research providers
 
-Orchestration in `research/orchestrator.py:_select_research_providers:196-240`.
+Orchestration in `research/orchestrator.py:_select_research_providers:238`.
 
-**Primary provider** — exactly one, chosen by priority in `research/providers.py` `choose_provider_with_name:405-475`:
+**Primary provider** — exactly one, chosen by priority in `research/providers.py` `choose_provider_with_name:426`:
 
 1. **AskNews** if `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set (the prod case): dual-phase search (HOT + HISTORICAL), rate-limited with retry/dedup (`research/providers.py:82-210`).
 2. **Exa.ai SmartSearcher** if `EXA_API_KEY` set (fallback when AskNews absent): generic rundown (`research/providers.py:263-281`).
@@ -148,11 +148,11 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 
 ### `metaculus_bot/probabilistic_tools/`
 
-Reusable probability math — pooling, Beta-Binomial Bayes, percentile → parametric fits (normal/lognormal/Student-t), declared-vs-math consistency checks, Dirichlet CIs, Neg-Bin/Poisson discrete percentiles, exponential/Weibull survival, Gamma-conjugate hazard. `prob_event_before`, `poisson_at_least_one`, `linear_pool` / `log_pool` / `satopaa_extremize`, `beta_binomial_update`, `cdf_at_threshold`, `dirichlet_with_other` are wired into `tool_runner` dispatch.
+Reusable probability math — pooling, Beta-Binomial Bayes, percentile → parametric fits (normal/lognormal/Student-t), declared-vs-math consistency checks, Dirichlet CIs, Neg-Bin/Poisson discrete percentiles, exponential/Weibull survival, Gamma-conjugate hazard. `prob_event_before`, `linear_pool` / `log_pool` / `satopaa_extremize`, `beta_binomial_update`, `cdf_at_threshold`, `dirichlet_with_other` are wired into `tool_runner` dispatch. (`poisson_at_least_one` is exported and used inside `mc_discrete.py` / `survival.py`, but is NOT itself dispatched by `tool_runner`.)
 
 Newly-added math (Workstreams D1-D3):
 
-- **Noisy-OR** (`noisy_or.py`): rare-binary decomposition `1 − ∏(1 − pᵢ)` for combining independent failure-mode probabilities. Wired into `tool_runner`.
+- **Noisy-OR** (`aggregation.py` `noisy_or`): rare-binary decomposition `1 − ∏(1 − pᵢ)` for combining independent failure-mode probabilities. Exported from the package, but NOT currently dispatched by `tool_runner` (no references in `tool_runner.py`) — it is a callable available for future wiring, not an active dispatch path. `TODO(noisy-or-wiring)`: either add a binary Noisy-OR dispatch (when a forecaster declares independent sub-event probabilities) or leave as a library-only helper.
 - **Mixture-of-normals** (`mixtures.py`): `MixtureOfNormals` / `MixtureComponent` types, `mixture_cdf`, `fit_mixture_from_percentiles` (multi-start L-BFGS-B with single-normal fallback), and `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced 201-point CDF). Schema slot lives in `structured_output_schema.NumericStructured.mixture_components`; the numeric-format router branches on it.
 - **Gamma waiting-time, conditional-given-survival**: `gamma_prob_event_before` with elapsed-window split (`survival_distributions.py`) — covers the missing waiting-time fitter alongside the existing exponential / Weibull / Gamma-hazard variants.
 
@@ -230,6 +230,10 @@ LLM ensemble lives in `metaculus_bot/llm_configs.py` — single source of truth.
 - **Large (100)**: `make backtest_large`
 
 **DEPRECATED — community benchmark** (`community_benchmark.py`): baseline scoring broken (Metaculus removed aggregations from list API). `make benchmark_display` still works for viewing old results.
+
+### Residual / performance analysis (read-only, FREE — not gated)
+
+The `metaculus_bot/performance_analysis/` package evaluates the live bot's calibration against actual resolutions. Entry point: `uv run python -m metaculus_bot.performance_analysis --tournament <slug> --output <path>` (defaults to `spring-aib-2026`; pass `--tournament` explicitly). The **pull is read-only and free** — it hits only the Metaculus API (resolved questions + the bot's own comments, user id 275109, auth via `METACULUS_TOKEN`), no LLM/research calls and no publishing, so it is **NOT subject to the cost gate above** (unlike `make backtest_*` and live runs). Full era-bucketed methodology (Recon → Pull → Analyze → Synthesize, config-era bucketing keyed on submission time) in `scratch_docs_and_planning/residual_rerun_workflow.js`; dated outputs land under `scratch/residual_<date>/` (gitignored). Before analysis, run `make sync_research` (read-only/free) so per-provider research artifacts in `backtests/research_archive/latest/<qid>.json` are fresh — GHA artifacts expire at 90 days; see `scripts/research_sync/` for the weekly launchd job.
 
 ### Code quality
 

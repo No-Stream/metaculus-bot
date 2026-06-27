@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job: weekly research-archive sync.
+
+  Pulls GHA research artifacts into backtests/research_archive/ before they expire
+  (GHA retention-days: 90). Weekly cadence leaves wide margin inside the 90-day window.
+
+  EDIT BEFORE INSTALL: the paths below assume the repo lives at
+  /Users/flatljan/personal/metaculus-bot. Adjust ProgramArguments / log paths if
+  your username or repo location differs. See README.md for the install command.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.metaculusbot.research-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/run_sync.sh</string>
+    </array>
+
+    <!-- Weekly: Sundays at 03:00 local. launchd runs a missed job at next wake,
+         so this is laptop-friendly (no need for the Mac to be awake at 03:00). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- launchd's own stdout/stderr for the job (separate from run_sync.sh's dated
+         logfiles). Useful for diagnosing a job that never starts. -->
+    <key>StandardOutPath</key>
+    <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

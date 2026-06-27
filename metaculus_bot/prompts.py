@@ -160,6 +160,32 @@ QUESTION:
 {footer}"""
 
 
+# Source-provenance / motivation trust ladder, shared verbatim across the three
+# forecaster prompts (binary / MC / numeric). Reverse-engineering high-scoring
+# competitor bots showed they rank factual claims by proximity to the primary
+# record and adjust by source motivation. Interpolated in place of the old
+# "Separate facts from opinions" bullet (which leads this block, so the swap is
+# clean and just appends the ladder). Every line is pre-indented to >= 15 spaces
+# so clean_indents preserves the (A)-(D) nesting in all three prompts despite
+# their differing baselines (binary baseline 12, MC/numeric baseline 8).
+_SOURCE_PROVENANCE_LADDER = """
+               • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+               • Rank factual claims by proximity to the primary record:
+                 (A) official / primary — government statistics, regulatory filings (e.g. SEC/EDGAR), court records,
+                     central-bank releases, and the question's own named resolution source;
+                 (B) wire services and papers of record carrying named-sourced facts (Reuters, AP, Bloomberg, FT);
+                 (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
+                     use the underlying cited facts, not their framing or causal narrative;
+                 (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
+               • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
+                 marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
+                 its own timeline, an on-record denial of a favorable rumor — as strong evidence.
+               • Primary-record override: an interested party's own filing is still tier-A for the facts it formally
+                 attests, even though the party is biased.
+               • Implausibility check: a figure that is internally implausible or off by ~an order of magnitude versus
+                 corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -169,7 +195,21 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
         f"""
             You are a senior forecaster preparing a public report for expert peers.
             You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
-            You should consider current prediction markets when possible but not be beholden to them.
+            Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from
+            your training that the research reports don't cover, you may rely on it. You are not required to ground
+            every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
+            Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+            includes a market on this question, default to treating its price as a serious signal: if the market's
+            resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
+            strong evidence and should anchor your forecast. If the resolution date or criteria DIFFER, discount it
+            proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
+            burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off as
+            "not an anchor." When the criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the
+            resolution DATE, do NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our
+            resolution date with a simple model and STATE the assumption. Treat the market price as a probability at
+            its date and project to ours under a constant-hazard / base-rate-over-time assumption (or whatever simple
+            model fits): a longer window to our date implies a higher cumulative probability, a shorter window a
+            lower one (e.g. 30% YES by an earlier date X projects upward by our later date Y). Show the arithmetic.
 
             Your Metaculus question is:
             {question.question_text}
@@ -207,7 +247,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             1) Source analysis (focus on historical context section)
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
-               • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
 
             2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
@@ -290,7 +330,20 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
         Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid
         over-confidence and make sure your probabilities sum to **100%**.
-        Please consider news, research, and prediction markets, but you are not beholden to them.
+        Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
+        training that the research reports don't cover, you may rely on it. You are not required to ground every claim
+        in the research; just be clear when you're drawing on your own knowledge versus the research.
+        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+        includes a market on this question, default to treating its prices as a serious signal: if the market's
+        resolution criteria, resolution date, and other material terms MATCH this question, it is extremely strong
+        evidence and should anchor your distribution. If the resolution date or criteria DIFFER, discount it
+        proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The burden
+        is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
+        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
+        vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our resolution date with a simple model and
+        STATE the assumption. Treat the market price as a probability at its date and project to ours under a
+        constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer window to our date
+        implies a higher cumulative probability, a shorter window a lower one. Show the arithmetic.
 
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
@@ -317,7 +370,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         (1) Source analysis (focus on historical context section)
             • Summarize key sources; note recency, credibility, and scope.
-            • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
 
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
@@ -405,6 +458,9 @@ def numeric_prompt(
         You are a **senior forecaster** writing a public report for expert peers.
         You will be scored with Metaculus' log-score, so accuracy **and** calibration
         (especially the width of your prediction interval) are critical.
+        Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
+        training that the research reports don't cover, you may rely on it. You are not required to ground every claim
+        in the research; just be clear when you're drawing on your own knowledge versus the research.
         Calibration guidance: For volatile quantities (financial markets, novel events, short-horizon
         relative returns), produce wide, diffuse distributions — these are fundamentally hard to predict.
         For stable, well-measured indicators with recent data (economic indices, demographic measures,
@@ -412,7 +468,18 @@ def numeric_prompt(
         Do not over-hedge on quantities you can actually predict well.
         Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
         but penalties for overly wide intervals on predictable quantities also accumulate.
-        Please consider news, research, and prediction markets, but you are not beholden to them.
+        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
+        includes a market on this quantity, default to treating its implied range as a serious signal: if the
+        market's resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
+        strong evidence and your percentiles should center on it. If the resolution date or criteria DIFFER, discount
+        it proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
+        burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
+        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
+        vague haircut — EXPLICITLY EXTRAPOLATE the market's implied value/probability to our resolution date with a
+        simple model and STATE the assumption. Project from the market's date to ours under a constant-hazard,
+        trend-continuation, or base-rate-over-time assumption (or whatever simple model fits): a longer window to our
+        date generally widens the spread and shifts the implied level, a shorter window tightens it.
+        Show the arithmetic.
 
         ── Question ──
         {question.question_text}
@@ -449,7 +516,7 @@ def numeric_prompt(
 
         (1) Source analysis and data anchor
             - Summarize key sources; note recency, credibility, and scope.
-            - Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
             - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
         (2) Outside view and quantitative modeling

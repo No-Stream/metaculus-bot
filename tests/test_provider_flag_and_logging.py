@@ -428,8 +428,8 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
     # AskNews returns no articles → its block is the "No articles" message.
     assert "Gemini grounded research output" in research
     assert "## News Articles (AskNews)" in research
-    # Prediction-market formatter starts with the NOT-AN-ANCHOR caveat.
-    assert "NOT AN ANCHOR" in research
+    # Prediction-market formatter starts with the strong-evidence caveat.
+    assert "STRONG EVIDENCE" in research
 
 
 @pytest.mark.asyncio
