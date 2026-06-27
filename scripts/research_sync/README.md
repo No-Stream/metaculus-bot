@@ -30,9 +30,11 @@ LLM/research calls and no publishing.
 
 ## Install
 
-The plist and wrapper assume the repo is at `/Users/flatljan/personal/metaculus-bot`
-and the user is `flatljan`. **If your username or repo path differs, edit the paths in
-both files first.** `run_sync.sh` is already executable (`chmod +x`).
+`run_sync.sh` self-locates the repo root relative to its own path, so it needs no
+edits. The **plist** still hardcodes the absolute path to `run_sync.sh` (launchd
+requires an absolute `ProgramArguments` path) and the log locations — **if your repo
+path differs, edit the paths in the plist first.** `run_sync.sh` is already executable
+(`chmod +x`).
 
 Copy the plist into your per-user `LaunchAgents` directory and bootstrap it:
 

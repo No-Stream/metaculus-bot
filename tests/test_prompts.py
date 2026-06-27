@@ -515,3 +515,40 @@ class TestPredictionMarketFraming:
 
         assert "Prediction market" in non_bench
         assert "Prediction market" not in bench
+
+
+# ---------------------------------------------------------------------------
+# Source-provenance / motivation trust ladder
+# ---------------------------------------------------------------------------
+
+
+class TestSourceProvenanceLadder:
+    """The Source-analysis section of every forecaster prompt must carry the
+    provenance trust ladder: rank claims by proximity to the primary record and
+    adjust by source motivation (discount self-interest, treat statements
+    against interest as strong evidence). These are lightweight "did the text
+    land" guards — we expect them to break when the prompt is revised."""
+
+    def _assert_ladder_present(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        lowered = " ".join(prompt.lower().split())
+        assert "proximity to the primary record" in lowered
+        assert "against the speaker's interest" in lowered
+
+    def test_binary_prompt_carries_provenance_ladder(self) -> None:
+        self._assert_ladder_present(binary_prompt(_binary_q(), research="r"))
+
+    def test_multiple_choice_prompt_carries_provenance_ladder(self) -> None:
+        self._assert_ladder_present(multiple_choice_prompt(_mc_q(), research="r"))
+
+    def test_numeric_prompt_carries_provenance_ladder(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_ladder_present(result)
+
+    def test_numeric_prompt_preserves_data_anchor(self) -> None:
+        """Regression: appending the ladder must not displace the load-bearing
+        data-anchor bullet in the numeric Source-analysis section."""
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        lowered = " ".join(result.lower().split())
+        assert "most recent authoritative measurement" in lowered
+        assert "centered near this value" in lowered

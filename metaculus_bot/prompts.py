@@ -160,6 +160,32 @@ QUESTION:
 {footer}"""
 
 
+# Source-provenance / motivation trust ladder, shared verbatim across the three
+# forecaster prompts (binary / MC / numeric). Reverse-engineering high-scoring
+# competitor bots showed they rank factual claims by proximity to the primary
+# record and adjust by source motivation. Interpolated in place of the old
+# "Separate facts from opinions" bullet (which leads this block, so the swap is
+# clean and just appends the ladder). Every line is pre-indented to >= 15 spaces
+# so clean_indents preserves the (A)-(D) nesting in all three prompts despite
+# their differing baselines (binary baseline 12, MC/numeric baseline 8).
+_SOURCE_PROVENANCE_LADDER = """
+               • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+               • Rank factual claims by proximity to the primary record:
+                 (A) official / primary — government statistics, regulatory filings (e.g. SEC/EDGAR), court records,
+                     central-bank releases, and the question's own named resolution source;
+                 (B) wire services and papers of record carrying named-sourced facts (Reuters, AP, Bloomberg, FT);
+                 (C) aggregators, advocacy or partisan outlets, and translated or single-outlet reports —
+                     use the underlying cited facts, not their framing or causal narrative;
+                 (D) anonymous, social, rumor, or untraceable AI-generated summaries — suggestive only.
+               • Weigh motivation, not just authority: discount claims that serve the speaker's interest (hype,
+                 marketing, sponsor optimism). Treat a statement AGAINST the speaker's interest — a company tempering
+                 its own timeline, an on-record denial of a favorable rumor — as strong evidence.
+               • Primary-record override: an interested party's own filing is still tier-A for the facts it formally
+                 attests, even though the party is biased.
+               • Implausibility check: a figure that is internally implausible or off by ~an order of magnitude versus
+                 corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -221,7 +247,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             1) Source analysis (focus on historical context section)
                • Briefly summarize the main sources from the briefing; include date, credibility, and scope.
-               • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
 
             2) Reference class and quantitative base rate
                • List plausible reference classes for this question and evaluate suitability.
@@ -344,7 +370,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         (1) Source analysis (focus on historical context section)
             • Summarize key sources; note recency, credibility, and scope.
-            • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
 
         (2) Reference class (outside view) analysis
             • Candidate reference classes and suitability.
@@ -490,7 +516,7 @@ def numeric_prompt(
 
         (1) Source analysis and data anchor
             - Summarize key sources; note recency, credibility, and scope.
-            - Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
+{_SOURCE_PROVENANCE_LADDER}
             - Critical: what is the most recent authoritative measurement or data point for this quantity? Your prediction should be centered near this value unless you have strong, specific evidence for departure.
 
         (2) Outside view and quantitative modeling

@@ -528,6 +528,107 @@ Older (2026-05-10) framing, now superseded by the version-confound note above: P
 pipeline could use the forecastability classification (output by the prompt) to apply different tail-widening
 parameters, or use the FORECASTABILITY tag to adjust smoothing / tail-mass allocation / post-hoc CDF scaling.
 
+### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
+
+Source: a systematic dissection of 12 high-scoring forecast outputs from three competitor bots
+(GreeneiBot2, Preseen-Atlas, SynapseSeer) captured in `/Users/flatljan/Documents/prompts/metac-examples-strong-bots-june-2026.md`,
+analyzed via an ultracode workflow on 2026-06-26. Full report + grounding-critic verdict at
+`scratch/competitor_analysis_2026-06-26/REPORT.md`. **Important caveat for all of these: the corpus
+has NO resolution outcomes**, so every "why it helps" is a *mechanism* argument, never an
+outcome-validated one — none of these is evidence that the competitor scores better. The one
+genuinely shipped this session was the source-provenance trust ladder (prompt edit, in
+`prompts.py:_SOURCE_PROVENANCE_LADDER`); everything below was deliberately deferred as
+higher-risk-than-this-session and is gated on a benchmark before acting.
+
+**1. Stacker deviation cap from the base-model median (experiment; needs benchmark).**
+Bound the stacker's output to within K of the base-forecaster median — binary in probability
+points, numeric as a percentile/location shift — mirroring the existing Platt deviation-cap
+pattern, with K a new constant near the `CONDITIONAL_STACKING_*_THRESHOLD`s. Land it in
+`aggregation_pipeline.py::_stacking_aggregate` (clamp just before `_apply_platt_calibration`),
+new caps in `constants.py`.
+*Grounding:* GreeneiBot2's fact-checker layer caps any consolidated update to ±20% of the
+forecaster panel average (source line 1352: "any consolidated forecast should remain between
+roughly 42% and 62%"). *Why it could matter for us:* our own ablation disabled the numeric
+stacker because MEDIAN beat it (CRPS p=0.042, see Aggregation status above) — a reviewer
+drifting too far from a well-calibrated central statistic is exactly the failure a cap prevents,
+so a cap might let us safely re-enable numeric stacking. *Cautions:* (a) the whole point of
+conditional stacking is to let the reviewer MOVE the number when one model is right — a cap that
+is too tight defeats it, so ablate before shipping, do not assume benefit; (b) their "±20% of the
+average" is multiplicative and unstable near 0/1 — use an ABSOLUTE points cap for binary, not a
+percentage. **Gate:** `make backtest_medium` (or large) ablation of capped-stacker vs current
+MEDIAN-default before shipping.
+
+**2. Shared-reliance / consensus-fragility audit (experiment; higher-risk, needs benchmark).**
+The hole: our spread-gate (`spread_metrics.compute_spread`) takes MEDIAN whenever the N
+forecasters agree and **never asks WHY they agree**. If all 6 agree because they swallowed the
+same unverified fact from shared research, that consensus is falsely confident and invisible to a
+pure numeric-spread metric. This is the missing *mirror* of our existing disagreement branch
+(`spread > threshold` → crux → targeted search → stack); the agreement branch has no counterpart.
+Three operationalizations, cheap→expensive:
+  - (A) **Prompt-only self-report** — add a `load_bearing_claims: [{claim, verified, source}]`
+    field to the structured JSON each forecaster already emits (consumed by `tool_runner`); each
+    forecaster names the 1-3 facts its forecast most depends on and whether it could verify them.
+    Surfaces shared reliance, improves rationales, zero aggregation change. Cheapest; could be done
+    in a future prompt session without the benchmark gate (strict rationale-quality improvement).
+  - (B) **Deterministic cross-forecaster flag** — if one unverified load-bearing claim appears in
+    ≥K of N forecasters' self-reports, mark consensus fragile and FORCE the stacker/crux path to
+    fire even at low spread. Reuses existing machinery; the stacker prompt already has the right
+    language (`prompts.py:725`: "hedged consensus can reflect shared priors more than shared
+    evidence") — it just never runs on agreement today. Hard part: clustering free-text claims
+    across models is fuzzy (may itself need an LLM).
+  - (C) **Dedicated consensus-auditor LLM** — one cheap pass over the N rationales on the
+    low-spread branch: "do they agree from independent reasoning or shared reliance on claim X? is
+    X verified?" Symmetric to the disagreement-crux extractor.
+*Grounding (honest provenance):* this is **OUR idea, seeded by — not copied from — the competitors.**
+Their fact-checkers do two things SEPARATELY that this fuses: (a) discount agreement as
+non-independent when rationales overlap (SpaceX-stock line 2028: "their agreement should not be
+treated as two independent signals because the rationales and inputs are highly overlapping";
+Iran line 1330: "their rationales are very similar, so I would not treat them as fully
+independent evidence"), and (b) notice both forecasters leaned on the same unverified figure
+(Metaculus-predictions lines 36, 43: "both lean somewhat on an unverified GPT search count") —
+but they respond to (b) by downweighting+widening, NEVER by gating aggregation. No competitor
+passage fuses "shared reliance on one unverified fact" with "therefore discount the consensus."
+*Caution:* (B)/(C) add cost to the COMMON cheap MEDIAN path (most questions agree), inverting our
+"cheap path for agreement, expensive only for disagreement" design — that per-question cost bump
+is the main reason it's deferred. **Gate:** benchmark (B)/(C) before shipping; (A) is the
+low-risk starting point.
+
+**3. Numeric "unverified-conflict → variance" rider (low priority; tension with our calibration).**
+When the source-provenance ladder genuinely CANNOT adjudicate between two candidate values for a
+load-bearing quantity, place mass across both rather than committing to one (widen the relevant
+percentiles), with a materiality gate so it only fires when the gap exceeds plausible
+measurement/timing noise.
+*Grounding:* the Metaculus-predictions fact-checkers, facing a background count (3,856,697) vs an
+unverified live count (3,895,701), widened rather than picking: "this discrepancy should widen
+uncertainty and slightly reduce confidence … not secure enough to fully adopt" (line 36); "treat
+the current count as uncertain, centered between these values but with extra variance … sigma
+95000 to cover the current-count discrepancy" (line 43); and a quantified materiality test ("a
+39004 same-day discrepancy is too large to dismiss as normal intraday growth").
+*Why deferred / tension:* our verified PIT analysis says our numeric CDFs are ALREADY too wide
+(why `TAIL_WIDEN_K_TAIL=1.0`, see Domain-aware CDF entry above), and our hedge-audit deliberately
+*penalizes* widening-out-of-caution. The narrow defense is that this widens for a NAMED, specific,
+quantified reason — which satisfies the hedge-audit's own "name specific evidence to widen"
+carve-out rather than violating it — but it risks an LLM over-applying it (every question has
+*some* source tension). Decided in design discussion (2026-06-26) NOT to ship as a standalone
+widening license; the trust ladder + the existing gap-fill tiebreaker-search already adjudicate
+most conflicts by authority. Revisit only as a tightly-scoped numeric-only A/B, never blanket;
+**gate** on P10/P90 coverage of resolved numerics not regressing.
+
+**Also observed but NOT pursued (logged so future sessions don't re-litigate):** binary-complement
+coherence guard ("state implied No; confirm Yes+No=100%", cheap defect protection — candidate for a
+future prompt session, see report rec #4); interrogate-the-resolution-source-quality prompt clause
+(Preseen-Atlas "Nasdaq calendar dates are 'not official'", line 2679 — partially covered by our
+trust ladder now placing "the question's own named resolution source" in tier A); numeric
+partial-resolution incorporation ("fix the realized portion, put variance only on the remainder")
+and reporting-vs-outcome-uncertainty clauses (report rec #5). **Explicitly rejected as conflicting
+with verified data** (do NOT re-recommend): GreeneiBot2's one-sided anti-overprediction shave
+`X=min(10−certainty, 0.2×estimate)` (our binary calibration slope flips 0.83→1.66 across rounds, so
+a fixed shave helps one round and hurts the next); blanket sigma-widening (CDFs already too wide);
+switching numeric to parametric mean/sigma representation (our percentile→PCHIP→CDF-space pipeline
+strictly subsumes a single normal and additionally supports mixtures via OPTION B); the open-tail
+"spike" grid-compliance trick (we solve grid validity deterministically in `pchip_cdf.py` and our
+prompt already tells forecasters spiky tricks don't pay).
+
 ## Longer-term (significant R&D)
 
 ### Agentic deep research (ReAct loop)

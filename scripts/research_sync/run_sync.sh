@@ -14,11 +14,15 @@
 
 set -euo pipefail
 
-REPO_DIR="/Users/flatljan/personal/metaculus-bot"
-LOG_DIR="${REPO_DIR}/scripts/research_sync/logs"
+# Resolve the repo root relative to this script (scripts/research_sync/run_sync.sh)
+# so the wrapper works regardless of where the repo is cloned. launchd invokes this
+# by absolute path, so BASH_SOURCE[0] is absolute and the cd's resolve correctly.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
 
 # Prepend the dirs holding uv (~/.local/bin) and gh (Homebrew) so launchd can find them.
-export PATH="/Users/flatljan/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
+export PATH="${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/sync_$(date +%Y-%m-%d).log"
