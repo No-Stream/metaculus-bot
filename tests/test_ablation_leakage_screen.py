@@ -388,6 +388,54 @@ class TestScreenResearchBlob:
         assert on_disk["detector_response"] == "<empty research; nothing to leak>"
 
     @pytest.mark.asyncio
+    async def test_diagnostics_only_blob_short_circuits(self, cache: AblationCache) -> None:
+        """A fully-failed research run returns a diagnostics-ONLY blob (just the
+        ``## Provider Diagnostics`` section: provider names/status/timing, nothing leakable).
+        It must short-circuit the detector exactly like an empty string, never get screened."""
+        from metaculus_bot.research.provider_diagnostics import ProviderResult, format_provider_diagnostics_block
+
+        diagnostics_only = format_provider_diagnostics_block(
+            [
+                ProviderResult(name="asknews", status="inactive", chars=0, latency_ms=12, error_type="ForbiddenError"),
+                ProviderResult(
+                    name="native_search", status="errored", chars=0, latency_ms=8, error_type="RuntimeError"
+                ),
+            ]
+        )
+        assert "## Provider Diagnostics" in diagnostics_only  # precondition: real diagnostics block
+
+        detector_llm = AsyncMock()
+        question = _make_question(42)
+        gt = _make_ground_truth(42)
+
+        verdict = await screen_research_blob(question, gt, diagnostics_only, cache, detector_llm=detector_llm)
+
+        assert verdict["is_leaked"] is False
+        assert verdict["detector_failed"] is False
+        detector_llm.invoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blob_with_real_research_plus_diagnostics_is_screened(self, cache: AblationCache) -> None:
+        """A blob that carries genuine research (a provider section) ALONGSIDE the diagnostics
+        block must still be screened — only diagnostics-only blobs short-circuit."""
+        from metaculus_bot.research.provider_diagnostics import ProviderResult, format_provider_diagnostics_block
+
+        diagnostics = format_provider_diagnostics_block(
+            [ProviderResult(name="native_search", status="ok", chars=42, latency_ms=10)]
+        )
+        blob = f"## Web Research (Native Search)\nSome real research content.\n\n{diagnostics}"
+
+        detector_llm = AsyncMock()
+        detector_llm.invoke.return_value = '{"is_leaked": false, "explanation": "no reveal"}'
+        question = _make_question(42)
+        gt = _make_ground_truth(42)
+
+        verdict = await screen_research_blob(question, gt, blob, cache, detector_llm=detector_llm)
+
+        detector_llm.invoke.assert_called_once()
+        assert verdict["detector_failed"] is False
+
+    @pytest.mark.asyncio
     async def test_records_screened_at_iso_datetime(self, cache: AblationCache) -> None:
         detector_llm = AsyncMock()
         detector_llm.invoke.return_value = '{"is_leaked": false, "explanation": "x"}'

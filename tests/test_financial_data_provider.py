@@ -7,11 +7,14 @@ import pandas as pd
 import pytest
 
 
-def _make_q(text: str) -> MagicMock:
-    """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
-    contract. Tests only care about question_text on this path."""
+def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
+    """Build a minimal MetaculusQuestion-shaped mock for the ResearchCallable
+    contract. resolution_criteria/fine_print default to "" (a bare MagicMock
+    would auto-create truthy child mocks, breaking the `or ""` guard and regex)."""
     q = MagicMock()
     q.question_text = text
+    q.resolution_criteria = resolution_criteria
+    q.fine_print = fine_print
     return q
 
 
@@ -330,8 +333,11 @@ class TestFinancialDataProviderIntegration:
             result = await provider(_make_q("Compare Apple and BADTICKER stock performance"))
 
         assert "AAPL" in result
-        # BADTICKER should not appear (its fetch failed and returned "")
-        assert "BADTICKER" not in result
+        # BADTICKER should not appear in the rendered data body (its fetch failed).
+        # The Part D routing marker legitimately records the classifier's choice,
+        # so check the body before the (forecaster-invisible) HTML-comment marker.
+        body = result.split("<!-- financial_routing:")[0]
+        assert "BADTICKER" not in body
 
     @pytest.mark.asyncio
     async def test_missing_fred_key_skips_fred_fetches(self) -> None:
@@ -363,8 +369,333 @@ class TestFinancialDataProviderIntegration:
                 monkeypatch.undo()
 
         assert "AAPL" in result
-        # FRED data should not appear since no API key
-        assert "UNRATE" not in result
+        # FRED data should not appear in the rendered body since there's no API key.
+        # The routing marker still records the (skipped) FRED routing decision.
+        body = result.split("<!-- financial_routing:")[0]
+        assert "UNRATE" not in body
+
+
+# ---------------------------------------------------------------------------
+# Deterministic identifier extraction from resolution criteria / fine print
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFinancialIdentifiers:
+    """Tests for extract_financial_identifiers_from_criteria (Part A)."""
+
+    def test_extracts_fred_series_from_url(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = "This resolves based on https://fred.stlouisfed.org/series/DGS10 as published."
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["fred_series"] == ["DGS10"]
+        assert result["tickers"] == []
+
+    def test_extracts_fred_series_with_underscores_and_digits(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = "High-yield spread: https://fred.stlouisfed.org/series/BAMLH0A0HYM2 and the 10y-2y https://fred.stlouisfed.org/series/T10Y2Y."
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["fred_series"] == ["BAMLH0A0HYM2", "T10Y2Y"]
+
+    def test_extracts_yahoo_ticker_with_url_encoded_caret(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = "Resolves on the 10Y yield index at https://finance.yahoo.com/quote/%5ETNX/"
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["tickers"] == ["^TNX"]
+        assert result["fred_series"] == []
+
+    def test_strips_trailing_period_from_sentence_final_yahoo_url(self) -> None:
+        """A URL ending a sentence captures the period into the Yahoo char class
+        (`.../quote/%5ETNX.` -> `^TNX.`), which isn't in KNOWN_TICKERS and silently
+        defeats the q43650 deterministic-fire guarantee. The trailing `.` must be
+        stripped; internal dots (e.g. DX-Y.NYB) are preserved by rstrip."""
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        result = extract_financial_identifiers_from_criteria("Resolves on https://finance.yahoo.com/quote/%5ETNX.")
+
+        assert result["tickers"] == ["^TNX"]
+
+    def test_extracts_yahoo_ticker_with_special_chars(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = "Crude: https://finance.yahoo.com/quote/CL=F bitcoin: https://finance.yahoo.com/quote/BTC-USD"
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["tickers"] == ["CL=F", "BTC-USD"]
+
+    def test_extracts_both_fred_and_yahoo(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = (
+            "Yield per https://fred.stlouisfed.org/series/DGS10 and proxy "
+            "https://finance.yahoo.com/quote/%5ETNX for context."
+        )
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["fred_series"] == ["DGS10"]
+        assert result["tickers"] == ["^TNX"]
+
+    def test_dedupes_preserving_order(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        text = (
+            "https://fred.stlouisfed.org/series/DGS10 ... again "
+            "https://fred.stlouisfed.org/series/DGS2 ... once more "
+            "https://fred.stlouisfed.org/series/DGS10"
+        )
+        result = extract_financial_identifiers_from_criteria(text)
+
+        assert result["fred_series"] == ["DGS10", "DGS2"]
+
+    def test_no_match_returns_empty_lists(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        result = extract_financial_identifiers_from_criteria("Will it rain in London tomorrow?")
+
+        assert result == {"tickers": [], "fred_series": []}
+
+    def test_empty_string_returns_empty_lists(self) -> None:
+        from metaculus_bot.research.financial_data import extract_financial_identifiers_from_criteria
+
+        result = extract_financial_identifiers_from_criteria("")
+
+        assert result == {"tickers": [], "fred_series": []}
+
+
+# ---------------------------------------------------------------------------
+# Deterministic routing integration: extraction guarantees + observability
+# ---------------------------------------------------------------------------
+
+
+def _stub_fred_fetch(series_id: str, api_key: str) -> str:
+    """Recognizable FRED markdown so tests assert on routing, not the live API."""
+    return f"### {series_id} (Test Series)\n- Latest value: 4.48 (2026-06-27)"
+
+
+def _stub_yfinance_fetch(ticker: str) -> str:
+    """Recognizable yfinance markdown so tests assert on routing, not the live API."""
+    return f"### {ticker}\n- Current price: 4.48"
+
+
+class TestDeterministicRouting:
+    """Part B/C/D: criteria-driven extraction guarantees the resolving source fires."""
+
+    @pytest.mark.asyncio
+    async def test_q43650_regression_dgs10_fires_despite_classifier_misroute(self) -> None:
+        """The q43650 smoking gun: criteria name FRED DGS10 but the classifier
+        emits only the Yahoo proxy ^TNX. Deterministic extraction must force a
+        ### DGS10 FRED section into the output regardless of the classifier."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: ^TNX\nFRED_SERIES: NONE"
+
+        question = _make_q(
+            "What will the 10-year Treasury yield be at end of June 2026?",
+            resolution_criteria="Resolves to the value at https://fred.stlouisfed.org/series/DGS10 on the close date.",
+        )
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                provider = financial_data_provider()
+                result = await provider(question)
+            finally:
+                monkeypatch.undo()
+
+        assert "### DGS10" in result
+        # The classifier's Yahoo proxy still fetched too (extraction is additive).
+        assert "### ^TNX" in result
+
+    @pytest.mark.asyncio
+    async def test_non_financial_classification_but_extracted_url_still_fetches(self) -> None:
+        """classification is None but criteria name a FRED URL -> still fetch it.
+        Must NOT early-return "" on the extracted path (the q43650-class guarantee)."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
+
+        question = _make_q(
+            "A vaguely-worded question the classifier won't recognize.",
+            fine_print="Resolution source: https://fred.stlouisfed.org/series/CPIAUCSL",
+        )
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                provider = financial_data_provider()
+                result = await provider(question)
+            finally:
+                monkeypatch.undo()
+
+        assert "### CPIAUCSL" in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("classifier_line", "fake_id"),
+        [
+            ("FINANCIAL: YES\nTICKERS: NONE\nFRED_SERIES: TOTALSALES_FAKE", "TOTALSALES_FAKE"),
+            # ZZZZ has only valid ticker chars (so F2 keeps it) but isn't in
+            # KNOWN_TICKERS, exercising the unknown-but-well-formed ticker branch.
+            ("FINANCIAL: YES\nTICKERS: ZZZZ\nFRED_SERIES: NONE", "ZZZZ"),
+        ],
+    )
+    async def test_unknown_classifier_id_logs_warning_but_still_fetches(
+        self, caplog: pytest.LogCaptureFixture, classifier_line: str, fake_id: str
+    ) -> None:
+        """An unrecognized classifier ID (FRED series OR ticker) is soft-failed
+        loudly: WARNING logged, fetch still happens (may be valid-but-unlisted), and
+        the id appears in the routing marker's unknown=[...] field."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = classifier_line
+
+        question = _make_q("Will some obscure indicator move?")
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                provider = financial_data_provider()
+                with caplog.at_level("WARNING", logger="metaculus_bot.research.financial_data"):
+                    result = await provider(question)
+            finally:
+                monkeypatch.undo()
+
+        assert f"### {fake_id}" in result
+        assert f"unknown=[{fake_id}]" in result
+        assert any(fake_id in rec.message and rec.levelname == "WARNING" for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_malformed_classifier_id_dropped_and_marker_not_corrupted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A classifier token containing chars outside the extraction char class
+        (here `-->`, which would close the routing HTML comment and leak its tail as
+        visible markdown) is dropped with a WARNING. A clean co-emitted id survives,
+        and the rendered marker contains exactly ONE `-->` (its own terminator).
+
+        Note: _parse_classifier_response upper-cases values, so `BAD --> leak`
+        reaches the sanitizer (and the WARNING) as `BAD --> LEAK`."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL, BAD --> leak\nFRED_SERIES: NONE"
+
+        question = _make_q("Will Apple stock move?")
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            with caplog.at_level("WARNING", logger="metaculus_bot.research.financial_data"):
+                provider = financial_data_provider()
+                result = await provider(question)
+
+        # The clean token still fetched; the malformed one is gone everywhere.
+        assert "### AAPL" in result
+        assert "LEAK" not in result
+        # Exactly one `-->`: the marker's own terminator, nothing leaked early.
+        assert result.count("-->") == 1
+        assert any("BAD --> LEAK" in rec.message and rec.levelname == "WARNING" for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_routing_marker_present_with_expected_values(self) -> None:
+        """Part D: a compact, forecaster-invisible HTML-comment routing marker is
+        appended to the returned markdown, recording the routing decision."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: ^TNX\nFRED_SERIES: NONE"
+
+        question = _make_q(
+            "10y Treasury yield question",
+            resolution_criteria="Resolves on https://fred.stlouisfed.org/series/DGS10.",
+        )
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_fred_data", side_effect=_stub_fred_fetch),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_stub_yfinance_fetch),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("FRED_API_KEY", "fake_key")
+            try:
+                provider = financial_data_provider()
+                result = await provider(question)
+            finally:
+                monkeypatch.undo()
+
+        assert "<!-- financial_routing:" in result
+        assert "fred=[DGS10]" in result
+        assert "tickers=[^TNX]" in result
+        assert "extracted_fred=[DGS10]" in result
+        assert "extracted_tickers=[]" in result
+        assert "unknown=[]" in result
+
+    @pytest.mark.asyncio
+    async def test_routing_marker_absent_on_non_financial_empty_return(self) -> None:
+        """The marker is only emitted when the provider actually ran; a truly
+        non-financial question (no classification, no extraction) returns ""."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
+
+        with patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            provider = financial_data_provider()
+            result = await provider(_make_q("Will it rain in London tomorrow?"))
+
+        assert result == ""
+        assert "financial_routing" not in result
+
+
+# ---------------------------------------------------------------------------
+# Allowlist / prompt single-source-of-truth consistency
+# ---------------------------------------------------------------------------
+
+
+class TestAllowlistPromptConsistency:
+    """The KNOWN_* frozensets and the CLASSIFIER_PROMPT reference table are both
+    derived from the _TICKER_GROUPS / _FRED_GROUPS dicts, so they cannot drift.
+    These tests guard that derivation (and would catch a future hardcode regression)."""
+
+    def test_every_known_id_appears_in_prompt(self) -> None:
+        from metaculus_bot.research.financial_data import CLASSIFIER_PROMPT, KNOWN_FRED_SERIES, KNOWN_TICKERS
+
+        for identifier in KNOWN_TICKERS | KNOWN_FRED_SERIES:
+            assert identifier in CLASSIFIER_PROMPT, f"{identifier} missing from CLASSIFIER_PROMPT reference table"
+
+    def test_frozensets_derived_from_label_dicts(self) -> None:
+        from metaculus_bot.research.financial_data import (
+            FRED_LABELS,
+            KNOWN_FRED_SERIES,
+            KNOWN_TICKERS,
+            TICKER_LABELS,
+        )
+
+        assert KNOWN_TICKERS == frozenset(TICKER_LABELS)
+        assert KNOWN_FRED_SERIES == frozenset(FRED_LABELS)
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ from forecasting_tools import GeneralLlm, MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.backtest.scoring import GroundTruth
+from metaculus_bot.research.provider_diagnostics import PROVIDER_DIAGNOSTICS_HEADER
 
 # Transient exceptions worth a single retry. The detector LLM call can fail in
 # two ways that legitimately recover on retry: (1) the LLM provider hiccups
@@ -223,6 +224,22 @@ async def _detect_leakage_structured(
     raise last_exc
 
 
+def _is_content_free_blob(research_blob: str) -> bool:
+    """True iff the blob carries no leakable research content.
+
+    A fully-failed research run no longer returns ``""`` — it returns a
+    diagnostics-only blob (just the ``## Provider Diagnostics`` section appended
+    by the orchestrator: provider names, statuses, timings; nothing leakable). We
+    strip a trailing diagnostics section before the emptiness check so such a blob
+    short-circuits the detector just like the old empty-string case did, instead
+    of being needlessly screened.
+    """
+    header_idx = research_blob.find(PROVIDER_DIAGNOSTICS_HEADER)
+    without_diagnostics = research_blob if header_idx == -1 else research_blob[:header_idx]
+    # Trailing ``---`` separator and surrounding whitespace are not research either.
+    return without_diagnostics.strip().rstrip("-").strip() == ""
+
+
 def _research_blob_sha(research_blob: str) -> str:
     """Short SHA-256 prefix used to detect stale cached verdicts.
 
@@ -280,7 +297,8 @@ async def screen_research_blob(
       exception (transport failure OR JSON parse failure), set is_leaked=True
       (CONSERVATIVE — drop the question, the production screen keeps it) and
       detector_failed=True.
-    - Empty research blob: short-circuit without calling the LLM.
+    - Content-free research blob (empty, or diagnostics-only from a fully-failed
+      run): short-circuit without calling the LLM.
     - Always writes the verdict to cache before returning (even on detector
       failure).
     """
@@ -296,7 +314,7 @@ async def screen_research_blob(
         if cached is not None:
             return cached
 
-    if research_blob == "":
+    if _is_content_free_blob(research_blob):
         verdict = _build_verdict(
             is_leaked=False,
             detector_response=_EMPTY_BLOB_RESPONSE,

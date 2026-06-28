@@ -1534,3 +1534,203 @@ class TestParsePerBaseModelForecasts:
 
         result = parse_per_base_model_forecasts(comment, "binary")
         assert result["gpt-5.5"] == "72.0%"
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: the new RESEARCH-section blocks added this session
+# (Prediction Market Snapshot, Provider Diagnostics, URL Context Fetches,
+# financial_routing comment) must NOT bleed into the MC option-probability
+# parsers.
+#
+# WHY THIS TEST EXISTS — the latent coupling
+# ------------------------------------------
+# ``_MC_OPTION_LINE_RE`` (parsing.py ~line 577) is
+#     (?m)^[ \t]*-\s+(.+?):\s+([0-9]+(?:\.[0-9]+)?)\s*%
+# which matches ANY ``- <name>: NN%`` bullet at column 0. The Prediction Market
+# Snapshot block emits ``### Resolution criteria / rules`` bullets shaped EXACTLY
+# like that — e.g. ``- **Polymarket** <url>: ...resolves YES if X... 55%``. That
+# line WOULD be captured as a spurious MC option ("**Polymarket** <url>: ...resolves
+# YES if X..." → 0.55) if the regex ever ran over it.
+#
+# It is safe TODAY only because the two MC-option parsers are SCOPED to sections
+# OUTSIDE the research blob:
+#   * ``parse_per_model_mc_option_probs`` scans only ``_summary_section_for_bullets``
+#     — the prefix BEFORE ``### Research Summary`` — and only the region between
+#     consecutive ``*Forecaster N*:`` bullets within it.
+#   * ``parse_per_base_model_forecasts`` scans only the ``## R1:`` reasoning bodies
+#     (via ``_iter_per_model_blocks``) and only returns non-empty when a
+#     stacker-combined body is present.
+# The snapshot lives in ``# RESEARCH`` (after ``### Research Summary``, before
+# ``# FORECASTS``), so neither parser's scope reaches it.
+#
+# If a future change widens that scope, reorders the framework sections, or drops
+# the ``### Research Summary`` boundary, the snapshot's ``: NN%`` bullets would be
+# silently mis-parsed as MC option probabilities and corrupt MC calibration
+# metrics. This test FAILS LOUDLY if that protection ever regresses.
+# ---------------------------------------------------------------------------
+
+# The booby-trap lines: Prediction Market Snapshot ``### Resolution criteria /
+# rules`` bullets shaped exactly like an MC option line (``- <name>: NN%``).
+# These sit inside the RESEARCH blob and must never surface as MC options.
+_POLYMARKET_TRAP_LINE = "- **Polymarket** <https://polymarket.com/event/foo>: resolves YES if X happens: 55%"
+_KALSHI_TRAP_LINE = "- **Kalshi** <https://kalshi.com/markets/bar>: market settles to the higher tier: 47%"
+
+# A realistic STACKED multiple-choice bot comment carrying ALL FOUR new research
+# blocks. Section order mirrors the framework's unified layout
+# (# SUMMARY → ### Research Summary → # RESEARCH → # FORECASTS) and the
+# stacker-combined R1 body produced by combine_stacker_and_base_reasoning.
+_MC_COMMENT_WITH_NEW_RESEARCH_BLOCKS = f"""# SUMMARY
+*Question*: Which tier will the policy land in?
+*Final Prediction*: Option A 58.0%, Option B 42.0%
+
+## Report 1 Summary
+### Forecasts
+*Forecaster 1 (stacker-claude-opus-4.5)*:
+- Option A: 58.0%
+- Option B: 42.0%
+
+### Research Summary
+Stacked across the base models below.
+
+# RESEARCH
+## Report 1 Research
+## News Articles (AskNews)
+Recent coverage of the policy debate.
+
+---
+
+## Provider Diagnostics
+- asknews: ok | 4210 chars | 8120 ms
+- native_search: ok | 9044 chars | 41210 ms
+- gemini_search: ok | 2210 chars | 15330 ms
+
+---
+
+## Prediction Market Snapshot
+| platform | title | prob | vol | close | conf |
+|---|---|---|---|---|---|
+| Polymarket | Will the policy land in Tier A | 0.55 | 12000 | 2026-07-01 | 0.80 |
+| Kalshi | Policy tier resolution | 0.47 | 4000 | 2026-07-01 | 0.62 |
+
+##### Resolution criteria / rules
+{_POLYMARKET_TRAP_LINE}
+{_KALSHI_TRAP_LINE}
+
+---
+
+## Web Research (Google Search via Gemini)
+Gemini grounded results.
+
+### URL Context Fetches
+_url_context: none_
+
+<!-- financial_routing: fred=[] tickers=['ACME'] extracted=['ACME'] unknown=[] -->
+
+# FORECASTS
+================================================================================
+FORECAST SECTION:
+
+## R1: Forecaster 1 Reasoning
+{{combined_reasoning}}
+
+<!-- STACKED=true -->
+<!-- STACKER_OUTCOME=primary -->
+"""
+
+
+def _mc_stacked_comment_with_research_blocks() -> str:
+    """Build the synthetic STACKED MC comment with the combined R1 body filled in.
+
+    The two base models each emit a real MC option vector inside their reasoning
+    body — that's the legitimate per-base-model content the parsers SHOULD find.
+    The Prediction Market Snapshot's option-shaped rules lines live in the
+    research blob and must NOT be picked up.
+    """
+    base_preds = [
+        _build_base_pred(
+            "openrouter/openai/gpt-5.5",
+            "My MC analysis:\n- Option A: 60.0%\n- Option B: 40.0%",
+        ),
+        _build_base_pred(
+            "openrouter/anthropic/claude-opus-4.7",
+            "My MC analysis:\n- Option A: 56.0%\n- Option B: 44.0%",
+        ),
+    ]
+    meta_text = "Stacker meta:\n- Option A: 58.0%\n- Option B: 42.0%"
+    combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+    return _MC_COMMENT_WITH_NEW_RESEARCH_BLOCKS.format(combined_reasoning=combined)
+
+
+class TestNewResearchBlocksDoNotLeakIntoMcParsers:
+    """Lock down MC parsers against the option-shaped Prediction Market rules lines."""
+
+    def test_snapshot_rules_lines_are_actually_mc_option_shaped(self):
+        # Guard the premise of this whole class: confirm the trap lines really
+        # DO match the MC-option regex. If the regex is ever rewritten so these
+        # no longer match, the scoping protection is moot and this test (and the
+        # ones below) should be revisited.
+        from metaculus_bot.performance_analysis.parsing import _MC_OPTION_LINE_RE
+
+        assert _MC_OPTION_LINE_RE.search(_POLYMARKET_TRAP_LINE) is not None
+        assert _MC_OPTION_LINE_RE.search(_KALSHI_TRAP_LINE) is not None
+
+    def test_mc_option_probs_excludes_snapshot_rules_lines(self):
+        comment = _mc_stacked_comment_with_research_blocks()
+        result = parse_per_model_mc_option_probs(comment)
+
+        # Only the stacker's summary-bullet option vector is returned.
+        assert result == {"stacker-claude-opus-4.5": {"Option A": 0.58, "Option B": 0.42}}
+
+        # No snapshot-derived option ever appears, under any key.
+        for options in result.values():
+            assert not any("Polymarket" in opt for opt in options)
+            assert not any("Kalshi" in opt for opt in options)
+            assert 0.55 not in options.values()
+            assert 0.47 not in options.values()
+
+    def test_per_base_model_forecasts_recovers_only_true_base_models(self):
+        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
+
+        comment = _mc_stacked_comment_with_research_blocks()
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+
+        # Exactly the two real base models, with their R1-body option vectors.
+        assert result == {
+            "gpt-5.5": {"Option A": 0.60, "Option B": 0.40},
+            "claude-opus-4.7": {"Option A": 0.56, "Option B": 0.44},
+        }
+
+        # The snapshot rules lines live in the research blob, not in any R1
+        # reasoning body, so no Polymarket/Kalshi-keyed option leaks in.
+        for options in result.values():
+            assert isinstance(options, dict)
+            assert not any("Polymarket" in opt for opt in options)
+            assert not any("Kalshi" in opt for opt in options)
+
+    def test_per_model_forecasts_unaffected_by_new_blocks(self):
+        # The binary/summary per-model parser keys off the single stacker bullet
+        # in the summary prefix; the new research blocks must not perturb it.
+        comment = _mc_stacked_comment_with_research_blocks()
+        result = parse_per_model_forecasts(comment)
+
+        # The MC stacker bullet's first-line value is empty (options follow on
+        # the next lines), so the captured value is empty — but the KEY must be
+        # exactly the stacker, with no spurious snapshot-derived entries.
+        assert set(result.keys()) == {"stacker-claude-opus-4.5"}
+        assert "Polymarket" not in result
+        assert "Kalshi" not in result
+
+    def test_summary_boundary_is_what_protects_the_parsers(self):
+        # Make the protection mechanism explicit: the snapshot trap lines must
+        # fall AFTER the ``### Research Summary`` boundary, i.e. outside the
+        # region the MC option parser scopes to. If a refactor ever moves the
+        # boundary or the snapshot, this assertion flags it before the
+        # mis-parse can happen.
+        from metaculus_bot.performance_analysis.parsing import _summary_section_for_bullets
+
+        comment = _mc_stacked_comment_with_research_blocks()
+        summary_prefix = _summary_section_for_bullets(comment)
+        assert _POLYMARKET_TRAP_LINE not in summary_prefix
+        assert _KALSHI_TRAP_LINE not in summary_prefix
+        # And the legitimate stacker bullet IS inside the scoped prefix.
+        assert "*Forecaster 1 (stacker-claude-opus-4.5)*:" in summary_prefix

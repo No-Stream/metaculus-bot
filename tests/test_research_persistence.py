@@ -137,6 +137,72 @@ class TestResearchPersistenceWriter:
         ts = datetime.fromisoformat(record["timestamp"])
         assert ts.tzinfo == timezone.utc
 
+    def test_provider_results_persisted_at_schema_v2(self, tmp_path: Path) -> None:
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        provider_results = [
+            {
+                "name": "asknews",
+                "status": "ok",
+                "chars": 12483,
+                "latency_ms": 8231,
+                "error_type": None,
+                "error_message": None,
+                "details": {},
+            },
+            {
+                "name": "gemini_search",
+                "status": "errored",
+                "chars": 0,
+                "latency_ms": 360002,
+                "error_type": "TimeoutError",
+                "error_message": "timed out",
+                "details": {},
+            },
+        ]
+        writer.record(
+            qid=7,
+            page_url="https://example.com/q/7/",
+            question_text="Test?",
+            research_text="data",
+            providers_used=["asknews", "gemini_search"],
+            gap_fill_used=False,
+            provider_results=provider_results,
+            providers_attempted=["asknews", "gemini_search"],
+            providers_succeeded=["asknews"],
+        )
+
+        result = writer.flush(output_dir=str(tmp_path))
+        assert result is not None
+        record = json.loads(result.read_text().strip())
+
+        assert record["schema_version"] == 2
+        assert record["provider_results"] == provider_results
+        assert record["providers_attempted"] == ["asknews", "gemini_search"]
+        assert record["providers_succeeded"] == ["asknews"]
+        # Legacy field retained for back-compat.
+        assert record["providers_used"] == ["asknews", "gemini_search"]
+
+    def test_record_works_without_new_args(self, tmp_path: Path) -> None:
+        """Existing callers omit the v2 args; record() must still produce a valid record."""
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer.record(
+            qid=1,
+            page_url="https://example.com/q/1/",
+            question_text="Q?",
+            research_text="R",
+            providers_used=["asknews"],
+            gap_fill_used=False,
+        )
+
+        result = writer.flush(output_dir=str(tmp_path))
+        assert result is not None
+        record = json.loads(result.read_text().strip())
+
+        assert record["schema_version"] == 2
+        assert record["provider_results"] == []
+        assert record["providers_attempted"] == []
+        assert record["providers_succeeded"] == []
+
     def test_unicode_content_preserved(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
         unicode_text = "Probability of event: 73.2% — source: “Forecast Journal” \U0001f4c8"

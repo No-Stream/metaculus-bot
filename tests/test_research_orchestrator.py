@@ -426,6 +426,229 @@ class TestIntegrationWithTemplateForecaster:
         assert bot._research_provider_timeout_count == 5
 
 
+class TestProviderDiagnosticsCapture:
+    """Per-provider observability: _run_providers_parallel returns a ProviderResult list
+    alongside the combined text, and run_research appends a diagnostics block."""
+
+    @pytest.mark.asyncio
+    async def test_status_ok_for_nonempty_provider(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="some research prose")
+
+        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+
+        assert len(results) == 1
+        assert results[0].name == "native_search"
+        assert results[0].status == "ok"
+        assert results[0].chars == len("some research prose")
+        assert isinstance(results[0].latency_ms, int)
+        assert results[0].latency_ms >= 0
+        assert results[0].error_type is None
+        assert results[0].error_message is None
+        assert results[0].details == {}
+
+    @pytest.mark.asyncio
+    async def test_status_empty_for_blank_provider(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="   ")
+
+        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+
+        assert results[0].status == "empty"
+        assert results[0].chars == 0
+
+    @pytest.mark.asyncio
+    async def test_status_errored_for_raising_provider(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(side_effect=RuntimeError("boom"))
+
+        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+
+        assert results[0].status == "errored"
+        assert results[0].chars == 0
+        assert results[0].error_type == "RuntimeError"
+        assert results[0].error_message is not None
+        assert "boom" in results[0].error_message
+        assert orch.timeout_count == 1
+
+    @pytest.mark.asyncio
+    async def test_status_inactive_for_asknews_subscription_error(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+
+        class ForbiddenError(Exception):
+            pass
+
+        provider = AsyncMock(side_effect=ForbiddenError("403011 - subscription is not currently active"))
+
+        _, results = await orch._run_providers_parallel(question, [(provider, "asknews")])
+
+        assert results[0].status == "inactive"
+        assert results[0].chars == 0
+        assert results[0].error_type == "ForbiddenError"
+        # Off-season is expected, not an alertable failure.
+        assert orch.timeout_count == 0
+
+    @pytest.mark.asyncio
+    async def test_status_fallback_when_asknews_falls_back_to_prose(self, mock_llm, question, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=True)
+        asknews = AsyncMock(side_effect=RuntimeError("asknews down"))
+
+        with patch.object(
+            orch,
+            "_call_perplexity",
+            new_callable=AsyncMock,
+            return_value="perplexity fallback prose",
+        ):
+            text, results = await orch._run_providers_parallel(question, [(asknews, "asknews")])
+
+        assert results[0].status == "fallback"
+        assert results[0].name == "asknews"
+        assert results[0].chars == len("perplexity fallback prose")
+        assert "perplexity fallback prose" in text
+
+    @pytest.mark.asyncio
+    async def test_one_result_per_provider_mixed_statuses(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        ok = AsyncMock(return_value="native prose")
+        failing = AsyncMock(side_effect=RuntimeError("timeout"))
+
+        _, results = await orch._run_providers_parallel(question, [(ok, "native_search"), (failing, "gemini_search")])
+
+        by_name = {r.name: r for r in results}
+        assert by_name["native_search"].status == "ok"
+        assert by_name["gemini_search"].status == "errored"
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_block_appended_to_research(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        ok = AsyncMock(return_value="native prose")
+        failing = AsyncMock(side_effect=RuntimeError("timeout"))
+
+        with patch.object(
+            orch,
+            "_select_research_providers",
+            return_value=[(ok, "native_search"), (failing, "gemini_search")],
+        ):
+            research = await orch.run_research(question)
+
+        assert "## Provider Diagnostics" in research
+        diag_lines = [line for line in research.splitlines() if line.startswith("- ")]
+        assert any(line.startswith("- native_search: ok |") for line in diag_lines)
+        errored_line = next(line for line in diag_lines if line.startswith("- gemini_search: errored |"))
+        assert "RuntimeError" in errored_line
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_block_after_gap_fill(self, mock_llm, question, monkeypatch):
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="A" * 200)
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
+                new_callable=AsyncMock,
+                return_value="gap fill addendum",
+            ),
+        ):
+            research = await orch.run_research(question)
+
+        # Ordering: providers -> gap-fill -> provider diagnostics.
+        assert research.index("Targeted Gap-Fill") < research.index("## Provider Diagnostics")
+
+    @pytest.mark.asyncio
+    async def test_sink_receives_attempted_and_succeeded_excluding_failures(self, mock_llm, question, monkeypatch):
+        """End-to-end guard for the schema-v2 derivation feeding the research sink.
+
+        ``providers_attempted`` is every selected provider in order; ``providers_succeeded``
+        is ONLY the ok/fallback ones. This pins the exclusion of ``empty``, ``errored``, AND —
+        most importantly — ``inactive`` (AskNews off-season), so a regression that derived
+        ``providers_succeeded`` from the attempted list, or included ``inactive``, would fail here.
+        Fallback is None-free in this orchestrator (allow_research_fallback=False), so the inactive
+        AskNews subscription error coerces to status=``inactive`` rather than triggering a fallback.
+        """
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+
+        captured: dict = {}
+
+        def sink(**kwargs) -> None:  # noqa: ANN003
+            captured.update(kwargs)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+            allow_research_fallback=False,
+            research_sink=sink,
+        )
+
+        class ForbiddenError(Exception):
+            pass
+
+        ok = AsyncMock(return_value="real research prose")
+        empty = AsyncMock(return_value="")
+        errored = AsyncMock(side_effect=RuntimeError("provider blew up"))
+        inactive = AsyncMock(side_effect=ForbiddenError("403011 - subscription is not currently active"))
+
+        selected = [
+            (ok, "native_search"),
+            (empty, "gemini_search"),
+            (errored, "financial_data"),
+            (inactive, "asknews"),
+        ]
+
+        with patch.object(orch, "_select_research_providers", return_value=selected):
+            await orch.run_research(question)
+
+        # Sink fired (question fixture id_of_question=42 satisfies the qid gate).
+        assert captured, "research_sink was never called"
+        assert captured["providers_attempted"] == ["native_search", "gemini_search", "financial_data", "asknews"]
+        # Only the ok provider succeeded — empty, errored, AND inactive are all excluded.
+        assert captured["providers_succeeded"] == ["native_search"]
+        assert "gemini_search" not in captured["providers_succeeded"]  # empty
+        assert "financial_data" not in captured["providers_succeeded"]  # errored
+        assert "asknews" not in captured["providers_succeeded"]  # inactive (off-season)
+
+        # provider_results round-trips each per-provider status as a list of dicts.
+        statuses = {r["name"]: r["status"] for r in captured["provider_results"]}
+        assert statuses == {
+            "native_search": "ok",
+            "gemini_search": "empty",
+            "financial_data": "errored",
+            "asknews": "inactive",
+        }
+
+    @pytest.mark.asyncio
+    async def test_sink_counts_fallback_as_succeeded(self, mock_llm, question, monkeypatch):
+        """A ``fallback`` provider (AskNews failed, prose fallback supplied the result) counts as
+        succeeded — it contributed usable research. Pins the second member of SUCCEEDED_STATUSES."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+
+        captured: dict = {}
+
+        def sink(**kwargs) -> None:  # noqa: ANN003
+            captured.update(kwargs)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+            allow_research_fallback=True,
+            research_sink=sink,
+        )
+        asknews = AsyncMock(side_effect=RuntimeError("asknews down"))
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(asknews, "asknews")]),
+            patch.object(orch, "_call_perplexity", new_callable=AsyncMock, return_value="perplexity fallback prose"),
+        ):
+            await orch.run_research(question)
+
+        assert captured["providers_attempted"] == ["asknews"]
+        assert captured["providers_succeeded"] == ["asknews"]  # fallback status counts as succeeded
+        assert captured["provider_results"][0]["status"] == "fallback"
+
+
 class TestDemoteInnerHeadings:
     """Provider bodies must not carry headings at/above the h2 provider header.
 

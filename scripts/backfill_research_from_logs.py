@@ -40,6 +40,7 @@ PROVIDER_HEADERS = {
     "## Web Research (Native Search)": "native_search",
     "## Web Research (Google Search via Gemini)": "gemini_search",
     "## Financial & Economic Data": "financial_data",
+    "## Prediction Market Snapshot": "prediction_market",
     "## Web Research (Exa)": "exa",
     "## Web Research (Perplexity)": "perplexity",
     "## Web Research (OpenRouter)": "openrouter",

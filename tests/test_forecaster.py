@@ -102,5 +102,8 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_empty_func.assert_called_once_with(question)
-            # Empty results don't get headers
-            assert research == ""
+            # Empty results don't get a provider header; the only body is the
+            # provider-diagnostics block recording the empty outcome for triage.
+            assert "## Research (fallback)" not in research
+            assert "## Provider Diagnostics" in research
+            assert "- fallback: empty | 0 chars |" in research
