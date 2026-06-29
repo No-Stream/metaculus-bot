@@ -28,6 +28,44 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ## Near-term (worth exploring soon)
 
+### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
+
+The 2026-06-28 research-quality audit found **zero positive evidence** that Gemini's `url_context`
+tool (purpose-built to directly read resolution-source URLs named in question fine print) ever fires
+in production. Across all 17 post-2026-05-17 Period-B research records, every Gemini section cites only
+`vertexaisearch.cloud.google.com/grounding-api-redirect/` links — 0/17 contain a direct
+`.gov`/`fred`/`cboe` resolution URL. In every observed tracker case the live resolving value was
+surfaced by the **gap-fill OpenAI native-search pass** or the **financial-data API**, NOT by
+url_context. Most damning single data point: on q43650 Gemini's grounded snippet was *wrong*
+(4.44–4.46%) while gap-fill returned the exact 4.48% that resolved. The fetch gap is *masked by
+gap-fill*, not *closed by url_context*. (Inference from research text only — at audit time there was
+no telemetry.)
+
+**Telemetry was added 2026-06-28** (`gemini_search.py` `_extract_url_context_telemetry`): each
+grounded call now logs `N/M url_context fetches` and writes a greppable marker into the persisted
+research blob — `### URL Context Fetches` (successful reads, with the retrieved URLs) or
+`_url_context: none_` (tool fired but fetched nothing). So this is now *observable for free* on the
+next scheduled tournament/backtest run.
+
+**Action (free, rides an already-scheduled run):** after the next prod run with Gemini enabled, grep
+`backtests/research_archive/latest/*.json` for `### URL Context Fetches` vs `_url_context: none_` vs
+absence, to settle definitively whether url_context fires and, if so, whether it reads the
+criteria-named resolution URL. If it reliably direct-reads named sources, the deterministic-fetch
+question (below) largely dissolves. If it never fires or never reads the *named* URL, that's the
+evidence that would justify the narrow deterministic named-URL fetcher.
+
+**Related (deferred, needs a small paid re-bench — clear cost first):** the audit could NOT test the
+gap's worst case — obscure, low-news, *non-API* official counters/registries/dashboards (state policy
+trackers, CBP encounters tables, WHO-style dashboards, mesonet data tables, "infants enrolled"
+homepage counters). Period B contained zero of that archetype; the only two clean research-side
+fetch failures in the entire 40-tracker corpus (q43046 WHO extranet dashboard, q43139 IEM mesonet
+precip table) were both this type and both pre-current-stack. A deliberately adversarial ~10–15-question
+re-bench enriched for that archetype is the single highest-leverage missing evidence — it either kills
+the deterministic-fetcher project or scopes it precisely. The narrow design (parse criteria for a
+resolver URL → force-fetch+parse; or make the gap-fill analyzer treat a criteria-named URL as a
+*mandatory* gap) is sketched in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. The FRED/Yahoo
+URL-extraction shipped 2026-06-28 already covers the API-backed financial subset of this class.
+
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
 `make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
@@ -329,6 +367,54 @@ single-session prompt + main.py + stacking.py edit behind a
 — exact file-and-line edits, parser-ordering gotcha (JSON block before
 `Probability: ZZ%`), A/B backtest verification sequence, known landmines.
 A fresh session can flip it live with minimal context loss.
+
+### Status-quo / last-print anchor for slow-moving numeric trackers (added 2026-06-28, NEEDS BACKTEST before acting)
+
+**Finding (2026-06-28 period-split research audit, current-stack "Period B" cohort, n=17, of which
+~5 numeric trackers — small sample, directional only):** on numeric/discrete questions that resolve on
+a slow-moving / mean-reverting tracker series, the research pipeline now reliably surfaces the **exact
+current value**, and then the forecaster ensemble *degrades* it by layering directional drift or
+asymmetric-widening tails on top. The three worst Period-B numeric trackers all had the resolving value
+sitting in the research:
+
+- **q43647 HY-OAS spread** (peer +52.4): research handed over 2.71 exactly; per-model medians skewed UP
+  to 2.73–2.80 anticipating widening that never came over a calm ~two-week window; truth landed below p40.
+- **q43611 generic ballot** (peer +31.8): research surfaced Silver net +6.8 *plus* an explicit
+  mean-reversion base rate; ensemble extrapolated the late-May uptrend to ~6.7–7.2; series reverted to 6.4.
+- **q43591 Trump approval** (peer +14.3): research surfaced 38.5; ensemble applied a damped *downtrend* to
+  37.8; the tracker ticked *up* to 38.6.
+
+NOTE these three scored **positively** — the bot did fine; the finding is "left points on the table by
+over-reasoning on a value research already nailed," not "lost." A flat "status-quo = last surfaced print"
+central anchor would have materially improved all three. This is a forecaster-**reasoning** lever, fully
+independent of the research/fetch work shipped 2026-06-28.
+
+**Proposed change (prompt-only, numeric + discrete paths):** add a conditional step to
+`numeric_prompt` / discrete handling: *when the research surfaces a current authoritative value for a
+slow-moving or mean-reverting tracker (rates, spreads, approval/poll averages, index levels), default the
+central estimate (p50, and the bulk of the mass) to that last print, and require an EXPLICIT,
+named justification before applying directional drift.* Frame it as a rebuttable default, not a hard
+constraint — the model must still be free to move when it has a concrete catalyst (a scheduled release,
+a structural break, a genuine trend with a stated mechanism). Likely lives alongside the existing
+conditional-hazard step in the numeric prompt; reuse that "compute the number, then state the assumption"
+pattern.
+
+**Why this is NOT shipped yet (the trap to avoid):**
+
+1. **n=3.** A real pattern but a thin sample; could be noise dressed as signal.
+2. **Over-correction risk.** A blanket anti-drift instruction will *hurt* genuinely-trending or
+   event-driven numerics (a series mid-breakout, a count accumulating toward a deadline). The rebuttable
+   framing mitigates this but doesn't eliminate it — the model has to correctly classify "slow/mean-
+   reverting" vs "trending," which is itself a judgment call the prompt is now asking it to make.
+3. **Prompt-behavior changes can only be validated on a real run** — unlike the observability/routing
+   work this session (all unit-testable offline), this one's value is unprovable without a paid backtest.
+
+**Backtest gate (clear cost with the operator first):** A/B on a **numeric/discrete-heavy slice** —
+improvement (or no regression) on slow-moving-tracker questions (rates/spreads/poll-averages/index-levels)
+AND, critically, **no regression on trending/event-driven numerics and count-toward-deadline questions**
+(the over-correction failure mode). A `make backtest_small`/`medium` seeded with both archetypes is the
+cheapest discriminating test. Do NOT ship on the strength of the n=3 hits alone. Full per-question
+evidence in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §3.
 
 ### LLM-based forecast self-evaluation
 

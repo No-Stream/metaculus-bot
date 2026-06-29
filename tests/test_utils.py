@@ -210,6 +210,42 @@ def test_bound_messages():
     assert "0.0" in lower or lower == ""
 
 
+def test_bound_messages_open_vs_closed_semantics():
+    """Open bounds must signal the outcome can resolve beyond the range; closed bounds must not."""
+    open_q = NumericQuestion(
+        id_of_question=8,
+        id_of_post=8,
+        page_url="example",
+        question_text="?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=75000000.0,
+        upper_bound=150000000.0,
+        open_lower_bound=True,
+        open_upper_bound=True,
+        unit_of_measure="$",
+        zero_point=None,
+    )
+    upper, lower = bound_messages(open_q)
+    # Open: explicitly licenses resolving past the displayed range, and directs
+    # percentiles at/beyond the bound when warranted (the Toy Story 5 fix).
+    assert "open" in upper.lower() and "can resolve above" in upper
+    assert "at or above" in upper
+    assert "open" in lower.lower() and "can resolve below" in lower
+    assert "at or below" in lower
+
+    closed_q = open_q.model_copy(update={"open_lower_bound": False, "open_upper_bound": False})
+    upper_c, lower_c = bound_messages(closed_q)
+    # Closed: hard limit, no "can resolve beyond" language.
+    assert "closed" in upper_c.lower() and "can not be higher" in upper_c
+    assert "can resolve above" not in upper_c
+    assert "closed" in lower_c.lower() and "can not be lower" in lower_c
+    assert "can resolve below" not in lower_c
+
+
 def test_bound_messages_uses_nominal_bounds():
     q = NumericQuestion(
         id_of_question=6,

@@ -112,7 +112,7 @@ class TestWritePathE2E:
         assert len(lines) == 1
 
         record = json.loads(lines[0])
-        assert record["schema_version"] == 1
+        assert record["schema_version"] == 2
         assert record["qid"] == 43613
         assert record["page_url"] == "https://www.metaculus.com/questions/43613/will-climate-target-be-met/"
         assert record["question_text"] == "Will the 2026 climate agreement emissions target be met by 2035?"
@@ -145,10 +145,14 @@ class TestWritePathE2E:
         assert record["research_chars"] == len(long_research)
 
     def test_sink_callback_signature_matches_orchestrator_call_site(self) -> None:
-        """The orchestrator calls research_sink with these exact kwargs. Verify writer.record accepts them."""
+        """The orchestrator calls research_sink with these exact kwargs. Verify writer.record accepts them.
+
+        Mirrors the schema-v2 sink call in ``ResearchOrchestrator.run_research`` (the
+        ``self._research_sink(...)`` block), including the three v2 fields
+        ``provider_results`` / ``providers_attempted`` / ``providers_succeeded``.
+        """
         writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
 
-        # These are the exact kwargs from research_orchestrator.py:100-107
         writer.record(
             qid=43613,
             page_url="https://www.metaculus.com/questions/43613/",
@@ -156,10 +160,21 @@ class TestWritePathE2E:
             research_text="## News Articles (AskNews)\nContent here",
             providers_used=["asknews", "native_search", "gemini_search"],
             gap_fill_used=False,
+            provider_results=[
+                {"name": "asknews", "status": "ok", "chars": 100, "latency_ms": 50},
+                {"name": "native_search", "status": "ok", "chars": 200, "latency_ms": 80},
+                {"name": "gemini_search", "status": "errored", "chars": 0, "latency_ms": 30},
+            ],
+            providers_attempted=["asknews", "native_search", "gemini_search"],
+            providers_succeeded=["asknews", "native_search"],
         )
 
         assert len(writer._records) == 1
-        assert writer._records[0]["qid"] == 43613
+        record = writer._records[0]
+        assert record["qid"] == 43613
+        assert record["providers_attempted"] == ["asknews", "native_search", "gemini_search"]
+        assert record["providers_succeeded"] == ["asknews", "native_search"]
+        assert [r["name"] for r in record["provider_results"]] == ["asknews", "native_search", "gemini_search"]
 
     def test_multiple_questions_in_single_flush(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="minibench", tournament_id="bench-1", run_id="local-42")

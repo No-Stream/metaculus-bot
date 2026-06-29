@@ -5,6 +5,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+_SUMMARIZE_ASKNEWS_PATH = "metaculus_bot.research.orchestrator.ResearchOrchestrator._summarize_asknews"
+
+
+async def _passthrough_summarize_asknews(self, question, research):
+    """Identity stub for the AskNews summarizer.
+
+    The combine test below routes an ``"asknews"``-named provider through the
+    orchestrator, which invokes ``_summarize_asknews`` with the bogus
+    ``GeneralLlm(model="test/model")`` summarizer. That raises BadRequestError;
+    on failure the orchestrator now drops the AskNews block to empty (it no
+    longer falls back to raw articles), which would erase the provider output
+    the test asserts on. Patching the summarizer to a passthrough keeps the
+    AskNews block intact without coupling the routing test to the failure path.
+    """
+    del self, question
+    await asyncio.sleep(0)
+    return research
+
 
 def _make_q(text: str) -> MagicMock:
     """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
@@ -331,7 +349,8 @@ class TestParallelExecution:
         provider2 = AsyncMock(return_value="Research from provider 2")
 
         providers = [(provider1, "asknews"), (provider2, "native_search")]
-        result = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        with patch(_SUMMARIZE_ASKNEWS_PATH, _passthrough_summarize_asknews):
+            result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from provider 1" in result
         assert "Research from provider 2" in result
@@ -352,7 +371,7 @@ class TestParallelExecution:
         working_provider = AsyncMock(return_value="Research from working provider")
 
         providers = [(failing_provider, "failing"), (working_provider, "working")]
-        result = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from working provider" in result
 
@@ -419,7 +438,7 @@ class TestAskNewsSubscriptionErrorHandling:
             raise ForbiddenError("403011 - subscription is not currently active")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.orchestrator"):
-            result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
         assert orch.timeout_count == 0, "Off-season subscription-inactive must NOT count as an alertable failure."
@@ -448,7 +467,7 @@ class TestAskNewsSubscriptionErrorHandling:
         asknews_provider = AsyncMock(side_effect=RuntimeError("connection timeout"))
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.orchestrator"):
-            result = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
         assert orch.timeout_count == 1

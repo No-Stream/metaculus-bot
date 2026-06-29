@@ -192,14 +192,24 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     lower_bound_number = nominal_lower if nominal_lower is not None else question.lower_bound
 
     if question.open_upper_bound:
-        upper_bound_message = f"Practical upper bound / display range is {upper_bound_number}."
+        upper_bound_message = (
+            f"The upper bound is open: {upper_bound_number} is the top of the displayed range, not a hard limit, "
+            f"so the outcome can resolve above {upper_bound_number}. Most outcomes stay within range, but if you "
+            f"see a real chance of exceeding it, place your upper percentiles at or above {upper_bound_number} "
+            f"accordingly."
+        )
     else:
-        upper_bound_message = f"The outcome can not be higher than {upper_bound_number}."
+        upper_bound_message = f"The upper bound is closed: the outcome can not be higher than {upper_bound_number}."
 
     if question.open_lower_bound:
-        lower_bound_message = f"Practical lower bound / display range is {lower_bound_number}."
+        lower_bound_message = (
+            f"The lower bound is open: {lower_bound_number} is the bottom of the displayed range, not a hard limit, "
+            f"so the outcome can resolve below {lower_bound_number}. Most outcomes stay within range, but if you "
+            f"see a real chance of falling below it, place your lower percentiles at or below {lower_bound_number} "
+            f"accordingly."
+        )
     else:
-        lower_bound_message = f"The outcome can not be lower than {lower_bound_number}."
+        lower_bound_message = f"The lower bound is closed: the outcome can not be lower than {lower_bound_number}."
     return upper_bound_message, lower_bound_message
 
 

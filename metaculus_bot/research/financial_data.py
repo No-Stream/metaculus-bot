@@ -7,7 +7,9 @@ Follows the same factory-function-returning-ResearchCallable pattern as other pr
 import asyncio
 import logging
 import os
+import re
 from typing import cast
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -29,7 +31,153 @@ from metaculus_bot.research.providers import ResearchCallable
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-CLASSIFIER_PROMPT = """You are a classifier that determines whether a forecasting question involves financial markets or economic indicators that can be looked up via stock/index/commodity tickers or FRED economic data series.
+# FRED series IDs are alphanumeric + underscore (e.g. DGS10, BAMLH0A0HYM2, T10Y2Y).
+# Yahoo tickers add `^`, `=`, `.`, `-` (e.g. ^TNX, CL=F, BTC-USD, EURUSD=X).
+_FRED_SERIES_URL_RE = re.compile(r"fred\.stlouisfed\.org/series/([A-Za-z0-9_]+)")
+_YAHOO_TICKER_URL_RE = re.compile(r"finance\.yahoo\.com/quote/([A-Za-z0-9.^=\-]+)")
+
+# Full-string char-class guards (same classes the extraction regexes enforce), used
+# to sanitize classifier-emitted IDs — which come from comma-splitting with NO
+# char validation — before they reach the fetch set and the HTML-comment marker.
+# A `-->` in a classifier token would otherwise close the comment and leak its tail
+# as visible markdown in the published Metaculus comment.
+_TICKER_CHARS_RE = re.compile(r"^[A-Za-z0-9.^=\-]+$")
+_FRED_CHARS_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+# Single source of truth for the reference identifiers: id -> human label, grouped
+# by category. The KNOWN_* frozensets AND the CLASSIFIER_PROMPT reference table are
+# both DERIVED from these dicts, so the allowlist and the prompt cannot drift apart.
+# Frozensets feed the soft-fail flagging (unrecognized classifier IDs surface as
+# WARNINGs + in the routing marker, never silently dropped); labels feed the prompt.
+_TICKER_GROUPS: dict[str, dict[str, str]] = {
+    "Stock indices": {
+        "^GSPC": "S&P 500",
+        "^DJI": "Dow Jones",
+        "^IXIC": "Nasdaq",
+        "^RUT": "Russell 2000",
+        "^FTSE": "FTSE 100",
+        "^N225": "Nikkei",
+    },
+    "Stocks": {
+        "AAPL": "",
+        "MSFT": "",
+        "GOOGL": "",
+        "AMZN": "",
+        "NVDA": "",
+        "TSLA": "",
+        "META": "",
+        "BRK-B": "",
+        "JPM": "",
+        "V": "",
+    },
+    "Commodities": {
+        "CL=F": "crude oil",
+        "GC=F": "gold",
+        "SI=F": "silver",
+        "NG=F": "natural gas",
+        "HG=F": "copper",
+    },
+    "Crypto": {
+        "BTC-USD": "Bitcoin",
+        "ETH-USD": "Ethereum",
+    },
+    "Bonds/Rates": {
+        "^TNX": "10Y Treasury yield",
+        "^FVX": "5Y Treasury yield",
+        "^TYX": "30Y Treasury yield",
+    },
+    "Currencies": {
+        "EURUSD=X": "",
+        "GBPUSD=X": "",
+        "USDJPY=X": "",
+        "DX-Y.NYB": "US Dollar Index",
+    },
+}
+_FRED_GROUPS: dict[str, dict[str, str]] = {
+    "labor": {"UNRATE": "unemployment rate", "PAYEMS": "nonfarm payrolls"},
+    "inflation": {"CPIAUCSL": "CPI all items", "CPILFESL": "core CPI", "PCEPI": "PCE price index"},
+    "output": {"GDP": "gross domestic product", "GDPC1": "real GDP"},
+    "rates": {"FEDFUNDS": "federal funds rate", "DFF": "daily fed funds"},
+    "treasury": {"DGS10": "10Y Treasury rate", "DGS2": "2Y Treasury rate", "T10Y2Y": "10Y-2Y spread"},
+    "housing": {"CSUSHPISA": "Case-Shiller home price index", "HOUST": "housing starts"},
+    "consumer": {"UMCSENT": "consumer sentiment", "RSAFS": "retail sales"},
+    "money": {"M2SL": "M2 money supply", "WALCL": "Fed balance sheet"},
+}
+
+TICKER_LABELS: dict[str, str] = {tid: label for group in _TICKER_GROUPS.values() for tid, label in group.items()}
+FRED_LABELS: dict[str, str] = {sid: label for group in _FRED_GROUPS.values() for sid, label in group.items()}
+KNOWN_TICKERS: frozenset[str] = frozenset(TICKER_LABELS)
+KNOWN_FRED_SERIES: frozenset[str] = frozenset(FRED_LABELS)
+
+
+def _render_ticker(tid: str, label: str) -> str:
+    """Render `id (label)` when a label exists, else the bare id (stocks have none)."""
+    return f"{tid} ({label})" if label else tid
+
+
+def _build_ticker_reference_lines() -> str:
+    """Build the prompt's grouped ticker reference lines from _TICKER_GROUPS."""
+    return "\n".join(
+        f"{group_name}: " + ", ".join(_render_ticker(tid, label) for tid, label in members.items())
+        for group_name, members in _TICKER_GROUPS.items()
+    )
+
+
+def _build_fred_reference_lines() -> str:
+    """Build the prompt's FRED reference bullet lines from _FRED_GROUPS."""
+    return "\n".join(
+        "- " + ", ".join(f"{sid} ({label})" for sid, label in members.items()) for members in _FRED_GROUPS.values()
+    )
+
+
+def _dedupe_preserving_order(items: list[str]) -> list[str]:
+    """Drop duplicates while keeping first-seen order (dict preserves insertion)."""
+    return list(dict.fromkeys(items))
+
+
+def _sanitize_classifier_ids(items: list[str], char_re: re.Pattern[str], kind: str) -> list[str]:
+    """Drop classifier IDs that don't fully match the extraction char class (log-and-skip).
+
+    Classifier IDs come from comma-splitting with no char validation, so a garbled
+    token (e.g. one containing `-->`) could close the routing HTML comment and leak
+    its tail as visible markdown, or be sent pointlessly to yfinance/FRED. Filter to
+    the same char classes the URL-extraction regexes enforce, warning on each drop so
+    a malformed classifier emission is visible rather than silently dropped.
+    """
+    sanitized: list[str] = []
+    for item in items:
+        if char_re.fullmatch(item):
+            sanitized.append(item)
+        else:
+            logger.warning("financial classifier emitted malformed %s %r — dropping", kind, item)
+    return sanitized
+
+
+def extract_financial_identifiers_from_criteria(text: str) -> dict[str, list[str]]:
+    """Deterministically extract the resolving FRED series / Yahoo tickers from URLs.
+
+    Resolution criteria usually name the exact source the question resolves on
+    (e.g. https://fred.stlouisfed.org/series/DGS10). Extracting these directly
+    guarantees the resolving series fires regardless of the LLM classifier's guess.
+
+    URL-decodes first so `%5ETNX` -> `^TNX` matches the Yahoo ticker pattern.
+    Returns {"tickers": [...], "fred_series": [...]}, deduped, order-preserving.
+    """
+    decoded = unquote(text)
+    fred_series = _dedupe_preserving_order(_FRED_SERIES_URL_RE.findall(decoded))
+    # The Yahoo char class includes `.` with no right boundary, so a sentence-final
+    # URL captures the trailing period (e.g. `.../quote/%5ETNX.` -> `^TNX.`), which
+    # isn't in KNOWN_TICKERS and fails the yfinance lookup. `.rstrip(".")` only trims
+    # trailing dots — internal dots (e.g. `DX-Y.NYB`) are preserved.
+    tickers = _dedupe_preserving_order([t.rstrip(".") for t in _YAHOO_TICKER_URL_RE.findall(decoded)])
+    return {"tickers": tickers, "fred_series": fred_series}
+
+
+# Built from _TICKER_GROUPS / _FRED_GROUPS so the prompt's reference table and the
+# KNOWN_* allowlist share one source of truth (the f-string-injected blocks carry no
+# `{...}` of their own; the trailing {question_text}/{resolution_criteria}/{fine_print}
+# remain str.format placeholders filled by _classify_financial_question).
+CLASSIFIER_PROMPT = f"""You are a classifier that determines whether a forecasting question involves financial markets or economic indicators that can be looked up via stock/index/commodity tickers or FRED economic data series.
 
 Respond in EXACTLY this format (3 lines, no extra text):
 FINANCIAL: YES or NO
@@ -38,39 +186,39 @@ FRED_SERIES: comma-separated FRED series IDs, or NONE
 
 REFERENCE TABLE of common tickers and FRED series:
 
-Stock indices: ^GSPC (S&P 500), ^DJI (Dow Jones), ^IXIC (Nasdaq), ^RUT (Russell 2000), ^FTSE (FTSE 100), ^N225 (Nikkei)
-Stocks: AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, BRK-B, JPM, V
-Commodities: CL=F (crude oil), GC=F (gold), SI=F (silver), NG=F (natural gas), HG=F (copper)
-Crypto: BTC-USD (Bitcoin), ETH-USD (Ethereum)
-Bonds/Rates: ^TNX (10Y Treasury yield), ^FVX (5Y Treasury yield), ^TYX (30Y Treasury yield)
-Currencies: EURUSD=X, GBPUSD=X, USDJPY=X, DX-Y.NYB (US Dollar Index)
+{_build_ticker_reference_lines()}
 
 FRED series:
-- UNRATE (unemployment rate), PAYEMS (nonfarm payrolls)
-- CPIAUCSL (CPI all items), CPILFESL (core CPI), PCEPI (PCE price index)
-- GDP (gross domestic product), GDPC1 (real GDP)
-- FEDFUNDS (federal funds rate), DFF (daily fed funds)
-- DGS10 (10Y Treasury rate), DGS2 (2Y Treasury rate), T10Y2Y (10Y-2Y spread)
-- CSUSHPISA (Case-Shiller home price index), HOUST (housing starts)
-- UMCSENT (consumer sentiment), RSAFS (retail sales)
-- M2SL (M2 money supply), WALCL (Fed balance sheet)
+{_build_fred_reference_lines()}
 
 Only output YES if there are specific tickers or FRED series that would provide useful data.
 If the question is about general economic trends without specific measurable indicators, output NO.
 
-Question: {question_text}"""
+Question: {{question_text}}
+
+Resolution criteria (may name the exact resolving source/series):
+{{resolution_criteria}}
+{{fine_print}}"""
 
 
 async def _classify_financial_question(
     question_text: str,
     classifier_llm: GeneralLlm,
+    resolution_criteria: str = "",
+    fine_print: str = "",
 ) -> dict[str, list[str]] | None:
     """Use an LLM to determine if a question involves trackable financial/economic data.
 
     Returns {"tickers": [...], "fred_series": [...]} or None if not financial.
+    Resolution criteria / fine print are passed through so the classifier also
+    sees the resolving source (belt-and-suspenders to the deterministic extraction).
     """
     try:
-        prompt = CLASSIFIER_PROMPT.format(question_text=question_text)
+        prompt = CLASSIFIER_PROMPT.format(
+            question_text=question_text,
+            resolution_criteria=resolution_criteria,
+            fine_print=fine_print,
+        )
         # Wrapped with the elapsed-gated transient retry (litellm #14895): the
         # classifier LLM is built allowed_tries=1, so this wrapper is its sole
         # retry layer and also supplies the wall-clock cap the call previously
@@ -313,12 +461,45 @@ def financial_data_provider() -> ResearchCallable:
     )
 
     async def _fetch(question: MetaculusQuestion) -> str:
-        classification = await _classify_financial_question(question.question_text, classifier_llm)
-        if classification is None:
+        criteria_text = f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
+        extracted = extract_financial_identifiers_from_criteria(criteria_text)
+
+        classification = await _classify_financial_question(
+            question.question_text,
+            classifier_llm,
+            resolution_criteria=question.resolution_criteria or "",
+            fine_print=question.fine_print or "",
+        )
+
+        # Sanitize classifier IDs (F2) BEFORE they reach the fetch set, marker, or
+        # unknown-flagging: they come from comma-splitting with no char validation,
+        # unlike the regex-constrained extracted IDs. A malformed token (e.g. one
+        # containing `-->`) would otherwise leak into the HTML-comment marker.
+        classifier_tickers = _sanitize_classifier_ids(
+            classification["tickers"] if classification else [], _TICKER_CHARS_RE, "ticker"
+        )
+        classifier_fred = _sanitize_classifier_ids(
+            classification["fred_series"] if classification else [], _FRED_CHARS_RE, "FRED series"
+        )
+
+        # Extraction is ADDITIVE, not a replacement: the classifier may legitimately
+        # add a Yahoo proxy for richer context, but extracted IDs guarantee the
+        # resolving series is in the fetch set.
+        tickers = _dedupe_preserving_order(classifier_tickers + extracted["tickers"])
+        fred_series = _dedupe_preserving_order(classifier_fred + extracted["fred_series"])
+
+        # The deterministic extraction is the load-bearing guarantee: even when the
+        # classifier returns None (question read as non-financial) or misroutes, the
+        # source the question RESOLVES ON must still fire. So we only bail when the
+        # merged fetch set is empty.
+        if not tickers and not fred_series:
             return ""
 
-        tickers = classification["tickers"]
-        fred_series = classification["fred_series"]
+        # Soft-fail loudly: classifier IDs not in the reference allowlist (and not
+        # independently confirmed by extraction) are flagged but still fetched —
+        # a valid-but-unlisted series shouldn't be dropped, just made visible.
+        unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
+
         fred_api_key = os.getenv(FRED_API_KEY_ENV)
 
         tasks: list[asyncio.Task] = []
@@ -348,6 +529,50 @@ def financial_data_provider() -> ResearchCallable:
         if not non_empty_results:
             return ""
 
-        return "\n\n".join(non_empty_results)
+        marker = _build_routing_marker(fred_series, tickers, extracted, unknown)
+        return "\n\n".join(non_empty_results) + marker
 
     return _fetch
+
+
+def _flag_unknown_classifier_ids(
+    classifier_tickers: list[str],
+    classifier_fred: list[str],
+    extracted: dict[str, list[str]],
+) -> list[str]:
+    """Return classifier IDs not in the reference allowlist nor confirmed by extraction.
+
+    Logs a WARNING per unrecognized ID (soft-fail loudly). Caller still fetches them.
+    """
+    unknown: list[str] = []
+    for ticker in classifier_tickers:
+        if ticker not in KNOWN_TICKERS and ticker not in extracted["tickers"]:
+            unknown.append(ticker)
+            logger.warning("financial classifier emitted unrecognized ticker %r — fetching anyway but flagging", ticker)
+    for series_id in classifier_fred:
+        if series_id not in KNOWN_FRED_SERIES and series_id not in extracted["fred_series"]:
+            unknown.append(series_id)
+            logger.warning(
+                "financial classifier emitted unrecognized FRED series %r — fetching anyway but flagging", series_id
+            )
+    return unknown
+
+
+def _build_routing_marker(
+    fred_series: list[str],
+    tickers: list[str],
+    extracted: dict[str, list[str]],
+    unknown: list[str],
+) -> str:
+    """Build a forecaster-invisible, greppable routing marker (Part D observability).
+
+    An HTML comment is invisible in rendered markdown but survives verbatim into
+    research_text — the cached blob, the persisted artifact, and the Metaculus
+    comment — so the routing decision is durable and auditable without changing
+    the ResearchCallable signature.
+    """
+    return (
+        f"\n\n<!-- financial_routing: fred=[{','.join(fred_series)}] tickers=[{','.join(tickers)}] "
+        f"extracted_fred=[{','.join(extracted['fred_series'])}] "
+        f"extracted_tickers=[{','.join(extracted['tickers'])}] unknown=[{','.join(unknown)}] -->"
+    )

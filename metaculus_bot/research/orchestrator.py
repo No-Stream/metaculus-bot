@@ -11,7 +11,9 @@ import asyncio
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
+from dataclasses import asdict
 
 import openai
 from forecasting_tools import GeneralLlm, SmartSearcher, clean_indents
@@ -35,11 +37,18 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.llm_retry import invoke_with_broad_retry
+from metaculus_bot.research.provider_diagnostics import (
+    SUCCEEDED_STATUSES,
+    ProviderResult,
+    format_provider_diagnostics_block,
+)
 from metaculus_bot.research.providers import (
     ResearchCallable,
     choose_provider_with_name,
     native_search_provider,
 )
+
+_PROVIDER_ERROR_MESSAGE_MAX_CHARS = 300
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +119,7 @@ class ResearchOrchestrator:
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
-            research = await self._run_providers_parallel(question, providers)
+            research, provider_results = await self._run_providers_parallel(question, providers)
 
             if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
                 from metaculus_bot.research.targeted import run_gap_fill_pass
@@ -123,6 +132,15 @@ class ResearchOrchestrator:
                 if addendum:
                     research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
 
+            gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
+
+            # Block ordering in the returned text (and therefore the comment):
+            # providers -> gap-fill -> provider diagnostics. Appended last so the
+            # diagnostics never perturb the gap-fill threshold/detection above.
+            diagnostics_block = format_provider_diagnostics_block(provider_results)
+            if diagnostics_block:
+                research = f"{research}\n\n{diagnostics_block}"
+
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
 
@@ -130,7 +148,8 @@ class ResearchOrchestrator:
                 qid = getattr(question, "id_of_question", None)
                 if qid is not None:
                     try:
-                        gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
+                        # provider_results is the authoritative per-provider outcome;
+                        # providers_used is kept only for legacy archive readers.
                         self._research_sink(
                             qid=qid,
                             page_url=question.page_url,
@@ -138,6 +157,9 @@ class ResearchOrchestrator:
                             research_text=research,
                             providers_used=provider_names,
                             gap_fill_used=gap_fill_used,
+                            provider_results=[asdict(r) for r in provider_results],
+                            providers_attempted=provider_names,
+                            providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
                         )
                     except Exception:
                         logger.exception("Research sink failed for qid=%d; continuing", qid)
@@ -148,8 +170,12 @@ class ResearchOrchestrator:
         """Compress raw AskNews article markdown into an analyst briefing.
 
         Only AskNews output flows here — it's the one provider that returns raw
-        article text rather than LLM-written prose. Soft-fails to the raw input
-        so a summarizer hiccup never drops the news entirely.
+        article text rather than LLM-written prose. On a summarizer failure we
+        drop AskNews to empty rather than passing the raw articles through: that
+        text feeds the forecasters and the published comment, and dozens of full
+        article bodies are noise in both. The other prod providers (native
+        search, Gemini grounded, gap-fill) still cover the question, so an empty
+        AskNews block degrades coverage slightly rather than dumping raw text.
         """
         if not research.strip():
             return research
@@ -203,11 +229,11 @@ class ResearchOrchestrator:
                 label="asknews_summarizer",
             )
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
-            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
-            return research
+            logger.warning("AskNews summarization failed (%s); dropping AskNews block", type(exc).__name__)
+            return ""
         if not summary.strip():
-            logger.warning("AskNews summarization returned blank output; using raw articles")
-            return research
+            logger.warning("AskNews summarization returned blank output; dropping AskNews block")
+            return ""
         return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
@@ -285,10 +311,11 @@ class ResearchOrchestrator:
         self,
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
-    ) -> str:
+    ) -> tuple[str, list[ProviderResult]]:
         from metaculus_bot.research.providers import is_asknews_subscription_error
 
-        async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, str]:
+        async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, ProviderResult]:
+            started = time.monotonic()
             try:
                 used_fallback = False
                 if name == "asknews" and self._allow_research_fallback:
@@ -304,9 +331,25 @@ class ResearchOrchestrator:
                 # is already prose, so skip summarization too.
                 if name == "asknews" and not used_fallback:
                     raw = await self._summarize_asknews(question, raw)
-                return (raw, name)
+                latency_ms = int((time.monotonic() - started) * 1000)
+                has_output = bool(raw and raw.strip())
+                if not has_output:
+                    status = "empty"
+                elif used_fallback:
+                    status = "fallback"
+                else:
+                    status = "ok"
+                result = ProviderResult(
+                    name=name,
+                    status=status,
+                    chars=len(raw) if has_output else 0,
+                    latency_ms=latency_ms,
+                )
+                return (raw, result)
             except Exception as e:
+                latency_ms = int((time.monotonic() - started) * 1000)
                 if name == "asknews" and is_asknews_subscription_error(e):
+                    status = "inactive"
                     logger.info(
                         "Research provider %s inactive (expected off-season): %s: %s",
                         name,
@@ -314,23 +357,35 @@ class ResearchOrchestrator:
                         e,
                     )
                 else:
+                    status = "errored"
                     self.timeout_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                     from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
 
                     _record_deprecation_if_matched(f"<provider:{name}>", str(e))
-                return ("", name)
+                result = ProviderResult(
+                    name=name,
+                    status=status,
+                    chars=0,
+                    latency_ms=latency_ms,
+                    error_type=type(e).__name__,
+                    error_message=str(e)[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS],
+                )
+                return ("", result)
 
         tasks = [_run_one(p, n) for p, n in providers]
-        results = await asyncio.gather(*tasks)
+        results: list[tuple[str, ProviderResult]] = await asyncio.gather(*tasks)
 
         combined_parts = []
-        for result, name in results:
-            if result and result.strip():
-                header = self._provider_header(name)
-                combined_parts.append(f"{header}\n{_demote_inner_headings(result)}")
+        provider_results: list[ProviderResult] = []
+        for raw, provider_result in results:
+            provider_results.append(provider_result)
+            if raw and raw.strip():
+                header = self._provider_header(provider_result.name)
+                combined_parts.append(f"{header}\n{_demote_inner_headings(raw)}")
 
-        return "\n\n---\n\n".join(combined_parts) if combined_parts else ""
+        combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
+        return combined, provider_results
 
     @staticmethod
     def _provider_header(name: str) -> str:
@@ -339,6 +394,7 @@ class ResearchOrchestrator:
             "native_search": "## Web Research (Native Search)",
             "gemini_search": "## Web Research (Google Search via Gemini)",
             "financial_data": "## Financial & Economic Data",
+            "prediction_market": "## Prediction Market Snapshot",
             "exa": "## Web Research (Exa)",
             "perplexity": "## Web Research (Perplexity)",
             "openrouter": "## Web Research (OpenRouter)",

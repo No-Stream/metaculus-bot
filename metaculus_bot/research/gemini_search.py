@@ -30,7 +30,12 @@ from metaculus_bot.research.providers import ResearchCallable
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_gemini_client", "gemini_search_provider", "invoke_gemini_grounded"]
+__all__ = [
+    "_extract_url_context_telemetry",
+    "build_gemini_client",
+    "gemini_search_provider",
+    "invoke_gemini_grounded",
+]
 
 # Header-only initializer for the sources list. Checking `len(sources_lines) > _SOURCES_HEADER_LEN`
 # against this named constant keeps the sources-present gate tied to the init block.
@@ -66,6 +71,85 @@ def build_gemini_client() -> genai.Client:
 
 def _resolve_model(model_slug: str | None) -> str:
     return model_slug or os.getenv(GEMINI_SEARCH_MODEL_ENV, GEMINI_SEARCH_DEFAULT_MODEL)
+
+
+_URL_RETRIEVAL_SUCCESS = "URL_RETRIEVAL_STATUS_SUCCESS"
+_URL_CONTEXT_NONE_MARKER = "_url_context: none_"
+_URL_CONTEXT_HEADER = "### URL Context Fetches"
+
+
+def _coerce_status_name(status: object) -> str:
+    """Coerce a url_retrieval_status (enum-with-.name, plain string, or None) to a string name."""
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name
+    if isinstance(status, str):
+        return status
+    return str(status)
+
+
+def _extract_url_context_telemetry(
+    response: genai_types.GenerateContentResponse,
+) -> tuple[bool, int, int, list[tuple[str, str]]]:
+    """Pull url_context retrieval telemetry off a grounded-search response.
+
+    Returns ``(reported, n_total, n_success, [(status_name, retrieved_url), ...])``. ``reported``
+    is whether the SDK attached a url_context_metadata object at all — the tool ran and reported
+    back, even with an empty fetch list — which lets callers keep 'fired but fetched nothing'
+    greppably distinct from 'no url_context signal'. ``n_total`` is the url_metadata entry count
+    and ``n_success`` those with status URL_RETRIEVAL_STATUS_SUCCESS.
+
+    Every field read here is a declared field on the typed SDK pydantic models
+    (``url_context_metadata``, ``url_metadata``, and each ``UrlMetadata``'s
+    ``url_retrieval_status`` / ``retrieved_url``), so they're accessed directly: a
+    future SDK rename should fail loudly here rather than silently report zero
+    forever, matching the direct ``.grounding_metadata`` access below. A
+    None-valued (but present) entry still coerces gracefully —
+    ``_coerce_status_name(None)`` maps to ``"None"`` and ``None or ""`` to ``""`` —
+    so telemetry never takes down the research path it only observes.
+    """
+    candidates = response.candidates
+    if not candidates:
+        return (False, 0, 0, [])
+
+    url_context_metadata = candidates[0].url_context_metadata
+    if url_context_metadata is None:
+        return (False, 0, 0, [])
+
+    url_metadata = url_context_metadata.url_metadata
+    if not url_metadata:
+        return (True, 0, 0, [])
+
+    entries: list[tuple[str, str]] = []
+    n_success = 0
+    for meta in url_metadata:
+        status_name = _coerce_status_name(meta.url_retrieval_status)
+        retrieved_url = meta.retrieved_url or ""
+        if status_name == _URL_RETRIEVAL_SUCCESS:
+            n_success += 1
+        entries.append((status_name, retrieved_url))
+
+    return (True, len(url_metadata), n_success, entries)
+
+
+def _format_url_context_marker(reported: bool, entries: list[tuple[str, str]]) -> str:
+    """Build the greppable url_context telemetry block appended to persisted research.
+
+    Only SUCCESSFUL fetches are listed inline (under ``### URL Context Fetches``) — those URLs were
+    genuinely read, so they are real research context. Any other reported state (fired but fetched
+    nothing, or every retrieval failed) collapses to the terse ``_url_context: none_`` marker, so a
+    'did nothing useful' run never pushes failed/dead URLs at the forecaster. No url_context signal
+    at all → empty string (no marker). Failed-fetch URLs are still captured in the INFO logs for
+    auditing, just not in the forecaster-facing research blob.
+    """
+    successes = [(status, url) for status, url in entries if status == _URL_RETRIEVAL_SUCCESS and url]
+    if successes:
+        lines = ["", "", _URL_CONTEXT_HEADER]
+        lines.extend(f"{status} — {url}" for status, url in successes)
+        return "\n".join(lines)
+    if reported:
+        return f"\n\n{_URL_CONTEXT_NONE_MARKER}"
+    return ""
 
 
 def _format_grounded_response(response: genai_types.GenerateContentResponse) -> str:
@@ -152,10 +236,11 @@ async def invoke_gemini_grounded(
 ) -> str:
     """Invoke Gemini with Google Search grounding and return formatted text.
 
-    Shared by the first-pass Gemini provider and the second-pass gap-fill
-    searches. Enables the URL context tool alongside Google Search by default
-    so the model can directly read specific URLs (e.g., resolution sources
-    named in question fine print).
+    Used by the first-pass Gemini search provider (and the ablation harness);
+    gap-fill uses OpenAI native search, not this google-genai grounded path.
+    Enables the URL context tool alongside Google Search by default so the model
+    can directly read specific URLs (e.g., resolution sources named in question
+    fine print).
 
     Raises on SDK errors — callers decide whether to fail hard or soft.
     """
@@ -185,7 +270,19 @@ async def invoke_gemini_grounded(
         metadata = candidates[0].grounding_metadata
         if metadata is not None and metadata.grounding_chunks:
             n_chunks = len(metadata.grounding_chunks)
-    logger.info(f"GeminiSearch: got {len(formatted)} chars, {n_chunks} grounding chunks from {model}")
+
+    reported, n_url_total, n_url_success, url_entries = _extract_url_context_telemetry(response)
+    logger.info(
+        f"GeminiSearch: got {len(formatted)} chars, {n_chunks} grounding chunks, "
+        f"{n_url_success}/{n_url_total} url_context fetches from {model}"
+    )
+    if url_entries:
+        for status, url in url_entries:
+            logger.info(f"GeminiSearch: url_context {status} — {url}")
+
+    # Only annotate non-empty research; an empty result must stay empty so callers can soft-fail.
+    if formatted:
+        formatted += _format_url_context_marker(reported, url_entries)
     return formatted
 
 

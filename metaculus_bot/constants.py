@@ -506,13 +506,16 @@ MC_STACKING_ENABLED_ENV: str = "MC_STACKING_ENABLED"
 NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
 
 # --- Prediction-market provider (Workstream G) ---
-# Env-gated so backtests can opt in explicitly. Resolved markets on all three
-# platforms retain their last-trade price after resolution — without the
-# ``as_of`` filter in ``fetch_market_snapshot``, pulling a market for a
-# resolved Metaculus question leaks post-resolution pricing into the
-# rationale. Default OFF until smoke + medium backtest validates match
-# quality and leakage defense. Flip ON in production workflows after that
-# gate. See atlas_inspired_improvements.md §G.
+# Env-gated. Resolved markets on all three platforms retain their last-trade
+# price after resolution — without the ``as_of`` filter in
+# ``fetch_market_snapshot``, pulling a market for a resolved Metaculus question
+# leaks post-resolution pricing into the rationale, which is why the provider is
+# hard-disabled under ``is_benchmarking=True``. ON in all prod workflows as of
+# commit 3c12dbe (prod runs with is_benchmarking=False, so the guard doesn't
+# suppress it there). The benchmarking guard means the standard ``make
+# backtest_*`` gate can't measure its forecasting value — it was validated via
+# the manual ``test_bot.yaml`` prod-mode run + opt-in live integration tests
+# instead. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 
 # Outer wall-clock timeout for the full prediction-market snapshot (keyword

@@ -57,6 +57,67 @@ This question could not be forecasted due to errors.
 No forecasts available.
 """
 
+# Mirrors SAMPLE_COMMENT_FULL but carries the research blocks ADDED this session:
+# ``## Prediction Market Snapshot`` (a NEW provider header wired into
+# PROVIDER_HEADERS), ``## Provider Diagnostics`` (pipe-delimited per-provider
+# status lines), a ``### URL Context Fetches`` / ``_url_context: none_`` block,
+# and the ``<!-- financial_routing ... -->`` HTML comment. These exercise the
+# regression that detect_providers / extract_research_text must (a) recognize the
+# new prediction-market header, (b) span the whole research blob including the new
+# blocks, and (c) NOT emit spurious providers from the diagnostics / routing /
+# url-context telemetry lines (detect_providers is a substring scan over header
+# strings, so a stray ``native_search`` token in a diagnostics line must not count
+# as a second provider header match).
+SAMPLE_COMMENT_WITH_NEW_BLOCKS = """\
+# SUMMARY
+
+*Question*: Will X happen by 2026?
+*URL*: https://www.metaculus.com/questions/43613/
+
+Brief summary of the forecast.
+
+# RESEARCH
+## Report 1 Research
+## News Articles (AskNews)
+Here are the relevant news articles about topic X.
+
+---
+
+## Provider Diagnostics
+- asknews: ok | 4210 chars | 8120 ms
+- native_search: ok | 9044 chars | 41210 ms
+- gemini_search: ok | 2210 chars | 15330 ms
+
+---
+
+## Web Research (Native Search)
+Web search found additional context about X.
+
+---
+
+## Prediction Market Snapshot
+| platform | title | prob | vol | close | conf |
+|---|---|---|---|---|---|
+| Polymarket | Will X happen by 2026 | 0.55 | 12000 | 2026-07-01 | 0.80 |
+
+##### Resolution criteria / rules
+- **Polymarket** <https://polymarket.com/event/x>: resolves YES if X happens: 55%
+
+---
+
+## Web Research (Google Search via Gemini)
+Gemini grounded search results here.
+
+### URL Context Fetches
+_url_context: none_
+
+<!-- financial_routing: fred=[] tickers=['ACME'] extracted=['ACME'] unknown=[] -->
+
+# FORECASTS
+## R1: Forecaster 1 Reasoning
+I think the probability is 75% because...
+"""
+
 SAMPLE_COMMENT_TRIMMED = """\
 # SUMMARY
 
@@ -242,6 +303,73 @@ class TestProviderDetectionFromComments:
         research = extract_research_text(SAMPLE_COMMENT_MINIMAL_RESEARCH)
         assert research is not None
         assert detect_gap_fill(research) is False
+
+
+class TestNewResearchBlocksFromComments:
+    """Regression guards for the research blocks added this session.
+
+    The Prediction Market Snapshot, Provider Diagnostics, URL Context Fetches,
+    and financial_routing blocks all live INSIDE the ``# RESEARCH`` span. These
+    tests lock down that (a) the new prediction-market header is recognized by
+    detect_providers, (b) the research span still bounds correctly with the new
+    blocks present, and (c) the diagnostics / routing / url-context telemetry
+    lines don't trip detect_providers' substring scan into emitting spurious
+    providers.
+    """
+
+    def test_detects_prediction_market_provider(self):
+        from scripts.backfill_research_from_comments import extract_research_text
+        from scripts.backfill_research_from_logs import detect_providers
+
+        research = extract_research_text(SAMPLE_COMMENT_WITH_NEW_BLOCKS)
+        assert research is not None
+        providers = detect_providers(research)
+        assert "prediction_market" in providers
+        # The other real provider headers still resolve correctly.
+        assert "asknews" in providers
+        assert "native_search" in providers
+        assert "gemini_search" in providers
+
+    def test_extract_research_text_spans_new_blocks_without_bleeding(self):
+        from scripts.backfill_research_from_comments import extract_research_text
+
+        research = extract_research_text(SAMPLE_COMMENT_WITH_NEW_BLOCKS)
+        assert research is not None
+
+        # Begins at the first provider section (## Report 1 Research header is
+        # stripped), includes every new block...
+        assert research.startswith("## News Articles (AskNews)")
+        assert "## Provider Diagnostics" in research
+        assert "- native_search: ok | 9044 chars | 41210 ms" in research
+        assert "## Prediction Market Snapshot" in research
+        assert "- **Polymarket** <https://polymarket.com/event/x>: resolves YES if X happens: 55%" in research
+        assert "### URL Context Fetches" in research
+        assert "_url_context: none_" in research
+        assert "<!-- financial_routing: fred=[] tickers=['ACME'] extracted=['ACME'] unknown=[] -->" in research
+
+        # ...and ends before # FORECASTS — no forecast prose bleeds in.
+        assert "# FORECASTS" not in research
+        assert "Forecaster 1 Reasoning" not in research
+        assert "I think the probability is 75%" not in research
+
+    def test_telemetry_lines_do_not_emit_spurious_providers(self):
+        from scripts.backfill_research_from_comments import extract_research_text
+        from scripts.backfill_research_from_logs import detect_providers
+
+        research = extract_research_text(SAMPLE_COMMENT_WITH_NEW_BLOCKS)
+        assert research is not None
+        providers = detect_providers(research)
+
+        # detect_providers is a substring scan over the ## header strings. The
+        # diagnostics block mentions provider NAMES (``native_search: ok | ...``)
+        # but never their ``## ...`` header form, so each provider must be
+        # counted exactly once — no duplicates from the telemetry lines.
+        assert len(providers) == len(set(providers))
+        # Providers whose ## header is absent must NOT appear despite their name
+        # showing up in diagnostics / routing telemetry.
+        assert "financial_data" not in providers
+        assert "exa" not in providers
+        assert "perplexity" not in providers
 
 
 class TestBuildRecord:

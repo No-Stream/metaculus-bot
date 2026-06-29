@@ -7,7 +7,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_SCHEMA_VERSION = 1
+RESEARCH_SCHEMA_VERSION = 2
 
 
 class ResearchPersistenceWriter:
@@ -27,8 +27,19 @@ class ResearchPersistenceWriter:
         research_text: str,
         providers_used: list[str],
         gap_fill_used: bool,
+        provider_results: list[dict] | None = None,
+        providers_attempted: list[str] | None = None,
+        providers_succeeded: list[str] | None = None,
     ) -> None:
-        """Record a single question's research output."""
+        """Record a single question's research output.
+
+        ``providers_used`` is legacy and ambiguous — in live-capture records it
+        meant "attempted", in comment-backfill records "succeeded-with-output".
+        It is kept for back-compat with old archive readers; ``provider_results``
+        is the authoritative per-provider outcome, with ``providers_attempted`` /
+        ``providers_succeeded`` as unambiguous derived lists. The new args default
+        to None so older callers (and backfill paths) keep working.
+        """
         self._records.append(
             {
                 "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -37,6 +48,9 @@ class ResearchPersistenceWriter:
                 "question_text": question_text,
                 "research_text": research_text,
                 "providers_used": providers_used,
+                "providers_attempted": providers_attempted if providers_attempted is not None else [],
+                "providers_succeeded": providers_succeeded if providers_succeeded is not None else [],
+                "provider_results": provider_results if provider_results is not None else [],
                 "run_mode": self._run_mode,
                 "tournament_id": self._tournament_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
