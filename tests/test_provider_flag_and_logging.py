@@ -14,24 +14,6 @@ _DT = datetime
 _TZ = timezone
 _ = asyncio  # used inside nested async def stubs defined in tests below
 
-_SUMMARIZE_ASKNEWS_PATH = "metaculus_bot.research.orchestrator.ResearchOrchestrator._summarize_asknews"
-
-
-async def _passthrough_summarize_asknews(self, question, research):
-    """Identity stub for the AskNews summarizer.
-
-    These tests assert on provider routing/logging, not summarizer behavior.
-    The real summarizer is the bogus ``"mock_summarizer"`` model here, which
-    raises BadRequestError when invoked; on failure the orchestrator now drops
-    the AskNews block to empty (it no longer falls back to raw articles), which
-    would erase the AskNews content these tests check. Patching the summarizer
-    to a passthrough keeps the AskNews block intact without coupling to the
-    failure path.
-    """
-    del self, question
-    await asyncio.sleep(0)
-    return research
-
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
@@ -69,10 +51,7 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
     )
     q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
 
-    with (
-        patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class,
-        patch(_SUMMARIZE_ASKNEWS_PATH, _passthrough_summarize_asknews),
-    ):
+    with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
         # Mock the SDK to return our test result
         mock_sdk = AsyncMock()
         mock_response = AsyncMock()
@@ -414,10 +393,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         captured_questions.append(question_arg)
         return await original_fetch(question_arg, **kwargs)
 
-    with (
-        patch(asknews_class_path) as mock_sdk_class,
-        patch(_SUMMARIZE_ASKNEWS_PATH, _passthrough_summarize_asknews),
-    ):
+    with patch(asknews_class_path) as mock_sdk_class:
         mock_sdk = AsyncMock()
         mock_response = AsyncMock()
         mock_response.as_dicts = []
