@@ -155,15 +155,13 @@ class TestAskNewsSummarization:
         invoke.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_soft_falls_back_to_empty_on_transient_summarizer_error(self, orchestrator, question):
-        """Transient LLM-provider errors (timeouts, API hiccups) drop the AskNews block to empty.
+    async def test_soft_falls_back_to_raw_on_transient_summarizer_error(self, orchestrator, question):
+        """Transient LLM-provider errors (timeouts, API hiccups) soft-fail to the raw articles.
 
         Round-2: the summarizer invoke is wrapped in the broad 30s-gated retry, which
         retries this fast asyncio.TimeoutError the full backoff schedule before it
-        surfaces and is caught by _SUMMARIZER_TRANSIENT_EXCEPTIONS. Rather than passing
-        the raw article bodies through to forecasters and the comment, we return "" so
-        the other providers carry the question. asyncio.sleep is patched so the backoffs
-        are instant.
+        surfaces and is caught by _SUMMARIZER_TRANSIENT_EXCEPTIONS → raw articles.
+        asyncio.sleep is patched so the backoffs are instant.
         """
         with (
             patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
@@ -176,7 +174,7 @@ class TestAskNewsSummarization:
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
-        assert result == ""
+        assert result == "raw asknews articles"
 
     @pytest.mark.asyncio
     async def test_non_transient_summarizer_error_propagates(self, orchestrator, question):
@@ -221,12 +219,12 @@ class TestAskNewsSummarization:
         assert invoke.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_slow_summarizer_failure_not_retried_soft_falls_to_empty(self, orchestrator, question):
-        """A summarizer failure past the 30s gate is NOT retried; it drops the AskNews block to empty.
+    async def test_slow_summarizer_failure_not_retried_soft_falls_to_raw(self, orchestrator, question):
+        """A summarizer failure past the 30s gate is NOT retried; it soft-falls to raw articles.
 
         A slow litellm.Timeout is a transient-type exception that _SUMMARIZER_TRANSIENT_
         EXCEPTIONS catches, so after the gate blocks the retry the orchestrator returns
-        "" (one invoke, no deadline-risking re-fire) rather than the raw articles.
+        the raw articles (one invoke, no deadline-risking re-fire).
         """
         import litellm.exceptions as litellm_exc
 
@@ -241,7 +239,7 @@ class TestAskNewsSummarization:
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
-        assert result == ""
+        assert result == "raw asknews articles"
         assert invoke.await_count == 1
 
     @pytest.mark.asyncio
