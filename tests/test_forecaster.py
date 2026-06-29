@@ -1,9 +1,27 @@
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from forecasting_tools import MetaculusQuestion
 
 from main import TemplateForecaster
+
+_SUMMARIZE_ASKNEWS_PATH = "metaculus_bot.research.orchestrator.ResearchOrchestrator._summarize_asknews"
+
+
+async def _passthrough_summarize_asknews(self, question, research):
+    """Identity stub for the AskNews summarizer.
+
+    This test asserts on provider routing/priority, not summarizer behavior.
+    The real summarizer here is the bogus ``"mock_summarizer"`` model, which
+    raises BadRequestError when invoked; on failure the orchestrator drops the
+    AskNews block to empty (it no longer falls back to raw articles). Patching
+    the summarizer to a passthrough keeps the AskNews block intact so the
+    priority assertions test routing, not the failure path.
+    """
+    del self, question
+    await asyncio.sleep(0)
+    return research
 
 
 @pytest.mark.asyncio
@@ -31,7 +49,10 @@ async def test_run_research_priority():
 
         # Mock the provider function returned by choose_provider_with_name
         mock_asknews_func = AsyncMock(return_value="AskNews Research")
-        with patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose:
+        with (
+            patch("metaculus_bot.research.orchestrator.choose_provider_with_name") as mock_choose,
+            patch(_SUMMARIZE_ASKNEWS_PATH, _passthrough_summarize_asknews),
+        ):
             mock_choose.return_value = (mock_asknews_func, "asknews")
 
             research = await forecaster.run_research(question)

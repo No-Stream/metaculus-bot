@@ -170,8 +170,12 @@ class ResearchOrchestrator:
         """Compress raw AskNews article markdown into an analyst briefing.
 
         Only AskNews output flows here — it's the one provider that returns raw
-        article text rather than LLM-written prose. Soft-fails to the raw input
-        so a summarizer hiccup never drops the news entirely.
+        article text rather than LLM-written prose. On a summarizer failure we
+        drop AskNews to empty rather than passing the raw articles through: that
+        text feeds the forecasters and the published comment, and dozens of full
+        article bodies are noise in both. The other prod providers (native
+        search, Gemini grounded, gap-fill) still cover the question, so an empty
+        AskNews block degrades coverage slightly rather than dumping raw text.
         """
         if not research.strip():
             return research
@@ -225,11 +229,11 @@ class ResearchOrchestrator:
                 label="asknews_summarizer",
             )
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
-            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
-            return research
+            logger.warning("AskNews summarization failed (%s); dropping AskNews block", type(exc).__name__)
+            return ""
         if not summary.strip():
-            logger.warning("AskNews summarization returned blank output; using raw articles")
-            return research
+            logger.warning("AskNews summarization returned blank output; dropping AskNews block")
+            return ""
         return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
