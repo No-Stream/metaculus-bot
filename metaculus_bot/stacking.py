@@ -17,9 +17,9 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
+from metaculus_bot.forecaster_runners import build_parse_notes
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.mc_processing import build_mc_prediction
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
@@ -205,17 +205,7 @@ async def run_stacking_numeric(
         lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
     )
 
-    unit_str = question.unit_of_measure or "base unit"
-    parse_notes = (
-        (
-            f"Return exactly these {EXPECTED_PERCENTILE_COUNT} percentiles and no others: {STANDARD_PERCENTILES_CSV}. "
-            "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
-            f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
-            "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
-        )
-        .replace("{lower}", str(question.lower_bound))
-        .replace("{upper}", str(question.upper_bound))
-    )
+    parse_notes = build_parse_notes(question)
     percentile_list: list[Percentile] = await structure_output(
         meta_reasoning, list[Percentile], model=parser_llm, additional_instructions=parse_notes
     )

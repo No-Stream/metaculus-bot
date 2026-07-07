@@ -14,7 +14,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.percentile_set import PercentileSet
 
-# Standard 11-set values used across tests: value_at(pct) == pct * 1000 so each
+# Standard 13-set values used across tests: value_at(pct) == pct * 1000 so each
 # label maps to a distinct, easily-checked value (e.g. P10 -> 100.0).
 _STANDARD_VALUES: dict[float, float] = {p: p * 1000.0 for p in STANDARD_PERCENTILES}
 
@@ -85,14 +85,9 @@ class TestLabelLookup:
 
     def test_unknown_label_raises_keyerror_not_neighbor(self):
         ps = PercentileSet.from_percentiles(_standard_percentile_list())
+        # Must raise, NOT silently return a neighboring percentile's value.
         with pytest.raises(KeyError):
             ps.value_at(0.11)
-        # Must NOT silently return a neighboring percentile's value.
-        try:
-            result = ps.value_at(0.11)
-        except KeyError:
-            result = None
-        assert result is None
 
     def test_float_key_robustness_via_rounding(self):
         ps = PercentileSet.from_percentiles(_standard_percentile_list())
@@ -137,7 +132,7 @@ class TestOrderedViews:
 
 
 class TestPositionalFootgunRegression:
-    def test_label_lookup_correct_for_current_11_set(self):
+    def test_label_lookup_correct_for_current_set(self):
         ps = PercentileSet.from_percentiles(_standard_percentile_list())
         assert ps.value_at(0.10) == pytest.approx(100.0)
         assert ps.value_at(0.50) == pytest.approx(500.0)

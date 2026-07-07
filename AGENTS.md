@@ -96,10 +96,10 @@ Thresholds (`metaculus_bot/constants.py:245-249`):
 
 ### Numeric pipeline (percentiles → PCHIP CDF)
 
-Each forecaster emits the 11 standard percentiles `{2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5}` as plain text (prompt example in `prompts.numeric_prompt`). Per-model stages:
+Each forecaster emits the 13 standard percentiles `{1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99}` as plain text (prompt example in `prompts.numeric_prompt`). Per-model stages:
 
 1. Parser LLM extracts `list[Percentile]`.
-2. `sanitize_percentiles` (`numeric/pipeline.py`): filter to the 11, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
+2. `sanitize_percentiles` (`numeric/pipeline.py`): filter to the 13, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
 3. `widen_declared_percentiles` (`numeric/tail_widening.py`): bound-aware stretch of distance-from-median by `k_tail=1.0` (identity by default; widening only kicks in when callers raise `k_tail` above 1.0) with `span_floor_gamma=0.0` (no span-floor enforcement by default). Both knobs are configurable per-call.
 4. `build_numeric_distribution` → `generate_pchip_cdf_with_smoothing` produces 201-point PCHIP CDF → ramp smoothing for min-step → validation. On failure: `create_fallback_numeric_distribution` delegates CDF build to forecasting-tools.
 5. **Discrete integer snapping**: if a majority of forecasters vote DISCRETE, snap the distribution to integers.
@@ -107,7 +107,7 @@ Each forecaster emits the 11 standard percentiles `{2.5, 5, 10, 20, 40, 50, 60, 
 
 ### Numeric format router (`numeric_format_router.py`)
 
-The router decides whether the LLM's numeric output is in OPTION A (the default 11 trailing `Percentile X.X: ...` lines) or OPTION B (a `mixture_components` list inside the JSON block). It always returns a 201-point Metaculus CDF and records which branch produced it for residual analysis (logged as `numeric_format=...`). If both formats are present, the mixture wins deterministically and a WARNING is logged so the frequency is auditable. The mixture branch flows through `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced grid evaluation of the mixture CDF).
+The router decides whether the LLM's numeric output is in OPTION A (the default 13 trailing `Percentile X.X: ...` lines) or OPTION B (a `mixture_components` list inside the JSON block). It always returns a 201-point Metaculus CDF and records which branch produced it for residual analysis (logged as `numeric_format=...`). If both formats are present, the mixture wins deterministically and a WARNING is logged so the frequency is auditable. The mixture branch flows through `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced grid evaluation of the mixture CDF).
 
 **Ensemble aggregation** (`numeric/utils.py` `aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 

@@ -11,6 +11,7 @@ import math
 import statistics
 from typing import Any
 
+import numpy as np
 from forecasting_tools import (
     BinaryQuestion,
     MultipleChoiceQuestion,
@@ -20,15 +21,65 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.percentile_set import PercentileSet
 from metaculus_bot.prob_math_utils import logit
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Percentile LABELS (not positions) at which numeric disagreement is measured:
-# the 10th, 50th, and 90th percentiles. Accessed by label via PercentileSet so
-# growing the standard percentile set (e.g. 11 -> 13) cannot silently shift them.
+# the 10th, 50th, and 90th percentiles. Accessed by label so growing the standard
+# percentile set (e.g. 11 -> 13) cannot silently shift them.
 _KEY_SPREAD_PERCENTILES: list[float] = [0.10, 0.50, 0.90]
+
+# Rounded standard-percentile label set, matching PercentileSet's rounding convention,
+# used to distinguish continuous forecaster output (the standard set) from a
+# discrete-resampled cumulative-probability CDF grid.
+_LABEL_DECIMALS: int = 6
+_STANDARD_LABEL_KEYS: frozenset[float] = frozenset(round(p, _LABEL_DECIMALS) for p in STANDARD_PERCENTILES)
+
+
+def _has_standard_labels(model_pcts: list[Percentile]) -> bool:
+    """True iff the model's percentile labels are exactly the standard percentile set."""
+    return frozenset(round(p.percentile, _LABEL_DECIMALS) for p in model_pcts) == _STANDARD_LABEL_KEYS
+
+
+def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, float]:
+    """Return the (P10, P50, P90) VALUES for one model's declared percentiles.
+
+    Continuous forecaster output declares the standard percentile set, so P10/P50/P90
+    resolve to exact label nodes via ``PercentileSet`` — byte-identical to the old strict
+    path.
+
+    Discrete numeric questions are different: ``build_numeric_distribution`` OVERWRITES a
+    model's ``declared_percentiles`` with a resampled CDF grid whose labels are CUMULATIVE
+    PROBABILITIES (0.0..1.0), not the standard set. For those, read the value at cumulative
+    probability 0.10/0.50/0.90 by treating each ``(value, percentile)`` point as an empirical
+    CDF and interpolating with ``np.interp`` (which requires the probability axis sorted
+    ascending).
+
+    A list that is neither the standard set nor a CDF grid spanning the key percentiles
+    (e.g. a truncated percentile list) cannot yield P10/P50/P90 without extrapolating
+    garbage, so it fails fast.
+    """
+    if _has_standard_labels(model_pcts):
+        percentile_set = PercentileSet.from_percentiles(model_pcts)
+        return (
+            percentile_set.value_at(0.10),
+            percentile_set.value_at(0.50),
+            percentile_set.value_at(0.90),
+        )
+
+    ordered = sorted(model_pcts, key=lambda p: p.percentile)
+    labels = [p.percentile for p in ordered]
+    values = [p.value for p in ordered]
+    if not labels or labels[0] > 0.10 or labels[-1] < 0.90:
+        raise ValueError(
+            "numeric_percentile_spread: declared percentiles are neither the standard percentiles "
+            f"nor a CDF grid spanning P10-P90; cannot read key percentiles from labels {labels}"
+        )
+    p10, p50, p90 = np.interp(_KEY_SPREAD_PERCENTILES, labels, values)
+    return float(p10), float(p50), float(p90)
 
 
 def binary_prob_range_spread(prediction_values: list[float]) -> float:
@@ -100,10 +151,14 @@ def numeric_percentile_spread(
     if len(prediction_values) < 2:
         raise ValueError("numeric_percentile_spread requires at least 2 predictions")
 
-    # Build a label-addressed PercentileSet per model. Construction validates that
-    # each model declares exactly the standard percentile set, so the key-percentile
-    # lookups below (P10/P50/P90) can never resolve to the wrong percentile.
-    model_sets = [PercentileSet.from_percentiles(model_pcts) for model_pcts in prediction_values]
+    # Read the (P10, P50, P90) VALUES per model by label. Continuous forecaster output
+    # uses the strict PercentileSet path; discrete-resampled CDF grids (cumulative-
+    # probability labels) are interpolated. Both resolve the same three percentiles.
+    key_values_by_model = [_key_percentile_values(model_pcts) for model_pcts in prediction_values]
+    p10_values = [values[0] for values in key_values_by_model]
+    p50_values = [values[1] for values in key_values_by_model]
+    p90_values = [values[2] for values in key_values_by_model]
+    values_by_percentile = {0.10: p10_values, 0.50: p50_values, 0.90: p90_values}
 
     has_finite_range = (
         not question.open_lower_bound
@@ -116,8 +171,6 @@ def numeric_percentile_spread(
         denominator = question.upper_bound - question.lower_bound
     else:
         # Fallback: ensemble IQR from 10th and 90th percentiles across all models
-        p10_values = [ps.value_at(0.10) for ps in model_sets]
-        p90_values = [ps.value_at(0.90) for ps in model_sets]
         denominator = statistics.median(p90_values) - statistics.median(p10_values)
 
     if denominator <= 0:
@@ -126,7 +179,7 @@ def numeric_percentile_spread(
 
     max_normalized_spread = 0.0
     for pct in _KEY_SPREAD_PERCENTILES:
-        values_at_percentile = [ps.value_at(pct) for ps in model_sets]
+        values_at_percentile = values_by_percentile[pct]
         raw_spread = max(values_at_percentile) - min(values_at_percentile)
         normalized = raw_spread / denominator
         max_normalized_spread = max(max_normalized_spread, normalized)

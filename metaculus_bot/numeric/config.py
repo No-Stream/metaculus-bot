@@ -11,9 +11,9 @@ from metaculus_bot.constants import NUM_MAX_STEP
 
 # --- Percentile Processing Constants ---
 
-# Expressed as decimals in [0,1]. P1 (0.01) and P99 (0.99) were added 2026-07 (11 -> 13)
-# to give forecasters finer tail anchors so they can express probability mass below an
-# open lower bound / above an open upper bound (the Minions & Monsters miss).
+# Expressed as decimals in [0,1]. P1 (0.01) and P99 (0.99) give forecasters finer tail
+# anchors so they can express probability mass below an open lower bound / above an open
+# upper bound (the Minions & Monsters miss).
 STANDARD_PERCENTILES: list[float] = [
     0.01,
     0.025,

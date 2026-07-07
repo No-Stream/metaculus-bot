@@ -13,6 +13,7 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
 )
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.spread_metrics import (
     binary_log_odds_spread,
     binary_prob_range_spread,
@@ -255,9 +256,8 @@ class TestNumericPercentileSpread:
         question = _make_numeric_question()
 
         spread = numeric_percentile_spread([model1, model2], question)
-        # At index 2 (10th pct): |40-20|/100 = 0.20
-        # At index 5 (50th pct): |60-40|/100 = 0.20
-        # At index 8 (90th pct): |80-60|/100 = 0.20
+        # Lookups are label-based: P10 |40-20|/100 = 0.20; P50 |60-40|/100 = 0.20;
+        # P90 |80-60|/100 = 0.20.
         assert spread == pytest.approx(0.20, abs=0.01)
 
     def test_open_ended_bounds_uses_iqr_fallback(self):
@@ -267,8 +267,8 @@ class TestNumericPercentileSpread:
         question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
 
         spread = numeric_percentile_spread([model1, model2], question)
-        # p90 values (index 8): model1=60, model2=80 -> median=70
-        # p10 values (index 2): model1=20, model2=40 -> median=30
+        # P90 values: model1=60, model2=80 -> median=70
+        # P10 values: model1=20, model2=40 -> median=30
         # IQR denominator = 70 - 30 = 40
         # raw spread at all key pcts = 20; normalized = 20/40 = 0.5
         assert spread == pytest.approx(0.5, abs=0.02)
@@ -370,3 +370,101 @@ class TestConstants:
         assert CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD == 0.15
         assert CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD == 0.20
         assert CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD == 0.15
+
+
+# The 13 standard percentile labels a continuous forecaster declares. Used to feed
+# sanitize_percentiles / build_numeric_distribution the same shape production does.
+_STANDARD_PERCENTILE_LABELS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99]
+
+
+def _make_standard_percentile_list(values: list[float]) -> list[Percentile]:
+    """Build a full standard-13 percentile list directly from 13 values (no tail extrapolation)."""
+    assert len(values) == len(_STANDARD_PERCENTILE_LABELS)
+    return [Percentile(percentile=pct, value=val) for pct, val in zip(_STANDARD_PERCENTILE_LABELS, values)]
+
+
+def _build_discrete_resampled_declared(question: NumericQuestion, values: list[float]) -> list[Percentile]:
+    """Run standard percentiles through the real discrete-resample pipeline.
+
+    For a discrete question (``cdf_size != 201``) ``build_numeric_distribution``
+    OVERWRITES ``declared_percentiles`` with a resampled CDF grid whose
+    ``.percentile`` labels are CUMULATIVE PROBABILITIES (e.g. 0.0, 0.05, 0.20,
+    ..., 1.0), NOT the standard percentile set. This is the exact shape that
+    used to crash ``PercentileSet.from_percentiles`` in ``compute_spread``.
+    """
+    sanitized, zero_point = sanitize_percentiles(_make_standard_percentile_list(values), question)
+    distribution = build_numeric_distribution(sanitized, question, zero_point)
+    return distribution.declared_percentiles
+
+
+class TestDiscreteResampledSpread:
+    """Regression: discrete numeric questions crashed compute_spread via PercentileSet.
+
+    DiscreteQuestion is modeled as a NumericQuestion with ``cdf_size != 201``. The
+    discrete-resample step in build_numeric_distribution replaces each model's
+    declared_percentiles with cumulative-probability-labeled grid points, which
+    the strict PercentileSet.from_percentiles rejected — hard-crashing aggregation
+    on the default CONDITIONAL_STACKING path for EVERY discrete question.
+    """
+
+    def test_discrete_declared_labels_are_cumulative_probabilities(self):
+        """Sanity-check the fixture: resampled labels are NOT the standard set."""
+        question = _make_numeric_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        declared = _build_discrete_resampled_declared(
+            question, [-0.3, 0.0, 0.5, 1.0, 1.5, 3.0, 3.5, 4.0, 5.5, 6.5, 7.0, 7.2, 7.4]
+        )
+        labels = sorted(round(p.percentile, 6) for p in declared)
+        assert labels != sorted(_STANDARD_PERCENTILE_LABELS)
+        # A cumulative-probability grid spans [0, 1] with endpoints pinned for closed bounds.
+        assert labels[0] == pytest.approx(0.0, abs=1e-9)
+        assert labels[-1] == pytest.approx(1.0, abs=1e-9)
+
+    def test_numeric_percentile_spread_tolerates_discrete_labels(self):
+        """numeric_percentile_spread must NOT raise on discrete-resampled percentiles."""
+        question = _make_numeric_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        model1 = _build_discrete_resampled_declared(
+            question, [-0.3, 0.0, 0.5, 1.0, 1.5, 3.0, 3.5, 4.0, 5.5, 6.5, 7.0, 7.2, 7.4]
+        )
+        model2 = _build_discrete_resampled_declared(
+            question, [-0.2, 0.1, 0.6, 1.2, 1.8, 3.2, 3.7, 4.2, 5.7, 6.6, 7.05, 7.25, 7.45]
+        )
+
+        spread = numeric_percentile_spread([model1, model2], question)
+        assert isinstance(spread, float)
+        assert math.isfinite(spread)
+        assert spread >= 0.0
+
+    def test_compute_spread_does_not_crash_on_discrete_question(self):
+        """The headline regression: compute_spread on a discrete question returns a float."""
+        question = _make_numeric_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        sanitized1, zp1 = sanitize_percentiles(
+            _make_standard_percentile_list([-0.3, 0.0, 0.5, 1.0, 1.5, 3.0, 3.5, 4.0, 5.5, 6.5, 7.0, 7.2, 7.4]),
+            question,
+        )
+        sanitized2, zp2 = sanitize_percentiles(
+            _make_standard_percentile_list([-0.2, 0.1, 0.6, 1.2, 1.8, 3.2, 3.7, 4.2, 5.7, 6.6, 7.05, 7.25, 7.45]),
+            question,
+        )
+        dist1 = build_numeric_distribution(sanitized1, question, zp1)
+        dist2 = build_numeric_distribution(sanitized2, question, zp2)
+
+        spread = compute_spread(question, [dist1, dist2])
+        assert isinstance(spread, float)
+        assert math.isfinite(spread)
+        assert spread >= 0.0
+
+
+class TestContinuousSpreadByteIdentical:
+    """Guard that the continuous (standard-13) path is byte-identical after the fix."""
+
+    def test_closed_bounds_exact_value(self):
+        model1 = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
+        model2 = _make_percentile_list([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])
+        question = _make_numeric_question()
+        assert numeric_percentile_spread([model1, model2], question) == 0.2
+
+    def test_open_bounds_iqr_exact_value(self):
+        model1 = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
+        model2 = _make_percentile_list([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])
+        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        assert numeric_percentile_spread([model1, model2], question) == 0.5

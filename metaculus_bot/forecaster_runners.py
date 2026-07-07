@@ -74,7 +74,7 @@ def build_parse_notes(question: NumericQuestion) -> str:
     (numeric/bounds_clamping.py) already gates its clamps on open/closed, so this is
     the one remaining place that must respect that distinction.
     """
-    unit_str = getattr(question, "unit_of_measure", None) or "base unit"
+    unit_str = question.unit_of_measure or "base unit"
 
     if question.open_lower_bound:
         lower_note = (

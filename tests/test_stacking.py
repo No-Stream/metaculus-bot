@@ -1211,7 +1211,7 @@ class TestStackingNumericParseNotes:
     """The numeric stacker's parser instruction must list the full 13-percentile set."""
 
     @staticmethod
-    def _numeric_question() -> "NumericQuestion":
+    def _numeric_question(*, open_lower_bound: bool = False, open_upper_bound: bool = False) -> "NumericQuestion":
         q = Mock(spec=NumericQuestion)
         q.id_of_question = 777
         q.page_url = "https://example.com/q/777"
@@ -1222,17 +1222,16 @@ class TestStackingNumericParseNotes:
         q.unit_of_measure = "USD"
         q.lower_bound = 0.0
         q.upper_bound = 1000.0
-        q.open_lower_bound = False
-        q.open_upper_bound = False
+        q.open_lower_bound = open_lower_bound
+        q.open_upper_bound = open_upper_bound
         q.zero_point = None
         q.open_time = _stub_open_time()
         q.scheduled_resolution_time = _stub_resolve_time()
         return cast(NumericQuestion, q)
 
-    @pytest.mark.asyncio
-    async def test_numeric_parse_notes_list_all_13_generated(self) -> None:
-        """run_stacking_numeric passes a parser instruction naming all 13 labels (incl. 1 and 99)."""
-        from metaculus_bot.numeric.config import STANDARD_PERCENTILES_CSV
+    @staticmethod
+    async def _capture_parse_notes(question: "NumericQuestion") -> str:
+        """Run run_stacking_numeric with structure_output stubbed and return the parser notes."""
         from metaculus_bot.stacking import run_stacking_numeric
 
         stacker = Mock(spec=GeneralLlm)
@@ -1249,7 +1248,7 @@ class TestStackingNumericParseNotes:
             await run_stacking_numeric(
                 stacker,
                 parser,
-                self._numeric_question(),
+                question,
                 "research",
                 ["base reasoning"],
                 "lower msg",
@@ -1257,8 +1256,30 @@ class TestStackingNumericParseNotes:
                 stacker_wall_timeout=500.0,
             )
 
-        notes = captured["notes"]
+        return captured["notes"]
+
+    @pytest.mark.asyncio
+    async def test_numeric_parse_notes_list_all_13_generated(self) -> None:
+        """run_stacking_numeric passes a parser instruction naming all 13 labels (incl. 1 and 99)."""
+        from metaculus_bot.numeric.config import STANDARD_PERCENTILES_CSV
+
+        notes = await self._capture_parse_notes(self._numeric_question())
         assert STANDARD_PERCENTILES_CSV in notes
         assert STANDARD_PERCENTILES_CSV == "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99"
         assert "13 percentiles" in notes
         assert "2.5,5,10,20,40,50,60,80,90,95,97.5." not in notes
+
+    @pytest.mark.asyncio
+    async def test_numeric_parse_notes_open_bound_never_clamps(self) -> None:
+        """Open-bound questions must NOT get a hard "within [lo, hi]" clamp in the parser notes.
+
+        The stacker follows open-bound guidance to place mass beyond the displayed range;
+        an obedient parser must extract those out-of-range values verbatim instead of
+        clamping them back in. Delegating to build_parse_notes gives us that open/closed
+        awareness (thoroughly matrixed in tests/test_forecaster_runners_parse_notes.py).
+        """
+        notes = await self._capture_parse_notes(self._numeric_question(open_lower_bound=True))
+
+        assert "within [" not in notes
+        assert "resolve below" in notes
+        assert "never clamp" in notes
