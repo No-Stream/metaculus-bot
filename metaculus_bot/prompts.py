@@ -8,6 +8,8 @@ from forecasting_tools import (
     clean_indents,
 )
 
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+
 __all__ = [
     "binary_prompt",
     "disagreement_crux_prompt",
@@ -494,7 +496,7 @@ def numeric_prompt(
         • Base units for output values: {unit_str}
         • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
         • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
-        • All 13 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
         ── Scoring Rule ──
@@ -638,7 +640,7 @@ def numeric_prompt(
 
         OPTION A — PERCENTILES:
           Use when your belief has a SINGLE mode with smooth tails and no clear
-          scenario branching. Emit the trailing 13 standard percentiles as your
+          scenario branching. Emit the trailing {EXPECTED_PERCENTILE_COUNT} standard percentiles as your
           Prediction block. Do NOT populate `mixture_components` in the JSON block.
 
         OPTION B — MIXTURE OF NORMALS:
@@ -880,7 +882,7 @@ def stacking_numeric_prompt(
         ── Units & Bounds (must follow) ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
         • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
-        • All 13 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──

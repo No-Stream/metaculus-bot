@@ -49,9 +49,12 @@ class TestBoundMessagesConcreteGuidance:
     def test_open_lower_carries_concrete_percentile_placement_guidance(self):
         upper, lower = bound_messages(_open_question(open_lower=True, open_upper=True))
         low = " ".join(lower.lower().split())
-        # Percentiles are the only channel; there is no separate tail-mass field.
+        # Percentiles are the only channel: mass beyond the range is expressed through them,
+        # not through the removed scalar tail-mass field (so the copy must not resurrect it).
         assert "only way" in low or "only channel" in low
-        assert "no separate" in low and "tail" in low
+        assert "including mass beyond the displayed range" in low
+        assert "separate field" not in low
+        assert "tail mass" not in low
         # Concrete mechanic: to put mass below the floor, place that fraction of percentiles below it,
         # and a majority-below belief pushes the MEDIAN below the floor.
         assert "median" in low
@@ -63,7 +66,9 @@ class TestBoundMessagesConcreteGuidance:
         upper, lower = bound_messages(_open_question(open_lower=True, open_upper=True))
         up = " ".join(upper.lower().split())
         assert "only way" in up or "only channel" in up
-        assert "no separate" in up and "tail" in up
+        assert "including mass beyond the displayed range" in up
+        assert "separate field" not in up
+        assert "tail mass" not in up
         assert "median" in up
         assert "above" in up
         assert "do not pile" in up or "don't pile" in up
@@ -72,7 +77,8 @@ class TestBoundMessagesConcreteGuidance:
         upper, lower = bound_messages(_open_question(open_lower=False, open_upper=False))
         for msg in (upper.lower(), lower.lower()):
             collapsed = " ".join(msg.split())
-            assert "no separate" not in collapsed
+            assert "only way" not in collapsed and "only channel" not in collapsed
+            assert "including mass beyond the displayed range" not in collapsed
             assert "do not pile" not in collapsed and "don't pile" not in collapsed
             # Closed messages keep the hard-limit framing.
         assert "can not be higher" in upper

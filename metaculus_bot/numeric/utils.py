@@ -195,7 +195,7 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
         upper_bound_message = (
             f"The upper bound is open: {upper_bound_number} is the top of the displayed range, not a hard limit, "
             f"so the outcome can resolve above {upper_bound_number}. Your percentiles are the ONLY way you express "
-            f"probability mass — there is no separate field for tail mass. To put N% of your probability above the "
+            f"probability mass, including mass beyond the displayed range. To put N% of your probability above the "
             f"open ceiling, place that fraction of your percentiles above it: if you believe there is a ~75% chance "
             f"the outcome exceeds {upper_bound_number}, then your P50 (median) must be ABOVE {upper_bound_number} and "
             f"only your lower percentiles (P1, P2.5, P5, P10, P20) sit inside or below the range. Put percentiles at "
@@ -209,7 +209,7 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
         lower_bound_message = (
             f"The lower bound is open: {lower_bound_number} is the bottom of the displayed range, not a hard limit, "
             f"so the outcome can resolve below {lower_bound_number}. Your percentiles are the ONLY way you express "
-            f"probability mass — there is no separate field for tail mass. To put N% of your probability below the "
+            f"probability mass, including mass beyond the displayed range. To put N% of your probability below the "
             f"open floor, place that fraction of your percentiles below it: if you believe there is a ~75% chance the "
             f"outcome is below {lower_bound_number}, then your P50 (median) must be BELOW {lower_bound_number} and "
             f"only your upper percentiles (P80, P90, P95, P97.5, P99) sit inside or above the range. Put percentiles "
