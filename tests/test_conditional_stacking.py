@@ -24,8 +24,8 @@ from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from tests.conftest import make_mock_numeric_question
 
-# Standard 11-percentile values used throughout numeric tests
-_STANDARD_PERCENTILES = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
+# Standard 13-percentile values used throughout numeric tests (P1/P99 added 2026-07)
+_STANDARD_PERCENTILES = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +255,8 @@ def _make_stacked_mc_result() -> PredictedOptionList:
 
 
 def _make_numeric_distribution(median_value: float, spread_factor: float = 1.0) -> NumericDistribution:
-    """Build a NumericDistribution with 11 percentiles centered on median_value."""
-    offsets = [-20, -17, -14, -10, -4, 0, 4, 10, 14, 17, 20]
+    """Build a NumericDistribution with 13 percentiles centered on median_value."""
+    offsets = [-24, -20, -17, -14, -10, -4, 0, 4, 10, 14, 17, 20, 24]
     percentiles = [
         Percentile(value=max(0.0, min(100.0, median_value + offset * spread_factor)), percentile=pct)
         for offset, pct in zip(offsets, _STANDARD_PERCENTILES)

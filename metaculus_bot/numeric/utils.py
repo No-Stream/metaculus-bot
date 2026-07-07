@@ -194,9 +194,13 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     if question.open_upper_bound:
         upper_bound_message = (
             f"The upper bound is open: {upper_bound_number} is the top of the displayed range, not a hard limit, "
-            f"so the outcome can resolve above {upper_bound_number}. Most outcomes stay within range, but if you "
-            f"see a real chance of exceeding it, place your upper percentiles at or above {upper_bound_number} "
-            f"accordingly."
+            f"so the outcome can resolve above {upper_bound_number}. Your percentiles are the ONLY way you express "
+            f"probability mass — there is no separate field for tail mass. To put N% of your probability above the "
+            f"open ceiling, place that fraction of your percentiles above it: if you believe there is a ~75% chance "
+            f"the outcome exceeds {upper_bound_number}, then your P50 (median) must be ABOVE {upper_bound_number} and "
+            f"only your lower percentiles (P1, P2.5, P5, P10, P20) sit inside or below the range. Put percentiles at "
+            f"or above {upper_bound_number} where you actually believe the value lies, even far outside the displayed "
+            f"range. Do not pile percentiles at the boundary."
         )
     else:
         upper_bound_message = f"The upper bound is closed: the outcome can not be higher than {upper_bound_number}."
@@ -204,9 +208,13 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     if question.open_lower_bound:
         lower_bound_message = (
             f"The lower bound is open: {lower_bound_number} is the bottom of the displayed range, not a hard limit, "
-            f"so the outcome can resolve below {lower_bound_number}. Most outcomes stay within range, but if you "
-            f"see a real chance of falling below it, place your lower percentiles at or below {lower_bound_number} "
-            f"accordingly."
+            f"so the outcome can resolve below {lower_bound_number}. Your percentiles are the ONLY way you express "
+            f"probability mass — there is no separate field for tail mass. To put N% of your probability below the "
+            f"open floor, place that fraction of your percentiles below it: if you believe there is a ~75% chance the "
+            f"outcome is below {lower_bound_number}, then your P50 (median) must be BELOW {lower_bound_number} and "
+            f"only your upper percentiles (P80, P90, P95, P97.5, P99) sit inside or above the range. Put percentiles "
+            f"at or below {lower_bound_number} where you actually believe the value lies, even far outside the "
+            f"displayed range. Do not pile percentiles at the boundary."
         )
     else:
         lower_bound_message = f"The lower bound is closed: the outcome can not be lower than {lower_bound_number}."

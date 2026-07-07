@@ -42,8 +42,8 @@ def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
     )
 
 
-def _eleven_percentiles(values: Sequence[float]) -> list[Percentile]:
-    ps = [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975]
+def _standard_percentiles(values: Sequence[float]) -> list[Percentile]:
+    ps = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
     assert len(values) == len(ps)
     return [Percentile(percentile=p, value=float(v)) for p, v in zip(ps, values)]
 
@@ -51,7 +51,7 @@ def _eleven_percentiles(values: Sequence[float]) -> list[Percentile]:
 class TestTailWideningUnit:
     def test_noop_when_k_is_one(self):
         q = _make_question(0.0, 100.0, False, False)
-        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
         out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
         assert [p.value for p in out] == [p.value for p in base]
         assert next(p.value for p in out if math.isclose(p.percentile, 0.5)) == 50
@@ -64,12 +64,12 @@ class TestTailWideningUnit:
         """
         q = _make_question(0.0, 100.0, False, False)
         shapes = [
-            [5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98],
-            [10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98],
-            [1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97],
+            [4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99],
+            [9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98, 99],
+            [0.5, 1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97, 98],
         ]
         for values in shapes:
-            base = _eleven_percentiles(values)
+            base = _standard_percentiles(values)
             out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
             assert [p.value for p in out] == values
             assert [p.percentile for p in out] == [p.percentile for p in base]
@@ -77,21 +77,21 @@ class TestTailWideningUnit:
     def test_k_tail_below_one_raises(self):
         """k_tail=0.8 currently silently no-ops (narrowing unimplemented). Must raise."""
         q = _make_question(0.0, 100.0, False, False)
-        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
         with pytest.raises(ValueError, match="narrowing is not implemented"):
             widen_declared_percentiles(base, q, k_tail=0.8, tail_start=0.2, span_floor_gamma=0.0)
 
     def test_k_tail_negative_raises(self):
         """Negative k_tail is nonsense; must fail fast per repo fail-fast convention."""
         q = _make_question(0.0, 100.0, False, False)
-        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
         with pytest.raises(ValueError):
             widen_declared_percentiles(base, q, k_tail=-1.0, tail_start=0.2, span_floor_gamma=0.0)
 
     def test_span_floor_gamma_negative_raises(self):
         """Negative span_floor_gamma produces nonsense; must fail fast."""
         q = _make_question(0.0, 100.0, False, False)
-        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
         with pytest.raises(ValueError):
             widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=-0.5)
 
@@ -110,13 +110,13 @@ class TestTailWideningUnit:
         # 2.5% tail conservatively. Empirical study confirms this holds on all 43
         # production questions.
         realistic_shapes = [
-            [2, 5, 7, 15, 30, 50, 70, 85, 93, 95, 98],
-            [1, 4, 6, 12, 30, 50, 70, 88, 94, 96, 99],
-            [10, 15, 18, 25, 38, 50, 62, 75, 82, 85, 90],
-            [5, 12, 15, 22, 35, 50, 65, 78, 85, 88, 95],
+            [1, 2, 5, 7, 15, 30, 50, 70, 85, 93, 95, 98, 99],
+            [0.5, 1, 4, 6, 12, 30, 50, 70, 88, 94, 96, 99, 99.5],
+            [5, 10, 15, 18, 25, 38, 50, 62, 75, 82, 85, 90, 95],
+            [2, 5, 12, 15, 22, 35, 50, 65, 78, 85, 88, 95, 98],
         ]
         for values in realistic_shapes:
-            base = _eleven_percentiles(values)
+            base = _standard_percentiles(values)
             out_zero = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=0.0)
             out_one = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=1.0)
             vals_zero = [p.value for p in out_zero]
@@ -126,7 +126,7 @@ class TestTailWideningUnit:
 
     def test_closed_bounds_widening_increases_tail_spans(self):
         q = _make_question(0.0, 100.0, False, False)
-        base = _eleven_percentiles([5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98])
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
         p = widen_declared_percentiles(base, q, k_tail=1.3, tail_start=0.2, span_floor_gamma=0.0)
 
         def _get(ps, target):
@@ -166,7 +166,7 @@ class TestTailWideningUnit:
     def test_semibounded_open_cases(self, open_lower: bool, open_upper: bool):
         L, U = 0.0, 100.0
         q = _make_question(L, U, open_lower, open_upper)
-        base = _eleven_percentiles([10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98])
+        base = _standard_percentiles([9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98, 99])
         out = widen_declared_percentiles(base, q, k_tail=1.3, tail_start=0.2, span_floor_gamma=0.0)
         # Median unchanged; monotone; values clamped within numeric range
         assert math.isclose(next(p.value for p in out if math.isclose(p.percentile, 0.5)), 50.0, abs_tol=1e-9)
@@ -177,7 +177,7 @@ class TestTailWideningUnit:
     def test_span_floor_enforced(self):
         q = _make_question(0.0, 100.0, False, False)
         # Intentionally compressed outer tails vs inner spans
-        base = _eleven_percentiles([10, 10.4, 12.0, 16.0, 30.0, 50.0, 70.0, 85.0, 92.0, 95.0, 96.0])
+        base = _standard_percentiles([6, 10, 10.4, 12.0, 16.0, 30.0, 50.0, 70.0, 85.0, 92.0, 95.0, 96.0, 99])
         out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=1.0)
 
         def _get(ps, target):
@@ -232,8 +232,8 @@ class TestTailWideningIntegration:
         )
 
         # Compressed tails baseline
-        baseline_vals = [10, 11, 13, 18, 30, 50, 70, 85, 92, 95, 96]
-        declared = _eleven_percentiles(baseline_vals)
+        baseline_vals = [9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 95, 96, 97]
+        declared = _standard_percentiles(baseline_vals)
 
         llm = MagicMock()
         llm.model = "m"

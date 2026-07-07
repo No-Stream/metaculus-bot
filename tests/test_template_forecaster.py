@@ -326,8 +326,8 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     fake_percentiles = [
         FTPercentile(value=v, percentile=p)
         for v, p in zip(
-            [0.5, 1, 2, 4, 5, 6, 7, 8, 9, 9.5, 9.75],
-            [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            [0.25, 0.5, 1, 2, 4, 5, 6, 7, 8, 9, 9.5, 9.75, 9.9],
+            [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
         )
     ]
     # Provide minimal numeric bounds attributes expected by NumericDistribution.from_question

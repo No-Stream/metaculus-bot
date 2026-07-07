@@ -468,14 +468,15 @@ class TestRouteNumericOutput:
         assert result.declared_percentiles is not None
         assert len(result.declared_percentiles) == 3
 
-    def test_f5_fallback_with_11_percentiles_drives_full_pipeline(self) -> None:
+    def test_f5_fallback_with_13_percentiles_drives_full_pipeline(self) -> None:
         # F22 (b)/(c): F5 fallback path uses unsanitized percentiles from the
         # structured block. Verify that when the JSON block carries the full
-        # 11 standard percentiles, the downstream pipeline (sanitize_percentiles
+        # 13 standard percentiles, the downstream pipeline (sanitize_percentiles
         # + build_numeric_distribution) still succeeds end-to-end. Earlier the
         # test only checked router output; this test extends coverage to the
         # full numeric pipeline that main.py runs after the router returns.
-        eleven_percentiles = {
+        thirteen_percentiles = {
+            "0.01": 3.0,
             "0.025": 5.0,
             "0.05": 8.0,
             "0.10": 12.0,
@@ -487,10 +488,11 @@ class TestRouteNumericOutput:
             "0.90": 85.0,
             "0.95": 92.0,
             "0.975": 96.0,
+            "0.99": 98.0,
         }
         payload: dict[str, Any] = {
             "question_type": "numeric",
-            "declared_percentiles": eleven_percentiles,
+            "declared_percentiles": thirteen_percentiles,
             "distribution_family_hint": "normal",
         }
         rationale = _wrap_json_block(payload)
@@ -505,7 +507,7 @@ class TestRouteNumericOutput:
         assert result.format == "percentiles"
         assert result.mixture is None
         assert result.declared_percentiles is not None
-        assert len(result.declared_percentiles) == 11
+        assert len(result.declared_percentiles) == 13
 
         # Drive the downstream pipeline that main.py runs on the percentile
         # branch. Both calls must succeed without raising.
@@ -517,4 +519,4 @@ class TestRouteNumericOutput:
         sanitized, zero_point = sanitize_percentiles(result.declared_percentiles, question)
         prediction = build_numeric_distribution(sanitized, question, zero_point)
         assert prediction is not None
-        assert len(prediction.declared_percentiles) >= 11
+        assert len(prediction.declared_percentiles) >= 13

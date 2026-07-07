@@ -96,6 +96,7 @@ class TestPchipValidation:
         mock_format.return_value = {}
 
         percentiles = [
+            Percentile(percentile=0.01, value=1.0),
             Percentile(percentile=0.025, value=3.0),
             Percentile(percentile=0.05, value=5.0),
             Percentile(percentile=0.10, value=10.0),
@@ -107,6 +108,7 @@ class TestPchipValidation:
             Percentile(percentile=0.90, value=90.0),
             Percentile(percentile=0.95, value=95.0),
             Percentile(percentile=0.975, value=97.0),
+            Percentile(percentile=0.99, value=99.0),
         ]
 
         # Should not raise any exceptions

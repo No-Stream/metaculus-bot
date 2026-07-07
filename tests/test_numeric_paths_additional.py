@@ -86,12 +86,12 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     f = _make_forecaster()
     q = _make_question()
 
-    # Valid 11-percentile set
+    # Valid 13-percentile set
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
@@ -122,8 +122,8 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         )
     ]
 
@@ -172,8 +172,8 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
         plist = [
             Percentile(percentile=p, value=v)
             for p, v in zip(
-                [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-                [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+                [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+                [0, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 100],
             )
         ]
         with patch(
@@ -199,12 +199,14 @@ async def test_numeric_percentile_set_validation():
     f = _make_forecaster()
     q = _make_question()
 
-    # 11 items but wrong set (0.03 instead of 0.025)
+    # 13 items but wrong set (0.03 instead of 0.025): filtering to the standard
+    # set drops the non-standard 0.03, so the count falls to 12 and validation
+    # fails on the count check — same "wrong label" intent as the old 11-set.
     bad = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.03, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [3, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.03, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 3, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
@@ -227,8 +229,8 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
@@ -253,6 +255,7 @@ def test_lower_bound_adjacent_cluster(caplog):
         upper_bound=100.0,
     )
     raw = [
+        Percentile(percentile=0.01, value=0.0),
         Percentile(percentile=0.025, value=0.0),
         Percentile(percentile=0.05, value=0.0),
         Percentile(percentile=0.10, value=0.0),
@@ -264,6 +267,7 @@ def test_lower_bound_adjacent_cluster(caplog):
         Percentile(percentile=0.90, value=30.0),
         Percentile(percentile=0.95, value=40.0),
         Percentile(percentile=0.975, value=50.0),
+        Percentile(percentile=0.99, value=60.0),
     ]
 
     caplog.clear()

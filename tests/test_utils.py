@@ -124,7 +124,7 @@ def test_numeric_prompt_includes_p5_and_p95():
     prompt = numeric_prompt(question, "research", "", "")
     assert "Percentile 5:" in prompt
     assert "Percentile 95:" in prompt
-    # Ensure all 11 percentiles are present in order
+    # Ensure all 13 percentiles are present in order
     lines = prompt.split("\n")
     example_section = False
     percentile_lines = []
@@ -136,7 +136,7 @@ def test_numeric_prompt_includes_p5_and_p95():
         if example_section and "Percentile" in line and ":" in line:
             percentile_lines.append(line.strip())
 
-    expected_percentiles = ["2.5", "5", "10", "20", "40", "50", "60", "80", "90", "95", "97.5"]
+    expected_percentiles = ["1", "2.5", "5", "10", "20", "40", "50", "60", "80", "90", "95", "97.5", "99"]
     assert len(percentile_lines) == len(expected_percentiles)
     for line, suffix in zip(percentile_lines, expected_percentiles):
         assert line.startswith(f"Percentile {suffix}:")

@@ -162,6 +162,7 @@ class TestNumericCDFSmoothing:
         mock_format.return_value = {}
 
         percentiles = [
+            Percentile(percentile=0.01, value=2.0),
             Percentile(percentile=0.025, value=3.0),
             Percentile(percentile=0.05, value=5.0),
             Percentile(percentile=0.10, value=10.0),
@@ -173,6 +174,7 @@ class TestNumericCDFSmoothing:
             Percentile(percentile=0.90, value=90.0),
             Percentile(percentile=0.95, value=95.0),
             Percentile(percentile=0.975, value=97.0),
+            Percentile(percentile=0.99, value=98.0),
         ]
 
         caplog.clear()
@@ -201,6 +203,7 @@ class TestNumericCDFSmoothing:
         mock_format.return_value = {}
 
         percentiles = [
+            Percentile(percentile=0.01, value=2.0),
             Percentile(percentile=0.025, value=3.0),
             Percentile(percentile=0.05, value=5.0),
             Percentile(percentile=0.10, value=10.0),
@@ -212,6 +215,7 @@ class TestNumericCDFSmoothing:
             Percentile(percentile=0.90, value=90.0),
             Percentile(percentile=0.95, value=95.0),
             Percentile(percentile=0.975, value=97.0),
+            Percentile(percentile=0.99, value=98.0),
         ]
 
         caplog.clear()

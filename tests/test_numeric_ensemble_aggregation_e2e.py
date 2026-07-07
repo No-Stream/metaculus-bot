@@ -65,6 +65,7 @@ def _make_numeric_question() -> NumericQuestion:
 
 
 _DECLARED_PERCENTILES_A: list[tuple[float, float]] = [
+    (0.01, 2.5),
     (0.025, 5.0),
     (0.05, 10.0),
     (0.10, 15.0),
@@ -76,9 +77,11 @@ _DECLARED_PERCENTILES_A: list[tuple[float, float]] = [
     (0.90, 80.0),
     (0.95, 88.0),
     (0.975, 95.0),
+    (0.99, 97.5),
 ]
 
 _DECLARED_PERCENTILES_B: list[tuple[float, float]] = [
+    (0.01, 4.0),
     (0.025, 8.0),
     (0.05, 14.0),
     (0.10, 19.0),
@@ -90,9 +93,11 @@ _DECLARED_PERCENTILES_B: list[tuple[float, float]] = [
     (0.90, 83.0),
     (0.95, 90.0),
     (0.975, 96.0),
+    (0.99, 98.0),
 ]
 
 _DECLARED_PERCENTILES_C: list[tuple[float, float]] = [
+    (0.01, 1.5),
     (0.025, 3.0),
     (0.05, 7.0),
     (0.10, 12.0),
@@ -104,6 +109,7 @@ _DECLARED_PERCENTILES_C: list[tuple[float, float]] = [
     (0.90, 75.0),
     (0.95, 85.0),
     (0.975, 92.0),
+    (0.99, 96.0),
 ]
 
 

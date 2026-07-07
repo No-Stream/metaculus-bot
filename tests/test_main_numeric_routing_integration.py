@@ -60,8 +60,9 @@ def _make_numeric_question() -> NumericQuestion:
     )
 
 
-# Eleven canonical percentiles a real forecaster would emit.
+# Thirteen canonical percentiles a real forecaster would emit.
 _DECLARED_PERCENTILES: list[tuple[float, float]] = [
+    (0.01, 2.0),
     (0.025, 5.0),
     (0.05, 10.0),
     (0.10, 15.0),
@@ -73,6 +74,7 @@ _DECLARED_PERCENTILES: list[tuple[float, float]] = [
     (0.90, 80.0),
     (0.95, 88.0),
     (0.975, 95.0),
+    (0.99, 98.0),
 ]
 
 

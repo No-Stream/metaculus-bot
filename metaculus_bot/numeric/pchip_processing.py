@@ -250,8 +250,27 @@ def create_fallback_numeric_distribution(
     question: NumericQuestion,
     zero_point: float | None,
 ) -> NumericDistribution:
-    """Create fallback NumericDistribution when PCHIP fails."""
-    return NumericDistribution(
+    """Create fallback NumericDistribution when PCHIP fails.
+
+    Wraps forecasting-tools' native ``.cdf`` builder but re-pins open-bound
+    endpoints through ``safe_cdf_bounds``. The native builder anchors an open
+    lower bound at ``int(0.5 * percentile_min)`` percent, which rounds to 0%
+    (``cdf[0] == 0.0``) once the standard set includes P1 (``percentile_min ==
+    1.0`` → ``int(0.5) == 0``). Metaculus rejects open-bound CDFs with
+    ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999``, so enforce the legal range here.
+    """
+
+    class BoundSafeNumericDistribution(NumericDistribution):
+        @property
+        def cdf(self) -> list[Percentile]:
+            base = super().cdf
+            if not (self.open_lower_bound or self.open_upper_bound):
+                return base
+            probs = np.array([p.percentile for p in base], dtype=float)
+            safe = safe_cdf_bounds(probs, self.open_lower_bound, self.open_upper_bound)
+            return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base)]
+
+    return BoundSafeNumericDistribution(
         declared_percentiles=percentile_list,
         open_upper_bound=question.open_upper_bound,
         open_lower_bound=question.open_lower_bound,

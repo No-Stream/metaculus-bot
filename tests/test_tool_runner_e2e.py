@@ -339,6 +339,7 @@ class TestBinaryStackingCrossModelAggregation:
 
 _NUMERIC_DECLARED: dict[str, dict[str, float]] = {
     "m1": {
+        "0.01": 2.0,
         "0.025": 5.0,
         "0.05": 10.0,
         "0.1": 15.0,
@@ -350,8 +351,10 @@ _NUMERIC_DECLARED: dict[str, dict[str, float]] = {
         "0.9": 80.0,
         "0.95": 88.0,
         "0.975": 95.0,
+        "0.99": 98.0,
     },
     "m2": {
+        "0.01": 4.0,
         "0.025": 8.0,
         "0.05": 14.0,
         "0.1": 20.0,
@@ -363,8 +366,10 @@ _NUMERIC_DECLARED: dict[str, dict[str, float]] = {
         "0.9": 83.0,
         "0.95": 90.0,
         "0.975": 96.0,
+        "0.99": 99.0,
     },
     "m3": {
+        "0.01": 1.0,
         "0.025": 3.0,
         "0.05": 7.0,
         "0.1": 12.0,
@@ -376,6 +381,7 @@ _NUMERIC_DECLARED: dict[str, dict[str, float]] = {
         "0.9": 78.0,
         "0.95": 86.0,
         "0.975": 94.0,
+        "0.99": 97.0,
     },
 }
 

@@ -131,8 +131,8 @@ def _make_bot(n_forecasters: int = 3, strategy: AggregationStrategy = Aggregatio
 
 
 def _numeric_percentiles(median: float, scale: float = 1.0, bounds: tuple[float, float] = (0.0, 20.0)):
-    """Build 11 standard percentiles centered on `median`."""
-    offsets = [-3.5, -3.0, -2.5, -1.8, -0.5, 0.0, 0.5, 1.8, 2.5, 3.0, 3.5]
+    """Build 13 standard percentiles centered on `median`."""
+    offsets = [-4.0, -3.5, -3.0, -2.5, -1.8, -0.5, 0.0, 0.5, 1.8, 2.5, 3.0, 3.5, 4.0]
     lo, hi = bounds
     return [
         Percentile(percentile=pct, value=max(lo + 0.01, min(hi - 0.01, median + off * scale)))
@@ -187,7 +187,7 @@ def _mc_option_list(probs: list[float], options: list[str] | None = None) -> Pre
 
 
 class TestNumericPercentileBranch:
-    """Numeric question through the standard 11-percentile path produces a valid CDF."""
+    """Numeric question through the standard 13-percentile path produces a valid CDF."""
 
     @pytest.mark.asyncio
     @pytest.mark.e2e

@@ -618,6 +618,7 @@ class TestStackingMethods:
                 "metaculus_bot.stacking.run_stacking_numeric",
                 return_value=(
                     [
+                        Percentile(value=1.0, percentile=0.01),
                         Percentile(value=2.5, percentile=0.025),
                         Percentile(value=5.0, percentile=0.05),
                         Percentile(value=10.0, percentile=0.10),
@@ -629,6 +630,7 @@ class TestStackingMethods:
                         Percentile(value=90.0, percentile=0.90),
                         Percentile(value=95.0, percentile=0.95),
                         Percentile(value=97.5, percentile=0.975),
+                        Percentile(value=99.0, percentile=0.99),
                     ],
                     "meta",
                 ),

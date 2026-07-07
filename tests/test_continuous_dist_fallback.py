@@ -75,8 +75,8 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
     fake_percentiles = [
         FTPercentile(value=v, percentile=p)
         for v, p in zip(
-            [95, 100, 110, 120, 130, 135, 140, 150, 160, 170, 175],
-            [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            [90, 95, 100, 110, 120, 130, 135, 140, 150, 160, 170, 175, 180],
+            [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
         )
     ]
 
@@ -88,9 +88,9 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
 
     values = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore
     # Basic sanity with tail widening enabled: monotone, median unchanged, tails not narrower
-    assert len(values) == 11
+    assert len(values) == 13
     assert all(b > a for a, b in zip(values, values[1:])), values
-    assert values[5] == pytest.approx(135.0)
+    assert values[6] == pytest.approx(135.0)
     assert values[0] <= 95.0 and values[-1] >= 175.0
 
 
