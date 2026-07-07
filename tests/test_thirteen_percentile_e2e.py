@@ -135,6 +135,47 @@ class TestThirteenPercentileRoundTrip:
         assert cdf[0].value == pytest.approx(75_000_000.0)
         assert probs[0] > 0.5, f"expected large below-floor mass at cdf[0], got {probs[0]}"
 
+    def test_mass_above_open_upper_bound_produces_small_cdf_last(self):
+        """The Toy Story 5 case (symmetric): P40..P99 sit ABOVE an open ceiling.
+
+        The actual gross ($159.68M) exceeded the open upper bound ($150M). With the
+        13-percentile set and no clamping, the pipeline must carry the forecaster's
+        above-ceiling belief into the CDF — the terminal cdf value (mass at/below the
+        ceiling) must be well under 1.0, i.e. large above-ceiling tail mass.
+        """
+        question = _question(lower=75_000_000.0, upper=150_000_000.0, open_lower=True, open_upper=True)
+        # Median (P50=165M) and everything from P40 up live ABOVE the 150M ceiling;
+        # only the lower percentiles (P1..P20) sit inside/below the displayed range.
+        declared = _declared(
+            [
+                90_000_000,  # P1 (inside range)
+                100_000_000,  # P2.5
+                110_000_000,  # P5
+                125_000_000,  # P10
+                140_000_000,  # P20
+                158_000_000,  # P40 (above ceiling)
+                165_000_000,  # P50 (median above ceiling)
+                172_000_000,  # P60
+                185_000_000,  # P80
+                200_000_000,  # P90
+                220_000_000,  # P95
+                240_000_000,  # P97.5
+                260_000_000,  # P99
+            ]
+        )
+
+        sanitized, zero_point = sanitize_percentiles(declared, question)
+        distribution = build_numeric_distribution(sanitized, question, zero_point)
+
+        cdf = distribution.cdf
+        probs = _assert_valid_metaculus_cdf(cdf, open_lower=True, open_upper=True)
+
+        # cdf[-1] is the mass AT the upper bound (150M) — the fraction at or below the
+        # open ceiling. Since P40 sits above 150M, this must be well under 0.5, so the
+        # above-ceiling tail mass (1 - probs[-1]) is large — what the old system couldn't express.
+        assert cdf[-1].value == pytest.approx(150_000_000.0)
+        assert probs[-1] < 0.5, f"expected large above-ceiling mass, got cdf[-1]={probs[-1]}"
+
 
 class TestFallbackCdfRespectsOpenBounds:
     """Regression: the forecasting-tools fallback CDF path must respect open-bound endpoints.
