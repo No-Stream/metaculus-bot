@@ -8,7 +8,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES, STANDARD_PERCENTILES_CSV
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> N
                     "loc": ("declared_percentiles",),
                     "input": percentile_list,
                     "ctx": {
-                        "error": f"Expected {EXPECTED_PERCENTILE_COUNT} declared percentiles (2.5,5,10,20,40,50,60,80,90,95,97.5), got {len(percentile_list)}.",
+                        "error": f"Expected {EXPECTED_PERCENTILE_COUNT} declared percentiles ({STANDARD_PERCENTILES_CSV}), got {len(percentile_list)}.",
                     },
                 }
             ],
@@ -45,7 +45,7 @@ def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> N
                     "loc": ("declared_percentiles",),
                     "input": percentile_list,
                     "ctx": {
-                        "error": f"Expected percentile set {{2.5,5,10,20,40,50,60,80,90,95,97.5}}, got {sorted(p.percentile * 100 for p in percentile_list)}.",
+                        "error": f"Expected percentile set {{{STANDARD_PERCENTILES_CSV}}}, got {sorted(p.percentile * 100 for p in percentile_list)}.",
                     },
                 }
             ],
@@ -58,7 +58,7 @@ def sort_percentiles_by_value(percentile_list: list[Percentile]) -> list[Percent
 
 
 def filter_to_standard_percentiles(percentile_list: list[Percentile]) -> list[Percentile]:
-    """Keep only the standard 11 percentiles {2.5,5,10,20,40,50,60,80,90,95,97.5}.
+    """Keep only the standard percentile set (see ``STANDARD_PERCENTILES``).
 
     If extras are present, drop them before validation. If duplicates occur (same percentile
     repeated), keep the first occurrence.

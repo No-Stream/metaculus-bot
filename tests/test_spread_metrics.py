@@ -97,15 +97,21 @@ def _make_numeric_question(**overrides) -> NumericQuestion:
     return NumericQuestion(**defaults)
 
 
-STANDARD_PERCENTILE_VALUES = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
+# The 11 "core" percentile labels callers supply values for. P1/P99 are auto-generated
+# by the helper (extrapolated tails) so the produced list matches the production 13-set
+# without every caller having to hand-write two extra tail values. The spread metric only
+# reads P10/P50/P90 by label, so the exact P1/P99 values are immaterial to the assertions.
+_CORE_PERCENTILE_LABELS = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
 
 
 def _make_percentile_list(predicted_values: list[float]) -> list[Percentile]:
-    """Build a standard 11-percentile list from predicted values at each percentile."""
-    assert len(predicted_values) == len(STANDARD_PERCENTILE_VALUES)
-    return [
-        Percentile(percentile=pct / 100.0, value=val) for pct, val in zip(STANDARD_PERCENTILE_VALUES, predicted_values)
-    ]
+    """Build the standard 13-percentile list from 11 core values, extrapolating P1/P99 tails."""
+    assert len(predicted_values) == len(_CORE_PERCENTILE_LABELS)
+    p1_value = predicted_values[0] - (predicted_values[1] - predicted_values[0])
+    p99_value = predicted_values[-1] + (predicted_values[-1] - predicted_values[-2])
+    labels = [1.0, *_CORE_PERCENTILE_LABELS, 99.0]
+    values = [p1_value, *predicted_values, p99_value]
+    return [Percentile(percentile=pct / 100.0, value=val) for pct, val in zip(labels, values)]
 
 
 # ===========================================================================

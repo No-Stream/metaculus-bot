@@ -45,6 +45,8 @@ def test_sanitize_percentiles_orders_and_jitters(monkeypatch):
         (0.05, 7.5),
         (0.975, 95.0),
         (0.9, 80.0),
+        (0.01, 2.5),
+        (0.99, 97.5),
     ]
     percentiles = [Percentile(percentile=p, value=v) for p, v in raw_values]
 
@@ -66,7 +68,7 @@ def test_build_numeric_distribution_fallback(monkeypatch):
     question = _build_question()
     sanitized = [
         Percentile(percentile=p, value=float(i * 10))
-        for i, p in enumerate([0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975], start=1)
+        for i, p in enumerate([0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99], start=1)
     ]
 
     failing = MagicMock(side_effect=RuntimeError("boom"))
@@ -97,7 +99,7 @@ def test_build_numeric_distribution_success(monkeypatch):
     question = _build_question()
     sanitized = [
         Percentile(percentile=p, value=float(i * 10))
-        for i, p in enumerate([0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975], start=1)
+        for i, p in enumerate([0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99], start=1)
     ]
 
     mock_cdf = [i / 10 for i in range(len(sanitized))]
@@ -139,6 +141,7 @@ def test_build_numeric_distribution_discrete_resamples_to_cdf_size():
     )
 
     raw_percentiles = [
+        Percentile(percentile=0.01, value=-0.3),
         Percentile(percentile=0.025, value=0.0),
         Percentile(percentile=0.05, value=0.5),
         Percentile(percentile=0.1, value=1.0),
@@ -150,6 +153,7 @@ def test_build_numeric_distribution_discrete_resamples_to_cdf_size():
         Percentile(percentile=0.9, value=6.5),
         Percentile(percentile=0.95, value=7.0),
         Percentile(percentile=0.975, value=7.2),
+        Percentile(percentile=0.99, value=7.4),
     ]
 
     sanitized, zero_point = sanitize_percentiles(raw_percentiles, question)

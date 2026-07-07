@@ -1203,3 +1203,60 @@ class TestStackerTransientRetry:
                 )
 
         assert stacker.invoke.await_count == 1
+
+
+class TestStackingNumericParseNotes:
+    """The numeric stacker's parser instruction must list the full 13-percentile set."""
+
+    @staticmethod
+    def _numeric_question() -> "NumericQuestion":
+        q = Mock(spec=NumericQuestion)
+        q.id_of_question = 777
+        q.page_url = "https://example.com/q/777"
+        q.question_text = "How many?"
+        q.background_info = "bg"
+        q.resolution_criteria = "rc"
+        q.fine_print = "fp"
+        q.unit_of_measure = "USD"
+        q.lower_bound = 0.0
+        q.upper_bound = 1000.0
+        q.open_lower_bound = False
+        q.open_upper_bound = False
+        q.zero_point = None
+        q.open_time = _stub_open_time()
+        q.scheduled_resolution_time = _stub_resolve_time()
+        return cast(NumericQuestion, q)
+
+    @pytest.mark.asyncio
+    async def test_numeric_parse_notes_list_all_13_generated(self) -> None:
+        """run_stacking_numeric passes a parser instruction naming all 13 labels (incl. 1 and 99)."""
+        from metaculus_bot.numeric.config import STANDARD_PERCENTILES_CSV
+        from metaculus_bot.stacking import run_stacking_numeric
+
+        stacker = Mock(spec=GeneralLlm)
+        stacker.invoke = AsyncMock(return_value="meta text")
+        parser = Mock(spec=GeneralLlm)
+
+        captured: dict[str, str] = {}
+
+        async def _capture(*_args, additional_instructions: str = "", **_kwargs):
+            captured["notes"] = additional_instructions
+            return []
+
+        with patch("metaculus_bot.stacking.structure_output", new=AsyncMock(side_effect=_capture)):
+            await run_stacking_numeric(
+                stacker,
+                parser,
+                self._numeric_question(),
+                "research",
+                ["base reasoning"],
+                "lower msg",
+                "upper msg",
+                stacker_wall_timeout=500.0,
+            )
+
+        notes = captured["notes"]
+        assert STANDARD_PERCENTILES_CSV in notes
+        assert STANDARD_PERCENTILES_CSV == "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99"
+        assert "13 percentiles" in notes
+        assert "2.5,5,10,20,40,50,60,80,90,95,97.5." not in notes

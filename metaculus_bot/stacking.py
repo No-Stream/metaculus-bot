@@ -19,6 +19,7 @@ from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.mc_processing import build_mc_prediction
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
@@ -207,7 +208,7 @@ async def run_stacking_numeric(
     unit_str = question.unit_of_measure or "base unit"
     parse_notes = (
         (
-            "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
+            f"Return exactly these {EXPECTED_PERCENTILE_COUNT} percentiles and no others: {STANDARD_PERCENTILES_CSV}. "
             "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
             f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
             "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."

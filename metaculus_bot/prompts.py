@@ -494,7 +494,7 @@ def numeric_prompt(
         • Base units for output values: {unit_str}
         • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
         • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
-        • All 11 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All 13 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
         ── Scoring Rule ──
@@ -557,7 +557,7 @@ def numeric_prompt(
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
-            - Keep 2.5% and 97.5% far apart to allow for unknown unknowns.
+            - Keep your extreme tails (P1 and P99) far apart to allow for unknown unknowns.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
             - Respect the explicit bounds above.
@@ -638,7 +638,7 @@ def numeric_prompt(
 
         OPTION A — PERCENTILES:
           Use when your belief has a SINGLE mode with smooth tails and no clear
-          scenario branching. Emit the trailing 11 standard percentiles as your
+          scenario branching. Emit the trailing 13 standard percentiles as your
           Prediction block. Do NOT populate `mixture_components` in the JSON block.
 
         OPTION B — MIXTURE OF NORMALS:
@@ -662,6 +662,7 @@ def numeric_prompt(
         - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.)
         Example:]
 
+        Percentile 1: 0.5
         Percentile 2.5: 1.2
         Percentile 5: 10.1
         Percentile 10: 12.3
@@ -673,6 +674,7 @@ def numeric_prompt(
         Percentile 90: 78.9
         Percentile 95: 89.0
         Percentile 97.5: 123.4
+        Percentile 99: 140.2
         """
     )
 
@@ -878,7 +880,7 @@ def stacking_numeric_prompt(
         ── Units & Bounds (must follow) ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
         • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
-        • All 11 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All 13 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──
@@ -930,12 +932,13 @@ def stacking_numeric_prompt(
            • Are my tails justified given the potential for unknown unknowns?
            • Commitment check (tail width): log score penalizes overconfident narrow intervals, but also penalizes hedging wide on quantities that are actually predictable. Don't widen your 90% interval beyond what the sharpest base model supports unless you can name specific evidence creating that extra uncertainty. Hedged-wide distributions hurt log score on precise resolutions.
 
-        Remember: Think in ranges, not points. Keep 2.5th and 97.5th percentiles appropriately wide.
+        Remember: Think in ranges, not points. Keep your extreme tails (P1 and P99) appropriately wide.
         Ensure strictly increasing percentiles and respect the bounds above.
 
         OUTPUT FORMAT, floating point numbers
         Must be last lines, nothing after, STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
 
+        Percentile 1: [value]
         Percentile 2.5: [value]
         Percentile 5: [value]
         Percentile 10: [value]
@@ -947,6 +950,7 @@ def stacking_numeric_prompt(
         Percentile 90: [value]
         Percentile 95: [value]
         Percentile 97.5: [value]
+        Percentile 99: [value]
         """
     )
 

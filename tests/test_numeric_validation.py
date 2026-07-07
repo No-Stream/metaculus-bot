@@ -41,30 +41,35 @@ def _make_question(
     )
 
 
+def _standard_13() -> list[Percentile]:
+    """The full standard 13-percentile set with value == percentile * 100."""
+    return [
+        Percentile(percentile=0.01, value=1.0),
+        Percentile(percentile=0.025, value=2.5),
+        Percentile(percentile=0.05, value=5.0),
+        Percentile(percentile=0.10, value=10.0),
+        Percentile(percentile=0.20, value=20.0),
+        Percentile(percentile=0.40, value=40.0),
+        Percentile(percentile=0.50, value=50.0),
+        Percentile(percentile=0.60, value=60.0),
+        Percentile(percentile=0.80, value=80.0),
+        Percentile(percentile=0.90, value=90.0),
+        Percentile(percentile=0.95, value=95.0),
+        Percentile(percentile=0.975, value=97.5),
+        Percentile(percentile=0.99, value=99.0),
+    ]
+
+
 class TestPercentileValidation:
     """Test percentile validation functions."""
 
     def test_validate_percentile_count_and_values_success(self):
-        """Test successful validation of correct percentiles."""
-        percentiles = [
-            Percentile(percentile=0.025, value=2.5),
-            Percentile(percentile=0.05, value=5.0),
-            Percentile(percentile=0.10, value=10.0),
-            Percentile(percentile=0.20, value=20.0),
-            Percentile(percentile=0.40, value=40.0),
-            Percentile(percentile=0.50, value=50.0),
-            Percentile(percentile=0.60, value=60.0),
-            Percentile(percentile=0.80, value=80.0),
-            Percentile(percentile=0.90, value=90.0),
-            Percentile(percentile=0.95, value=95.0),
-            Percentile(percentile=0.975, value=97.5),
-        ]
-
+        """Test successful validation of the correct 13-percentile set."""
         # Should not raise any exception
-        validate_percentile_count_and_values(percentiles)
+        validate_percentile_count_and_values(_standard_13())
 
     def test_validate_percentile_count_wrong_count(self):
-        """Test validation fails with wrong number of percentiles."""
+        """Test validation fails with wrong number of percentiles (too few)."""
         percentiles = [
             Percentile(percentile=0.025, value=2.5),
             Percentile(percentile=0.05, value=5.0),
@@ -74,28 +79,51 @@ class TestPercentileValidation:
         with pytest.raises(ValidationError) as exc_info:
             validate_percentile_count_and_values(percentiles)
 
-        assert "Expected 11 declared percentiles" in str(exc_info.value)
+        assert "Expected 13 declared percentiles" in str(exc_info.value)
+
+    def test_validate_percentile_rejects_old_11_set(self):
+        """The old 11-set (no P1/P99) must now fail — it's missing two labels."""
+        old_11 = [p for p in _standard_13() if p.percentile not in (0.01, 0.99)]
+        assert len(old_11) == 11
+        with pytest.raises(ValidationError) as exc_info:
+            validate_percentile_count_and_values(old_11)
+        assert "Expected 13 declared percentiles" in str(exc_info.value)
+
+    def test_validate_percentile_rejects_12_set(self):
+        """A 12-set (missing just P99) must fail, naming the expected count/set."""
+        twelve = [p for p in _standard_13() if p.percentile != 0.99]
+        assert len(twelve) == 12
+        with pytest.raises(ValidationError) as exc_info:
+            validate_percentile_count_and_values(twelve)
+        msg = str(exc_info.value)
+        assert "Expected 13 declared percentiles" in msg or "Expected percentile set" in msg
 
     def test_validate_percentile_wrong_values(self):
-        """Test validation fails with wrong percentile values."""
-        percentiles = [
-            Percentile(percentile=0.03, value=3.0),  # Wrong (should be 0.025)
-            Percentile(percentile=0.05, value=5.0),
-            Percentile(percentile=0.10, value=10.0),
-            Percentile(percentile=0.20, value=20.0),
-            Percentile(percentile=0.40, value=40.0),
-            Percentile(percentile=0.50, value=50.0),
-            Percentile(percentile=0.60, value=60.0),
-            Percentile(percentile=0.80, value=80.0),
-            Percentile(percentile=0.90, value=90.0),
-            Percentile(percentile=0.95, value=95.0),
-            Percentile(percentile=0.975, value=97.5),
-        ]
+        """Test validation fails with wrong percentile values (right count, wrong label)."""
+        percentiles = _standard_13()
+        percentiles[0] = Percentile(percentile=0.03, value=3.0)  # Wrong (should be 0.01)
 
         with pytest.raises(ValidationError) as exc_info:
             validate_percentile_count_and_values(percentiles)
 
         assert "Expected percentile set" in str(exc_info.value)
+
+    def test_count_error_names_full_13_label_set(self):
+        """The count-error parenthetical must list the full 13 labels (incl. 1 and 99),
+        generated from STANDARD_PERCENTILES — not the stale hardcoded 11-list."""
+        with pytest.raises(ValidationError) as exc_info:
+            validate_percentile_count_and_values([Percentile(percentile=0.5, value=1.0)])
+        msg = str(exc_info.value)
+        assert "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99" in msg
+
+    def test_wrong_value_error_names_full_13_label_set(self):
+        """The wrong-set error must name the full 13-label expected set (incl. 1 and 99)."""
+        percentiles = _standard_13()
+        percentiles[0] = Percentile(percentile=0.03, value=3.0)
+        with pytest.raises(ValidationError) as exc_info:
+            validate_percentile_count_and_values(percentiles)
+        msg = str(exc_info.value)
+        assert "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99" in msg
 
     def test_sort_percentiles_by_value(self):
         """Test sorting percentiles by percentile value."""

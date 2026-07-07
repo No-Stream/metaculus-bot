@@ -700,10 +700,10 @@ def aggregate_numeric_values(
     normalized: list[list[Percentile]] = []
     for entry in prediction_percentiles:
         if isinstance(entry, NumericDistribution):
-            # declared_percentiles preserves the 11 anchor points the
+            # declared_percentiles preserves the standard anchor points the
             # forecaster asserted; that's what the median-extraction loop
             # expects. The 201-point CDF would also work but is less
-            # information-dense (median is one of the 11 anchors).
+            # information-dense (median is one of the declared anchors).
             normalized.append(list(entry.declared_percentiles))
         else:
             normalized.append(list(entry))

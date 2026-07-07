@@ -43,7 +43,7 @@ for the full activation plan):
 - **Library helpers for future wiring (phase-3)**: ``bayes_from_likelihoods``,
   ``laplace_rule_of_succession``, ``inverse_variance_pool``, ``noisy_or``,
   ``weibull_prob_event_before``, ``poisson_at_least_one``,
-  ``base_rate_to_hazard``, ``fit_to_11_percentiles``,
+  ``base_rate_to_hazard``, ``fit_to_standard_percentiles``,
   ``percentiles_to_metaculus_cdf``, ``negative_binomial_percentiles``,
   ``poisson_percentiles``, ``beta_binomial_ceiling_percentiles``,
   ``FitType``.
@@ -84,7 +84,7 @@ from metaculus_bot.probabilistic_tools.distributions import (
     fit_lognormal_from_percentiles,
     fit_normal_from_percentiles,
     fit_student_t_from_percentiles,
-    fit_to_11_percentiles,
+    fit_to_standard_percentiles,
     out_of_bounds_mass,
     percentiles_to_metaculus_cdf,
 )
@@ -140,7 +140,7 @@ __all__ = [
     "fit_normal_from_percentiles",
     "fit_student_t_from_percentiles",
     "fit_mixture_from_percentiles",
-    "fit_to_11_percentiles",
+    "fit_to_standard_percentiles",
     "gamma_prob_event_before",
     "implied_likelihood_ratio",
     "inverse_variance_pool",

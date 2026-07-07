@@ -172,14 +172,14 @@ class TestSpreadMetricsUnchanged:
 
         from metaculus_bot.spread_metrics import numeric_percentile_spread
 
-        std_pcts = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
+        std_pcts = [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99]
 
         def make(values: list[float]) -> list[Percentile]:
             return [Percentile(percentile=p / 100.0, value=v) for p, v in zip(std_pcts, values)]
 
-        # Same fixture as the pre-existing closed-bounds spread test.
-        model1 = make([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
-        model2 = make([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])
+        # Same fixture as the pre-existing closed-bounds spread test (P1/P99 tails added).
+        model1 = make([5, 10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70, 75])
+        model2 = make([25, 30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90, 95])
         question = NumericQuestion(
             question_text="How many?",
             id_of_question=3,

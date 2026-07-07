@@ -31,7 +31,7 @@ from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.mc_processing import build_mc_prediction
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.diagnostics import log_final_prediction
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
@@ -94,9 +94,8 @@ def build_parse_notes(question: NumericQuestion) -> str:
     else:
         upper_note = f"Values are at or below the upper bound {question.upper_bound}."
 
-    # NOTE: percentile set also defined in numeric/config.STANDARD_PERCENTILES.
     return (
-        "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
+        f"Return exactly these {EXPECTED_PERCENTILE_COUNT} percentiles and no others: {STANDARD_PERCENTILES_CSV}. "
         "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
         f"Values must be in the base unit '{unit_str}'. The displayed range is [{question.lower_bound}, "
         f"{question.upper_bound}] — use it only to infer scale, not as a constraint. "

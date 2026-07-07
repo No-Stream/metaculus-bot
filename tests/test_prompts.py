@@ -552,3 +552,52 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(result.lower().split())
         assert "most recent authoritative measurement" in lowered
         assert "centered near this value" in lowered
+
+
+class TestNumericPromptThirteenPercentiles:
+    """The numeric prompts must enumerate all 13 percentile lines (P1 first, P99 last)
+    and never tell the model to emit exactly 11."""
+
+    def test_numeric_prompt_example_block_has_p1_and_p99(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        # P1 line comes first, P99 line comes last in the enumerated Option-A block.
+        assert "Percentile 1:" in result
+        assert "Percentile 99:" in result
+        assert "Percentile 2.5:" in result
+        assert "Percentile 97.5:" in result
+        # P1 must precede P2.5; P99 must follow P97.5.
+        assert result.find("Percentile 1:") < result.find("Percentile 2.5:")
+        assert result.find("Percentile 99:") > result.find("Percentile 97.5:")
+
+    def test_numeric_prompt_says_13_not_11(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        lowered = " ".join(result.lower().split())
+        assert "all 13 percentiles" in lowered
+        assert "13 standard percentiles" in lowered
+        assert "11 percentiles" not in lowered
+        assert "11 standard percentiles" not in lowered
+
+    def test_stacking_numeric_prompt_says_13_not_11(self) -> None:
+        result = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        lowered = " ".join(result.lower().split())
+        assert "all 13 percentiles" in lowered
+        assert "11 percentiles" not in lowered
+
+    def test_stacking_numeric_prompt_example_block_has_p1_and_p99(self) -> None:
+        result = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        assert "Percentile 1:" in result
+        assert "Percentile 99:" in result
+        assert result.find("Percentile 1:") < result.find("Percentile 2.5:")
+        assert result.find("Percentile 99:") > result.find("Percentile 97.5:")

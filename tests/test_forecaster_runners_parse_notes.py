@@ -97,3 +97,19 @@ class TestBuildParseNotes:
             assert "base unit" in notes
             assert "350B" in notes
             assert "350000000000" in notes
+
+    def test_parse_notes_lists_all_13_percentiles_generated(self):
+        """The parser instruction lists the full 13-label set (incl. 1 and 99), generated
+        from STANDARD_PERCENTILES — not the stale hardcoded 11-list."""
+        from metaculus_bot.numeric.config import STANDARD_PERCENTILES_CSV
+
+        q = _numeric_question(lower=0, upper=1000, open_lower=False, open_upper=False)
+        notes = build_parse_notes(q)
+
+        # Full generated CSV is present verbatim.
+        assert STANDARD_PERCENTILES_CSV in notes
+        assert STANDARD_PERCENTILES_CSV == "1,2.5,5,10,20,40,50,60,80,90,95,97.5,99"
+        # The two new tail labels appear; count instruction reflects 13, not 11.
+        assert "13 percentiles" in notes
+        # The stale 11-list must be gone.
+        assert "2.5,5,10,20,40,50,60,80,90,95,97.5." not in notes

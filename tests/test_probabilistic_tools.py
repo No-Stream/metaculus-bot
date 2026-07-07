@@ -29,7 +29,7 @@ from metaculus_bot.probabilistic_tools import (
     fit_lognormal_from_percentiles,
     fit_normal_from_percentiles,
     fit_student_t_from_percentiles,
-    fit_to_11_percentiles,
+    fit_to_standard_percentiles,
     gamma_prob_event_before,
     implied_likelihood_ratio,
     inverse_variance_pool,
@@ -875,17 +875,17 @@ class TestCdfAtThreshold:
         assert got == pytest.approx(0.5)
 
 
-class TestFitTo11Percentiles:
+class TestFitToStandardPercentiles:
     def test_normal(self):
         fit = NormalFit(mu=0.0, sigma=1.0, method="m")
-        out = fit_to_11_percentiles(fit)
+        out = fit_to_standard_percentiles(fit)
         assert set(out.keys()) == set(STANDARD_PERCENTILES)
         for q in STANDARD_PERCENTILES:
             assert out[q] == pytest.approx(float(stats.norm.ppf(q)), rel=1e-9, abs=1e-9)
 
     def test_monotone(self):
         fit = LognormalFit(mu=1.0, sigma=0.5, method="m")
-        out = fit_to_11_percentiles(fit)
+        out = fit_to_standard_percentiles(fit)
         values = [out[q] for q in sorted(out.keys())]
         assert all(a < b for a, b in zip(values, values[1:]))
 
