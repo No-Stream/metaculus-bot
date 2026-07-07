@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 _HAZARD_FRACTION_TOLERANCE = 0.01
 _SCENARIO_PROB_SUM_TOLERANCE = 0.02
 _MC_OPTION_PROB_SUM_TOLERANCE = 0.02
-_TAIL_MASS_SUM_CEILING = 0.5
 _REQUIRED_NUMERIC_PERCENTILES: frozenset[float] = frozenset({0.1, 0.5, 0.9})
 # Defensive cap on raw structured-block size. Legitimate blocks are <5KB;
 # larger payloads likely indicate a malformed rationale (e.g., an unclosed
@@ -161,25 +160,6 @@ class MixtureComponentDeclaration(BaseModel):
     sd: float = Field(gt=0.0)
 
 
-class TailMass(BaseModel):
-    """Declared mass outside the question's declared numeric range."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    below_min_expected: float = Field(ge=0.0, le=1.0)
-    above_max_expected: float = Field(ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def _check_sum(self) -> TailMass:
-        total = self.below_min_expected + self.above_max_expected
-        if total >= _TAIL_MASS_SUM_CEILING:
-            raise ValueError(
-                f"TailMass sum must be < {_TAIL_MASS_SUM_CEILING}, got {total} "
-                f"(below_min_expected={self.below_min_expected}, above_max_expected={self.above_max_expected})"
-            )
-        return self
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -233,7 +213,6 @@ class NumericStructured(BaseModel):
     declared_percentiles: dict[float, float] | None = None
     distribution_family_hint: Literal["normal", "lognormal", "student_t", "skew_normal", "beta", "other"] | None = None
     student_t_df: float | None = None
-    tails: TailMass | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     mixture_components: list[MixtureComponentDeclaration] | None = None
 

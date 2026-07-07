@@ -611,7 +611,6 @@ def numeric_prompt(
           "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
           "distribution_family_hint": "normal",
           "student_t_df": null,
-          "tails": {{"below_min_expected": 0.02, "above_max_expected": 0.05}},
           "scenarios": [],
           "mixture_components": null
         }}
@@ -624,8 +623,6 @@ def numeric_prompt(
           If you take OPTION B (mixture), you may omit `declared_percentiles` entirely.
         - `distribution_family_hint` ∈ {{"normal", "lognormal", "student_t"}}.
         - `student_t_df` only meaningful if family_hint = "student_t".
-        - `tails.below_min_expected` and `tails.above_max_expected` are the probability
-          mass you expect outside the closed bounds.
         - `mixture_components` is OPTIONAL and now wired end-to-end (see OUTPUT FORMAT
           below). It is a list of {{weight, mean, sd}} triples whose weights sum to
           1.0 (within 0.001).

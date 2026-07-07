@@ -241,7 +241,6 @@ class TestRouteNumericOutput:
             ],
             distribution_family_hint=None,
             student_t_df=None,
-            tails=None,
             scenarios=[],
             prior=None,
         )
@@ -386,7 +385,6 @@ class TestRouteNumericOutput:
             ],
             distribution_family_hint=None,
             student_t_df=None,
-            tails=None,
             scenarios=[],
             prior=None,
         )

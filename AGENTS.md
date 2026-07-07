@@ -92,7 +92,7 @@ Thresholds (`metaculus_bot/constants.py:245-249`):
 
 - **Binary**: `[BINARY_PROB_MIN=0.02, BINARY_PROB_MAX=0.98]` (`constants.py`). Applied per-model in `forecaster_runners.py` and on stacker output in `stacking.py`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
 - **MC**: `[0.005, 0.995]`, clamp-then-renormalize via `clamp_and_renormalize_mc` (`numeric/utils.py`).
-- **Numeric CDF**: 201 points, `min_step ≥ 5e-5`, `max_step ≤ 0.2`, open bounds clipped to `[0.001, 0.999]`, closed bounds pinned to `{0.0, 1.0}`. Enforced in `numeric/pchip_cdf.py` `generate_pchip_cdf` with aggressive repair + `safe_cdf_bounds` redistribution on max-step violations.
+- **Numeric CDF**: 201 points, `min_step ≥ 5e-5`, `max_step ≤ 0.2`. Open bounds are a **one-sided** constraint per tail, not a box: open lower bound → `cdf[0]` is floored at a *minimum* of 0.001 (a required minimum positive mass, NOT a cap on below-bound mass); open upper bound → `cdf[-1]` is ceilinged at 0.999. There is no cap on out-of-bound mass — a distribution can legitimately place e.g. 78% of its mass below an open lower bound. Out-of-bound mass is expressed by placing percentile values beyond the displayed range (values are not clamped on open bounds) so `F(bound)` interpolates to the intended fraction; it's bounded only by min/max-step feasibility (~0.99). Closed bounds are pinned to `{0.0, 1.0}`. Enforced in `numeric/pchip_cdf.py` `generate_pchip_cdf` with aggressive repair + `safe_cdf_bounds` redistribution on max-step violations.
 
 ### Numeric pipeline (percentiles → PCHIP CDF)
 

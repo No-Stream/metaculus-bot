@@ -128,7 +128,6 @@ def _numeric_payload(**overrides) -> dict:
             "0.9": 80.0,
         },
         "distribution_family_hint": "normal",
-        "tails": {"below_min_expected": 0.02, "above_max_expected": 0.05},
     }
     base.update(overrides)
     return base
@@ -994,8 +993,7 @@ with long upper tail.
     "0.9": 80.0,
     "0.95": 150.0
   },
-  "distribution_family_hint": "lognormal",
-  "tails": {"below_min_expected": 0.02, "above_max_expected": 0.05}
+  "distribution_family_hint": "lognormal"
 }
 ```
 
@@ -1110,41 +1108,11 @@ class TestMcContractBridge:
 
 
 # ---------------------------------------------------------------------------
-# F7: previously-unconsumed schema fields (tails delta, scenarios count)
+# F7: previously-unconsumed schema fields (scenarios count)
 # ---------------------------------------------------------------------------
 
 
 class TestSchemaFieldWiring:
-    def test_numeric_tails_delta_line_emitted(self):
-        # Declared tails should produce a delta line comparing declared vs fitted tails.
-        payload = _numeric_payload(
-            declared_percentiles={"0.1": 20.0, "0.5": 40.0, "0.9": 60.0},
-            distribution_family_hint="normal",
-            tails={"below_min_expected": 0.05, "above_max_expected": 0.03},
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Declared vs fitted tails" in result
-        assert "declared [below=0.050, above=0.030]" in result
-
-    def test_numeric_no_tails_omits_delta_line(self):
-        payload = {
-            "question_type": "numeric",
-            "declared_percentiles": {"0.1": 20.0, "0.5": 40.0, "0.9": 60.0},
-            "distribution_family_hint": "normal",
-        }
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Declared vs fitted tails" not in result
-
     def test_binary_scenarios_count_line_emitted(self):
         payload = _binary_payload(
             scenarios=[

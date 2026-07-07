@@ -278,6 +278,42 @@ class TestExceededSpreadThreshold:
         # max option spread: A = 0.65-0.6=0.05, B = 0.4-0.35=0.05. max=0.05 < 0.20
         assert exceeded_spread_threshold(record) is False
 
+    def test_numeric_high_spread_closed_bounds(self):
+        # Standard 11-percentile lists (raw 0-100 labels) on a [0, 100] range.
+        # P10: |40-20|/100=0.20; P50: |60-40|/100=0.20; P90: |80-60|/100=0.20 > 0.15.
+        std = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
+        model_a = [[p, v] for p, v in zip(std, [10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])]
+        model_b = [[p, v] for p, v in zip(std, [30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])]
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {"a": model_a, "b": model_b},
+            "scaling": {"range_min": 0.0, "range_max": 100.0},
+        }
+        assert exceeded_spread_threshold(record) is True
+
+    def test_numeric_spread_is_percentile_label_invariant(self):
+        # Regression: the numeric spread must key P10/P50/P90 by LABEL, not by the
+        # positional index [2, 5, 8]. Prepend P1 and append P99 (the future 13-set)
+        # so positional [2,5,8] would read P5/P40/P80 instead. Only the P50 value
+        # differs from its neighbors here, so a positional bug (reading P40) would
+        # compute a DIFFERENT spread. Label lookup must be invariant.
+        labels = [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99]
+        # Both models identical except P50: a=50, b=90 -> P50 spread = |90-50|/100 = 0.40.
+        # All other labels identical -> 0 spread. P40 (positional index 5 in 13-set)
+        # is identical between models, so a positional bug would see 0 and return False.
+        vals_a = [5, 10, 15, 20, 30, 40, 50, 55, 70, 80, 85, 90, 95]
+        vals_b = [5, 10, 15, 20, 30, 40, 90, 55, 70, 80, 85, 90, 95]
+        model_a = [[p, v] for p, v in zip(labels, vals_a)]
+        model_b = [[p, v] for p, v in zip(labels, vals_b)]
+        record = {
+            "type": "numeric",
+            "per_model_numeric_percentiles": {"a": model_a, "b": model_b},
+            "scaling": {"range_min": 0.0, "range_max": 100.0},
+        }
+        # Label lookup finds the P50 disagreement (0.40 > 0.15) -> True.
+        # A positional-[2,5,8] bug would read P40 (identical) and return False.
+        assert exceeded_spread_threshold(record) is True
+
 
 class TestExceededSpreadThresholdBaseModelField:
     """Tests for per_base_model_forecasts preference in exceeded_spread_threshold."""

@@ -332,16 +332,6 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
             try:
                 tail = out_of_bounds_mass(fit, lower_bound=lower, upper_bound=upper)
                 lines.append(_format_tail_mass(tail, family=hint or type(fit).__name__))
-                if block.tails is not None:
-                    declared_below = block.tails.below_min_expected
-                    declared_above = block.tails.above_max_expected
-                    delta_below = tail.prob_below_min - declared_below
-                    delta_above = tail.prob_above_max - declared_above
-                    lines.append(
-                        f"- **Declared vs fitted tails**: declared [below={declared_below:.3f}, above={declared_above:.3f}] "
-                        f"vs fitted [{tail.prob_below_min:.3f}, {tail.prob_above_max:.3f}]; "
-                        f"Δ = [{delta_below:+.3f}, {delta_above:+.3f}]"
-                    )
             except ValueError as exc:
                 logger.debug("out_of_bounds_mass skipped: %s", exc)
 

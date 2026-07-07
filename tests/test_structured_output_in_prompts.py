@@ -110,7 +110,7 @@ class TestNumericPromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"numeric"' in prompt
         assert "declared_percentiles" in prompt
-        for field in ("distribution_family_hint", "student_t_df", "tails", "scenarios"):
+        for field in ("distribution_family_hint", "student_t_df", "scenarios"):
             assert field in prompt, f"missing optional field {field!r} in numeric schema"
 
     def test_numeric_percentiles_match_trailing_lines_note_present(self):

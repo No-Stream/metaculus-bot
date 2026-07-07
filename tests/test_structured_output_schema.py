@@ -22,7 +22,6 @@ from metaculus_bot.structured_output_schema import (
     StatedBaseRate,
     StatedHazard,
     StatedPrior,
-    TailMass,
     extract_first_balanced_braces,
     extract_json_block,
     parse_structured_block,
@@ -71,11 +70,6 @@ def valid_scenarios_binary() -> list[ScenarioBranch]:
 
 
 @pytest.fixture
-def valid_tails() -> TailMass:
-    return TailMass(below_min_expected=0.05, above_max_expected=0.05)
-
-
-@pytest.fixture
 def valid_binary_block(
     valid_prior: StatedPrior,
     valid_base_rate: StatedBaseRate,
@@ -95,14 +89,13 @@ def valid_binary_block(
 
 
 @pytest.fixture
-def valid_numeric_block(valid_prior: StatedPrior, valid_tails: TailMass) -> NumericStructured:
+def valid_numeric_block(valid_prior: StatedPrior) -> NumericStructured:
     return NumericStructured(
         question_type="numeric",
         prior=valid_prior,
         declared_percentiles={0.1: 10.0, 0.5: 50.0, 0.9: 90.0},
         distribution_family_hint="normal",
         student_t_df=None,
-        tails=valid_tails,
         scenarios=[],
     )
 
@@ -184,8 +177,6 @@ class TestNumericStructuredHappyPath:
         assert set(n.declared_percentiles.keys()) >= {0.1, 0.5, 0.9}
         assert n.declared_percentiles[0.5] == pytest.approx(50.0)
         assert n.distribution_family_hint == "normal"
-        assert isinstance(n.tails, TailMass)
-        assert n.tails.below_min_expected == pytest.approx(0.05)
 
     def test_only_required_fields(self) -> None:
         n = NumericStructured(
@@ -193,9 +184,22 @@ class TestNumericStructuredHappyPath:
             declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
         )
         assert n.prior is None
-        assert n.tails is None
         assert n.scenarios == []
         assert n.student_t_df is None
+
+    def test_tails_field_removed(self) -> None:
+        # The dead `tails` / TailMass slot was removed (W2). NumericStructured
+        # uses extra="forbid", so passing a `tails` key must now raise, and
+        # TailMass must no longer be importable from the schema module.
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                tails={"below_min_expected": 0.05, "above_max_expected": 0.05},  # type: ignore[call-arg]
+            )
+        import metaculus_bot.structured_output_schema as schema
+
+        assert not hasattr(schema, "TailMass")
 
     def test_accepts_extra_percentiles(self) -> None:
         n = NumericStructured(
@@ -408,24 +412,6 @@ class TestEvidenceItemValidators:
     def test_empty_summary_raises(self) -> None:
         with pytest.raises(ValidationError):
             EvidenceItem(summary="", direction="up", strength="weak")
-
-
-class TestTailMassValidators:
-    def test_sum_exactly_at_ceiling_raises(self) -> None:
-        with pytest.raises(ValidationError, match="TailMass sum"):
-            TailMass(below_min_expected=0.25, above_max_expected=0.25)
-
-    def test_sum_above_ceiling_raises(self) -> None:
-        with pytest.raises(ValidationError, match="TailMass sum"):
-            TailMass(below_min_expected=0.3, above_max_expected=0.3)
-
-    def test_small_sum_ok(self) -> None:
-        t = TailMass(below_min_expected=0.1, above_max_expected=0.1)
-        assert t.below_min_expected + t.above_max_expected == pytest.approx(0.2)
-
-    def test_zero_ok(self) -> None:
-        t = TailMass(below_min_expected=0.0, above_max_expected=0.0)
-        assert t.below_min_expected == 0.0
 
 
 class TestScenarioBranchValidators:

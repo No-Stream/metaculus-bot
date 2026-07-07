@@ -283,12 +283,12 @@ class TestNumericPercentileSpread:
             numeric_percentile_spread([model], question)
 
     def test_short_percentile_list_raises(self):
-        """Percentile lists with fewer than 9 elements should raise ValueError."""
+        """Incomplete percentile lists should raise ValueError (missing labels)."""
         short_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])[:5]
         full_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
         question = _make_numeric_question()
 
-        with pytest.raises(ValueError, match="at least 9 percentiles"):
+        with pytest.raises(ValueError, match="standard percentiles"):
             numeric_percentile_spread([short_model, full_model], question)
 
 

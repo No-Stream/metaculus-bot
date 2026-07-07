@@ -20,13 +20,15 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
+from metaculus_bot.numeric.percentile_set import PercentileSet
 from metaculus_bot.prob_math_utils import logit
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Indices into the standard 11-percentile list (2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5)
-# that correspond to the 10th, 50th, and 90th percentiles.
-_KEY_PERCENTILE_INDICES: list[int] = [2, 5, 8]
+# Percentile LABELS (not positions) at which numeric disagreement is measured:
+# the 10th, 50th, and 90th percentiles. Accessed by label via PercentileSet so
+# growing the standard percentile set (e.g. 11 -> 13) cannot silently shift them.
+_KEY_SPREAD_PERCENTILES: list[float] = [0.10, 0.50, 0.90]
 
 
 def binary_prob_range_spread(prediction_values: list[float]) -> float:
@@ -98,13 +100,10 @@ def numeric_percentile_spread(
     if len(prediction_values) < 2:
         raise ValueError("numeric_percentile_spread requires at least 2 predictions")
 
-    min_required = max(_KEY_PERCENTILE_INDICES) + 1  # 9
-    for model_pcts in prediction_values:
-        if len(model_pcts) < min_required:
-            raise ValueError(
-                f"numeric_percentile_spread requires at least {min_required} percentiles per model,"
-                f" got {len(model_pcts)}"
-            )
+    # Build a label-addressed PercentileSet per model. Construction validates that
+    # each model declares exactly the standard percentile set, so the key-percentile
+    # lookups below (P10/P50/P90) can never resolve to the wrong percentile.
+    model_sets = [PercentileSet.from_percentiles(model_pcts) for model_pcts in prediction_values]
 
     has_finite_range = (
         not question.open_lower_bound
@@ -117,8 +116,8 @@ def numeric_percentile_spread(
         denominator = question.upper_bound - question.lower_bound
     else:
         # Fallback: ensemble IQR from 10th and 90th percentiles across all models
-        p10_values = [model_pcts[_KEY_PERCENTILE_INDICES[0]].value for model_pcts in prediction_values]
-        p90_values = [model_pcts[_KEY_PERCENTILE_INDICES[2]].value for model_pcts in prediction_values]
+        p10_values = [ps.value_at(0.10) for ps in model_sets]
+        p90_values = [ps.value_at(0.90) for ps in model_sets]
         denominator = statistics.median(p90_values) - statistics.median(p10_values)
 
     if denominator <= 0:
@@ -126,8 +125,8 @@ def numeric_percentile_spread(
         return 0.0
 
     max_normalized_spread = 0.0
-    for idx in _KEY_PERCENTILE_INDICES:
-        values_at_percentile = [model_pcts[idx].value for model_pcts in prediction_values]
+    for pct in _KEY_SPREAD_PERCENTILES:
+        values_at_percentile = [ps.value_at(pct) for ps in model_sets]
         raw_spread = max(values_at_percentile) - min(values_at_percentile)
         normalized = raw_spread / denominator
         max_normalized_spread = max(max_normalized_spread, normalized)

@@ -61,6 +61,50 @@ END LLM OUTPUT | {model_name}
     )
 
 
+def build_parse_notes(question: NumericQuestion) -> str:
+    """Build the parser LLM's extraction instructions for a numeric question.
+
+    The parser's only job is to EXTRACT the forecaster's declared percentile values
+    and convert unit suffixes (350B -> 350000000000). It must NOT interpret or
+    constrain them. For a CLOSED bound the outcome genuinely cannot cross it, so a
+    hard sanity note ("at or above/below {bound}") is fine. For an OPEN bound the
+    displayed bound is only the bottom/top of the shown range — the outcome can
+    resolve outside it — so the parser must preserve out-of-range values verbatim
+    and never clamp them into range. The downstream sanitize layer
+    (numeric/bounds_clamping.py) already gates its clamps on open/closed, so this is
+    the one remaining place that must respect that distinction.
+    """
+    unit_str = getattr(question, "unit_of_measure", None) or "base unit"
+
+    if question.open_lower_bound:
+        lower_note = (
+            f"The lower bound {question.lower_bound} is only the bottom of the displayed range; the outcome can "
+            f"resolve below it. If the forecaster's text states a value below {question.lower_bound}, extract that "
+            "value verbatim — never clamp or round it up into range."
+        )
+    else:
+        lower_note = f"Values are at or above the lower bound {question.lower_bound}."
+
+    if question.open_upper_bound:
+        upper_note = (
+            f"The upper bound {question.upper_bound} is only the top of the displayed range; the outcome can "
+            f"resolve above it. If the forecaster's text states a value above {question.upper_bound}, extract that "
+            "value verbatim — never clamp or round it down into range."
+        )
+    else:
+        upper_note = f"Values are at or below the upper bound {question.upper_bound}."
+
+    # NOTE: percentile set also defined in numeric/config.STANDARD_PERCENTILES.
+    return (
+        "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
+        "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
+        f"Values must be in the base unit '{unit_str}'. The displayed range is [{question.lower_bound}, "
+        f"{question.upper_bound}] — use it only to infer scale, not as a constraint. "
+        f"{lower_note} {upper_note} "
+        "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
+    )
+
+
 async def run_binary_forecast(
     question: BinaryQuestion,
     research: str,
@@ -196,17 +240,7 @@ async def run_numeric_forecast(
             vote_label,
         )
 
-    unit_str = getattr(question, "unit_of_measure", None) or "base unit"
-    parse_notes = (
-        (
-            "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
-            "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
-            f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
-            "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
-        )
-        .replace("{lower}", str(question.lower_bound))
-        .replace("{upper}", str(question.upper_bound))
-    )
+    parse_notes = build_parse_notes(question)
 
     percentile_list: list[Percentile] | None
     try:
