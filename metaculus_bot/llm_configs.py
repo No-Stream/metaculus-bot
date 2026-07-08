@@ -150,8 +150,8 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 # dice with the same distribution), and the budget is better spent on a
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/anthropic/claude-opus-4.5",
-    reasoning={"max_tokens": 32_000},  # Opus 4.5 uses explicit thinking budget, not effort/verbosity levels
+    "openrouter/anthropic/claude-fable-5",
+    reasoning={"max_tokens": 32_000},  # explicit thinking budget (OpenRouter budget-based reasoning)
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
 
