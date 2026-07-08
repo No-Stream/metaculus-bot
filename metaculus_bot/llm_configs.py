@@ -151,7 +151,10 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/anthropic/claude-fable-5",
-    reasoning={"max_tokens": 32_000},  # explicit thinking budget (OpenRouter budget-based reasoning)
+    # Fable 5 uses effort-based adaptive thinking (none/low/medium/high/max), not a
+    # max_tokens budget. effort=high + verbosity=high matches the opus-4.8 forecaster slot.
+    reasoning={"effort": "high"},
+    extra_body={"verbosity": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
 
