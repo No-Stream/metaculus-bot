@@ -296,26 +296,17 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
             You MUST emit a fenced ```json block below, immediately after your analysis
             and BEFORE your final answer line(s). This block is required for scoring —
-            responses without it are discarded. Downstream tools use these fields to
-            compute calibrated aggregations across forecasters.
-            Schema (all fields except `posterior_prob` are optional — populate as follows):
-            - `prior`: populate if you stated an outside-view base rate in Phase 1.
-            - `base_rate`: populate with k/n if you identified a reference-class frequency.
-            - `hazard`: populate if you computed a conditional-hazard rate (recurring events).
-            - `evidence`: populate with your Phase 2 evidence items (include `likelihood_ratio` if you can estimate one; it strengthens the math).
-            - `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal).
+            responses without it are discarded.
+            Schema:
 
             ```json
             {{
               "question_type": "binary",
-              "prior": {{"prob": 0.15, "source": "annual incidence 2015-2024"}},
-              "base_rate": {{"k": 3, "n": 12, "ref_class": "years matching condition"}},
-              "hazard": {{"rate_per_unit": 0.25, "unit": "year", "window_duration_units": 1.0, "elapsed_fraction": 0.33, "remaining_fraction": 0.67}},
-              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate", "likelihood_ratio": 2.5}}],
-              "scenarios": [],
               "posterior_prob": 0.28
             }}
             ```
+
+            `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal, 0-1).
 
             Emit the JSON block BEFORE the final Probability line below.
 
@@ -426,9 +417,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         You MUST emit a fenced ```json block below, immediately after your analysis
         and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded. Downstream tools use these fields to
-        compute calibrated aggregations across forecasters.
-        Schema (all fields except `option_probs` are optional; omit if not applicable):
+        responses without it are discarded.
+        Schema (`option_probs` is REQUIRED; others optional):
 
         ```json
         {{
@@ -602,22 +592,23 @@ def numeric_prompt(
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         You MUST emit a fenced ```json block below, immediately after your analysis
         and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded. Downstream tools use these fields to
-        compute calibrated aggregations across forecasters.
-        Schema (`declared_percentiles` is REQUIRED; `scenarios` is optional):
+        responses without it are discarded.
+        Schema (`declared_percentiles` is REQUIRED; `outcome_type` is REQUIRED):
 
         ```json
         {{
           "question_type": "numeric",
           "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
-          "scenarios": []
+          "outcome_type": "continuous"
         }}
         ```
 
         Notes:
         - `declared_percentiles` must cover at least {{0.1, 0.5, 0.9}} and should
-          match your final Percentile lines below (tools operate on the JSON; the
-          official forecast is still read from the trailing Percentile lines).
+          match your final Percentile lines below.
+        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
+          whole number (counts, rankings, number of events, number of countries),
+          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
         Emit the JSON block BEFORE the final Prediction block.
 

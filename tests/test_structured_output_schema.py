@@ -196,6 +196,41 @@ class TestNumericStructuredHappyPath:
 
         assert not hasattr(schema, "TailMass")
 
+    def test_outcome_type_discrete(self) -> None:
+        """C3: outcome_type='discrete_integer' accepted."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            outcome_type="discrete_integer",
+        )
+        assert n.outcome_type == "discrete_integer"
+
+    def test_outcome_type_continuous(self) -> None:
+        """C3: outcome_type='continuous' accepted."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            outcome_type="continuous",
+        )
+        assert n.outcome_type == "continuous"
+
+    def test_outcome_type_none_default(self) -> None:
+        """C3: outcome_type defaults to None (backward compat)."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+        )
+        assert n.outcome_type is None
+
+    def test_outcome_type_invalid_raises(self) -> None:
+        """C3: invalid outcome_type string rejected by Literal constraint."""
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                outcome_type="unknown",  # type: ignore[arg-type]
+            )
+
     def test_accepts_extra_percentiles(self) -> None:
         n = NumericStructured(
             question_type="numeric",

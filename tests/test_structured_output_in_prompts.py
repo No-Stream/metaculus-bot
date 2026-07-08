@@ -68,9 +68,18 @@ class TestBinaryPromptSchemaInstruction:
         assert '"binary"' in prompt
         # Required output field
         assert "posterior_prob" in prompt
-        # At least one optional field documented
+
+    def test_tier2_fields_not_demanded_in_schema(self):
+        """Tier-2 scaffold fields are no longer demanded in the JSON schema block (C2)."""
+        prompt = binary_prompt(_make_binary_q(), research="R")
+        # The schema example in the JSON block should NOT contain tier-2 fields.
+        # They may still appear elsewhere in the analysis template (e.g. "base rate"
+        # as a prose concept), so we check only the STRUCTURED FORECAST section.
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
         for field in ("prior", "base_rate", "hazard", "evidence", "scenarios"):
-            assert field in prompt, f"missing optional field {field!r} in binary schema"
+            assert f'"{field}"' not in structured_section, (
+                f"tier-2 field {field!r} should not be demanded in the STRUCTURED FORECAST schema block"
+            )
 
     def test_schema_block_precedes_answer_line(self):
         # Critical ordering constraint: JSON block must appear BEFORE the
@@ -89,8 +98,18 @@ class TestMultipleChoicePromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"multiple_choice"' in prompt
         assert "option_probs" in prompt
+        # Optional tier-1 fields still shown in the example
         for field in ("other_mass", "concentration"):
             assert field in prompt, f"missing optional field {field!r} in MC schema"
+
+    def test_tier2_fields_not_demanded_in_mc_schema(self):
+        """Tier-2 scaffold fields are no longer demanded in the MC JSON schema block (C2)."""
+        prompt = multiple_choice_prompt(_make_mc_q(), research="R")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        for field in ("prior", "base_rate", "hazard", "evidence", "scenarios"):
+            assert f'"{field}"' not in structured_section, (
+                f"tier-2 field {field!r} should not be demanded in the MC STRUCTURED FORECAST schema block"
+            )
 
     def test_schema_block_precedes_option_answer_lines(self):
         prompt = multiple_choice_prompt(_make_mc_q(), research="R")
@@ -110,8 +129,23 @@ class TestNumericPromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"numeric"' in prompt
         assert "declared_percentiles" in prompt
-        for field in ("scenarios",):
-            assert field in prompt, f"missing optional field {field!r} in numeric schema"
+
+    def test_outcome_type_in_numeric_schema(self):
+        """C3: outcome_type field is documented in the numeric JSON schema block."""
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert "outcome_type" in structured_section
+        assert "discrete_integer" in structured_section
+        assert "continuous" in structured_section
+
+    def test_tier2_fields_not_demanded_in_numeric_schema(self):
+        """Tier-2 scaffold fields are no longer demanded in the numeric JSON schema block (C2)."""
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        for field in ("prior", "base_rate", "hazard", "evidence", "scenarios"):
+            assert f'"{field}"' not in structured_section, (
+                f"tier-2 field {field!r} should not be demanded in the numeric STRUCTURED FORECAST schema block"
+            )
 
     def test_numeric_percentiles_match_trailing_lines_note_present(self):
         # Reminder that JSON declared_percentiles should reflect the trailing

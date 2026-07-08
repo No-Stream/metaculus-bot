@@ -194,6 +194,7 @@ class NumericStructured(BaseModel):
     question_type: Literal["numeric"]
     prior: StatedPrior | None = None
     declared_percentiles: dict[float, float] | None = None
+    outcome_type: Literal["discrete_integer", "continuous"] | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
 
     @field_validator("declared_percentiles")

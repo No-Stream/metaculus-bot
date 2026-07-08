@@ -209,20 +209,32 @@ async def run_numeric_forecast(
 
     qid = question.id_of_question
     discrete_vote: bool | None = None
-    try:
-        outcome_result: OutcomeTypeResult = await structure_output(
-            reasoning,
-            OutcomeTypeResult,
-            model=parser_llm,
-            additional_instructions=(
-                "The forecaster classified whether this question's resolution values are discrete "
-                "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
-                "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
-            ),
-        )
-        discrete_vote = outcome_result.is_discrete_integer
-    except (ValidationError, ValueError) as e:
-        logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, forecaster_llm.model, e)
+
+    # C3: try to read outcome_type from the structured JSON block first (saves
+    # a parser LLM call). Fall back to the OutcomeTypeResult parser call when
+    # the block is missing or doesn't declare outcome_type.
+    from metaculus_bot.structured_output_schema import (
+        parse_structured_block,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+    )
+
+    block = parse_structured_block(reasoning, "numeric")
+    if block is not None and hasattr(block, "outcome_type") and block.outcome_type is not None:
+        discrete_vote = block.outcome_type == "discrete_integer"
+    else:
+        try:
+            outcome_result: OutcomeTypeResult = await structure_output(
+                reasoning,
+                OutcomeTypeResult,
+                model=parser_llm,
+                additional_instructions=(
+                    "The forecaster classified whether this question's resolution values are discrete "
+                    "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
+                    "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
+                ),
+            )
+            discrete_vote = outcome_result.is_discrete_integer
+        except (ValidationError, ValueError) as e:
+            logger.warning("Failed to parse OUTCOME_TYPE for Q %s | model=%s: %s", qid, forecaster_llm.model, e)
 
     if qid is not None:
         if discrete_vote is True:

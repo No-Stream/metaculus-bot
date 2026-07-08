@@ -77,10 +77,10 @@ jobs:
           GAP_FILL_ENABLED: 'true'
           # Probabilistic tools post-processor: deterministic probability math
           # injected into per-forecaster rationales and the stacker's view.
-          # Per-type allow-list: empirically helpful for binary (Wilcoxon p=0.094,
-          # n=44) and MC (directional, n=22); inconclusive for numeric (n=22,
-          # p=0.113), so excluded.
-          PROBABILISTIC_TOOLS_ENABLED: 'true'
+          # Retired (C2): tier-2 scaffold fields no longer demanded in prompts;
+          # tool_runner stays dormant behind this flag. Re-enable if future
+          # benchmarks show value from structured-declaration math.
+          PROBABILISTIC_TOOLS_ENABLED: 'false'
           PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'
           # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
           # is_benchmarking=False in the prod path (this workflow), so the
