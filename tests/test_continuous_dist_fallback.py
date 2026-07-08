@@ -104,5 +104,5 @@ async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
         "metaculus_bot.forecaster_runners.structure_output",
         side_effect=ValidationError.from_exception_data("NumericDistribution", []),
     ):
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValueError, match="no declared_percentiles available"):
             await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

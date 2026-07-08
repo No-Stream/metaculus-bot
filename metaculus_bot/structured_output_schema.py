@@ -146,20 +146,6 @@ class ScenarioBranch(BaseModel):
     conditional_outcome: str | None = None
 
 
-class MixtureComponentDeclaration(BaseModel):
-    """Mixture-of-normals component.
-
-    Weights across all components in a NumericStructured must sum to 1.0
-    within 1e-3 tolerance (checked at ``NumericStructured`` level).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    weight: float = Field(ge=0.0)
-    mean: float
-    sd: float = Field(gt=0.0)
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -207,44 +193,12 @@ class NumericStructured(BaseModel):
 
     question_type: Literal["numeric"]
     prior: StatedPrior | None = None
-    # Optional ONLY when a valid mixture_components is present (enforced by
-    # _require_percentiles_or_mixture). A percentile-only block must still
-    # supply this with p10/p50/p90 + strictly-increasing values.
     declared_percentiles: dict[float, float] | None = None
-    distribution_family_hint: Literal["normal", "lognormal", "student_t", "skew_normal", "beta", "other"] | None = None
-    student_t_df: float | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
-    mixture_components: list[MixtureComponentDeclaration] | None = None
-
-    @field_validator("mixture_components")
-    @classmethod
-    def _check_mixture_components(
-        cls, v: list[MixtureComponentDeclaration] | None
-    ) -> list[MixtureComponentDeclaration] | None:
-        if v is None:
-            return None
-        if len(v) < 2:
-            raise ValueError(f"mixture_components requires at least 2 components (got {len(v)})")
-        total = sum(c.weight for c in v)
-        if not (0.999 <= total <= 1.001):
-            raise ValueError(f"mixture_components weights must sum to 1.0 within 1e-3, got {total}")
-        return v
-
-    @field_validator("student_t_df")
-    @classmethod
-    def _check_df(cls, v: float | None) -> float | None:
-        if v is not None and v <= 1:
-            raise ValueError(f"NumericStructured.student_t_df must be > 1 if set, got {v}")
-        return v
 
     @field_validator("declared_percentiles")
     @classmethod
     def _check_percentiles(cls, v: dict[float, float] | None) -> dict[float, float] | None:
-        # None / empty is allowed here so a mixture-only block can omit
-        # declared_percentiles entirely. The "at least one of percentiles or
-        # mixture" requirement is enforced by _require_percentiles_or_mixture.
-        # When percentiles ARE supplied, the full p10/p50/p90 + monotonic
-        # contract still applies.
         if not v:
             return v
         missing = _REQUIRED_NUMERIC_PERCENTILES - set(v.keys())
@@ -269,18 +223,10 @@ class NumericStructured(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _require_percentiles_or_mixture(self) -> NumericStructured:
-        # numeric_prompt OPTION B lets a model emit only a mixture and omit the
-        # percentile lines. By the time this runs, _check_mixture_components has
-        # already guaranteed mixture_components is None or a valid (>=2 comps,
-        # weights ~1.0) list, and _check_percentiles has enforced the p10/p50/p90
-        # contract on any supplied percentiles. So we only need to reject the
-        # block where BOTH are absent — nothing to build a CDF from.
-        if not self.declared_percentiles and self.mixture_components is None:
+    def _require_percentiles(self) -> NumericStructured:
+        if not self.declared_percentiles:
             raise ValueError(
-                "NumericStructured requires either declared_percentiles (with at least "
-                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}) or a valid mixture_components "
-                "(>=2 components, weights summing to ~1.0); both were absent"
+                f"NumericStructured requires declared_percentiles with at least {sorted(_REQUIRED_NUMERIC_PERCENTILES)}"
             )
         return self
 

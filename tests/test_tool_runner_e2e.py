@@ -8,7 +8,7 @@ stacker prompt as a "Cross-model aggregation (deterministic math)" block.
 
 Drives the full STACKING / CONDITIONAL_STACKING path of
 ``_aggregate_predictions`` for binary, MC, numeric (with declared
-percentiles) and numeric (with mixture components). Each test mocks the
+percentiles) and numeric. Each test mocks the
 stacker LLM's ``invoke`` so we can capture the resulting prompt and assert
 the cross-model block landed in it.
 
@@ -168,22 +168,12 @@ def _numeric_percentiles_rationale(model_name: str, family: str, declared: dict[
     payload = {
         "question_type": "numeric",
         "declared_percentiles": declared,
-        "distribution_family_hint": family,
     }
     pct_lines = "\n".join(
         f"Percentile {int(float(k) * 100) if float(k) * 100 == int(float(k) * 100) else float(k) * 100}: {v}"
         for k, v in declared.items()
     )
     return f"Model: {model_name}\n\n```json\n{json.dumps(payload)}\n```\n\n{pct_lines}"
-
-
-def _numeric_mixture_rationale(model_name: str, declared: dict[str, float], components: list[dict]) -> str:
-    payload = {
-        "question_type": "numeric",
-        "declared_percentiles": declared,
-        "mixture_components": components,
-    }
-    return f"Model: {model_name}\n\nAnalysis.\n\n```json\n{json.dumps(payload)}\n```\n"
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +323,6 @@ class TestBinaryStackingCrossModelAggregation:
 
 
 # ---------------------------------------------------------------------------
-# Gap 1B: Numeric (declared_percentiles) + Numeric (mixture) paths
 # ---------------------------------------------------------------------------
 
 
@@ -458,94 +447,6 @@ class TestNumericStackingCrossModelAggregation:
         assert "Cross-model aggregation (deterministic math)" in prompt
         # Numeric aggregation should surface the medians line and family hints.
         assert "Forecaster medians" in prompt
-        assert "Declared distribution families" in prompt
-
-    @pytest.mark.asyncio
-    async def test_numeric_with_mixture_components_injects_aggregation(self, monkeypatch) -> None:
-        """Numeric structured aggregation for forecasters whose JSON blocks include
-        ``mixture_components``. Cross-model aggregation still emits the medians +
-        families lines because those are computed from declared_percentiles, which
-        the schema requires alongside any mixture."""
-        monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
-        bot = _make_stacking_bot(AggregationStrategy.STACKING)
-        question = _make_numeric_q()
-
-        components_a = [
-            {"weight": 0.3, "mean": 25.0, "sd": 8.0},
-            {"weight": 0.4, "mean": 50.0, "sd": 10.0},
-            {"weight": 0.3, "mean": 75.0, "sd": 8.0},
-        ]
-        components_b = [
-            {"weight": 0.5, "mean": 30.0, "sd": 12.0},
-            {"weight": 0.5, "mean": 70.0, "sd": 12.0},
-        ]
-        components_c = [
-            {"weight": 0.4, "mean": 20.0, "sd": 7.0},
-            {"weight": 0.6, "mean": 60.0, "sd": 11.0},
-        ]
-
-        rationales = [
-            _numeric_mixture_rationale("m1", _NUMERIC_DECLARED["m1"], components_a),
-            _numeric_mixture_rationale("m2", _NUMERIC_DECLARED["m2"], components_b),
-            _numeric_mixture_rationale("m3", _NUMERIC_DECLARED["m3"], components_c),
-        ]
-
-        # Build numeric predictions via the router (mixture branch).
-        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-        from metaculus_bot.numeric_format_router import route_numeric_output
-
-        numeric_predictions = []
-        for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
-            pcts = _percentile_objs_from(declared)
-            routed = route_numeric_output(rationale=rationale, declared_percentiles=pcts, question=question)
-            # mixture or both branches set declared_percentiles to None and
-            # cdf_percentiles to a 201-pt CDF.
-            mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
-            from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-
-            mixture_declared: list[Percentile] = []
-            for target_pct in STANDARD_PERCENTILES:
-                hit = next(
-                    (p for p in routed.cdf_percentiles if p.percentile >= target_pct),
-                    routed.cdf_percentiles[-1],
-                )
-                mixture_declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
-            pred = create_pchip_numeric_distribution(mixture_cdf_values, mixture_declared, question, zero_point=None)
-            numeric_predictions.append(pred)
-
-        reasoned = [
-            ReasonedPrediction(prediction_value=p, reasoning=r) for p, r in zip(numeric_predictions, rationales)
-        ]
-
-        capture = _PromptCapture(
-            stacker_response="Percentile 50: 45.0",
-            parser_response=_percentile_objs_from(_NUMERIC_DECLARED["m1"]),
-        )
-        from metaculus_bot.tool_runner import build_cross_model_aggregation
-
-        with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.structure_output", new=capture.parser_structure_output):
-                await bot._aggregate_predictions(
-                    numeric_predictions,  # type: ignore[arg-type]
-                    question,
-                    research="research",
-                    reasoned_predictions=reasoned,
-                    aggregated_tool_output=build_cross_model_aggregation(
-                        question=question,
-                        rationales=rationales,
-                        prediction_values=[_percentile_objs_from(d) for d in _NUMERIC_DECLARED.values()],
-                    )
-                    or None,
-                )
-
-        prompt = capture.prompts[0]
-        assert "Cross-model aggregation (deterministic math)" in prompt
-        assert "Forecaster medians" in prompt
-
-
-# ---------------------------------------------------------------------------
-# Gap 1C: Multiple-choice path
-# ---------------------------------------------------------------------------
 
 
 class TestMcStackingCrossModelAggregation:

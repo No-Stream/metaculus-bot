@@ -127,7 +127,6 @@ def _numeric_payload(**overrides) -> dict:
             "0.75": 60.0,
             "0.9": 80.0,
         },
-        "distribution_family_hint": "normal",
     }
     base.update(overrides)
     return base
@@ -354,7 +353,6 @@ class TestRunToolsNumeric:
                 "0.9": 100.0,
                 "0.95": 500.0,
             },
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         result = run_tools_for_forecaster(
@@ -380,93 +378,6 @@ class TestRunToolsNumeric:
         with caplog.at_level(logging.WARNING):
             result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="m")
         assert result == ""
-
-    def test_numeric_with_mixture_components_surfaces_section(self):
-        # Workstream D3: mixture_components populated in NumericStructured should
-        # surface a "Mixture-of-normals" subsection in the output.
-        payload = _numeric_payload(
-            mixture_components=[
-                {"weight": 0.2, "mean": 20.0, "sd": 5.0},
-                {"weight": 0.55, "mean": 50.0, "sd": 8.0},
-                {"weight": 0.25, "mean": 80.0, "sd": 6.0},
-            ],
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        # Section header.
-        assert "### Mixture-of-normals" in result
-
-        # Each component's full triple (weight, mean, sd) must appear in the
-        # rendered table — not just the mean. Per _render_mixture_section
-        # tool_runner.py:322-323:
-        #   "- Component {i+1}: weight {weight:.3f}, mean {mean:.3g}, sd {sd:.3g}"
-        assert "Component 1: weight 0.200, mean 20, sd 5" in result
-        assert "Component 2: weight 0.550, mean 50, sd 8" in result
-        assert "Component 3: weight 0.250, mean 80, sd 6" in result
-
-        # CDF sample table header + exactly 5 sample rows over [0, 100].
-        # Sample rows are indented two spaces ("  - "); the header line is "- ".
-        assert "CDF sample (value → F):" in result
-        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
-        assert len(cdf_sample_lines) == 5, f"expected 5 CDF sample rows, got {len(cdf_sample_lines)}"
-
-        # Bounded size: a well-formed mixture section is a small markdown
-        # block. A pathological serializer dumping a 201-pt CDF would balloon
-        # this past a few hundred chars — guard the upper bound.
-        mixture_section = result.split("### Mixture-of-normals", 1)[1]
-        assert len(mixture_section) < 1000, (
-            f"mixture section is unexpectedly large ({len(mixture_section)} chars); "
-            "rendering may be dumping more than the 5-row sample table"
-        )
-
-    def test_numeric_without_mixture_components_unchanged(self):
-        # Regression: existing numeric path (percentiles only) still works and does
-        # NOT surface a mixture section when mixture_components is absent.
-        rationale = _wrap_json(_numeric_payload())
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Percentile-family consistency" in result
-        assert "Out-of-bounds mass" in result
-        assert "Mixture-of-normals" not in result
-
-    def test_numeric_with_both_percentiles_and_mixture_shows_both(self):
-        # When both declared_percentiles and mixture_components are present, both
-        # sections appear. No consistency check between them (that's Workstream E).
-        payload = _numeric_payload(
-            mixture_components=[
-                {"weight": 0.3, "mean": 25.0, "sd": 7.0},
-                {"weight": 0.4, "mean": 50.0, "sd": 10.0},
-                {"weight": 0.3, "mean": 75.0, "sd": 8.0},
-            ],
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        # Both sections must surface — no consistency check between them.
-        assert "Percentile-family consistency" in result
-        assert "### Mixture-of-normals" in result
-        # Each component's full triple appears verbatim.
-        assert "Component 1: weight 0.300, mean 25, sd 7" in result
-        assert "Component 2: weight 0.400, mean 50, sd 10" in result
-        assert "Component 3: weight 0.300, mean 75, sd 8" in result
-        # CDF sample table has exactly 5 rows.
-        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
-        assert len(cdf_sample_lines) == 5
-
-
-# ---------------------------------------------------------------------------
-# run_tools_for_forecaster: MC and discrete
-# ---------------------------------------------------------------------------
 
 
 class TestRunToolsMc:
@@ -652,19 +563,6 @@ class TestCrossModelAggregationNumeric:
         # Match either integer or decimal formatting of the min value.
         assert re.search(r"min 30(\.\d+)?", result)
 
-    def test_declared_families_listed(self):
-        rationales = [
-            _wrap_json(_numeric_payload(distribution_family_hint="normal")),
-            _wrap_json(_numeric_payload(distribution_family_hint="lognormal")),
-        ]
-        preds = [self._make_pcts(40), self._make_pcts(60)]
-        result = build_cross_model_aggregation(
-            question=_make_numeric_question(),
-            rationales=rationales,
-            prediction_values=preds,
-        )
-        assert "Declared distribution families" in result
-
 
 class TestCrossModelAggregationMc:
     def test_mc_dirichlet_pool(self):
@@ -725,7 +623,6 @@ class TestCdfAtThreshold:
                 "0.5": 50.0,
                 "0.9": 70.0,
             },
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)
@@ -744,7 +641,6 @@ class TestCdfAtThreshold:
     def test_threshold_far_below_returns_near_zero(self):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         result = cdf_at_threshold_for_forecaster(
@@ -992,8 +888,7 @@ with long upper tail.
     "0.5": 20.0,
     "0.9": 80.0,
     "0.95": 150.0
-  },
-  "distribution_family_hint": "lognormal"
+  }
 }
 ```
 
@@ -1002,8 +897,7 @@ Percentiles as given.
         q = _make_numeric_question(lower_bound=0.0, upper_bound=500.0)
         result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="gpt-5-golden")
         assert "Percentile-family consistency" in result
-        # Formatter emits "(lognormal fit)" since hint matches best family.
-        assert "Out-of-bounds mass (lognormal fit)" in result
+        assert "Out-of-bounds mass" in result
 
     def test_mc_with_other_mass_golden_output(self):
         # Option_probs + explicit other_mass → expect residual-mass line AND
@@ -1240,7 +1134,6 @@ class TestCdfAtThresholdOutOfBoundsLogging:
     def test_threshold_above_closed_upper_bound_logs_debug(self, caplog):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)
@@ -1254,7 +1147,6 @@ class TestCdfAtThresholdOutOfBoundsLogging:
     def test_threshold_below_closed_lower_bound_logs_debug(self, caplog):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)

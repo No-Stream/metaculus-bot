@@ -2088,11 +2088,9 @@ def _binary_rationale_with_valid_json(posterior_prob: float = 0.42) -> str:
 
 
 def _numeric_rationale_with_valid_json(median: float = 50.0) -> str:
-    """Synthetic numeric rationale with mixture_components + standard percentiles.
+    """Synthetic numeric rationale with standard percentiles.
 
-    The mixture_components block triggers _render_mixture_section in the real
-    tool_runner, producing a "### Mixture-of-normals" subsection with CDF
-    samples. The declared_percentiles also trigger family-consistency and
+    The declared_percentiles trigger family-consistency and
     out-of-bounds-mass tools.
     """
     return textwrap.dedent(
@@ -2110,13 +2108,7 @@ def _numeric_rationale_with_valid_json(median: float = 50.0) -> str:
             "0.5": {median}, "0.6": {median + 5}, "0.8": {median + 12},
             "0.9": {median + 20}, "0.95": {median + 25}, "0.975": {median + 30},
             "0.99": {median + 35}
-          }},
-          "distribution_family_hint": "normal",
-          "mixture_components": [
-            {{"weight": 0.3, "mean": {median - 20}, "sd": 7.0}},
-            {{"weight": 0.4, "mean": {median}, "sd": 10.0}},
-            {{"weight": 0.3, "mean": {median + 20}, "sd": 8.0}}
-          ]
+          }}
         }}
         ```
 
@@ -2494,13 +2486,11 @@ class TestRealToolRunnerIntegration:
         for slug, md in payload["computed_quantities"].items():
             assert "Percentile-family consistency" in md, f"Missing family check for {slug}: {md!r}"
             assert "Out-of-bounds mass" in md, f"Missing OOB mass for {slug}: {md!r}"
-            assert "### Mixture-of-normals" in md, f"Missing mixture section for {slug}: {md!r}"
 
         # Cross-model agg: medians + declared families.
         assert payload["cross_model_aggregation"], "Real build_cross_model_aggregation produced empty numeric output!"
         agg = payload["cross_model_aggregation"]
         assert "Forecaster medians" in agg, agg
-        assert "Declared distribution families" in agg, agg
 
     def test_arm_b_with_real_tool_runner_produces_dirichlet_for_mc(
         self,

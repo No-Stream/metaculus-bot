@@ -110,7 +110,7 @@ class TestNumericPromptSchemaInstruction:
         assert "STRUCTURED FORECAST" in prompt
         assert '"numeric"' in prompt
         assert "declared_percentiles" in prompt
-        for field in ("distribution_family_hint", "student_t_df", "scenarios"):
+        for field in ("scenarios",):
             assert field in prompt, f"missing optional field {field!r} in numeric schema"
 
     def test_numeric_percentiles_match_trailing_lines_note_present(self):
@@ -120,47 +120,6 @@ class TestNumericPromptSchemaInstruction:
         assert "match your final Percentile" in prompt or "match your final percentile" in prompt.lower(), (
             "numeric prompt should note that JSON percentiles should match the trailing Percentile lines"
         )
-
-    def test_mixture_components_in_numeric_schema(self):
-        # Workstream D activated mixture_components end-to-end (schema slot,
-        # router, and CDF builder). The JSON example block must list the
-        # field so LLMs that lean on the literal example know they can emit
-        # a mixture.
-        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        assert '"mixture_components"' in prompt, (
-            "mixture_components must be present in the numeric schema example so LLMs see the OPTION B branch"
-        )
-
-    def test_option_b_mixture_offered(self):
-        # Both output formats must be offered; OPTION B (mixture) is a
-        # first-class choice, not a buried fallback.
-        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        assert "OPTION A" in prompt
-        assert "OPTION B" in prompt
-
-    def test_option_a_not_anchored_as_default(self):
-        # W4: the "default; what most models use" anchor on OPTION A pushed
-        # nearly every model to percentiles and starved the mixture path
-        # (0/27 in the bench). The choice must be framed by question SHAPE,
-        # not by a default-arm thumb on the scale.
-        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        assert "default; what most models use" not in prompt
-        assert "what most models use" not in prompt
-
-    def test_option_choice_is_shape_driven(self):
-        # The A-vs-B decision must reference the distribution's SHAPE
-        # (single mode vs. multi-modal / scenario branching).
-        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        lowered = prompt.lower()
-        assert "single" in lowered and "mode" in lowered
-        assert "multi-modal" in lowered or "multimodal" in lowered or "bimodal" in lowered
-
-    def test_mixture_only_omission_consistent_with_schema(self):
-        # The schema now accepts mixture-only blocks (W4), so the prompt's
-        # "you may omit the percentile lines entirely" promise is TRUE and
-        # must remain.
-        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        assert "omit the percentile lines" in prompt
 
     def test_schema_block_precedes_percentile_answer_lines(self):
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")

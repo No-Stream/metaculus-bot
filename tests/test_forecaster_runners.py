@@ -289,7 +289,6 @@ class TestRunNumericForecast:
             format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
-            mixture=None,
         )
 
         with (
@@ -343,7 +342,6 @@ class TestRunNumericForecast:
             format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
-            mixture=None,
         )
 
         with (
@@ -388,7 +386,6 @@ class TestRunNumericForecast:
             format="percentiles",
             cdf_percentiles=percentiles,
             declared_percentiles=percentiles,
-            mixture=None,
         )
 
         with (

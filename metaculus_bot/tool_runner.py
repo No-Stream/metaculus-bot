@@ -56,8 +56,6 @@ from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,
     ConsistencyResult,
-    MixtureComponent,
-    MixtureOfNormals,
     SurvivalResult,
     TailMassResult,
     base_rate_blend,
@@ -68,7 +66,6 @@ from metaculus_bot.probabilistic_tools import (
     linear_pool,
     linear_pool_options,
     log_pool,
-    mixture_cdf,
     out_of_bounds_mass,
     percentile_family_consistency,
     prob_event_before,
@@ -315,8 +312,8 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
             raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             declared_percentiles=block.declared_percentiles,
-            claimed_family=block.distribution_family_hint,
-            student_t_df=block.student_t_df,
+            claimed_family=None,
+            student_t_df=None,
         )
         lines.append(_format_family_consistency(family_result))
     except ValueError as exc:
@@ -324,7 +321,7 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
         family_result = None
 
     if family_result is not None:
-        hint = block.distribution_family_hint or family_result.details.get("best_fit_family")
+        hint = family_result.details.get("best_fit_family")
         fit = family_result.details["fits_by_family"].get(hint) if hint else None
         if fit is not None:
             lower = question.lower_bound if not question.open_lower_bound else None
@@ -334,41 +331,6 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
                 lines.append(_format_tail_mass(tail, family=hint or type(fit).__name__))
             except ValueError as exc:
                 logger.debug("out_of_bounds_mass skipped: %s", exc)
-
-    if block.mixture_components is not None:
-        lines.extend(_render_mixture_section(block, question))
-
-    return lines
-
-
-def _render_mixture_section(block: NumericStructured, question: NumericQuestion) -> list[str]:
-    """Render a ``### Mixture-of-normals`` subsection for a NumericStructured
-    with populated ``mixture_components``. Lists the components and a 5-row
-    CDF-sample table over the declared range."""
-    assert block.mixture_components is not None
-    try:
-        comps = tuple(MixtureComponent(weight=c.weight, mean=c.mean, sd=c.sd) for c in block.mixture_components)
-        mix = MixtureOfNormals(comps)
-    except ValueError as exc:
-        logger.debug("mixture construction skipped: %s", exc)
-        return []
-
-    lines: list[str] = ["### Mixture-of-normals"]
-    for i, c in enumerate(mix.components):
-        lines.append(f"- Component {i + 1}: weight {c.weight:.3f}, mean {c.mean:.3g}, sd {c.sd:.3g}")
-
-    # Build a 5-row CDF sample table across the declared question range.
-    lower = float(question.lower_bound)
-    upper = float(question.upper_bound)
-    if upper > lower:
-        try:
-            sample_grid = np.linspace(lower, upper, 5)
-            sample_cdf = mixture_cdf(mix, sample_grid)
-            lines.append("- CDF sample (value → F):")
-            for x, p in zip(sample_grid, sample_cdf):
-                lines.append(f"  - {x:.3g} → {p:.3f}")
-        except ValueError as exc:
-            logger.debug("mixture_cdf sample skipped: %s", exc)
 
     return lines
 
@@ -632,12 +594,6 @@ def _aggregate_numeric_lines(
     if len(medians) >= 2:
         lines.append(f"- **Forecaster medians**: min {min(medians):.3g}, max {max(medians):.3g}, n={len(medians)}")
 
-    if blocks:
-        hints = [b.distribution_family_hint for b in blocks if b.distribution_family_hint]
-        if hints:
-            unique = sorted(set(hints))
-            lines.append(f"- **Declared distribution families**: {', '.join(unique)} ({len(hints)} forecasters)")
-
     lines.extend(_spread_plausibility_lines(prediction_percentiles))
 
     return lines
@@ -797,13 +753,13 @@ def cdf_at_threshold_for_forecaster(
             raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             block.declared_percentiles,
-            claimed_family=block.distribution_family_hint,
-            student_t_df=block.student_t_df,
+            claimed_family=None,
+            student_t_df=None,
         )
     except ValueError as exc:
         logger.debug("percentile_family_consistency skipped: %s", exc)
         return None
-    hint = block.distribution_family_hint or family_result.details.get("best_fit_family")
+    hint = family_result.details.get("best_fit_family")
     if not hint:
         return None
     fit = family_result.details["fits_by_family"].get(hint)

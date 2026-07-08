@@ -31,14 +31,13 @@ from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.mc_processing import build_mc_prediction
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.diagnostics import log_final_prediction
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.numeric_format_router import detect_numeric_format, route_numeric_output
+from metaculus_bot.numeric_format_router import route_numeric_output
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
 
@@ -249,19 +248,10 @@ async def run_numeric_forecast(
             model=parser_llm,
             additional_instructions=parse_notes,
         )
-    except (ValidationError, ValueError) as e:
-        detected = detect_numeric_format(reasoning)
-        if detected in ("mixture", "both"):
-            logger.info(
-                "Numeric percentile parser found no percentile lines for Q %s | model=%s: %s "
-                "(rationale carries mixture_components — using mixture branch)",
-                qid,
-                forecaster_llm.model,
-                e,
-            )
-            percentile_list = None
-        else:
-            raise
+    except (ValidationError, ValueError):
+        # Parser couldn't extract percentile lines - the router's F5 fallback
+        # will try to lift declared_percentiles from the JSON block instead.
+        percentile_list = None
 
     routed = route_numeric_output(
         rationale=reasoning,
@@ -269,35 +259,15 @@ async def run_numeric_forecast(
         question=question,
     )
     logger.info(
-        "numeric_format=%s for Q %s | model=%s | mixture_components=%s",
+        "numeric_format=%s for Q %s | model=%s",
         routed.format,
         qid,
         forecaster_llm.model,
-        (len(routed.mixture.components) if routed.mixture is not None else 0),
     )
 
-    if routed.mixture is not None:
-        mixture_cdf_values: list[float] = [float(p.percentile) for p in routed.cdf_percentiles]
-        mixture_declared: list[Percentile] = []
-        for target_pct in STANDARD_PERCENTILES:
-            hit = next(
-                (p for p in routed.cdf_percentiles if p.percentile >= target_pct),
-                routed.cdf_percentiles[-1],
-            )
-            mixture_declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
-
-        prediction = create_pchip_numeric_distribution(
-            mixture_cdf_values,
-            mixture_declared,
-            question,
-            zero_point=None,
-        )
-        log_final_prediction(prediction, question)
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote
-
     assert routed.declared_percentiles is not None, (
-        "route_numeric_output returned a non-mixture result without declared_percentiles; "
-        "this is a router bug — mixture-fallback should have raised ValueError instead."
+        "route_numeric_output returned without declared_percentiles; "
+        "this is a router bug — should have raised ValueError instead."
     )
     sanitized_percentiles, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
 
