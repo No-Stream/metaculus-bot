@@ -51,12 +51,12 @@ async def test_binary_parsing_clamps_extremes():
 
     # 0.0 gets clamped to BINARY_PROB_MIN (0.02 since 2026-05-12; Atlas-inspired).
     # See scratch_docs_and_planning/atlas_inspired_improvements.md Workstream B.
-    with patch("metaculus_bot.forecaster_runners.structure_output", return_value=_Bin(0.0)):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=_Bin(0.0)):
         res = await bot._run_forecast_on_binary(q, "", llm)
         assert res.prediction_value == 0.02
 
     # 1.0 gets clamped to BINARY_PROB_MAX (0.98).
-    with patch("metaculus_bot.forecaster_runners.structure_output", return_value=_Bin(1.0)):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=_Bin(1.0)):
         res = await bot._run_forecast_on_binary(q, "", llm)
         assert res.prediction_value == 0.98
 
@@ -97,7 +97,7 @@ async def test_numeric_parsing_raises_on_wrong_count():
     llm.invoke = AsyncMock(return_value="rationale")
 
     with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
+        "metaculus_bot.forecaster_runners.parse_structured",
         side_effect=[OutcomeTypeResult(is_discrete_integer=False), bad],
     ):
         with pytest.raises(ValidationError):
@@ -124,9 +124,10 @@ async def test_parser_llm_used_for_structured_output():
     captured = {}
 
     async def _fake_structure_output(*args, **kwargs):  # noqa: D401
-        captured["model"] = kwargs.get("model")
+        # parse_structured signature: (text, output_type, parser_llm, *, prompt_notes=...)
+        captured["model"] = args[2] if len(args) > 2 else kwargs.get("parser_llm")
         # Return a minimally valid object for each call site
-        out_type = kwargs.get("output_type") if "output_type" in kwargs else (args[1] if len(args) > 1 else None)
+        out_type = args[1] if len(args) > 1 else kwargs.get("output_type")
         assert out_type is not None
         if out_type.__name__ == "BinaryPrediction":
 
@@ -160,7 +161,7 @@ async def test_parser_llm_used_for_structured_output():
     llm.model = "m"
     llm.invoke = AsyncMock(return_value="r")
 
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
         await bot._run_forecast_on_binary(bq, "", llm)
         assert captured["model"] is sentinel_parser_model
 
@@ -175,7 +176,7 @@ async def test_parser_llm_used_for_structured_output():
     mcq.id_of_question = 20
     mcq.open_time = _stub_open_time()
     mcq.scheduled_resolution_time = _stub_resolve_time()
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
         await bot._run_forecast_on_multiple_choice(mcq, "", llm)
         assert captured["model"] is sentinel_parser_model
 
@@ -197,7 +198,7 @@ async def test_parser_llm_used_for_structured_output():
         open_time=_stub_open_time(),
         scheduled_resolution_time=_stub_resolve_time(),
     )
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
         await bot._run_forecast_on_numeric(nq, "", llm)  # type: ignore[arg-type]
         assert captured["model"] is sentinel_parser_model
 
@@ -230,11 +231,11 @@ async def test_mc_additional_instructions_include_options():
     seen = {}
 
     async def _fake_structure_output(*args, **kwargs):  # noqa: D401
-        seen["additional_instructions"] = kwargs.get("additional_instructions", "")
+        seen["prompt_notes"] = kwargs.get("prompt_notes", "")
         return MagicMock()
 
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
         await bot._run_forecast_on_multiple_choice(q, "", llm)
 
-    ai = seen["additional_instructions"] or ""
+    ai = seen["prompt_notes"] or ""
     assert "Alpha" in ai and "Beta" in ai

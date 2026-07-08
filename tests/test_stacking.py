@@ -1157,7 +1157,7 @@ class TestStackerTransientRetry:
         with (
             patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
             patch(
-                "metaculus_bot.stacking.structure_output",
+                "metaculus_bot.stacking.parse_structured",
                 new=AsyncMock(return_value=Mock(prediction_in_decimal=0.42)),
             ),
         ):
@@ -1240,11 +1240,11 @@ class TestStackingNumericParseNotes:
 
         captured: dict[str, str] = {}
 
-        async def _capture(*_args, additional_instructions: str = "", **_kwargs):
-            captured["notes"] = additional_instructions
+        async def _capture(*_args, prompt_notes: str = "", **_kwargs):
+            captured["notes"] = prompt_notes
             return []
 
-        with patch("metaculus_bot.stacking.structure_output", new=AsyncMock(side_effect=_capture)):
+        with patch("metaculus_bot.stacking.parse_structured", new=AsyncMock(side_effect=_capture)):
             await run_stacking_numeric(
                 stacker,
                 parser,

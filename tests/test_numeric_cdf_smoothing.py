@@ -180,7 +180,7 @@ class TestNumericCDFSmoothing:
         caplog.clear()
         caplog.set_level("WARNING")
         with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
             result = await f._run_forecast_on_numeric(
@@ -221,7 +221,7 @@ class TestNumericCDFSmoothing:
         caplog.clear()
         caplog.set_level("WARNING")
         with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
             result = await f._run_forecast_on_numeric(

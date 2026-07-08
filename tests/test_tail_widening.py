@@ -240,7 +240,7 @@ class TestTailWideningIntegration:
         llm.invoke = AsyncMock(return_value="rationale")
 
         with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), declared],
         ):
             result = await bot._run_forecast_on_numeric(cast(NumericQuestion, nq), "", llm)

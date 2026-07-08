@@ -11,7 +11,6 @@ from forecasting_tools import (
     NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
-    structure_output,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
@@ -23,6 +22,7 @@ from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
+from metaculus_bot.structured_parse import parse_structured
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -105,11 +105,11 @@ async def run_stacking_binary(
         "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
         "Do not return percentages, strings, or any extra fields."
     )
-    binary_prediction: BinaryPrediction = await structure_output(
+    binary_prediction: BinaryPrediction = await parse_structured(
         meta_reasoning,
         BinaryPrediction,
-        model=parser_llm,
-        additional_instructions=parse_instructions,
+        parser_llm,
+        prompt_notes=parse_instructions,
     )
     decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, binary_prediction.prediction_in_decimal))
     return decimal_pred, meta_reasoning
@@ -151,11 +151,11 @@ async def run_stacking_mc(
     )
     # Try strict PredictedOptionList first (compatibility) then tolerant fallback
     try:
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=meta_reasoning,
-            output_type=PredictedOptionList,
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
+        predicted_option_list: PredictedOptionList = await parse_structured(
+            meta_reasoning,
+            PredictedOptionList,
+            parser_llm,
+            prompt_notes=parsing_instructions,
         )
 
         try:
@@ -164,11 +164,11 @@ async def run_stacking_mc(
             logger.warning(f"MC clamp/renormalize failed: {e}")
     except Exception as e:
         logger.warning(f"Primary MC structured parse failed: {e}")
-        raw_options: list[OptionProbability] = await structure_output(
-            text_to_structure=meta_reasoning,
-            output_type=list[OptionProbability],
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
+        raw_options: list[OptionProbability] = await parse_structured(
+            meta_reasoning,
+            list[OptionProbability],
+            parser_llm,
+            prompt_notes=parsing_instructions,
         )
         predicted_option_list = build_mc_prediction(raw_options, list(question.options))
     return predicted_option_list, meta_reasoning
@@ -206,7 +206,7 @@ async def run_stacking_numeric(
     )
 
     parse_notes = build_parse_notes(question)
-    percentile_list: list[Percentile] = await structure_output(
-        meta_reasoning, list[Percentile], model=parser_llm, additional_instructions=parse_notes
+    percentile_list: list[Percentile] = await parse_structured(
+        meta_reasoning, list[Percentile], parser_llm, prompt_notes=parse_notes
     )
     return percentile_list, meta_reasoning

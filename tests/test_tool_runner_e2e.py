@@ -202,7 +202,7 @@ class _PromptCapture:
 
     The stacker's parser LLM separately decodes a structured prediction; we
     mock both: ``invoke`` returns ``stacker_response``, and
-    ``structure_output`` returns ``parser_response``.
+    ``parse_structured`` returns ``parser_response``.
     """
 
     def __init__(self, stacker_response: str, parser_response: Any) -> None:
@@ -244,7 +244,7 @@ class TestBinaryStackingCrossModelAggregation:
         )
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.structure_output", new=capture.parser_structure_output):
+            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
                 aggregated = await bot._aggregate_predictions(
                     posteriors,  # type: ignore[arg-type]
                     question,
@@ -304,7 +304,7 @@ class TestBinaryStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.structure_output", new=capture.parser_structure_output):
+            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
                 await bot._aggregate_predictions(
                     posteriors,  # type: ignore[arg-type]
                     question,
@@ -429,7 +429,7 @@ class TestNumericStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.structure_output", new=capture.parser_structure_output):
+            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
                 await bot._aggregate_predictions(
                     numeric_predictions,  # type: ignore[arg-type]
                     question,
@@ -488,7 +488,7 @@ class TestMcStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.structure_output", new=capture.parser_structure_output):
+            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
                 await bot._aggregate_predictions(
                     prediction_values,  # type: ignore[arg-type]
                     question,

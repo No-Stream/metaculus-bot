@@ -194,7 +194,7 @@ class TestRunStackingBinaryThreading:
             await asyncio.sleep(0)
             return BinaryPrediction(prediction_in_decimal=0.42)
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -230,7 +230,7 @@ class TestRunStackingBinaryThreading:
             await asyncio.sleep(0)
             return BinaryPrediction(prediction_in_decimal=0.42)
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -268,7 +268,7 @@ class TestRunStackingMcThreading:
                 ]
             )
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_mc(
@@ -316,7 +316,7 @@ class TestRunStackingNumericThreading:
                 Percentile(percentile=0.975, value=11.0),
             ]
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_numeric(
@@ -370,7 +370,7 @@ class TestRunStackingBinaryFullPromptCapture:
             await asyncio.sleep(0)
             return BinaryPrediction(prediction_in_decimal=0.41)
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -444,7 +444,7 @@ class TestRunStackingMcFullPromptCapture:
         mc_q.open_time = _OPEN
         mc_q.scheduled_resolution_time = _RESOLVE
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_mc(
@@ -502,7 +502,7 @@ class TestRunStackingNumericFullPromptCapture:
                 Percentile(percentile=0.975, value=80.0),
             ]
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.parse_structured", fake_structure_output)
 
         asyncio.run(
             stacking.run_stacking_numeric(

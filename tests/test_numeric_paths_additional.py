@@ -96,7 +96,7 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     ]
 
     with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
+        "metaculus_bot.forecaster_runners.parse_structured",
         side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
     ):
         caplog.clear()
@@ -138,7 +138,7 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
 
     with (
         patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
         ),
         patch("metaculus_bot.numeric.pchip_processing.NumericDistribution", FakeND),
@@ -177,7 +177,7 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
             )
         ]
         with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
         ):
             caplog.clear()
@@ -210,7 +210,7 @@ async def test_numeric_percentile_set_validation():
         )
     ]
 
-    with patch("metaculus_bot.forecaster_runners.structure_output", return_value=bad):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=bad):
         with pytest.raises(Exception):  # pydantic ValidationError via from_exception_data
             await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
@@ -235,7 +235,7 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
     ]
 
     with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
+        "metaculus_bot.forecaster_runners.parse_structured",
         side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
     ):
         await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
@@ -311,12 +311,12 @@ async def test_binary_parse_additional_instructions_capture():
             self.prediction_in_decimal = val
 
     async def _fake_structure_output(*args, **kwargs):
-        seen["additional_instructions"] = kwargs.get("additional_instructions", "")
+        seen["prompt_notes"] = kwargs.get("prompt_notes", "")
         return _Bin(0.5)
 
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
         await bot._run_forecast_on_binary(q, "", llm)
 
-    ai = seen.get("additional_instructions", "")
+    ai = seen.get("prompt_notes", "")
     assert "decimal in [0,1]" in ai
     assert "NN%" in ai and "NN/100" in ai

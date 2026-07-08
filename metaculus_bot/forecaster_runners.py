@@ -22,7 +22,6 @@ from forecasting_tools import (
     PredictedOptionList,
     ReasonedPrediction,
     clean_indents,
-    structure_output,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
@@ -40,6 +39,7 @@ from metaculus_bot.numeric.validation import detect_unit_mismatch
 from metaculus_bot.numeric_format_router import route_numeric_output
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.simple_types import OptionProbability
+from metaculus_bot.structured_parse import parse_structured
 
 logger = logging.getLogger(__name__)
 
@@ -124,11 +124,11 @@ async def run_binary_forecast(
         "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
         "Do not return percentages, strings, or any extra fields."
     )
-    binary_prediction: BinaryPrediction = await structure_output(
+    binary_prediction: BinaryPrediction = await parse_structured(
         reasoning,
         BinaryPrediction,
-        model=parser_llm,
-        additional_instructions=binary_parse_instructions,
+        parser_llm,
+        prompt_notes=binary_parse_instructions,
     )
     decimal_pred = max(
         BINARY_PROB_MIN,
@@ -163,11 +163,11 @@ async def run_mc_forecast(
     )
 
     try:
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
+        predicted_option_list: PredictedOptionList = await parse_structured(
+            reasoning,
+            PredictedOptionList,
+            parser_llm,
+            prompt_notes=parsing_instructions,
         )
         try:
             predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
@@ -175,11 +175,11 @@ async def run_mc_forecast(
             logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
     except (ValidationError, ValueError) as exc:
         logger.warning(f"Primary MC parse failed: {exc}")
-        raw_options: list[OptionProbability] = await structure_output(
-            text_to_structure=reasoning,
-            output_type=list[OptionProbability],
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
+        raw_options: list[OptionProbability] = await parse_structured(
+            reasoning,
+            list[OptionProbability],
+            parser_llm,
+            prompt_notes=parsing_instructions,
         )
         predicted_option_list = build_mc_prediction(raw_options, list(question.options))
 
@@ -222,11 +222,11 @@ async def run_numeric_forecast(
         discrete_vote = block.outcome_type == "discrete_integer"
     else:
         try:
-            outcome_result: OutcomeTypeResult = await structure_output(
+            outcome_result: OutcomeTypeResult = await parse_structured(
                 reasoning,
                 OutcomeTypeResult,
-                model=parser_llm,
-                additional_instructions=(
+                parser_llm,
+                prompt_notes=(
                     "The forecaster classified whether this question's resolution values are discrete "
                     "integers (OUTCOME_TYPE: DISCRETE) or continuous real numbers (OUTCOME_TYPE: CONTINUOUS). "
                     "Return is_discrete_integer=true if the forecaster said DISCRETE, false if CONTINUOUS."
@@ -254,11 +254,11 @@ async def run_numeric_forecast(
 
     percentile_list: list[Percentile] | None
     try:
-        percentile_list = await structure_output(
+        percentile_list = await parse_structured(
             reasoning,
             list[Percentile],
-            model=parser_llm,
-            additional_instructions=parse_notes,
+            parser_llm,
+            prompt_notes=parse_notes,
         )
     except (ValidationError, ValueError):
         # Parser couldn't extract percentile lines - the router's F5 fallback

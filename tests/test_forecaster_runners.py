@@ -77,7 +77,7 @@ class TestRunBinaryForecast:
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
             patch(
-                "metaculus_bot.forecaster_runners.structure_output",
+                "metaculus_bot.forecaster_runners.parse_structured",
                 new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.75)),
             ),
         ):
@@ -98,7 +98,7 @@ class TestRunBinaryForecast:
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Very unlikely")),
             patch(
-                "metaculus_bot.forecaster_runners.structure_output",
+                "metaculus_bot.forecaster_runners.parse_structured",
                 new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.001)),
             ),
         ):
@@ -117,7 +117,7 @@ class TestRunBinaryForecast:
             patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="Nearly certain")),
             patch(
-                "metaculus_bot.forecaster_runners.structure_output",
+                "metaculus_bot.forecaster_runners.parse_structured",
                 new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.999)),
             ),
         ):
@@ -154,7 +154,7 @@ class TestForecasterBroadRetry:
             patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
             patch.object(forecaster_llm, "invoke", new=invoke),
             patch(
-                "metaculus_bot.forecaster_runners.structure_output",
+                "metaculus_bot.forecaster_runners.parse_structured",
                 new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.70)),
             ),
         ):
@@ -201,7 +201,7 @@ class TestRunMcForecast:
             patch("metaculus_bot.forecaster_runners.multiple_choice_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
             patch(
-                "metaculus_bot.forecaster_runners.structure_output",
+                "metaculus_bot.forecaster_runners.parse_structured",
                 new=AsyncMock(return_value=option_list),
             ),
             patch("metaculus_bot.forecaster_runners.clamp_and_renormalize_mc", return_value=option_list),
@@ -239,7 +239,7 @@ class TestRunMcForecast:
         with (
             patch("metaculus_bot.forecaster_runners.multiple_choice_prompt", return_value="prompt"),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
-            patch("metaculus_bot.forecaster_runners.structure_output", new=mock_structure_output),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
             patch("metaculus_bot.forecaster_runners.build_mc_prediction", return_value=fallback_result),
         ):
             result = await run_mc_forecast(mc_question, "research", forecaster_llm, parser_llm)
@@ -278,7 +278,7 @@ class TestRunNumericForecast:
 
         call_count = 0
 
-        async def mock_structure_output(text, output_type, model, additional_instructions=None):
+        async def mock_structure_output(text, output_type, parser_llm, *, prompt_notes=""):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -295,7 +295,7 @@ class TestRunNumericForecast:
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
-            patch("metaculus_bot.forecaster_runners.structure_output", new=mock_structure_output),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
             patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
             patch(
                 "metaculus_bot.forecaster_runners.sanitize_percentiles",
@@ -331,7 +331,7 @@ class TestRunNumericForecast:
 
         call_count = 0
 
-        async def mock_structure_output(text, output_type, model, additional_instructions=None):
+        async def mock_structure_output(text, output_type, parser_llm, *, prompt_notes=""):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -348,7 +348,7 @@ class TestRunNumericForecast:
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="reasoning")),
-            patch("metaculus_bot.forecaster_runners.structure_output", new=mock_structure_output),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
             patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(percentiles, None)),
             patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
@@ -375,7 +375,7 @@ class TestRunNumericForecast:
 
         call_count = 0
 
-        async def mock_structure_output(text, output_type, model, additional_instructions=None):
+        async def mock_structure_output(text, output_type, parser_llm, *, prompt_notes=""):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -392,7 +392,7 @@ class TestRunNumericForecast:
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="reasoning")),
-            patch("metaculus_bot.forecaster_runners.structure_output", new=mock_structure_output),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
             patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(percentiles, None)),
             patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),

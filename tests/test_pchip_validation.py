@@ -114,7 +114,7 @@ class TestPchipValidation:
         # Should not raise any exceptions
         llm = self.create_dummy_llm()
         with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
+            "metaculus_bot.forecaster_runners.parse_structured",
             side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
         ):
             result = await forecaster._run_forecast_on_numeric(
@@ -138,7 +138,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to PCHIP validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -160,7 +160,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -182,7 +182,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -205,7 +205,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -227,7 +227,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -249,7 +249,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
@@ -271,7 +271,7 @@ class TestPchipValidation:
         percentiles = [Percentile(percentile=0.50, value=50.0)]
 
         with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.structure_output", return_value=percentiles):
+            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
                 with pytest.raises(Exception):  # Should fall back due to validation failure
                     await forecaster._run_forecast_on_numeric(
                         cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
