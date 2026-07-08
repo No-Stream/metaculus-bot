@@ -15,16 +15,13 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.spread_metrics import (
+    _key_percentile_values,
     binary_log_odds_spread,
     binary_prob_range_spread,
     compute_spread,
     mc_max_option_spread,
     numeric_percentile_spread,
 )
-
-# ===========================================================================
-# binary_prob_range_spread (the active trigger metric)
-# ===========================================================================
 
 
 class TestBinaryProbRangeSpread:
@@ -49,9 +46,7 @@ class TestBinaryProbRangeSpread:
             binary_prob_range_spread([])
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_binary_question(**overrides) -> BinaryQuestion:
@@ -115,9 +110,7 @@ def _make_percentile_list(predicted_values: list[float]) -> list[Percentile]:
     return [Percentile(percentile=pct / 100.0, value=val) for pct, val in zip(labels, values)]
 
 
-# ===========================================================================
 # binary_log_odds_spread
-# ===========================================================================
 
 
 class TestBinaryLogOddsSpread:
@@ -159,9 +152,7 @@ class TestBinaryLogOddsSpread:
             binary_log_odds_spread([])
 
 
-# ===========================================================================
 # mc_max_option_spread
-# ===========================================================================
 
 
 class TestMcMaxOptionSpread:
@@ -241,9 +232,7 @@ class TestMcMaxOptionSpread:
             mc_max_option_spread([pred1, pred2])
 
 
-# ===========================================================================
 # numeric_percentile_spread
-# ===========================================================================
 
 
 class TestNumericPercentileSpread:
@@ -289,8 +278,15 @@ class TestNumericPercentileSpread:
             numeric_percentile_spread([model], question)
 
     def test_short_percentile_list_raises(self):
-        """Incomplete percentile lists should raise ValueError (missing labels)."""
-        short_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])[:5]
+        """Genuinely truncated lists (< _MIN_GRID_POINTS and not spanning P10-P90) raise.
+
+        The open-tail CDF grid fix (spread_metrics.py `_key_percentile_values`) relaxed
+        the guard for plausible grids (>= 5 points) so open-bound discrete questions with
+        heavy out-of-bound mass no longer crash. A shorter list that also fails to span
+        P10-P90 must still raise.
+        """
+        # Only 3 points — is_plausible_grid=False AND labels don't span P10-P90.
+        short_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])[:3]
         full_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
         question = _make_numeric_question()
 
@@ -298,9 +294,7 @@ class TestNumericPercentileSpread:
             numeric_percentile_spread([short_model, full_model], question)
 
 
-# ===========================================================================
 # compute_spread (dispatcher)
-# ===========================================================================
 
 
 class TestComputeSpread:
@@ -360,9 +354,7 @@ class TestComputeSpread:
             compute_spread(unknown_question, [0.5, 0.5])
 
 
-# ===========================================================================
 # Constants are exported
-# ===========================================================================
 
 
 class TestConstants:
@@ -468,3 +460,83 @@ class TestContinuousSpreadByteIdentical:
         model2 = _make_percentile_list([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])
         question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
         assert numeric_percentile_spread([model1, model2], question) == 0.5
+
+
+class TestOpenTailCdfGrid:
+    """Regression: CDF grids from open-bound discrete questions with heavy out-of-bound
+    mass previously raised in ``_key_percentile_values`` because the old guard required
+    ``labels[0] <= 0.10`` and ``labels[-1] >= 0.90``. On the "Toy Story" scenario a
+    resampled grid can legitimately start at labels[0] ≈ 0.40 (open lower bound with 40%
+    below-bound mass) or end at labels[-1] ≈ 0.60 (symmetric case above upper bound).
+    np.interp clamps at the ends, so the honest answer is the displayed bound.
+    """
+
+    def test_open_lower_bound_heavy_below_mass_returns_displayed_bound(self):
+        """Open lower bound: labels start at 0.40. P10 clamps to values[0] (displayed lower bound)."""
+        displayed_lower = 5.0
+        # A CDF grid with heavy below-bound mass — 40% of probability is below the displayed lower bound.
+        # Grid spans cumulative probability [0.40, 1.0] over the displayed range [5.0, 20.0].
+        labels = [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
+        values = [displayed_lower, 7.0, 9.0, 11.0, 13.0, 16.0, 20.0]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+
+        p10, p50, p90 = _key_percentile_values(model_pcts)
+        # np.interp clamps: query 0.10 is below labels[0]=0.40, so returns values[0] = displayed_lower
+        assert p10 == pytest.approx(displayed_lower)
+        # P50 and P90 interpolate normally inside the grid
+        assert p50 == pytest.approx(7.0)  # exactly at labels index 1
+        assert p90 == pytest.approx(16.0)  # exactly at labels index 5
+
+    def test_open_upper_bound_heavy_above_mass_returns_displayed_bound(self):
+        """Open upper bound: labels end at 0.60. P90 clamps to values[-1] (displayed upper bound)."""
+        displayed_upper = 20.0
+        # A CDF grid with heavy above-bound mass — 40% of probability is above the displayed upper bound.
+        # Grid spans cumulative probability [0.0, 0.60] over the displayed range [5.0, 20.0].
+        labels = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
+        values = [5.0, 7.0, 9.0, 11.0, 13.0, 16.0, displayed_upper]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+
+        p10, p50, p90 = _key_percentile_values(model_pcts)
+        # np.interp clamps: query 0.90 is above labels[-1]=0.60, so returns values[-1] = displayed_upper
+        assert p90 == pytest.approx(displayed_upper)
+        # P10 and P50 interpolate normally inside the grid (0.10 and 0.50 both <= 0.60)
+        assert p10 == pytest.approx(7.0)  # exactly at labels index 1
+        assert p50 == pytest.approx(16.0)  # exactly at labels index 5
+
+    def test_short_truncated_non_grid_list_still_raises(self):
+        """A genuinely truncated 3-point list not spanning P10-P90 should still raise."""
+        # Only 3 points, and range [0.40, 0.60] doesn't cover P10 or P90 —
+        # is_plausible_grid=False (len<5) AND spans_key_percentiles=False.
+        labels = [0.40, 0.50, 0.60]
+        values = [10.0, 15.0, 20.0]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values)]
+
+        with pytest.raises(ValueError, match="neither the standard percentiles"):
+            _key_percentile_values(model_pcts)
+
+
+class TestDuplicateStandardLabelsHardening:
+    """Finding-2 guard: a hypothetical 14-item list covering all 13 standard labels
+    plus one duplicate should route to the interp branch, not crash PercentileSet.
+
+    Unreachable in practice (``filter_to_standard_percentiles`` deduplicates upstream),
+    but the length check makes ``_has_standard_labels`` defensively correct.
+    """
+
+    def test_duplicate_standard_label_routes_to_interp_branch(self):
+        """List with 14 entries (all 13 standard labels + one duplicate) does not crash."""
+        # All 13 standard labels, plus a duplicate of P50. frozenset() would match
+        # _STANDARD_LABEL_KEYS on its own — the len check is what prevents the crash.
+        standard_labels = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
+        standard_values = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 15.0, 18.0, 22.0, 28.0, 32.0, 36.0, 40.0]
+        model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(standard_labels, standard_values)]
+        # Add a duplicate of the P50 entry
+        model_pcts.append(Percentile(percentile=0.50, value=15.0))
+        assert len(model_pcts) == 14
+
+        # Should NOT crash — the len check routes past _has_standard_labels into the
+        # interp branch, where np.interp handles the sorted (labels, values) fine.
+        p10, p50, p90 = _key_percentile_values(model_pcts)
+        assert p10 == pytest.approx(5.0)
+        assert p50 == pytest.approx(15.0)
+        assert p90 == pytest.approx(28.0)

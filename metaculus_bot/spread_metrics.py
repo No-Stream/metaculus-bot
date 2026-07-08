@@ -41,7 +41,10 @@ _STANDARD_LABEL_KEYS: frozenset[float] = frozenset(round(p, _LABEL_DECIMALS) for
 
 def _has_standard_labels(model_pcts: list[Percentile]) -> bool:
     """True iff the model's percentile labels are exactly the standard percentile set."""
-    return frozenset(round(p.percentile, _LABEL_DECIMALS) for p in model_pcts) == _STANDARD_LABEL_KEYS
+    return (
+        len(model_pcts) == len(_STANDARD_LABEL_KEYS)
+        and frozenset(round(p.percentile, _LABEL_DECIMALS) for p in model_pcts) == _STANDARD_LABEL_KEYS
+    )
 
 
 def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, float]:
@@ -73,10 +76,24 @@ def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, 
     ordered = sorted(model_pcts, key=lambda p: p.percentile)
     labels = [p.percentile for p in ordered]
     values = [p.value for p in ordered]
-    if not labels or labels[0] > 0.10 or labels[-1] < 0.90:
+    if not labels:
+        raise ValueError("numeric_percentile_spread: declared percentiles are empty; cannot compute spread")
+    # CDF grids from discrete resampling have many points (typically 50-201) with
+    # cumulative-probability labels. Open-bound questions can legitimately have
+    # heavy out-of-bound mass (e.g. labels[0]=0.40 means 40% mass below the
+    # displayed lower bound — the "Toy Story" scenario). np.interp clamps: if
+    # a key percentile (0.10) is below labels[0], it returns values[0] (the
+    # displayed bound), which is the honest answer.
+    # Only reject short non-grid lists that clearly can't interpolate key
+    # percentiles (< 5 points AND doesn't span P10-P90).
+    _MIN_GRID_POINTS = 5
+    is_plausible_grid = len(labels) >= _MIN_GRID_POINTS
+    spans_key_percentiles = labels[0] <= 0.10 and labels[-1] >= 0.90
+    if not is_plausible_grid and not spans_key_percentiles:
         raise ValueError(
             "numeric_percentile_spread: declared percentiles are neither the standard percentiles "
-            f"nor a CDF grid spanning P10-P90; cannot read key percentiles from labels {labels}"
+            f"nor a CDF grid spanning P10-P90; cannot read key percentiles from labels "
+            f"(len={len(labels)}, range=[{labels[0]:.4f}, {labels[-1]:.4f}])"
         )
     p10, p50, p90 = np.interp(_KEY_SPREAD_PERCENTILES, labels, values)
     return float(p10), float(p50), float(p90)
