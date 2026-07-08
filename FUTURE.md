@@ -66,6 +66,27 @@ resolver URL → force-fetch+parse; or make the gap-fill analyzer treat a criter
 *mandatory* gap) is sketched in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. The FRED/Yahoo
 URL-extraction shipped 2026-06-28 already covers the API-backed financial subset of this class.
 
+### Parser hardening + forecasting-tools upgrade path (added 2026-07-07)
+
+Full plan in `scratch_docs_and_planning/parser_hardening_and_ft_upgrade_plan.md` (written
+after an 8-agent structured-outputs exploration). Decisions: do NOT migrate forecaster calls
+to native `response_format` structured outputs (OpenRouter silent-degradation footguns,
+load-bearing rationale channel, zero competitive precedent — no upstream layer uses it
+either). Instead:
+
+- **Workstream A (soon, free until one smoke run):** shadow divergence logging
+  (parser-extracted vs JSON-block values, both already computed per question) + strict
+  json_schema on the *parser call only* via `GeneralLlm(response_format=...)` — works on the
+  frozen 0.2.54 pin — with framework `structure_output` kept as fallback.
+- **Workstream B (between rounds, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 →
+  0.2.92+. Two verified breaks: our PCHIP subclasses override `.cdf` but HEAD internals moved
+  to `get_cdf()` (silent bypass of our CDF machinery); `fetch_hardening` patch target moved
+  to the new `MetaculusClient` (silent no-op). Plus a validator audit — HEAD's new
+  `_check_too_far_from_bounds` (25% wiggle) may conflict with our beyond-range open-bound
+  percentile design. Unlocks the litellm/cryptography CVE fixes below.
+- **Deferred:** JSON-block-as-authoritative for binary/MC — gated on Workstream A's shadow
+  data, decide at a round boundary.
+
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
 `make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
