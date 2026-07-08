@@ -213,12 +213,13 @@ async def run_numeric_forecast(
     # C3: try to read outcome_type from the structured JSON block first (saves
     # a parser LLM call). Fall back to the OutcomeTypeResult parser call when
     # the block is missing or doesn't declare outcome_type.
-    from metaculus_bot.structured_output_schema import (
-        parse_structured_block,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+    from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        NumericStructured,
+        parse_structured_block,
     )
 
     block = parse_structured_block(reasoning, "numeric")
-    if block is not None and hasattr(block, "outcome_type") and block.outcome_type is not None:
+    if isinstance(block, NumericStructured) and block.outcome_type is not None:
         discrete_vote = block.outcome_type == "discrete_integer"
     else:
         try:
