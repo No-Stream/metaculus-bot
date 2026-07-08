@@ -433,7 +433,7 @@ def parse_structured_block(
     """
     raw = extract_json_block(rationale_text)
     if raw is None:
-        logger.debug("No JSON block found in rationale for question_type=%s", question_type)
+        logger.info("No JSON block found in rationale for question_type=%s", question_type)
         return None
 
     if len(raw) > _MAX_STRUCTURED_BLOCK_BYTES:

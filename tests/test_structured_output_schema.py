@@ -819,14 +819,14 @@ class TestParseStructuredBlock:
         d = DiscreteCountStructured(question_type="discrete_count", mean_estimate=2.0, dispersion="poisson")
         assert d.mean_estimate == pytest.approx(2.0)
 
-    def test_no_block_returns_none_and_debug_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_no_block_returns_none_and_info_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         rationale = "Prose with no JSON block at all."
-        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.structured_output_schema"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.structured_output_schema"):
             result = parse_structured_block(rationale, "binary")
         assert result is None
-        # Should be DEBUG-level, not WARNING
+        # A0b: lifted from DEBUG to INFO so block-reliability is visible in run logs
         assert any(
-            record.levelno == logging.DEBUG and "No JSON block found" in record.message for record in caplog.records
+            record.levelno == logging.INFO and "No JSON block found" in record.message for record in caplog.records
         )
         assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 

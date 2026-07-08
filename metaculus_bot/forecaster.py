@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 from typing import Any, Callable, Coroutine, Sequence, cast
@@ -61,6 +62,113 @@ from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 logger = logging.getLogger(__name__)
 
 load_environment()
+
+
+# ---------------------------------------------------------------------------
+# A0: Shadow divergence logging — parser-extracted vs JSON-block comparison
+# ---------------------------------------------------------------------------
+
+# Regex for extracting trailing "Percentile X.X: <value>" lines from rationale text.
+# Used for numeric divergence comparison without invoking the parser LLM.
+_PERCENTILE_LINE_RE = re.compile(r"Percentile\s+([\d.]+)\s*:\s*([-\d.eE+]+)")
+
+
+def _log_parser_vs_block_divergence(
+    question: MetaculusQuestion,
+    prediction_value: Any,
+    reasoning: str,
+    model_name: str,
+) -> None:
+    """Compare parser-extracted prediction against the JSON block's declared values.
+
+    Logs a structured INFO line per forecaster per question. This is observability
+    only — it NEVER affects the prediction pipeline. Wrapped in a broad except so
+    any failure is silently logged at DEBUG and swallowed.
+    """
+    try:
+        from metaculus_bot.structured_output_schema import (
+            BinaryStructured,
+            MultipleChoiceStructured,
+            NumericStructured,
+            parse_structured_block,
+        )
+
+        # Determine question type for block parsing
+        if isinstance(question, BinaryQuestion):
+            q_type_str = "binary"
+        elif isinstance(question, MultipleChoiceQuestion):
+            q_type_str = "multiple_choice"
+        elif isinstance(question, NumericQuestion):
+            q_type_str = "numeric"
+        else:
+            return
+
+        block = parse_structured_block(reasoning, q_type_str)
+        block_present = block is not None
+        block_valid = block_present  # If parse_structured_block returned non-None, it passed validation
+
+        max_abs_diff: float | None = None
+
+        if block is not None:
+            if isinstance(block, BinaryStructured) and isinstance(prediction_value, float):
+                max_abs_diff = abs(block.posterior_prob - prediction_value)
+
+            elif isinstance(block, MultipleChoiceStructured) and hasattr(prediction_value, "predicted_options"):
+                # Build a dict from the parser's extracted prediction
+                parser_probs: dict[str, float] = {
+                    opt.option_name.strip().lower(): opt.probability for opt in prediction_value.predicted_options
+                }
+                block_probs: dict[str, float] = {k.strip().lower(): v for k, v in block.option_probs.items()}
+                # Compare matching options; max over all
+                diffs: list[float] = []
+                all_keys = set(parser_probs.keys()) | set(block_probs.keys())
+                for key in all_keys:
+                    p_val = parser_probs.get(key, 0.0)
+                    b_val = block_probs.get(key, 0.0)
+                    diffs.append(abs(p_val - b_val))
+                max_abs_diff = max(diffs) if diffs else 0.0
+
+            elif isinstance(block, NumericStructured) and block.declared_percentiles:
+                # Extract trailing percentile lines from the rationale via regex
+                matches = _PERCENTILE_LINE_RE.findall(reasoning)
+                if matches:
+                    # Parser percentiles keyed by percentile level (as fraction 0-1)
+                    # The trailing lines use percentage (1, 2.5, 5, ..., 99) while
+                    # the block uses fraction (0.01, 0.025, ..., 0.99).
+                    parser_pctiles: dict[float, float] = {}
+                    for pct_str, val_str in matches:
+                        try:
+                            pct = float(pct_str) / 100.0  # Convert percentage to fraction
+                            parser_pctiles[pct] = float(val_str)
+                        except ValueError:
+                            continue
+
+                    diffs_numeric: list[float] = []
+                    for pct_key, block_val in block.declared_percentiles.items():
+                        # Find matching parser percentile (tolerance for float keys)
+                        parser_val = parser_pctiles.get(pct_key)
+                        if parser_val is None:
+                            # Try matching with small tolerance
+                            for p_key, p_val in parser_pctiles.items():
+                                if abs(p_key - pct_key) < 0.001:
+                                    parser_val = p_val
+                                    break
+                        if parser_val is not None:
+                            diffs_numeric.append(abs(parser_val - block_val))
+                    max_abs_diff = max(diffs_numeric) if diffs_numeric else None
+
+        qid = question.id_of_question
+        logger.info(
+            "SHADOW_DIVERGENCE: qid=%s model=%s type=%s block_present=%s block_valid=%s max_abs_diff=%s",
+            qid,
+            model_name,
+            q_type_str,
+            block_present,
+            block_valid,
+            f"{max_abs_diff:.6f}" if max_abs_diff is not None else "N/A",
+        )
+    except Exception:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # observability-only; must never crash pipeline
+        logger.debug("Shadow divergence logging failed", exc_info=True)
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -927,6 +1035,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         if computed_md:
             prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
+
+        # A0: Shadow divergence — compare parser-extracted value vs JSON block declaration.
+        # Observability only; never affects prediction path.
+        _log_parser_vs_block_divergence(
+            question=question,
+            prediction_value=prediction.prediction_value,
+            reasoning=prediction.reasoning,
+            model_name=actual_llm.model,
+        )
+
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
