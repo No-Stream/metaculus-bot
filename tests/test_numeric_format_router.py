@@ -1,9 +1,11 @@
 """Tests for ``metaculus_bot.numeric_format_router``.
 
-After Workstream C1 the router is percentile-only. Its job is:
-1. Pass through parser-extracted percentiles when available.
-2. F5 fallback: lift declared_percentiles from the JSON block when the parser fails.
-3. Raise ValueError when neither source has percentiles.
+After F8 (2026-07-08) the router is a thin fallback shim:
+
+1. Passes parser-extracted percentiles through unchanged when available.
+2. F5 fallback: lifts ``declared_percentiles`` from the JSON block when the
+   parser returned None.
+3. Raises ``ValueError`` when neither source has percentiles.
 """
 
 from __future__ import annotations
@@ -14,10 +16,8 @@ from typing import Any
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.numeric_format_router import (
-    detect_numeric_format,
-    route_numeric_output,
-)
+from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric_format_router import route_numeric_output
 from tests.conftest import make_mock_numeric_question as _make_numeric_question
 
 
@@ -40,99 +40,47 @@ def _percentiles_from_payload(payload: dict[str, Any]) -> list[Percentile]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# detect_numeric_format
-# ---------------------------------------------------------------------------
-
-
-class TestDetectNumericFormat:
-    def test_pure_percentiles_returns_percentiles(self) -> None:
-        rationale = _wrap_json_block(_VALID_PERCENTILES_PAYLOAD)
-        assert detect_numeric_format(rationale) == "percentiles"
-
-    def test_no_json_block_returns_none(self) -> None:
-        rationale = "Just prose, no fenced JSON.\nPercentile 50: 42"
-        assert detect_numeric_format(rationale) is None
-
-    def test_malformed_json_block_returns_none(self) -> None:
-        rationale = "Prose.\n\n```json\n{this is not valid JSON}\n```\nDone."
-        assert detect_numeric_format(rationale) is None
-
-    def test_empty_percentiles_returns_none(self) -> None:
-        payload = {"question_type": "numeric", "declared_percentiles": {}}
-        rationale = _wrap_json_block(payload)
-        assert detect_numeric_format(rationale) is None
-
-
-# ---------------------------------------------------------------------------
-# route_numeric_output
-# ---------------------------------------------------------------------------
-
-
 class TestRouteNumericOutput:
-    def test_percentiles_only_rationale_returns_percentiles_format(self) -> None:
+    def test_parser_percentiles_pass_through_unchanged(self) -> None:
+        """When parser returns percentiles, they are passed through untouched
+        even if the JSON block has a conflicting set."""
         rationale = _wrap_json_block(_VALID_PERCENTILES_PAYLOAD)
         declared = _percentiles_from_payload(_VALID_PERCENTILES_PAYLOAD)
-        question = _make_numeric_question()
 
-        result = route_numeric_output(
-            rationale=rationale,
-            declared_percentiles=declared,
-            question=question,
-        )
+        result = route_numeric_output(rationale=rationale, declared_percentiles=declared)
 
-        assert result.format == "percentiles"
-        assert result.declared_percentiles == declared
-        assert result.cdf_percentiles == declared
+        assert result == declared
 
-    def test_neither_format_raises_value_error(self) -> None:
+    def test_neither_source_raises_value_error(self) -> None:
         rationale = "Just prose, no JSON, no percentiles."
-        question = _make_numeric_question()
         with pytest.raises(ValueError):
-            route_numeric_output(
-                rationale=rationale,
-                declared_percentiles=None,
-                question=question,
-            )
+            route_numeric_output(rationale=rationale, declared_percentiles=None)
 
-    def test_no_json_with_declared_percentiles_uses_percentile_path(self) -> None:
+    def test_parser_percentiles_with_no_block_pass_through(self) -> None:
+        """Parser percentiles arrive even when there's no JSON block at all."""
         rationale = "Just prose."
         declared = _percentiles_from_payload(_VALID_PERCENTILES_PAYLOAD)
-        question = _make_numeric_question()
 
-        result = route_numeric_output(
-            rationale=rationale,
-            declared_percentiles=declared,
-            question=question,
-        )
+        result = route_numeric_output(rationale=rationale, declared_percentiles=declared)
 
-        assert result.format == "percentiles"
-        assert result.declared_percentiles == declared
+        assert result == declared
 
-    def test_structured_block_percentiles_fallback_when_arg_none(self) -> None:
-        """F5: parser fails but JSON block has declared_percentiles."""
+    def test_f5_fallback_lifts_block_percentiles_when_parser_none(self) -> None:
+        """F5: parser returns None but the JSON block carries declared_percentiles."""
         rationale = _wrap_json_block(_VALID_PERCENTILES_PAYLOAD)
-        question = _make_numeric_question()
 
-        result = route_numeric_output(
-            rationale=rationale,
-            declared_percentiles=None,
-            question=question,
-        )
+        result = route_numeric_output(rationale=rationale, declared_percentiles=None)
 
-        assert result.format == "percentiles"
-        assert result.declared_percentiles is not None
-        assert len(result.declared_percentiles) == 3
-        sorted_pcts = sorted(result.declared_percentiles, key=lambda p: p.percentile)
+        sorted_pcts = sorted(result, key=lambda p: p.percentile)
+        assert len(sorted_pcts) == 3
         assert sorted_pcts[0].percentile == pytest.approx(0.1)
         assert sorted_pcts[0].value == pytest.approx(10.0)
+        assert sorted_pcts[-1].percentile == pytest.approx(0.9)
+        assert sorted_pcts[-1].value == pytest.approx(90.0)
 
     def test_f5_fallback_with_13_percentiles_drives_full_pipeline(self) -> None:
-        """F5 fallback with full 13 percentiles succeeds end-to-end."""
-        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415
-            build_numeric_distribution,
-            sanitize_percentiles,
-        )
+        """F5 fallback with the full 13 declared percentiles runs end-to-end
+        through sanitize + build_numeric_distribution."""
 
         thirteen_percentiles = {
             "0.01": 3.0,
@@ -156,17 +104,18 @@ class TestRouteNumericOutput:
         rationale = _wrap_json_block(payload)
         question = _make_numeric_question()
 
-        result = route_numeric_output(
-            rationale=rationale,
-            declared_percentiles=None,
-            question=question,
-        )
+        result = route_numeric_output(rationale=rationale, declared_percentiles=None)
 
-        assert result.format == "percentiles"
-        assert result.declared_percentiles is not None
-        assert len(result.declared_percentiles) == 13
+        assert len(result) == 13
 
-        sanitized, zero_point = sanitize_percentiles(result.declared_percentiles, question)
+        sanitized, zero_point = sanitize_percentiles(result, question)
         prediction = build_numeric_distribution(sanitized, question, zero_point)
         assert prediction is not None
         assert len(prediction.declared_percentiles) >= 13
+
+    def test_malformed_block_with_none_parser_raises(self) -> None:
+        """Malformed JSON + no parser percentiles → ValueError (no silent
+        fallback to an empty list)."""
+        rationale = "Prose.\n\n```json\n{this is not valid JSON}\n```\nDone."
+        with pytest.raises(ValueError):
+            route_numeric_output(rationale=rationale, declared_percentiles=None)

@@ -23,9 +23,6 @@ from metaculus_bot.simple_types import OptionProbability
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
-# Parser model slug — must match llm_configs.PARSER_LLM's model.
-_PARSER_MODEL = "openrouter/openai/gpt-5.4-mini"
-
 
 # ---------------------------------------------------------------------------
 # Wrapper models for list types (response_format requires a single BaseModel)
@@ -63,21 +60,26 @@ def _get_wrapper_type(output_type: type) -> type[BaseModel] | None:
     return None
 
 
-def _build_constrained_llm(response_format_model: type[BaseModel]) -> GeneralLlm:
+def _build_constrained_llm(response_format_model: type[BaseModel], parser_model: str) -> GeneralLlm:
     """Build a parser LLM with strict json_schema response_format.
 
     Uses the same donated-key fallback chain as the production PARSER_LLM.
     The extra_body provider.require_parameters=true ensures OpenRouter rejects
     the request rather than silently dropping the schema.
+
+    ``allowed_tries=1`` + ``timeout=90`` bounds the constrained primary so the
+    ``structure_output`` fallback always has budget within the 600s forecaster
+    soft deadline; without that cap a stuck primary can consume the entire
+    deadline and cancel the coroutine before the fallback runs (F1).
     """
     return build_llm_with_openrouter_fallback(
-        _PARSER_MODEL,
+        parser_model,
         temperature=0.0,
         top_p=0.9,
         max_tokens=32_000,
         stream=False,
-        timeout=300,
-        allowed_tries=3,
+        timeout=90,
+        allowed_tries=1,
         reasoning={"effort": "low"},
         response_format=response_format_model,
         extra_body={"provider": {"require_parameters": True}},
@@ -115,7 +117,7 @@ async def parse_structured(
 
     # --- Primary path: constrained json_schema ---
     try:
-        constrained_llm = _build_constrained_llm(schema_model)
+        constrained_llm = _build_constrained_llm(schema_model, parser_llm.model)
 
         # Build the extraction prompt (simpler than structure_output's — the schema
         # is enforced by the model's constrained decoding, so we just need the text
@@ -141,7 +143,7 @@ async def parse_structured(
         else:
             return schema_model.model_validate_json(raw_response)  # type: ignore[return-value]
 
-    except Exception as exc:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback
         logger.info(
             "Constrained parse failed (%s: %s); falling back to structure_output",
             type(exc).__name__,

@@ -162,7 +162,7 @@ async def run_stacking_mc(
             predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
         except ValueError as e:
             logger.warning(f"MC clamp/renormalize failed: {e}")
-    except Exception as e:
+    except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: strict PredictedOptionList → tolerant list[OptionProbability] fallback
         logger.warning(f"Primary MC structured parse failed: {e}")
         raw_options: list[OptionProbability] = await parse_structured(
             meta_reasoning,

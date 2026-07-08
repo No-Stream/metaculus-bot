@@ -107,7 +107,13 @@ Each forecaster emits the 13 standard percentiles `{1, 2.5, 5, 10, 20, 40, 50, 6
 
 ### Numeric format router (`numeric_format_router.py`)
 
-The router decides whether the LLM's numeric output is in OPTION A (the default 13 trailing `Percentile X.X: ...` lines) or OPTION B (a `mixture_components` list inside the JSON block). It always returns a 201-point Metaculus CDF and records which branch produced it for residual analysis (logged as `numeric_format=...`). If both formats are present, the mixture wins deterministically and a WARNING is logged so the frequency is auditable. The mixture branch flows through `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced grid evaluation of the mixture CDF).
+`route_numeric_output(rationale, declared_percentiles) -> list[Percentile]` is a thin fallback shim after the 2026-07-08 mixture-branch removal (Workstream C1 mixtures had zero prod fires in the 90-day window and never beat percentiles+PCHIP in benchmarks). It always returns a `list[Percentile]` that the caller feeds into `sanitize_percentiles` → `build_numeric_distribution`. The forecaster is responsible for calling `parse_structured` on the trailing `Percentile X.X: ...` lines first; the router just picks between the parser's result and the F5 block-lifted fallback:
+
+1. If `declared_percentiles` was extracted by the parser (the common path), return it verbatim.
+2. **F5 fallback**: if the parser missed the trailing lines (returned `None`) but the fenced structured JSON block carries a `declared_percentiles` dict, lift those into `Percentile(percentile=..., value=...)` objects and return them — so a rationale that dropped the trailing lines but kept the structured block still yields a forecast.
+3. Otherwise raise `ValueError` — the numeric forecaster has no percentile source and the caller propagates the failure.
+
+The `mixture_components` schema slot, `RoutedNumericForecast` return type, and `numeric_format=...` logging were all deleted in the collapse; discrete-integer snapping is decided by the C3 block-read in `forecaster_runners.run_numeric_forecast` (which reads `NumericStructured.outcome_type` before falling back to a parser LLM call for `OutcomeTypeResult`), not by the router.
 
 **Ensemble aggregation** (`numeric/utils.py` `aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 
@@ -153,7 +159,7 @@ Reusable probability math — pooling, Beta-Binomial Bayes, percentile → param
 Newly-added math (Workstreams D1-D3):
 
 - **Noisy-OR** (`aggregation.py` `noisy_or`): rare-binary decomposition `1 − ∏(1 − pᵢ)` for combining independent failure-mode probabilities. Exported from the package, but NOT currently dispatched by `tool_runner` (no references in `tool_runner.py`) — it is a callable available for future wiring, not an active dispatch path. `TODO(noisy-or-wiring)`: either add a binary Noisy-OR dispatch (when a forecaster declares independent sub-event probabilities) or leave as a library-only helper.
-- **Mixture-of-normals** (`mixtures.py`): `MixtureOfNormals` / `MixtureComponent` types, `mixture_cdf`, `fit_mixture_from_percentiles` (multi-start L-BFGS-B with single-normal fallback), and `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced 201-point CDF). Schema slot lives in `structured_output_schema.NumericStructured.mixture_components`; the numeric-format router branches on it.
+- **Mixture-of-normals** (`mixtures.py`): `MixtureOfNormals` / `MixtureComponent` types, `mixture_cdf`, `fit_mixture_from_percentiles` (multi-start L-BFGS-B with single-normal fallback), and `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced 201-point CDF). The library itself is preserved but currently dormant — the `NumericStructured.mixture_components` schema slot and the router branch that consumed it were removed 2026-07-08 after zero prod fires; percentiles+PCHIP outperformed the mixture path in every benchmark.
 - **Gamma waiting-time, conditional-given-survival**: `gamma_prob_event_before` with elapsed-window split (`survival_distributions.py`) — covers the missing waiting-time fitter alongside the existing exponential / Weibull / Gamma-hazard variants.
 
 ### `metaculus_bot/tool_runner.py`

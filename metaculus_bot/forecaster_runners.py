@@ -266,23 +266,11 @@ async def run_numeric_forecast(
         # will try to lift declared_percentiles from the JSON block instead.
         percentile_list = None
 
-    routed = route_numeric_output(
+    effective_percentiles = route_numeric_output(
         rationale=reasoning,
         declared_percentiles=percentile_list,
-        question=question,
     )
-    logger.info(
-        "numeric_format=%s for Q %s | model=%s",
-        routed.format,
-        qid,
-        forecaster_llm.model,
-    )
-
-    assert routed.declared_percentiles is not None, (
-        "route_numeric_output returned without declared_percentiles; "
-        "this is a router bug — should have raised ValueError instead."
-    )
-    sanitized_percentiles, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
+    sanitized_percentiles, zero_point = sanitize_percentiles(effective_percentiles, question)
 
     prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 

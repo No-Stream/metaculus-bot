@@ -402,21 +402,18 @@ class TestNumericStackingCrossModelAggregation:
         numeric_predictions = []
         for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
             pcts = _percentile_objs_from(declared)
-            routed = route_numeric_output(rationale=rationale, declared_percentiles=pcts, question=question)
-            assert routed.declared_percentiles is not None
-            cdf_probs = [float(p.percentile) for p in routed.cdf_percentiles] or [
-                float(p.percentile) for p in routed.declared_percentiles
-            ]
-            # For the percentile branch the router returns the raw declared list
-            # — wrap in a NumericDistribution via the same builder ``main.py``
+            # After the router collapse, route_numeric_output returns
+            # ``list[Percentile]`` directly (no more RoutedNumericForecast /
+            # ``question`` argument).
+            routed_pcts = route_numeric_output(rationale=rationale, declared_percentiles=pcts)
+            # Wrap in a NumericDistribution via the same builder ``main.py``
             # uses on the percentile path.
             from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
-            sanitized, zero_point = sanitize_percentiles(routed.declared_percentiles, question)
+            sanitized, zero_point = sanitize_percentiles(routed_pcts, question)
             pred = build_numeric_distribution(sanitized, question, zero_point)
             numeric_predictions.append(pred)
             _ = create_pchip_numeric_distribution  # silence unused-import lint
-            _ = cdf_probs
 
         reasoned = [
             ReasonedPrediction(prediction_value=p, reasoning=r) for p, r in zip(numeric_predictions, rationales)

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 import time
 from collections import defaultdict
 from typing import Any, Callable, Coroutine, Sequence, cast
@@ -68,10 +67,6 @@ load_environment()
 # A0: Shadow divergence logging — parser-extracted vs JSON-block comparison
 # ---------------------------------------------------------------------------
 
-# Regex for extracting trailing "Percentile X.X: <value>" lines from rationale text.
-# Used for numeric divergence comparison without invoking the parser LLM.
-_PERCENTILE_LINE_RE = re.compile(r"Percentile\s+([\d.]+)\s*:\s*([-\d.eE+]+)")
-
 
 def _log_parser_vs_block_divergence(
     question: MetaculusQuestion,
@@ -83,29 +78,34 @@ def _log_parser_vs_block_divergence(
 
     Logs a structured INFO line per forecaster per question. This is observability
     only — it NEVER affects the prediction pipeline. Wrapped in a broad except so
-    any failure is silently logged at DEBUG and swallowed.
+    any failure is logged at WARNING and swallowed — a systematic bug in this
+    comparison would otherwise be invisible and quietly bias the A0 read-out
+    toward "no drift observed" (F10).
     """
     try:
-        from metaculus_bot.structured_output_schema import (
+        from metaculus_bot.structured_output_schema import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             BinaryStructured,
             MultipleChoiceStructured,
             NumericStructured,
+            extract_json_block,
             parse_structured_block,
         )
+        from metaculus_bot.tool_runner import (  # noqa: PLC0415  # function-scoped: tool_runner drags scipy — see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _question_type_of,
+        )
 
-        # Determine question type for block parsing
-        if isinstance(question, BinaryQuestion):
-            q_type_str = "binary"
-        elif isinstance(question, MultipleChoiceQuestion):
-            q_type_str = "multiple_choice"
-        elif isinstance(question, NumericQuestion):
-            q_type_str = "numeric"
-        else:
+        # F11: reuse the shared question-type mapping. tool_runner imports scipy
+        # via probabilistic_tools, so keep the import function-scoped.
+        q_type_str = _question_type_of(question)
+        if q_type_str is None:
             return
 
+        # F4: distinguish "no fenced JSON block at all" from "block present but
+        # parse_structured_block rejected it" — parse_structured_block returns
+        # None for both, so we probe extract_json_block independently.
+        block_present = extract_json_block(reasoning) is not None
         block = parse_structured_block(reasoning, q_type_str)
-        block_present = block is not None
-        block_valid = block_present  # If parse_structured_block returned non-None, it passed validation
+        block_valid = block is not None
 
         max_abs_diff: float | None = None
 
@@ -129,26 +129,20 @@ def _log_parser_vs_block_divergence(
                 max_abs_diff = max(diffs) if diffs else 0.0
 
             elif isinstance(block, NumericStructured) and block.declared_percentiles:
-                # Extract trailing percentile lines from the rationale via regex
-                matches = _PERCENTILE_LINE_RE.findall(reasoning)
-                if matches:
-                    # Parser percentiles keyed by percentile level (as fraction 0-1)
-                    # The trailing lines use percentage (1, 2.5, 5, ..., 99) while
-                    # the block uses fraction (0.01, 0.025, ..., 0.99).
-                    parser_pctiles: dict[float, float] = {}
-                    for pct_str, val_str in matches:
-                        try:
-                            pct = float(pct_str) / 100.0  # Convert percentage to fraction
-                            parser_pctiles[pct] = float(val_str)
-                        except ValueError:
-                            continue
-
+                # F5: compare block.declared_percentiles against the parser's
+                # already-parsed prediction (PchipNumericDistribution's
+                # ``.declared_percentiles`` is a list[Percentile] in the same
+                # base-unit scale as the block). The previous rationale-text
+                # regex truncated unit suffixes (350B→350) and thousands
+                # separators (331,900,000→331), corrupting the A0 metric.
+                parser_declared = getattr(prediction_value, "declared_percentiles", None)
+                if parser_declared:
+                    parser_pctiles: dict[float, float] = {float(p.percentile): float(p.value) for p in parser_declared}
                     diffs_numeric: list[float] = []
                     for pct_key, block_val in block.declared_percentiles.items():
-                        # Find matching parser percentile (tolerance for float keys)
                         parser_val = parser_pctiles.get(pct_key)
                         if parser_val is None:
-                            # Try matching with small tolerance
+                            # Tolerate small float-key drift between the two sources.
                             for p_key, p_val in parser_pctiles.items():
                                 if abs(p_key - pct_key) < 0.001:
                                     parser_val = p_val
@@ -168,7 +162,9 @@ def _log_parser_vs_block_divergence(
             f"{max_abs_diff:.6f}" if max_abs_diff is not None else "N/A",
         )
     except Exception:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # observability-only; must never crash pipeline
-        logger.debug("Shadow divergence logging failed", exc_info=True)
+        # F10: WARNING (not DEBUG) so a systematic bug in the A0 comparison
+        # code doesn't hide behind a silent "no drift" read-out.
+        logger.warning("Shadow divergence logging failed", exc_info=True)
 
 
 class TemplateForecaster(CompactLoggingForecastBot):

@@ -256,7 +256,6 @@ class TestRunNumericForecast:
         from forecasting_tools.data_models.numeric_report import Percentile
 
         from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-        from metaculus_bot.numeric_format_router import RoutedNumericForecast
 
         reasoning_text = "OUTCOME_TYPE: DISCRETE\n\nPercentile 2.5: 50"
 
@@ -285,18 +284,12 @@ class TestRunNumericForecast:
                 return OutcomeTypeResult(is_discrete_integer=True)
             return percentiles
 
-        routed = RoutedNumericForecast(
-            format="percentiles",
-            cdf_percentiles=percentiles,
-            declared_percentiles=percentiles,
-        )
-
         with (
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
             patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
-            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
+            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=percentiles),
             patch(
                 "metaculus_bot.forecaster_runners.sanitize_percentiles",
                 return_value=(percentiles, None),
@@ -319,7 +312,6 @@ class TestRunNumericForecast:
 
         from metaculus_bot.exceptions import UnitMismatchError
         from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-        from metaculus_bot.numeric_format_router import RoutedNumericForecast
 
         percentiles = [
             Percentile(percentile=p / 100, value=v)
@@ -338,18 +330,12 @@ class TestRunNumericForecast:
                 return OutcomeTypeResult(is_discrete_integer=False)
             return percentiles
 
-        routed = RoutedNumericForecast(
-            format="percentiles",
-            cdf_percentiles=percentiles,
-            declared_percentiles=percentiles,
-        )
-
         with (
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="reasoning")),
             patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
-            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
+            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=percentiles),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(percentiles, None)),
             patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(True, "off by 1000x")),
@@ -358,12 +344,70 @@ class TestRunNumericForecast:
                 await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
 
     @pytest.mark.asyncio
+    async def test_c3_block_read_skips_parser_call_for_outcome_type(self, numeric_question, forecaster_llm, parser_llm):
+        """F7: when the rationale's structured JSON block declares outcome_type,
+        discrete_vote is read from the block and parse_structured is NOT called for
+        OutcomeTypeResult — the only parse_structured call is for list[Percentile].
+        """
+        from forecasting_tools.data_models.numeric_report import Percentile
+
+        # Rationale with a fenced json block declaring outcome_type=discrete_integer.
+        # declared_percentiles must include the required {0.1, 0.5, 0.9} keys and be
+        # strictly increasing to pass NumericStructured validation.
+        reasoning_text = (
+            "Some rationale text.\n"
+            "```json\n"
+            '{"question_type": "numeric", "outcome_type": "discrete_integer",'
+            ' "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}\n'
+            "```\n"
+        )
+
+        percentiles = [
+            Percentile(percentile=p / 100, value=v)
+            for p, v in zip(
+                [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+                [50, 100, 150, 200, 350, 450, 550, 700, 800, 900, 950],
+            )
+        ]
+
+        # parse_structured should be called ONLY for list[Percentile] extraction —
+        # NEVER for OutcomeTypeResult (that path is skipped when the block declares
+        # outcome_type). Assert the output_type of every call.
+        parse_calls: list[type] = []
+
+        async def mock_parse_structured(text, output_type, parser_llm, *, prompt_notes=""):
+            parse_calls.append(output_type)
+            return percentiles
+
+        with (
+            patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
+            patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_parse_structured),
+            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=percentiles),
+            patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(percentiles, None)),
+            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+        ):
+            _, discrete_vote = await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
+
+        # Vote comes from the block (True == "discrete_integer"), not the parser.
+        assert discrete_vote is True
+        # Exactly one parse_structured call — for percentiles. OutcomeTypeResult was
+        # NOT parsed because the block already declared outcome_type.
+        assert len(parse_calls) == 1
+        # The one call is for list[Percentile], not OutcomeTypeResult.
+        from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+
+        assert parse_calls[0] is not OutcomeTypeResult
+        assert parse_calls[0] == list[Percentile]
+
+    @pytest.mark.asyncio
     async def test_discrete_vote_none_when_parse_fails(self, numeric_question, forecaster_llm, parser_llm):
         """When OUTCOME_TYPE parsing fails, discrete_vote is None."""
         from forecasting_tools.data_models.numeric_report import Percentile
         from pydantic import ValidationError
-
-        from metaculus_bot.numeric_format_router import RoutedNumericForecast
 
         percentiles = [
             Percentile(percentile=p / 100, value=v)
@@ -382,18 +426,12 @@ class TestRunNumericForecast:
                 raise ValidationError.from_exception_data(title="test", line_errors=[])
             return percentiles
 
-        routed = RoutedNumericForecast(
-            format="percentiles",
-            cdf_percentiles=percentiles,
-            declared_percentiles=percentiles,
-        )
-
         with (
             patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="prompt"),
             patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper msg", "lower msg")),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="reasoning")),
             patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_structure_output),
-            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=routed),
+            patch("metaculus_bot.forecaster_runners.route_numeric_output", return_value=percentiles),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(percentiles, None)),
             patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),

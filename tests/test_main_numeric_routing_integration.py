@@ -5,8 +5,9 @@ end-to-end through ``TemplateForecaster._run_forecast_on_numeric``:
 
 1. Percentiles-only -> percentile pipeline (sanitize + build_numeric_distribution).
 
-Must produce a 201-point CDF and emit a ``numeric_format=...``
-INFO log line for residual analysis.
+Must produce a 201-point CDF. (The ``numeric_format=...`` log line was
+removed 2026-07-08 with the mixture-branch collapse — the router is
+percentile-only now.)
 """
 
 from __future__ import annotations
@@ -134,7 +135,6 @@ async def test_percentiles_only_path_logs_format_and_returns_distribution(caplog
     assert isinstance(pred.prediction_value, NumericDistribution)
     cdf = pred.prediction_value.cdf
     assert len(cdf) == 201
-    assert any("numeric_format=percentiles" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio
