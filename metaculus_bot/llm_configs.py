@@ -88,11 +88,15 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         model="openrouter/google/gemini-3.1-pro-preview",
         **_FORECASTER_CONFIG,
     ),
-    # 2026-05-18: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
-    # Added explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
-    # (4.3 defaults to low effort if unspecified, vs. 4.1-fast which had no effort flag).
+    # 2026-07-08: migrated from x-ai/grok-4.3 to x-ai/grok-4.5 (released today; xAI's
+    # newest frontier reasoning model, 500K context, $2/$6 per M input/output tokens).
+    # Prior hop 2026-05-18: x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI) → grok-4.3
+    # with explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
+    # (4.3 defaulted to low effort if unspecified, vs. 4.1-fast which had no effort flag).
+    # effort=high kept from the 4.3 config — 4.5's default-effort behavior isn't yet
+    # documented, so preserving the peer-parity setting rather than reverting to default.
     build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.3",
+        model="openrouter/x-ai/grok-4.5",
         reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
