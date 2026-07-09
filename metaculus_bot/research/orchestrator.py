@@ -208,10 +208,9 @@ class ResearchOrchestrator:
             - NEVER paraphrase numbers, percentages, probabilities, dates, or quantitative data. Copy them EXACTLY.
               BAD:  "The Fed indicated a low-medium recession risk"
               GOOD: "The Fed's March 2025 report estimated a 30% probability of recession by Q4"
-            - Stamp every dated fact relative to the question window: label events dated before {open_date} as
-              "[PRE-WINDOW — occurred before question open, cannot trigger resolution]" and events dated on or
-              after {open_date} as "[IN-WINDOW]". Keep pre-window facts in the briefing as base-rate/context
-              evidence, but NEVER present a pre-window event as satisfying the resolution criteria.
+            - Date every fact precisely. Explicitly flag as "[PRE-WINDOW — occurred before question open,
+              cannot itself satisfy the criteria]" any event that could otherwise be read as already satisfying
+              the resolution criteria. Keep such facts in the briefing as base-rate/context evidence.
             - Single-source rule: when a claim rests on ONE source/outlet, label it "[SINGLE-SOURCE]" and carry
               the original hedges forward verbatim ("reportedly", "according to X"). NEVER promote a
               single-source claim to a confirmed or factual statement.

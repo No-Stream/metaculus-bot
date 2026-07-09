@@ -242,7 +242,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             PHASE 0: PRELIMINARY CHECK
 
             0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-               • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied.
+               • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (or a qualifying event is so recent that resolution simply lags — the resolution check in 0a below covers that case).
                • To move off this status-quo answer, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
             0a) Resolution check
@@ -287,7 +287,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
                • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
-               • Reconcile your final forecast against that product in one line. Your final probability may deviate from the product ONLY by naming a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") — quantify the correction. Generic narrative uplift ("momentum suggests higher", "this cycle feels different") is NOT a valid reason to override the computed product; if no clause dependence applies, stay at the product.
+               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly two valid moves: revise the clause probabilities themselves and recompute, or name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect. Any override that is neither of these is not valid — all hedging and adjustment must operate through the clause probabilities or their dependence, not around them. If neither applies, stay at the product.
 
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
@@ -380,7 +380,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         PHASE 0: PRELIMINARY CHECK
 
         (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-            • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied.
+            • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (with one exception: if a qualifying event is so recent that resolution simply lags, treat the criteria as effectively met and weight your distribution accordingly).
             • To move probability mass off that status-quo option, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
@@ -531,7 +531,7 @@ def numeric_prompt(
         PHASE 0: PRELIMINARY CHECK
 
         (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-            - State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone.
+            - State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
             - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)

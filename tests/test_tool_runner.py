@@ -368,7 +368,7 @@ class TestAnchorAndClauseTelemetryLines:
             forecaster_id="m",
         )
         assert "Anchor telemetry" in result
-        assert "published 55% vs stated anchor 15-35%" in result
+        assert "declared 55% vs stated anchor 15-35%" in result
         assert "overshoot +20.0pp" in result
         assert "<!-- ANCHOR_OVERSHOOT_PP=+20.0 -->" in result
 

@@ -151,8 +151,10 @@ class TestAskNewsSummarization:
     @pytest.mark.asyncio
     async def test_prompt_carries_open_date_and_window_stamping_rules(self, orchestrator, question):
         """Summarizer hardening (2026-07-08): the prompt must (a) state the
-        question's open date, (b) demand PRE-WINDOW / IN-WINDOW stamping of
-        every dated fact, and (c) carry the single-source rule."""
+        question's open date, (b) demand precise dating with a targeted
+        PRE-WINDOW flag only for facts that could otherwise be misread as
+        already satisfying the criteria (no blanket IN-WINDOW stamps), and
+        (c) carry the single-source rule."""
         with patch.object(
             orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"
         ) as invoke:
@@ -165,11 +167,13 @@ class TestAskNewsSummarization:
         # (a) Open date threaded from the question object (fixture: 2026-03-15).
         assert "2026-03-15" in prompt
         assert "opened on 2026-03-15" in collapsed
-        # (b) Window-stamping rule with both labels; pre-window facts stay as base-rate evidence.
-        assert "[PRE-WINDOW — occurred before question open, cannot trigger resolution]" in collapsed
-        assert "[IN-WINDOW]" in collapsed
+        # (b) Lighter window-stamping: precise dating, targeted PRE-WINDOW label
+        #     only for facts that could look like they satisfy the criteria; no
+        #     blanket IN-WINDOW stamps.
+        assert "Date every fact precisely" in collapsed
+        assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "[IN-WINDOW]" not in collapsed
         assert "base-rate" in collapsed
-        assert "NEVER present a pre-window event as satisfying the resolution criteria" in collapsed
         # (c) Single-source rule: label + carry hedges + no promotion to confirmed.
         assert "[SINGLE-SOURCE]" in collapsed
         assert "hedges" in collapsed

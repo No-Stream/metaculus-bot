@@ -644,14 +644,20 @@ class TestConjunctiveCriteriaPricing:
     def test_reconciliation_requires_named_clause_dependence(self) -> None:
         """pgodzinai 42855 failure mode: a computed clause product coexisting
         with free-form narrative adjustment gets nullified (82% computed →
-        87% via 'season-specific upward adjustment'). Deviation from the
-        product must be licensed ONLY by a named clause dependence; generic
-        narrative uplift is explicitly forbidden."""
+        87% via 'season-specific upward adjustment'). Any deviation from the
+        product must operate through the clause probabilities themselves or a
+        named clause dependence; overrides that route around the clauses are
+        explicitly forbidden."""
         prompt = binary_prompt(_binary_q(), research="r")
         lowered = " ".join(prompt.lower().split())
-        assert "only by naming a specific dependence between clauses" in lowered
-        assert "not a valid reason to override the computed product" in lowered
-        assert "if no clause dependence applies, stay at the product" in lowered
+        assert "you have exactly two valid moves" in lowered
+        assert "revise the clause probabilities themselves and recompute" in lowered
+        assert "name a specific dependence between clauses" in lowered
+        assert (
+            "all hedging and adjustment must operate through the clause probabilities or their dependence, "
+            "not around them" in lowered
+        )
+        assert "if neither applies, stay at the product" in lowered
 
 
 class TestNumericPromptThirteenPercentiles:

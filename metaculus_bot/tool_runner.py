@@ -252,7 +252,7 @@ def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
             block.base_rate_anchor.high,
         )
         lines.append(
-            f"- **Anchor telemetry**: published {block.posterior_prob * 100:.0f}% vs stated anchor "
+            f"- **Anchor telemetry**: declared {block.posterior_prob * 100:.0f}% vs stated anchor "
             f"{block.base_rate_anchor.low * 100:.0f}-{block.base_rate_anchor.high * 100:.0f}%, "
             f"overshoot {overshoot:+.1f}pp {format_anchor_overshoot_marker(overshoot)}"
         )
