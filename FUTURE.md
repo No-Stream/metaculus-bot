@@ -606,6 +606,15 @@ clause product). It is the first trigger that keys on divergence-from-own-math r
 confidence, anchor band, or market presence — the exact conditionality the three tested
 guards failed to achieve. Watch, don't act.
 
+Also watch (MC, added 2026-07-09): whether the low-bucket over-payment closes under the new
+merged MC calibration bullet (`ceab2df`). Baseline: [0-5%) options assigned mean 2.4%,
+resolve at 1.0% (n=96 pairs, both eras — "courtesy mass" on named-dead longshots leaking
+from under-committed favorites; see MC_CONFIDENCE_FINDINGS.md). If the gap persists at the
+next residual pull, add one prompt line: price clearly-dead NAMED options at/near the 1%
+floor (residual/"Other" options keep honest mass — asymmetric by option type). The 1% floor
+itself stays (operator decision 2026-07-09: sub-1% headroom is ~+0.01 nats/question ideal
+case vs. parser/clamp regression risk — not worth it).
+
 ## Medium-term (requires more exploration)
 
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
