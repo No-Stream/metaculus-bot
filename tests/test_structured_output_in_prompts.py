@@ -91,6 +91,17 @@ class TestBinaryPromptSchemaInstruction:
         assert answer_idx >= 0, "answer line missing"
         assert schema_idx < answer_idx, "JSON schema must come before the final answer line (Option A ordering)"
 
+    def test_telemetry_fields_documented_in_binary_schema(self):
+        """Anchor + clause telemetry fields (2026-07-08) are shown in the schema
+        example AND carry fill instructions, so forecasters populate them."""
+        prompt = binary_prompt(_make_binary_q(), research="R")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        assert '"base_rate_anchor"' in structured_section
+        assert '"criteria_clauses"' in structured_section
+        # Fill instructions reference where the values come from.
+        assert "outside-view base-rate range" in structured_section
+        assert "conjunctive criteria pricing table" in structured_section.lower()
+
 
 class TestMultipleChoicePromptSchemaInstruction:
     def test_contains_mc_schema_fields(self):

@@ -554,6 +554,106 @@ class TestSourceProvenanceLadder:
         assert "centered near this value" in lowered
 
 
+class TestStatusQuoDerivation:
+    """Every forecaster prompt must open PHASE 0 with a mandatory status-quo
+    DERIVATION — a question the model answers itself before reviewing any
+    research — not a rule/warning. Rules-as-warnings get argued away as
+    boilerplate (qid 42024: 4/5 models dismissed the "not yet satisfied"
+    line); a derivation the model writes in its own words is stickier."""
+
+    def _assert_derivation_present(self, prompt: str) -> None:
+        lowered = " ".join(prompt.lower().split())
+        assert "status-quo derivation" in lowered
+        # The model must state the platform-state premise in its own words...
+        assert "open and unresolved as of" in lowered
+        # ...with today's date interpolated so the statement is concrete.
+        assert datetime.now().strftime("%Y-%m-%d") in prompt
+        # Moving off the status quo requires naming a post-open trigger.
+        assert "post-open event" in lowered
+        # And an explicit commitment about the window.
+        assert "no qualifying event has yet occurred inside the window" in lowered
+
+    def _assert_derivation_before_outside_view(self, prompt: str) -> None:
+        idx_derivation = prompt.find("Status-quo derivation")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert idx_derivation >= 0
+        assert idx_phase1 >= 0
+        assert idx_derivation < idx_phase1, "status-quo derivation must come before the outside view"
+
+    def test_binary_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+        # In binary, the derivation must be the TOP of PHASE 0 — before the resolution check.
+        assert prompt.find("Status-quo derivation") < prompt.find("Resolution check")
+
+    def test_multiple_choice_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = multiple_choice_prompt(_mc_q(), research="r")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+
+    def test_numeric_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+
+    def test_binary_resolution_check_retained_after_derivation(self) -> None:
+        """Regression: adding the derivation must not displace the 0a resolution
+        check or the 0b decomposition."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        assert "Resolution check" in prompt
+        assert "Resolution decomposition" in prompt
+
+
+class TestConjunctiveCriteriaPricing:
+    """Change #2: the binary prompt upgrades the qualitative Boolean-product
+    decomposition with a NUMERIC pricing table — placed LATE in the flow
+    (after evidence review and red-team) so the red-team can causally affect
+    the clause probabilities. PHASE 0b keeps only the qualitative listing."""
+
+    def test_binary_prompt_has_pricing_table_section(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert "conjunctive criteria pricing" in lowered
+        assert "one row per resolution clause" in lowered
+        assert "product" in lowered
+
+    def test_pricing_table_comes_after_red_team_and_before_final_rationale(self) -> None:
+        """ORDERING IS LOAD-BEARING: clause numbers must be emitted after the
+        red-team/bear-bull section so red-teaming can move them, and before
+        the final rationale that reconciles against the product."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        idx_red_team = prompt.find("Red-team both")
+        idx_pricing = prompt.find("Conjunctive criteria pricing")
+        idx_final = prompt.find("Final rationale and calibration")
+        assert 0 <= idx_red_team < idx_pricing < idx_final
+
+    def test_phase0b_keeps_listing_but_defers_numbers(self) -> None:
+        """PHASE 0b still lists/structures the clauses (early structure
+        identification is fine) but must explicitly defer the probabilities
+        to the late pricing step."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        assert "Resolution decomposition" in prompt
+        assert "Boolean product" in prompt
+        lowered = " ".join(prompt.lower().split())
+        assert "do not assign probabilities to the clauses yet" in lowered
+        # The deferral must appear inside 0b, i.e. before PHASE 1.
+        idx_defer = prompt.find("Do NOT assign probabilities to the clauses yet")
+        assert 0 <= idx_defer < prompt.find("PHASE 1")
+
+    def test_reconciliation_requires_named_clause_dependence(self) -> None:
+        """pgodzinai 42855 failure mode: a computed clause product coexisting
+        with free-form narrative adjustment gets nullified (82% computed →
+        87% via 'season-specific upward adjustment'). Deviation from the
+        product must be licensed ONLY by a named clause dependence; generic
+        narrative uplift is explicitly forbidden."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert "only by naming a specific dependence between clauses" in lowered
+        assert "not a valid reason to override the computed product" in lowered
+        assert "if no clause dependence applies, stay at the product" in lowered
+
+
 class TestNumericPromptThirteenPercentiles:
     """The numeric prompts must enumerate all 13 percentile lines (P1 first, P99 last)
     and never tell the model to emit exactly 11."""

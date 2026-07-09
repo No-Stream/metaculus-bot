@@ -175,6 +175,11 @@ class ResearchOrchestrator:
         """
         if not research.strip():
             return research
+        # Real API-fetched questions always populate open_time; a missing value
+        # means broken upstream data and the forecaster prompts assert on it
+        # anyway (_forecasting_window_str), so fail loudly here too.
+        assert question.open_time is not None, "question.open_time is required for window-stamping"
+        open_date = question.open_time.strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
             You are a research analyst preparing a comprehensive intelligence briefing for an expert forecaster.
@@ -185,6 +190,9 @@ class ResearchOrchestrator:
             Resolution criteria:
             {question.resolution_criteria or ""}
             {question.fine_print or ""}
+
+            The question opened on {open_date}. Its forecasting window runs from that open date to resolution:
+            only events occurring AFTER {open_date} can trigger resolution.
 
             Below is raw news research. Your task is to produce a DETAILED and COMPREHENSIVE briefing that:
 
@@ -200,6 +208,13 @@ class ResearchOrchestrator:
             - NEVER paraphrase numbers, percentages, probabilities, dates, or quantitative data. Copy them EXACTLY.
               BAD:  "The Fed indicated a low-medium recession risk"
               GOOD: "The Fed's March 2025 report estimated a 30% probability of recession by Q4"
+            - Stamp every dated fact relative to the question window: label events dated before {open_date} as
+              "[PRE-WINDOW — occurred before question open, cannot trigger resolution]" and events dated on or
+              after {open_date} as "[IN-WINDOW]". Keep pre-window facts in the briefing as base-rate/context
+              evidence, but NEVER present a pre-window event as satisfying the resolution criteria.
+            - Single-source rule: when a claim rests on ONE source/outlet, label it "[SINGLE-SOURCE]" and carry
+              the original hedges forward verbatim ("reportedly", "according to X"). NEVER promote a
+              single-source claim to a confirmed or factual statement.
             - Be COMPREHENSIVE — do not omit relevant details. A longer, thorough summary is better than a short one.
             - Include direct quotes from experts and officials where available.
             - If the research contains prediction market data, include exact numbers and odds.

@@ -146,6 +146,41 @@ class ScenarioBranch(BaseModel):
     conditional_outcome: str | None = None
 
 
+class BaseRateAnchor(BaseModel):
+    """The forecaster's stated outside-view base-rate range (telemetry only).
+
+    Consumed by the anchor-overshoot telemetry in ``tool_runner``: the signed
+    pp distance of the declared posterior outside [low, high]. Never used to
+    clamp or mutate a forecast — the 2026-07 residual experiments showed
+    anchor-guard clamping sign-flips across eras, while overshoot >15pp
+    monotonically degrades Brier, so we measure and log only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    low: float = Field(ge=0.0, le=1.0)
+    high: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> BaseRateAnchor:
+        if self.low > self.high:
+            raise ValueError(f"BaseRateAnchor requires low <= high, got low={self.low}, high={self.high}")
+        return self
+
+
+class CriteriaClause(BaseModel):
+    """One priced resolution clause from the conjunctive-criteria table (telemetry only).
+
+    The product of clause probabilities is compared against the declared
+    posterior by ``tool_runner``; divergence is logged, never enforced.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    prob: float = Field(ge=0.0, le=1.0)
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -179,6 +214,10 @@ class BinaryStructured(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     posterior_prob: float = Field(ge=0.0, le=1.0)
+    # Telemetry-only optional fields (2026-07-08): stated outside-view range and
+    # priced resolution clauses. Old blocks without them must keep parsing.
+    base_rate_anchor: BaseRateAnchor | None = None
+    criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
 
     @field_validator("scenarios")
     @classmethod

@@ -82,6 +82,11 @@ def _forecasting_window_str(
     )
 
 
+def _today_str() -> str:
+    """Today's date, formatted to match ``_forecasting_window_str``'s "Today:" line."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
     """Render the cross-model-aggregation markdown block for the stacker prompt.
 
@@ -236,13 +241,18 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             PHASE 0: PRELIMINARY CHECK
 
-            0) Resolution check
+            0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+               • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied.
+               • To move off this status-quo answer, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
+
+            0a) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
                • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
                • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "a model is released AND it is Opus-branded AND it is accessible to external users"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
                • Write one worked Yes example (a concrete scenario where every factor = 1) and one worked No example (a concrete scenario where exactly one factor = 0, with that factor named). This is mechanical bait-and-switch protection: it forces the resolution criteria to be consumed as structured constraints rather than treated as a prose paraphrase.
+               • Do NOT assign probabilities to the clauses yet — that happens in step 5b, after the evidence review and red-team.
                • For single-condition questions ("Will Z happen?"), write "single-condition, decomposition skipped" and move on.
 
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
@@ -275,6 +285,10 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Strongest Bull Case (Yes): most compelling, evidence-based argument for Yes.
                • Red-team both: attack assumptions, data gaps, and causal claims.
 
+            5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
+               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
+               • Reconcile your final forecast against that product in one line. Your final probability may deviate from the product ONLY by naming a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") — quantify the correction. Generic narrative uplift ("momentum suggests higher", "this cycle feels different") is NOT a valid reason to override the computed product; if no clause dependence applies, stay at the product.
+
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Question-specific base rate: the relevant base rate is the historical frequency for questions LIKE THIS ONE (e.g., "how often do German federal elections return X"), not a generic "most things don't happen" prior.
@@ -302,11 +316,15 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             ```json
             {{
               "question_type": "binary",
-              "posterior_prob": 0.28
+              "posterior_prob": 0.28,
+              "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
+              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
             }}
             ```
 
             `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal, 0-1).
+            `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
+            `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
 
             Emit the JSON block BEFORE the final Probability line below.
 
@@ -358,6 +376,12 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         Reproduce the following analysis template in your answer:
 
         ── Analysis Template ──
+
+        PHASE 0: PRELIMINARY CHECK
+
+        (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+            • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied.
+            • To move probability mass off that status-quo option, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
@@ -503,6 +527,12 @@ def numeric_prompt(
         Reproduce the following analysis template in your answer:
 
         -- Analysis Template ──
+
+        PHASE 0: PRELIMINARY CHECK
+
+        (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+            - State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone.
+            - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
