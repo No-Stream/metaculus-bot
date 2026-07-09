@@ -549,6 +549,42 @@ signed haircut), which capture most of the demonstrated value at zero cost. Hone
 ~30–60 spot-peer points of damage limitation on consensus misses, no flips. See
 `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3.
 
+**Update 2026-07-08 (guard counterfactuals):** the sequencing premise is falsified — all
+three deterministic guards buried on offline replay (era sign-flips / top-5 concentration /
+fall-hostile fire rates; see `scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`
+and the three guard entries in the "Killed by July 2026-07-08" section below). The critic
+pass now carries the full burden of demonstrating era-stable conditional firing on its own
+paid backtest; there is no free deterministic fallback capturing the same value. Its gate
+must include a fall-like era-stability check, not just capture of the spring miss cluster —
+the guards showed that harvesting that cluster is exactly what damages the largest and
+best-calibrated era.
+
+### Telemetry-first guard revival program (added 2026-07-08, passive)
+
+The shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` on `BinaryStructured`,
+`ANCHOR_OVERSHOOT_PP` and `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML markers in published
+comments) plus `PREDICTION_MARKETS_ENABLED: 'true'` across all four prod workflows make
+future guard replays exact rather than parser-based — Arm A's regex parser at 84.9% text
+coverage is now a structured field, and the market snapshot section starts populating the
+archive going forward. No code is on the roadmap here; the whole program is passive.
+
+First checks in the next residual session, both free:
+
+1. **Marker presence rate per forecaster** in published comments — the whole replay program
+   depends on the telemetry actually landing. Grep the archive for
+   `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` / structured `base_rate_anchor`
+   per forecaster slot and confirm every slot is emitting them.
+2. **Does the spring overshoot pattern reproduce on the current roster at all?** If the
+   confident-overshoot cluster (analogues of 42024 / 42304 / 41800) does not appear in
+   post-`30bca2f` resolutions, the prompt fixes were sufficient and all three guard revival
+   conditions (Guard 1 anchors, Guard 2 markets, Guard 3 confidence deadzone) become moot.
+
+One novel candidate trigger becomes analyzable for free once current-roster binaries
+resolve: `clause_product_divergence_pp` (published forecast vs. the model's own priced
+clause product). It is the first trigger that keys on divergence-from-own-math rather than
+confidence, anchor band, or market presence — the exact conditionality the three tested
+guards failed to achieve. Watch, don't act.
+
 ## Medium-term (requires more exploration)
 
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
@@ -883,6 +919,45 @@ here so future sessions don't re-recommend them without new data.
   survivorship bias; median remains at the non-oracle frontier per dim_peer-calibration across
   two additional pulls; and even laertes's 41800 "win" discarded its own best member and was
   saved by its floor, not by aggregation.
+- **Anchor-floor guard on cheap tails** — the deterministic follow-up to the Arm A anchor-guard
+  kill. The median-band variant sign-flips across eras (fall +1.68 / spring −2.19 total Brier
+  at the 10pp margin) because 76% of parsed anchor bands are degenerate points, collapsing the
+  clamp back into Arm A's buried point-anchor clamp. The union-band variant is sign-consistent
+  but 100% top-5-concentrated (1–2 questions per era) and catches only 1/5 of the known misses.
+  Decomposing fires shows same-side tail clamping — the mechanism the guard is named for —
+  hurts BOTH well-powered eras. Revival condition: ≥50 current-roster binaries carrying the
+  new structured `base_rate_anchor` telemetry (shipped 30bca2f) AND an era-stable,
+  non-concentrated (top-5 < 50% of gross) replay. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD1_FINDINGS.md`.
+- **No-market-no-extremize cap** — feasibility kill: the market-presence signal exists in
+  essentially one era (fall is 89% NO_SIGNAL because the prediction-market provider was
+  benchmark-suppressed; the canonical `## Prediction Market Snapshot` header appears in
+  exactly 1 archived binary), so era-stability is un-testable for the market-conditioned form.
+  Marketless fallback form = Arm A's point-anchor clamp drift bomb; strict form's gain is 3
+  spring questions (74–98% of gross improvement) and the market gate itself adds ~nothing
+  (with-cond vs. no-cond within ~0.2 Brier on spring). Revival condition: ≥~50 resolved
+  binaries per era carrying the structured `## Prediction Market Snapshot` AND the market
+  gate itself earning the delta the marketless form does not. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD2_FINDINGS.md`.
+- **Signed deadzone haircut toward 0.5** (question closed permanently) — extends the Arm B
+  symmetric-shrink kill to all thresholded / high-t forms. 0 of 24 (λ, t) grid cells help or
+  are neutral in both well-powered eras; fall has no improving cell anywhere. Fire rate ≥30%
+  at even the loosest deadzone (t=0.4) because the bot is a confident forecaster
+  (median |p−0.5| ≈ 0.32–0.38) so confidence-keyed deadzones fire on the bulk, not a tail.
+  LOTO fit on spring+summer degrades held-out fall +1.12 total Brier. Keeper: the
+  signed-toward-0.5 direction constraint stands as a design rule (mirrors the fixed-direction
+  haircut kill above). Revival condition: the ensemble's calibration profile qualitatively
+  changes (a fall-like era where confident calls are wrong at scale) AND leave-one-era-out
+  passes on every held-out era; do not re-grid λ/t on new data absent that. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD3_FINDINGS.md`.
+- **Cross-cutting** — at mid-grid configs all three guards fire on the same spring miss
+  cluster (42024 / 42304 / 41800 in particular; often 42018 / 42577 / 42855 / 41644 too), so
+  they are one lever measured three ways rather than three independent findings. The shipped
+  `30bca2f` prompt changes (status-quo derivation, conjunctive clause pricing, anchor/clause
+  telemetry) target that exact cluster, so any future guard replay on post-`30bca2f` data
+  must never fit on pre-`30bca2f` eras — that is the roster-drift bomb with a prompt-change
+  fuse. Config-era bucketing (keyed on submission time) already handles this; the new prompt
+  era starts at `30bca2f`.
 
 ## Instrumentation bugs
 
