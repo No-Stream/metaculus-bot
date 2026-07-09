@@ -561,23 +561,38 @@ best-calibrated era.
 
 ### Telemetry-first guard revival program (added 2026-07-08, passive)
 
-The shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` on `BinaryStructured`,
-`ANCHOR_OVERSHOOT_PP` and `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML markers in published
-comments) plus `PREDICTION_MARKETS_ENABLED: 'true'` across all four prod workflows make
-future guard replays exact rather than parser-based — Arm A's regex parser at 84.9% text
+The shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` and `criteria_clauses` on
+`BinaryStructured`) plus `PREDICTION_MARKETS_ENABLED: 'true'` across all four prod workflows
+make future guard replays exact rather than parser-based — Arm A's regex parser at 84.9% text
 coverage is now a structured field, and the market snapshot section starts populating the
 archive going forward. No code is on the roadmap here; the whole program is passive.
 
+Important gating note on the telemetry channel: the computed
+`ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers emit only from
+`tool_runner.run_tools_for_forecaster`, which is gated behind `PROBABILISTIC_TOOLS_ENABLED`
+(all three prod workflows pin it to `'false'`), so those computed markers are currently
+DORMANT in published prod comments. What DOES land unconditionally in every prod R1
+rationale is the raw `base_rate_anchor` and `criteria_clauses` JSON the forecaster writes
+into its own STRUCTURED FORECAST block — the primary telemetry channel today. The computed
+markers become the primary channel only if the flag is flipped on; until then the
+overshoot / divergence math (which lives in `tool_runner`) is trivially replayable offline
+from the raw JSON.
+
 First checks in the next residual session, both free:
 
-1. **Marker presence rate per forecaster** in published comments — the whole replay program
-   depends on the telemetry actually landing. Grep the archive for
-   `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` / structured `base_rate_anchor`
-   per forecaster slot and confirm every slot is emitting them.
+1. **Structured-JSON presence rate per forecaster** in published comments — the whole replay
+   program depends on the telemetry actually landing. Grep the archive for the raw
+   `base_rate_anchor` and `criteria_clauses` JSON keys inside each forecaster's STRUCTURED
+   FORECAST block and confirm every slot is emitting them. If `PROBABILISTIC_TOOLS_ENABLED`
+   is ever flipped on, additionally grep for the computed `ANCHOR_OVERSHOOT_PP` /
+   `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers as a cross-check; today those markers
+   are absent and their absence carries no signal.
 2. **Does the spring overshoot pattern reproduce on the current roster at all?** If the
    confident-overshoot cluster (analogues of 42024 / 42304 / 41800) does not appear in
    post-`30bca2f` resolutions, the prompt fixes were sufficient and all three guard revival
    conditions (Guard 1 anchors, Guard 2 markets, Guard 3 confidence deadzone) become moot.
+   Compute overshoot / divergence offline from the raw JSON (same math as `tool_runner`)
+   until the flag lands.
 
 One novel candidate trigger becomes analyzable for free once current-roster binaries
 resolve: `clause_product_divergence_pp` (published forecast vs. the model's own priced

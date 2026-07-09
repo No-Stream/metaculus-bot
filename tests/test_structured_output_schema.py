@@ -27,6 +27,7 @@ from metaculus_bot.structured_output_schema import (
     extract_json_block,
     parse_structured_block,
 )
+from metaculus_bot.tool_runner import _aggregate_binary_lines, _parse_all_blocks
 
 # ===========================================================================
 # Fixtures
@@ -227,6 +228,184 @@ class TestBinaryTelemetryFields:
     def test_degenerate_point_anchor_allowed(self) -> None:
         anchor = BaseRateAnchor(low=0.3, high=0.3)
         assert anchor.low == anchor.high == pytest.approx(0.3)
+
+
+class TestBinaryTelemetryStripAndRetry:
+    """Strip-and-retry recovery for malformed BINARY telemetry (2026-07-08).
+
+    Contract: a good ``posterior_prob`` (and other core fields) must survive
+    a malformed ``base_rate_anchor`` / ``criteria_clauses`` value — dropping
+    the entire block on a pure telemetry formatting bug would silently shift
+    stacker input via the cross-model aggregation path in ``tool_runner``.
+
+    Fail-fast on core fields is preserved: a bad ``posterior_prob`` must
+    still return None even if telemetry is well-formed.
+    """
+
+    def test_criteria_clauses_null_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Canonical failure: prompt says "omit" criteria_clauses when there
+        # isn't a conjunctive breakdown, but LLMs frequently emit `null`
+        # instead. Old behavior: whole block dropped, base-rate blend and
+        # prior/posterior contributions vanish. New behavior: warn + keep
+        # the core binary block.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "prior": {"prob": 0.2, "source": "20yr base rate"},
+                    "base_rate": {"k": 4, "n": 20, "ref_class": "past 20 yrs"},
+                    "posterior_prob": 0.35,
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.35)
+        # Core telemetry-adjacent fields preserved.
+        assert result.prior is not None
+        assert result.prior.prob == pytest.approx(0.2)
+        assert result.base_rate is not None
+        assert result.base_rate.k == 4
+        # Telemetry defaults after strip-and-retry.
+        assert result.base_rate_anchor is None
+        assert result.criteria_clauses == []
+        # WARNING logged so this recovery is visible in run logs.
+        assert any(
+            "malformed telemetry fields" in rec.message and "criteria_clauses" in rec.message for rec in caplog.records
+        )
+
+    def test_reversed_anchor_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Canonical failure: {low: 0.6, high: 0.2} is rejected by
+        # BaseRateAnchor's ordering validator. Same recovery contract as
+        # criteria_clauses=null.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 0.42,
+                    "base_rate_anchor": {"low": 0.6, "high": 0.2},
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+        assert result.base_rate_anchor is None
+        assert any(
+            "malformed telemetry fields" in rec.message and "base_rate_anchor" in rec.message for rec in caplog.records
+        )
+
+    def test_both_telemetry_fields_malformed_recovers(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Both telemetry keys present and malformed: strip both, keep core.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 0.28,
+                    "base_rate_anchor": {"low": 0.9, "high": 0.1},
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.28)
+        assert result.base_rate_anchor is None
+        assert result.criteria_clauses == []
+        message_text = " ".join(rec.message for rec in caplog.records)
+        assert "base_rate_anchor" in message_text
+        assert "criteria_clauses" in message_text
+
+    def test_bad_core_field_still_returns_none(self, caplog: pytest.LogCaptureFixture) -> None:
+        # posterior_prob=1.5 is a core-field violation. Even with valid
+        # telemetry alongside, the block must still be dropped — strip-and-
+        # retry MUST NOT rescue a bad core field.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 1.5,
+                    "base_rate_anchor": {"low": 0.15, "high": 0.35},
+                    "criteria_clauses": [{"name": "clause", "prob": 0.5}],
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert result is None
+        # Original failed-validation warning still fires; no recovery warning.
+        assert any("failed validation" in rec.message for rec in caplog.records)
+        assert not any("malformed telemetry fields" in rec.message for rec in caplog.records)
+
+    def test_bad_core_and_bad_telemetry_still_none(self) -> None:
+        # Neither retry variant is valid — bad core, bad telemetry. Must
+        # return None (fall through to the original None return).
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 1.5,  # out of range
+                    "base_rate_anchor": {"low": 0.9, "high": 0.1},  # reversed
+                }
+            )
+            + "\n```"
+        )
+        result = parse_structured_block(rationale, "binary")
+        assert result is None
+
+    def test_recovered_block_feeds_cross_model_aggregation(self) -> None:
+        # Guard the invariant end-to-end: a forecaster whose ONLY validation
+        # error is malformed telemetry must still contribute its base_rate
+        # to the cross-model aggregation. Uses tool_runner's internal
+        # _parse_all_blocks + _aggregate_binary_lines directly to keep the
+        # test independent of feature-flag env state.
+
+        good = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "base_rate": {"k": 2, "n": 10, "ref_class": "ref"},
+                    "posterior_prob": 0.25,
+                }
+            )
+            + "\n```"
+        )
+        # This rationale would previously drop entirely because of the null
+        # criteria_clauses; after strip-and-retry it contributes to the
+        # base_rate blend.
+        recovered = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "base_rate": {"k": 6, "n": 10, "ref_class": "ref"},
+                    "posterior_prob": 0.55,
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        blocks = _parse_all_blocks([good, recovered], "binary")
+        assert len(blocks) == 2  # both survive — invariant restored
+        lines = _aggregate_binary_lines([0.25, 0.55], [b for b in blocks if isinstance(b, BinaryStructured)])
+        blend_line = next((line for line in lines if "Blended base rate" in line), None)
+        assert blend_line is not None
+        # Blend should reflect BOTH forecasters (n=2), not just the well-formed one.
+        assert "2 forecasters" in blend_line
 
 
 class TestNumericStructuredHappyPath:

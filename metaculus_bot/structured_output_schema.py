@@ -518,6 +518,39 @@ def parse_structured_block(
     try:
         return model_cls.model_validate(payload)  # type: ignore[return-value]
     except ValidationError as exc:
+        # Strip-and-retry for malformed BINARY telemetry (2026-07-08). The
+        # ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY
+        # ONLY — nothing in the pipeline reads them to clamp or mutate a
+        # forecast. But without this branch, a malformed anchor / clauses
+        # payload (canonical failure modes: ``criteria_clauses: null`` even
+        # though the prompt says "omit"; a reversed ``{low > high}`` anchor)
+        # would make us drop the ENTIRE block — including a perfectly good
+        # posterior_prob — silently disappearing the forecaster's base-rate
+        # blend and prior/posterior contributions from the cross-model
+        # aggregation. That would let a pure formatting bug in a telemetry
+        # field shift stacker input, violating the telemetry rollout's
+        # zero-behavior-change invariant.
+        #
+        # NOT a schema-wide before-validator: those silently coerce bad
+        # clause probs and miss the reversed-anchor case. Retry with only
+        # the telemetry fields dropped, so any error in a core field
+        # (posterior_prob, prior, base_rate, hazard, evidence, scenarios)
+        # still surfaces via the None return.
+        _TELEMETRY_FIELDS = {"base_rate_anchor", "criteria_clauses"}
+        if question_type == "binary" and _TELEMETRY_FIELDS & payload.keys():
+            stripped_keys = sorted(_TELEMETRY_FIELDS & payload.keys())
+            stripped_payload = {k: v for k, v in payload.items() if k not in _TELEMETRY_FIELDS}
+            try:
+                retry = model_cls.model_validate(stripped_payload)  # type: ignore[assignment]
+            except ValidationError:
+                pass
+            else:
+                logger.warning(
+                    "Dropping malformed telemetry fields %s and keeping core binary block (original error: %s)",
+                    stripped_keys,
+                    exc,
+                )
+                return retry  # type: ignore[return-value]
         logger.warning(
             "Structured block failed validation for question_type=%s: %s",
             question_type,

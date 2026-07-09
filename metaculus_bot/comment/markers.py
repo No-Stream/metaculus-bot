@@ -75,12 +75,20 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 
 # Per-forecaster anchor / clause telemetry markers (2026-07-08). Emitted by
 # ``tool_runner._run_binary_tools`` inside each forecaster's "## Computed
-# quantities" block (which flows into the published comment's R1 rationale
-# sections), NOT in the per-question trailer — the quantities are
-# per-forecaster, so the trailer would be ambiguous. TELEMETRY ONLY: the
-# residual-analysis collector extracts these to measure anchor overshoot and
-# clause-product divergence against outcomes; nothing in the pipeline reads
-# them back to clamp or mutate a forecast.
+# quantities" block, which is gated behind the ``PROBABILISTIC_TOOLS_ENABLED``
+# env flag: ``run_tools_for_forecaster`` returns an empty string when the
+# flag is false-y (see ``tool_runner.py``). All three prod workflows pin the
+# flag to ``'false'``
+# (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
+# so these HTML-comment markers are currently DORMANT in published prod
+# comments. What DOES land in every prod R1 rationale — regardless of the
+# flag — is the raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
+# forecaster writes into its own STRUCTURED FORECAST block; residual-replay
+# tooling should key off that raw JSON today and can compute the same
+# overshoot / divergence numbers offline. The markers below become the
+# primary channel only if ``PROBABILISTIC_TOOLS_ENABLED`` is ever flipped on.
+# TELEMETRY ONLY either way: nothing in the pipeline reads these back to
+# clamp or mutate a forecast.
 ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
 CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"
 

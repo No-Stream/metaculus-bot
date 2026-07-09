@@ -230,8 +230,16 @@ def clause_product_divergence_pp(posterior_prob: float, clause_probs: list[float
 def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
     """Neutral telemetry lines + HTML markers for anchor / clause declarations.
 
-    Emitted into the per-forecaster "Computed quantities" section (which
-    flows into the published comment) so residual analysis can extract them.
+    Emitted into the per-forecaster "Computed quantities" section built by
+    ``run_tools_for_forecaster``, which is gated behind
+    ``PROBABILISTIC_TOOLS_ENABLED`` (all three prod workflows pin the flag
+    to ``'false'`` today, so these lines and their ``ANCHOR_OVERSHOOT_PP`` /
+    ``CLAUSE_PRODUCT_DIVERGENCE_PP`` HTML markers are dormant in prod
+    comments). The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
+    forecaster writes into its own STRUCTURED FORECAST block DOES land in
+    every published R1 rationale regardless of the flag; the same overshoot
+    / divergence math is trivially replayable offline from that JSON.
+
     NO forecast mutation anywhere — the 2026-07-08 experiments buried the
     clamp variant; only the >15pp-overshoot *measurement* survived.
     """
