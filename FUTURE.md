@@ -499,9 +499,67 @@ cohort.
 Blocked on: STACKER_OUTCOME marker fix (Priority 1A in NEXT_SESSION_QUEUE.md), then
 ≥30 stacked records under the new marker, before this can be tested. Defer.
 
+### Per-forecaster critic/revision pass (added 2026-07-08, medium priority)
+
+An unconditional adversarial critic reviews each forecaster's draft against a resolution-criteria
+checklist BEFORE aggregation — window discipline (does the resolution window actually cover the
+event?), already-resolved-events-don't-count (an event before the window opened cannot resolve
+the question), listing/instrument bar (does the specific instrument or ticker named in the
+question exist and clear the criteria?), blind-spot pricing (did the model implicitly assume
+a fact it should have priced). The forecaster then answers the critic point-by-point and
+re-issues its forecast, with the revision capped at ±20% from the original draft to prevent
+over-swing on a single critic pass.
+
+**Evidence.** Laertes (summer futureeval-2026 #4 slot) runs this critic pass on all forecasters.
+The most striking single data point is qid 42024: Laertes's Forecaster 1 initially drafted 97%
+(the exact number we published) and the critic reversed it to 4% pre-publication after flagging
+that the "resolving" event fell outside the question's open window. GreeneiBot2 (spring-aib-2026
+#1 slot) runs capped critique rounds with similar structure. Two independent top bots
+converging on this pattern is a notable signal.
+
+**Caveat (explicit).** The demonstrated evidence is on **degenerate** failures — pre-open-window
+event traps and similar resolution-criteria misreads where a critic pass mechanically catches a
+model applying the wrong reference class. Generalizing to non-degenerate misses (routine
+mid-range calibration errors, close-call disagreements) is **unproven** and would require a
+proper paid backtest (`make backtest_medium`-class ablation of critic-on vs. critic-off on a
+mixed cohort) before shipping. Cost is ~1 extra LLM call per forecaster per question, so at
+6 forecasters × ~250 Qs/tournament this is a non-trivial but not-huge line item.
+
+**Distinct from the stacker (which was benchmarked and rejected).** The stacker is a *post-hoc
+aggregate rewrite* — one meta-model looks at the N base forecasts and produces a single
+consolidated number, which the ablation showed ties MEDIAN on binary and loses on numeric. The
+critic pass here acts **per-member BEFORE aggregation** with a **bounded revision** (±20%),
+which is a structurally different lever — it hardens each base forecast against a checklist of
+known reasoning traps rather than trying to arbitrate a disagreement after the fact.
+
+**Gate before shipping:** `make backtest_medium` on a mixed-question cohort, primary metric peer
+score, secondary metric Brier / CRPS. Look for: (a) improvement or no regression on the
+"degenerate-failure" subset (window-trap, listing-bar, already-resolved cases — the demonstrated
+class); (b) no regression on non-degenerate misses (the unproven-generalization class). If (a)
+lands but (b) shows regression, ship it as a **conditional** critic (fires only when the
+question exhibits pre-open-event / listing-bar / criteria-mismatch flags) rather than
+unconditionally.
+
 ## Medium-term (requires more exploration)
 
-### Dependency hygiene: version-floor bumps + uv migration (added 2026-06-01)
+### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
+
+Motivated by the qid 42304 INES miss: the then-native-search provider (`x-ai/grok-4.1-fast`,
+since retired) cited a real but undated-URL NucNet archive article from 1 Feb 1999 (the
+1998–99 Istanbul INES-3 accident) and presented it as a "February 2026" Turkish event with a
+fabricated "reported March 1, 2026" date — likely cross-contaminated from an adjacent 2026
+search result. All five forecasters anchored on it (81% published; resolved NO; peer −115.9).
+The same phantom claim independently reached at least two top-competitor research stacks, so
+this is a field-wide hazard of undated archive URLs, not a one-off provider quirk.
+
+Idea: a free, offline audit pass over `backtests/research_archive/latest/` — sample research
+texts per provider, spot-check high-leverage factual claims (dates, event existence, numbers)
+against their cited URLs, and classify error modes (temporal displacement, fabricated dates,
+certainty inflation by the summarizer). Output: per-provider error-rate estimates + a list of
+recurring hazard patterns to feed prompt/summarizer hardening. Low priority — the offending
+provider is gone and prompt-side mitigations (date-stamping relative to question open date,
+single-source claim flagging) are the nearer-term lever — but worth doing before trusting any
+new research provider swap.
 
 Deferred from the 2026-06-01 desloppify code-health pass (which did only behavior-neutral pyproject hygiene: dropped unused `python-decouple`, removed the unused `litellm[proxy]` extra, declared the directly-imported `scipy`/`pandas`/`pydantic` that were previously only transitive via `forecasting-tools`).
 
