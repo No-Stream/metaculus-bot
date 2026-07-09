@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
+    BaseRateAnchor,
     BinaryStructured,
+    CriteriaClause,
     DiscreteCountStructured,
     EvidenceItem,
     MultipleChoiceStructured,
@@ -153,6 +155,9 @@ class TestBinaryStructuredHappyPath:
         assert b.hazard is None
         assert b.evidence == []
         assert b.scenarios == []
+        # Telemetry fields are optional — old blocks without them parse fine.
+        assert b.base_rate_anchor is None
+        assert b.criteria_clauses == []
 
     def test_posterior_out_of_range(self) -> None:
         with pytest.raises(ValidationError):
@@ -164,6 +169,64 @@ class TestBinaryStructuredHappyPath:
             # Pydantic's extra="forbid" rejects it. Static-typing complaint is
             # expected and correct; we care about the runtime behavior.
             BinaryStructured(question_type="binary", posterior_prob=0.5, unknown_field="oops")  # type: ignore[call-arg]
+
+
+class TestBinaryTelemetryFields:
+    """Optional anchor / clause telemetry fields (2026-07-08).
+
+    Back-compat contract: blocks WITHOUT the fields must keep parsing (see
+    ``TestBinaryStructuredHappyPath.test_only_required_fields``); blocks WITH
+    them round-trip; malformed values are rejected by validation.
+    """
+
+    def test_anchor_and_clauses_round_trip(self) -> None:
+        payload = json.dumps(
+            {
+                "question_type": "binary",
+                "posterior_prob": 0.42,
+                "base_rate_anchor": {"low": 0.15, "high": 0.35},
+                "criteria_clauses": [
+                    {"name": "formal instrument signed", "prob": 0.6},
+                    {"name": "in-window", "prob": 0.8},
+                ],
+            }
+        )
+        block = parse_structured_block(f"```json\n{payload}\n```", "binary")
+        assert isinstance(block, BinaryStructured)
+        assert block.base_rate_anchor is not None
+        assert block.base_rate_anchor.low == pytest.approx(0.15)
+        assert block.base_rate_anchor.high == pytest.approx(0.35)
+        assert [c.name for c in block.criteria_clauses] == ["formal instrument signed", "in-window"]
+        assert [c.prob for c in block.criteria_clauses] == [pytest.approx(0.6), pytest.approx(0.8)]
+
+    def test_old_block_without_telemetry_fields_still_parses(self) -> None:
+        payload = json.dumps({"question_type": "binary", "posterior_prob": 0.28})
+        block = parse_structured_block(f"```json\n{payload}\n```", "binary")
+        assert isinstance(block, BinaryStructured)
+        assert block.base_rate_anchor is None
+        assert block.criteria_clauses == []
+
+    def test_anchor_low_above_high_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=0.6, high=0.4)
+
+    def test_anchor_bounds_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=-0.1, high=0.4)
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=0.1, high=1.4)
+
+    def test_clause_prob_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CriteriaClause(name="threshold met", prob=1.2)
+
+    def test_clause_empty_name_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CriteriaClause(name="", prob=0.5)
+
+    def test_degenerate_point_anchor_allowed(self) -> None:
+        anchor = BaseRateAnchor(low=0.3, high=0.3)
+        assert anchor.low == anchor.high == pytest.approx(0.3)
 
 
 class TestNumericStructuredHappyPath:

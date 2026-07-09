@@ -10,6 +10,7 @@ Verifies that the orchestrator:
 """
 
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,7 @@ def question() -> MagicMock:
     q.page_url = "https://metaculus.com/questions/42"
     q.resolution_criteria = "Resolves YES if X happens"
     q.fine_print = ""
+    q.open_time = datetime(2026, 3, 15)
     return q
 
 
@@ -145,6 +147,41 @@ class TestAskNewsSummarization:
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_open_date_and_window_stamping_rules(self, orchestrator, question):
+        """Summarizer hardening (2026-07-08): the prompt must (a) state the
+        question's open date, (b) demand PRE-WINDOW / IN-WINDOW stamping of
+        every dated fact, and (c) carry the single-source rule."""
+        with patch.object(
+            orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"
+        ) as invoke:
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert invoke.await_args is not None
+        prompt = invoke.await_args.args[0]
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        collapsed = " ".join(prompt.split())
+        # (a) Open date threaded from the question object (fixture: 2026-03-15).
+        assert "2026-03-15" in prompt
+        assert "opened on 2026-03-15" in collapsed
+        # (b) Window-stamping rule with both labels; pre-window facts stay as base-rate evidence.
+        assert "[PRE-WINDOW — occurred before question open, cannot trigger resolution]" in collapsed
+        assert "[IN-WINDOW]" in collapsed
+        assert "base-rate" in collapsed
+        assert "NEVER present a pre-window event as satisfying the resolution criteria" in collapsed
+        # (c) Single-source rule: label + carry hedges + no promotion to confirmed.
+        assert "[SINGLE-SOURCE]" in collapsed
+        assert "hedges" in collapsed
+        assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
+
+    @pytest.mark.asyncio
+    async def test_missing_open_time_asserts(self, orchestrator, question):
+        """Missing open_time is a data bug — fail loudly (matches the
+        _forecasting_window_str contract), never silently skip stamping."""
+        question.open_time = None
+        with pytest.raises(AssertionError):
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
 
     @pytest.mark.asyncio
     async def test_empty_research_skips_summarizer(self, orchestrator, question):
