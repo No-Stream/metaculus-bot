@@ -419,9 +419,8 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
             • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers. Adjust only with specific new evidence, not vibe.
-            • Hedge audit: if your reasoning makes a clear case that one option dominates, but your final distribution flattens it out of general conservatism, you are losing points. Log score rewards commitment to well-reasoned distributions. Only spread mass toward weaker options when you can name specific evidence that makes them plausible, not because it feels safer.
+            • Calibration audit: if one option is genuinely dominant, commit to it — don't flatten a well-supported favorite out of general conservatism; under-committing to strong favorites costs points. Hedge by keeping honest probability on plausible residual outcomes ("Other", "no decision", "none of the above", record-extreme buckets) — that is where surprises actually land — not by spreading mass across the board.
             Remember:
-            • Good forecasters leave a little probability on most options and avoid overconfidence.
             • Use integers 1%-99% (no 0 % or 100 %).
             • They must sum to 100 %.
 
