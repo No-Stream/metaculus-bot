@@ -85,7 +85,13 @@ either). Instead:
   `_check_too_far_from_bounds` (25% wiggle) may conflict with our beyond-range open-bound
   percentile design. Unlocks the litellm/cryptography CVE fixes below.
 - **Deferred:** JSON-block-as-authoritative for binary/MC — gated on Workstream A's shadow
-  data, decide at a round boundary.
+  data, decide at a round boundary. **Concrete trigger (operator, 2026-07-08): once ~50
+  questions of shadow divergence data exist, check parser-vs-block agreement; if the
+  structured block is reliably consistent (near-zero divergence, no missing-block cases the
+  parser rescued), promote the block to authoritative and drop the parser LLM call for
+  binary/MC — no reason to burn LLM calls (however cheap) on parsing that deterministic
+  block-reads handle.** Numeric keeps the parser longer (percentile extraction is the
+  hard case; the F5 block-lift fallback already covers block-only rationales).
 
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
