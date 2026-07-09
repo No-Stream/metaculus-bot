@@ -540,6 +540,15 @@ lands but (b) shows regression, ship it as a **conditional** critic (fires only 
 question exhibits pre-open-event / listing-bar / criteria-mismatch flags) rather than
 unconditionally.
 
+**Update 2026-07-08 (pt2 acid test):** down-scoped. On the two non-degenerate consensus misses
+(41800 / 42855), advisory critique captured ~0 points even when it diagnosed the exact defect;
+only BINDING corrections moved numbers. If built, the critic must emit a bounded numeric
+adjustment / floor / cap that is mechanically applied in aggregation — not prose. Sequence AFTER
+the free offline counterfactuals of the deterministic guards (anchor-floor, no-market cap,
+signed haircut), which capture most of the demonstrated value at zero cost. Honest ceiling:
+~30–60 spot-peer points of damage limitation on consensus misses, no flips. See
+`scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3.
+
 ## Medium-term (requires more exploration)
 
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
@@ -845,6 +854,35 @@ here so future sessions don't re-recommend them without new data.
   ~0.7 questions average. Noise dominates. Stick with the 1D predicted-bucket cut.
 - **MC per-model audit** — per-model MC predictions don't survive in stored
   comments. Would require collector changes for n=24/round. Not worth it.
+
+## Killed by July 2026-07-08 residual + competitor analysis
+
+- **YES-side shrink / any fitted directional calibration layer** — the P6 YES-overconfidence
+  finding is real on pooled data but era-local (spring-2026 only; fall confident-YES buckets
+  are ~100% accurate). All three pre-registered stability criteria failed; a fit-on-two-eras
+  layer degraded held-out fall performance (+4.3e-3 mean Brier). Receipts:
+  `scratch/residual_2026-07-08/experiments/ARM_B_FINDINGS.md`. One sub-finding survives as a
+  hard rule: symmetric shrink was strictly worse in every era — never touch the NO side.
+- **Anchor-guard as a clamp/gate** — models publish outside their own stated base-rate anchor
+  on ~88% of forecasts (that is the normal outside → inside update, not a bug); precision on
+  a binary "flag it" gate is ≤29% and the sign of the effect flips across eras. Surviving
+  fragment: overshoot MAGNITUDE >15pp degrades Brier monotonically in both well-powered eras,
+  so ship it as telemetry plus a prompt nudge only (telemetry shipped 2026-07-08). Receipts:
+  `scratch/residual_2026-07-08/experiments/ARM_A_FINDINGS.md`.
+- **Advisory (non-binding) critic passes** — pt2 natural experiment: GreeneiBot2's critique
+  diagnosed our exact 41800 defect verbatim and the number never moved; laertes's correct
+  42855 reference-class recomputation was half-overridden by its own forecasters. Corrections
+  that BIND (formula/floor/structural) captured 30–130 spot-peer points; advisory captured
+  ~0. Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md`. The critic-pass Near-term
+  entry stays, but in binding-output form only.
+- **Fixed-direction haircuts** — GreeneiBot2's always-downward haircut was best-of-group on
+  42855 AND actively harmful on 41800 (it extremized a 12 down to 10 on a YES resolution).
+  Any damping mechanism must push toward 0.5, not in a fixed direction. Consistent with the
+  already-killed one-sided anti-overprediction shave.
+- **"Median drowns the correct dissenter"** (re-confirmed dead) — the 7/9 washouts framing is
+  survivorship bias; median remains at the non-oracle frontier per dim_peer-calibration across
+  two additional pulls; and even laertes's 41800 "win" discarded its own best member and was
+  saved by its floor, not by aggregation.
 
 ## Instrumentation bugs
 
