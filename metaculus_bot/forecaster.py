@@ -52,7 +52,6 @@ from metaculus_bot.research.providers import (
     ResearchCallable,
 )
 from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
-from metaculus_bot.shadow_divergence import log_parser_vs_block_divergence
 from metaculus_bot.spread_metrics import compute_spread
 
 # Probabilistic-tools wiring (Workstream C activation). The feature flag is
@@ -929,14 +928,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if computed_md:
             prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
 
-        # A0: Shadow divergence — compare post-processed prediction value vs JSON block declaration.
-        # Observability only; never affects prediction path.
-        log_parser_vs_block_divergence(
-            question=question,
-            prediction_value=prediction.prediction_value,
-            reasoning=prediction.reasoning,
-            model_name=actual_llm.model,
-        )
+        # A0 shadow-divergence logging lives in the runners (forecaster_runners.py),
+        # where the raw parser extraction still exists pre-clamp/renormalize/sanitize (F6).
 
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern

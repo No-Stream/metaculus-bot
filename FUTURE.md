@@ -104,10 +104,8 @@ Follow-ups:
    (Gemini `url_context` or OpenAI native-search URL-read).
    **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
    (added 2026-06-28) — no point building on url_context until we know it fires.
-4. **LOW — minor follow-ups from review, explicitly deferred:** module split of
-   `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`); key the per-host politeness
-   semaphore on the original netloc across redirect chains (politeness-only, not a correctness
-   issue); simplify `_host_from_netloc` to `urlparse().hostname`.
+4. **LOW — minor follow-up from review, explicitly deferred:** module split of
+   `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
 
 ### Parser hardening + forecasting-tools upgrade path (added 2026-07-07)
 

@@ -16,8 +16,10 @@ Design anchors:
   URL and ~62.5% of them are recoverable by a plain browser-headers fetch.
 - Extraction is trafilatura in a thread (`asyncio.to_thread`) — the parse is
   CPU-bound sync C code.
-- Per-host politeness: one `asyncio.Semaphore(1)` per netloc. Distinct hosts
-  run concurrently up to the connector limit.
+- Per-host politeness: one `asyncio.Semaphore(1)` per netloc, acquired around
+  each redirect hop's GET and keyed on THAT hop's host — so chains converging
+  on one final host still serialize there. Distinct hosts run concurrently up
+  to the connector limit.
 - Char caps apply to RAW (non-LLM-processed) content only; the LLM-emitted
   research bundle is never truncated (see the resolution-source plan).
 """
@@ -439,14 +441,38 @@ _RAW_TEXT_CONTENT_TYPES = ("text/plain", "text/csv")
 _JSON_CONTENT_TYPES = ("application/json",)
 
 
-async def _fetch_one(session: Any, url: str, host_sem: asyncio.Semaphore) -> FetchResult:
-    """Fetch a single URL under a per-host semaphore.
+def _sem_for_host(host_sems: dict[str, asyncio.Semaphore], url: str) -> asyncio.Semaphore:
+    """Get-or-create the ``Semaphore(1)`` for ``url``'s netloc.
+
+    Every task in one :func:`fetch_resolution_sources` run shares the same
+    ``host_sems`` map, so every request to a given host — original URL or
+    redirect hop — contends on the same semaphore object.
+    """
+    host = urlparse(url).netloc
+    sem = host_sems.get(host)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        host_sems[host] = sem
+    return sem
+
+
+async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaphore]) -> FetchResult:
+    """Fetch a single URL, holding the per-host politeness semaphore hop by hop.
 
     Content-type routing:
       * HTML → trafilatura extraction (via to_thread) + JS-wall check.
       * JSON → capped raw body, no pretty-print (the data IS the content).
       * text/plain, text/csv → capped raw body.
-      * anything else (PDF/binary) → ``unsupported_type``, body NOT read.
+      * anything else (PDF/binary) — including a missing/empty Content-Type
+        header, by design — → ``unsupported_type``, body NOT read.
+
+    Politeness: each hop acquires the semaphore for THAT hop's host around its
+    single GET (+ body read on terminal responses) and releases it before
+    following a redirect. Keying per hop — not on the original URL's host —
+    preserves one-request-per-host when chains from different initial hosts
+    converge on the same final host; the strict per-hop acquire/release
+    pairing means an A→B→A chain never re-acquires a semaphore it still holds
+    (asyncio semaphores are not reentrant).
 
     SSRF guard: rejects non-public URLs (private / loopback / link-local IPs,
     userinfo tricks, non-http(s) schemes) BEFORE any network I/O and again on
@@ -458,24 +484,26 @@ async def _fetch_one(session: Any, url: str, host_sem: asyncio.Semaphore) -> Fet
 
     No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``.
     """
-    async with host_sem:
-        # Guard the initial URL before any network I/O.
-        if not await is_public_http_url(url):
-            logger.warning(f"resolution_source ssrf_blocked (initial url): {urlparse(url).netloc}")
-            return FetchResult(
-                url=url,
-                status="ssrf_blocked",
-                text="",
-                http_status=None,
-                content_type=None,
-            )
+    # Guard the initial URL before any network I/O.
+    if not await is_public_http_url(url):
+        logger.warning(f"resolution_source ssrf_blocked (initial url): {urlparse(url).netloc}")
+        return FetchResult(
+            url=url,
+            status="ssrf_blocked",
+            text="",
+            http_status=None,
+            content_type=None,
+        )
 
-        current_url = url
-        # Bounded redirect loop. Each iteration issues ONE GET with
-        # allow_redirects=False; a redirect status resolves the Location, re-
-        # guards, and loops. Non-redirect responses fall through to the normal
-        # content-type routing below.
-        for _hop in range(_MAX_REDIRECTS + 1):
+    current_url = url
+    # Bounded redirect loop. Each iteration issues ONE GET with
+    # allow_redirects=False under the current hop's host semaphore; a redirect
+    # status resolves the Location, re-guards, and loops (`continue` unwinds
+    # both context managers, releasing the semaphore before the next hop
+    # acquires its own — no nesting, so no self-deadlock on revisited hosts).
+    # Non-redirect responses fall through to the content-type routing below.
+    for _hop in range(_MAX_REDIRECTS + 1):
+        async with _sem_for_host(host_sems, current_url):
             try:
                 async with session.get(current_url, allow_redirects=False) as resp:
                     netloc = urlparse(current_url).netloc
@@ -606,6 +634,11 @@ async def _fetch_one(session: Any, url: str, host_sem: asyncio.Semaphore) -> Fet
                         )
 
                     # Anything else — PDF, images, etc. Do NOT read the body.
+                    # INTENDED limitation: a 200 OK with a missing/empty Content-Type header
+                    # also lands here (ct='') and is dropped unread. Real resolution sources
+                    # send Content-Type; content-sniffing would re-open the don't-read-unknown-
+                    # bodies posture for a case that mostly can't happen. The per-URL
+                    # FetchStatus is the Tier-2 seam if logs ever show `unsupported_type ct=''`.
                     logger.info(f"resolution_source fetched {netloc} (unsupported_type ct={content_type!r})")
                     return FetchResult(
                         url=current_url,
@@ -624,23 +657,26 @@ async def _fetch_one(session: Any, url: str, host_sem: asyncio.Semaphore) -> Fet
                     content_type=None,
                 )
 
-        # Fell out of the loop -> exceeded _MAX_REDIRECTS.
-        logger.info(f"resolution_source redirect chain exceeded {_MAX_REDIRECTS} hops (final={current_url})")
-        return FetchResult(
-            url=current_url,
-            status="error",
-            text="",
-            http_status=None,
-            content_type=None,
-        )
+    # Fell out of the loop -> exceeded _MAX_REDIRECTS.
+    logger.info(f"resolution_source redirect chain exceeded {_MAX_REDIRECTS} hops (final={current_url})")
+    return FetchResult(
+        url=current_url,
+        status="error",
+        text="",
+        http_status=None,
+        content_type=None,
+    )
 
 
 async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
-    """Fetch each URL under a per-netloc Semaphore(1).
+    """Fetch each URL under per-netloc Semaphore(1) politeness.
 
     Distinct hosts run concurrently up to the connector limit; same-host
-    URLs serialize (politeness — e.g. StatCan asks Crawl-delay: 2). Session
-    is closed in ``finally``.
+    requests serialize (politeness — e.g. StatCan asks Crawl-delay: 2). The
+    shared ``host_sems`` map is handed to every ``_fetch_one`` task so each
+    redirect hop contends on ITS host's semaphore — chains from different
+    initial hosts that converge on one final host still serialize there.
+    Session is closed in ``finally``.
 
     Teardown race guard (F5): the outer factory wraps this call in
     ``asyncio.wait_for``. When the wall-clock timeout fires, wait_for cancels
@@ -653,17 +689,9 @@ async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
     """
     host_sems: dict[str, asyncio.Semaphore] = {}
 
-    def _sem_for(url: str) -> asyncio.Semaphore:
-        host = urlparse(url).netloc
-        sem = host_sems.get(host)
-        if sem is None:
-            sem = asyncio.Semaphore(1)
-            host_sems[host] = sem
-        return sem
-
     session_cm = _get_session()
     async with session_cm as session:
-        tasks = [asyncio.create_task(_fetch_one(session, u, _sem_for(u))) for u in urls]
+        tasks = [asyncio.create_task(_fetch_one(session, u, host_sems)) for u in urls]
         try:
             results = await asyncio.gather(*tasks, return_exceptions=False)
             return list(results)

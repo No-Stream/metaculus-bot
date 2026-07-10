@@ -1,4 +1,4 @@
-"""A0 shadow-divergence logging: JSON block vs post-processed prediction.
+"""A0 shadow-divergence logging: JSON block vs RAW parser extraction.
 
 Extracted from ``forecaster.py`` (F3) so the comparator lives in a small,
 importable module instead of bloating the bot class's file. Observability
@@ -10,9 +10,9 @@ to the authoritative prediction source.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from forecasting_tools import MetaculusQuestion
+from forecasting_tools import MetaculusQuestion, PredictedOptionList
+from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
@@ -28,36 +28,37 @@ logger = logging.getLogger(__name__)
 
 def log_parser_vs_block_divergence(
     question: MetaculusQuestion,
-    prediction_value: Any,
+    raw_parser_value: float | PredictedOptionList | list[Percentile] | None,
     reasoning: str,
     model_name: str,
 ) -> None:
-    """Compare the JSON block's declared values against the POST-PROCESSED prediction value.
+    """Compare the JSON block's declared values against the RAW parser extraction.
 
-    Logs a structured INFO line per forecaster per question. This is observability
-    only — it NEVER affects the prediction pipeline. Wrapped in a broad except so
-    any failure is logged at WARNING and swallowed — a systematic bug in this
-    comparison would otherwise be invisible and quietly bias the A0 read-out
-    toward "no drift observed" (F10).
+    Called from the three runners in ``forecaster_runners`` at the point where
+    the parser output still exists untouched by post-processing (F6):
 
-    Caveats:
-        ``prediction_value`` is the pipeline's post-processed output, NOT the raw
-        parser extraction, so ``max_abs_diff`` folds in deterministic
-        post-processing on top of any true parser-vs-block drift:
+    - binary: the raw ``prediction_in_decimal`` float, BEFORE the
+      [BINARY_PROB_MIN, BINARY_PROB_MAX] clamp;
+    - multiple choice: the parsed ``PredictedOptionList``, BEFORE
+      ``clamp_and_renormalize_mc`` (on the fallback parse path, the
+      ``build_mc_prediction`` output — the closest-to-raw value available);
+    - numeric: the parser's raw ``list[Percentile]``, BEFORE
+      ``sanitize_percentiles`` / distribution building. ``None`` (parser
+      failed) logs ``max_abs_diff=N/A``. Keys are percentile labels
+      (0.1/0.5/0.9, ...), matching the block's ``declared_percentiles`` keys
+      — unlike the post-processed distribution, whose discrete resampling
+      rekeyed onto cumulative CDF probabilities and made the comparison
+      meaningless on DISCRETE questions.
 
-        - Binary: per-model clamping to [BINARY_PROB_MIN, BINARY_PROB_MAX]
-          (``forecaster_runners.py``) — a block at 0.995 vs a clamped 0.98 reads
-          as 0.015 divergence at the extremes.
-        - Numeric: ``declared_percentiles`` have been through
-          ``sanitize_percentiles`` (jitter, cluster spreading, bound clamping)
-          and ``widen_declared_percentiles``.
-        - Discrete numeric: the distribution is resampled onto a CDF grid whose
-          keys are cumulative probabilities, not the declared percentile labels,
-          so the key spaces don't match and numeric divergence values on
-          DISCRETE questions are NOT meaningful.
+    ``max_abs_diff`` therefore reflects TRUE parser-vs-block drift; no
+    deterministic post-processing (clamps, renormalization, jitter, discrete
+    CDF resampling) is folded in.
 
-        Interpreting near-zero divergence as "parser and block agree" is safe;
-        interpreting non-zero divergence requires netting out these effects.
+    Logs a structured INFO line per forecaster per question. This is
+    observability only — it NEVER affects the prediction pipeline. Wrapped in
+    a broad except so any failure is logged at WARNING and swallowed — a
+    systematic bug in this comparison would otherwise be invisible and
+    quietly bias the A0 read-out toward "no drift observed" (F10).
     """
     try:
         q_type_str = question_type_of(question)
@@ -74,16 +75,16 @@ def log_parser_vs_block_divergence(
         max_abs_diff: float | None = None
 
         if block is not None:
-            if isinstance(block, BinaryStructured) and isinstance(prediction_value, float):
-                max_abs_diff = abs(block.posterior_prob - prediction_value)
+            if isinstance(block, BinaryStructured) and isinstance(raw_parser_value, float):
+                max_abs_diff = abs(block.posterior_prob - raw_parser_value)
 
-            elif isinstance(block, MultipleChoiceStructured) and hasattr(prediction_value, "predicted_options"):
-                # Build a dict from the pipeline's predicted options
+            elif isinstance(block, MultipleChoiceStructured) and isinstance(raw_parser_value, PredictedOptionList):
+                # Compare on canonicalized option names; options missing from
+                # one side default to 0.0.
                 parser_probs: dict[str, float] = {
-                    opt.option_name.strip().lower(): opt.probability for opt in prediction_value.predicted_options
+                    opt.option_name.strip().lower(): opt.probability for opt in raw_parser_value.predicted_options
                 }
                 block_probs: dict[str, float] = {k.strip().lower(): v for k, v in block.option_probs.items()}
-                # Compare matching options; max over all
                 diffs: list[float] = []
                 all_keys = set(parser_probs.keys()) | set(block_probs.keys())
                 for key in all_keys:
@@ -92,28 +93,24 @@ def log_parser_vs_block_divergence(
                     diffs.append(abs(p_val - b_val))
                 max_abs_diff = max(diffs) if diffs else 0.0
 
-            elif isinstance(block, NumericStructured) and block.declared_percentiles:
-                # F5: compare block.declared_percentiles against the pipeline's
-                # post-processed prediction (PchipNumericDistribution's
-                # ``.declared_percentiles`` is a list[Percentile] in the same
-                # base-unit scale as the block). The previous rationale-text
-                # regex truncated unit suffixes (350B→350) and thousands
-                # separators (331,900,000→331), corrupting the A0 metric.
-                parser_declared = getattr(prediction_value, "declared_percentiles", None)
-                if parser_declared:
-                    parser_pctiles: dict[float, float] = {float(p.percentile): float(p.value) for p in parser_declared}
-                    diffs_numeric: list[float] = []
-                    for pct_key, block_val in block.declared_percentiles.items():
-                        parser_val = parser_pctiles.get(pct_key)
-                        if parser_val is None:
-                            # Tolerate small float-key drift between the two sources.
-                            for p_key, p_val in parser_pctiles.items():
-                                if abs(p_key - pct_key) < 0.001:
-                                    parser_val = p_val
-                                    break
-                        if parser_val is not None:
-                            diffs_numeric.append(abs(parser_val - block_val))
-                    max_abs_diff = max(diffs_numeric) if diffs_numeric else None
+            elif (
+                isinstance(block, NumericStructured)
+                and block.declared_percentiles
+                and isinstance(raw_parser_value, list)
+            ):
+                parser_pctiles: dict[float, float] = {float(p.percentile): float(p.value) for p in raw_parser_value}
+                diffs_numeric: list[float] = []
+                for pct_key, block_val in block.declared_percentiles.items():
+                    parser_val = parser_pctiles.get(pct_key)
+                    if parser_val is None:
+                        # Tolerate small float-key drift between the two sources.
+                        for p_key, p_val in parser_pctiles.items():
+                            if abs(p_key - pct_key) < 0.001:
+                                parser_val = p_val
+                                break
+                    if parser_val is not None:
+                        diffs_numeric.append(abs(parser_val - block_val))
+                max_abs_diff = max(diffs_numeric) if diffs_numeric else None
 
         qid = question.id_of_question
         logger.info(

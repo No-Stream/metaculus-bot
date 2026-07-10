@@ -7,6 +7,7 @@ TemplateForecaster methods they replaced.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -124,6 +125,44 @@ class TestRunBinaryForecast:
             result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert result.prediction_value == BINARY_PROB_MAX
+
+    @pytest.mark.asyncio
+    async def test_shadow_divergence_logged_with_raw_preclamp_value(
+        self, binary_question, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ):
+        """F6: the SHADOW_DIVERGENCE line compares the block against the RAW parser value.
+
+        Parser extracts 0.99 and the block declares 0.99 — perfect agreement.
+        The returned prediction is still clamped to BINARY_PROB_MAX (0.98), but
+        max_abs_diff must be 0.000000: under the old post-processed contract
+        the clamp manufactured a phantom 0.010000 divergence.
+        """
+        from forecasting_tools import BinaryPrediction
+
+        from metaculus_bot.constants import BINARY_PROB_MAX
+
+        caplog.set_level(logging.INFO, logger="metaculus_bot.shadow_divergence")
+        reasoning_text = 'Nearly certain.\n\n```json\n{"question_type": "binary", "posterior_prob": 0.99}\n```'
+
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="prompt"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value=reasoning_text)),
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                new=AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.99)),
+            ),
+        ):
+            result = await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert result.prediction_value == BINARY_PROB_MAX  # post-processing untouched
+        shadow_msgs = [r.getMessage() for r in caplog.records if "SHADOW_DIVERGENCE" in r.getMessage()]
+        assert len(shadow_msgs) == 1
+        msg = shadow_msgs[0]
+        assert "qid=1001" in msg
+        assert "model=test-forecaster" in msg
+        assert "type=binary" in msg
+        assert "block_valid=True" in msg
+        assert "max_abs_diff=0.000000" in msg
 
 
 class TestForecasterBroadRetry:

@@ -455,8 +455,7 @@ class TestFetchOne:
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://news.example.com/report", host_sem)
+        result = await _fetch_one(session, "https://news.example.com/report", {})
         assert result.status == "success"
         assert result.http_status == 200
         # Real trafilatura ran on the article — a known substring survives.
@@ -466,16 +465,14 @@ class TestFetchOne:
 
     async def test_403_maps_to_blocked(self):
         session = FakeSession({"https://blocked.example.com/x": FakeResponse(403, body=b"nope")})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://blocked.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://blocked.example.com/x", {})
         assert result.status == "blocked"
         assert result.http_status == 403
         assert result.text == ""
 
     async def test_404_maps_to_not_found(self):
         session = FakeSession({"https://gone.example.com/x": FakeResponse(404)})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://gone.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://gone.example.com/x", {})
         assert result.status == "not_found"
         assert result.http_status == 404
 
@@ -483,8 +480,7 @@ class TestFetchOne:
         # 200 OK but the extracted text is short: js_wall.
         tiny = b"<!doctype html><html><body><div id='root'></div></body></html>"
         session = FakeSession({"https://spa.example.com/x": FakeResponse(200, body=tiny, content_type="text/html")})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://spa.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://spa.example.com/x", {})
         assert result.status == "js_wall"
         assert result.http_status == 200
         assert result.text == ""
@@ -496,23 +492,20 @@ class TestFetchOne:
         session = FakeSession(
             {"https://big.example.com/x": FakeResponse(200, body=oversized, content_type="text/html")}
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://big.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://big.example.com/x", {})
         # read_body_capped returns None -> we mark as error (no readable body).
         assert result.status == "error"
         assert result.text == ""
 
     async def test_timeout_maps_to_error(self):
         session = FakeSession({"https://slow.example.com/x": asyncio.TimeoutError()})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://slow.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://slow.example.com/x", {})
         assert result.status == "error"
         assert result.http_status is None
 
     async def test_client_error_maps_to_error(self):
         session = FakeSession({"https://broken.example.com/x": aiohttp.ClientError("boom")})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://broken.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://broken.example.com/x", {})
         assert result.status == "error"
         assert result.http_status is None
 
@@ -522,8 +515,7 @@ class TestFetchOne:
         session = FakeSession(
             {"https://json.example.com/kev": FakeResponse(200, body=payload, content_type="application/json")}
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://json.example.com/kev", host_sem)
+        result = await _fetch_one(session, "https://json.example.com/kev", {})
         assert result.status == "success"
         assert result.content_type is not None and "json" in result.content_type
         assert result.text.startswith('{"vulnerabilities')
@@ -538,9 +530,21 @@ class TestFetchOne:
         session = FakeSession(
             {"https://pdf.example.com/doc": UnreadableResponse(200, body=b"", content_type="application/pdf")}
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://pdf.example.com/doc", host_sem)
+        result = await _fetch_one(session, "https://pdf.example.com/doc", {})
         assert result.status == "unsupported_type"
+        assert result.text == ""
+
+    async def test_missing_content_type_is_unsupported_type(self):
+        # INTENDED limitation (F13): a 200 OK served without a Content-Type
+        # header matches no routing prefix and is classified unsupported_type,
+        # body unread — real resolution sources always send Content-Type, and
+        # we deliberately don't content-sniff unknown bodies.
+        resp = FakeResponse(200, body=b"<html><body>hello there</body></html>")
+        del resp.headers["Content-Type"]
+        session = FakeSession({"https://noct.example.com/x": resp})
+        result = await _fetch_one(session, "https://noct.example.com/x", {})
+        assert result.status == "unsupported_type"
+        assert result.content_type is None
         assert result.text == ""
 
 
@@ -588,6 +592,59 @@ class TestFetchResolutionSources:
         assert session.host_peak.get("b.example.com", 0) == 1
         # Session was closed.
         assert session.closed is True
+
+    async def test_redirect_convergence_serializes_on_final_host(self, article_html, monkeypatch):
+        """F15 regression: two chains starting on DISTINCT hosts that both
+        redirect to the SAME final host must serialize there. Keying the
+        semaphore on the original URL's netloc (the old bug) gives each task
+        its own semaphore, so the shared final host sees concurrency 2."""
+
+        class SlowReadResponse(FakeResponse):
+            async def read(self) -> bytes:
+                # Keep the final-host GET context open long enough for the
+                # other task's GET to arrive — without per-hop semaphores the
+                # two windows overlap and host_peak records 2.
+                await asyncio.sleep(0.01)
+                return self._body
+
+        session = FakeSession(
+            {
+                "https://a.example.com/one": FakeResponse(302, headers={"Location": "https://c.example.com/final"}),
+                "https://b.example.com/two": FakeResponse(302, headers={"Location": "https://c.example.com/final"}),
+                "https://c.example.com/final": SlowReadResponse(200, body=article_html, content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await fetch_resolution_sources(
+            ["https://a.example.com/one", "https://b.example.com/two"],
+        )
+        assert [r.status for r in results] == ["success", "success"]
+        # The politeness guarantee holds at the CONVERGED host, not just the
+        # original ones: never more than one in-flight request to c.example.com.
+        assert session.host_peak["c.example.com"] == 1
+
+    async def test_redirect_revisiting_initial_host_does_not_deadlock(self, article_html, monkeypatch):
+        """A→B→A chain: strict per-hop acquire/release must never re-acquire a
+        semaphore the task still holds (asyncio semaphores are not reentrant).
+        wait_for turns a reentrancy regression into a fast TimeoutError
+        instead of hanging the suite."""
+        session = FakeSession(
+            {
+                "https://a.example.com/start": FakeResponse(302, headers={"Location": "https://b.example.com/mid"}),
+                "https://b.example.com/mid": FakeResponse(302, headers={"Location": "https://a.example.com/final"}),
+                "https://a.example.com/final": FakeResponse(200, body=article_html, content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        results = await asyncio.wait_for(
+            fetch_resolution_sources(["https://a.example.com/start"]),
+            timeout=5.0,
+        )
+        assert len(results) == 1
+        assert results[0].status == "success"
+        assert results[0].url == "https://a.example.com/final"
 
 
 # ---------------------------------------------------------------------------
@@ -738,8 +795,7 @@ class TestFetchOneSsrf:
         # Even if a broken handler is registered, the guard must reject before
         # session.get is ever called. Use a session with NO handlers to prove it.
         session = FakeSession({})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "http://169.254.169.254/latest/meta-data/", host_sem)
+        result = await _fetch_one(session, "http://169.254.169.254/latest/meta-data/", {})
         assert result.status == "ssrf_blocked"
         assert result.text == ""
         # http_status is None (no request ever made).
@@ -747,8 +803,7 @@ class TestFetchOneSsrf:
 
     async def test_direct_fetch_of_userinfo_url_is_ssrf_blocked(self):
         session = FakeSession({})
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://trusted@169.254.169.254/", host_sem)
+        result = await _fetch_one(session, "https://trusted@169.254.169.254/", {})
         assert result.status == "ssrf_blocked"
         assert result.http_status is None
 
@@ -766,8 +821,7 @@ class TestFetchOneSsrf:
                 ),
             }
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://redirect.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://redirect.example.com/x", {})
         assert result.status == "ssrf_blocked"
 
     async def test_single_redirect_to_public_page_succeeds(self, article_html):
@@ -784,8 +838,7 @@ class TestFetchOneSsrf:
                 "https://final.example.com/report": FakeResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://start.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://start.example.com/x", {})
         assert result.status == "success"
         # Final URL wins in the returned URL field so the section header points
         # readers at the actual page fetched, not the redirect stub.
@@ -805,8 +858,7 @@ class TestFetchOneSsrf:
         # Final target (never reached) — kept so no missing-handler AssertionError.
         handlers["https://hop7.example.com/"] = FakeResponse(200, body=b"<html><body>ok</body></html>")
         session = FakeSession(handlers)
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://hop0.example.com/", host_sem)
+        result = await _fetch_one(session, "https://hop0.example.com/", {})
         # Runaway redirect chain — reject conservatively. Either classification
         # is acceptable; the point is we don't follow past the cap or return success.
         assert result.status in ("error", "ssrf_blocked")
@@ -824,8 +876,7 @@ class TestFetchOneSsrf:
                 ),
             }
         )
-        host_sem = asyncio.Semaphore(1)
-        result = await _fetch_one(session, "https://noloc.example.com/x", host_sem)
+        result = await _fetch_one(session, "https://noloc.example.com/x", {})
         assert result.status == "error"
         assert result.text == ""
 
