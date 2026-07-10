@@ -264,8 +264,10 @@ def _format_asknews_dual_sections(
 def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         searcher = SmartSearcher(
+            # temperature ignored when model is a preconfigured GeneralLlm; None
+            # keeps litellm from applying a sampling param on the fallback str path.
             model=default_llm,
-            temperature=0,
+            temperature=None,
             num_searches_to_run=2,
             num_sites_per_search=10,
         )
@@ -284,7 +286,9 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         model_name = "openrouter/perplexity/sonar-reasoning-pro" if use_open_router else "perplexity/sonar-pro"
-        model = GeneralLlm(model=model_name, temperature=0.1)
+        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+        # defer to provider defaults. No top_p.
+        model = GeneralLlm(model=model_name, temperature=None)
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             "" if is_benchmarking else "In addition to news, consider all relevant prediction markets.\n"
@@ -316,10 +320,10 @@ def build_native_search_llm(
     / NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect
     without re-importing), UNLESS the caller passes an explicit ``reasoning_effort``
     / ``verbosity`` override — an explicit value always wins over the env read.
-    This lets the gap-fill resolver run at medium effort without perturbing the
-    main native_search provider, which stays on the env-driven LOW. An empty
-    string (from either the override or the env) disables passing the
-    corresponding kwarg.
+    This lets callers like the gap-fill resolver pin their own model/effort
+    without perturbing the main native_search provider, which stays on the
+    env-driven LOW. An empty string (from either the override or the env)
+    disables passing the corresponding kwarg.
     """
     from metaculus_bot.constants import (
         NATIVE_SEARCH_CONTEXT_SIZE,
@@ -329,9 +333,7 @@ def build_native_search_llm(
         NATIVE_SEARCH_MODEL_ENV,
         NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
         NATIVE_SEARCH_REASONING_EFFORT_ENV,
-        NATIVE_SEARCH_TEMPERATURE,
         NATIVE_SEARCH_TIMEOUT,
-        NATIVE_SEARCH_TOP_P,
         NATIVE_SEARCH_VERBOSITY_DEFAULT,
         NATIVE_SEARCH_VERBOSITY_ENV,
     )
@@ -341,8 +343,9 @@ def build_native_search_llm(
 
     kwargs: dict = dict(
         model=model_with_search,
-        temperature=NATIVE_SEARCH_TEMPERATURE,
-        top_p=NATIVE_SEARCH_TOP_P,
+        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+        # reasoning models defer to provider defaults. top_p left unset.
+        temperature=None,
         max_tokens=NATIVE_SEARCH_MAX_TOKENS,
         timeout=NATIVE_SEARCH_TIMEOUT,
         # allowed_tries=1: a malformed-whitespace response from OpenRouter (the

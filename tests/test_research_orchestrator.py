@@ -178,6 +178,9 @@ class TestAskNewsSummarization:
         assert "[SINGLE-SOURCE]" in collapsed
         assert "hedges" in collapsed
         assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
+        # (d) No-forecast rule (bench: sol-low appended its own probability table,
+        #     which would anchor the six downstream forecasters): evidence only.
+        assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
 
     @pytest.mark.asyncio
     async def test_missing_open_time_asserts(self, orchestrator, question):

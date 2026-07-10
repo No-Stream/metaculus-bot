@@ -2572,12 +2572,12 @@ class TestRealToolRunnerIntegration:
 
 class TestDefaultStackerWiredViaDonatedKey:
     """When callers pass ``stacker_llm=None`` we construct claude-opus-4.5
-    (primary) and gpt-5.5 (fallback) routed via ``build_llm_with_openrouter_fallback``
+    (primary) and gpt-5.6-sol (fallback) routed via ``build_llm_with_openrouter_fallback``
     so the Metaculus-donated key is tried before the operator's paid key.
 
     This mirrors production STACKER_LLM / STACKER_FALLBACK_LLM in
-    ``llm_configs.py``. The earlier iteration tried gpt-5.5 as primary, but
-    the operator's local-`.env` donated key data-policy blocks gpt-5.5;
+    ``llm_configs.py``. An earlier iteration tried an OpenAI model as primary,
+    but the operator's local-`.env` donated key data-policy blocked it;
     Anthropic models work cleanly. Production with a different
     ``OAI_ANTH_OPENROUTER_KEY`` GitHub-secret value behaved differently.
     """
@@ -2596,9 +2596,10 @@ class TestDefaultStackerWiredViaDonatedKey:
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake_paid")
 
         # Pin the new defaults at the constant level — primary is opus-4.5,
-        # fallback stays gpt-5.5 (different provider for independent failure mode).
+        # fallback is gpt-5.6-sol (different provider for independent failure
+        # mode; matches prod STACKER_FALLBACK_LLM post the 2026-07-09 migration).
         assert DEFAULT_STACKER_MODEL == "openrouter/anthropic/claude-opus-4.5"
-        assert DEFAULT_STACKER_FALLBACK_MODEL == "openrouter/openai/gpt-5.5"
+        assert DEFAULT_STACKER_FALLBACK_MODEL == "openrouter/openai/gpt-5.6-sol"
 
         captured_llms: list[Any] = []
 

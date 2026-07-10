@@ -19,16 +19,17 @@ Reads canonical (qid, model_slug) cache entries written by
 ``metaculus_bot.ablation.forecasters`` and dispatches to
 ``metaculus_bot.stacking.run_stacking_*``.
 
-Default stacker is ``openrouter/openai/gpt-5.5`` routed through
-``build_llm_with_openrouter_fallback`` so the Metaculus-donated OpenRouter
-key absorbs cost ahead of the operator's paid key. The wrapper handles
-donated→paid fallback on credit/auth/allowed-providers errors internally,
-so the outer primary→fallback chain in ``run_stacker_for_arm`` is a
-defense-in-depth backstop rather than a primary cost-control mechanism.
+Default stacker is ``openrouter/anthropic/claude-opus-4.5`` (with a
+``gpt-5.6-sol`` fallback) routed through ``build_llm_with_openrouter_fallback``
+so the Metaculus-donated OpenRouter key absorbs cost ahead of the operator's
+paid key. The wrapper handles donated→paid fallback on
+credit/auth/allowed-providers errors internally, so the outer primary→fallback
+chain in ``run_stacker_for_arm`` is a defense-in-depth backstop rather than a
+primary cost-control mechanism.
 
 Cost note (rough order of magnitude — for the operator's mental model only):
 
-* gpt-5.5 with ``reasoning={"effort": "high"}`` runs ~$0.05–0.10 per stacker call.
+* A frontier stacker with ``reasoning={"effort": "high"}`` runs ~$0.05–0.10 per call.
 * 20-question intermediate sweep (40 stacker calls) ≈ $2–4 if everything pays.
 * 60-question medium sweep (120 stacker calls) ≈ $6–12 worst case.
 * In practice the donated key absorbs almost everything, so the actual
@@ -74,7 +75,7 @@ ARM_MEDIAN = "median"  # deterministic median over base predictions, no LLM (see
 ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 
 # Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
-# claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.5 as
+# claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.6-sol as
 # fallback (production STACKER_FALLBACK_LLM choice — different provider so an
 # Anthropic stall doesn't take both attempts down). Both are routed through
 # ``build_llm_with_openrouter_fallback`` for the donated→paid key fallback the
@@ -86,7 +87,8 @@ ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metac
 # different `OAI_ANTH_OPENROUTER_KEY` GitHub-secret value works, but local
 # couldn't. claude-opus-4.5 sidesteps the issue entirely.
 DEFAULT_STACKER_MODEL = "openrouter/anthropic/claude-opus-4.5"
-DEFAULT_STACKER_FALLBACK_MODEL = "openrouter/openai/gpt-5.5"
+# Matches prod STACKER_FALLBACK_LLM post the 2026-07-09 gpt-5.6 migration.
+DEFAULT_STACKER_FALLBACK_MODEL = "openrouter/openai/gpt-5.6-sol"
 DEFAULT_PARSER_MODEL = "openrouter/openai/gpt-oss-120b:free"
 
 # Prod-ish ablation stacker. Mirrors the prod-ish forecaster posture (opus-4.8 at
@@ -108,20 +110,20 @@ _PROD_STACKER_KWARGS: dict[str, Any] = {
 # ``reasoning={"max_tokens": ...}`` (explicit thinking budget — see production
 # STACKER_LLM at llm_configs.py:122). OpenAI models use ``reasoning={"effort":
 # ...}``. We construct each LLM with its own kwargs so the per-provider
-# parameter differences are explicit.
+# parameter differences are explicit. Sampling params follow the repo-wide
+# convention: ``temperature=None`` keeps litellm from injecting a temperature,
+# top_p is unset — reasoning models defer to provider defaults.
 _OPUS_STACKER_KWARGS: dict[str, Any] = {
     "reasoning": {"max_tokens": 32_000},
-    "temperature": 1.0,
-    "top_p": 0.95,
+    "temperature": None,
     "max_tokens": 64_000,
     "stream": False,
     "timeout": 480,
     "allowed_tries": 1,
 }
-_GPT_5_5_STACKER_KWARGS: dict[str, Any] = {
+_OPENAI_STACKER_KWARGS: dict[str, Any] = {
     "reasoning": {"effort": "high"},
-    "temperature": 1.0,
-    "top_p": 0.95,
+    "temperature": None,
     "max_tokens": 64_000,
     "stream": False,
     "timeout": 480,
@@ -141,15 +143,15 @@ def _build_default_stacker_llm() -> GeneralLlm:
 
 
 def _build_default_fallback_stacker_llm() -> GeneralLlm:
-    """Fallback ablation stacker (gpt-5.5).
+    """Fallback ablation stacker (gpt-5.6-sol).
 
     Mirrors production STACKER_FALLBACK_LLM. Different provider on purpose —
     if Anthropic is thrashing, retrying against Anthropic rarely recovers.
     Goes through the donated-key wrapper too; if the donated key data-policy
-    blocks gpt-5.5 (operator-specific), the wrapper's fallback to the paid
-    key catches it.
+    blocks the OpenAI model (operator-specific), the wrapper's fallback to the
+    paid key catches it.
     """
-    return build_llm_with_openrouter_fallback(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
+    return build_llm_with_openrouter_fallback(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
 
 
 # Re-exported so existing imports of ``probabilistic_tools_enabled`` and
@@ -183,8 +185,9 @@ __all__ = [
 ABLATION_MIN_FORECASTERS = 2
 
 # Approximate per-prompt character ceiling for stacker calls. ~4 chars/token
-# is the standard rule of thumb for English; both Opus 4.5 (200k) and gpt-5.5
-# (128k) need headroom for the model's reasoning + response tokens, so we
+# is the standard rule of thumb for English; sized to the smallest window ever
+# used in this slot (gpt-5.5's 128k; Opus 4.5 is 200k and gpt-5.6-sol is 1.05M)
+# with headroom for the model's reasoning + response tokens, so we
 # use 128k - 30k headroom = 98k tokens => ~390k chars as the guard threshold.
 # Going over surfaces as a 400 ``context_length_exceeded`` on the primary,
 # fallback inherits the same prompt and fails too — the question is dropped

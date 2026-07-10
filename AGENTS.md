@@ -57,29 +57,29 @@ Fork of the Metaculus starter template. Runs a multi-LLM ensemble with a meta-st
 
 Per question (`forecaster.py:_research_and_make_predictions`):
 
-1. **Research** — `run_research` (`forecaster.py:413`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:116`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.4-mini`, medium effort, via OpenRouter on the donated key).
+1. **Research** — `run_research` (`forecaster.py:413`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:116`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.6-sol`, low effort, via OpenRouter on the donated key).
 2. **Forecaster fan-out** — N forecaster LLMs run in parallel via `_forecaster_with_soft_deadline` (10-min cap each) → `_make_prediction` → type-specific runner (binary/MC/numeric).
 3. **Min-forecasters guard** (`forecaster.py:590`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction.
 4. **Aggregation** — see CONDITIONAL_STACKING below.
 
 ### Ensemble (6 forecasters)
 
-See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.4, gpt-5.5, claude-opus-4.8, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.5. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
+See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequently). As of this writing: gpt-5.6-sol, gpt-5.5, claude-opus-4.8, claude-opus-4.6, gemini-3.1-pro-preview, grok-4.5. Do NOT hardcode model names outside `llm_configs.py`. Provider: OpenRouter with automatic key fallback.
 
 Support models (also in `llm_configs.py`):
 
-- **Stacker**: `claude-fable-5` (primary, since 2026-07-07; effort-based adaptive thinking `reasoning={"effort": "high"}`, not a max_tokens budget), `gpt-5.5` (cross-provider fallback for independence if Anthropic thrashes). Both `allowed_tries=1` — on stall, we fall back rather than burn budget retrying the same provider.
-- **Disagreement analyzer**: `gpt-5.5` (medium-effort crux extractor; quality drives targeted-search query, with a 180s soft deadline).
-- **Summarizer / researcher**: `gpt-5.4-mini` (low effort, deterministic). Migrated 2026-05-17 from gemini-3-flash-preview for consistency with OpenAI-based support stack and to dodge donated-key Google rate limits; bills to personal `OPENROUTER_API_KEY` until OpenAI data-policy block is lifted.
-- **Parser**: `gpt-5.4-mini` (low effort, deterministic).
+- **Stacker**: `claude-fable-5` (primary, since 2026-07-07; effort-based adaptive thinking `reasoning={"effort": "high"}`, not a max_tokens budget), `gpt-5.6-sol` (cross-provider fallback for independence if Anthropic thrashes). Both `allowed_tries=1` — on stall, we fall back rather than burn budget retrying the same provider.
+- **Disagreement analyzer**: `gpt-5.6-sol` (low-effort crux extractor; quality drives targeted-search query, with a 180s soft deadline).
+- **Summarizer / researcher**: `gpt-5.6-sol` (low effort, deterministic). Top tier because the summarizer decides what is load-bearing in the briefing every forecaster reads; low effort keeps latency in check.
+- **Parser**: `gpt-5.4-mini` (low effort, deterministic; saturated extraction task, still cheaper than gpt-5.6-luna).
 
 ### CONDITIONAL_STACKING (default)
 
-`AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:117`). Behavior:
+`AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:117`). Note: this describes the code default — stacking is currently DISABLED in prod, since all four prod workflow yamls set `BINARY_STACKING_ENABLED`/`MC_STACKING_ENABLED`/`NUMERIC_STACKING_ENABLED` to `'false'` (the chain stays live in backtests/ablation). Behavior:
 
 - Compute spread across the N forecasters via `spread_metrics.compute_spread`.
 - If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_base_combine`, `aggregation_pipeline.py:213`).
-- If spread > threshold → extract the **disagreement crux**, run **targeted search** (OpenAI native search via `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity="low"`, 360s timeout), then invoke the **stacker LLM** with the full base-model reasonings + targeted research (`stacking.run_stacking_{binary,mc,numeric}`).
+- If spread > threshold → extract the **disagreement crux**, run **targeted search** (OpenAI native search via `gpt-5.6-sol` with `reasoning={"effort":"low"}` (env default) + `verbosity="low"`, 360s timeout), then invoke the **stacker LLM** with the full base-model reasonings + targeted research (`stacking.run_stacking_{binary,mc,numeric}`).
 - Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`aggregation_pipeline.py:283-359`, `_stacking_aggregate`.)
 
 Thresholds (`metaculus_bot/constants.py:245-249`):
@@ -133,14 +133,14 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 
 **Additional providers run in parallel on top of the primary** (each independently gated):
 
-- **OpenAI native search** (OpenRouter web plugin, `research/providers.py`): default model `openai/gpt-5.5` with `reasoning={"effort":"medium"}` + `extra_body={"verbosity":"low"}` and a 360s timeout (`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_TIMEOUT` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` / `NATIVE_SEARCH_VERBOSITY_DEFAULT`; overridable via the matching `NATIVE_SEARCH_*` env vars). Migrated 2026-05-17 from deprecated `x-ai/grok-4.1-fast` (initial flip to `gpt-5.4-mini`, then v3 bench at `scratch/native_search_bench_2026-05-17/comparison_v3.md` showed `gpt-5.5` medium-effort fits in ~230s under a 360s cap and produces materially deeper research; supersedes the v2 mini verdict). Gated by `NATIVE_SEARCH_ENABLED`. **Note**: the donated-key data-policy block has been RESOLVED (verified 2026-06-25 by a live call returning 200 with grounding for both `gpt-5.5` and `gpt-5.4-mini`). OpenAI native search now routes through and bills the donated `OAI_ANTH_OPENROUTER_KEY`; `FallbackOpenRouterLlm` still falls back to personal `OPENROUTER_API_KEY` on credential / credit errors.
+- **OpenAI native search** (OpenRouter web plugin, `research/providers.py`): default model `openai/gpt-5.6-sol` with `reasoning={"effort":"low"}` + `extra_body={"verbosity":"low"}` and a 360s timeout (`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_TIMEOUT` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` / `NATIVE_SEARCH_VERBOSITY_DEFAULT`; overridable via the matching `NATIVE_SEARCH_*` env vars). Model migrated 2026-07-09 to `gpt-5.6-sol` (strongest OpenAI tier at low effort dominates a smaller tier at higher effort); effort has been low since 2026-05-20 (latency; see constants.py). Gated by `NATIVE_SEARCH_ENABLED`. **Note**: the donated-key data-policy block has been RESOLVED (verified 2026-06-25 by a live call returning 200 with grounding). OpenAI native search now routes through and bills the donated `OAI_ANTH_OPENROUTER_KEY`; `FallbackOpenRouterLlm` still falls back to personal `OPENROUTER_API_KEY` on credential / credit errors.
 - **Gemini grounded search** (`research/gemini_search.py`): real Google Search grounding via `google-genai` SDK (not OpenRouter) + `url_context` tool for specific URL reads. Gated by `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`.
 - **Financial data** (`research/financial_data.py`): LLM classifier routes to yfinance + FRED for financial/economic questions. Gated by `FINANCIAL_DATA_ENABLED` + `FRED_API_KEY`.
 - **Prediction-market snapshot** (`research/prediction_market.py`): fans out to Polymarket Gamma, Kalshi (prefetch + local rapidfuzz match), and Manifold concurrently; aggregates the top matches into a benchmarking-safe research blurb. Gated by `PREDICTION_MARKETS_ENABLED` + a benchmarking guard (the snapshot is suppressed in `is_benchmarking=True` runs to avoid data leakage). **ON in all prod workflows** as of commit `3c12dbe` (the `is_benchmarking=False` prod path means the benchmarking guard doesn't suppress it there). Because that guard hard-disables the provider during backtests, its forecasting value can't be measured by the standard `make backtest_*` gate — it was validated via the manual `test_bot.yaml` prod-mode run + opt-in live integration tests instead. Research section header: `## Prediction Market Snapshot`.
 
-**Second-pass gap-fill** (`research/targeted.py` `run_gap_fill_pass`): always-on when `GAP_FILL_ENABLED` is set (the resolver migrated off Google as of 2026-06-25, so `GOOGLE_API_KEY` is no longer required). Two stages: a `gpt-5.5` low-effort non-grounded OpenRouter analyzer identifies up to `GAP_FILL_MAX_GAPS` factual gaps → parallel OpenAI native web searches (`gpt-5.4-mini` medium effort, via OpenRouter on the donated key) resolve each. Soft-fails (returns `""`) on any error.
+**Second-pass gap-fill** (`research/targeted.py` `run_gap_fill_pass`): always-on when `GAP_FILL_ENABLED` is set (the resolver migrated off Google as of 2026-06-25, so `GOOGLE_API_KEY` is no longer required). Two stages: a `gpt-5.6-terra` low-effort non-grounded OpenRouter analyzer identifies up to `GAP_FILL_MAX_GAPS` factual gaps → parallel OpenAI native web searches (`gpt-5.6-sol` low effort, via OpenRouter on the donated key) resolve each. Soft-fails (returns `""`) on any error.
 
-**Production workflows** (`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) set `NATIVE_SEARCH_ENABLED=true`, `GEMINI_SEARCH_ENABLED=true`, `FINANCIAL_DATA_ENABLED=true`, `GAP_FILL_ENABLED=true`. `PREDICTION_MARKETS_ENABLED` is not yet on by default. So in prod the active stack is AskNews + OpenAI native search (`gpt-5.5` medium-effort + verbosity=low, 360s) + Gemini grounded + financial-data (when classified as financial) + always-on OpenAI native-search gap-fill, with the prediction-market provider available behind its env flag.
+**Production workflows** (`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) set `NATIVE_SEARCH_ENABLED=true`, `GEMINI_SEARCH_ENABLED=true`, `FINANCIAL_DATA_ENABLED=true`, `GAP_FILL_ENABLED=true`, `PREDICTION_MARKETS_ENABLED='true'`. So in prod the active stack is AskNews + OpenAI native search (`gpt-5.6-sol` low-effort + verbosity=low, 360s) + Gemini grounded + financial-data (when classified as financial) + always-on OpenAI native-search gap-fill + the prediction-market snapshot.
 
 ### Prompts (`metaculus_bot/prompts.py`)
 

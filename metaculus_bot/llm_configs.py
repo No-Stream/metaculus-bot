@@ -4,6 +4,8 @@ Keeping these objects in a single module avoids merge-conflicts and makes it
 possible to tweak/benchmark models without touching application code.
 """
 
+from typing import Any
+
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -19,25 +21,22 @@ __all__ = [
     "DISAGREEMENT_ANALYZER_LLM",
     "PREDICTION_MARKET_KEYWORD_LLM_CONFIG",
 ]
-REASONING_MODEL_CONFIG = {
-    "temperature": 1.0,  # standard sampling params for recent reasoning models
-    "top_p": 0.95,
+# Reasoning models ignore (or degrade under) explicit sampling params, so we
+# defer to provider defaults. temperature=None is load-bearing: GeneralLlm
+# injects temperature=0 when the arg is omitted, so None is what makes litellm
+# drop it; top_p flows via **kwargs and is simply never set.
+REASONING_MODEL_CONFIG: dict[str, Any] = {
+    "temperature": None,
     "max_tokens": 64_000,  # Prevent truncation; all current forecasters/stackers support 64k output
     "stream": False,
     "timeout": 480,
     "allowed_tries": 3,
 }
-QWEN_CONFIG = {  # developer recommends this for qwen models
-    "temperature": 0.6,
-    "top_p": 0.95,
-    "max_tokens": 32_000,
-    "stream": False,
-    "timeout": 300,
-    "allowed_tries": 3,
-}
-DETERMINISTIC_MODEL_CONFIG = {  # used for basic parsing and summarization tasks
-    "temperature": 0.0,
-    "top_p": 0.9,
+# Low-effort utility slots (parser, summarizer, analyzer). Same sampling-param
+# rationale as REASONING_MODEL_CONFIG: temperature=None keeps litellm from
+# injecting temperature=0; top_p left unset for provider defaults.
+UTILITY_MODEL_CONFIG: dict[str, Any] = {
+    "temperature": None,
     "max_tokens": 32_000,
     "stream": False,
     "timeout": 300,
@@ -59,11 +58,15 @@ ACCEPTABLE_QUANTS = [
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
 FORECASTER_LLMS: list[GeneralLlm] = [
+    # 2026-07-09: OpenAI flagship (5.6 series, released today); replaces gpt-5.4. High effort —
+    # forecaster quality is the product. (Date anchors the config era for residual analysis.)
     build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.4",
+        model="openrouter/openai/gpt-5.6-sol",
         reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
+    # Kept (not migrated to sol) to preserve intra-OpenAI generation diversity
+    # alongside gpt-5.6-sol in the ensemble.
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.5",
         reasoning={"effort": "high"},
@@ -115,26 +118,26 @@ def _forecaster_display_name(llm: GeneralLlm) -> str:
 FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
 # Summarizer: compresses raw AskNews article markdown into an analyst briefing
-# (AskNews-only; all other providers already emit LLM prose). Migrated 2026-05-17
-# from gemini-3-flash-preview to gpt-5.4-mini for: (1) consistency with the rest
-# of the OpenAI-based support stack (analyzer, parser, native search), (2) lower
-# rate-limit exposure than the donated-key Google route, (3) the donated-key
-# data-policy block on OpenAI is expected to be lifted; until then, summarizer
-# bills to personal OPENROUTER_API_KEY (~$0.01/call × every Q).
+# (AskNews-only; all other providers already emit LLM prose). NOT a saturated
+# task — it decides what is load-bearing and which sources to trust in the
+# briefing every forecaster reads, which rewards the top tier; low effort keeps
+# latency in check (sol-low ≈ terra-medium quality per the AA Pareto frontier).
 # allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
 # 30s-gated retry (orchestrator._summarize_asknews) to impose the universal
 # "no retry after 30s" deadline rule. Per-instance override so PARSER_LLM (which
-# also uses DETERMINISTIC_MODEL_CONFIG) keeps its allowed_tries=3.
+# also uses UTILITY_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.4-mini",
+    "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "low"},
-    **{**DETERMINISTIC_MODEL_CONFIG, "allowed_tries": 1},
+    **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )
-# Parser should be a reliable, low-latency model for structure extraction
+# Parser: deterministic extraction of percentiles/JSON from rationales — a
+# capability-saturated task where mini is still cheaper than gpt-5.6-luna
+# ($0.75/$4.50 vs $1/$6 per 1M) and keeps allowed_tries=3 for robustness.
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.4-mini",
     reasoning={"effort": "low"},
-    **DETERMINISTIC_MODEL_CONFIG,
+    **UTILITY_MODEL_CONFIG,
 )
 # Researcher slot in the forecasting-tools LLM config dict. Effectively dead
 # code in our pipeline — we use research providers (AskNews/Gemini/native_search)
@@ -162,27 +165,30 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
 
-# Fallback stacker used when the primary stacker times out or errors. Different
-# provider on purpose: if Anthropic is thrashing, retrying against Anthropic
-# is unlikely to recover; gpt-5.5 via OpenAI gives us an independent failure
-# mode. Tighter timeout and single try since we're already running late on
-# the critical path by the time this fires.
+# Fallback stacker used when the primary stacker times out or errors.
+# Reasoning slot → strongest OpenAI tier (gpt-5.6-sol) at high effort;
+# deliberately cross-provider from the Anthropic Fable primary so an Anthropic
+# stall doesn't take both attempts down. Tighter timeout and single try since
+# we're already running late on the critical path by the time this fires.
 STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.5",
+    "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
 
 # Keyword-extraction LLM config for the prediction-market provider.
+# Keyword extraction is capability-saturated; mini is the cheapest capable tier.
 # Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
 # gpt-5.4-mini reasoning=low burns 128-512 tokens on invisible reasoning before
 # emitting any visible response, so max_tokens=800 is load-bearing.
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
+# temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+# reasoning models defer to provider defaults. top_p left unset.
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.4-mini",
-    "temperature": 0.0,
+    "temperature": None,
     "max_tokens": 800,
     "reasoning_effort": "low",
     "timeout": 60,
@@ -191,16 +197,15 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 
 # Tier-B auxiliary: read-and-synthesize work that needs taste but not deep
 # reasoning. Identifies the crux of forecaster disagreement; output text seeds
-# the targeted-search query downstream. Dropped 2026-05-20 from medium→low
-# effort alongside the broader tier-B consolidation (native_search also at low):
-# 1-3 sentence crux extraction is structure-following with light judgment, not
-# deep reasoning. Cost roughly halves (~$4 → ~$1.50/tournament).
+# the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE (180s);
+# effort deliberately low since 2026-05-20 for latency — the tier was upgraded
+# instead (smarter-model-at-lower-effort beats more effort on a smaller model).
 # allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
 # 30s-gated retry (targeted.extract_disagreement_crux) to impose the universal
 # "no retry after 30s" deadline rule on the conditional-stacking critical path.
 # Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.5",
+    "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "low"},
-    **{**DETERMINISTIC_MODEL_CONFIG, "allowed_tries": 1},
+    **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )

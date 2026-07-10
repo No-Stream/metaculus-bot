@@ -74,8 +74,9 @@ def _build_constrained_llm(response_format_model: type[BaseModel], parser_model:
     """
     return build_llm_with_openrouter_fallback(
         parser_model,
-        temperature=0.0,
-        top_p=0.9,
+        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+        # reasoning models defer to provider defaults. No top_p.
+        temperature=None,
         max_tokens=32_000,
         stream=False,
         timeout=90,

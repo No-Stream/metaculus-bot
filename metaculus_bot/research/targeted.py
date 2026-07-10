@@ -184,10 +184,10 @@ async def _run_analyzer(
 ) -> list[dict[str, str]]:
     """Call the analyzer LLM (no grounding) to identify gaps.
 
-    Migrated 2026-05-20 from gemini-3-flash-preview (google-genai direct) to
-    gpt-5.5 low-effort via OpenRouter (with donated-key fallback). The analyzer
-    is non-grounded so it doesn't need Google's search index; this gets us
-    OpenAI-stack consistency with native_search and the disagreement analyzer.
+    Runs gpt-5.6-terra at low effort via OpenRouter (with donated-key
+    fallback). The analyzer is non-grounded so it doesn't need Google's search
+    index; the task is gap decomposition (not deep judgment) under a tight
+    soft-fail wall cap, so terra-low is the latency-safe tier.
 
     Without google-genai's response_mime_type=application/json, the prompt asks
     for ```json fenced output and _parse_gap_list handles fence stripping +
@@ -198,7 +198,9 @@ async def _run_analyzer(
     llm = build_llm_with_openrouter_fallback(
         model=GAP_FILL_ANALYZER_MODEL,
         reasoning={"effort": "low"},
-        temperature=0.0,
+        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+        # reasoning models defer to provider defaults. No top_p.
+        temperature=None,
         timeout=GAP_FILL_ANALYZER_TIMEOUT,
         allowed_tries=1,
     )
@@ -236,8 +238,9 @@ async def _resolve_single_gap(
     Migrated 2026-06-25 off direct-Google grounded Gemini (google-genai, personal
     GOOGLE_API_KEY) to native search on the Metaculus-donated key — this is the
     dominant cost-saving change since the resolver fans out up to GAP_FILL_MAX_GAPS
-    calls per question. Runs gpt-5.4-mini at medium effort (research-tier), distinct
-    from the global LOW the main native_search provider uses.
+    calls per question. Runs gpt-5.6-sol at low effort (same LOW as the main
+    native_search provider): the workers run in parallel, so latency is the
+    slowest call, not the sum.
 
     Raises on SDK/OpenRouter errors — the caller uses ``asyncio.gather(..., return_exceptions=True)``
     so one failure doesn't kill the rest.
@@ -269,9 +272,9 @@ async def run_gap_fill_pass(
     """Identify and resolve factual gaps in first-pass research.
 
     Two-stage flow:
-    1. Analyzer call (gpt-5.5 effort=low via OpenRouter, no grounding) → JSON
-       list of up to ``GAP_FILL_MAX_GAPS`` gaps.
-    2. Parallel OpenAI native web searches (gpt-5.4-mini medium effort via
+    1. Analyzer call (gpt-5.6-terra effort=low via OpenRouter, no grounding) →
+       JSON list of up to ``GAP_FILL_MAX_GAPS`` gaps.
+    2. Parallel OpenAI native web searches (gpt-5.6-sol low effort via
        OpenRouter), one per gap, via ``asyncio.gather``.
 
     Never raises. Returns "" on any upstream failure (missing API key, timeout,

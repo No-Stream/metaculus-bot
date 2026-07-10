@@ -7,11 +7,10 @@ Two lineups are available:
   same N forecasters run once per question, and their rationales feed BOTH stacker
   arms — so per-forecaster cost is amortized across arms.
 * **Prod-ish** (``PROD_FORECASTER_MODELS``): 3 paid frontier models (Claude
-  Opus 4.6, Claude Opus 4.8, GPT-5.4), all at medium reasoning effort, for the
-  paid ablation re-run on a quality-representative ensemble. These are reasoning
-  models, so the lineup deliberately drops sampling params (``temperature`` is
-  passed as ``None`` to keep litellm from injecting it, and ``top_p`` /
-  ``max_tokens`` are never set).
+  Opus 4.6, Claude Opus 4.8, GPT-5.6-sol), all at medium reasoning effort, for the
+  paid ablation re-run on a quality-representative ensemble. Sampling params
+  follow the repo-wide convention (``temperature=None``, no ``top_p`` /
+  ``max_tokens``) — see ``llm_configs.REASONING_MODEL_CONFIG``.
 
 **Routing posture**: ablation/benchmarking the Metaculus bot IS Metaculus work,
 so it bills to the Metaculus-donated OpenRouter key wherever that key can cover
@@ -45,7 +44,7 @@ from forecasting_tools import GeneralLlm
 
 from metaculus_bot.benchmark.bot_factory import MODEL_CONFIG
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.llm_configs import DETERMINISTIC_MODEL_CONFIG
+from metaculus_bot.llm_configs import UTILITY_MODEL_CONFIG
 
 __all__ = [
     "FREE_FORECASTER_MODELS",
@@ -69,16 +68,16 @@ __all__ = [
 PROD_FORECASTER_SPECS: list[tuple[str, dict]] = [
     ("openrouter/anthropic/claude-opus-4.6", {"reasoning": {"effort": "medium"}}),
     ("openrouter/anthropic/claude-opus-4.8", {"reasoning": {"effort": "medium"}}),
-    ("openrouter/openai/gpt-5.4", {"reasoning": {"effort": "medium"}}),
+    # Mirrors prod forecaster slot 1 post the 2026-07-09 gpt-5.6 migration (identity, not effort).
+    ("openrouter/openai/gpt-5.6-sol", {"reasoning": {"effort": "medium"}}),
 ]
 PROD_FORECASTER_MODELS: list[str] = [m for m, _ in PROD_FORECASTER_SPECS]
 
-# Minimal litellm config for the prod-ish reasoning ensemble. Deliberately NOT
-# REASONING_MODEL_CONFIG: these are reasoning models, so we drop the sampling
-# params. ``temperature=None`` is load-bearing — GeneralLlm injects
-# ``temperature=0`` when the arg is omitted, so passing None explicitly is what
-# makes litellm omit it (and top_p). ``top_p`` / ``max_tokens`` are simply never
-# set so the provider defaults apply.
+# Minimal litellm config for the prod-ish reasoning ensemble. Follows the
+# repo-wide sampling-param convention (``temperature=None``, no ``top_p`` — see
+# llm_configs.REASONING_MODEL_CONFIG) but also leaves ``max_tokens`` unset so the
+# provider defaults apply, which is the one deliberate departure from
+# REASONING_MODEL_CONFIG.
 _PROD_FORECASTER_CONFIG: dict = {
     "temperature": None,
     "stream": False,
@@ -179,12 +178,12 @@ def build_free_forecaster_llms() -> list[GeneralLlm]:
 
 
 def build_free_parser_llm() -> GeneralLlm:
-    """Plain ``GeneralLlm`` parser at deterministic config.
+    """Plain ``GeneralLlm`` parser on the utility config.
 
-    Mirrors the production PARSER_LLM contract — low temperature, deterministic
-    output — but on a free model. Plain (no donated-key wrapper): see
-    ``build_free_forecaster_llms`` and the module docstring for why ``:free``
-    models bypass the donated key (allowed-providers 404). litellm picks up
-    ``OPENROUTER_API_KEY`` from env at invoke time.
+    Mirrors the production PARSER_LLM contract — a low-effort utility slot that
+    defers sampling to provider defaults — but on a free model. Plain (no
+    donated-key wrapper): see ``build_free_forecaster_llms`` and the module
+    docstring for why ``:free`` models bypass the donated key (allowed-providers
+    404). litellm picks up ``OPENROUTER_API_KEY`` from env at invoke time.
     """
-    return GeneralLlm(model=FREE_PARSER_MODEL, **DETERMINISTIC_MODEL_CONFIG)
+    return GeneralLlm(model=FREE_PARSER_MODEL, **UTILITY_MODEL_CONFIG)

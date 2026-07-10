@@ -199,10 +199,11 @@ async def test_native_search_provider_enforces_wall_clock_timeout(
 class TestBuildNativeSearchLlmOverrides:
     """Per-call reasoning_effort / verbosity overrides on build_native_search_llm.
 
-    The gap-fill resolver needs gpt-5.4-mini at MEDIUM effort without perturbing
-    the global NATIVE_SEARCH_REASONING_EFFORT env (which the main native_search
-    provider reads at LOW). These tests lock the override semantics: explicit
-    args win over env; None preserves the existing env-read behavior exactly.
+    Callers like the gap-fill resolver need a per-call model/effort without
+    perturbing the global NATIVE_SEARCH_REASONING_EFFORT env (which the main
+    native_search provider reads). These tests lock the override semantics:
+    explicit args win over env; None preserves the existing env-read behavior
+    exactly. (Model slugs below are arbitrary fixtures, not pinned defaults.)
     """
 
     def _captured_kwargs(self, *, model_slug=None, reasoning_effort=None, verbosity=None) -> dict:  # type: ignore[no-untyped-def]

@@ -592,7 +592,9 @@ class TestScreenBatch:
         assert mock_llm_class.call_count == 1
         call_kwargs = mock_llm_class.call_args.kwargs
         assert call_kwargs["model"] == DEFAULT_DETECTOR_MODEL
-        assert call_kwargs["temperature"] == 0.0
+        # temperature=None: reasoning models defer to provider defaults; None
+        # keeps litellm from injecting temperature=0 (see _build_detector_llm).
+        assert call_kwargs["temperature"] is None
         # max_tokens=32_000 is the combined reasoning+content budget for the
         # default reasoning model (glm-4.5-air:free). Production leakage.py uses
         # 500 against gpt-5.4-mini, but 500 starves the reasoning budget on long
