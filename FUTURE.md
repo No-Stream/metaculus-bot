@@ -75,17 +75,36 @@ real questions (`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 q
 get a non-empty `## Resolution Source Snapshot` vs the probe's 62.5% Tier-1 target, 30/45 URL
 success, 0 SSRF false positives, and the first-cited URL was the primary grading source in all
 12 multi-URL questions. Remaining misses are all known Tier-2 hosts (JS walls / bot
-fingerprinting). Follow-ups, in order:
+fingerprinting).
 
-1. **Flip prod workflows.** After eyeballing a live `test_bot.yaml` run's
+**Truncation-cap distribution study (2026-07-09, don't re-derive):** uncapped re-fetch of the
+29 real successful URLs from the smoke run, full trafilatura extraction: p25=697 / p50=2,201 /
+p75=5,206 / p90=67,041 / max=438,049 chars. Elbow at 6,000 chars/URL — a 3,000 cap truncates
+14/29 URLs (48%), 6,000 truncates 6/29 (21%), and past 6,000 only whale pages (67k+) remain,
+which need summarization, not bigger caps. Mean prompt cost across all 40 smoke questions:
+380→578 tokens/question at 6k. **Shipped:** `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` 3,000→6,000
+and `RESOLUTION_SOURCE_TOTAL_MAX_CHARS` 12,000→18,000 (headroom so the per-URL cap is the
+binding constraint; max observed section simulates to ~11.1k at 6k/URL).
+
+Follow-ups:
+
+1. **Flip prod workflows (near-term).** After eyeballing a live `test_bot.yaml` run's
    `## Resolution Source Snapshot` sections (content quality, no junk extraction), set
    `RESOLUTION_SOURCE_ENABLED` in the three `run_bot_on_*.yaml` prod workflows.
-2. **Tier-2 LLM fetch for the js_wall/blocked slice** (~15% of questions). The per-URL
-   `FetchStatus` (blocked / js_wall retained deliberately) is the seam — a follow-on pass feeds
-   those URLs to an LLM-based reader (Gemini `url_context` or OpenAI native-search URL-read).
+2. **MEDIUM — Conditional summarization for oversized sources.** The first-cited URL's content
+   stays verbatim (provenance for the primary grading source); URLs 2+ and/or whale pages
+   (full extraction ≥ ~10k chars; p90 of the real distribution is 67k) go through the existing
+   cheap summarizer path (`gpt-5.4-mini`, temp 0, ~$0.01/call). Rationale: the distribution
+   study found ~5 whale sources per 40 questions that no reasonable cap captures; raising caps
+   past 6k has near-zero marginal rescue.
+3. **MEDIUM — Expand fetching for other site types (Tier-2 LLM fetch)** for the
+   js_wall/blocked slice (~15% of questions; e.g. Masters.com, childmortality.org, UNICEF,
+   Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked / js_wall retained
+   deliberately) is the seam — a follow-on pass feeds those URLs to an LLM-mediated reader
+   (Gemini `url_context` or OpenAI native-search URL-read).
    **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
    (added 2026-06-28) — no point building on url_context until we know it fires.
-3. **Minor follow-ups from review, explicitly deferred:** module split of
+4. **LOW — minor follow-ups from review, explicitly deferred:** module split of
    `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`); key the per-host politeness
    semaphore on the original netloc across redirect chains (politeness-only, not a correctness
    issue); simplify `_host_from_netloc` to `urlparse().hostname`.

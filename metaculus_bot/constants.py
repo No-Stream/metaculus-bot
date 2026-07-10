@@ -302,8 +302,10 @@ RESOLUTION_SOURCE_HTTP_TIMEOUT: float = 20.0  # per-request (probe: 0-2s typical
 RESOLUTION_SOURCE_WALL_TIMEOUT: float = 45.0  # hard cap on the whole provider
 RESOLUTION_SOURCE_MAX_URLS: int = 5  # 58 URLs / 40 Qs ≈ 1.45 avg; bounds pathological multi-URL Qs
 RESOLUTION_SOURCE_MAX_RESPONSE_BYTES: int = 5 * 1024 * 1024  # CISA KEV JSON ~1.5 MB; 5 MiB headroom
-RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 3000  # ~750 tokens/source
-RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = 12000  # whole-section budget (~3k tokens)
+RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 6000  # elbow of full-extraction dist (p50=2.2k, p75=5.2k); truncation 48%->21% on 2026-07-09 smoke; ~1.5k tokens/URL
+RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
+    18000  # headroom so per-URL cap binds (max observed section ~11.1k at 6k/URL); ~4.5k tokens worst case
+)
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
 
