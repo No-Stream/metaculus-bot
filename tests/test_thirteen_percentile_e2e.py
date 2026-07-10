@@ -19,6 +19,7 @@ from forecasting_tools import NumericQuestion
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
+from metaculus_bot.numeric.pchip_processing import create_fallback_numeric_distribution
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
 _MIN_STEP = 5e-5
@@ -187,8 +188,6 @@ class TestFallbackCdfRespectsOpenBounds:
     """
 
     def test_fallback_open_bounds_endpoints_pinned(self):
-        from metaculus_bot.numeric.pchip_processing import create_fallback_numeric_distribution
-
         question = _question(lower=0.0, upper=100.0, open_lower=True, open_upper=True)
         declared = _declared([5, 8, 12, 18, 28, 42, 50, 58, 72, 82, 88, 92, 96])
 
@@ -200,3 +199,20 @@ class TestFallbackCdfRespectsOpenBounds:
         assert probs[0] >= 0.001
         assert probs[-1] <= 0.999
         assert np.all(np.diff(probs) >= 0.0), "fallback CDF must be monotone non-decreasing"
+
+    def test_fallback_open_lower_min_step_satisfied(self):
+        """Regression: with P1 well inside the range, the native builder puts sub-0.001
+        probabilities on the leading bins; pinning cdf[0] to 0.001 + cummax then flattens
+        them into 0-step bins, tripping the framework's ``assert diff >= 5e-05`` and
+        dropping the model's prediction. safe_cdf_bounds must re-enforce the min-step."""
+        question = _question(lower=0.0, upper=100.0, open_lower=True, open_upper=False)
+        declared = _declared([10, 14, 18, 24, 32, 44, 50, 56, 68, 78, 84, 90, 96])
+
+        distribution = create_fallback_numeric_distribution(declared, question, zero_point=None)
+        cdf = distribution.cdf
+
+        assert len(cdf) == 201
+        probs = np.array([p.percentile for p in cdf], dtype=float)
+        steps = np.diff(probs)
+        assert float(steps.min()) >= _MIN_STEP - 1e-10, f"min-step violation: {float(steps.min())}"
+        assert probs[0] >= 0.001

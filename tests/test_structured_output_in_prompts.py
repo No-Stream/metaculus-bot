@@ -166,6 +166,19 @@ class TestNumericPromptSchemaInstruction:
             "numeric prompt should note that JSON percentiles should match the trailing Percentile lines"
         )
 
+    def test_numeric_schema_example_carries_all_thirteen_percentile_keys(self):
+        """The declared_percentiles example must show all 13 standard percentiles as
+        fractional keys ("0.01".."0.99" — the format the F5 fallback lifts into
+        Percentile objects). A 3-key block is unsalvageable in exactly the
+        parser-miss scenario the fallback exists for: sanitize_percentiles
+        hard-requires the full 13-set."""
+        prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        for key in ("0.01", "0.025", "0.05", "0.1", "0.2", "0.4", "0.5", "0.6", "0.8", "0.9", "0.95", "0.975", "0.99"):
+            assert f'"{key}"' in structured_section, f"missing percentile key {key!r} in declared_percentiles example"
+        assert "all 13" in structured_section, "note must state the full 13-percentile requirement"
+        assert "at least" not in structured_section, "stale 'at least {0.1, 0.5, 0.9}' wording must be gone"
+
     def test_schema_block_precedes_percentile_answer_lines(self):
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
         schema_idx = prompt.find('"question_type"')

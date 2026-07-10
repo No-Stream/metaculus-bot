@@ -617,19 +617,27 @@ def numeric_prompt(
         You MUST emit a fenced ```json block below, immediately after your analysis
         and BEFORE your final answer line(s). This block is required for scoring —
         responses without it are discarded.
-        Schema (`declared_percentiles` is REQUIRED; `outcome_type` is REQUIRED):
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
+        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
+        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
 
         ```json
         {{
           "question_type": "numeric",
-          "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
+          "declared_percentiles": {{
+            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
+            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
+          }},
           "outcome_type": "continuous"
         }}
         ```
 
         Notes:
-        - `declared_percentiles` must cover at least {{0.1, 0.5, 0.9}} and should
-          match your final Percentile lines below.
+        - `declared_percentiles` MUST contain all 13 standard percentiles (0.01,
+          0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99)
+          and MUST match your final Percentile lines below exactly. If the trailing
+          Percentile lines are dropped, this block is the only recoverable source of
+          your forecast, and a partial set cannot be salvaged.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
           whole number (counts, rankings, number of events, number of countries),
           "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
