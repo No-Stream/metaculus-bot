@@ -66,6 +66,30 @@ resolver URL → force-fetch+parse; or make the gap-fill analyzer treat a criter
 *mandatory* gap) is sketched in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. The FRED/Yahoo
 URL-extraction shipped 2026-06-28 already covers the API-backed financial subset of this class.
 
+### Resolution-source fetcher: flip prod workflows + Tier-2 LLM fetch (added 2026-07-09)
+
+The Tier-1 deterministic resolution-source fetcher shipped in `66e31c0`
+(`research/resolution_source.py` + shared `research/http_fetch.py`, gated by
+`RESOLUTION_SOURCE_ENABLED`, currently ON in `test_bot.yaml` only). Smoke-validated on 40 cached
+real questions (`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 questions (60%)
+get a non-empty `## Resolution Source Snapshot` vs the probe's 62.5% Tier-1 target, 30/45 URL
+success, 0 SSRF false positives, and the first-cited URL was the primary grading source in all
+12 multi-URL questions. Remaining misses are all known Tier-2 hosts (JS walls / bot
+fingerprinting). Follow-ups, in order:
+
+1. **Flip prod workflows.** After eyeballing a live `test_bot.yaml` run's
+   `## Resolution Source Snapshot` sections (content quality, no junk extraction), set
+   `RESOLUTION_SOURCE_ENABLED` in the three `run_bot_on_*.yaml` prod workflows.
+2. **Tier-2 LLM fetch for the js_wall/blocked slice** (~15% of questions). The per-URL
+   `FetchStatus` (blocked / js_wall retained deliberately) is the seam — a follow-on pass feeds
+   those URLs to an LLM-based reader (Gemini `url_context` or OpenAI native-search URL-read).
+   **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
+   (added 2026-06-28) — no point building on url_context until we know it fires.
+3. **Minor follow-ups from review, explicitly deferred:** module split of
+   `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`); key the per-host politeness
+   semaphore on the original netloc across redirect chains (politeness-only, not a correctness
+   issue); simplify `_host_from_netloc` to `urlparse().hostname`.
+
 ### Parser hardening + forecasting-tools upgrade path (added 2026-07-07)
 
 Full plan in `scratch_docs_and_planning/parser_hardening_and_ft_upgrade_plan.md` (written
