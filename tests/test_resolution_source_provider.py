@@ -442,6 +442,46 @@ class TestFormatResolutionSections:
         # We should NOT see all four full 300-char blocks packed together.
         assert out.count("A" * 300) <= 2
 
+    def test_dropped_sections_note_appended(self, monkeypatch):
+        # Tighten TOTAL cap so at least one section is dropped entirely: cap=300,
+        # 4 sources of 300 chars each — first section fills the budget, 3 dropped.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_TOTAL_MAX_CHARS", 300)
+        results = [
+            FetchResult(
+                url=f"https://example.com/{i}",
+                status="success",
+                text="A" * 300,
+                http_status=200,
+                content_type="text/html",
+            )
+            for i in range(4)
+        ]
+        out = resolution_source.format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        # The dropped-section note must appear, naming the dropped count.
+        assert "additional source(s) omitted — section budget" in out
+        assert "3 additional" in out
+
+    def test_no_drop_note_when_all_sections_fit(self):
+        # All sections fit -> no trailing "omitted" note.
+        results = [
+            FetchResult(
+                url="https://x.example.com/a",
+                status="success",
+                text="short body",
+                http_status=200,
+                content_type="text/html",
+            ),
+            FetchResult(
+                url="https://x.example.com/b",
+                status="success",
+                text="another short body",
+                http_status=200,
+                content_type="text/html",
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        assert "omitted" not in out
+
 
 # ---------------------------------------------------------------------------
 # 2. Network layer: _fetch_one branches + fetch_resolution_sources per-host serialization
@@ -462,6 +502,31 @@ class TestFetchOne:
         assert "Bureau of Labor Statistics" in result.text
         # Per-URL truncation was applied.
         assert len(result.text) <= 200
+
+    async def test_html_truncation_appends_marker(self, article_html, monkeypatch):
+        # Live run analysis (2026-07-10): the per-URL cap truncates mid-sentence
+        # with no marker so forecasters can't tell the snapshot is partial.
+        # When truncation fires, a marker line naming the cap and URL must
+        # appear, and total text length must remain bounded by the cap.
+        cap = 200
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        session = FakeSession(
+            {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
+        )
+        result = await _fetch_one(session, "https://news.example.com/report", {})
+        assert result.status == "success"
+        assert f"[truncated at {cap} chars — full source at https://news.example.com/report]" in result.text
+        assert len(result.text) <= cap
+
+    async def test_no_truncation_marker_when_fits_under_cap(self, article_html, monkeypatch):
+        # Extraction fits entirely under the cap -> NO marker appended.
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 100_000)
+        session = FakeSession(
+            {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
+        )
+        result = await _fetch_one(session, "https://news.example.com/report", {})
+        assert result.status == "success"
+        assert "truncated at" not in result.text
 
     async def test_403_maps_to_blocked(self):
         session = FakeSession({"https://blocked.example.com/x": FakeResponse(403, body=b"nope")})
@@ -510,8 +575,9 @@ class TestFetchOne:
         assert result.http_status is None
 
     async def test_json_content_type_returns_raw_truncated(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 50)
-        payload = b'{"vulnerabilities":[{"cveID":"CVE-2026-0001","description":"' + b"x" * 200 + b'"}]}'
+        cap = 200
+        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
+        payload = b'{"vulnerabilities":[{"cveID":"CVE-2026-0001","description":"' + b"x" * 500 + b'"}]}'
         session = FakeSession(
             {"https://json.example.com/kev": FakeResponse(200, body=payload, content_type="application/json")}
         )
@@ -519,7 +585,9 @@ class TestFetchOne:
         assert result.status == "success"
         assert result.content_type is not None and "json" in result.content_type
         assert result.text.startswith('{"vulnerabilities')
-        assert len(result.text) <= 50
+        # Truncated -> marker appears, total bounded by cap.
+        assert f"[truncated at {cap} chars — full source at https://json.example.com/kev]" in result.text
+        assert len(result.text) <= cap
 
     async def test_pdf_content_type_is_unsupported(self):
         # PDF: body is NEVER read (per the plan). A read() that raises verifies that.

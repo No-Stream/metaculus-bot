@@ -88,6 +88,9 @@ jobs:
           # disabled under is_benchmarking=True to prevent backtest leakage
           # (the prod path is_benchmarking=False, so this fires here).
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
+          # Validated via live test_bot run 2026-07-10.
+          RESOLUTION_SOURCE_ENABLED: 'true'
           # Disable stacking on all types. n=88 ablation: stacker hurts numeric CRPS
           # and is <= median on binary; 2026-05-29 peer recompute found the stacker's
           # own model (claude-opus-4.5) is one of the weakest base binary forecasters.

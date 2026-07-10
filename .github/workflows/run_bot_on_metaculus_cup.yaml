@@ -82,6 +82,9 @@ jobs:
           # is_benchmarking=False in the prod path (this workflow), so the
           # provider's own benchmarking guard doesn't suppress it here.
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
+          # Validated via live test_bot run 2026-07-10.
+          RESOLUTION_SOURCE_ENABLED: 'true'
           # Stacking disabled on all types (ablation: stacker <= median on binary,
           # hurts numeric CRPS; stacker base model is a weak binary forecaster).
           NUMERIC_STACKING_ENABLED: 'false'

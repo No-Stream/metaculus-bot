@@ -346,6 +346,26 @@ def looks_like_js_wall(text: str) -> bool:
     return len(text.strip()) < RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
 
 
+def _truncate_with_marker(text: str, cap: int, url: str) -> str:
+    """Return ``text`` bounded at ``cap`` chars; on truncation, append a marker
+    line naming the cap and URL so forecasters can tell the snapshot is partial.
+
+    Invariant: ``len(return) <= cap``. When truncation fires, the emitted text
+    is trimmed to ``cap - len(marker)`` before the marker is appended so the
+    total stays within budget. If the marker itself is longer than the cap
+    (pathologically small cap in tests), returns the raw truncation without
+    the marker rather than emitting only-marker text.
+    """
+    if len(text) <= cap:
+        return text
+    marker = f"\n[truncated at {cap} chars — full source at {url}]"
+    if len(marker) >= cap:
+        # Cap is too small to even fit the marker; degrade to plain truncation.
+        return text[:cap]
+    body_budget = cap - len(marker)
+    return text[:body_budget].rstrip() + marker
+
+
 def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
     """Render successful fetches as a markdown body block (orchestrator adds the ``##`` header).
 
@@ -353,7 +373,9 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across sections: later sections are
     trimmed (or dropped) once the budget is spent. Per-URL truncation is the
     caller's responsibility (already applied in ``_fetch_one``); this cap
-    covers the aggregate section length.
+    covers the aggregate section length. When one or more sections are dropped
+    entirely (budget spent before them), a final line names the dropped count
+    so downstream readers can tell the snapshot is partial.
     """
     successes = [r for r in results if r.status == "success"]
     if not successes:
@@ -364,6 +386,7 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
 
     sections: list[str] = []
     remaining = RESOLUTION_SOURCE_TOTAL_MAX_CHARS
+    dropped = 0
     for r in successes:
         # Cheap per-section budget accounting on the text body only. Section
         # overhead (URL heading + fetched-date line) is negligible relative to
@@ -371,7 +394,8 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         # tightens it dramatically for a test, we still cut the text
         # conservatively.
         if remaining <= 0:
-            break
+            dropped += 1
+            continue
         body = r.text
         if len(body) > remaining:
             body = body[:remaining].rstrip()
@@ -379,7 +403,10 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
         section = f"### {r.url}\n(fetched {fetched_iso})\n\n{body}"
         sections.append(section)
 
-    return caveat + "\n\n" + "\n\n".join(sections)
+    rendered = caveat + "\n\n" + "\n\n".join(sections)
+    if dropped:
+        rendered += f"\n\n[{dropped} additional source(s) omitted — section budget]"
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +623,11 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                                 http_status=status,
                                 content_type=content_type or None,
                             )
-                        truncated = extracted[:RESOLUTION_SOURCE_PER_URL_MAX_CHARS]
+                        truncated = _truncate_with_marker(
+                            extracted,
+                            RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+                            current_url,
+                        )
                         logger.info(f"resolution_source fetched {netloc} (success)")
                         return FetchResult(
                             url=current_url,
@@ -623,7 +654,11 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                                 content_type=content_type or None,
                             )
                         raw = body.decode("utf-8", errors="replace")
-                        truncated = raw[:RESOLUTION_SOURCE_PER_URL_MAX_CHARS]
+                        truncated = _truncate_with_marker(
+                            raw,
+                            RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
+                            current_url,
+                        )
                         logger.info(f"resolution_source fetched {netloc} (success)")
                         return FetchResult(
                             url=current_url,
@@ -750,7 +785,8 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
         n_fail = sum(1 for r in results if r.status != "success")
         if n_fail:
             logger.info(
-                f"resolution_source: {n_fail}/{len(results)} urls unfetched (Tier-2 candidates)",
+                f"resolution_source: {n_fail}/{len(results)} urls unfetched "
+                f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch)",
             )
         return format_resolution_sections(results, datetime.now(timezone.utc))
 

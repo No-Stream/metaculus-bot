@@ -88,9 +88,11 @@ binding constraint; max observed section simulates to ~11.1k at 6k/URL).
 
 Follow-ups:
 
-1. **Flip prod workflows (near-term).** After eyeballing a live `test_bot.yaml` run's
-   `## Resolution Source Snapshot` sections (content quality, no junk extraction), set
-   `RESOLUTION_SOURCE_ENABLED` in the three `run_bot_on_*.yaml` prod workflows.
+1. **Flip prod workflows — DONE 2026-07-10.** Live `test_bot.yaml` run confirmed real rubric/fact
+   content, visible forecaster uptake, and clean diagnostics; `RESOLUTION_SOURCE_ENABLED=true`
+   now set in all three `run_bot_on_*.yaml` prod workflows (tournament / metaculus_cup / minibench).
+   Same commit added a per-URL truncation marker (`[truncated at N chars — full source at URL]`)
+   and a dropped-section note so forecasters can tell when the snapshot is partial.
 2. **MEDIUM — Conditional summarization for oversized sources.** The first-cited URL's content
    stays verbatim (provenance for the primary grading source); URLs 2+ and/or whale pages
    (full extraction ≥ ~10k chars; p90 of the real distribution is 67k) go through the existing
