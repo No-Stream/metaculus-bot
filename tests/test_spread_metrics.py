@@ -2,6 +2,7 @@
 
 import math
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericDistribution, NumericQuestion
@@ -334,7 +335,7 @@ class TestComputeSpread:
         question = _make_numeric_question()
         pcts1 = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
         pcts2 = _make_percentile_list([30, 35, 40, 45, 55, 60, 65, 75, 80, 85, 90])
-        dist_args = {
+        dist_args: dict[str, Any] = {
             "lower_bound": question.lower_bound,
             "upper_bound": question.upper_bound,
             "open_lower_bound": question.open_lower_bound,
@@ -347,8 +348,6 @@ class TestComputeSpread:
         assert spread == pytest.approx(numeric_percentile_spread([pcts1, pcts2], question))
 
     def test_unknown_type_raises(self):
-        from unittest.mock import Mock
-
         unknown_question = Mock()
         with pytest.raises(ValueError, match="Unsupported question type"):
             compute_spread(unknown_question, [0.5, 0.5])
@@ -526,7 +525,7 @@ class TestDuplicateStandardLabelsHardening:
     def test_duplicate_standard_label_routes_to_interp_branch(self):
         """List with 14 entries (all 13 standard labels + one duplicate) does not crash."""
         # All 13 standard labels, plus a duplicate of P50. frozenset() would match
-        # _STANDARD_LABEL_KEYS on its own — the len check is what prevents the crash.
+        # percentile_set.EXPECTED_KEYS on its own — the len check is what prevents the crash.
         standard_labels = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
         standard_values = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 15.0, 18.0, 22.0, 28.0, 32.0, 36.0, 40.0]
         model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(standard_labels, standard_values)]

@@ -13,21 +13,26 @@ integer ``__getitem__``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import BaseModel, ConfigDict
 
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
-# Match the rounding convention used for float-keyed percentile matching in
-# metaculus_bot/numeric/validation.py so lookups are robust to float noise.
-_KEY_DECIMALS: int = 6
+# Canonical rounding convention for float-keyed percentile matching, shared by
+# every module that compares percentile labels (spread_metrics, validation) so
+# lookups are robust to float noise.
+PERCENTILE_KEY_DECIMALS: int = 6
 
-_EXPECTED_KEYS: frozenset[float] = frozenset(round(p, _KEY_DECIMALS) for p in STANDARD_PERCENTILES)
+# The canonical standard-percentile label set, rounded to lookup keys. Single
+# source of truth — reuse this instead of re-deriving from STANDARD_PERCENTILES.
+EXPECTED_KEYS: frozenset[float] = frozenset(round(p, PERCENTILE_KEY_DECIMALS) for p in STANDARD_PERCENTILES)
 
 
-def _key(percentile: float) -> float:
+def percentile_key(percentile: float) -> float:
     """Round a percentile label to the canonical lookup key."""
-    return round(float(percentile), _KEY_DECIMALS)
+    return round(float(percentile), PERCENTILE_KEY_DECIMALS)
 
 
 class PercentileSet(BaseModel):
@@ -44,16 +49,20 @@ class PercentileSet(BaseModel):
 
     @classmethod
     def from_mapping(cls, mapping: dict[float, float]) -> PercentileSet:
-        keyed = {_key(p): float(v) for p, v in mapping.items()}
+        keyed = {percentile_key(p): float(v) for p, v in mapping.items()}
+        if len(keyed) != len(mapping):
+            raise ValueError(
+                f"PercentileSet: duplicate percentile labels in {sorted(percentile_key(p) for p in mapping)}"
+            )
         _validate_keys(keyed.keys())
         return cls(values_by_percentile=keyed)
 
     @classmethod
     def from_percentiles(cls, percentiles: list[Percentile]) -> PercentileSet:
-        keyed = {_key(p.percentile): float(p.value) for p in percentiles}
+        keyed = {percentile_key(p.percentile): float(p.value) for p in percentiles}
         if len(keyed) != len(percentiles):
             raise ValueError(
-                f"PercentileSet: duplicate percentile labels in {sorted(_key(p.percentile) for p in percentiles)}"
+                f"PercentileSet: duplicate percentile labels in {sorted(percentile_key(p.percentile) for p in percentiles)}"
             )
         _validate_keys(keyed.keys())
         return cls(values_by_percentile=keyed)
@@ -63,7 +72,7 @@ class PercentileSet(BaseModel):
 
         Raises ``KeyError`` on an unknown label — never returns a neighbor.
         """
-        key = _key(percentile)
+        key = percentile_key(percentile)
         if key not in self.values_by_percentile:
             raise KeyError(f"PercentileSet has no percentile {key}; known labels: {sorted(self.values_by_percentile)}")
         return self.values_by_percentile[key]
@@ -77,17 +86,17 @@ class PercentileSet(BaseModel):
         return [Percentile(percentile=k, value=self.values_by_percentile[k]) for k in sorted(self.values_by_percentile)]
 
 
-def _validate_keys(keys: object) -> None:
-    actual = frozenset(keys)  # type: ignore[arg-type]
-    if actual == _EXPECTED_KEYS:
+def _validate_keys(keys: Iterable[float]) -> None:
+    actual = frozenset(keys)
+    if actual == EXPECTED_KEYS:
         return
-    missing = sorted(_EXPECTED_KEYS - actual)
-    extra = sorted(actual - _EXPECTED_KEYS)
+    missing = sorted(EXPECTED_KEYS - actual)
+    extra = sorted(actual - EXPECTED_KEYS)
     problems: list[str] = []
     if missing:
         problems.append(f"missing {missing}")
     if extra:
         problems.append(f"extra {extra}")
     raise ValueError(
-        f"PercentileSet requires exactly the standard percentiles {sorted(_EXPECTED_KEYS)}; " + "; ".join(problems)
+        f"PercentileSet requires exactly the standard percentiles {sorted(EXPECTED_KEYS)}; " + "; ".join(problems)
     )

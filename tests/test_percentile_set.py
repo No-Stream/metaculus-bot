@@ -9,10 +9,12 @@ silently shifts when the standard percentile set grows from 11 to 13.
 from __future__ import annotations
 
 import pytest
+from forecasting_tools import NumericQuestion
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.percentile_set import PercentileSet
+from metaculus_bot.spread_metrics import numeric_percentile_spread
 
 # Standard 13-set values used across tests: value_at(pct) == pct * 1000 so each
 # label maps to a distinct, easily-checked value (e.g. P10 -> 100.0).
@@ -23,9 +25,7 @@ def _standard_percentile_list() -> list[Percentile]:
     return [Percentile(percentile=p, value=v) for p, v in _STANDARD_VALUES.items()]
 
 
-# ===========================================================================
 # Construction and round-tripping
-# ===========================================================================
 
 
 class TestConstruction:
@@ -46,9 +46,7 @@ class TestConstruction:
         assert from_list.values_sorted() == from_map.values_sorted()
 
 
-# ===========================================================================
 # Construction-time validation
-# ===========================================================================
 
 
 class TestValidation:
@@ -68,10 +66,17 @@ class TestValidation:
         with pytest.raises(ValueError, match="0.11"):
             PercentileSet.from_mapping(with_extra)
 
+    def test_from_mapping_colliding_keys_raise(self):
+        # Two distinct mapping keys within rounding distance (5e-7) collapse to
+        # the same 6-decimal label; the collision must raise, not silently drop
+        # one of the values (mirrors from_percentiles' duplicate-label check).
+        with_collision = dict(_STANDARD_VALUES)
+        with_collision[0.5000004] = 999.0  # rounds to 0.5, colliding with the real P50
+        with pytest.raises(ValueError, match="duplicate percentile labels"):
+            PercentileSet.from_mapping(with_collision)
 
-# ===========================================================================
+
 # Label lookup (the whole point)
-# ===========================================================================
 
 
 class TestLabelLookup:
@@ -97,9 +102,7 @@ class TestLabelLookup:
         assert ps.value_at(0.099999999) == pytest.approx(100.0)
 
 
-# ===========================================================================
 # Ordered / list views
-# ===========================================================================
 
 
 class TestOrderedViews:
@@ -123,12 +126,10 @@ class TestOrderedViews:
     def test_no_positional_integer_access(self):
         ps = PercentileSet.from_percentiles(_standard_percentile_list())
         with pytest.raises(TypeError):
-            _ = ps[2]  # type: ignore[index]
+            _ = ps[2]  # type: ignore[index]  # ty: ignore[not-subscriptable]
 
 
-# ===========================================================================
 # Regression: documents the positional foot-gun this object prevents
-# ===========================================================================
 
 
 class TestPositionalFootgunRegression:
@@ -156,17 +157,11 @@ class TestPositionalFootgunRegression:
         assert future_map[0.90] == pytest.approx(future_list[9].value)
 
 
-# ===========================================================================
 # Regression: migrated spread_metrics produces identical values
-# ===========================================================================
 
 
 class TestSpreadMetricsUnchanged:
     def test_numeric_percentile_spread_matches_hand_computed(self):
-        from forecasting_tools import NumericQuestion
-
-        from metaculus_bot.spread_metrics import numeric_percentile_spread
-
         std_pcts = [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99]
 
         def make(values: list[float]) -> list[Percentile]:

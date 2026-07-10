@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Callable
 
 import aiohttp
 import aiohttp.abc
@@ -124,17 +124,27 @@ def build_session(
     return aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers)
 
 
-async def read_body_capped(resp: Any, *, max_bytes: int, label: str) -> bytes | None:
-    """Read a response body in full, rejecting bodies over ``max_bytes``.
+_READ_CHUNK_BYTES = 65536
 
-    Uses ``resp.read()`` (full decompressed body) then checks size, rather than
-    ``resp.content.read(n)`` which returns only whatever is in the internal
-    buffer — causing silent truncation on chunked/brotli responses.
+
+async def read_body_capped(resp: Any, *, max_bytes: int, label: str) -> bytes | None:
+    """Read a response body incrementally, rejecting bodies over ``max_bytes``.
+
+    Streams DECOMPRESSED bytes via ``resp.content.iter_chunked`` (aiohttp's
+    ``DeflateBuffer`` feeds the same stream ``resp.read()`` consumes, so no
+    chunked/gzip truncation) and aborts as soon as the running total exceeds
+    the cap. The cap therefore bounds peak memory DURING the read — a huge or
+    gzip-bombed response from an untrusted URL can't buffer fully before the
+    guard fires.
 
     Returns None on an oversized body (logged at WARNING with ``label``).
     """
-    raw = await cast("Awaitable[bytes]", resp.read())
-    if len(raw) > max_bytes:
-        logger.warning(f"{label} response too large ({len(raw)} bytes > {max_bytes}); dropping")
-        return None  # noqa: ASYNC910
-    return raw
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(_READ_CHUNK_BYTES):
+        total += len(chunk)
+        if total > max_bytes:
+            logger.warning(f"{label} response too large ({total} bytes read > {max_bytes}); dropping")
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)

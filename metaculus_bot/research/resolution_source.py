@@ -117,25 +117,6 @@ def _ip_is_disallowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool
     )
 
 
-def _host_from_netloc(netloc: str) -> str:
-    """Extract the bare host from ``netloc``, stripping userinfo, port, and
-    IPv6 brackets. Returns "" if the netloc has no host component."""
-    host = netloc
-    # Drop userinfo (already rejected upstream, but be self-sufficient).
-    if "@" in host:
-        host = host.rsplit("@", 1)[1]
-    # IPv6 literals live inside brackets: `[::1]:8000`.
-    if host.startswith("["):
-        end = host.find("]")
-        if end == -1:
-            return ""
-        return host[1:end]
-    # IPv4 or hostname: strip trailing `:port` if present.
-    if ":" in host:
-        host = host.rsplit(":", 1)[0]
-    return host
-
-
 async def is_public_http_url(url: str) -> bool:
     """Return True iff ``url`` is safe to fetch from CI (public HTTP(S) only).
 
@@ -170,7 +151,9 @@ async def is_public_http_url(url: str) -> bool:
     if parsed.username is not None or parsed.password is not None:
         return False
 
-    host = _host_from_netloc(parsed.netloc)
+    # `.hostname` strips userinfo, port, and IPv6 brackets, and lowercases —
+    # harmless here: both ip_address() and getaddrinfo() are case-insensitive.
+    host = parsed.hostname or ""
     if not host:
         return False
 
@@ -252,14 +235,13 @@ def extract_source_urls(text: str) -> list[str]:
 
     Handles markdown links ``[label](https://…)`` and bare URLs. Strips trailing
     punctuation, applies backslash-unescape, dedupes preserving order (case-
-    insensitive scheme+host, exact path). Returns the FULL deduped list — the
-    ``RESOLUTION_SOURCE_MAX_URLS`` cap is applied downstream by
+    insensitive scheme+host; exact path and query — query params stay in the
+    key because we may need them, e.g. for FRED graph_id; fragments are
+    excluded because they're never sent over HTTP). Returns the FULL deduped
+    list — the ``RESOLUTION_SOURCE_MAX_URLS`` cap is applied downstream by
     :func:`select_fetchable_urls`, AFTER the self-ref/FRED/Yahoo skip filter,
     so a run of leading self-refs doesn't starve the real sources out of the
     fetch budget.
-
-    A local ``_normalize_url_for_dedup`` (does NOT strip query params — we may
-    need them, e.g. for FRED graph_id) is used for dedup keys.
     """
     if not text:
         return []
@@ -289,10 +271,12 @@ def extract_source_urls(text: str) -> list[str]:
             continue
         cleaned.append(u)
 
-    # Dedup preserving order. Case-insensitive scheme+netloc; exact path/query/fragment,
-    # except a bare host and a bare host + "/" collapse to one entry (real questions cite
-    # both forms of the same root page — observed on childmortality.org in the 2026-07-09
-    # smoke test, burning a duplicate fetch slot).
+    # Dedup preserving order (first-seen URL string wins). Case-insensitive
+    # scheme+netloc; exact path/query. Fragments are excluded — they're never
+    # sent over HTTP, so URLs differing only by fragment are the same fetch.
+    # A bare host and a bare host + "/" collapse to one entry (real questions
+    # cite both forms of the same root page — observed on childmortality.org
+    # in the 2026-07-09 smoke test, burning a duplicate fetch slot).
     seen: set[str] = set()
     deduped: list[str] = []
     for u in cleaned:
@@ -300,7 +284,7 @@ def extract_source_urls(text: str) -> list[str]:
             parsed = urlparse(u)
         except ValueError:
             continue
-        key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path or '/'}?{parsed.query}#{parsed.fragment}"
+        key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path or '/'}?{parsed.query}"
         if key in seen:
             continue
         seen.add(key)
@@ -381,8 +365,9 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     for r in successes:
         # Cheap per-section budget accounting on the text body only. Section
         # overhead (URL heading + fetched-date line) is negligible relative to
-        # a 12k-char total budget; if the caller tightens it dramatically for a
-        # test, we still cut the text conservatively.
+        # the RESOLUTION_SOURCE_TOTAL_MAX_CHARS total budget; if the caller
+        # tightens it dramatically for a test, we still cut the text
+        # conservatively.
         if remaining <= 0:
             break
         body = r.text
@@ -710,7 +695,9 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
     - Env flag ``RESOLUTION_SOURCE_ENABLED`` must be truthy.
 
     Returns section BODY only; the orchestrator prepends the ``## Resolution
-    Source Snapshot`` header and demotes inner ``###`` → ``####``.
+    Source Snapshot`` header. Inner ``### {url}`` headers stay at h3 — the
+    orchestrator's heading demotion only touches h1/h2, and h3 is already
+    correctly nested under the h2 provider header.
     """
 
     async def _fetch(question: MetaculusQuestion) -> str:

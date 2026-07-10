@@ -74,10 +74,11 @@ ARM_PDF_MIN2 = "pdf_min2"  # pdf arm with min_forecasters=2 (proper aggregation)
 ARM_MEDIAN = "median"  # deterministic median over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 
-# Default stacker mirrors production ``STACKER_LLM`` from ``llm_configs.py``:
-# claude-opus-4.5 as primary (donated key allows it; verified) and gpt-5.6-sol as
-# fallback (production STACKER_FALLBACK_LLM choice — different provider so an
-# Anthropic stall doesn't take both attempts down). Both are routed through
+# Default stacker intentionally uses claude-opus-4.5 as primary for local
+# donated-key compatibility (see the History note below), independent of the
+# current prod ``STACKER_LLM`` primary (claude-fable-5 in ``llm_configs.py``).
+# gpt-5.6-sol as fallback matches prod STACKER_FALLBACK_LLM (different provider
+# so an Anthropic stall doesn't take both attempts down). Both are routed through
 # ``build_llm_with_openrouter_fallback`` for the donated→paid key fallback the
 # wrapper provides on credit/auth/data-policy errors.
 #
@@ -253,7 +254,7 @@ def _is_finite_prediction(prediction_value: Any) -> bool:
     NaN/inf values explicitly so they don't poison the cross-model
     aggregator and bootstrap CIs downstream.
     """
-    import math  # noqa: PLC0415  - keep import resilient against formatter strip
+    import math  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # keep import resilient against formatter strip
 
     if not isinstance(prediction_value, dict):
         return False
@@ -339,12 +340,14 @@ async def _dispatch_stacker(
         # Function-scoped imports survive Ruff's unused-import pass when added
         # in the same edit as their usage; see AGENTS.md note on ``main.py``'s
         # function-scoped imports for the same reason.
-        from metaculus_bot.exceptions import UnitMismatchError  # noqa: PLC0415  # function-scoped: see AGENTS.md
-        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.exceptions import (
+            UnitMismatchError,  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        )
+        from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             build_numeric_distribution,
             sanitize_percentiles,
         )
-        from metaculus_bot.numeric.validation import (
+        from metaculus_bot.numeric.validation import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             detect_unit_mismatch,  # noqa: PLC0415  # function-scoped: see AGENTS.md
         )
 
@@ -399,7 +402,7 @@ def _median_fallback_prediction(
     Marks the failure mode in the caller's logs; no internal logging
     here so the surrounding context (qid, arm) appears in one place.
     """
-    from metaculus_bot.aggregation_strategies import (  # noqa: PLC0415
+    from metaculus_bot.aggregation_strategies import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
         AggregationStrategy,
         combine_binary_predictions,
         combine_multiple_choice_predictions,
@@ -595,7 +598,7 @@ async def run_stacker_for_arm(
                         timeout=STACKER_SOFT_DEADLINE,
                     )
                     stacker_model_used = "primary"
-                except Exception as primary_exc:  # noqa: BLE001 - translated to cached error payload
+                except Exception as primary_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
                     logger.exception("Primary stacker failed for qid=%s arm=%s", qid, arm)
                     errors_list.append(f"primary: {type(primary_exc).__name__}: {primary_exc!r}")
                     if fallback_stacker_llm is not None:
@@ -617,7 +620,7 @@ async def run_stacker_for_arm(
                                 timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                             )
                             stacker_model_used = "fallback"
-                        except Exception as fallback_exc:  # noqa: BLE001 - translated to cached error payload
+                        except Exception as fallback_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
                             logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
                             errors_list.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
                             result = None
@@ -678,7 +681,7 @@ async def run_stacker_for_arm(
             )
             cache.write_stacker_output(qid=qid, arm=arm, payload=median_payload, stacker_slug=stacker_slug)
             return median_payload
-        except Exception as median_exc:  # noqa: BLE001 - degrade gracefully
+        except Exception as median_exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # degrade gracefully to error payload
             logger.exception("Median fallback failed for qid=%s arm=%s", qid, arm)
             errors_list.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
             error_payload = make_error_payload(

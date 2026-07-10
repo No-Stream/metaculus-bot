@@ -42,9 +42,7 @@ from typing import Literal
 
 import numpy as np
 from forecasting_tools import (
-    BinaryQuestion,
     MetaculusQuestion,
-    MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
     PredictedOptionList,
@@ -76,6 +74,7 @@ from metaculus_bot.probabilistic_tools import (
     satopaa_extremize,
     stated_base_rate_consistency,
 )
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
@@ -139,16 +138,6 @@ def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choic
         logger.warning("PROBABILISTIC_TOOLS_TYPES has invalid entries %s; ignoring them", invalid)
         allowed = allowed & _VALID_TYPES
     return question_type in allowed
-
-
-def _question_type_of(question: MetaculusQuestion) -> Literal["binary", "numeric", "multiple_choice"] | None:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +487,7 @@ def run_tools_for_forecaster(
     when the feature flag is off, no structured block was found, or no
     tool produced output.
     """
-    qtype = _question_type_of(question)
+    qtype = question_type_of(question)
     if qtype is None:
         logger.debug(
             "Unsupported question type %s for tool runner; skipping (forecaster=%s)",
@@ -518,7 +507,7 @@ def run_tools_for_forecaster(
         lines = _run_binary_tools(block)
     elif isinstance(block, NumericStructured):
         # qtype=="numeric" guarantees question is a NumericQuestion (see
-        # _question_type_of); cast is needed because pyright can't prove the
+        # question_type_of); cast is needed because pyright can't prove the
         # cross-field invariant across the discriminated union.
         assert isinstance(question, NumericQuestion)
         lines = _run_numeric_tools(block, question)
@@ -786,7 +775,7 @@ def build_cross_model_aggregation(
     unsupported, or there is nothing useful to report. Callers can instead
     use the typed entry points (``aggregate_binary_values`` etc.) directly.
     """
-    qtype = _question_type_of(question)
+    qtype = question_type_of(question)
     if qtype is None:
         return ""
 

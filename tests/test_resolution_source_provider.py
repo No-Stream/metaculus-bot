@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket as _socket
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
@@ -45,11 +45,29 @@ from metaculus_bot.research.resolution_source import (
 # ---------------------------------------------------------------------------
 # Fake aiohttp session (copied + extended from tests/test_prediction_market_provider.py).
 # Extensions vs. the prediction-market template:
-#   * FakeResponse gets an async .read() -> bytes and a `headers` dict
+#   * FakeResponse gets an async .read() -> bytes, a `.content.iter_chunked`
+#     stream (what `read_body_capped` consumes), and a `headers` dict
 #     exposing Content-Type (the resolution-source fetcher branches on it).
 #   * FakeSession tracks per-host in-flight counts so the per-netloc-Semaphore
 #     serialization guarantee can be asserted.
 # ---------------------------------------------------------------------------
+
+
+class _FakeContent:
+    """Stub for `resp.content`: streams the body via `iter_chunked`.
+
+    Delegates to the owning FakeResponse's `.read()` so tests that monkeypatch
+    or override `read()` (slow-read serialization probe, UnreadableResponse's
+    body-must-not-be-read assertion) keep working against the streaming path.
+    """
+
+    def __init__(self, resp: "FakeResponse"):
+        self._resp = resp
+
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+        body = await self._resp.read()
+        for i in range(0, len(body), n):
+            yield body[i : i + n]
 
 
 class FakeResponse:
@@ -71,6 +89,7 @@ class FakeResponse:
             merged.update(headers)
         self.headers = merged
         self._text = text if text is not None else body.decode("utf-8", errors="replace")
+        self.content = _FakeContent(self)
 
     async def read(self) -> bytes:
         return self._body  # noqa: ASYNC910
@@ -270,6 +289,12 @@ class TestExtractSourceUrls:
         # childmortality.org vs childmortality.org/) — one fetch slot, not two.
         text = "See https://x.org and also https://x.org/ for data."
         assert extract_source_urls(text) == ["https://x.org"]
+
+    def test_dedup_ignores_fragment(self):
+        # Fragments are never sent over HTTP — URLs differing only by fragment
+        # are the same fetch and must not burn two fetch slots. First-seen wins.
+        text = "See https://x.org/page#section-a and https://x.org/page#section-b for data."
+        assert extract_source_urls(text) == ["https://x.org/page#section-a"]
 
     def test_no_cap_in_extraction(self, monkeypatch):
         # The cap moved to `select_fetchable_urls` (F2 fix). `extract_source_urls`

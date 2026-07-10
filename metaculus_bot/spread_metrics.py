@@ -21,8 +21,7 @@ from forecasting_tools import (
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-from metaculus_bot.numeric.percentile_set import PercentileSet
+from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, PercentileSet, percentile_key
 from metaculus_bot.prob_math_utils import logit
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -32,18 +31,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 # percentile set (e.g. 11 -> 13) cannot silently shift them.
 _KEY_SPREAD_PERCENTILES: list[float] = [0.10, 0.50, 0.90]
 
-# Rounded standard-percentile label set, matching PercentileSet's rounding convention,
-# used to distinguish continuous forecaster output (the standard set) from a
-# discrete-resampled cumulative-probability CDF grid.
-_LABEL_DECIMALS: int = 6
-_STANDARD_LABEL_KEYS: frozenset[float] = frozenset(round(p, _LABEL_DECIMALS) for p in STANDARD_PERCENTILES)
-
 
 def _has_standard_labels(model_pcts: list[Percentile]) -> bool:
-    """True iff the model's percentile labels are exactly the standard percentile set."""
+    """True iff the model's percentile labels are exactly the standard percentile set.
+
+    Uses ``percentile_set``'s canonical rounded key set (``EXPECTED_KEYS``) to
+    distinguish continuous forecaster output (the standard set) from a
+    discrete-resampled cumulative-probability CDF grid. The length check guards
+    against a duplicate label masquerading as the standard set.
+    """
     return (
-        len(model_pcts) == len(_STANDARD_LABEL_KEYS)
-        and frozenset(round(p.percentile, _LABEL_DECIMALS) for p in model_pcts) == _STANDARD_LABEL_KEYS
+        len(model_pcts) == len(EXPECTED_KEYS)
+        and frozenset(percentile_key(p.percentile) for p in model_pcts) == EXPECTED_KEYS
     )
 
 

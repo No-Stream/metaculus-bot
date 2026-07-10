@@ -151,7 +151,7 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 - Conditional-stacking support: `disagreement_crux_prompt`, `targeted_search_prompt`.
 - Gap-fill: `gap_fill_analyzer_prompt`, `gap_fill_search_prompt`.
 
-## Probabilistic tools (ACTIVE)
+## Probabilistic tools (wired, DISABLED in prod)
 
 ### `metaculus_bot/probabilistic_tools/`
 
@@ -165,7 +165,7 @@ Newly-added math (Workstreams D1-D3):
 
 ### `metaculus_bot/tool_runner.py`
 
-Despite the name, **not** an LLM tool-calling harness. A **deterministic probability-math post-processor** that runs on structured JSON blocks emitted by each forecaster (priors, base rates, hazards, percentiles, scenarios) and injects a "Computed quantities" section into per-forecaster rationales plus a cross-model aggregation block into the stacker prompt. Entry points `run_tools_for_forecaster` and `build_cross_model_aggregation`. Gated by `PROBABILISTIC_TOOLS_ENABLED`; both entry points no-op when the flag is unset. **Wired into production code**: `run_tools_for_forecaster` runs from `_make_prediction`, and `build_cross_model_aggregation` feeds the stacker prompts in both the STACKING and CONDITIONAL_STACKING paths. A `TOOLS_USED` marker is emitted in the comment trailer alongside the `STACKER_OUTCOME` marker so residual analysis can bucket tool-augmented vs. vanilla runs.
+Despite the name, **not** an LLM tool-calling harness. A **deterministic probability-math post-processor** that runs on structured JSON blocks emitted by each forecaster (priors, base rates, hazards, percentiles, scenarios) and injects a "Computed quantities" section into per-forecaster rationales plus a cross-model aggregation block into the stacker prompt. Entry points `run_tools_for_forecaster` and `build_cross_model_aggregation`. Gated by `PROBABILISTIC_TOOLS_ENABLED`; both entry points no-op when the flag is unset. **Wired but DORMANT in prod**: all three prod workflows (`.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml`) pin `PROBABILISTIC_TOOLS_ENABLED: 'false'` (retired via Workstream C2, which also removed the tier-2 scaffold from the prompts; tool_runner + probabilistic_tools stay behind the flag). The wiring remains live: `run_tools_for_forecaster` runs from `_make_prediction`, and `build_cross_model_aggregation` feeds the stacker prompts in both the STACKING and CONDITIONAL_STACKING paths. A `TOOLS_USED` marker is emitted in the comment trailer alongside the `STACKER_OUTCOME` marker so residual analysis can bucket tool-augmented vs. vanilla runs (always `false` in prod while the flag is off; see `metaculus_bot/comment/markers.py` for the marker-dormancy details).
 
 ## Project structure
 

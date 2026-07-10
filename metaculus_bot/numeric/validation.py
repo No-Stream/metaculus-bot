@@ -8,15 +8,14 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, percentile_key
 
 logger = logging.getLogger(__name__)
 
 
 def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> None:
     """Validate that we have exactly the expected number of percentiles with the correct values."""
-    expected_percentiles = set(STANDARD_PERCENTILES)
-
     # Check count
     if len(percentile_list) != EXPECTED_PERCENTILE_COUNT:
         raise ValidationError.from_exception_data(
@@ -33,10 +32,9 @@ def validate_percentile_count_and_values(percentile_list: list[Percentile]) -> N
             ],
         )
 
-    # Check values with tolerance for rounding
-    actual_percentiles = {round(p.percentile, 6) for p in percentile_list}
-    expected_rounded = {round(p, 6) for p in expected_percentiles}
-    if actual_percentiles != expected_rounded:
+    # Check values with tolerance for rounding (canonical key convention from percentile_set)
+    actual_percentiles = {percentile_key(p.percentile) for p in percentile_list}
+    if actual_percentiles != EXPECTED_KEYS:
         raise ValidationError.from_exception_data(
             "NumericDistribution",
             [
@@ -63,12 +61,11 @@ def filter_to_standard_percentiles(percentile_list: list[Percentile]) -> list[Pe
     If extras are present, drop them before validation. If duplicates occur (same percentile
     repeated), keep the first occurrence.
     """
-    allowed = {round(p, 6) for p in STANDARD_PERCENTILES}
     seen: set[float] = set()
     filtered: list[Percentile] = []
     for p in percentile_list:
-        key = round(float(p.percentile), 6)
-        if key in allowed and key not in seen:
+        key = percentile_key(p.percentile)
+        if key in EXPECTED_KEYS and key not in seen:
             filtered.append(p)
             seen.add(key)
     return filtered

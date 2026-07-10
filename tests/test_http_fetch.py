@@ -3,7 +3,8 @@
 Covers:
 - `BROWSER_HEADERS` completeness (Safari-like UA + Accept / Accept-Language / Accept-Encoding)
 - `build_session` config plumbing (ClientTimeout total+sock_read, TCPConnector limit, headers, resolver)
-- `read_body_capped` under/at/over the byte cap (over -> None + WARNING)
+- `read_body_capped` under/at/over the byte cap (over -> None + WARNING), including
+  multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
   and delegates `close()` to its inner resolver.
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -69,14 +71,25 @@ def _reject_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_private or ip.is_loopback
 
 
-class FakeReadResponse:
-    """Minimal stub exposing the `.read()` surface `read_body_capped` consumes."""
+class FakeStreamContent:
+    """Stub for `resp.content`: yields pre-set chunks and counts how many were consumed."""
 
-    def __init__(self, body: bytes):
-        self._body = body
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+        self.chunks_consumed = 0
 
-    async def read(self) -> bytes:
-        return self._body  # noqa: ASYNC910
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+        del n  # chunk boundaries are dictated by the test's pre-set chunks
+        for chunk in self._chunks:
+            self.chunks_consumed += 1
+            yield chunk
+
+
+class FakeStreamResponse:
+    """Minimal stub exposing the `.content.iter_chunked` surface `read_body_capped` consumes."""
+
+    def __init__(self, chunks: list[bytes]):
+        self.content = FakeStreamContent(chunks)
 
 
 class TestBrowserHeaders:
@@ -137,18 +150,35 @@ class TestBuildSession:
 class TestReadBodyCapped:
     async def test_returns_body_under_cap(self):
         body = b"x" * 100
-        assert await read_body_capped(FakeReadResponse(body), max_bytes=200, label="under") == body
+        assert await read_body_capped(FakeStreamResponse([body]), max_bytes=200, label="under") == body
 
     async def test_returns_body_at_cap_boundary(self):
         body = b"x" * 200
-        assert await read_body_capped(FakeReadResponse(body), max_bytes=200, label="at-cap") == body
+        assert await read_body_capped(FakeStreamResponse([body]), max_bytes=200, label="at-cap") == body
 
     async def test_over_cap_returns_none_and_warns(self, caplog):
         with caplog.at_level(logging.WARNING):
-            result = await read_body_capped(FakeReadResponse(b"x" * 201), max_bytes=200, label="mylabel")
+            result = await read_body_capped(FakeStreamResponse([b"x" * 201]), max_bytes=200, label="mylabel")
         assert result is None
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "mylabel" in r.getMessage()]
         assert warnings, "expected a WARNING mentioning the label for the oversized body"
+
+    async def test_multi_chunk_body_under_cap_is_joined(self):
+        chunks = [b"alpha-", b"beta-", b"gamma"]
+        result = await read_body_capped(FakeStreamResponse(chunks), max_bytes=200, label="multi")
+        assert result == b"alpha-beta-gamma"
+
+    async def test_over_cap_mid_stream_aborts_without_draining(self, caplog):
+        # Cap 100, 50-byte chunks: chunk 2 lands exactly AT the cap (kept),
+        # chunk 3 crosses it — the loop must bail there (bounding peak memory)
+        # and never pull chunk 4 off the stream.
+        resp = FakeStreamResponse([b"a" * 50, b"b" * 50, b"c" * 50, b"d" * 50])
+        with caplog.at_level(logging.WARNING):
+            result = await read_body_capped(resp, max_bytes=100, label="midstream")
+        assert result is None
+        assert resp.content.chunks_consumed == 3
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "midstream" in r.getMessage()]
+        assert warnings, "expected a WARNING mentioning the label for the mid-stream over-cap abort"
 
 
 class TestFilteringResolver:
