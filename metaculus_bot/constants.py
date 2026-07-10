@@ -71,9 +71,7 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
 
     Call this at bot startup to catch stale tournament IDs.
     """
-    import logging as _logging
-
-    log = logger or _logging.getLogger(__name__)
+    log = logger or logging.getLogger(__name__)
 
     try:
         end_date = datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d")
@@ -299,6 +297,19 @@ NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
+
+# --- Resolution-Source Fetcher (Tier 1) ---
+# Char caps below apply to RAW fetched content only (policy: raw passthrough is
+# capped; LLM-emitted research is never truncated).
+RESOLUTION_SOURCE_ENABLED_ENV: str = "RESOLUTION_SOURCE_ENABLED"
+RESOLUTION_SOURCE_HTTP_TIMEOUT: float = 20.0  # per-request (probe: 0-2s typical; slack for slow gov sites)
+RESOLUTION_SOURCE_WALL_TIMEOUT: float = 45.0  # hard cap on the whole provider
+RESOLUTION_SOURCE_MAX_URLS: int = 5  # 58 URLs / 40 Qs ≈ 1.45 avg; bounds pathological multi-URL Qs
+RESOLUTION_SOURCE_MAX_RESPONSE_BYTES: int = 5 * 1024 * 1024  # CISA KEV JSON ~1.5 MB; 5 MiB headroom
+RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 3000  # ~750 tokens/source
+RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = 12000  # whole-section budget (~3k tokens)
+RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
+RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google

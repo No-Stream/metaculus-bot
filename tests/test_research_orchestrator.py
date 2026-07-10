@@ -352,6 +352,7 @@ class TestProviderSelection:
         monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
         monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("RESOLUTION_SOURCE_ENABLED", raising=False)
         monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
 
         orch = ResearchOrchestrator(
@@ -361,6 +362,72 @@ class TestProviderSelection:
         providers = orch._select_research_providers()
         assert len(providers) == 1
         assert providers[0][1] == "none"
+
+    def test_includes_resolution_source_when_enabled(self, mock_llm, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+        )
+        providers = orch._select_research_providers()
+        names = [n for _, n in providers]
+        assert "resolution_source" in names
+
+    def test_excludes_resolution_source_when_flag_unset(self, mock_llm, monkeypatch):
+        monkeypatch.delenv("RESOLUTION_SOURCE_ENABLED", raising=False)
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+        )
+        providers = orch._select_research_providers()
+        names = [n for _, n in providers]
+        assert "resolution_source" not in names
+
+    def test_resolution_source_body_composes_with_header_and_demoted_headings(self):
+        """Body written by the resolution_source provider composes with the
+        orchestrator header machinery: h2 provider header sits above the body,
+        and any in-body h1/h2 subheadings are demoted so the whole snapshot is
+        a well-formed section within the combined research doc.
+        """
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator as RO
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = (
+            "Caveat: only reproduces text as fetched; forecaster must judge relevance.\n\n"
+            "### https://example.com/data\n"
+            "Some extracted content.\n"
+        )
+        # Simulate _run_providers_parallel's composition step (orchestrator.py ~L389-397).
+        header = RO._provider_header("resolution_source")
+        composed = f"{header}\n{_demote_inner_headings(body)}"
+
+        assert "## Resolution Source Snapshot" in composed
+        # The h3 "### https://example.com/data" is untouched by the demoter
+        # (which only shifts h1/h2), so it stays h3 under the h2 header. If
+        # future author writes it as h1/h2 the demoter shifts it to h3/h4.
+        assert composed.index("## Resolution Source Snapshot") < composed.index("### https://example.com/data")
 
     def test_includes_native_search_when_enabled(self, mock_llm, monkeypatch):
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")

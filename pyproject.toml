@@ -23,6 +23,7 @@ dependencies = [
     "pydantic>=2.9.2,<3.0.0",
     "tqdm>=4.66", # imported at top level in backtest.py / community_benchmark.py
     "typeguard>=4.5", # imported at top level in backtest.py / community_benchmark.py / scoring_patches.py
+    "trafilatura>=2.1.0",
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`

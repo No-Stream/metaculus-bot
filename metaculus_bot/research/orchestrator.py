@@ -33,6 +33,7 @@ from metaculus_bot.constants import (
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
     PREDICTION_MARKETS_ENABLED_ENV,
+    RESOLUTION_SOURCE_ENABLED_ENV,
     SUMMARIZER_WALL_TIMEOUT,
     env_flag_enabled,
 )
@@ -308,6 +309,11 @@ class ResearchOrchestrator:
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
+        if env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
+            from metaculus_bot.research.resolution_source import resolution_source_provider  # noqa: PLC0415
+
+            providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
+
         if not providers:
 
             async def _empty(_: MetaculusQuestion) -> str:
@@ -405,6 +411,7 @@ class ResearchOrchestrator:
             "gemini_search": "## Web Research (Google Search via Gemini)",
             "financial_data": "## Financial & Economic Data",
             "prediction_market": "## Prediction Market Snapshot",
+            "resolution_source": "## Resolution Source Snapshot",
             "exa": "## Web Research (Exa)",
             "perplexity": "## Web Research (Perplexity)",
             "openrouter": "## Web Research (OpenRouter)",

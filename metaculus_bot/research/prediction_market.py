@@ -41,7 +41,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Iterable, Literal, cast
+from typing import Any, Iterable, Literal
 
 import aiohttp
 import litellm.exceptions
@@ -57,6 +57,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
+from metaculus_bot.research.http_fetch import build_session, read_body_capped
 from metaculus_bot.research.providers import ResearchCallable
 
 logger = logging.getLogger(__name__)
@@ -148,10 +149,12 @@ def _reset_session_caches() -> None:
 
 
 def _get_session() -> aiohttp.ClientSession:
-    """Construct a fresh aiohttp session. Patched in tests."""
-    timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
-    connector = aiohttp.TCPConnector(limit=20)
-    return aiohttp.ClientSession(timeout=timeout, connector=connector)
+    """Construct a fresh aiohttp session. Patched in tests.
+
+    No headers arg: the JSON APIs get aiohttp's default UA (flipping to a
+    browser UA is a separate experiment — see the resolution-source plan).
+    """
+    return build_session(timeout_s=PLATFORM_HTTP_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -287,18 +290,17 @@ class KeywordExtractor:
 async def _read_json_capped(resp: Any, label: str) -> Any | None:
     """Parse a response body as JSON, rejecting responses over MAX_RESPONSE_BYTES.
 
-    Uses `resp.read()` (which reads the full decompressed body) then checks
-    size, rather than `resp.content.read(n)` which returns only whatever is in
-    the internal buffer -- causing silent truncation on chunked/brotli responses.
+    Size-capped body read delegated to the shared `read_body_capped` (full
+    `resp.read()` — avoids the chunked/brotli truncation trap of
+    `resp.content.read(n)`).
 
     Test stubs that only implement `.json()` are handled via the fallback path.
     Returns None on decode failure or oversized response (caller logs).
     """
     read_method = getattr(resp, "read", None)
     if read_method is not None and callable(read_method):
-        raw = await cast("Awaitable[Any]", read_method())
-        if len(raw) > MAX_RESPONSE_BYTES:
-            logger.warning(f"{label} response too large ({len(raw)} bytes > {MAX_RESPONSE_BYTES}); dropping")
+        raw = await read_body_capped(resp, max_bytes=MAX_RESPONSE_BYTES, label=label)
+        if raw is None:
             return None  # noqa: ASYNC910
         try:
             return json.loads(raw)
