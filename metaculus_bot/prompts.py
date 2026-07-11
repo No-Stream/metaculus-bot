@@ -10,6 +10,7 @@ from forecasting_tools import (
 )
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+from metaculus_bot.numeric.utils import nominal_bounds
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
@@ -518,6 +519,7 @@ def numeric_prompt(
     upper_bound_message: str,
 ) -> str:
     unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
+    nom_upper, nom_lower = nominal_bounds(question)
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
@@ -555,10 +557,10 @@ def numeric_prompt(
         {question.resolution_criteria}
         {question.fine_print}
 
-        ── Units & Bounds (must follow) ──
+        ── Units & Bounds ──
         • Base units for output values: {unit_str}
-        • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
-        • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
+        • Displayed range (in base units): [{nom_lower}, {nom_upper}]
+        • Note: displayed range is suggestive of units! If needed, you may use it to infer units.
         • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
@@ -630,7 +632,7 @@ def numeric_prompt(
             - Keep your extreme tails (P1 and P99) far apart to allow for unknown unknowns.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
-            - Respect the explicit bounds above.
+            - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
         (9) Outcome type classification
             Determine whether the resolution value for this question will always be a whole integer
@@ -651,7 +653,7 @@ def numeric_prompt(
             FORECASTABILITY: HIGH
             FORECASTABILITY: MEDIUM
             FORECASTABILITY: LOW
-            For LOW forecastability, your IQR should span a large fraction of the allowed range.
+            For LOW forecastability, your IQR should span a large fraction of the displayed range (or beyond where a bound is open).
             For HIGH, your IQR can be as narrow as the historical data justifies.
 
         (10) Brief checklist
@@ -907,6 +909,7 @@ def stacking_numeric_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
+    nom_upper, nom_lower = nominal_bounds(question)
 
     return clean_indents(
         f"""
@@ -925,9 +928,9 @@ def stacking_numeric_prompt(
         
         Units: {question.unit_of_measure or "Not stated: infer if possible"}
         
-        ── Units & Bounds (must follow) ─────────────────────────────────────
+        ── Units & Bounds ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
-        • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
+        • Displayed range (base units): [{nom_lower}, {nom_upper}]
         • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
@@ -984,7 +987,8 @@ def stacking_numeric_prompt(
            • Are my tails justified given the potential for unknown unknowns?
 
         Remember: Think in ranges, not points. Keep your extreme tails (P1 and P99) appropriately wide.
-        Ensure strictly increasing percentiles and respect the bounds above.
+        Ensure strictly increasing percentiles.
+        For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
