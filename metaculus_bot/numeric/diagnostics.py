@@ -1,9 +1,13 @@
 """Log diagnostic information for numeric prediction processing."""
 
+from __future__ import annotations
+
 import logging
 
 from forecasting_tools import NumericDistribution
 from forecasting_tools.data_models.questions import NumericQuestion
+
+from metaculus_bot.numeric.config import OPEN_BOUND_PILING_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +68,58 @@ def log_final_prediction(prediction: NumericDistribution, question: NumericQuest
     logger.info(
         f"Forecasted URL {getattr(question, 'page_url', '<unknown>')} as {getattr(prediction, 'declared_percentiles', [])}"
     )
+
+
+def log_open_bound_piling_diagnostics(
+    prediction: NumericDistribution,
+    question: NumericQuestion,
+    model_name: str,
+    *,
+    threshold: float = OPEN_BOUND_PILING_THRESHOLD,
+) -> None:
+    """WARN when probability mass piles onto the terminal bin of an OPEN bound.
+
+    On an open bound, the displayed edge is not a hard cap: mass beyond it is expressed
+    by placing percentiles past the edge. When a model instead crams the terminal bin and
+    keeps every declared percentile inside the range, it is treating the open edge as a
+    hard limit — the prompt-contradiction bug this detector surfaces. Diagnostics only:
+    never raises, never mutates the prediction.
+    """
+    if not question.open_upper_bound and not question.open_lower_bound:
+        return
+
+    cdf = getattr(prediction, "cdf", None)
+    declared = getattr(prediction, "declared_percentiles", None)
+    if not cdf or len(cdf) < 2 or not declared:
+        return
+
+    if question.open_upper_bound:
+        bin_mass = cdf[-1].percentile - cdf[-2].percentile
+        declared_edge = max(p.value for p in declared)
+        if bin_mass >= threshold and declared_edge <= question.upper_bound:
+            logger.warning(
+                "OPEN_BOUND_PILING: question=%s model=%s bound=%s bin_mass=%.3f declared_edge=%.6g bound_value=%.6g",
+                getattr(question, "id_of_question", None),
+                model_name,
+                "upper",
+                bin_mass,
+                declared_edge,
+                question.upper_bound,
+            )
+
+    if question.open_lower_bound:
+        bin_mass = cdf[1].percentile - cdf[0].percentile
+        declared_edge = min(p.value for p in declared)
+        if bin_mass >= threshold and declared_edge >= question.lower_bound:
+            logger.warning(
+                "OPEN_BOUND_PILING: question=%s model=%s bound=%s bin_mass=%.3f declared_edge=%.6g bound_value=%.6g",
+                getattr(question, "id_of_question", None),
+                model_name,
+                "lower",
+                bin_mass,
+                declared_edge,
+                question.lower_bound,
+            )
 
 
 def log_pchip_fallback(question: NumericQuestion, error: Exception) -> None:

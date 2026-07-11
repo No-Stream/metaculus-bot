@@ -17,6 +17,7 @@ from forecasting_tools.data_models.numeric_report import (
 from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
@@ -24,6 +25,7 @@ __all__ = [
     "aggregate_numeric",
     "aggregate_binary_mean",
     "bound_messages",
+    "nominal_bounds",
     "clamp_and_renormalize_mc",
 ]
 
@@ -171,25 +173,27 @@ def aggregate_numeric(
     return _postprocess_ensemble_cdf(x_vals, p_vals, question, method_label=method)
 
 
+def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:
+    """Return (upper, lower) nominal/displayed bounds; derive from half-step for discrete Qs."""
+    nominal_upper = getattr(question, "nominal_upper_bound", None)
+    nominal_lower = getattr(question, "nominal_lower_bound", None)
+    cdf_size = getattr(question, "cdf_size", None)
+    if nominal_upper is None and nominal_lower is None and cdf_size is not None and cdf_size != PCHIP_CDF_POINTS:
+        step = (question.upper_bound - question.lower_bound) / (cdf_size - 1)
+        nominal_upper = question.upper_bound - step / 2
+        nominal_lower = question.lower_bound + step / 2
+    upper = nominal_upper if nominal_upper is not None else question.upper_bound
+    lower = nominal_lower if nominal_lower is not None else question.lower_bound
+    return upper, lower
+
+
 def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     """Return upper & lower bound helper messages for numeric prompts.
 
     For discrete questions, if nominal bounds are missing, derive them using half-step logic.
     """
 
-    nominal_upper = getattr(question, "nominal_upper_bound", None)
-    nominal_lower = getattr(question, "nominal_lower_bound", None)
-
-    # For discrete questions, if we don't have nominal bounds, derive them using half-step logic
-    cdf_size = getattr(question, "cdf_size", None)
-    if nominal_upper is None and nominal_lower is None and cdf_size is not None and cdf_size != 201:
-        # This is likely a discrete question - derive nominal bounds from half-step
-        step = (question.upper_bound - question.lower_bound) / (cdf_size - 1)
-        nominal_upper = question.upper_bound - step / 2
-        nominal_lower = question.lower_bound + step / 2
-
-    upper_bound_number = nominal_upper if nominal_upper is not None else question.upper_bound
-    lower_bound_number = nominal_lower if nominal_lower is not None else question.lower_bound
+    upper_bound_number, lower_bound_number = nominal_bounds(question)
 
     if question.open_upper_bound:
         upper_bound_message = (
