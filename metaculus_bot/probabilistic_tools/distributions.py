@@ -229,7 +229,7 @@ def cdf_at_threshold(fit: FitType, threshold: float) -> float:
     return eval_cdf(fit, threshold)
 
 
-def fit_to_11_percentiles(fit: FitType) -> dict[float, float]:
+def fit_to_standard_percentiles(fit: FitType) -> dict[float, float]:
     return {float(q): float(_eval_ppf(fit, q)) for q in STANDARD_PERCENTILES}
 
 

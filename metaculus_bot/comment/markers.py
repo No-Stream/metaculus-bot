@@ -73,6 +73,44 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Per-forecaster anchor / clause telemetry markers (2026-07-08). Emitted by
+# ``tool_runner._run_binary_tools`` inside each forecaster's "## Computed
+# quantities" block, which is gated behind the ``PROBABILISTIC_TOOLS_ENABLED``
+# env flag: ``run_tools_for_forecaster`` returns an empty string when the
+# flag is false-y (see ``tool_runner.py``). All three prod workflows pin the
+# flag to ``'false'``
+# (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
+# so these HTML-comment markers are currently DORMANT in published prod
+# comments. What DOES land in every prod R1 rationale — regardless of the
+# flag — is the raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
+# forecaster writes into its own STRUCTURED FORECAST block; residual-replay
+# tooling should key off that raw JSON today and can compute the same
+# overshoot / divergence numbers offline. The markers below become the
+# primary channel only if ``PROBABILISTIC_TOOLS_ENABLED`` is ever flipped on.
+# TELEMETRY ONLY either way: nothing in the pipeline reads these back to
+# clamp or mutate a forecast.
+ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
+CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"
+
+ANCHOR_OVERSHOOT_MARKER_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*ANCHOR_OVERSHOOT_PP=([+-]?\d+(?:\.\d+)?)\s*-->",
+    re.IGNORECASE,
+)
+CLAUSE_DIVERGENCE_MARKER_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*CLAUSE_PRODUCT_DIVERGENCE_PP=([+-]?\d+(?:\.\d+)?)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def format_anchor_overshoot_marker(overshoot_pp: float) -> str:
+    """Render the per-forecaster anchor-overshoot marker (signed, 1 decimal)."""
+    return f"<!-- {ANCHOR_OVERSHOOT_MARKER_PREFIX}={overshoot_pp:+.1f} -->"
+
+
+def format_clause_divergence_marker(divergence_pp: float) -> str:
+    """Render the per-forecaster clause-product-divergence marker (signed, 1 decimal)."""
+    return f"<!-- {CLAUSE_DIVERGENCE_MARKER_PREFIX}={divergence_pp:+.1f} -->"
+
 
 # Section headers emitted by ``metaculus_bot.stacking.combine_stacker_and_base_reasoning``
 # inside the single R1 body for stacked questions. Shared with
@@ -129,6 +167,12 @@ assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
 assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_FALSE) is not None, (
     f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_FALSE={TOOLS_USED_MARKER_FALSE!r}"
 )
+assert ANCHOR_OVERSHOOT_MARKER_RE.search(format_anchor_overshoot_marker(16.2)) is not None, (
+    "ANCHOR_OVERSHOOT_MARKER_RE does not match its own formatter output"
+)
+assert CLAUSE_DIVERGENCE_MARKER_RE.search(format_clause_divergence_marker(-4.0)) is not None, (
+    "CLAUSE_DIVERGENCE_MARKER_RE does not match its own formatter output"
+)
 assert STACKER_META_ANALYSIS_HEADER.startswith("## "), (
     f"STACKER_META_ANALYSIS_HEADER must be a markdown H2 header, got {STACKER_META_ANALYSIS_HEADER!r}"
 )
@@ -153,4 +197,10 @@ __all__ = [
     "TOOLS_USED_MARKER_TRUE",
     "TOOLS_USED_MARKER_FALSE",
     "TOOLS_USED_MARKER_RE",
+    "ANCHOR_OVERSHOOT_MARKER_PREFIX",
+    "ANCHOR_OVERSHOOT_MARKER_RE",
+    "CLAUSE_DIVERGENCE_MARKER_PREFIX",
+    "CLAUSE_DIVERGENCE_MARKER_RE",
+    "format_anchor_overshoot_marker",
+    "format_clause_divergence_marker",
 ]

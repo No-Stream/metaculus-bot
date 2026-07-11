@@ -443,7 +443,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Forecaster ensemble: 'free' for the 4-model free-tier ablation (default), "
             "'prod' for the 3-model paid ensemble (claude-opus-4.6, claude-opus-4.8, "
-            "gpt-5.4, all at medium reasoning effort). The 'prod' lineup also selects "
+            "gpt-5.6-sol, all at medium reasoning effort). The 'prod' lineup also selects "
             "the opus-4.8 prod stacker under --plain-llm."
         ),
     )
@@ -1385,7 +1385,7 @@ async def _stage_llm_stacker(
         fallback_llm_kwarg: GeneralLlm | None = None
         if getattr(args, "plain_llm", False):
             from metaculus_bot.ablation.run_stacker import (  # noqa: PLC0415
-                _GPT_5_5_STACKER_KWARGS,
+                _OPENAI_STACKER_KWARGS,
                 _OPUS_STACKER_KWARGS,
                 _PROD_STACKER_KWARGS,
                 DEFAULT_STACKER_FALLBACK_MODEL,
@@ -1398,7 +1398,7 @@ async def _stage_llm_stacker(
             else:
                 stacker_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_MODEL, **_OPUS_STACKER_KWARGS)
             if not getattr(args, "no_stacker_fallback", False):
-                fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_GPT_5_5_STACKER_KWARGS)
+                fallback_llm_kwarg = GeneralLlm(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
         elif getattr(args, "no_stacker_fallback", False):
             # No fallback but still use the donated-key wrapper for primary.
             fallback_llm_kwarg = None

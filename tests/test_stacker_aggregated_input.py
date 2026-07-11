@@ -21,6 +21,7 @@ from forecasting_tools import (
     PredictedOptionList,
 )
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot import stacking
 from metaculus_bot.prompts import (
@@ -28,16 +29,13 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+from metaculus_bot.value_extraction import ExtractionOutcome
 from tests.conftest import make_mock_numeric_question
 
 # _forecasting_window_str asserts on open_time / scheduled_resolution_time;
 # populate in every mock question fixture below.
 _OPEN = datetime.now() - timedelta(days=30)
 _RESOLVE = datetime.now() + timedelta(days=365)
-
-# ---------------------------------------------------------------------------
-# Question factories
-# ---------------------------------------------------------------------------
 
 
 def _make_binary_q() -> BinaryQuestion:
@@ -78,11 +76,6 @@ AGG_BLOCK = (
     "- **Pools over 3 forecasters**: linear 0.400, log 0.370, Satopää α=2.5 0.420\n"
     "- **Blended base rate across 2 forecasters**: 0.300 (range 0.250–0.333)"
 )
-
-
-# ---------------------------------------------------------------------------
-# Prompt-builder direct checks
-# ---------------------------------------------------------------------------
 
 
 class TestStackingBinaryPromptInjection:
@@ -168,9 +161,34 @@ class TestStackingNumericPromptInjection:
         assert "Cross-model aggregation" not in prompt
 
 
-# ---------------------------------------------------------------------------
-# run_stacking_* threads the new kwarg through
-# ---------------------------------------------------------------------------
+# Ladder-seam fakes: run_stacking_* now consumes ExtractionOutcome values via
+# ``metaculus_bot.stacking.extract_{binary,mc,numeric}``. The threading tests
+# below patch the seam and return a canned ``block``-rung outcome, so the
+# stacker's invoke() gets a captured prompt while parsing stays deterministic.
+
+
+def _make_binary_extract(value: float):
+    async def _fake(*_args, **_kwargs) -> ExtractionOutcome[float]:
+        await asyncio.sleep(0)
+        return ExtractionOutcome(value=value, rung="block", block_present=True)
+
+    return _fake
+
+
+def _make_mc_extract(pol: PredictedOptionList):
+    async def _fake(*_args, **_kwargs) -> ExtractionOutcome[PredictedOptionList]:
+        await asyncio.sleep(0)
+        return ExtractionOutcome(value=pol, rung="block", block_present=True)
+
+    return _fake
+
+
+def _make_numeric_extract(percentiles: list[Percentile]):
+    async def _fake(*_args, **_kwargs) -> ExtractionOutcome[list[Percentile]]:
+        await asyncio.sleep(0)
+        return ExtractionOutcome(value=percentiles, rung="block", block_present=True)
+
+    return _fake
 
 
 class TestRunStackingBinaryThreading:
@@ -188,13 +206,7 @@ class TestRunStackingBinaryThreading:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            from forecasting_tools import BinaryPrediction
-
-            await asyncio.sleep(0)
-            return BinaryPrediction(prediction_in_decimal=0.42)
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.extract_binary", _make_binary_extract(0.42))
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -224,13 +236,7 @@ class TestRunStackingBinaryThreading:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            from forecasting_tools import BinaryPrediction
-
-            await asyncio.sleep(0)
-            return BinaryPrediction(prediction_in_decimal=0.42)
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.extract_binary", _make_binary_extract(0.42))
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -259,16 +265,13 @@ class TestRunStackingMcThreading:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            await asyncio.sleep(0)
-            return PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="Red", probability=0.5),
-                    PredictedOption(option_name="Blue", probability=0.5),
-                ]
-            )
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        mc_pol = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Red", probability=0.5),
+                PredictedOption(option_name="Blue", probability=0.5),
+            ]
+        )
+        monkeypatch.setattr("metaculus_bot.stacking.extract_mc", _make_mc_extract(mc_pol))
 
         asyncio.run(
             stacking.run_stacking_mc(
@@ -285,8 +288,6 @@ class TestRunStackingMcThreading:
 
 class TestRunStackingNumericThreading:
     def test_run_stacking_numeric_passes_aggregated_output_into_prompt(self, monkeypatch):
-        from forecasting_tools.data_models.numeric_report import Percentile
-
         captured_prompts: list[str] = []
 
         class FakeStackerLLM:
@@ -300,23 +301,20 @@ class TestRunStackingNumericThreading:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            await asyncio.sleep(0)
-            return [
-                Percentile(percentile=0.025, value=1.0),
-                Percentile(percentile=0.05, value=2.0),
-                Percentile(percentile=0.1, value=3.0),
-                Percentile(percentile=0.2, value=4.0),
-                Percentile(percentile=0.4, value=5.0),
-                Percentile(percentile=0.5, value=6.0),
-                Percentile(percentile=0.6, value=7.0),
-                Percentile(percentile=0.8, value=8.0),
-                Percentile(percentile=0.9, value=9.0),
-                Percentile(percentile=0.95, value=10.0),
-                Percentile(percentile=0.975, value=11.0),
-            ]
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        percentiles = [
+            Percentile(percentile=0.025, value=1.0),
+            Percentile(percentile=0.05, value=2.0),
+            Percentile(percentile=0.1, value=3.0),
+            Percentile(percentile=0.2, value=4.0),
+            Percentile(percentile=0.4, value=5.0),
+            Percentile(percentile=0.5, value=6.0),
+            Percentile(percentile=0.6, value=7.0),
+            Percentile(percentile=0.8, value=8.0),
+            Percentile(percentile=0.9, value=9.0),
+            Percentile(percentile=0.95, value=10.0),
+            Percentile(percentile=0.975, value=11.0),
+        ]
+        monkeypatch.setattr("metaculus_bot.stacking.extract_numeric", _make_numeric_extract(percentiles))
 
         asyncio.run(
             stacking.run_stacking_numeric(
@@ -333,12 +331,10 @@ class TestRunStackingNumericThreading:
         assert "Cross-model aggregation (deterministic math)" in captured_prompts[0]
 
 
-# ---------------------------------------------------------------------------
 # End-to-end runtime threading: stacker LLM receives the full aggregation block
 # verbatim (Gap 5). Earlier tests above check that the kwarg threads through to
 # the prompt builder; these assert that *all* aggregation lines actually reach
 # the captured prompt, in order, with no rewriting / truncation.
-# ---------------------------------------------------------------------------
 
 
 _RICH_AGG_BLOCK = (
@@ -364,13 +360,7 @@ class TestRunStackingBinaryFullPromptCapture:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            from forecasting_tools import BinaryPrediction
-
-            await asyncio.sleep(0)
-            return BinaryPrediction(prediction_in_decimal=0.41)
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.extract_binary", _make_binary_extract(0.41))
 
         asyncio.run(
             stacking.run_stacking_binary(
@@ -423,15 +413,13 @@ class TestRunStackingMcFullPromptCapture:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            await asyncio.sleep(0)
-            return PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="Red", probability=0.5),
-                    PredictedOption(option_name="Blue", probability=0.3),
-                    PredictedOption(option_name="Green", probability=0.2),
-                ]
-            )
+        mc_pol = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Red", probability=0.5),
+                PredictedOption(option_name="Blue", probability=0.3),
+                PredictedOption(option_name="Green", probability=0.2),
+            ]
+        )
 
         mc_q = MagicMock(spec=MultipleChoiceQuestion)
         mc_q.id_of_question = 7
@@ -444,7 +432,7 @@ class TestRunStackingMcFullPromptCapture:
         mc_q.open_time = _OPEN
         mc_q.scheduled_resolution_time = _RESOLVE
 
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        monkeypatch.setattr("metaculus_bot.stacking.extract_mc", _make_mc_extract(mc_pol))
 
         asyncio.run(
             stacking.run_stacking_mc(
@@ -467,8 +455,6 @@ class TestRunStackingMcFullPromptCapture:
 
 class TestRunStackingNumericFullPromptCapture:
     def test_all_aggregation_lines_present_for_numeric(self, monkeypatch):
-        from forecasting_tools.data_models.numeric_report import Percentile
-
         captured_prompts: list[str] = []
         numeric_agg_block = (
             "- **Forecaster medians**: min 25.5, max 47.2, n=3\n"
@@ -486,23 +472,20 @@ class TestRunStackingNumericFullPromptCapture:
         class FakeParserLLM:
             model = "parser"
 
-        async def fake_structure_output(*_args, **_kwargs):
-            await asyncio.sleep(0)
-            return [
-                Percentile(percentile=0.025, value=10.0),
-                Percentile(percentile=0.05, value=15.0),
-                Percentile(percentile=0.1, value=20.0),
-                Percentile(percentile=0.2, value=25.0),
-                Percentile(percentile=0.4, value=30.0),
-                Percentile(percentile=0.5, value=35.0),
-                Percentile(percentile=0.6, value=40.0),
-                Percentile(percentile=0.8, value=50.0),
-                Percentile(percentile=0.9, value=60.0),
-                Percentile(percentile=0.95, value=70.0),
-                Percentile(percentile=0.975, value=80.0),
-            ]
-
-        monkeypatch.setattr("metaculus_bot.stacking.structure_output", fake_structure_output)
+        percentiles = [
+            Percentile(percentile=0.025, value=10.0),
+            Percentile(percentile=0.05, value=15.0),
+            Percentile(percentile=0.1, value=20.0),
+            Percentile(percentile=0.2, value=25.0),
+            Percentile(percentile=0.4, value=30.0),
+            Percentile(percentile=0.5, value=35.0),
+            Percentile(percentile=0.6, value=40.0),
+            Percentile(percentile=0.8, value=50.0),
+            Percentile(percentile=0.9, value=60.0),
+            Percentile(percentile=0.95, value=70.0),
+            Percentile(percentile=0.975, value=80.0),
+        ]
+        monkeypatch.setattr("metaculus_bot.stacking.extract_numeric", _make_numeric_extract(percentiles))
 
         asyncio.run(
             stacking.run_stacking_numeric(

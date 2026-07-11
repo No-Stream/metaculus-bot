@@ -26,7 +26,7 @@ def _no_sleep(monkeypatch):
     keeps the fixture scoped to this file (no global conftest pollution).
     """
 
-    async def _instant(*args, **kwargs):
+    async def _instant(*args, **kwargs):  # noqa: ASYNC124 - must stay async: replaces asyncio.sleep
         return None
 
     monkeypatch.setattr("metaculus_bot.research.providers.asyncio.sleep", _instant)
@@ -49,7 +49,11 @@ async def test_research_provider_flag_and_logging(mock_os_getenv, caplog):
             "summarizer": "mock_summarizer",
         }
     )
-    q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
         # Mock the SDK to return our test result
@@ -86,7 +90,11 @@ async def test_gemini_search_flag_logs_provider_name(mock_os_getenv, caplog):
             "summarizer": "mock_summarizer",
         }
     )
-    q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     # Stub the AskNews SDK (primary provider) to return immediately.
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
@@ -136,7 +144,11 @@ async def test_gemini_search_params_passed_through(mock_os_getenv, caplog):
     )
     # Explicitly set is_benchmarking to a known value so we can assert it propagates.
     bot.is_benchmarking = False
-    q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
         mock_sdk = AsyncMock()
@@ -178,7 +190,11 @@ async def test_gemini_search_flag_disabled_excludes_provider(mock_os_getenv, cap
             "summarizer": "mock_summarizer",
         }
     )
-    q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
         mock_sdk = AsyncMock()
@@ -196,7 +212,6 @@ async def test_gemini_search_flag_disabled_excludes_provider(mock_os_getenv, cap
     assert not any("gemini_search" in msg for msg in provider_log_messages)
 
 
-# ---------------------------------------------------------------------------
 # Gap 2: prediction-market provider integration with _run_providers_parallel
 #
 # Earlier tests in tests/test_prediction_market_provider.py cover the provider
@@ -205,7 +220,6 @@ async def test_gemini_search_flag_disabled_excludes_provider(mock_os_getenv, cap
 # Gemini outputs, that flag-off keeps it out of the provider list, and that
 # the F1 ``MetaculusQuestion`` plumbing reaches the snapshot orchestrator
 # end-to-end (carrying ``scheduled_resolution_time`` for as_of derivation).
-# ---------------------------------------------------------------------------
 
 
 _PM_HANDLERS_SHARED: dict[str, list] = {}
@@ -244,7 +258,7 @@ def _make_manifold_payload() -> list:
             "creatorUsername": "spaceFan",
             "probability": 0.62,
             "volume24Hours": 500.0,
-            "closeTime": 1782086400000,  # ms: 2026-06-20
+            "closeTime": 1782086400000,  # epoch ms, future close date
             "textDescription": "YES if SpaceX Starship reaches orbit before July 1 2026.",
             "isResolved": False,
         }
@@ -288,9 +302,11 @@ class _FakeResponse:
         return ""
 
     async def __aenter__(self):
+        await asyncio.sleep(0)
         return self
 
     async def __aexit__(self, *_args):
+        await asyncio.sleep(0)
         return None
 
 
@@ -301,16 +317,18 @@ class _FakeSession:
         self._handlers = handlers
         self.closed = False
 
-    def get(self, url: str, params=None, **_kwargs):
+    def get(self, url: str, _params=None, **_kwargs):
         for prefix, response in self._handlers.items():
             if url.startswith(prefix):
                 return response
         raise AssertionError(f"unhandled URL {url}")
 
     async def close(self):
+        await asyncio.sleep(0)
         self.closed = True
 
     async def __aenter__(self):
+        await asyncio.sleep(0)
         return self
 
     async def __aexit__(self, *_args):
@@ -356,7 +374,11 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
     # Real MetaculusQuestion so the F1 plumbing flows through. Use a future
     # scheduled_resolution_time so as_of derivation doesn't drop the test
     # close_times (which are in 2026).
-    q = MetaculusQuestion(question_text="Will SpaceX Starship reach orbit?", page_url="http://example.com/q/1")
+    q = MetaculusQuestion(
+        question_text="Will SpaceX Starship reach orbit?",
+        page_url="http://example.com/q/1",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
     q.id_of_question = 99999  # type: ignore[attr-defined]
     q.scheduled_resolution_time = datetime(2027, 1, 1, tzinfo=timezone.utc)
     q.resolution_criteria = "Resolves Yes if a SpaceX Starship reaches orbital velocity."
@@ -380,7 +402,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         def __init__(self, **_kwargs):
             pass
 
-        async def invoke(self, prompt: str) -> str:
+        async def invoke(self, _prompt: str) -> str:
             await asyncio.sleep(0)
             return "Starship orbit"
 
@@ -451,7 +473,11 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
             "summarizer": "mock_summarizer",
         }
     )
-    q = MetaculusQuestion(question_text="Test", page_url="http://example.com")
+    q = MetaculusQuestion(
+        question_text="Test",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     # Sentinel: if the provider runs, it would try to instantiate a session
     # via _get_session. Patch it to a sentinel that raises AssertionError if
@@ -511,7 +537,7 @@ async def test_prediction_market_provider_as_of_derives_from_question(mock_os_ge
         def __init__(self, **_kwargs):
             pass
 
-        async def invoke(self, prompt: str) -> str:
+        async def invoke(self, _prompt: str) -> str:
             await asyncio.sleep(0)
             return "Event X"
 

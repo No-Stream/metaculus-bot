@@ -7,7 +7,7 @@ Tests for numeric CDF smoothing:
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -17,6 +17,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+from metaculus_bot.value_extraction import ExtractionOutcome
 
 
 def _stub_open_time() -> datetime:
@@ -162,6 +163,7 @@ class TestNumericCDFSmoothing:
         mock_format.return_value = {}
 
         percentiles = [
+            Percentile(percentile=0.01, value=2.0),
             Percentile(percentile=0.025, value=3.0),
             Percentile(percentile=0.05, value=5.0),
             Percentile(percentile=0.10, value=10.0),
@@ -173,13 +175,20 @@ class TestNumericCDFSmoothing:
             Percentile(percentile=0.90, value=90.0),
             Percentile(percentile=0.95, value=95.0),
             Percentile(percentile=0.975, value=97.0),
+            Percentile(percentile=0.99, value=98.0),
         ]
 
         caplog.clear()
         caplog.set_level("WARNING")
-        with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(return_value=ExtractionOutcome(value=percentiles, rung="block", block_present=True)),
+            ),
         ):
             result = await f._run_forecast_on_numeric(
                 cast(NumericQuestion, q), "test research", cast(GeneralLlm, DummyLLM())
@@ -201,6 +210,7 @@ class TestNumericCDFSmoothing:
         mock_format.return_value = {}
 
         percentiles = [
+            Percentile(percentile=0.01, value=2.0),
             Percentile(percentile=0.025, value=3.0),
             Percentile(percentile=0.05, value=5.0),
             Percentile(percentile=0.10, value=10.0),
@@ -212,13 +222,20 @@ class TestNumericCDFSmoothing:
             Percentile(percentile=0.90, value=90.0),
             Percentile(percentile=0.95, value=95.0),
             Percentile(percentile=0.975, value=97.0),
+            Percentile(percentile=0.99, value=98.0),
         ]
 
         caplog.clear()
         caplog.set_level("WARNING")
-        with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), percentiles],
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(return_value=ExtractionOutcome(value=percentiles, rung="block", block_present=True)),
+            ),
         ):
             result = await f._run_forecast_on_numeric(
                 cast(NumericQuestion, q), "test research", cast(GeneralLlm, DummyLLM())

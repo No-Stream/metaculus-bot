@@ -927,6 +927,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         if computed_md:
             prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
+
+        # Extraction telemetry (EXTRACTION_RUNG lines) is emitted inside the
+        # value-extraction ladder (metaculus_bot/value_extraction.py), which the
+        # runners call — no per-prediction logging is needed here.
+
         # Each branch returns a specific ReasonedPrediction[T] but the signature
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]

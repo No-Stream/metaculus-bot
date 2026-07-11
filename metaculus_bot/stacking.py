@@ -4,24 +4,22 @@ import logging
 from collections.abc import Sequence
 
 from forecasting_tools import (
-    BinaryPrediction,
     BinaryQuestion,
     GeneralLlm,
     MultipleChoiceQuestion,
     NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
-    structure_output,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
+from metaculus_bot.forecaster_runners import build_parse_notes
 from metaculus_bot.llm_retry import invoke_with_transient_retry
-from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.prompts import stacking_binary_prompt, stacking_multiple_choice_prompt, stacking_numeric_prompt
-from metaculus_bot.simple_types import OptionProbability
+from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -104,13 +102,14 @@ async def run_stacking_binary(
         "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
         "Do not return percentages, strings, or any extra fields."
     )
-    binary_prediction: BinaryPrediction = await structure_output(
+    outcome = await extract_binary(
         meta_reasoning,
-        BinaryPrediction,
-        model=parser_llm,
-        additional_instructions=parse_instructions,
+        parser_llm,
+        prompt_notes=parse_instructions,
+        question_id=question.id_of_question,
+        model_name=stacker_llm.model,
     )
-    decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, binary_prediction.prediction_in_decimal))
+    decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, outcome.value))
     return decimal_pred, meta_reasoning
 
 
@@ -140,36 +139,24 @@ async def run_stacking_mc(
         lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
     )
 
-    # Defined OUTSIDE the try so the fallback (except) branch can also use it
-    # without Pyright flagging it as possibly-unbound. Both the strict and
-    # tolerant parser invocations use the same instruction text.
     parsing_instructions = (
         "Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and "
         "`probability` (decimal in [0,1]). Use option names exactly from this list (case-insensitive accepted):\n"
         f"{question.options}\nDo not include any other options."
     )
-    # Try strict PredictedOptionList first (compatibility) then tolerant fallback
+    outcome = await extract_mc(
+        meta_reasoning,
+        list(question.options),
+        parser_llm,
+        prompt_notes=parsing_instructions,
+        question_id=question.id_of_question,
+        model_name=stacker_llm.model,
+    )
+    predicted_option_list = outcome.value
     try:
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=meta_reasoning,
-            output_type=PredictedOptionList,
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
-        )
-
-        try:
-            predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-        except ValueError as e:
-            logger.warning(f"MC clamp/renormalize failed: {e}")
-    except Exception as e:
-        logger.warning(f"Primary MC structured parse failed: {e}")
-        raw_options: list[OptionProbability] = await structure_output(
-            text_to_structure=meta_reasoning,
-            output_type=list[OptionProbability],
-            model=parser_llm,
-            additional_instructions=parsing_instructions,
-        )
-        predicted_option_list = build_mc_prediction(raw_options, list(question.options))
+        predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
+    except ValueError as e:
+        logger.warning(f"MC clamp/renormalize failed: {e}")
     return predicted_option_list, meta_reasoning
 
 
@@ -204,18 +191,12 @@ async def run_stacking_numeric(
         lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
     )
 
-    unit_str = question.unit_of_measure or "base unit"
-    parse_notes = (
-        (
-            "Return exactly these 11 percentiles and no others: 2.5,5,10,20,40,50,60,80,90,95,97.5. "
-            "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (float). "
-            f"Values must be in the base unit '{unit_str}' and within [{{lower}}, {{upper}}]. "
-            "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
-        )
-        .replace("{lower}", str(question.lower_bound))
-        .replace("{upper}", str(question.upper_bound))
+    parse_notes = build_parse_notes(question)
+    outcome = await extract_numeric(
+        meta_reasoning,
+        parser_llm,
+        prompt_notes=parse_notes,
+        question_id=question.id_of_question,
+        model_name=stacker_llm.model,
     )
-    percentile_list: list[Percentile] = await structure_output(
-        meta_reasoning, list[Percentile], model=parser_llm, additional_instructions=parse_notes
-    )
-    return percentile_list, meta_reasoning
+    return outcome.value, meta_reasoning

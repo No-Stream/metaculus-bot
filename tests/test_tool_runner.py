@@ -27,8 +27,10 @@ from metaculus_bot.tool_runner import (
     aggregate_binary_values,
     aggregate_mc_values,
     aggregate_numeric_values,
+    anchor_overshoot_pp,
     build_cross_model_aggregation,
     cdf_at_threshold_for_forecaster,
+    clause_product_divergence_pp,
     run_tools_for_forecaster,
 )
 
@@ -127,8 +129,6 @@ def _numeric_payload(**overrides) -> dict:
             "0.75": 60.0,
             "0.9": 80.0,
         },
-        "distribution_family_hint": "normal",
-        "tails": {"below_min_expected": 0.02, "above_max_expected": 0.05},
     }
     base.update(overrides)
     return base
@@ -315,6 +315,144 @@ class TestRunToolsBinary:
 
 
 # ---------------------------------------------------------------------------
+# Anchor + clause telemetry (2026-07-08) — TELEMETRY ONLY, no forecast mutation
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorOvershootMath:
+    def test_inside_anchor_range_is_zero(self):
+        assert anchor_overshoot_pp(0.25, 0.15, 0.35) == 0.0
+
+    def test_at_boundaries_is_zero(self):
+        assert anchor_overshoot_pp(0.15, 0.15, 0.35) == 0.0
+        assert anchor_overshoot_pp(0.35, 0.15, 0.35) == 0.0
+
+    def test_overshoot_above_is_positive_pp(self):
+        assert anchor_overshoot_pp(0.55, 0.15, 0.35) == pytest.approx(20.0)
+
+    def test_undershoot_below_is_negative_pp(self):
+        assert anchor_overshoot_pp(0.05, 0.15, 0.35) == pytest.approx(-10.0)
+
+    def test_degenerate_point_anchor(self):
+        assert anchor_overshoot_pp(0.30, 0.30, 0.30) == 0.0
+        assert anchor_overshoot_pp(0.45, 0.30, 0.30) == pytest.approx(15.0)
+
+
+class TestClauseProductMath:
+    def test_product_and_divergence(self):
+        product, divergence = clause_product_divergence_pp(0.87, [0.9, 0.95, 0.96])
+        assert product == pytest.approx(0.9 * 0.95 * 0.96)
+        assert divergence == pytest.approx((0.87 - 0.9 * 0.95 * 0.96) * 100.0)
+
+    def test_posterior_below_product_is_negative(self):
+        product, divergence = clause_product_divergence_pp(0.3, [0.8, 0.7])
+        assert product == pytest.approx(0.56)
+        assert divergence == pytest.approx(-26.0)
+
+    def test_single_clause(self):
+        product, divergence = clause_product_divergence_pp(0.5, [0.5])
+        assert product == pytest.approx(0.5)
+        assert divergence == 0.0
+
+
+class TestAnchorAndClauseTelemetryLines:
+    """Wiring: blocks carrying the optional telemetry fields produce neutral
+    measurement lines + machine-readable markers in the Computed quantities
+    output. Blocks without them (back-compat) produce no telemetry lines."""
+
+    def test_anchor_line_emitted_with_marker(self):
+        payload = _binary_payload(base_rate_anchor={"low": 0.15, "high": 0.35}, posterior_prob=0.55)
+        result = run_tools_for_forecaster(
+            question=_make_binary_question(),
+            rationale=_wrap_json(payload),
+            forecaster_id="m",
+        )
+        assert "Anchor telemetry" in result
+        assert "declared 55% vs stated anchor 15-35%" in result
+        assert "overshoot +20.0pp" in result
+        assert "<!-- ANCHOR_OVERSHOOT_PP=+20.0 -->" in result
+
+    def test_anchor_inside_range_reports_zero_overshoot(self):
+        payload = _binary_payload(base_rate_anchor={"low": 0.15, "high": 0.35}, posterior_prob=0.28)
+        result = run_tools_for_forecaster(
+            question=_make_binary_question(),
+            rationale=_wrap_json(payload),
+            forecaster_id="m",
+        )
+        assert "overshoot +0.0pp" in result
+        assert "<!-- ANCHOR_OVERSHOOT_PP=+0.0 -->" in result
+
+    def test_large_overshoot_logs_warning_but_stays_neutral(self, caplog):
+        payload = _binary_payload(base_rate_anchor={"low": 0.10, "high": 0.20}, posterior_prob=0.55)
+        with caplog.at_level(logging.WARNING):
+            result = run_tools_for_forecaster(
+                question=_make_binary_question(),
+                rationale=_wrap_json(payload),
+                forecaster_id="m",
+            )
+        assert any("ANCHOR_OVERSHOOT" in rec.message for rec in caplog.records)
+        # The comment-facing line stays neutral — no clamp language, no directive.
+        assert "clamp" not in result.lower()
+        assert "overshoot +35.0pp" in result
+
+    def test_clause_product_line_emitted_with_marker(self):
+        payload = _binary_payload(
+            criteria_clauses=[
+                {"name": "formal instrument", "prob": 0.9},
+                {"name": "in-window", "prob": 0.8},
+            ],
+            posterior_prob=0.8,
+        )
+        result = run_tools_for_forecaster(
+            question=_make_binary_question(),
+            rationale=_wrap_json(payload),
+            forecaster_id="m",
+        )
+        assert "Clause-product telemetry" in result
+        assert "product 0.720" in result
+        assert "divergence +8.0pp" in result
+        assert "<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=+8.0 -->" in result
+
+    def test_block_without_telemetry_fields_emits_no_telemetry_lines(self):
+        # Back-compat: the standard payload (no anchor, no clauses) must not
+        # grow telemetry lines.
+        result = run_tools_for_forecaster(
+            question=_make_binary_question(),
+            rationale=_wrap_json(_binary_payload()),
+            forecaster_id="m",
+        )
+        assert "Anchor telemetry" not in result
+        assert "Clause-product telemetry" not in result
+        assert "ANCHOR_OVERSHOOT_PP" not in result
+        assert "CLAUSE_PRODUCT_DIVERGENCE_PP" not in result
+
+    def test_markers_parse_back_out_with_collector_regexes(self):
+        """Producer/consumer round-trip: the residual-analysis regexes in
+        comment.markers must extract the values the runner emitted."""
+        from metaculus_bot.comment.markers import (
+            ANCHOR_OVERSHOOT_MARKER_RE,
+            CLAUSE_DIVERGENCE_MARKER_RE,
+        )
+
+        payload = _binary_payload(
+            base_rate_anchor={"low": 0.15, "high": 0.35},
+            criteria_clauses=[{"name": "a", "prob": 0.5}, {"name": "b", "prob": 0.5}],
+            posterior_prob=0.55,
+        )
+        result = run_tools_for_forecaster(
+            question=_make_binary_question(),
+            rationale=_wrap_json(payload),
+            forecaster_id="m",
+        )
+        anchor_match = ANCHOR_OVERSHOOT_MARKER_RE.search(result)
+        clause_match = CLAUSE_DIVERGENCE_MARKER_RE.search(result)
+        assert anchor_match is not None
+        assert float(anchor_match.group(1)) == pytest.approx(20.0)
+        assert clause_match is not None
+        assert float(clause_match.group(1)) == pytest.approx((0.55 - 0.25) * 100.0)
+
+
+# ---------------------------------------------------------------------------
 # run_tools_for_forecaster: numeric
 # ---------------------------------------------------------------------------
 
@@ -355,7 +493,6 @@ class TestRunToolsNumeric:
                 "0.9": 100.0,
                 "0.95": 500.0,
             },
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         result = run_tools_for_forecaster(
@@ -381,93 +518,6 @@ class TestRunToolsNumeric:
         with caplog.at_level(logging.WARNING):
             result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="m")
         assert result == ""
-
-    def test_numeric_with_mixture_components_surfaces_section(self):
-        # Workstream D3: mixture_components populated in NumericStructured should
-        # surface a "Mixture-of-normals" subsection in the output.
-        payload = _numeric_payload(
-            mixture_components=[
-                {"weight": 0.2, "mean": 20.0, "sd": 5.0},
-                {"weight": 0.55, "mean": 50.0, "sd": 8.0},
-                {"weight": 0.25, "mean": 80.0, "sd": 6.0},
-            ],
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        # Section header.
-        assert "### Mixture-of-normals" in result
-
-        # Each component's full triple (weight, mean, sd) must appear in the
-        # rendered table — not just the mean. Per _render_mixture_section
-        # tool_runner.py:322-323:
-        #   "- Component {i+1}: weight {weight:.3f}, mean {mean:.3g}, sd {sd:.3g}"
-        assert "Component 1: weight 0.200, mean 20, sd 5" in result
-        assert "Component 2: weight 0.550, mean 50, sd 8" in result
-        assert "Component 3: weight 0.250, mean 80, sd 6" in result
-
-        # CDF sample table header + exactly 5 sample rows over [0, 100].
-        # Sample rows are indented two spaces ("  - "); the header line is "- ".
-        assert "CDF sample (value → F):" in result
-        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
-        assert len(cdf_sample_lines) == 5, f"expected 5 CDF sample rows, got {len(cdf_sample_lines)}"
-
-        # Bounded size: a well-formed mixture section is a small markdown
-        # block. A pathological serializer dumping a 201-pt CDF would balloon
-        # this past a few hundred chars — guard the upper bound.
-        mixture_section = result.split("### Mixture-of-normals", 1)[1]
-        assert len(mixture_section) < 1000, (
-            f"mixture section is unexpectedly large ({len(mixture_section)} chars); "
-            "rendering may be dumping more than the 5-row sample table"
-        )
-
-    def test_numeric_without_mixture_components_unchanged(self):
-        # Regression: existing numeric path (percentiles only) still works and does
-        # NOT surface a mixture section when mixture_components is absent.
-        rationale = _wrap_json(_numeric_payload())
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Percentile-family consistency" in result
-        assert "Out-of-bounds mass" in result
-        assert "Mixture-of-normals" not in result
-
-    def test_numeric_with_both_percentiles_and_mixture_shows_both(self):
-        # When both declared_percentiles and mixture_components are present, both
-        # sections appear. No consistency check between them (that's Workstream E).
-        payload = _numeric_payload(
-            mixture_components=[
-                {"weight": 0.3, "mean": 25.0, "sd": 7.0},
-                {"weight": 0.4, "mean": 50.0, "sd": 10.0},
-                {"weight": 0.3, "mean": 75.0, "sd": 8.0},
-            ],
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        # Both sections must surface — no consistency check between them.
-        assert "Percentile-family consistency" in result
-        assert "### Mixture-of-normals" in result
-        # Each component's full triple appears verbatim.
-        assert "Component 1: weight 0.300, mean 25, sd 7" in result
-        assert "Component 2: weight 0.400, mean 50, sd 10" in result
-        assert "Component 3: weight 0.300, mean 75, sd 8" in result
-        # CDF sample table has exactly 5 rows.
-        cdf_sample_lines = [line for line in result.splitlines() if line.startswith("  - ") and "→" in line]
-        assert len(cdf_sample_lines) == 5
-
-
-# ---------------------------------------------------------------------------
-# run_tools_for_forecaster: MC and discrete
-# ---------------------------------------------------------------------------
 
 
 class TestRunToolsMc:
@@ -653,19 +703,6 @@ class TestCrossModelAggregationNumeric:
         # Match either integer or decimal formatting of the min value.
         assert re.search(r"min 30(\.\d+)?", result)
 
-    def test_declared_families_listed(self):
-        rationales = [
-            _wrap_json(_numeric_payload(distribution_family_hint="normal")),
-            _wrap_json(_numeric_payload(distribution_family_hint="lognormal")),
-        ]
-        preds = [self._make_pcts(40), self._make_pcts(60)]
-        result = build_cross_model_aggregation(
-            question=_make_numeric_question(),
-            rationales=rationales,
-            prediction_values=preds,
-        )
-        assert "Declared distribution families" in result
-
 
 class TestCrossModelAggregationMc:
     def test_mc_dirichlet_pool(self):
@@ -726,7 +763,6 @@ class TestCdfAtThreshold:
                 "0.5": 50.0,
                 "0.9": 70.0,
             },
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)
@@ -745,7 +781,6 @@ class TestCdfAtThreshold:
     def test_threshold_far_below_returns_near_zero(self):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         result = cdf_at_threshold_for_forecaster(
@@ -993,9 +1028,7 @@ with long upper tail.
     "0.5": 20.0,
     "0.9": 80.0,
     "0.95": 150.0
-  },
-  "distribution_family_hint": "lognormal",
-  "tails": {"below_min_expected": 0.02, "above_max_expected": 0.05}
+  }
 }
 ```
 
@@ -1004,8 +1037,7 @@ Percentiles as given.
         q = _make_numeric_question(lower_bound=0.0, upper_bound=500.0)
         result = run_tools_for_forecaster(question=q, rationale=rationale, forecaster_id="gpt-5-golden")
         assert "Percentile-family consistency" in result
-        # Formatter emits "(lognormal fit)" since hint matches best family.
-        assert "Out-of-bounds mass (lognormal fit)" in result
+        assert "Out-of-bounds mass" in result
 
     def test_mc_with_other_mass_golden_output(self):
         # Option_probs + explicit other_mass → expect residual-mass line AND
@@ -1110,41 +1142,11 @@ class TestMcContractBridge:
 
 
 # ---------------------------------------------------------------------------
-# F7: previously-unconsumed schema fields (tails delta, scenarios count)
+# F7: previously-unconsumed schema fields (scenarios count)
 # ---------------------------------------------------------------------------
 
 
 class TestSchemaFieldWiring:
-    def test_numeric_tails_delta_line_emitted(self):
-        # Declared tails should produce a delta line comparing declared vs fitted tails.
-        payload = _numeric_payload(
-            declared_percentiles={"0.1": 20.0, "0.5": 40.0, "0.9": 60.0},
-            distribution_family_hint="normal",
-            tails={"below_min_expected": 0.05, "above_max_expected": 0.03},
-        )
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Declared vs fitted tails" in result
-        assert "declared [below=0.050, above=0.030]" in result
-
-    def test_numeric_no_tails_omits_delta_line(self):
-        payload = {
-            "question_type": "numeric",
-            "declared_percentiles": {"0.1": 20.0, "0.5": 40.0, "0.9": 60.0},
-            "distribution_family_hint": "normal",
-        }
-        rationale = _wrap_json(payload)
-        result = run_tools_for_forecaster(
-            question=_make_numeric_question(lower_bound=0.0, upper_bound=100.0),
-            rationale=rationale,
-            forecaster_id="m",
-        )
-        assert "Declared vs fitted tails" not in result
-
     def test_binary_scenarios_count_line_emitted(self):
         payload = _binary_payload(
             scenarios=[
@@ -1272,7 +1274,6 @@ class TestCdfAtThresholdOutOfBoundsLogging:
     def test_threshold_above_closed_upper_bound_logs_debug(self, caplog):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)
@@ -1286,7 +1287,6 @@ class TestCdfAtThresholdOutOfBoundsLogging:
     def test_threshold_below_closed_lower_bound_logs_debug(self, caplog):
         payload = _numeric_payload(
             declared_percentiles={"0.1": 30.0, "0.5": 50.0, "0.9": 70.0},
-            distribution_family_hint="normal",
         )
         rationale = _wrap_json(payload)
         q = _make_numeric_question(lower_bound=0.0, upper_bound=100.0)

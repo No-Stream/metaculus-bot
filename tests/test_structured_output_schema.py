@@ -12,21 +12,22 @@ from pydantic import ValidationError
 
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
+    BaseRateAnchor,
     BinaryStructured,
+    CriteriaClause,
     DiscreteCountStructured,
     EvidenceItem,
-    MixtureComponentDeclaration,
     MultipleChoiceStructured,
     NumericStructured,
     ScenarioBranch,
     StatedBaseRate,
     StatedHazard,
     StatedPrior,
-    TailMass,
     extract_first_balanced_braces,
     extract_json_block,
     parse_structured_block,
 )
+from metaculus_bot.tool_runner import _aggregate_binary_lines, _parse_all_blocks
 
 # ===========================================================================
 # Fixtures
@@ -71,11 +72,6 @@ def valid_scenarios_binary() -> list[ScenarioBranch]:
 
 
 @pytest.fixture
-def valid_tails() -> TailMass:
-    return TailMass(below_min_expected=0.05, above_max_expected=0.05)
-
-
-@pytest.fixture
 def valid_binary_block(
     valid_prior: StatedPrior,
     valid_base_rate: StatedBaseRate,
@@ -95,14 +91,11 @@ def valid_binary_block(
 
 
 @pytest.fixture
-def valid_numeric_block(valid_prior: StatedPrior, valid_tails: TailMass) -> NumericStructured:
+def valid_numeric_block(valid_prior: StatedPrior) -> NumericStructured:
     return NumericStructured(
         question_type="numeric",
         prior=valid_prior,
         declared_percentiles={0.1: 10.0, 0.5: 50.0, 0.9: 90.0},
-        distribution_family_hint="normal",
-        student_t_df=None,
-        tails=valid_tails,
         scenarios=[],
     )
 
@@ -163,6 +156,9 @@ class TestBinaryStructuredHappyPath:
         assert b.hazard is None
         assert b.evidence == []
         assert b.scenarios == []
+        # Telemetry fields are optional — old blocks without them parse fine.
+        assert b.base_rate_anchor is None
+        assert b.criteria_clauses == []
 
     def test_posterior_out_of_range(self) -> None:
         with pytest.raises(ValidationError):
@@ -176,6 +172,242 @@ class TestBinaryStructuredHappyPath:
             BinaryStructured(question_type="binary", posterior_prob=0.5, unknown_field="oops")  # type: ignore[call-arg]
 
 
+class TestBinaryTelemetryFields:
+    """Optional anchor / clause telemetry fields (2026-07-08).
+
+    Back-compat contract: blocks WITHOUT the fields must keep parsing (see
+    ``TestBinaryStructuredHappyPath.test_only_required_fields``); blocks WITH
+    them round-trip; malformed values are rejected by validation.
+    """
+
+    def test_anchor_and_clauses_round_trip(self) -> None:
+        payload = json.dumps(
+            {
+                "question_type": "binary",
+                "posterior_prob": 0.42,
+                "base_rate_anchor": {"low": 0.15, "high": 0.35},
+                "criteria_clauses": [
+                    {"name": "formal instrument signed", "prob": 0.6},
+                    {"name": "in-window", "prob": 0.8},
+                ],
+            }
+        )
+        block = parse_structured_block(f"```json\n{payload}\n```", "binary")
+        assert isinstance(block, BinaryStructured)
+        assert block.base_rate_anchor is not None
+        assert block.base_rate_anchor.low == pytest.approx(0.15)
+        assert block.base_rate_anchor.high == pytest.approx(0.35)
+        assert [c.name for c in block.criteria_clauses] == ["formal instrument signed", "in-window"]
+        assert [c.prob for c in block.criteria_clauses] == [pytest.approx(0.6), pytest.approx(0.8)]
+
+    def test_old_block_without_telemetry_fields_still_parses(self) -> None:
+        payload = json.dumps({"question_type": "binary", "posterior_prob": 0.28})
+        block = parse_structured_block(f"```json\n{payload}\n```", "binary")
+        assert isinstance(block, BinaryStructured)
+        assert block.base_rate_anchor is None
+        assert block.criteria_clauses == []
+
+    def test_anchor_low_above_high_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=0.6, high=0.4)
+
+    def test_anchor_bounds_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=-0.1, high=0.4)
+        with pytest.raises(ValidationError):
+            BaseRateAnchor(low=0.1, high=1.4)
+
+    def test_clause_prob_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CriteriaClause(name="threshold met", prob=1.2)
+
+    def test_clause_empty_name_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CriteriaClause(name="", prob=0.5)
+
+    def test_degenerate_point_anchor_allowed(self) -> None:
+        anchor = BaseRateAnchor(low=0.3, high=0.3)
+        assert anchor.low == anchor.high == pytest.approx(0.3)
+
+
+class TestBinaryTelemetryStripAndRetry:
+    """Strip-and-retry recovery for malformed BINARY telemetry (2026-07-08).
+
+    Contract: a good ``posterior_prob`` (and other core fields) must survive
+    a malformed ``base_rate_anchor`` / ``criteria_clauses`` value — dropping
+    the entire block on a pure telemetry formatting bug would silently shift
+    stacker input via the cross-model aggregation path in ``tool_runner``.
+
+    Fail-fast on core fields is preserved: a bad ``posterior_prob`` must
+    still return None even if telemetry is well-formed.
+    """
+
+    def test_criteria_clauses_null_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Canonical failure: prompt says "omit" criteria_clauses when there
+        # isn't a conjunctive breakdown, but LLMs frequently emit `null`
+        # instead. Old behavior: whole block dropped, base-rate blend and
+        # prior/posterior contributions vanish. New behavior: warn + keep
+        # the core binary block.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "prior": {"prob": 0.2, "source": "20yr base rate"},
+                    "base_rate": {"k": 4, "n": 20, "ref_class": "past 20 yrs"},
+                    "posterior_prob": 0.35,
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.35)
+        # Core telemetry-adjacent fields preserved.
+        assert result.prior is not None
+        assert result.prior.prob == pytest.approx(0.2)
+        assert result.base_rate is not None
+        assert result.base_rate.k == 4
+        # Telemetry defaults after strip-and-retry.
+        assert result.base_rate_anchor is None
+        assert result.criteria_clauses == []
+        # WARNING logged so this recovery is visible in run logs.
+        assert any(
+            "malformed telemetry fields" in rec.message and "criteria_clauses" in rec.message for rec in caplog.records
+        )
+
+    def test_reversed_anchor_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Canonical failure: {low: 0.6, high: 0.2} is rejected by
+        # BaseRateAnchor's ordering validator. Same recovery contract as
+        # criteria_clauses=null.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 0.42,
+                    "base_rate_anchor": {"low": 0.6, "high": 0.2},
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+        assert result.base_rate_anchor is None
+        assert any(
+            "malformed telemetry fields" in rec.message and "base_rate_anchor" in rec.message for rec in caplog.records
+        )
+
+    def test_both_telemetry_fields_malformed_recovers(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Both telemetry keys present and malformed: strip both, keep core.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 0.28,
+                    "base_rate_anchor": {"low": 0.9, "high": 0.1},
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.28)
+        assert result.base_rate_anchor is None
+        assert result.criteria_clauses == []
+        message_text = " ".join(rec.message for rec in caplog.records)
+        assert "base_rate_anchor" in message_text
+        assert "criteria_clauses" in message_text
+
+    def test_bad_core_field_still_returns_none(self, caplog: pytest.LogCaptureFixture) -> None:
+        # posterior_prob=1.5 is a core-field violation. Even with valid
+        # telemetry alongside, the block must still be dropped — strip-and-
+        # retry MUST NOT rescue a bad core field.
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 1.5,
+                    "base_rate_anchor": {"low": 0.15, "high": 0.35},
+                    "criteria_clauses": [{"name": "clause", "prob": 0.5}],
+                }
+            )
+            + "\n```"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(rationale, "binary")
+        assert result is None
+        # Original failed-validation warning still fires; no recovery warning.
+        assert any("failed validation" in rec.message for rec in caplog.records)
+        assert not any("malformed telemetry fields" in rec.message for rec in caplog.records)
+
+    def test_bad_core_and_bad_telemetry_still_none(self) -> None:
+        # Neither retry variant is valid — bad core, bad telemetry. Must
+        # return None (fall through to the original None return).
+        rationale = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "posterior_prob": 1.5,  # out of range
+                    "base_rate_anchor": {"low": 0.9, "high": 0.1},  # reversed
+                }
+            )
+            + "\n```"
+        )
+        result = parse_structured_block(rationale, "binary")
+        assert result is None
+
+    def test_recovered_block_feeds_cross_model_aggregation(self) -> None:
+        # Guard the invariant end-to-end: a forecaster whose ONLY validation
+        # error is malformed telemetry must still contribute its base_rate
+        # to the cross-model aggregation. Uses tool_runner's internal
+        # _parse_all_blocks + _aggregate_binary_lines directly to keep the
+        # test independent of feature-flag env state.
+
+        good = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "base_rate": {"k": 2, "n": 10, "ref_class": "ref"},
+                    "posterior_prob": 0.25,
+                }
+            )
+            + "\n```"
+        )
+        # This rationale would previously drop entirely because of the null
+        # criteria_clauses; after strip-and-retry it contributes to the
+        # base_rate blend.
+        recovered = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "question_type": "binary",
+                    "base_rate": {"k": 6, "n": 10, "ref_class": "ref"},
+                    "posterior_prob": 0.55,
+                    "criteria_clauses": None,
+                }
+            )
+            + "\n```"
+        )
+        blocks = _parse_all_blocks([good, recovered], "binary")
+        assert len(blocks) == 2  # both survive — invariant restored
+        lines = _aggregate_binary_lines([0.25, 0.55], [b for b in blocks if isinstance(b, BinaryStructured)])
+        blend_line = next((line for line in lines if "Blended base rate" in line), None)
+        assert blend_line is not None
+        # Blend should reflect BOTH forecasters (n=2), not just the well-formed one.
+        assert "2 forecasters" in blend_line
+
+
 class TestNumericStructuredHappyPath:
     def test_full_construction(self, valid_numeric_block: NumericStructured) -> None:
         n = valid_numeric_block
@@ -183,9 +415,6 @@ class TestNumericStructuredHappyPath:
         assert n.declared_percentiles is not None
         assert set(n.declared_percentiles.keys()) >= {0.1, 0.5, 0.9}
         assert n.declared_percentiles[0.5] == pytest.approx(50.0)
-        assert n.distribution_family_hint == "normal"
-        assert isinstance(n.tails, TailMass)
-        assert n.tails.below_min_expected == pytest.approx(0.05)
 
     def test_only_required_fields(self) -> None:
         n = NumericStructured(
@@ -193,9 +422,56 @@ class TestNumericStructuredHappyPath:
             declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
         )
         assert n.prior is None
-        assert n.tails is None
         assert n.scenarios == []
-        assert n.student_t_df is None
+
+    def test_tails_field_removed(self) -> None:
+        # The dead `tails` / TailMass slot was removed (W2). NumericStructured
+        # uses extra="forbid", so passing a `tails` key must now raise, and
+        # TailMass must no longer be importable from the schema module.
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                tails={"below_min_expected": 0.05, "above_max_expected": 0.05},  # type: ignore[call-arg]
+            )
+        import metaculus_bot.structured_output_schema as schema
+
+        assert not hasattr(schema, "TailMass")
+
+    def test_outcome_type_discrete(self) -> None:
+        """C3: outcome_type='discrete_integer' accepted."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            outcome_type="discrete_integer",
+        )
+        assert n.outcome_type == "discrete_integer"
+
+    def test_outcome_type_continuous(self) -> None:
+        """C3: outcome_type='continuous' accepted."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+            outcome_type="continuous",
+        )
+        assert n.outcome_type == "continuous"
+
+    def test_outcome_type_none_default(self) -> None:
+        """C3: outcome_type defaults to None (backward compat)."""
+        n = NumericStructured(
+            question_type="numeric",
+            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+        )
+        assert n.outcome_type is None
+
+    def test_outcome_type_invalid_raises(self) -> None:
+        """C3: invalid outcome_type string rejected by Literal constraint."""
+        with pytest.raises(ValidationError):
+            NumericStructured(
+                question_type="numeric",
+                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
+                outcome_type="unknown",  # type: ignore[arg-type]
+            )
 
     def test_accepts_extra_percentiles(self) -> None:
         n = NumericStructured(
@@ -204,25 +480,6 @@ class TestNumericStructuredHappyPath:
         )
         assert n.declared_percentiles is not None
         assert len(n.declared_percentiles) == 6
-
-    def test_student_t_df_valid(self) -> None:
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-            student_t_df=4.0,
-        )
-        assert n.student_t_df == pytest.approx(4.0)
-
-    def test_mixture_family_hint_rejected(self) -> None:
-        # "mixture" was dropped from the distribution_family_hint literal
-        # along with MixtureComponent; the Pydantic literal validator must
-        # now reject it.
-        with pytest.raises(ValidationError):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 10.0, 0.5: 50.0, 0.9: 90.0},
-                distribution_family_hint="mixture",  # type: ignore[arg-type]
-            )
 
 
 class TestMultipleChoiceStructuredHappyPath:
@@ -410,24 +667,6 @@ class TestEvidenceItemValidators:
             EvidenceItem(summary="", direction="up", strength="weak")
 
 
-class TestTailMassValidators:
-    def test_sum_exactly_at_ceiling_raises(self) -> None:
-        with pytest.raises(ValidationError, match="TailMass sum"):
-            TailMass(below_min_expected=0.25, above_max_expected=0.25)
-
-    def test_sum_above_ceiling_raises(self) -> None:
-        with pytest.raises(ValidationError, match="TailMass sum"):
-            TailMass(below_min_expected=0.3, above_max_expected=0.3)
-
-    def test_small_sum_ok(self) -> None:
-        t = TailMass(below_min_expected=0.1, above_max_expected=0.1)
-        assert t.below_min_expected + t.above_max_expected == pytest.approx(0.2)
-
-    def test_zero_ok(self) -> None:
-        t = TailMass(below_min_expected=0.0, above_max_expected=0.0)
-        assert t.below_min_expected == 0.0
-
-
 class TestScenarioBranchValidators:
     def test_prob_out_of_range_raises(self) -> None:
         with pytest.raises(ValidationError):
@@ -534,14 +773,6 @@ class TestNumericDeclaredPercentiles:
             NumericStructured(
                 question_type="numeric",
                 declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0, 1.5: 15.0},
-            )
-
-    def test_student_t_df_at_boundary_raises(self) -> None:
-        with pytest.raises(ValidationError, match="student_t_df must be > 1"):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-                student_t_df=1.0,
             )
 
 
@@ -830,14 +1061,14 @@ class TestParseStructuredBlock:
         d = DiscreteCountStructured(question_type="discrete_count", mean_estimate=2.0, dispersion="poisson")
         assert d.mean_estimate == pytest.approx(2.0)
 
-    def test_no_block_returns_none_and_debug_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_no_block_returns_none_and_info_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         rationale = "Prose with no JSON block at all."
-        with caplog.at_level(logging.DEBUG, logger="metaculus_bot.structured_output_schema"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.structured_output_schema"):
             result = parse_structured_block(rationale, "binary")
         assert result is None
-        # Should be DEBUG-level, not WARNING
+        # A0b: lifted from DEBUG to INFO so block-reliability is visible in run logs
         assert any(
-            record.levelno == logging.DEBUG and "No JSON block found" in record.message for record in caplog.records
+            record.levelno == logging.INFO and "No JSON block found" in record.message for record in caplog.records
         )
         assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
@@ -1084,208 +1315,3 @@ class TestSizeCapBoundary:
             result = parse_structured_block(rationale, "binary")
         assert result is None
         assert any("size cap" in rec.message for rec in caplog.records)
-
-
-# ===========================================================================
-# NumericStructured: mixture_components (Workstream D3)
-# ===========================================================================
-
-
-class TestNumericStructuredMixture:
-    def test_valid_three_component_list_accepted(self) -> None:
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-            mixture_components=[
-                MixtureComponentDeclaration(weight=0.2, mean=2.0, sd=0.5),
-                MixtureComponentDeclaration(weight=0.55, mean=5.0, sd=1.0),
-                MixtureComponentDeclaration(weight=0.25, mean=8.0, sd=0.7),
-            ],
-        )
-        assert n.mixture_components is not None
-        assert len(n.mixture_components) == 3
-        assert sum(c.weight for c in n.mixture_components) == pytest.approx(1.0, abs=1e-6)
-
-    def test_single_component_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-                mixture_components=[MixtureComponentDeclaration(weight=1.0, mean=5.0, sd=1.0)],
-            )
-
-    def test_weights_sum_below_tolerance_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-                mixture_components=[
-                    MixtureComponentDeclaration(weight=0.3, mean=2.0, sd=1.0),
-                    MixtureComponentDeclaration(weight=0.3, mean=5.0, sd=1.0),
-                ],
-            )
-
-    def test_weights_sum_above_tolerance_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-                mixture_components=[
-                    MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
-                    MixtureComponentDeclaration(weight=0.6, mean=5.0, sd=1.0),
-                ],
-            )
-
-    def test_zero_sd_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=0.0)
-
-    def test_negative_weight_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            MixtureComponentDeclaration(weight=-0.1, mean=5.0, sd=1.0)
-
-    def test_mixture_components_none_still_valid(self) -> None:
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-            mixture_components=None,
-        )
-        assert n.mixture_components is None
-
-
-# ===========================================================================
-# NumericStructured: mixture-only blocks (Workstream W4)
-#
-# numeric_prompt OPTION B tells models they may omit the percentile lines
-# entirely when emitting a mixture. Before W4 such blocks failed Pydantic
-# validation (declared_percentiles was required unconditionally), so the
-# mixture was silently dropped — numeric mixtures fired 0/27 in the bench.
-# These tests pin the new contract: a valid mixture lets declared_percentiles
-# be absent, but a block with NEITHER is still rejected.
-# ===========================================================================
-
-
-class TestNumericStructuredMixtureOnly:
-    def test_mixture_only_block_parses(self) -> None:
-
-        n = NumericStructured(  # type: ignore[call-arg]
-            question_type="numeric",
-            mixture_components=[
-                MixtureComponentDeclaration(weight=0.4, mean=2.0, sd=1.0),
-                MixtureComponentDeclaration(weight=0.6, mean=5.0, sd=1.0),
-            ],
-        )
-        assert n.declared_percentiles is None
-        assert n.mixture_components is not None
-        assert len(n.mixture_components) == 2
-
-    def test_mixture_only_three_components_parses(self) -> None:
-
-        n = NumericStructured(  # type: ignore[call-arg]
-            question_type="numeric",
-            mixture_components=[
-                MixtureComponentDeclaration(weight=0.2, mean=1.0, sd=0.5),
-                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
-                MixtureComponentDeclaration(weight=0.3, mean=9.0, sd=0.8),
-            ],
-        )
-        assert n.declared_percentiles is None
-        assert n.mixture_components is not None
-        assert len(n.mixture_components) == 3
-
-    def test_explicit_empty_percentiles_with_valid_mixture_parses(self) -> None:
-        # A model that emits an empty dict alongside a valid mixture should be
-        # treated the same as omitting the field.
-
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={},
-            mixture_components=[
-                MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
-                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
-            ],
-        )
-        assert not n.declared_percentiles
-        assert n.mixture_components is not None
-
-    def test_neither_percentiles_nor_mixture_rejected(self) -> None:
-        # Both absent — there is nothing to build a CDF from, so reject.
-        with pytest.raises(ValidationError, match="declared_percentiles"):
-            NumericStructured(question_type="numeric")  # type: ignore[call-arg]
-
-    def test_single_component_mixture_without_percentiles_rejected(self) -> None:
-        # A 1-component "mixture" cannot build a CDF and the field validator
-        # rejects it before the model validator runs — so the block is rejected
-        # whether or not declared_percentiles is present.
-
-        with pytest.raises(ValidationError):
-            NumericStructured(  # type: ignore[call-arg]
-                question_type="numeric",
-                mixture_components=[MixtureComponentDeclaration(weight=1.0, mean=5.0, sd=1.0)],
-            )
-
-    def test_bad_weight_sum_mixture_without_percentiles_rejected(self) -> None:
-
-        with pytest.raises(ValidationError):
-            NumericStructured(  # type: ignore[call-arg]
-                question_type="numeric",
-                mixture_components=[
-                    MixtureComponentDeclaration(weight=0.3, mean=2.0, sd=1.0),
-                    MixtureComponentDeclaration(weight=0.3, mean=5.0, sd=1.0),
-                ],
-            )
-
-    def test_percentiles_only_still_parses(self) -> None:
-        # Backward-compat: the legacy percentile-only block (no mixture) parses
-        # exactly as before.
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-        )
-        assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
-        assert n.mixture_components is None
-
-    def test_both_present_still_parses(self) -> None:
-
-        n = NumericStructured(
-            question_type="numeric",
-            declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
-            mixture_components=[
-                MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
-                MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
-            ],
-        )
-        assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
-        assert n.mixture_components is not None
-
-    def test_partial_percentiles_with_mixture_still_validates_percentiles(self) -> None:
-        # When declared_percentiles IS supplied, the p10/p50/p90 + monotonic
-        # rules still apply even though a mixture is present.
-
-        with pytest.raises(ValidationError, match="declared_percentiles must include"):
-            NumericStructured(
-                question_type="numeric",
-                declared_percentiles={0.5: 5.0, 0.9: 9.0},  # missing p10
-                mixture_components=[
-                    MixtureComponentDeclaration(weight=0.5, mean=2.0, sd=1.0),
-                    MixtureComponentDeclaration(weight=0.5, mean=5.0, sd=1.0),
-                ],
-            )
-
-    def test_mixture_only_parses_through_parse_structured_block(self) -> None:
-        # End-to-end: a mixture-only rationale (OPTION B taken literally — no
-        # percentile lines, no declared_percentiles in JSON) now parses instead
-        # of being silently dropped.
-        payload = {
-            "question_type": "numeric",
-            "mixture_components": [
-                {"weight": 0.4, "mean": 2.0, "sd": 1.0},
-                {"weight": 0.6, "mean": 5.0, "sd": 1.5},
-            ],
-        }
-        rationale = f"My scenario reasoning...\n```json\n{json.dumps(payload)}\n```"
-        result = parse_structured_block(rationale, "numeric")
-        assert isinstance(result, NumericStructured)
-        assert result.declared_percentiles is None
-        assert result.mixture_components is not None
-        assert len(result.mixture_components) == 2

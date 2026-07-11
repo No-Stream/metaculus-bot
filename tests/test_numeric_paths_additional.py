@@ -16,6 +16,11 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+from metaculus_bot.value_extraction import ExtractionOutcome
+
+
+def _numeric_extract_mock(plist):
+    return AsyncMock(return_value=ExtractionOutcome(value=plist, rung="block", block_present=True))
 
 
 def _as_numeric_question(q: SimpleNamespace) -> NumericQuestion:
@@ -86,18 +91,21 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
     f = _make_forecaster()
     q = _make_question()
 
-    # Valid 11-percentile set
+    # Valid 13-percentile set
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
     ):
         caplog.clear()
         caplog.set_level("WARNING")
@@ -122,8 +130,8 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         )
     ]
 
@@ -138,9 +146,10 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
 
     with (
         patch(
-            "metaculus_bot.forecaster_runners.structure_output",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
         ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
         patch("metaculus_bot.numeric.pchip_processing.NumericDistribution", FakeND),
     ):
         caplog.clear()
@@ -172,13 +181,16 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
         plist = [
             Percentile(percentile=p, value=v)
             for p, v in zip(
-                [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-                [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+                [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+                [0, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 100],
             )
         ]
-        with patch(
-            "metaculus_bot.forecaster_runners.structure_output",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
         ):
             caplog.clear()
             caplog.set_level("WARNING")
@@ -199,16 +211,18 @@ async def test_numeric_percentile_set_validation():
     f = _make_forecaster()
     q = _make_question()
 
-    # 11 items but wrong set (0.03 instead of 0.025)
+    # 13 items but wrong set (0.03 instead of 0.025): filtering to the standard
+    # set drops the non-standard 0.03, so the count falls to 12 and validation
+    # fails on the count check — same "wrong label" intent as the old 11-set.
     bad = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.03, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [3, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.03, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 3, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
-    with patch("metaculus_bot.forecaster_runners.structure_output", return_value=bad):
+    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=bad):
         with pytest.raises(Exception):  # pydantic ValidationError via from_exception_data
             await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
@@ -227,14 +241,17 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
     plist = [
         Percentile(percentile=p, value=v)
         for p, v in zip(
-            [0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975],
-            [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5],
+            [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99],
+            [1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99],
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
     ):
         await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
@@ -253,6 +270,7 @@ def test_lower_bound_adjacent_cluster(caplog):
         upper_bound=100.0,
     )
     raw = [
+        Percentile(percentile=0.01, value=0.0),
         Percentile(percentile=0.025, value=0.0),
         Percentile(percentile=0.05, value=0.0),
         Percentile(percentile=0.10, value=0.0),
@@ -264,6 +282,7 @@ def test_lower_bound_adjacent_cluster(caplog):
         Percentile(percentile=0.90, value=30.0),
         Percentile(percentile=0.95, value=40.0),
         Percentile(percentile=0.975, value=50.0),
+        Percentile(percentile=0.99, value=60.0),
     ]
 
     caplog.clear()
@@ -302,17 +321,13 @@ async def test_binary_parse_additional_instructions_capture():
 
     seen = {}
 
-    class _Bin:
-        def __init__(self, val):
-            self.prediction_in_decimal = val
+    async def _fake_extract_binary(*args, **kwargs):
+        seen["prompt_notes"] = kwargs.get("prompt_notes", "")
+        return ExtractionOutcome(value=0.5, rung="block", block_present=True)
 
-    async def _fake_structure_output(*args, **kwargs):
-        seen["additional_instructions"] = kwargs.get("additional_instructions", "")
-        return _Bin(0.5)
-
-    with patch("metaculus_bot.forecaster_runners.structure_output", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.extract_binary", _fake_extract_binary):
         await bot._run_forecast_on_binary(q, "", llm)
 
-    ai = seen.get("additional_instructions", "")
+    ai = seen.get("prompt_notes", "")
     assert "decimal in [0,1]" in ai
     assert "NN%" in ai and "NN/100" in ai

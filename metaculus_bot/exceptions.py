@@ -6,3 +6,13 @@ class UnitMismatchError(ValueError):
     """
 
     pass
+
+
+class ValueExtractionError(Exception):
+    """Raised when all rungs of the extraction ladder fail to produce a valid value.
+
+    The message string lists each rung and its failure reason so callers can
+    surface which stage (block-parse, json-repair, LLM-salvage) tripped.
+    """
+
+    pass

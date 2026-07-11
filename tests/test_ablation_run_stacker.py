@@ -1,3 +1,4 @@
+# noqa: HARNESS-SCAN-EXEMPT-monolithic-file-loc
 """Tests for the per-arm stacker runner used in the probabilistic-tools ablation benchmark.
 
 Treatment in our A/B test is *only* visible to the stacker. Forecasters run once and never
@@ -135,6 +136,7 @@ def _numeric_payload(model: str = "openrouter/test/m1", median: float = 50.0) ->
     monotone linear CDF that spans the bounds.
     """
     declared = [
+        {"percentile": 0.01, "value": median - 35},
         {"percentile": 0.025, "value": median - 30},
         {"percentile": 0.05, "value": median - 25},
         {"percentile": 0.10, "value": median - 20},
@@ -146,6 +148,7 @@ def _numeric_payload(model: str = "openrouter/test/m1", median: float = 50.0) ->
         {"percentile": 0.90, "value": median + 20},
         {"percentile": 0.95, "value": median + 25},
         {"percentile": 0.975, "value": median + 30},
+        {"percentile": 0.99, "value": median + 35},
     ]
     cdf_probabilities = [0.001 + (0.998 * i / 200) for i in range(201)]
     return {
@@ -637,7 +640,7 @@ class TestPerForecasterComputedQuantities:
         # rationale starts with "Model: openrouter/test/m1\n\n"; after strip, must not start with "Model:"
         assert captured_base_texts
         for base_text in captured_base_texts[0]:
-            assert not base_text.startswith("Model: "), f"Expected stripped, got: {base_text[:60]!r}"
+            assert not base_text.startswith("Model: "), f"Expected stripped, got: {base_text[:60]!r}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # display truncation in assert message, not data subsampling
 
     def test_per_forecaster_computed_quantities_recorded_in_payload(
         self,
@@ -1092,7 +1095,9 @@ class TestSoftDeadline:
         timeout, fall back to the fallback LLM, succeed, and record the
         timeout in the payload's ``errors``.
         """
-        from metaculus_bot.ablation import run_stacker as run_stacker_module
+        from metaculus_bot.ablation import (
+            run_stacker as run_stacker_module,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
 
@@ -1151,7 +1156,9 @@ class TestSoftDeadline:
         """When BOTH primary and fallback stall past their deadlines, the
         median fallback (M3) takes over — but errors record both timeouts.
         """
-        from metaculus_bot.ablation import run_stacker as run_stacker_module
+        from metaculus_bot.ablation import (
+            run_stacker as run_stacker_module,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
         monkeypatch.setattr(run_stacker_module, "STACKER_FALLBACK_SOFT_DEADLINE", 1)
@@ -1206,7 +1213,7 @@ class TestWindowPatchActive:
         fallback_stacker_llm: MagicMock,
         parser_llm: MagicMock,
     ) -> None:
-        from metaculus_bot.ablation import window_patch as wp
+        from metaculus_bot.ablation import window_patch as wp  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
 
         observed_active: list[bool] = []
 
@@ -1388,6 +1395,7 @@ class TestQuestionTypeDispatch:
         # before serialization. The fake here returns the raw list to mimic that
         # production contract; the wrapping is what we're verifying gets exercised.
         _percentiles = [
+            Percentile(percentile=0.01, value=15.0),
             Percentile(percentile=0.025, value=20.0),
             Percentile(percentile=0.05, value=25.0),
             Percentile(percentile=0.10, value=30.0),
@@ -1399,6 +1407,7 @@ class TestQuestionTypeDispatch:
             Percentile(percentile=0.90, value=70.0),
             Percentile(percentile=0.95, value=75.0),
             Percentile(percentile=0.975, value=80.0),
+            Percentile(percentile=0.99, value=85.0),
         ]
         captured_args: list[Any] = []
 
@@ -1456,15 +1465,15 @@ class TestQuestionTypeDispatch:
         ``sanitize_percentiles`` + ``detect_unit_mismatch`` + ``build_numeric_distribution``
         before the canonical full-CDF serializer runs.
 
-        We feed an *unsorted, duplicate-laden* 11-percentile list. If wrapping is
+        We feed an *unsorted, duplicate-laden* 13-percentile list. If wrapping is
         absent, the raw list goes straight to ``serialize_prediction_value``,
         which raises ``TypeError`` (Bucket 1 contract: numeric requires
         ``NumericDistribution``). If wrapping is present, ``sanitize_percentiles``
         sorts by percentile + clamps + deduplicates, and the resulting payload
-        carries a sorted ``declared_percentiles`` list with all 11 standard
+        carries a sorted ``declared_percentiles`` list with all 13 standard
         percentiles preserved.
         """
-        # 11 standard percentiles, deliberately unsorted and with one near-duplicate
+        # 13 standard percentiles, deliberately unsorted and with one near-duplicate
         # value cluster that ``apply_jitter_for_duplicates`` should spread.
         unsorted_with_dupes = [
             Percentile(percentile=0.50, value=50.0),  # out of order
@@ -1478,6 +1487,8 @@ class TestQuestionTypeDispatch:
             Percentile(percentile=0.975, value=80.0),
             Percentile(percentile=0.90, value=70.0),
             Percentile(percentile=0.95, value=75.0),
+            Percentile(percentile=0.01, value=15.0),
+            Percentile(percentile=0.99, value=85.0),
         ]
 
         def _fake_numeric(*_args: Any, **_kwargs: Any) -> tuple[Any, str]:
@@ -1514,17 +1525,17 @@ class TestQuestionTypeDispatch:
         # Wrapping ran: serialized payload is a NumericDistribution-shaped dict.
         assert isinstance(sp, dict)
         assert sp["type"] == "numeric"
-        # All 11 standard percentiles survive (filter_to_standard_percentiles
+        # All 13 standard percentiles survive (filter_to_standard_percentiles
         # keeps the canonical set; sanitize_percentiles validates count).
-        assert len(sp["declared_percentiles"]) == 11
+        assert len(sp["declared_percentiles"]) == 13
         # sort_percentiles_by_value reorders by ``percentile`` ascending.
-        percentile_keys = [round(float(p["percentile"]), 6) for p in sp["declared_percentiles"]]
+        percentile_keys = [round(float(p["percentile"]), 6) for p in sp["declared_percentiles"]]  # noqa: HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
         assert percentile_keys == sorted(percentile_keys), (
             f"sanitize_percentiles should sort by percentile; got {percentile_keys}"
         )
         # apply_jitter_for_duplicates / ensure_strictly_increasing_bounded:
         # value-axis must be strictly increasing after sanitization.
-        values = [float(p["value"]) for p in sp["declared_percentiles"]]
+        values = [float(p["value"]) for p in sp["declared_percentiles"]]  # noqa: HARNESS-SCAN-EXEMPT-object-explosion  # tiny test frame (13 percentiles)
         assert all(v_next > v_prev for v_prev, v_next in zip(values, values[1:])), (
             f"sanitize_percentiles should produce strictly increasing values; got {values}"
         )
@@ -1634,7 +1645,7 @@ class TestPayloadShape:
                 )
             )
         # binary: stored using canonical forecasters.serialize_prediction_value format
-        import json
+        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
 
         assert payload["stacker_prediction"] == {"type": "binary", "prob": 0.42}
         # JSON-roundtrippable
@@ -1654,14 +1665,15 @@ class TestPayloadShape:
         ``_dispatch_stacker`` mirrors main.py:450-465 by piping the list through
         ``sanitize_percentiles`` → ``detect_unit_mismatch`` → ``build_numeric_distribution``
         before the canonical full-CDF serializer runs. The fake here returns the
-        raw 11-Percentile list so we exercise that wrapping, then assert the
+        raw 13-Percentile list so we exercise that wrapping, then assert the
         serialized payload still carries declared_percentiles + cdf_probabilities
         + bounds + zero_point + cdf_size.
         """
         question = _make_numeric_q(qid=3)
-        # 11 standard percentiles in canonical order — what production
+        # 13 standard percentiles in canonical order — what production
         # ``stacking.run_stacking_numeric`` emits after the parser LLM.
         declared = [
+            Percentile(percentile=0.01, value=15.0),
             Percentile(percentile=0.025, value=20.0),
             Percentile(percentile=0.05, value=25.0),
             Percentile(percentile=0.10, value=30.0),
@@ -1673,6 +1685,7 @@ class TestPayloadShape:
             Percentile(percentile=0.90, value=70.0),
             Percentile(percentile=0.95, value=75.0),
             Percentile(percentile=0.975, value=80.0),
+            Percentile(percentile=0.99, value=85.0),
         ]
         cdf_size = int(question.cdf_size or 201)
 
@@ -1705,16 +1718,16 @@ class TestPayloadShape:
                     parser_llm=parser_llm,
                 )
             )
-        import json
+        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
 
         # numeric (post-Bucket-1): full-CDF schema; JSON-roundtrippable.
         sp = payload["stacker_prediction"]
         assert isinstance(sp, dict)
         assert sp["type"] == "numeric"
-        # declared_percentiles: the 11 standard percentiles round-trip after
+        # declared_percentiles: the 13 standard percentiles round-trip after
         # sanitize_percentiles + build_numeric_distribution.
         assert isinstance(sp["declared_percentiles"], list)
-        assert len(sp["declared_percentiles"]) == 11
+        assert len(sp["declared_percentiles"]) == 13
         assert all("percentile" in p and "value" in p for p in sp["declared_percentiles"])
         # cdf_probabilities: 201 monotonic floats
         assert isinstance(sp["cdf_probabilities"], list)
@@ -1772,7 +1785,7 @@ class TestPayloadShape:
                     parser_llm=parser_llm,
                 )
             )
-        import json
+        import json  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
 
         sp = payload["stacker_prediction"]
         assert isinstance(sp, dict)
@@ -1976,7 +1989,7 @@ class TestConcurrentStackerLock:
         concurrent stacker calls would race and the second to enter would
         crash. The lock keeps each call inside its own patched region.
         """
-        from metaculus_bot.ablation import window_patch as wp
+        from metaculus_bot.ablation import window_patch as wp  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
 
         observed_active_during_call: list[bool] = []
         max_concurrent_in_patch = 0
@@ -2080,11 +2093,9 @@ def _binary_rationale_with_valid_json(posterior_prob: float = 0.42) -> str:
 
 
 def _numeric_rationale_with_valid_json(median: float = 50.0) -> str:
-    """Synthetic numeric rationale with mixture_components + standard percentiles.
+    """Synthetic numeric rationale with standard percentiles.
 
-    The mixture_components block triggers _render_mixture_section in the real
-    tool_runner, producing a "### Mixture-of-normals" subsection with CDF
-    samples. The declared_percentiles also trigger family-consistency and
+    The declared_percentiles trigger family-consistency and
     out-of-bounds-mass tools.
     """
     return textwrap.dedent(
@@ -2097,17 +2108,12 @@ def _numeric_rationale_with_valid_json(median: float = 50.0) -> str:
         {{
           "question_type": "numeric",
           "declared_percentiles": {{
-            "0.025": {median - 30}, "0.05": {median - 25}, "0.1": {median - 20},
-            "0.2": {median - 12}, "0.4": {median - 5}, "0.5": {median},
-            "0.6": {median + 5}, "0.8": {median + 12}, "0.9": {median + 20},
-            "0.95": {median + 25}, "0.975": {median + 30}
-          }},
-          "distribution_family_hint": "normal",
-          "mixture_components": [
-            {{"weight": 0.3, "mean": {median - 20}, "sd": 7.0}},
-            {{"weight": 0.4, "mean": {median}, "sd": 10.0}},
-            {{"weight": 0.3, "mean": {median + 20}, "sd": 8.0}}
-          ]
+            "0.01": {median - 35}, "0.025": {median - 30}, "0.05": {median - 25},
+            "0.1": {median - 20}, "0.2": {median - 12}, "0.4": {median - 5},
+            "0.5": {median}, "0.6": {median + 5}, "0.8": {median + 12},
+            "0.9": {median + 20}, "0.95": {median + 25}, "0.975": {median + 30},
+            "0.99": {median + 35}
+          }}
         }}
         ```
 
@@ -2370,15 +2376,16 @@ class TestRealToolRunnerIntegration:
             f"Prior/posterior snapshot appeared but JSON should not have parsed: {agg!r}"
         )
 
-    def test_arm_b_with_real_tool_runner_produces_mixture_section_for_numeric(
+    def test_arm_b_with_real_tool_runner_produces_family_and_oob_sections_for_numeric(
         self,
         cache: AblationCache,
         stacker_llm: MagicMock,
         fallback_stacker_llm: MagicMock,
         parser_llm: MagicMock,
     ) -> None:
-        """Arm B + real tool_runner + valid numeric JSON with mixture_components
-        → per-forecaster Mixture-of-normals subsection AND cross-model medians."""
+        """Arm B + real tool_runner + valid numeric JSON with declared_percentiles
+        → per-forecaster Percentile-family consistency + Out-of-bounds mass
+        subsections AND a cross-model Forecaster-medians aggregation block."""
         # Post-Bucket-1: forecaster numeric payloads use the full-CDF schema.
         # Synthesize a monotone linear CDF that spans the bounds for both forecasters.
         _cdf_probs = [0.001 + (0.998 * i / 200) for i in range(201)]
@@ -2401,6 +2408,7 @@ class TestRealToolRunnerIntegration:
                 "model": "openrouter/test/m1",
                 "prediction_value": _numeric_pred_payload(
                     [
+                        {"percentile": 0.01, "value": 15},
                         {"percentile": 0.025, "value": 20},
                         {"percentile": 0.05, "value": 25},
                         {"percentile": 0.1, "value": 30},
@@ -2412,6 +2420,7 @@ class TestRealToolRunnerIntegration:
                         {"percentile": 0.9, "value": 70},
                         {"percentile": 0.95, "value": 75},
                         {"percentile": 0.975, "value": 80},
+                        {"percentile": 0.99, "value": 85},
                     ]
                 ),
                 "reasoning": _numeric_rationale_with_valid_json(50.0),
@@ -2421,6 +2430,7 @@ class TestRealToolRunnerIntegration:
                 "model": "openrouter/test/m2",
                 "prediction_value": _numeric_pred_payload(
                     [
+                        {"percentile": 0.01, "value": 20},
                         {"percentile": 0.025, "value": 25},
                         {"percentile": 0.05, "value": 30},
                         {"percentile": 0.1, "value": 35},
@@ -2432,6 +2442,7 @@ class TestRealToolRunnerIntegration:
                         {"percentile": 0.9, "value": 75},
                         {"percentile": 0.95, "value": 80},
                         {"percentile": 0.975, "value": 85},
+                        {"percentile": 0.99, "value": 90},
                     ]
                 ),
                 "reasoning": _numeric_rationale_with_valid_json(55.0),
@@ -2443,6 +2454,7 @@ class TestRealToolRunnerIntegration:
         # in production; ``_dispatch_stacker`` wraps the list with sanitize +
         # build_numeric_distribution before serialization.
         _stacker_percentiles = [
+            Percentile(percentile=0.01, value=17.0),
             Percentile(percentile=0.025, value=22.0),
             Percentile(percentile=0.05, value=27.0),
             Percentile(percentile=0.10, value=32.0),
@@ -2454,6 +2466,7 @@ class TestRealToolRunnerIntegration:
             Percentile(percentile=0.90, value=72.0),
             Percentile(percentile=0.95, value=77.0),
             Percentile(percentile=0.975, value=82.0),
+            Percentile(percentile=0.99, value=87.0),
         ]
 
         with patch(
@@ -2479,13 +2492,11 @@ class TestRealToolRunnerIntegration:
         for slug, md in payload["computed_quantities"].items():
             assert "Percentile-family consistency" in md, f"Missing family check for {slug}: {md!r}"
             assert "Out-of-bounds mass" in md, f"Missing OOB mass for {slug}: {md!r}"
-            assert "### Mixture-of-normals" in md, f"Missing mixture section for {slug}: {md!r}"
 
         # Cross-model agg: medians + declared families.
         assert payload["cross_model_aggregation"], "Real build_cross_model_aggregation produced empty numeric output!"
         agg = payload["cross_model_aggregation"]
         assert "Forecaster medians" in agg, agg
-        assert "Declared distribution families" in agg, agg
 
     def test_arm_b_with_real_tool_runner_produces_dirichlet_for_mc(
         self,
@@ -2567,12 +2578,12 @@ class TestRealToolRunnerIntegration:
 
 class TestDefaultStackerWiredViaDonatedKey:
     """When callers pass ``stacker_llm=None`` we construct claude-opus-4.5
-    (primary) and gpt-5.5 (fallback) routed via ``build_llm_with_openrouter_fallback``
+    (primary) and gpt-5.6-sol (fallback) routed via ``build_llm_with_openrouter_fallback``
     so the Metaculus-donated key is tried before the operator's paid key.
 
     This mirrors production STACKER_LLM / STACKER_FALLBACK_LLM in
-    ``llm_configs.py``. The earlier iteration tried gpt-5.5 as primary, but
-    the operator's local-`.env` donated key data-policy blocks gpt-5.5;
+    ``llm_configs.py``. An earlier iteration tried an OpenAI model as primary,
+    but the operator's local-`.env` donated key data-policy blocked it;
     Anthropic models work cleanly. Production with a different
     ``OAI_ANTH_OPENROUTER_KEY`` GitHub-secret value behaved differently.
     """
@@ -2580,20 +2591,23 @@ class TestDefaultStackerWiredViaDonatedKey:
     def test_default_stacker_uses_opus_4_5_via_donated_key_wrapper(
         self, cache: AblationCache, parser_llm: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from metaculus_bot.ablation.run_stacker import (
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
             DEFAULT_STACKER_FALLBACK_MODEL,
             DEFAULT_STACKER_MODEL,
         )
-        from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
+        from metaculus_bot.fallback_openrouter import (
+            FallbackOpenRouterLlm,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         # Both keys present + distinct → wrapper chooses FallbackOpenRouterLlm.
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "fake_donated")
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake_paid")
 
         # Pin the new defaults at the constant level — primary is opus-4.5,
-        # fallback stays gpt-5.5 (different provider for independent failure mode).
+        # fallback is gpt-5.6-sol (different provider for independent failure
+        # mode; matches prod STACKER_FALLBACK_LLM post the 2026-07-09 migration).
         assert DEFAULT_STACKER_MODEL == "openrouter/anthropic/claude-opus-4.5"
-        assert DEFAULT_STACKER_FALLBACK_MODEL == "openrouter/openai/gpt-5.5"
+        assert DEFAULT_STACKER_FALLBACK_MODEL == "openrouter/openai/gpt-5.6-sol"
 
         captured_llms: list[Any] = []
 
@@ -2638,7 +2652,9 @@ class TestDefaultStackerWiredViaDonatedKey:
     def test_default_stacker_in_batch_uses_opus_4_5_via_donated_key_wrapper(
         self, cache: AblationCache, parser_llm: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
+        from metaculus_bot.fallback_openrouter import (
+            FallbackOpenRouterLlm,  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "fake_donated")
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake_paid")
@@ -3166,7 +3182,7 @@ class TestStackerPromptSizeGuard:
         """4 rationales x 200k chars -> WARNING log + each truncated to a
         per-rationale share of the budget. The truncation must keep the
         LAST chars (conclusion), not the head."""
-        import logging  # noqa: PLC0415  - test-local
+        import logging  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  - test-local
 
         big_chunk = "a" * 200_000
         # Distinctive end marker so we can confirm the tail survived truncation.
@@ -3231,7 +3247,7 @@ class TestStackerPromptSizeGuard:
         parser_llm: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        import logging  # noqa: PLC0415
+        import logging  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
         captured_base_texts: list[list[str]] = []
 
@@ -3285,7 +3301,9 @@ class TestStackerPromptSizeGuard:
 
 class TestNaNFiltering:
     def test_surviving_forecasters_filters_binary_nan(self) -> None:
-        from metaculus_bot.ablation.run_stacker import _surviving_forecasters
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _surviving_forecasters,
+        )
 
         forecasters = {
             "m1": _binary_payload("m1", float("nan")),
@@ -3297,7 +3315,9 @@ class TestNaNFiltering:
         assert set(surviving.keys()) == {"m2", "m3"}
 
     def test_surviving_forecasters_filters_binary_infinity(self) -> None:
-        from metaculus_bot.ablation.run_stacker import _surviving_forecasters
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _surviving_forecasters,
+        )
 
         forecasters = {
             "m1": _binary_payload("m1", float("inf")),
@@ -3308,7 +3328,9 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_filters_mc_nan_option(self) -> None:
-        from metaculus_bot.ablation.run_stacker import _surviving_forecasters
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _surviving_forecasters,
+        )
 
         bad_mc = _mc_payload("m1")
         bad_mc["prediction_value"]["options"][0]["probability"] = float("nan")
@@ -3321,7 +3343,9 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_filters_numeric_nan_in_cdf(self) -> None:
-        from metaculus_bot.ablation.run_stacker import _surviving_forecasters
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _surviving_forecasters,
+        )
 
         bad_numeric = _numeric_payload("m1", median=50.0)
         bad_numeric["prediction_value"]["cdf_probabilities"][100] = float("nan")
@@ -3334,7 +3358,9 @@ class TestNaNFiltering:
         assert "m1" not in surviving
 
     def test_surviving_forecasters_keeps_finite_values(self) -> None:
-        from metaculus_bot.ablation.run_stacker import _surviving_forecasters
+        from metaculus_bot.ablation.run_stacker import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            _surviving_forecasters,
+        )
 
         forecasters = _three_binary_forecasters()
         surviving = _surviving_forecasters(forecasters)

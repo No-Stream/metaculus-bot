@@ -14,6 +14,7 @@ keys), never guess from a configured roster.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -21,13 +22,16 @@ import pytest
 
 from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.performance_analysis.parsing import (
+    _MC_OPTION_LINE_RE,
     _iter_per_model_blocks,
     _parse_probability,
+    _summary_section_for_bullets,
     annotate_forecaster_bullets_with_models,
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
     parse_forecaster_model_map,
     parse_inferred_stacker_outcome,
+    parse_per_base_model_forecasts,
     parse_per_model_forecasts,
     parse_per_model_mc_option_probs,
     parse_per_model_numeric_percentiles,
@@ -1022,7 +1026,6 @@ class TestForecasterReBoundedToSummarySection:
         # they exist BEFORE any stray reasoning text — and emit a warning so
         # operators notice. We accept the legacy unanchored behavior in this
         # path because there's no clean section to bound to.
-        import logging
 
         comment = "*Forecaster 1*: 73.0%\n*Forecaster 2*: 75.0%\n"
         with caplog.at_level(logging.WARNING):
@@ -1119,7 +1122,6 @@ class TestParseProbabilityHeuristic:
     def test_warning_emitted_when_skipping_ambiguous(self, caplog):
         # WARNING-level log when we drop an out-of-range value — operators
         # should be able to grep for these to spot upstream parse drift.
-        import logging
 
         with caplog.at_level(logging.WARNING):
             assert _parse_probability("1.2") is None
@@ -1377,8 +1379,6 @@ class TestParsePerBaseModelForecasts:
     """Per-base-model probability extraction from stacker-combined reasoning bodies."""
 
     def test_binary_stacked_comment_extracts_five_base_model_probs(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_names = [
             "openrouter/openai/gpt-5.5",
             "openrouter/anthropic/claude-opus-4.7",
@@ -1404,8 +1404,6 @@ class TestParsePerBaseModelForecasts:
         assert result["gpt-5.4"] == "80.0%"
 
     def test_binary_stacked_comment_handles_decimal_probability_format(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nFinal probability: 0.72"),
             _build_base_pred("openrouter/anthropic/claude-opus-4.7", "Analysis.\n\nProbability: 65%"),
@@ -1420,8 +1418,6 @@ class TestParsePerBaseModelForecasts:
         assert result["claude-opus-4.7"] == "65.0%"
 
     def test_binary_extracts_last_probability_when_multiple_present(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         body = "Initial estimate: Probability: 40%\nAfter adjusting for base rates...\nFinal probability: 55%"
         base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
         meta_text = "Meta.\n\nProbability: 55%"
@@ -1433,8 +1429,6 @@ class TestParsePerBaseModelForecasts:
         assert result["gpt-5.5"] == "55.0%"
 
     def test_mc_stacked_comment_extracts_per_base_model_option_dicts(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred(
                 "openrouter/openai/gpt-5.5",
@@ -1455,8 +1449,6 @@ class TestParsePerBaseModelForecasts:
         assert result["claude-opus-4.7"] == {"Option A": 0.55, "Option B": 0.30, "Option C": 0.15}
 
     def test_numeric_returns_empty_dict(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred(
                 "openrouter/openai/gpt-5.5",
@@ -1471,8 +1463,6 @@ class TestParsePerBaseModelForecasts:
         assert result == {}
 
     def test_discrete_returns_empty_dict(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred(
                 "openrouter/openai/gpt-5.5",
@@ -1487,8 +1477,6 @@ class TestParsePerBaseModelForecasts:
         assert result == {}
 
     def test_non_stacked_comment_returns_empty_dict(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         comment = (
             "## R1: Forecaster 1 Reasoning\n"
             "Model: openrouter/openai/gpt-5.5\n\n"
@@ -1501,8 +1489,6 @@ class TestParsePerBaseModelForecasts:
         assert result == {}
 
     def test_excludes_stacker_meta_block(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nProbability: 72%"),
         ]
@@ -1517,14 +1503,10 @@ class TestParsePerBaseModelForecasts:
         assert "Forecaster 1" not in result
 
     def test_empty_comment_returns_empty_dict(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         assert parse_per_base_model_forecasts("", "binary") == {}
         assert parse_per_base_model_forecasts("", "multiple_choice") == {}
 
     def test_binary_with_about_prefix(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         base_preds = [
             _build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nProbability: about 72%"),
         ]
@@ -1669,7 +1651,6 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
         # DO match the MC-option regex. If the regex is ever rewritten so these
         # no longer match, the scoping protection is moot and this test (and the
         # ones below) should be revisited.
-        from metaculus_bot.performance_analysis.parsing import _MC_OPTION_LINE_RE
 
         assert _MC_OPTION_LINE_RE.search(_POLYMARKET_TRAP_LINE) is not None
         assert _MC_OPTION_LINE_RE.search(_KALSHI_TRAP_LINE) is not None
@@ -1689,8 +1670,6 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
             assert 0.47 not in options.values()
 
     def test_per_base_model_forecasts_recovers_only_true_base_models(self):
-        from metaculus_bot.performance_analysis.parsing import parse_per_base_model_forecasts
-
         comment = _mc_stacked_comment_with_research_blocks()
         result = parse_per_base_model_forecasts(comment, "multiple_choice")
 
@@ -1726,7 +1705,6 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
         # region the MC option parser scopes to. If a refactor ever moves the
         # boundary or the snapshot, this assertion flags it before the
         # mis-parse can happen.
-        from metaculus_bot.performance_analysis.parsing import _summary_section_for_bullets
 
         comment = _mc_stacked_comment_with_research_blocks()
         summary_prefix = _summary_section_for_bullets(comment)
@@ -1734,3 +1712,226 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
         assert _KALSHI_TRAP_LINE not in summary_prefix
         # And the legitimate stacker bullet IS inside the scoped prefix.
         assert "*Forecaster 1 (stacker-claude-opus-4.5)*:" in summary_prefix
+
+
+# ---------------------------------------------------------------------------
+# Block-first parsing (2026-07 prompt change) — the forecaster prompts now emit
+# forecast values ONLY inside the fenced ```json STRUCTURED FORECAST block; the
+# trailing prose value lines are removed. Historical comments still carry the
+# prose lines, so the reasoning-body parsers must try block-first per body and
+# fall back to the prose regexes. The tests below exercise BOTH paths per
+# function plus block-over-prose precedence when both are present.
+# ---------------------------------------------------------------------------
+
+
+def _fenced_json_block(payload: dict) -> str:
+    return "```json\n" + json.dumps(payload) + "\n```"
+
+
+def _numeric_block(percentiles: dict[str, float]) -> str:
+    return _fenced_json_block({"question_type": "numeric", "declared_percentiles": percentiles})
+
+
+def _binary_block(posterior_prob: float) -> str:
+    return _fenced_json_block({"question_type": "binary", "posterior_prob": posterior_prob})
+
+
+def _mc_block(option_probs: dict[str, float]) -> str:
+    return _fenced_json_block({"question_type": "multiple_choice", "option_probs": option_probs})
+
+
+class TestBlockFirstNumericPercentiles:
+    """parse_per_model_numeric_percentiles: JSON block first, prose regex fallback."""
+
+    def test_post_change_comment_parses_via_block(self):
+        # No prose "Percentile X: V" lines at all — values live only in the block.
+        block = _numeric_block({"0.025": 100.0, "0.1": 120.0, "0.5": 150.0, "0.9": 180.0})
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "analysis prose, no trailing value lines.\n\n"
+            f"{block}\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        # Block decimals (0.025, 0.1, ...) are converted to the raw prose-label
+        # convention (2.5, 10, ...) so downstream consumers see one shape.
+        assert result == {"gpt-5.5": [(2.5, 100.0), (10.0, 120.0), (50.0, 150.0), (90.0, 180.0)]}
+
+    def test_block_labels_are_exact_despite_float_noise(self):
+        # 0.1 * 100 is 10.000000000000002 in IEEE 754 — the converter must
+        # round so stacker_detection's label lookup (10.0/50.0/90.0) matches.
+        block = _numeric_block({"0.1": 1.0, "0.5": 2.0, "0.9": 3.0})
+        comment = f"## R1: Forecaster 1 Reasoning\nModel: openrouter/openai/gpt-5.5\n\n{block}\n"
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(10.0, 1.0), (50.0, 2.0), (90.0, 3.0)]}
+
+    def test_pre_change_comment_still_parses_via_prose(self):
+        # Historical shape: prose lines, no JSON block.
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "analysis...\n\n"
+            "Percentile 10: 120.0\n"
+            "Percentile 50: 150.0\n"
+            "Percentile 90: 180.0\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(10.0, 120.0), (50.0, 150.0), (90.0, 180.0)]}
+
+    def test_block_wins_over_prose_when_both_present(self):
+        # Transition-era comment: block AND prose lines. Block values differ so
+        # the assertion proves precedence, not coincidence.
+        block = _numeric_block({"0.1": 125.0, "0.5": 155.0, "0.9": 185.0})
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            f"{block}\n\n"
+            "Percentile 10: 120.0\n"
+            "Percentile 50: 150.0\n"
+            "Percentile 90: 180.0\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(10.0, 125.0), (50.0, 155.0), (90.0, 185.0)]}
+
+    def test_invalid_block_falls_back_to_prose(self):
+        # A fenced json block that fails schema validation (missing the
+        # required 0.1/0.5/0.9 percentiles) must not eat the prose lines.
+        bad_block = _fenced_json_block({"question_type": "numeric", "declared_percentiles": {"0.5": 150.0}})
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            f"{bad_block}\n\n"
+            "Percentile 10: 120.0\n"
+            "Percentile 50: 150.0\n"
+            "Percentile 90: 180.0\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(10.0, 120.0), (50.0, 150.0), (90.0, 180.0)]}
+
+    def test_stacked_comment_mixed_eras_per_base_model(self):
+        # One base model is post-change (block only), one pre-change (prose
+        # only) — per-body try-then-fallback must handle both in one comment.
+        block_body = "block-era analysis.\n\n" + _numeric_block({"0.1": 10.0, "0.5": 20.0, "0.9": 30.0})
+        prose_body = "prose-era analysis.\n\nPercentile 10: 11\nPercentile 50: 21\nPercentile 90: 31"
+        base_preds = [
+            _build_base_pred("openrouter/openai/gpt-5.5", block_body),
+            _build_base_pred("openrouter/anthropic/claude-opus-4.7", prose_body),
+        ]
+        combined = combine_stacker_and_base_reasoning("stacker meta, no values", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result["gpt-5.5"] == [(10.0, 10.0), (50.0, 20.0), (90.0, 30.0)]
+        assert result["claude-opus-4.7"] == [(10.0, 11.0), (50.0, 21.0), (90.0, 31.0)]
+
+
+class TestBlockFirstPerBaseModelBinary:
+    """parse_per_base_model_forecasts binary branch: block first, prose fallback."""
+
+    def test_post_change_stacked_comment_parses_via_block(self):
+        base_preds = [
+            _build_base_pred("openrouter/openai/gpt-5.5", "analysis, no prose value.\n\n" + _binary_block(0.62)),
+            _build_base_pred(
+                "openrouter/anthropic/claude-opus-4.7", "analysis, no prose value.\n\n" + _binary_block(0.57)
+            ),
+        ]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "binary")
+        # Same "{prob*100:.1f}%" shape the prose path produces.
+        assert result == {"gpt-5.5": "62.0%", "claude-opus-4.7": "57.0%"}
+
+    def test_block_wins_over_prose_when_both_present(self):
+        body = "Initial thoughts.\n\nProbability: 55%\n\n" + _binary_block(0.62)
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result == {"gpt-5.5": "62.0%"}
+
+    def test_invalid_block_falls_back_to_prose(self):
+        # posterior_prob out of range fails validation → prose line still read.
+        bad_block = _fenced_json_block({"question_type": "binary", "posterior_prob": 1.7})
+        body = "Analysis.\n\nProbability: 55%\n\n" + bad_block
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result == {"gpt-5.5": "55.0%"}
+
+    def test_pre_change_prose_only_unchanged(self):
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", "Analysis.\n\nProbability: 72%")]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result == {"gpt-5.5": "72.0%"}
+
+
+class TestBlockFirstPerBaseModelMultipleChoice:
+    """parse_per_base_model_forecasts MC branch: block first, prose fallback."""
+
+    def test_post_change_stacked_comment_parses_via_block(self):
+        base_preds = [
+            _build_base_pred(
+                "openrouter/openai/gpt-5.5",
+                "analysis, no option lines.\n\n" + _mc_block({"Option A": 0.61, "Option B": 0.39}),
+            ),
+        ]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+        assert result == {"gpt-5.5": {"Option A": 0.61, "Option B": 0.39}}
+
+    def test_block_wins_over_prose_when_both_present(self):
+        body = "My analysis:\n- Option A: 55.0%\n- Option B: 45.0%\n\n" + _mc_block(
+            {"Option A": 0.61, "Option B": 0.39}
+        )
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+        assert result == {"gpt-5.5": {"Option A": 0.61, "Option B": 0.39}}
+
+    def test_invalid_block_falls_back_to_prose(self):
+        # option_probs not summing to ~1.0 fails validation → prose lines used.
+        bad_block = _fenced_json_block(
+            {"question_type": "multiple_choice", "option_probs": {"Option A": 0.5, "Option B": 0.1}}
+        )
+        body = "My analysis:\n- Option A: 55.0%\n- Option B: 45.0%\n\n" + bad_block
+        base_preds = [_build_base_pred("openrouter/openai/gpt-5.5", body)]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+        assert result == {"gpt-5.5": {"Option A": 0.55, "Option B": 0.45}}
+
+
+class TestMcSummaryBulletsStayProseOnly:
+    """parse_per_model_mc_option_probs reads bot-RENDERED summary bullets.
+
+    The framework formats each parsed prediction via
+    MultipleChoiceReport.make_readable_prediction into ``- {option}: {prob}%``
+    lines regardless of what the model wrote in its rationale, so the summary
+    region keeps its prose form after the block-only prompt change. The parser
+    must keep reading the bullets and must NOT be diverted by a JSON block
+    living in the R1 reasoning body.
+    """
+
+    def test_summary_bullets_parsed_even_when_r1_body_is_block_only(self):
+        r1_block = _mc_block({"Option A": 0.99, "Option B": 0.01})  # decoy values
+        comment = (
+            "## Report 1 Summary\n"
+            "### Forecasts\n"
+            "*Forecaster 1 (gpt-5.5)*: \n"
+            "- Option A: 40.0%\n"
+            "- Option B: 60.0%\n"
+            "\n"
+            "### Research Summary\n"
+            "stuff\n\n"
+            "================================================================================\n"
+            "FORECAST SECTION:\n\n"
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            f"block-era rationale.\n\n{r1_block}\n"
+        )
+        result = parse_per_model_mc_option_probs(comment)
+        # Summary bullets (the bot's rendered values), NOT the R1 body's block.
+        assert result == {"gpt-5.5": {"Option A": 0.40, "Option B": 0.60}}

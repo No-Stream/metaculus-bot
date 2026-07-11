@@ -7,6 +7,7 @@ tests exercise the FULL production code path with deterministic outputs.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -35,17 +36,8 @@ Key considerations:
 - Current trajectory suggests gradual cooling, not a sharp spike
 - No major recession trigger is currently identified by consensus forecasters
 
-Probability: 22%
-
 ```json
-{
-  "STRUCTURED FORECAST": {
-    "base_rate": 0.20,
-    "prior_probability": 0.20,
-    "evidence_adjustment": 0.02,
-    "final_probability": 0.22
-  }
-}
+{"question_type": "binary", "posterior_prob": 0.22}
 ```
 """
 
@@ -57,27 +49,14 @@ indicators suggest a gradual cooling of the labor market. The Fed's restrictive 
 is expected to continue moderating employment growth. Historical patterns suggest unemployment \
 typically rises 0.3-0.8pp during a soft landing scenario.
 
-OUTCOME_TYPE: CONTINUOUS
-
-Percentile 2.5: 3.2
-Percentile 5: 3.4
-Percentile 10: 3.6
-Percentile 20: 3.8
-Percentile 40: 4.1
-Percentile 50: 4.3
-Percentile 60: 4.5
-Percentile 80: 5.0
-Percentile 90: 5.6
-Percentile 95: 6.2
-Percentile 97.5: 7.0
-
 ```json
 {
-  "STRUCTURED FORECAST": {
-    "distribution_type": "lognormal",
-    "center": 4.3,
-    "spread": 0.8
-  }
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 3.0, "0.025": 3.2, "0.05": 3.4, "0.1": 3.6, "0.2": 3.8, "0.4": 4.1, "0.5": 4.3,
+    "0.6": 4.5, "0.8": 5.0, "0.9": 5.6, "0.95": 6.2, "0.975": 7.0, "0.99": 7.8
+  },
+  "outcome_type": "continuous"
 }
 ```
 """
@@ -95,11 +74,7 @@ My assessment of probabilities:
 - Option C: 15%
 
 ```json
-{
-  "STRUCTURED FORECAST": {
-    "option_probabilities": {"Option A": 0.45, "Option B": 0.40, "Option C": 0.15}
-  }
-}
+{"question_type": "multiple_choice", "option_probs": {"Option A": 0.45, "Option B": 0.40, "Option C": 0.15}}
 ```
 """
 
@@ -114,7 +89,9 @@ priors on recession probability in the next 6 months.
 Synthesizing: the labor market data is more current and reliable than base-rate extrapolation alone. \
 I weight Model 1's reasoning slightly higher but incorporate the uncertainty flagged by Models 2 and 3.
 
-Final probability: 25%
+```json
+{"question_type": "binary", "posterior_prob": 0.25}
+```
 """
 
 CANNED_RESEARCH_TEXT = """\
@@ -166,7 +143,6 @@ class LlmRouter:
         self._stacker_call_count = 0
 
     async def __call__(self, prompt: str, **kwargs: Any) -> str:
-        import asyncio
 
         await asyncio.sleep(0)
         self.calls.append(prompt)
@@ -191,13 +167,19 @@ class LlmRouter:
         return any(signal.lower() in prompt.lower() for signal in stacker_signals)
 
     def _is_forecaster_prompt(self, prompt: str) -> bool:
-        forecaster_signals = ["Probability:", "probability estimate", "your forecast"]
-        return any(signal.lower() in prompt.lower() for signal in forecaster_signals)
+        # All forecaster + stacker prompts now emit a fenced STRUCTURED FORECAST
+        # JSON block. Stacker prompts also match — the __call__ order routes them
+        # via ``_is_stacker_prompt`` first, so this signal only sees non-stacker
+        # LLM calls. The old ``"Probability:"`` cue is gone: the base binary
+        # prompt no longer requests a trailing "Probability: NN%" line.
+        return "STRUCTURED FORECAST" in prompt
 
     def _detect_question_type(self, prompt: str) -> str:
-        if "percentile" in prompt.lower() or "upper bound" in prompt.lower():
+        # Numeric prompt talks about "percentiles" extensively; MC prompt has an
+        # "Options (in resolution order):" line the others lack. Otherwise binary.
+        if "percentile" in prompt.lower():
             return "numeric"
-        if "options" in prompt.lower() and "probability for each" in prompt.lower():
+        if "options (in resolution order)" in prompt.lower():
             return "mc"
         return "binary"
 

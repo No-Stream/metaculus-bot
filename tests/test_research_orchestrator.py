@@ -10,6 +10,7 @@ Verifies that the orchestrator:
 """
 
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,7 @@ def question() -> MagicMock:
     q.page_url = "https://metaculus.com/questions/42"
     q.resolution_criteria = "Resolves YES if X happens"
     q.fine_print = ""
+    q.open_time = datetime(2026, 3, 15)
     return q
 
 
@@ -145,6 +147,48 @@ class TestAskNewsSummarization:
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
         assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_open_date_and_window_stamping_rules(self, orchestrator, question):
+        """Summarizer hardening (2026-07-08): the prompt must (a) state the
+        question's open date, (b) demand precise dating with a targeted
+        PRE-WINDOW flag only for facts that could otherwise be misread as
+        already satisfying the criteria (no blanket IN-WINDOW stamps), and
+        (c) carry the single-source rule."""
+        with patch.object(
+            orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="summary"
+        ) as invoke:
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert invoke.await_args is not None
+        prompt = invoke.await_args.args[0]
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        collapsed = " ".join(prompt.split())
+        # (a) Open date threaded from the question object (fixture: 2026-03-15).
+        assert "2026-03-15" in prompt
+        assert "opened on 2026-03-15" in collapsed
+        # (b) Lighter window-stamping: precise dating, targeted PRE-WINDOW label
+        #     only for facts that could look like they satisfy the criteria; no
+        #     blanket IN-WINDOW stamps.
+        assert "Date every fact precisely" in collapsed
+        assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "[IN-WINDOW]" not in collapsed
+        assert "base-rate" in collapsed
+        # (c) Single-source rule: label + carry hedges + no promotion to confirmed.
+        assert "[SINGLE-SOURCE]" in collapsed
+        assert "hedges" in collapsed
+        assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
+        # (d) No-forecast rule (bench: sol-low appended its own probability table,
+        #     which would anchor the six downstream forecasters): evidence only.
+        assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
+
+    @pytest.mark.asyncio
+    async def test_missing_open_time_asserts(self, orchestrator, question):
+        """Missing open_time is a data bug — fail loudly (matches the
+        _forecasting_window_str contract), never silently skip stamping."""
+        question.open_time = None
+        with pytest.raises(AssertionError):
+            await orchestrator._summarize_asknews(question, "raw asknews articles")
 
     @pytest.mark.asyncio
     async def test_empty_research_skips_summarizer(self, orchestrator, question):
@@ -311,6 +355,7 @@ class TestProviderSelection:
         monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
         monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
         monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("RESOLUTION_SOURCE_ENABLED", raising=False)
         monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
 
         orch = ResearchOrchestrator(
@@ -320,6 +365,72 @@ class TestProviderSelection:
         providers = orch._select_research_providers()
         assert len(providers) == 1
         assert providers[0][1] == "none"
+
+    def test_includes_resolution_source_when_enabled(self, mock_llm, monkeypatch):
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+        )
+        providers = orch._select_research_providers()
+        names = [n for _, n in providers]
+        assert "resolution_source" in names
+
+    def test_excludes_resolution_source_when_flag_unset(self, mock_llm, monkeypatch):
+        monkeypatch.delenv("RESOLUTION_SOURCE_ENABLED", raising=False)
+        monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("GEMINI_SEARCH_ENABLED", "false")
+        monkeypatch.setenv("FINANCIAL_DATA_ENABLED", "false")
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "false")
+        monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PROVIDER", raising=False)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+        )
+        providers = orch._select_research_providers()
+        names = [n for _, n in providers]
+        assert "resolution_source" not in names
+
+    def test_resolution_source_body_composes_with_header_and_demoted_headings(self):
+        """Body written by the resolution_source provider composes with the
+        orchestrator header machinery: h2 provider header sits above the body,
+        and any in-body h1/h2 subheadings are demoted so the whole snapshot is
+        a well-formed section within the combined research doc.
+        """
+        from metaculus_bot.research.orchestrator import ResearchOrchestrator as RO
+        from metaculus_bot.research.orchestrator import _demote_inner_headings
+
+        body = (
+            "Caveat: only reproduces text as fetched; forecaster must judge relevance.\n\n"
+            "### https://example.com/data\n"
+            "Some extracted content.\n"
+        )
+        # Simulate _run_providers_parallel's composition step (orchestrator.py ~L389-397).
+        header = RO._provider_header("resolution_source")
+        composed = f"{header}\n{_demote_inner_headings(body)}"
+
+        assert "## Resolution Source Snapshot" in composed
+        # The h3 "### https://example.com/data" is untouched by the demoter
+        # (which only shifts h1/h2), so it stays h3 under the h2 header. If
+        # future author writes it as h1/h2 the demoter shifts it to h3/h4.
+        assert composed.index("## Resolution Source Snapshot") < composed.index("### https://example.com/data")
 
     def test_includes_native_search_when_enabled(self, mock_llm, monkeypatch):
         monkeypatch.setenv("NATIVE_SEARCH_ENABLED", "true")

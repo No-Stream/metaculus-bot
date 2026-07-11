@@ -15,7 +15,7 @@ The snapping algorithm:
   2. Reconstruct step-function CDF with steps at integer positions
   3. Apply uniform mixture for min-step compliance (primary min-step mechanism)
   4. Apply max-step redistribution + boundary pinning via safe_cdf_bounds()
-     (note: safe_cdf_bounds handles max-step and boundaries only, not min-step)
+     (which also re-enforces min-step after its pin+cummax pass)
   5. Post-hoc min-step verification (guard for concentrated distributions)
 """
 
@@ -125,7 +125,8 @@ def snap_cdf_to_integers(
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
     # --- Step 4: Max-step redistribution + boundary pinning ---
-    # safe_cdf_bounds handles max-step and boundary constraints; min-step relies on the uniform mixture above
+    # safe_cdf_bounds handles max-step, boundary constraints, and a final min-step re-enforcement;
+    # the uniform mixture above remains the primary min-step mechanism
     enforced_cdf = safe_cdf_bounds(mixed_cdf, open_lower_bound, open_upper_bound)
 
     result = enforced_cdf.tolist()

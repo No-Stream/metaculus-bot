@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Literal
 
@@ -7,6 +8,35 @@ from forecasting_tools import (
     NumericQuestion,
     clean_indents,
 )
+
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+
+# Decimal places for illustrative example probabilities in ``_option_probs_example``.
+_EXAMPLE_PROB_DECIMALS = 4
+# Lower/upper safety epsilons for illustrative example probs so no bucket lands
+# at exactly 0.0 or 1.0 (the prompt tells the model to use values in (0, 1)).
+_EXAMPLE_PROB_FLOOR = 0.01
+_EXAMPLE_PROB_CEIL = 0.99
+
+
+def _build_example_probs(n_opts: int) -> list[float]:
+    """Illustrative per-option probabilities that always sum to ~1.0 in (0, 1).
+
+    Split ``1.0`` evenly across ``n_opts`` buckets, put the rounding remainder
+    on the first bucket, and clamp each bucket into ``(_EXAMPLE_PROB_FLOOR,
+    _EXAMPLE_PROB_CEIL)``. For any ``n_opts >= 1`` the returned list is
+    non-empty and its sum is within a few floating-point ulps of 1.0.
+    """
+    if n_opts <= 0:
+        return []
+    base = round(1.0 / n_opts, _EXAMPLE_PROB_DECIMALS)
+    remainder = round(1.0 - base * n_opts, _EXAMPLE_PROB_DECIMALS)
+    probs = [base] * n_opts
+    probs[0] = round(probs[0] + remainder, _EXAMPLE_PROB_DECIMALS)
+    # For very large n_opts, ``base`` can round to 0.0 or (n_opts == 1) to 1.0;
+    # keep every bucket in the (floor, ceil) band the prompt promises.
+    return [min(_EXAMPLE_PROB_CEIL, max(_EXAMPLE_PROB_FLOOR, p)) for p in probs]
+
 
 __all__ = [
     "binary_prompt",
@@ -80,6 +110,11 @@ def _forecasting_window_str(
     )
 
 
+def _today_str() -> str:
+    """Today's date, formatted to match ``_forecasting_window_str``'s "Today:" line."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
     """Render the cross-model-aggregation markdown block for the stacker prompt.
 
@@ -89,6 +124,33 @@ def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
     if not aggregated_tool_output:
         return ""
     return f"\n── Cross-model aggregation (deterministic math) ──\n{aggregated_tool_output}\n"
+
+
+def _option_probs_example(options: list[str]) -> str:
+    """Render the ``option_probs`` JSON-body fragment for MC schema examples.
+
+    Both ``multiple_choice_prompt`` and ``stacking_multiple_choice_prompt`` need
+    the same shape: real option names as JSON keys with illustrative decimal
+    probs that sum to ~1.0. A parser can only bind LLM output to the allowed
+    options when the schema example carries the exact option strings — literal
+    ``Option_A`` placeholders yield ``<<NOT_FOUND>>`` on strict parsers.
+
+    Uses ``json.dumps`` for both keys and values so option names carrying
+    ``"``, ``\\``, or newlines produce a syntactically valid JSON example (a
+    naive f-string would emit invalid JSON that misleads the LLM about the
+    schema). The caller wraps the returned fragment in an outer ``{{...}}`` so
+    we strip ``json.dumps``'s outer braces before returning.
+
+    Returns the empty string for an empty options list so the caller can render
+    ``{{}}`` degenerately without a special case.
+    """
+    if not options:
+        return ""
+    example_probs = _build_example_probs(len(options))
+    body = json.dumps(dict(zip(options, example_probs)))
+    # ``body`` is ``{"opt1": p1, "opt2": p2, ...}`` — strip the outer braces
+    # because the template supplies them (``"option_probs": {{{example}}}``).
+    return body[1:-1]
 
 
 CitationStyle = Literal["markdown", "auto_annotated"]
@@ -234,13 +296,18 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             PHASE 0: PRELIMINARY CHECK
 
-            0) Resolution check
+            0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+               • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (or a qualifying event is so recent that resolution simply lags — the resolution check in 0a below covers that case).
+               • To move off this status-quo answer, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
+
+            0a) Resolution check
                • Does the research already contain evidence that the resolution condition has been met (or is now impossible to meet)? If so, assign a near-extreme probability (≥95% or ≤5%), briefly explain why, and skip to the final answer. Do not perform full reference-class analysis for questions whose answers are already deterministic from current evidence.
                • Before marking the resolution condition "already met", verify the triggering evidence post-dates the question's open timestamp (shown above). Historical events pre-dating the open date generally do NOT resolve a forward-looking question YES — e.g., a 1945 detonation does not resolve "Will a nuclear detonation occur in a Japanese city by 2030?" that opened in 2024. If the resolution criteria explicitly count pre-open events, say so explicitly.
 
             0b) Resolution decomposition (multi-part questions only)
-               • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "a model is released AND it is Opus-branded AND it is accessible to external users"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
+               • If the resolution criteria contain multiple independently-testable conditions (e.g. "X is available AND the provider is Y" or "an event occurs AND it is formally confirmed by the named source AND it falls within the question window"), write the criteria as a Boolean product: "Yes iff A × B × C × ... = 1", naming each factor.
                • Write one worked Yes example (a concrete scenario where every factor = 1) and one worked No example (a concrete scenario where exactly one factor = 0, with that factor named). This is mechanical bait-and-switch protection: it forces the resolution criteria to be consumed as structured constraints rather than treated as a prose paraphrase.
+               • Do NOT assign probabilities to the clauses yet — that happens in step 5b, after the evidence review and red-team.
                • For single-condition questions ("Will Z happen?"), write "single-condition, decomposition skipped" and move on.
 
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
@@ -253,7 +320,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • List plausible reference classes for this question and evaluate suitability.
                • State the outside-view base rate(s) and how you combine them into a baseline probability.
                • Attempt an explicit calculation if the data supports it: historical frequency, rate extrapolation, z-score, or probability union (for "at least one of N" questions, compute 1 - product of (1-p_i)). A rough quantitative estimate from data is more reliable than an intuitive guess.
-               • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. For 2-3 gaps of 70-110 days with the deadline at day 85 and day 66 already elapsed, the conditional probability is often 35-50%, not the 15-20% that an unconditional window calculation would give. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
+               • Conditional-hazard check (for recurring-event questions only — product launches, elections, legislation, earnings, etc. with a history of inter-arrival gaps): an unconditional "event per typical interval" rate is usually wrong when time has already elapsed without the event. Compute the *conditional* probability: fit a simple model to historical gaps (exponential with mean = average gap, or the set of observed gaps treated as an empirical distribution), then compute P(event by deadline | no event in the T days already elapsed) — not just P(event in a window of size W). Show the number. If the question is not of this recurring type, write "non-recurring, conditional-hazard skipped".
 
             3) Timeframe reasoning
                • How long until resolution? If the timeline were halved/doubled, how would the probability shift and why?
@@ -273,6 +340,10 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Strongest Bull Case (Yes): most compelling, evidence-based argument for Yes.
                • Red-team both: attack assumptions, data gaps, and causal claims.
 
+            5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
+               • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
+               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly two valid moves: revise the clause probabilities themselves and recompute, or name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect. Any override that is neither of these is not valid — all hedging and adjustment must operate through the clause probabilities or their dependence, not around them. If neither applies, stay at the product.
+
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
                • Question-specific base rate: the relevant base rate is the historical frequency for questions LIKE THIS ONE (e.g., "how often do German federal elections return X"), not a generic "most things don't happen" prior.
@@ -280,51 +351,44 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Small-delta check: would a ±10% change still be coherent with the rationale? Why?
                • Trajectory check: consider whether the "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion" (e.g., a deadline arriving, a trend continuing, a process completing). Justify predictions that diverge from the most likely trajectory.
                • Anchor on your math: if you computed a probability from data (base rate, frequency, z-score, rate extrapolation, probability union), your final answer should stay close to that number. You can adjust, but name the SPECIFIC new evidence justifying the adjustment. "I'll hedge to 30% because this is a novel situation" is NOT a valid adjustment — either your base rate was wrong (redo the calculation with different inputs) or the base rate stands with minor refinement.
-               • Hedge audit: if your final probability is softer than your analysis supports — e.g., you wrote a case that points strongly in one direction but your final answer splits the difference — you are losing points. Log score rewards commitment to well-reasoned positions. Only soften when you can name specific evidence creating the uncertainty, not because it feels safer.
 
             ── Brief checklist (keep concise) ───────────────────────────────
             • Paraphrase the resolution criteria (<30 words).
-            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
+            • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
             • State the outside-view base rate you anchored to.
             • Consistency line: "X out of 100 times, [criteria] happens." Sensible?
             • Top 3-5 evidence items + quick factual validity check.
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
-            • Trajectory check sanity check: does your prediction align with the most likely trajectory?
 
             ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-            You MUST emit a fenced ```json block below, immediately after your analysis
-            and BEFORE your final answer line(s). This block is required for scoring —
-            responses without it are discarded. Downstream tools use these fields to
-            compute calibrated aggregations across forecasters.
-            Schema (all fields except `posterior_prob` are optional — populate as follows):
-            - `prior`: populate if you stated an outside-view base rate in Phase 1.
-            - `base_rate`: populate with k/n if you identified a reference-class frequency.
-            - `hazard`: populate if you computed a conditional-hazard rate (recurring events).
-            - `evidence`: populate with your Phase 2 evidence items (include `likelihood_ratio` if you can estimate one; it strengthens the math).
-            - `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal).
+            This block is the ONLY authoritative source of your forecast — a
+            downstream deterministic parser reads it and nothing else. Responses
+            without it are discarded.
+            Schema:
 
             ```json
             {{
               "question_type": "binary",
-              "prior": {{"prob": 0.15, "source": "annual incidence 2015-2024"}},
-              "base_rate": {{"k": 3, "n": 12, "ref_class": "years matching condition"}},
-              "hazard": {{"rate_per_unit": 0.25, "unit": "year", "window_duration_units": 1.0, "elapsed_fraction": 0.33, "remaining_fraction": 0.67}},
-              "evidence": [{{"summary": "Q1 policy shift", "direction": "up", "strength": "moderate", "likelihood_ratio": 2.5}}],
-              "scenarios": [],
-              "posterior_prob": 0.28
+              "posterior_prob": 0.28,
+              "base_rate_anchor": {{"low": 0.15, "high": 0.35}},
+              "criteria_clauses": [{{"name": "formal instrument signed", "prob": 0.6}}, {{"name": "in-window", "prob": 0.8}}]
             }}
             ```
 
-            Emit the JSON block BEFORE the final Probability line below.
+            `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
+            `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
+            `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
 
-            [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
-            An example response is: "Probability: 50%"
+            The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """
     )
 
 
 def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> str:
-    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
+    # Build the STRUCTURED FORECAST block example with the REAL option names as
+    # JSON keys — a strict parser can only map placeholder keys like "Option_A"
+    # back onto real options via prose lines, and we no longer emit those.
+    option_probs_example = _option_probs_example(question.options)
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
@@ -366,6 +430,12 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         ── Analysis Template ──
 
+        PHASE 0: PRELIMINARY CHECK
+
+        (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+            • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (with one exception: if a qualifying event is so recent that resolution simply lags, treat the criteria as effectively met and weight your distribution accordingly).
+            • To move probability mass off that status-quo option, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
+
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
         (1) Source analysis (focus on historical context section)
@@ -404,44 +474,39 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
             • Small-delta check: would ±10% on the leading options remain coherent with your reasoning?
             • Blind-spot consideration: if the resolution is unexpected, what would likely be the reason, and how should that affect confidence spreads?
             • Anchor on your math: if you computed probabilities from data (base rate, frequency, etc.), your final answers should stay close to those numbers. Adjust only with specific new evidence, not vibe.
-            • Hedge audit: if your reasoning makes a clear case that one option dominates, but your final distribution flattens it out of general conservatism, you are losing points. Log score rewards commitment to well-reasoned distributions. Only spread mass toward weaker options when you can name specific evidence that makes them plausible, not because it feels safer.
+            • Calibration audit: if one option is genuinely dominant, commit to it — don't flatten a well-supported favorite out of general conservatism; under-committing to strong favorites costs points. Hedge by keeping honest probability on plausible residual outcomes ("Other", "no decision", "none of the above", record-extreme buckets) — that is where surprises actually land — not by spreading mass across the board.
             Remember:
-            • Good forecasters leave a little probability on most options and avoid overconfidence.
             • Use integers 1%-99% (no 0 % or 100 %).
             • They must sum to 100 %.
 
         ── Brief checklist (keep concise) ───────────────────────────────────
         • Paraphrase options & resolution criteria (<30 words).
-        • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
+        • Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
         • State the outside-view distribution used as anchor.
         • Consistency line: "Most likely: __; least likely: __; coherent with rationale?"
         • Top 3-5 evidence items + quick factual validity check.
-        • Blind-spot statement; trajectory check sanity check.
+        • Blind-spot statement.
 
         [**CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-        You MUST emit a fenced ```json block below, immediately after your analysis
-        and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded. Downstream tools use these fields to
-        compute calibrated aggregations across forecasters.
-        Schema (all fields except `option_probs` are optional; omit if not applicable):
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`option_probs` is REQUIRED; others optional):
 
         ```json
         {{
           "question_type": "multiple_choice",
-          "option_probs": {{"Option_A": 0.5, "Option_B": 0.3, "Option_C": 0.2}},
+          "option_probs": {{{option_probs_example}}},
           "other_mass": 0.0,
           "concentration": 20.0
         }}
         ```
 
         The `option_probs` object must sum to 1.0 and use the exact option names above.
-        Emit the JSON block BEFORE the final per-option answer lines.
-
-        ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        {answer_example_lines}
+        The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )
 
@@ -494,7 +559,7 @@ def numeric_prompt(
         • Base units for output values: {unit_str}
         • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
         • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
-        • All 11 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
         ── Scoring Rule ──
@@ -511,6 +576,12 @@ def numeric_prompt(
         Reproduce the following analysis template in your answer:
 
         -- Analysis Template ──
+
+        PHASE 0: PRELIMINARY CHECK
+
+        (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
+            - State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
+            - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
@@ -548,7 +619,6 @@ def numeric_prompt(
         (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
             - Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
-            - Odds check: translate your probability to odds (e.g., 90% = 9:1, 99% = 99:1). Does this feel right? How would a ±10% shift resonate with your analysis?
             - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning
             - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
             - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
@@ -557,7 +627,7 @@ def numeric_prompt(
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
-            - Keep 2.5% and 97.5% far apart to allow for unknown unknowns.
+            - Keep your extreme tails (P1 and P99) far apart to allow for unknown unknowns.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
             - Respect the explicit bounds above.
@@ -566,9 +636,8 @@ def numeric_prompt(
             Determine whether the resolution value for this question will always be a whole integer
             (e.g. counts, rankings, number of events, number of countries) or can be any real number
             (e.g. temperatures, percentages, dollar amounts, ratios).
-            Output exactly one of:
-            OUTCOME_TYPE: DISCRETE
-            OUTCOME_TYPE: CONTINUOUS
+            Record this decision in the `outcome_type` field of the STRUCTURED FORECAST block below
+            ("discrete_integer" for whole-integer resolutions, "continuous" otherwise).
 
         (9b) Forecastability classification
             How inherently predictable is this quantity on the given time horizon?
@@ -588,94 +657,44 @@ def numeric_prompt(
         (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
             - Paraphrase the resolution criteria and units in less than 30 words.
-            - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question? This is a common and costly error.
+            - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
             - State the outside view baseline used.
             - Consistency line about which percentile corresponds to the status quo or trend.
             - Top 3 to 5 evidence items plus a quick factual validity check.
             - Blind spot scenario and expected effect on tails.
-            - Trajectory check sanity check: does your prediction align with the most likely trajectory?
             - Forecastability check: does your interval width match the forecastability classification?
-            - Remember: log score penalizes both overconfident narrow intervals AND overly wide intervals on predictable quantities.
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-        You MUST emit a fenced ```json block below, immediately after your analysis
-        and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded. Downstream tools use these fields to
-        compute calibrated aggregations across forecasters.
-        Schema (supply EITHER `declared_percentiles` OR a `mixture_components` list —
-        see OUTPUT FORMAT below; all other fields are optional, omit if not applicable):
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
+        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
+        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
 
         ```json
         {{
           "question_type": "numeric",
-          "declared_percentiles": {{"0.1": 10.0, "0.5": 40.0, "0.9": 80.0}},
-          "distribution_family_hint": "normal",
-          "student_t_df": null,
-          "tails": {{"below_min_expected": 0.02, "above_max_expected": 0.05}},
-          "scenarios": [],
-          "mixture_components": null
+          "declared_percentiles": {{
+            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
+            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
+          }},
+          "outcome_type": "continuous"
         }}
         ```
 
         Notes:
-        - If you take OPTION A (percentiles), `declared_percentiles` must cover at least
-          {{0.1, 0.5, 0.9}} and should match your final Percentile lines below (tools operate
-          on the JSON; the official forecast is still read from the trailing Percentile lines).
-          If you take OPTION B (mixture), you may omit `declared_percentiles` entirely.
-        - `distribution_family_hint` ∈ {{"normal", "lognormal", "student_t"}}.
-        - `student_t_df` only meaningful if family_hint = "student_t".
-        - `tails.below_min_expected` and `tails.above_max_expected` are the probability
-          mass you expect outside the closed bounds.
-        - `mixture_components` is OPTIONAL and now wired end-to-end (see OUTPUT FORMAT
-          below). It is a list of {{weight, mean, sd}} triples whose weights sum to
-          1.0 (within 0.001).
+        - The `declared_percentiles` block is the ONLY source of your forecast — it
+          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
+          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
+          salvaged.
+        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
+          equal); floating-point numbers in the base unit; no scientific notation.
+        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
+          whole number (counts, rankings, number of events, number of countries),
+          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
-        Emit the JSON block BEFORE the final Prediction block.
-
-        ── OUTPUT FORMAT — pick the one that fits the SHAPE of your belief ──
-
-        Let the distribution's shape decide, not habit. A unimodal belief is best
-        described by percentiles; a genuinely multi-modal / scenario-branching
-        belief is best described by a mixture. Both options are equally valid —
-        choose by shape.
-
-        OPTION A — PERCENTILES:
-          Use when your belief has a SINGLE mode with smooth tails and no clear
-          scenario branching. Emit the trailing 11 standard percentiles as your
-          Prediction block. Do NOT populate `mixture_components` in the JSON block.
-
-        OPTION B — MIXTURE OF NORMALS:
-          Use when your belief is clearly MULTI-MODAL or splits into distinct
-          scenarios (e.g. 'underperform / baseline / breakout', or any bimodal
-          outcome). Populate `mixture_components` in the JSON block with at least
-          2 components whose weights sum to 1.0 (within 0.001), each with `weight`,
-          `mean`, and `sd` (>0). Means and sds are in the question's base unit.
-          Code will build the 201-point Metaculus CDF directly from your mixture;
-          you may omit the percentile lines entirely (the parser will use the
-          mixture) and the JSON block may omit `declared_percentiles` as well.
-
-        If you emit BOTH formats, the parser will use the mixture and ignore the
-        percentile lines (a WARNING is logged so we can audit how often this
-        happens). Pick one — don't hedge.
-
-        Prediction:
-        [Reminders:
-        - Floating point numbers in the base unit
-        - Must be last lines, nothing after
-        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.)
-        Example:]
-
-        Percentile 2.5: 1.2
-        Percentile 5: 10.1
-        Percentile 10: 12.3
-        Percentile 20: 23.4
-        Percentile 40: 34.5
-        Percentile 50: 45.6
-        Percentile 60: 56.7
-        Percentile 80: 67.8
-        Percentile 90: 78.9
-        Percentile 95: 89.0
-        Percentile 97.5: 123.4
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 
@@ -721,44 +740,55 @@ def stacking_binary_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `posterior_prob`, a
+        decimal in [0,1]). Read those blocks to get each model's declared number,
+        and read the surrounding reasoning to weight the analysis.
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Model agreement analysis
            • Where do the models agree? What shared evidence drives consensus?
            • Where do they disagree? What causes divergent reasoning?
            • Are disagreements due to different evidence weighting or different evidence sources?
-        
+
         2) Evidence synthesis
            • Which evidence appears most frequently across analyses? Is this justified?
            • What unique evidence does each model bring? How credible is it?
            • Are there systematic biases visible across models (overconfidence, anchoring, etc.)?
-        
+
         3) Reasoning quality assessment
            • Which models demonstrate strongest analytical rigor?
            • Which models best incorporate reference class reasoning?
            • Which models show appropriate uncertainty calibration?
-        
+
         4) Meta-level adjustments
            • Should I weight models equally or give more weight to better-reasoned analyses?
            • Are there blind spots that all models missed?
            • How should I account for model correlation vs independence?
-           • Active role: you are NOT bound to produce an average of the inputs. You can side with one or two models if THEIR REASONING is stronger, not merely because their answer looks appealing. Ask:
-             - Did they cite a specific fact, calculation, or reference class the others missed or handled poorly?
-             - Did they identify a resolution-criteria detail the others glossed over?
-             - Does a later-training-cutoff model reference evidence the others don't know about?
-             If none of these apply — i.e., the dissent is just a different vibe on the same evidence — the crowd is usually right.
-           • Dissenter check: if one model's probability differs notably from the others, read its argument carefully — it may be right. Hedged consensus can reflect shared priors more than shared evidence. A confident outlier with specific evidence is often more informative than the median of hedgers.
-           • Anchor on math: if the base models computed explicit probabilities from data (base rate, frequency, z-score), and one model's calculation is sounder than the others, you can go with its number rather than averaging. Don't soften well-reasoned outputs into the hedged middle.
+           • Weigh dissent by its reasoning, not its confidence: side with an outlier only when it cites a specific fact, calculation, reference class, or resolution-criteria detail the others missed or mishandled — or when a later-training-cutoff model plausibly knows something the others can't. If the dissent is just a different read of the same shared evidence, the crowd is usually right. Don't average mechanically, and don't chase confidence.
 
         5) Final synthesis
            • What probability best integrates all the evidence and reasoning?
            • Does this probability appropriately reflect the uncertainty in the question?
            • Sanity check: does this probability make sense given the base rate and evidence?
-           • Commitment check: log score penalizes confident wrong predictions asymmetrically, but it also penalizes hedging away from well-supported answers. If the evidence supports a confident answer, commit; if it genuinely splits, hedge appropriately.
 
-        The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"
-        An example response is: "Probability: 50%"
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema:
+
+        ```json
+        {{
+          "question_type": "binary",
+          "posterior_prob": 0.28
+        }}
+        ```
+
+        `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
+
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 
@@ -775,7 +805,9 @@ def stacking_multiple_choice_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
-    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
+    # Build the STRUCTURED FORECAST block example with the REAL option names as
+    # JSON keys — the downstream parser can only recognize the actual options.
+    option_probs_example = _option_probs_example(question.options)
 
     return clean_indents(
         f"""
@@ -800,6 +832,11 @@ def stacking_multiple_choice_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `option_probs`, keyed
+        by the exact option names, values as decimals summing to 1.0). Read those
+        blocks to get each model's declared distribution, and read the surrounding
+        reasoning to weight the analysis.
         {predictions_text}
 
         ── Meta-Analysis Framework ──
@@ -807,41 +844,51 @@ def stacking_multiple_choice_prompt(
            • Which options show consensus vs divergence across models?
            • What shared reasoning drives agreement on likely/unlikely options?
            • Where models disagree, what drives the different assessments?
-        
+
         2) Evidence synthesis across models
            • What evidence appears consistently? Is this justified by source quality?
            • What unique insights does each model contribute?
            • Are there systematic biases (overconfidence on favorites, neglect of tails)?
-        
+
         3) Probability distribution analysis
            • Which models show appropriate uncertainty (avoid 0%/100%)?
            • How do the models differ in their tail probability allocation?
            • Are there systematic patterns in how models distribute probability?
-        
+
         4) Reasoning quality assessment
            • Which analyses demonstrate strongest logical coherence?
            • Which models best incorporate reference class reasoning?
            • Which show most appropriate calibration for this question type?
-        
+
         5) Meta-level synthesis
            • Should models be weighted equally or by reasoning quality?
            • Are there overlooked scenarios that all models missed?
            • How should I account for correlation vs independence in model errors?
-           • Active role: you are NOT bound to produce an average. If one or two models have identified a specific, well-sourced fact, a correct reference class, or an arithmetic result the others missed, you can side with them rather than averaging. Dissent backed by stronger reasoning should shift your synthesis; dissent that's just a different vibe usually shouldn't.
-           • Dissenter check: a confident outlier with specific evidence is often more informative than the median of hedgers. Read the dissenting argument carefully before assuming the crowd is right.
-           • Anchor on math: if one base model computed an explicit probability for an option from data (base rate, reference-class frequency, explicit enumeration) and its calculation is sounder than the others' vibe-based estimates, you can adopt its number for that option rather than averaging into the middle. Don't flatten well-reasoned distributions into the hedged consensus.
+           • Weigh dissent by its reasoning, not its confidence: side with an outlier only when it cites a specific fact, calculation, reference class, or resolution-criteria detail the others missed or mishandled — or when a later-training-cutoff model plausibly knows something the others can't. If the dissent is just a different read of the same shared evidence, the crowd is usually right. Don't average mechanically, and don't chase confidence.
 
         6) Final distribution calibration
            • What probability distribution best synthesizes all analyses?
            • Does my distribution appropriately reflect uncertainty?
            • Are my tail probabilities justified given the evidence?
-           • Commitment check: log score penalizes confident-wrong predictions, but it also penalizes hedging away from well-supported distributions. If the evidence supports one option as clearly dominant, don't flatten the distribution out of general conservatism; commit to the dominant option. If the evidence genuinely splits across options, hedge appropriately.
-        
+
         **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
-        
-        ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        {answer_example_lines}
+
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`option_probs` is REQUIRED):
+
+        ```json
+        {{
+          "question_type": "multiple_choice",
+          "option_probs": {{{option_probs_example}}}
+        }}
+        ```
+
+        The `option_probs` object must sum to 1.0 and use the exact option names above.
+        The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )
 
@@ -881,7 +928,7 @@ def stacking_numeric_prompt(
         ── Units & Bounds (must follow) ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
         • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
-        • All 11 percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──
@@ -896,6 +943,12 @@ def stacking_numeric_prompt(
         {upper_bound_message}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `declared_percentiles`,
+        an object keyed by the 13 standard percentiles as decimals from 0.01 through
+        0.99, with values in the base unit; plus `outcome_type`). Read those blocks
+        to get each model's declared distribution, and read the surrounding reasoning
+        to weight the analysis.
         {predictions_text}
 
         ── Meta-Analysis Framework ──
@@ -903,53 +956,67 @@ def stacking_numeric_prompt(
            • Compare the central tendencies (medians) across models - what explains differences?
            • Compare uncertainty ranges (90% intervals) - which models show appropriate calibration?
            • Are there systematic patterns in how models approach this forecasting problem?
-        
+
         2) Evidence synthesis
            • What evidence/approaches appear across multiple analyses?
            • What unique insights or data does each model contribute?
            • Which models demonstrate strongest analytical rigor for this question type?
-        
+
         3) Calibration assessment
            • Which models show appropriate uncertainty given the available evidence?
            • Are any models systematically overconfident (too narrow ranges)?
            • Which uncertainty ranges seem most justified by the evidence quality?
-        
+
         4) Reference class integration
            • How do models differ in their reference class selection?
            • Which outside view approaches seem most appropriate?
            • Should I favor models with stronger reference class reasoning?
-        
+
         5) Meta-level synthesis
            • Should I weight models equally or by reasoning quality?
            • Are there blind spots or scenarios all models missed?
            • How should I account for correlation vs independence in model approaches?
-           • Active role: you are NOT bound to average the central estimates. If one model did an explicit calculation (extrapolation, historical trend, explicit formula) that is sounder than the others' vibe-based medians, you can go with its central estimate. A model with later training data may know facts the others don't.
-           • Dissenter check: a well-reasoned outlier median, backed by specific evidence or arithmetic, is often more informative than the average of hedged guesses.
-           • Anchor on math: if one base model derived its percentiles from an explicit computation (trend extrapolation, historical mean/variance, fitted model) and that derivation is sounder than the others' intuitive ranges, you can adopt its central estimate and width rather than averaging. Don't widen a well-reasoned tight distribution into the hedged middle.
+           • Weigh dissent by its reasoning, not its confidence: side with an outlier only when it cites a specific fact, calculation, reference class, or resolution-criteria detail the others missed or mishandled — or when a later-training-cutoff model plausibly knows something the others can't. If the dissent is just a different read of the same shared evidence, the crowd is usually right. Don't average mechanically, and don't chase confidence. The same applies to width — adopt a sharper model's interval only when its derivation is concretely sounder, not merely tighter.
 
         6) Final distribution calibration
            • What percentiles best synthesize all the evidence and reasoning?
            • Does my final distribution appropriately reflect epistemic uncertainty?
            • Are my tails justified given the potential for unknown unknowns?
-           • Commitment check (tail width): log score penalizes overconfident narrow intervals, but also penalizes hedging wide on quantities that are actually predictable. Don't widen your 90% interval beyond what the sharpest base model supports unless you can name specific evidence creating that extra uncertainty. Hedged-wide distributions hurt log score on precise resolutions.
 
-        Remember: Think in ranges, not points. Keep 2.5th and 97.5th percentiles appropriately wide.
+        Remember: Think in ranges, not points. Keep your extreme tails (P1 and P99) appropriately wide.
         Ensure strictly increasing percentiles and respect the bounds above.
 
-        OUTPUT FORMAT, floating point numbers
-        Must be last lines, nothing after, STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
+        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
+        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
 
-        Percentile 2.5: [value]
-        Percentile 5: [value]
-        Percentile 10: [value]
-        Percentile 20: [value]
-        Percentile 40: [value]
-        Percentile 50: [value]
-        Percentile 60: [value]
-        Percentile 80: [value]
-        Percentile 90: [value]
-        Percentile 95: [value]
-        Percentile 97.5: [value]
+        ```json
+        {{
+          "question_type": "numeric",
+          "declared_percentiles": {{
+            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
+            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
+          }},
+          "outcome_type": "continuous"
+        }}
+        ```
+
+        Notes:
+        - The `declared_percentiles` block is the ONLY source of your forecast — it
+          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
+          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
+          salvaged.
+        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
+          equal); floating-point numbers in the base unit; no scientific notation.
+        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
+          whole number (counts, rankings, number of events, number of countries),
+          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
+
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 

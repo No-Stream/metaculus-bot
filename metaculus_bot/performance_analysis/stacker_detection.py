@@ -192,12 +192,21 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
         if len(pnp) < 2:
             return None
 
-        key_indices = [2, 5, 8]  # 10th, 50th, 90th in standard 11-percentile list
-        all_pcts: list[list[list[float]]] = []
+        # Key percentile LABELS (raw 0-100 numbers as parsed from comments) at
+        # which numeric disagreement is measured: the 10th, 50th, and 90th. Looked
+        # up by label so growing the standard percentile set can't shift them.
+        # This branch consumes lenient historical data (>=9 percentiles, possibly
+        # non-standard), so a per-model label dict is used here rather than the
+        # strict PercentileSet value object.
+        key_labels = [10.0, 50.0, 90.0]
+        model_maps: list[dict[float, float]] = []
         for model_pcts in pnp.values():
-            if len(model_pcts) >= 9:
-                all_pcts.append(model_pcts)
-        if len(all_pcts) < 2:
+            if len(model_pcts) < 9:
+                continue
+            label_to_value = {round(float(p), 6): float(v) for p, v in model_pcts}
+            if all(round(label, 6) in label_to_value for label in key_labels):
+                model_maps.append(label_to_value)
+        if len(model_maps) < 2:
             return None
 
         import math
@@ -220,16 +229,16 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
         if has_finite_range and range_max is not None and range_min is not None:
             denominator = range_max - range_min
         else:
-            p10_values = [pcts[key_indices[0]][1] for pcts in all_pcts]
-            p90_values = [pcts[key_indices[2]][1] for pcts in all_pcts]
+            p10_values = [m[round(10.0, 6)] for m in model_maps]
+            p90_values = [m[round(90.0, 6)] for m in model_maps]
             denominator = statistics.median(p90_values) - statistics.median(p10_values)
 
         if denominator <= 0:
             return None
 
         max_normalized_spread = 0.0
-        for idx in key_indices:
-            values_at_pct = [pcts[idx][1] for pcts in all_pcts]
+        for label in key_labels:
+            values_at_pct = [m[round(label, 6)] for m in model_maps]
             raw_spread = max(values_at_pct) - min(values_at_pct)
             normalized = raw_spread / denominator
             max_normalized_spread = max(max_normalized_spread, normalized)

@@ -66,6 +66,84 @@ resolver URL → force-fetch+parse; or make the gap-fill analyzer treat a criter
 *mandatory* gap) is sketched in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. The FRED/Yahoo
 URL-extraction shipped 2026-06-28 already covers the API-backed financial subset of this class.
 
+### Resolution-source fetcher: flip prod workflows + Tier-2 LLM fetch (added 2026-07-09)
+
+The Tier-1 deterministic resolution-source fetcher shipped in `66e31c0`
+(`research/resolution_source.py` + shared `research/http_fetch.py`, gated by
+`RESOLUTION_SOURCE_ENABLED`, currently ON in `test_bot.yaml` only). Smoke-validated on 40 cached
+real questions (`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 questions (60%)
+get a non-empty `## Resolution Source Snapshot` vs the probe's 62.5% Tier-1 target, 30/45 URL
+success, 0 SSRF false positives, and the first-cited URL was the primary grading source in all
+12 multi-URL questions. Remaining misses are all known Tier-2 hosts (JS walls / bot
+fingerprinting).
+
+**Truncation-cap distribution study (2026-07-09, don't re-derive):** uncapped re-fetch of the
+29 real successful URLs from the smoke run, full trafilatura extraction: p25=697 / p50=2,201 /
+p75=5,206 / p90=67,041 / max=438,049 chars. Elbow at 6,000 chars/URL — a 3,000 cap truncates
+14/29 URLs (48%), 6,000 truncates 6/29 (21%), and past 6,000 only whale pages (67k+) remain,
+which need summarization, not bigger caps. Mean prompt cost across all 40 smoke questions:
+380→578 tokens/question at 6k. **Shipped:** `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` 3,000→6,000
+and `RESOLUTION_SOURCE_TOTAL_MAX_CHARS` 12,000→18,000 (headroom so the per-URL cap is the
+binding constraint; max observed section simulates to ~11.1k at 6k/URL).
+
+Follow-ups:
+
+1. **Flip prod workflows — DONE 2026-07-10.** Live `test_bot.yaml` run confirmed real rubric/fact
+   content, visible forecaster uptake, and clean diagnostics; `RESOLUTION_SOURCE_ENABLED=true`
+   now set in all three `run_bot_on_*.yaml` prod workflows (tournament / metaculus_cup / minibench).
+   Same commit added a per-URL truncation marker (`[truncated at N chars — full source at URL]`)
+   and a dropped-section note so forecasters can tell when the snapshot is partial.
+2. **MEDIUM — Conditional summarization for oversized sources.** The first-cited URL's content
+   stays verbatim (provenance for the primary grading source); URLs 2+ and/or whale pages
+   (full extraction ≥ ~10k chars; p90 of the real distribution is 67k) go through the existing
+   cheap summarizer path (`gpt-5.4-mini`, temp 0, ~$0.01/call). Rationale: the distribution
+   study found ~5 whale sources per 40 questions that no reasonable cap captures; raising caps
+   past 6k has near-zero marginal rescue.
+3. **MEDIUM — Expand fetching for other site types (Tier-2 LLM fetch)** for the
+   js_wall/blocked slice (~15% of questions; e.g. Masters.com, childmortality.org, UNICEF,
+   Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked / js_wall retained
+   deliberately) is the seam — a follow-on pass feeds those URLs to an LLM-mediated reader
+   (Gemini `url_context` or OpenAI native-search URL-read).
+   **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
+   (added 2026-06-28) — no point building on url_context until we know it fires.
+4. **LOW — minor follow-up from review, explicitly deferred:** module split of
+   `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
+
+### Parser hardening + forecasting-tools upgrade path (added 2026-07-07)
+
+Full plan in `scratch_docs_and_planning/parser_hardening_and_ft_upgrade_plan.md` (written
+after an 8-agent structured-outputs exploration). Decisions: do NOT migrate forecaster calls
+to native `response_format` structured outputs (OpenRouter silent-degradation footguns,
+load-bearing rationale channel, zero competitive precedent — no upstream layer uses it
+either). Instead:
+
+- **Workstream A — DONE and superseded.** Shadow divergence logging shipped, served its
+  purpose, and was deleted 2026-07-10 when the block became authoritative (see the DONE
+  entry below; `EXTRACTION_RUNG` telemetry replaced it). The strict json_schema on the
+  *parser call* via `GeneralLlm(response_format=...)` also shipped (`structured_parse.py`,
+  constrained primary + framework `structure_output` fallback) and now serves as the
+  ladder's rung-3 salvage parser.
+- **Workstream B (between rounds, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 →
+  0.2.92+. Two verified breaks: our PCHIP subclasses override `.cdf` but HEAD internals moved
+  to `get_cdf()` (silent bypass of our CDF machinery); `fetch_hardening` patch target moved
+  to the new `MetaculusClient` (silent no-op). Plus a validator audit — HEAD's new
+  `_check_too_far_from_bounds` (25% wiggle) may conflict with our beyond-range open-bound
+  percentile design. Unlocks the litellm/cryptography CVE fixes below.
+- **DONE (2026-07-10): JSON-block-as-authoritative for ALL question types
+  (binary, MC, numeric) AND the stacker.** Value extraction runs through the
+  deterministic four-rung ladder in `metaculus_bot/value_extraction.py`:
+  fenced ```json block parse → json-repair salvage → LLM-parser salvage
+  (`parse_structured`) → `ValueExtractionError`. The old Workstream A trigger
+  ("wait for ~50 questions of shadow-divergence agreement data") was
+  **consciously waived by the operator** in favor of two lighter-weight
+  verification channels: (a) the `EXTRACTION_RUNG` INFO telemetry emitted on
+  every extraction — `rung=llm` salvages and `block_present=false` are the
+  drift signals to watch in prod logs; and (b) a user-gated live `test_bot`
+  rerun that eyeballs those rungs before the first tournament run. The
+  shadow-divergence logging module and its tests were deleted (superseded
+  by rung telemetry); the F5 block-lift fallback was absorbed into rung 1
+  of the numeric ladder.
+
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
 `make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
@@ -478,9 +556,136 @@ cohort.
 Blocked on: STACKER_OUTCOME marker fix (Priority 1A in NEXT_SESSION_QUEUE.md), then
 ≥30 stacked records under the new marker, before this can be tested. Defer.
 
+### Per-forecaster critic/revision pass (added 2026-07-08, medium priority)
+
+An unconditional adversarial critic reviews each forecaster's draft against a resolution-criteria
+checklist BEFORE aggregation — window discipline (does the resolution window actually cover the
+event?), already-resolved-events-don't-count (an event before the window opened cannot resolve
+the question), listing/instrument bar (does the specific instrument or ticker named in the
+question exist and clear the criteria?), blind-spot pricing (did the model implicitly assume
+a fact it should have priced). The forecaster then answers the critic point-by-point and
+re-issues its forecast, with the revision capped at ±20% from the original draft to prevent
+over-swing on a single critic pass.
+
+**Evidence.** Laertes (summer futureeval-2026 #4 slot) runs this critic pass on all forecasters.
+The most striking single data point is qid 42024: Laertes's Forecaster 1 initially drafted 97%
+(the exact number we published) and the critic reversed it to 4% pre-publication after flagging
+that the "resolving" event fell outside the question's open window. GreeneiBot2 (spring-aib-2026
+#1 slot) runs capped critique rounds with similar structure. Two independent top bots
+converging on this pattern is a notable signal.
+
+**Caveat (explicit).** The demonstrated evidence is on **degenerate** failures — pre-open-window
+event traps and similar resolution-criteria misreads where a critic pass mechanically catches a
+model applying the wrong reference class. Generalizing to non-degenerate misses (routine
+mid-range calibration errors, close-call disagreements) is **unproven** and would require a
+proper paid backtest (`make backtest_medium`-class ablation of critic-on vs. critic-off on a
+mixed cohort) before shipping. Cost is ~1 extra LLM call per forecaster per question, so at
+6 forecasters × ~250 Qs/tournament this is a non-trivial but not-huge line item.
+
+**Distinct from the stacker (which was benchmarked and rejected).** The stacker is a *post-hoc
+aggregate rewrite* — one meta-model looks at the N base forecasts and produces a single
+consolidated number, which the ablation showed ties MEDIAN on binary and loses on numeric. The
+critic pass here acts **per-member BEFORE aggregation** with a **bounded revision** (±20%),
+which is a structurally different lever — it hardens each base forecast against a checklist of
+known reasoning traps rather than trying to arbitrate a disagreement after the fact.
+
+**Gate before shipping:** `make backtest_medium` on a mixed-question cohort, primary metric peer
+score, secondary metric Brier / CRPS. Look for: (a) improvement or no regression on the
+"degenerate-failure" subset (window-trap, listing-bar, already-resolved cases — the demonstrated
+class); (b) no regression on non-degenerate misses (the unproven-generalization class). If (a)
+lands but (b) shows regression, ship it as a **conditional** critic (fires only when the
+question exhibits pre-open-event / listing-bar / criteria-mismatch flags) rather than
+unconditionally.
+
+**Update 2026-07-08 (pt2 acid test):** down-scoped. On the two non-degenerate consensus misses
+(41800 / 42855), advisory critique captured ~0 points even when it diagnosed the exact defect;
+only BINDING corrections moved numbers. If built, the critic must emit a bounded numeric
+adjustment / floor / cap that is mechanically applied in aggregation — not prose. Sequence AFTER
+the free offline counterfactuals of the deterministic guards (anchor-floor, no-market cap,
+signed haircut), which capture most of the demonstrated value at zero cost. Honest ceiling:
+~30–60 spot-peer points of damage limitation on consensus misses, no flips. See
+`scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3.
+
+**Update 2026-07-08 (guard counterfactuals):** the sequencing premise is falsified — all
+three deterministic guards buried on offline replay (era sign-flips / top-5 concentration /
+fall-hostile fire rates; see `scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`
+and the three guard entries in the "Killed by July 2026-07-08" section below). The critic
+pass now carries the full burden of demonstrating era-stable conditional firing on its own
+paid backtest; there is no free deterministic fallback capturing the same value. Its gate
+must include a fall-like era-stability check, not just capture of the spring miss cluster —
+the guards showed that harvesting that cluster is exactly what damages the largest and
+best-calibrated era.
+
+### Telemetry-first guard revival program (added 2026-07-08, passive)
+
+The shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` and `criteria_clauses` on
+`BinaryStructured`) plus `PREDICTION_MARKETS_ENABLED: 'true'` across all four prod workflows
+make future guard replays exact rather than parser-based — Arm A's regex parser at 84.9% text
+coverage is now a structured field, and the market snapshot section starts populating the
+archive going forward. No code is on the roadmap here; the whole program is passive.
+
+Important gating note on the telemetry channel: the computed
+`ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers emit only from
+`tool_runner.run_tools_for_forecaster`, which is gated behind `PROBABILISTIC_TOOLS_ENABLED`
+(all three prod workflows pin it to `'false'`), so those computed markers are currently
+DORMANT in published prod comments. What DOES land unconditionally in every prod R1
+rationale is the raw `base_rate_anchor` and `criteria_clauses` JSON the forecaster writes
+into its own STRUCTURED FORECAST block — the primary telemetry channel today. The computed
+markers become the primary channel only if the flag is flipped on; until then the
+overshoot / divergence math (which lives in `tool_runner`) is trivially replayable offline
+from the raw JSON.
+
+First checks in the next residual session, both free:
+
+1. **Structured-JSON presence rate per forecaster** in published comments — the whole replay
+   program depends on the telemetry actually landing. Grep the archive for the raw
+   `base_rate_anchor` and `criteria_clauses` JSON keys inside each forecaster's STRUCTURED
+   FORECAST block and confirm every slot is emitting them. If `PROBABILISTIC_TOOLS_ENABLED`
+   is ever flipped on, additionally grep for the computed `ANCHOR_OVERSHOOT_PP` /
+   `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers as a cross-check; today those markers
+   are absent and their absence carries no signal.
+2. **Does the spring overshoot pattern reproduce on the current roster at all?** If the
+   confident-overshoot cluster (analogues of 42024 / 42304 / 41800) does not appear in
+   post-`30bca2f` resolutions, the prompt fixes were sufficient and all three guard revival
+   conditions (Guard 1 anchors, Guard 2 markets, Guard 3 confidence deadzone) become moot.
+   Compute overshoot / divergence offline from the raw JSON (same math as `tool_runner`)
+   until the flag lands.
+
+One novel candidate trigger becomes analyzable for free once current-roster binaries
+resolve: `clause_product_divergence_pp` (published forecast vs. the model's own priced
+clause product). It is the first trigger that keys on divergence-from-own-math rather than
+confidence, anchor band, or market presence — the exact conditionality the three tested
+guards failed to achieve. Watch, don't act.
+
+Also watch (MC, added 2026-07-09): whether the low-bucket over-payment closes under the new
+merged MC calibration bullet (`ceab2df`). Baseline: [0-5%) options assigned mean 2.4%,
+resolve at 1.0% (n=96 pairs, both eras — "courtesy mass" on named-dead longshots leaking
+from under-committed favorites; see MC_CONFIDENCE_FINDINGS.md). If the gap persists at the
+next residual pull, add one prompt line: price clearly-dead NAMED options at/near the 1%
+floor (residual/"Other" options keep honest mass — asymmetric by option type). The 1% floor
+itself stays (operator decision 2026-07-09: sub-1% headroom is ~+0.01 nats/question ideal
+case vs. parser/clamp regression risk — not worth it).
+
 ## Medium-term (requires more exploration)
 
-### Dependency hygiene: version-floor bumps + uv migration (added 2026-06-01)
+### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
+
+Motivated by the qid 42304 INES miss: the then-native-search provider (`x-ai/grok-4.1-fast`,
+since retired) cited a real but undated-URL NucNet archive article from 1 Feb 1999 (the
+1998–99 Istanbul INES-3 accident) and presented it as a "February 2026" Turkish event with a
+fabricated "reported March 1, 2026" date — likely cross-contaminated from an adjacent 2026
+search result. All five forecasters anchored on it (81% published; resolved NO; peer −115.9).
+The same phantom claim independently reached at least two top-competitor research stacks, so
+this is a field-wide hazard of undated archive URLs, not a one-off provider quirk.
+
+Idea: a free, offline audit pass over `backtests/research_archive/latest/` — sample research
+texts per provider, spot-check high-leverage factual claims (dates, event existence, numbers)
+against their cited URLs, and classify error modes (temporal displacement, fabricated dates,
+certainty inflation by the summarizer). Output: per-provider error-rate estimates + a list of
+recurring hazard patterns to feed prompt/summarizer hardening. Low priority — the offending
+provider is gone and prompt-side mitigations (date-stamping relative to question open date,
+single-source claim flagging) are the nearer-term lever — but worth doing before trusting any
+new research provider swap.
 
 Deferred from the 2026-06-01 desloppify code-health pass (which did only behavior-neutral pyproject hygiene: dropped unused `python-decouple`, removed the unused `litellm[proxy]` extra, declared the directly-imported `scipy`/`pandas`/`pydantic` that were previously only transitive via `forecasting-tools`).
 
@@ -766,6 +971,74 @@ here so future sessions don't re-recommend them without new data.
   ~0.7 questions average. Noise dominates. Stick with the 1D predicted-bucket cut.
 - **MC per-model audit** — per-model MC predictions don't survive in stored
   comments. Would require collector changes for n=24/round. Not worth it.
+
+## Killed by July 2026-07-08 residual + competitor analysis
+
+- **YES-side shrink / any fitted directional calibration layer** — the P6 YES-overconfidence
+  finding is real on pooled data but era-local (spring-2026 only; fall confident-YES buckets
+  are ~100% accurate). All three pre-registered stability criteria failed; a fit-on-two-eras
+  layer degraded held-out fall performance (+4.3e-3 mean Brier). Receipts:
+  `scratch/residual_2026-07-08/experiments/ARM_B_FINDINGS.md`. One sub-finding survives as a
+  hard rule: symmetric shrink was strictly worse in every era — never touch the NO side.
+- **Anchor-guard as a clamp/gate** — models publish outside their own stated base-rate anchor
+  on ~88% of forecasts (that is the normal outside → inside update, not a bug); precision on
+  a binary "flag it" gate is ≤29% and the sign of the effect flips across eras. Surviving
+  fragment: overshoot MAGNITUDE >15pp degrades Brier monotonically in both well-powered eras,
+  so ship it as telemetry plus a prompt nudge only (telemetry shipped 2026-07-08). Receipts:
+  `scratch/residual_2026-07-08/experiments/ARM_A_FINDINGS.md`.
+- **Advisory (non-binding) critic passes** — pt2 natural experiment: GreeneiBot2's critique
+  diagnosed our exact 41800 defect verbatim and the number never moved; laertes's correct
+  42855 reference-class recomputation was half-overridden by its own forecasters. Corrections
+  that BIND (formula/floor/structural) captured 30–130 spot-peer points; advisory captured
+  ~0. Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md`. The critic-pass Near-term
+  entry stays, but in binding-output form only.
+- **Fixed-direction haircuts** — GreeneiBot2's always-downward haircut was best-of-group on
+  42855 AND actively harmful on 41800 (it extremized a 12 down to 10 on a YES resolution).
+  Any damping mechanism must push toward 0.5, not in a fixed direction. Consistent with the
+  already-killed one-sided anti-overprediction shave.
+- **"Median drowns the correct dissenter"** (re-confirmed dead) — the 7/9 washouts framing is
+  survivorship bias; median remains at the non-oracle frontier per dim_peer-calibration across
+  two additional pulls; and even laertes's 41800 "win" discarded its own best member and was
+  saved by its floor, not by aggregation.
+- **Anchor-floor guard on cheap tails** — the deterministic follow-up to the Arm A anchor-guard
+  kill. The median-band variant sign-flips across eras (fall +1.68 / spring −2.19 total Brier
+  at the 10pp margin) because 76% of parsed anchor bands are degenerate points, collapsing the
+  clamp back into Arm A's buried point-anchor clamp. The union-band variant is sign-consistent
+  but 100% top-5-concentrated (1–2 questions per era) and catches only 1/5 of the known misses.
+  Decomposing fires shows same-side tail clamping — the mechanism the guard is named for —
+  hurts BOTH well-powered eras. Revival condition: ≥50 current-roster binaries carrying the
+  new structured `base_rate_anchor` telemetry (shipped 30bca2f) AND an era-stable,
+  non-concentrated (top-5 < 50% of gross) replay. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD1_FINDINGS.md`.
+- **No-market-no-extremize cap** — feasibility kill: the market-presence signal exists in
+  essentially one era (fall is 89% NO_SIGNAL because the prediction-market provider was
+  benchmark-suppressed; the canonical `## Prediction Market Snapshot` header appears in
+  exactly 1 archived binary), so era-stability is un-testable for the market-conditioned form.
+  Marketless fallback form = Arm A's point-anchor clamp drift bomb; strict form's gain is 3
+  spring questions (74–98% of gross improvement) and the market gate itself adds ~nothing
+  (with-cond vs. no-cond within ~0.2 Brier on spring). Revival condition: ≥~50 resolved
+  binaries per era carrying the structured `## Prediction Market Snapshot` AND the market
+  gate itself earning the delta the marketless form does not. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD2_FINDINGS.md`.
+- **Signed deadzone haircut toward 0.5** (question closed permanently) — extends the Arm B
+  symmetric-shrink kill to all thresholded / high-t forms. 0 of 24 (λ, t) grid cells help or
+  are neutral in both well-powered eras; fall has no improving cell anywhere. Fire rate ≥30%
+  at even the loosest deadzone (t=0.4) because the bot is a confident forecaster
+  (median |p−0.5| ≈ 0.32–0.38) so confidence-keyed deadzones fire on the bulk, not a tail.
+  LOTO fit on spring+summer degrades held-out fall +1.12 total Brier. Keeper: the
+  signed-toward-0.5 direction constraint stands as a design rule (mirrors the fixed-direction
+  haircut kill above). Revival condition: the ensemble's calibration profile qualitatively
+  changes (a fall-like era where confident calls are wrong at scale) AND leave-one-era-out
+  passes on every held-out era; do not re-grid λ/t on new data absent that. Receipts:
+  `scratch/residual_2026-07-08/experiments/GUARD3_FINDINGS.md`.
+- **Cross-cutting** — at mid-grid configs all three guards fire on the same spring miss
+  cluster (42024 / 42304 / 41800 in particular; often 42018 / 42577 / 42855 / 41644 too), so
+  they are one lever measured three ways rather than three independent findings. The shipped
+  `30bca2f` prompt changes (status-quo derivation, conjunctive clause pricing, anchor/clause
+  telemetry) target that exact cluster, so any future guard replay on post-`30bca2f` data
+  must never fit on pre-`30bca2f` eras — that is the roster-drift bomb with a prompt-change
+  fuse. Config-era bucketing (keyed on submission time) already handles this; the new prompt
+  era starts at `30bca2f`.
 
 ## Instrumentation bugs
 

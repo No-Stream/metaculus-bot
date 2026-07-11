@@ -1,14 +1,15 @@
 # type: ignore
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
-from pydantic import ValidationError
 
 from main import TemplateForecaster
+from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.value_extraction import ExtractionOutcome
 
 
 def _stub_open_time() -> datetime:
@@ -75,34 +76,58 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
     fake_percentiles = [
         FTPercentile(value=v, percentile=p)
         for v, p in zip(
-            [95, 100, 110, 120, 130, 135, 140, 150, 160, 170, 175],
-            [0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975],
+            [90, 95, 100, 110, 120, 130, 135, 140, 150, 160, 170, 175, 180],
+            [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99],
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.forecaster_runners.extract_numeric",
+            new=AsyncMock(return_value=ExtractionOutcome(value=fake_percentiles, rung="block", block_present=True)),
+        ),
     ):
         result = await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
     values = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore
     # Basic sanity with tail widening enabled: monotone, median unchanged, tails not narrower
-    assert len(values) == 11
+    assert len(values) == 13
     assert all(b > a for a, b in zip(values, values[1:])), values
-    assert values[5] == pytest.approx(135.0)
+    assert values[6] == pytest.approx(135.0)
     assert values[0] <= 95.0 and values[-1] >= 175.0
 
 
 @pytest.mark.asyncio
 async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
+    # Rationale has neither a fenced JSON block nor rescuable braces, so the
+    # ladder's block+repair rungs fail. The salvage rung's parser
+    # (value_extraction.parse_structured — an independent binding from the
+    # C3 outcome_type read in forecaster_runners) returns an insufficient
+    # 2-percentile list; _validate_numeric rejects the non-13 set and the
+    # ladder's terminal rung raises its typed ValueExtractionError. The old
+    # text-extraction "no declared_percentiles available" fallback is gone
+    # with the F5 router.
     rationale = "Percentile 10: 5\nPercentile 20: 6\n"
+    insufficient = [
+        FTPercentile(value=5.0, percentile=0.1),
+        FTPercentile(value=6.0, percentile=0.2),
+    ]
 
     q = make_dummy_numeric_question()
     llm = DummyLLM(rationale)
-    with patch(
-        "metaculus_bot.forecaster_runners.structure_output",
-        side_effect=ValidationError.from_exception_data("NumericDistribution", []),
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.value_extraction.parse_structured",
+            new=AsyncMock(return_value=insufficient),
+        ),
     ):
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValueExtractionError):
             await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

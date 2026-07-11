@@ -42,22 +42,22 @@ from typing import Literal
 
 import numpy as np
 from forecasting_tools import (
-    BinaryQuestion,
     MetaculusQuestion,
-    MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
     PredictedOptionList,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
 
+from metaculus_bot.comment.markers import (
+    format_anchor_overshoot_marker,
+    format_clause_divergence_marker,
+)
 from metaculus_bot.constants import env_flag_enabled
 from metaculus_bot.probabilistic_tools import (
     DEFAULT_INFORMATIVE_PRIOR_STRENGTH,
     BetaBinomialResult,
     ConsistencyResult,
-    MixtureComponent,
-    MixtureOfNormals,
     SurvivalResult,
     TailMassResult,
     base_rate_blend,
@@ -68,13 +68,13 @@ from metaculus_bot.probabilistic_tools import (
     linear_pool,
     linear_pool_options,
     log_pool,
-    mixture_cdf,
     out_of_bounds_mass,
     percentile_family_consistency,
     prob_event_before,
     satopaa_extremize,
     stated_base_rate_consistency,
 )
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
@@ -110,6 +110,14 @@ _P10_P90_Z_GAP: float = 2.5631
 # flagged. Defense-in-depth atop the family-consistency check.
 _SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
 
+# Anchor-overshoot telemetry threshold (percentage points). The 2026-07-08
+# residual experiments showed overshoot beyond ~15pp past the stated
+# outside-view anchor degrades Brier monotonically in both well-powered eras.
+# TELEMETRY ONLY: overshoots past this log a WARNING for residual analysis;
+# they never clamp or mutate the forecast (the clamp variant sign-flipped
+# across eras and is buried).
+ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP: float = 15.0
+
 
 def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choice"] | None = None) -> bool:
     """Return True iff global PROBABILISTIC_TOOLS_ENABLED is set AND
@@ -130,16 +138,6 @@ def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choic
         logger.warning("PROBABILISTIC_TOOLS_TYPES has invalid entries %s; ignoring them", invalid)
         allowed = allowed & _VALID_TYPES
     return question_type in allowed
-
-
-def _question_type_of(question: MetaculusQuestion) -> Literal["binary", "numeric", "multiple_choice"] | None:
-    if isinstance(question, BinaryQuestion):
-        return "binary"
-    if isinstance(question, NumericQuestion):
-        return "numeric"
-    if isinstance(question, MultipleChoiceQuestion):
-        return "multiple_choice"
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +189,84 @@ def _format_family_consistency(result: ConsistencyResult) -> str:
     flag_mark = " ⚠ FLAGGED" if result.flag else ""
     reason = f" — {result.flag_reason}" if result.flag_reason else ""
     return f"- **Percentile-family consistency{flag_mark}**: claimed {claimed!r}, best-fit {best!r}{reason}"
+
+
+def anchor_overshoot_pp(posterior_prob: float, anchor_low: float, anchor_high: float) -> float:
+    """Signed pp distance of the published probability outside [low, high].
+
+    0.0 when the posterior sits inside the stated anchor range; positive when
+    it overshoots above ``anchor_high``; negative when it undershoots below
+    ``anchor_low``. Telemetry only — callers must never clamp with this.
+    """
+    if posterior_prob > anchor_high:
+        return (posterior_prob - anchor_high) * 100.0
+    if posterior_prob < anchor_low:
+        return (posterior_prob - anchor_low) * 100.0
+    return 0.0
+
+
+def clause_product_divergence_pp(posterior_prob: float, clause_probs: list[float]) -> tuple[float, float]:
+    """Return (clause_product, signed pp divergence of posterior from the product).
+
+    Positive divergence = the published probability exceeds the independent
+    clause product (the forecaster priced in positive dependence or narrative
+    uplift); negative = below it. Telemetry only.
+    """
+    product = math.prod(clause_probs)
+    return product, (posterior_prob - product) * 100.0
+
+
+def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
+    """Neutral telemetry lines + HTML markers for anchor / clause declarations.
+
+    Emitted into the per-forecaster "Computed quantities" section built by
+    ``run_tools_for_forecaster``, which is gated behind
+    ``PROBABILISTIC_TOOLS_ENABLED`` (all three prod workflows pin the flag
+    to ``'false'`` today, so these lines and their ``ANCHOR_OVERSHOOT_PP`` /
+    ``CLAUSE_PRODUCT_DIVERGENCE_PP`` HTML markers are dormant in prod
+    comments). The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
+    forecaster writes into its own STRUCTURED FORECAST block DOES land in
+    every published R1 rationale regardless of the flag; the same overshoot
+    / divergence math is trivially replayable offline from that JSON.
+
+    NO forecast mutation anywhere — the 2026-07-08 experiments buried the
+    clamp variant; only the >15pp-overshoot *measurement* survived.
+    """
+    lines: list[str] = []
+
+    if block.base_rate_anchor is not None:
+        overshoot = anchor_overshoot_pp(
+            block.posterior_prob,
+            block.base_rate_anchor.low,
+            block.base_rate_anchor.high,
+        )
+        lines.append(
+            f"- **Anchor telemetry**: declared {block.posterior_prob * 100:.0f}% vs stated anchor "
+            f"{block.base_rate_anchor.low * 100:.0f}-{block.base_rate_anchor.high * 100:.0f}%, "
+            f"overshoot {overshoot:+.1f}pp {format_anchor_overshoot_marker(overshoot)}"
+        )
+        if abs(overshoot) > ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP:
+            logger.warning(
+                "ANCHOR_OVERSHOOT: posterior %.3f is %.1fpp outside stated anchor [%.3f, %.3f]",
+                block.posterior_prob,
+                overshoot,
+                block.base_rate_anchor.low,
+                block.base_rate_anchor.high,
+            )
+
+    if block.criteria_clauses:
+        product, divergence = clause_product_divergence_pp(
+            block.posterior_prob,
+            [c.prob for c in block.criteria_clauses],
+        )
+        clause_strs = ", ".join(f"{c.name} {c.prob:.2f}" for c in block.criteria_clauses)
+        lines.append(
+            f"- **Clause-product telemetry**: {len(block.criteria_clauses)} clauses ({clause_strs}) → "
+            f"product {product:.3f}; published {block.posterior_prob:.3f}, "
+            f"divergence {divergence:+.1f}pp {format_clause_divergence_marker(divergence)}"
+        )
+
+    return lines
 
 
 def _lr_chained_posterior(prior_prob: float, lrs: list[float]) -> float | None:
@@ -303,6 +379,9 @@ def _run_binary_tools(block: BinaryStructured) -> list[str]:
                     f"Δ = {block.posterior_prob - chained:+.3f}"
                 )
 
+    # Anchor / clause telemetry (2026-07-08): neutral measurement lines only.
+    lines.extend(_anchor_and_clause_telemetry_lines(block))
+
     return lines
 
 
@@ -315,8 +394,8 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
             raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             declared_percentiles=block.declared_percentiles,
-            claimed_family=block.distribution_family_hint,
-            student_t_df=block.student_t_df,
+            claimed_family=None,
+            student_t_df=None,
         )
         lines.append(_format_family_consistency(family_result))
     except ValueError as exc:
@@ -324,7 +403,7 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
         family_result = None
 
     if family_result is not None:
-        hint = block.distribution_family_hint or family_result.details.get("best_fit_family")
+        hint = family_result.details.get("best_fit_family")
         fit = family_result.details["fits_by_family"].get(hint) if hint else None
         if fit is not None:
             lower = question.lower_bound if not question.open_lower_bound else None
@@ -332,53 +411,8 @@ def _run_numeric_tools(block: NumericStructured, question: NumericQuestion) -> l
             try:
                 tail = out_of_bounds_mass(fit, lower_bound=lower, upper_bound=upper)
                 lines.append(_format_tail_mass(tail, family=hint or type(fit).__name__))
-                if block.tails is not None:
-                    declared_below = block.tails.below_min_expected
-                    declared_above = block.tails.above_max_expected
-                    delta_below = tail.prob_below_min - declared_below
-                    delta_above = tail.prob_above_max - declared_above
-                    lines.append(
-                        f"- **Declared vs fitted tails**: declared [below={declared_below:.3f}, above={declared_above:.3f}] "
-                        f"vs fitted [{tail.prob_below_min:.3f}, {tail.prob_above_max:.3f}]; "
-                        f"Δ = [{delta_below:+.3f}, {delta_above:+.3f}]"
-                    )
             except ValueError as exc:
                 logger.debug("out_of_bounds_mass skipped: %s", exc)
-
-    if block.mixture_components is not None:
-        lines.extend(_render_mixture_section(block, question))
-
-    return lines
-
-
-def _render_mixture_section(block: NumericStructured, question: NumericQuestion) -> list[str]:
-    """Render a ``### Mixture-of-normals`` subsection for a NumericStructured
-    with populated ``mixture_components``. Lists the components and a 5-row
-    CDF-sample table over the declared range."""
-    assert block.mixture_components is not None
-    try:
-        comps = tuple(MixtureComponent(weight=c.weight, mean=c.mean, sd=c.sd) for c in block.mixture_components)
-        mix = MixtureOfNormals(comps)
-    except ValueError as exc:
-        logger.debug("mixture construction skipped: %s", exc)
-        return []
-
-    lines: list[str] = ["### Mixture-of-normals"]
-    for i, c in enumerate(mix.components):
-        lines.append(f"- Component {i + 1}: weight {c.weight:.3f}, mean {c.mean:.3g}, sd {c.sd:.3g}")
-
-    # Build a 5-row CDF sample table across the declared question range.
-    lower = float(question.lower_bound)
-    upper = float(question.upper_bound)
-    if upper > lower:
-        try:
-            sample_grid = np.linspace(lower, upper, 5)
-            sample_cdf = mixture_cdf(mix, sample_grid)
-            lines.append("- CDF sample (value → F):")
-            for x, p in zip(sample_grid, sample_cdf):
-                lines.append(f"  - {x:.3g} → {p:.3f}")
-        except ValueError as exc:
-            logger.debug("mixture_cdf sample skipped: %s", exc)
 
     return lines
 
@@ -453,7 +487,7 @@ def run_tools_for_forecaster(
     when the feature flag is off, no structured block was found, or no
     tool produced output.
     """
-    qtype = _question_type_of(question)
+    qtype = question_type_of(question)
     if qtype is None:
         logger.debug(
             "Unsupported question type %s for tool runner; skipping (forecaster=%s)",
@@ -473,7 +507,7 @@ def run_tools_for_forecaster(
         lines = _run_binary_tools(block)
     elif isinstance(block, NumericStructured):
         # qtype=="numeric" guarantees question is a NumericQuestion (see
-        # _question_type_of); cast is needed because pyright can't prove the
+        # question_type_of); cast is needed because pyright can't prove the
         # cross-field invariant across the discriminated union.
         assert isinstance(question, NumericQuestion)
         lines = _run_numeric_tools(block, question)
@@ -642,12 +676,6 @@ def _aggregate_numeric_lines(
     if len(medians) >= 2:
         lines.append(f"- **Forecaster medians**: min {min(medians):.3g}, max {max(medians):.3g}, n={len(medians)}")
 
-    if blocks:
-        hints = [b.distribution_family_hint for b in blocks if b.distribution_family_hint]
-        if hints:
-            unique = sorted(set(hints))
-            lines.append(f"- **Declared distribution families**: {', '.join(unique)} ({len(hints)} forecasters)")
-
     lines.extend(_spread_plausibility_lines(prediction_percentiles))
 
     return lines
@@ -710,10 +738,10 @@ def aggregate_numeric_values(
     normalized: list[list[Percentile]] = []
     for entry in prediction_percentiles:
         if isinstance(entry, NumericDistribution):
-            # declared_percentiles preserves the 11 anchor points the
+            # declared_percentiles preserves the standard anchor points the
             # forecaster asserted; that's what the median-extraction loop
             # expects. The 201-point CDF would also work but is less
-            # information-dense (median is one of the 11 anchors).
+            # information-dense (median is one of the declared anchors).
             normalized.append(list(entry.declared_percentiles))
         else:
             normalized.append(list(entry))
@@ -747,7 +775,7 @@ def build_cross_model_aggregation(
     unsupported, or there is nothing useful to report. Callers can instead
     use the typed entry points (``aggregate_binary_values`` etc.) directly.
     """
-    qtype = _question_type_of(question)
+    qtype = question_type_of(question)
     if qtype is None:
         return ""
 
@@ -807,13 +835,13 @@ def cdf_at_threshold_for_forecaster(
             raise ValueError("declared_percentiles is missing or empty")
         family_result = percentile_family_consistency(
             block.declared_percentiles,
-            claimed_family=block.distribution_family_hint,
-            student_t_df=block.student_t_df,
+            claimed_family=None,
+            student_t_df=None,
         )
     except ValueError as exc:
         logger.debug("percentile_family_consistency skipped: %s", exc)
         return None
-    hint = block.distribution_family_hint or family_result.details.get("best_fit_family")
+    hint = family_result.details.get("best_fit_family")
     if not hint:
         return None
     fit = family_result.details["fits_by_family"].get(hint)
@@ -827,11 +855,14 @@ def cdf_at_threshold_for_forecaster(
 
 
 __all__ = [
+    "ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP",
     "FEATURE_FLAG_ENV",
     "aggregate_binary_values",
     "aggregate_mc_values",
     "aggregate_numeric_values",
+    "anchor_overshoot_pp",
     "build_cross_model_aggregation",
     "cdf_at_threshold_for_forecaster",
+    "clause_product_divergence_pp",
     "run_tools_for_forecaster",
 ]

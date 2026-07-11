@@ -71,9 +71,7 @@ def check_tournament_dates(logger: logging.Logger | None = None) -> None:
 
     Call this at bot startup to catch stale tournament IDs.
     """
-    import logging as _logging
-
-    log = logger or _logging.getLogger(__name__)
+    log = logger or logging.getLogger(__name__)
 
     try:
         end_date = datetime.strptime(TOURNAMENT_END_DATE, "%Y-%m-%d")
@@ -252,20 +250,16 @@ CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD: float = 0.15
 # Environment variable names
 NATIVE_SEARCH_ENABLED_ENV: str = "NATIVE_SEARCH_ENABLED"
 NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
-# Default model for native search (without openrouter/ prefix)
-# 2026-05-17: migrated from x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI).
-# Initially flipped to gpt-5.4-mini, but v3 bench (scratch/native_search_bench_2026-05-17/comparison_v3.md)
-# showed gpt-5.5 with reasoning=medium + verbosity=low fits in ~230s under a
-# 360s cap with 130s headroom, and consistently produces materially deeper
-# research (Opus rubric: 23/25 vs mini's 15-16/25 across two unrelated
-# questions). Donated key currently blocked by data-policy guardrail —
-# see FUTURE.md "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block" — calls
-# bill to personal OPENROUTER_API_KEY for now (~$0.15/call × 250 Qs =
-# ~$40/tournament).
-NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.5"
-# LLM parameters for native search (lower temp for factual grounding)
-NATIVE_SEARCH_TEMPERATURE: float = 0.3
-NATIVE_SEARCH_TOP_P: float = 0.9
+# Default model for native search (without openrouter/ prefix).
+# Critical-path research — this constant covers BOTH the always-on native-search
+# provider (every question) and the targeted search on the stacking path.
+# Strongest OpenAI tier because research depth compounds into every forecaster
+# prompt; effort stays at the env default LOW (see
+# NATIVE_SEARCH_REASONING_EFFORT_DEFAULT below) — sol-low ≥ terra-medium per
+# the AA Pareto frontier at similar latency.
+NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.6-sol"
+# No temperature / top_p: reasoning models defer to provider defaults; the LLM
+# is built with temperature=None so litellm omits the param (see build_native_search_llm).
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
 NATIVE_SEARCH_TIMEOUT: int = (
     360  # 2026-05-17: raised 240→360 alongside gpt-5.5 medium-effort migration; see comparison_v3.md
@@ -285,20 +279,35 @@ NATIVE_SEARCH_WALL_TIMEOUT: int = 420
 NATIVE_SEARCH_REASONING_EFFORT_ENV: str = "NATIVE_SEARCH_REASONING_EFFORT"
 # 2026-05-20: dropped medium→low after the OpenRouter whitespace-stream incident
 # that consumed 8m37s on a single call. v3 bench (comparison_v3.md) measured
-# gpt-5.5 effort=low at ~50s vs effort=medium at ~230s, so low gives ~4.5×
-# faster wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT (420s)
-# / NATIVE_SEARCH_TIMEOUT (360s). Caveat: v3 only sanity-checked low for latency,
-# not graded quality (mini at default scored 15/25, gpt-5.5 medium 23/25, low
-# unknown). Override via NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs
-# medium quality back. Note: this default applies ONLY to the native-search
-# provider — DISAGREEMENT_ANALYZER_LLM stays at medium (llm_configs.py:182),
-# all forecasters stay at high.
+# effort=low at ~50s vs effort=medium at ~230s, so low gives ~4.5× faster
+# wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT (420s)
+# / NATIVE_SEARCH_TIMEOUT (360s). The quality cost of low is now absorbed by
+# the tier upgrade to gpt-5.6-sol (smarter model at lower effort). Override via
+# NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs medium back. Note:
+# this default applies ONLY to the native-search provider —
+# DISAGREEMENT_ANALYZER_LLM is also at low (llm_configs.py), all forecasters
+# stay at high.
 NATIVE_SEARCH_REASONING_EFFORT_DEFAULT: str = "low"
 NATIVE_SEARCH_VERBOSITY_ENV: str = "NATIVE_SEARCH_VERBOSITY"
 NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
 # Native search web options (passed to OpenRouter plugins)
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
+
+# --- Resolution-Source Fetcher (Tier 1) ---
+# Char caps below apply to RAW fetched content only (policy: raw passthrough is
+# capped; LLM-emitted research is never truncated).
+RESOLUTION_SOURCE_ENABLED_ENV: str = "RESOLUTION_SOURCE_ENABLED"
+RESOLUTION_SOURCE_HTTP_TIMEOUT: float = 20.0  # per-request (probe: 0-2s typical; slack for slow gov sites)
+RESOLUTION_SOURCE_WALL_TIMEOUT: float = 45.0  # hard cap on the whole provider
+RESOLUTION_SOURCE_MAX_URLS: int = 5  # 58 URLs / 40 Qs ≈ 1.45 avg; bounds pathological multi-URL Qs
+RESOLUTION_SOURCE_MAX_RESPONSE_BYTES: int = 5 * 1024 * 1024  # CISA KEV JSON ~1.5 MB; 5 MiB headroom
+RESOLUTION_SOURCE_PER_URL_MAX_CHARS: int = 6000  # elbow of full-extraction dist (p50=2.2k, p75=5.2k); truncation 48%->21% on 2026-07-09 smoke; ~1.5k tokens/URL
+RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
+    18000  # headroom so per-URL cap binds (max observed section ~11.1k at 6k/URL); ~4.5k tokens worst case
+)
+RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
+RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
@@ -344,14 +353,13 @@ GEMINI_SEARCH_TIMEOUT: int = 360
 # web search (see GAP_FILL_RESOLVER_MODEL below). Fails soft — forecast proceeds
 # with first-pass research alone if any stage errors out.
 GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
-# 2026-05-20: migrated analyzer from gemini-3-flash-preview (google-genai SDK
-# direct) to gpt-5.5 effort=low via OpenRouter. The analyzer is non-grounded —
-# it reads the first-pass research and emits a JSON list of factual gaps —
-# so it doesn't need Google as a search index, and OpenAI-stack consistency
-# matches the rest of the auxiliary tier (native_search, disagreement_analyzer
-# also at gpt-5.5 low). Grounded search resolution still uses google-genai
-# directly via gemini_search_provider — that path needs the search index.
-GAP_FILL_ANALYZER_MODEL: str = "openrouter/openai/gpt-5.5"
+# Non-grounded gap-listing: reads the first-pass research and emits a JSON list
+# of up to GAP_FILL_MAX_GAPS factual gaps, under a tight 135s wall cap that
+# soft-fails silently on breach — terra-low is the latency-safe choice; the
+# task is decomposition, not deep judgment. Grounded search resolution still
+# uses google-genai directly via gemini_search_provider — that path needs the
+# search index.
+GAP_FILL_ANALYZER_MODEL: str = "openrouter/openai/gpt-5.6-terra"
 GAP_FILL_MAX_GAPS: int = 5
 # Analyzer call is non-grounded (no Google Search) and should return quickly.
 # Use a tight timeout to prevent a single hung analyzer request from holding a
@@ -377,19 +385,19 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 # paying for 1 call/question, and it uses url_context which OpenRouter can't
 # replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
 #
-# Effort LOW (Round-2, 2026-06-25): the resolver was the ~5-min critical-path
-# bottleneck (it fans out up to GAP_FILL_MAX_GAPS medium-effort calls that gate
-# the forecast). The native_search v3 bench (comparison_v3.md) measured gpt-5.5
-# effort=low at ~50s vs medium ~230s — roughly 4.5× faster; mini scales similarly.
-# Dropping to low keeps gap-fill comfortably inside the per-question deadline.
-# Quality of low-effort gap resolution is to be spot-checked from the GHA
-# test-bot run; bump back to medium here if it skims too much.
-GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.4-mini"
+# Agentic single-gap web research whose source-trust judgment lands directly in
+# every forecaster prompt. Small per-gap outputs mute sol's latency premium, and
+# the 5 workers run in parallel under a 420s cap (latency = slowest call, not
+# sum), so effort stays LOW. 2026-07-09 bench: sol-low matched terra-low coverage
+# 24/25 in 20% fewer chars and uniquely caught a research-internal error.
+GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-sol"
 GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
 FRED_API_KEY_ENV: str = "FRED_API_KEY"
+# Binary-ish routing classification (is this a financial/economic question?)
+# under a 30s timeout — capability-saturated, so mini stays the cheapest capable tier.
 FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.4-mini"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
@@ -461,7 +469,7 @@ STACKER_SOFT_DEADLINE: int = 500
 # late on the critical path by the time the fallback fires.
 STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 
-# Per-question soft deadline for the disagreement-crux extractor (gpt-5.5 medium effort).
+# Per-question soft deadline for the disagreement-crux extractor (gpt-5.6-sol low effort).
 # Caps the unbounded worst case on the conditional-stacking critical path: without
 # this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
 CRUX_SOFT_DEADLINE: int = 180
@@ -469,7 +477,7 @@ CRUX_SOFT_DEADLINE: int = 180
 # Wall-clock cap for the AskNews summarizer invoke. The summarizer is set
 # allowed_tries=1 (llm_configs.py) and wrapped in the broad 30s-gated retry, which
 # previously had no wall guard at all. Matches the summarizer's litellm per-request
-# timeout (DETERMINISTIC_MODEL_CONFIG timeout=300) so the per-attempt cap aligns
+# timeout (UTILITY_MODEL_CONFIG timeout=300) so the per-attempt cap aligns
 # with the underlying request budget; on breach the summarizer soft-fails to the
 # raw AskNews articles rather than hanging the question.
 SUMMARIZER_WALL_TIMEOUT: int = 300
@@ -488,6 +496,8 @@ BACKTEST_DEFAULT_RESOLVED_AFTER: str = "2025-12-01"
 BACKTEST_DEFAULT_TOURNAMENT: str = "fall-aib-2025"
 BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
+# Mechanical leakage screen over research text, backtest-only — saturated task,
+# mini is the cheapest capable tier.
 LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5.4-mini"
 
 # --- Per-type stacking gates ---

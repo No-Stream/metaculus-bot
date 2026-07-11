@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.pchip_cdf import (
     enforce_min_steps,
     enforce_strict_increasing,
@@ -165,6 +165,21 @@ class TestSafeCdfBounds:
         steps = np.diff(result)
         assert all(step <= NUM_MAX_STEP + 1e-6 for step in steps), f"Steps: {steps}"
         assert result[-1] - result[0] == pytest.approx(1.0, rel=1e-9)
+
+    def test_open_lower_flat_prefix_min_step_reenforced(self):
+        """Regression: pinning cdf[0] to 0.001 + cummax flattens any sub-0.001
+        prefix into 0-step bins, violating the 5e-5 server min-step. The
+        ensemble ramp (7.5e-7/bin) can't rescue that, so safe_cdf_bounds must
+        re-enforce the min-step itself after the pin+cummax."""
+        ramp = np.linspace(0.0015, 0.999, 197)
+        cdf = np.concatenate([[0.0002, 0.0004, 0.0006, 0.0008], ramp])
+        result = safe_cdf_bounds(cdf, open_lower=True, open_upper=True)
+
+        steps = np.diff(result)
+        assert float(steps.min()) >= NUM_MIN_PROB_STEP - 1e-12, f"min-step violation: {float(steps.min())}"
+        assert result[0] >= 0.001
+        assert result[-1] <= 0.999 + 1e-12
+        assert np.all(steps >= 0.0), "CDF must be monotone non-decreasing"
 
 
 class TestGeneratePchipCdf:

@@ -13,9 +13,10 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
 
+# temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+# reasoning models defer to provider defaults. top_p left unset.
 MODEL_CONFIG: dict[str, Any] = {
-    "temperature": 1.0,
-    "top_p": 0.95,
+    "temperature": None,
     "max_tokens": 32_000,
     "stream": False,
     "timeout": 480,  # 8 minutes - reasoning models (o3, gpt-5.1) need extra time

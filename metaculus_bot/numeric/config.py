@@ -11,10 +11,11 @@ from metaculus_bot.constants import NUM_MAX_STEP
 
 # --- Percentile Processing Constants ---
 
-EXPECTED_PERCENTILE_COUNT: int = 11
-
-# Expressed as decimals in [0,1]
+# Expressed as decimals in [0,1]. P1 (0.01) and P99 (0.99) give forecasters finer tail
+# anchors so they can express probability mass below an open lower bound / above an open
+# upper bound (the Minions & Monsters miss).
 STANDARD_PERCENTILES: list[float] = [
+    0.01,
     0.025,
     0.05,
     0.10,
@@ -26,7 +27,15 @@ STANDARD_PERCENTILES: list[float] = [
     0.90,
     0.95,
     0.975,
+    0.99,
 ]
+
+EXPECTED_PERCENTILE_COUNT: int = len(STANDARD_PERCENTILES)
+
+# Human-readable label CSV (percentile * 100, e.g. "1,2.5,5,...,97.5,99"). The single
+# source for the label string embedded in prompts and validation errors — never hardcode
+# the list elsewhere so it stays in lockstep with STANDARD_PERCENTILES.
+STANDARD_PERCENTILES_CSV: str = ",".join(f"{p * 100:g}" for p in STANDARD_PERCENTILES)
 
 MIN_PERCENTILES_REQUIRED: int = 3
 

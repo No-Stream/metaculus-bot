@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -17,7 +18,13 @@ async def test_run_research_priority():
             "summarizer": "mock_summarizer",
         }
     )
-    question = MetaculusQuestion(question_text="Test question", page_url="http://example.com")
+    # open_time is required by the summarizer's window-stamping prompt
+    # (_summarize_asknews asserts on it, matching _forecasting_window_str).
+    question = MetaculusQuestion(
+        question_text="Test question",
+        page_url="http://example.com",
+        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
     # Test AskNews priority (highest priority when available)
     with patch("os.getenv") as mock_getenv:

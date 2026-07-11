@@ -449,7 +449,9 @@ def financial_data_provider() -> ResearchCallable:
     """
     classifier_llm = build_llm_with_openrouter_fallback(
         model=FINANCIAL_CLASSIFIER_MODEL,
-        temperature=0.0,
+        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
+        # reasoning models defer to provider defaults. No top_p.
+        temperature=None,
         max_tokens=500,
         reasoning={"effort": "low"},
         timeout=FINANCIAL_CLASSIFIER_TIMEOUT,

@@ -16,9 +16,13 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --dev --frozen
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run basedpyright
+      # --frozen on every `uv run`: without it, uv re-resolves because the
+      # lockfile's exclude-newer stamp (from the operator's global uv config)
+      # is absent on CI runners, silently pulling newer-than-locked packages.
+      # (--locked would hard-fail on the same mismatch; --frozen is correct.)
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen basedpyright
 
   test:
     runs-on: ubuntu-latest
@@ -30,7 +34,7 @@ jobs:
           python-version: "3.12"
       - run: uv sync --dev --frozen
       - name: Run tests
-        run: uv run pytest --cov=metaculus_bot
+        run: uv run --frozen pytest --cov=metaculus_bot
 
   # Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
   # PyPI package), so it runs via Google's published container action rather

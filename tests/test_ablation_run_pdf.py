@@ -2,7 +2,7 @@
 
 ARM_PDF replaces the LLM stacker with deterministic probability-math. For each
 surviving forecaster, it extracts the structured JSON block, computes a
-prediction from the declared math (hazard, Bayes, mixture, fitted distribution,
+prediction from the declared math (hazard, Bayes, fitted distribution,
 option_probs), and aggregates via pointwise median — apples-to-apples with
 ARM_MEDIAN except inputs are structured-math-derived rather than declared answers.
 
@@ -145,20 +145,6 @@ def _mc_reasoning(option_probs: dict[str, float] | None = None) -> str:
     return f"MC reasoning\n\n```json\n{block}\n```"
 
 
-def _numeric_mixture_reasoning(mean_shift: float = 0.0) -> str:
-    block = json.dumps(
-        {
-            "question_type": "numeric",
-            "declared_percentiles": {"0.1": 25.0 + mean_shift, "0.5": 50.0 + mean_shift, "0.9": 75.0 + mean_shift},
-            "mixture_components": [
-                {"weight": 0.6, "mean": 40.0 + mean_shift, "sd": 12.0},
-                {"weight": 0.4, "mean": 60.0 + mean_shift, "sd": 10.0},
-            ],
-        }
-    )
-    return f"Numeric reasoning\n\n```json\n{block}\n```"
-
-
 def _numeric_percentile_reasoning(percentiles: dict[str, float] | None = None) -> str:
     if percentiles is None:
         percentiles = {"0.1": 20.0, "0.5": 50.0, "0.9": 80.0}
@@ -166,7 +152,6 @@ def _numeric_percentile_reasoning(percentiles: dict[str, float] | None = None) -
         {
             "question_type": "numeric",
             "declared_percentiles": percentiles,
-            "distribution_family_hint": "normal",
         }
     )
     return f"Numeric reasoning\n\n```json\n{block}\n```"
@@ -493,43 +478,7 @@ class TestMultipleChoice:
 
 
 # ---------------------------------------------------------------------------
-# Tests: Numeric — mixture components path
-# ---------------------------------------------------------------------------
 
-
-class TestNumericMixture:
-    def test_mixture_produces_201_point_cdf(self, tmp_path: Any) -> None:
-        """Mixture components path produces a valid 201-point CDF."""
-        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid
-
-        cache = AblationCache(str(tmp_path))
-        question = _make_numeric_q(qid=600)
-        payloads = {
-            "model_a": _make_forecaster_payload(
-                _numeric_mixture_reasoning(mean_shift=0.0),
-                prediction_value={"type": "numeric", "cdf_probabilities": [i / 200.0 for i in range(201)]},
-            ),
-            "model_b": _make_forecaster_payload(
-                _numeric_mixture_reasoning(mean_shift=5.0),
-                prediction_value={"type": "numeric", "cdf_probabilities": [i / 200.0 for i in range(201)]},
-            ),
-        }
-        result = asyncio.run(
-            run_pdf_for_qid(
-                qid=600,
-                question=question,
-                forecaster_payloads=payloads,
-                cache=cache,
-                force=False,
-            )
-        )
-        assert result["success"] is True
-        pred = result["stacker_prediction"]
-        assert pred["type"] == "numeric"
-        assert len(pred["cdf_probabilities"]) == 201
-
-
-# ---------------------------------------------------------------------------
 # Tests: Numeric — declared percentiles fitting path
 # ---------------------------------------------------------------------------
 

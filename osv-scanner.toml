@@ -81,3 +81,6 @@ reason = "transformers 4.57.6 pinned transitively under frozen forecasting-tools
 [[IgnoredVulns]]
 id = "GHSA-69w3-r845-3855"
 reason = "transformers 4.57.6 pinned transitively under frozen forecasting-tools==0.2.54; fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-29pf-2h5f-8g72"
+reason = "transformers 4.57.6 RCE requires loading an attacker-controlled model via from_pretrained; transformers is never imported by our code nor by forecasting-tools 0.2.54 (declared-but-unused dep), so unreachable. Pinned transitively under frozen forecasting-tools==0.2.54 (<5.0.0 cap); fix (5.3.0) unreachable until that pin moves"

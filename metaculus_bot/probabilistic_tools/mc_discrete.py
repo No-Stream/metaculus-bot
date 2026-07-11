@@ -70,7 +70,7 @@ def _canonical_percentiles_from_rv(rv) -> dict[float, float]:
 
 
 def negative_binomial_percentiles(mean: float, overdispersion_factor: float) -> dict[float, float]:
-    """Return the 11 canonical percentiles of a Negative Binomial(mean, phi).
+    """Return the standard canonical percentiles of a Negative Binomial(mean, phi).
 
     Special case: when ``mean == 0`` the distribution collapses to a point mass
     at 0, so every canonical percentile is returned as 0.0.

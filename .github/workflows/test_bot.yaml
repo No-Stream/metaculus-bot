@@ -25,7 +25,7 @@ jobs:
         run: uv sync --no-dev --frozen
       - name: Run bot
         run: |
-          uv run --no-dev python main.py --mode test_questions
+          uv run --frozen --no-dev python main.py --mode test_questions
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -47,7 +47,7 @@ jobs:
           # this default in metaculus_bot/__init__.py; pinned here for parity.
           DISABLE_AIOHTTP_TRANSPORT: 'true'
           # Native search runs in parallel with AskNews; model defaults to
-          # openai/gpt-5.5 (medium effort, verbosity=low, 360s) per constants.py.
+          # openai/gpt-5.6-sol (low effort, verbosity=low, 360s) per constants.py.
           NATIVE_SEARCH_ENABLED: 'true'
           FINANCIAL_DATA_ENABLED: 'true'
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -73,6 +73,10 @@ jobs:
           # Manual workflow_dispatch runs use this for end-to-end testing in prod
           # mode (is_benchmarking=False).
           PREDICTION_MARKETS_ENABLED: 'true'
+          # Tier-1 resolution-source fetcher: deterministically fetches URLs cited
+          # in the resolution criteria (plain HTTP + trafilatura), no LLM calls.
+          # test_bot only for now; prod workflows after eyeballing live output.
+          RESOLUTION_SOURCE_ENABLED: 'true'
           # Stacking disabled on all types (ablation: stacker <= median on binary,
           # hurts numeric CRPS; stacker base model is a weak binary forecaster).
           NUMERIC_STACKING_ENABLED: 'false'

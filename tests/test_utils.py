@@ -70,10 +70,14 @@ def test_multiple_choice_prompt_contains_options():
     )
     prompt = multiple_choice_prompt(question, "mc research")
     assert "Who will win?" in prompt
-    # The trailing answer-format example must list real option names so strict
-    # parsers can map the LLM's output directly onto question.options.
-    assert "A: NN%" in prompt
-    assert "B: NN%" in prompt
+    # Post-refactor: the STRUCTURED FORECAST JSON block is the sole per-option
+    # forecast surface; real option names appear as JSON keys so strict parsers
+    # can bind LLM output to question.options. The old trailing "{opt}: NN%"
+    # prose lines are gone.
+    assert '"A"' in prompt
+    assert '"B"' in prompt
+    assert "A: NN%" not in prompt
+    assert "B: NN%" not in prompt
 
 
 def test_numeric_prompt_bounds_and_research():
@@ -100,8 +104,10 @@ def test_numeric_prompt_bounds_and_research():
     assert "widgets" in prompt and "num research" in prompt
 
 
-def test_numeric_prompt_includes_p5_and_p95():
-    """Test that numeric prompt includes P5 and P95 in the output format."""
+def test_numeric_prompt_declared_percentiles_block_has_all_thirteen_keys():
+    """Post-refactor: the numeric prompt's ONLY forecast surface is the
+    STRUCTURED FORECAST JSON block. It must carry all 13 standard percentile
+    keys ("0.01".."0.99") in the declared_percentiles example, in order."""
     question = NumericQuestion(
         id_of_question=5,
         id_of_post=5,
@@ -122,24 +128,19 @@ def test_numeric_prompt_includes_p5_and_p95():
         zero_point=None,
     )
     prompt = numeric_prompt(question, "research", "", "")
-    assert "Percentile 5:" in prompt
-    assert "Percentile 95:" in prompt
-    # Ensure all 11 percentiles are present in order
-    lines = prompt.split("\n")
-    example_section = False
-    percentile_lines = []
-    sentinel_phrases = ("Example:", "Example]")
-    for line in lines:
-        if any(marker in line for marker in sentinel_phrases):
-            example_section = True
-            continue
-        if example_section and "Percentile" in line and ":" in line:
-            percentile_lines.append(line.strip())
 
-    expected_percentiles = ["2.5", "5", "10", "20", "40", "50", "60", "80", "90", "95", "97.5"]
-    assert len(percentile_lines) == len(expected_percentiles)
-    for line, suffix in zip(percentile_lines, expected_percentiles):
-        assert line.startswith(f"Percentile {suffix}:")
+    # Trailing prose "Percentile X: ..." block must be gone entirely.
+    assert "Percentile 5:" not in prompt
+    assert "Percentile 95:" not in prompt
+
+    structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+    expected_keys = ["0.01", "0.025", "0.05", "0.1", "0.2", "0.4", "0.5", "0.6", "0.8", "0.9", "0.95", "0.975", "0.99"]
+    indices = []
+    for key in expected_keys:
+        token = f'"{key}"'
+        assert token in structured_section, f"missing percentile key {token} in declared_percentiles example"
+        indices.append(structured_section.find(token))
+    assert indices == sorted(indices), f"percentile keys out of order: {indices}"
 
 
 # ---------- Numeric utils ---------------------------------------------------

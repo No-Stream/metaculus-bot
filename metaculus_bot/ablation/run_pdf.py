@@ -14,9 +14,8 @@ Per-forecaster prediction cascade:
   4. No fallback to declared ``posterior_prob``. Drop if none apply.
 
 **Numeric** — single path:
-  1. If ``mixture_components`` set: constraint-enforced 201-point CDF via mixture.
-  2. Else if ``declared_percentiles`` set: fit parametric family, build CDF on grid.
-  3. No fallback. Drop if neither parseable.
+  1. If ``declared_percentiles`` set: fit parametric family, build CDF on grid.
+  2. No fallback. Drop if not parseable.
 
 **Multiple choice** — single path:
   1. If ``option_probs`` well-formed (sums ~1): use directly.
@@ -52,11 +51,6 @@ from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviv
 from metaculus_bot.ablation.stage_payload import make_error_payload, make_success_payload
 from metaculus_bot.prob_math_utils import sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
-from metaculus_bot.probabilistic_tools.mixtures import (
-    MixtureComponent,
-    MixtureOfNormals,
-    percentiles_to_metaculus_cdf_via_mixture,
-)
 from metaculus_bot.probabilistic_tools.survival import prob_event_before
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
@@ -165,25 +159,13 @@ def _compute_binary_prediction(block: BinaryStructured) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _compute_numeric_from_mixture(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
-    """Path 1: Build 201-point CDF from declared mixture components."""
-    if block.mixture_components is None:
-        return None
-    if len(block.mixture_components) < 2:
-        return None
-    components = tuple(MixtureComponent(weight=c.weight, mean=c.mean, sd=c.sd) for c in block.mixture_components)
-    mix = MixtureOfNormals(components)
-    return percentiles_to_metaculus_cdf_via_mixture(mix, question)
-
-
-def _compute_numeric_from_percentiles(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
-    """Path 2: Fit parametric family to declared percentiles, build CDF on grid."""
-    from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
-    from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
-    from metaculus_bot.probabilistic_tools.distributions import (
+def _compute_numeric_prediction(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
+    """Numeric: fit parametric family to declared percentiles, build CDF on grid. None = drop."""
+    from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS  # noqa: PLC0415
+    from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
+    from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
         FitType,
         eval_cdf,
-        fit_lognormal_from_percentiles,
         fit_normal_from_percentiles,
         fit_student_t_from_percentiles,
     )
@@ -192,22 +174,17 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     if not percentiles or len(percentiles) < 2:
         return None
 
-    hint = block.distribution_family_hint
+    # Without distribution_family_hint, default to student-t (df=5) as a
+    # robust fallback that handles both normal-ish and heavy-tailed cases.
     fit: FitType | None = None
     try:
-        if hint == "lognormal":
-            if all(v > 0 for v in percentiles.values()):
-                fit = fit_lognormal_from_percentiles(percentiles)
-            else:
-                fit = fit_student_t_from_percentiles(percentiles, df=block.student_t_df or 5.0)
-        elif hint == "normal":
-            fit = fit_normal_from_percentiles(percentiles)
-        else:
-            df = block.student_t_df if block.student_t_df is not None else 5.0
-            fit = fit_student_t_from_percentiles(percentiles, df=df)
+        fit = fit_student_t_from_percentiles(percentiles, df=5.0)
     except (ValueError, RuntimeError):
-        logger.debug("Parametric fit failed for numeric block; dropping forecaster")
-        return None
+        try:
+            fit = fit_normal_from_percentiles(percentiles)
+        except (ValueError, RuntimeError):
+            logger.debug("Parametric fit failed for numeric block; dropping forecaster")
+            return None
 
     if fit is None:
         return None
@@ -220,8 +197,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
 
     grid = np.linspace(lower, upper, num_points)
     cdf_values = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
-
-    from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP
 
     hi_cap = 0.999 if open_upper else 1.0
     lo_cap = 0.001 if open_lower else 0.0
@@ -238,14 +213,6 @@ def _compute_numeric_from_percentiles(block: NumericStructured, question: Numeri
     cdf_values = safe_cdf_bounds(cdf_values, open_lower, open_upper)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf_values[i])) for i in range(num_points)]
-
-
-def _compute_numeric_prediction(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
-    """Numeric cascade: mixture > percentile fit. None = drop."""
-    result = _compute_numeric_from_mixture(block, question)
-    if result is not None:
-        return result
-    return _compute_numeric_from_percentiles(block, question)
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 _HAZARD_FRACTION_TOLERANCE = 0.01
 _SCENARIO_PROB_SUM_TOLERANCE = 0.02
 _MC_OPTION_PROB_SUM_TOLERANCE = 0.02
-_TAIL_MASS_SUM_CEILING = 0.5
 _REQUIRED_NUMERIC_PERCENTILES: frozenset[float] = frozenset({0.1, 0.5, 0.9})
 # Defensive cap on raw structured-block size. Legitimate blocks are <5KB;
 # larger payloads likely indicate a malformed rationale (e.g., an unclosed
@@ -147,37 +146,39 @@ class ScenarioBranch(BaseModel):
     conditional_outcome: str | None = None
 
 
-class MixtureComponentDeclaration(BaseModel):
-    """Mixture-of-normals component.
+class BaseRateAnchor(BaseModel):
+    """The forecaster's stated outside-view base-rate range (telemetry only).
 
-    Weights across all components in a NumericStructured must sum to 1.0
-    within 1e-3 tolerance (checked at ``NumericStructured`` level).
+    Consumed by the anchor-overshoot telemetry in ``tool_runner``: the signed
+    pp distance of the declared posterior outside [low, high]. Never used to
+    clamp or mutate a forecast — the 2026-07 residual experiments showed
+    anchor-guard clamping sign-flips across eras, while overshoot >15pp
+    monotonically degrades Brier, so we measure and log only.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    weight: float = Field(ge=0.0)
-    mean: float
-    sd: float = Field(gt=0.0)
+    low: float = Field(ge=0.0, le=1.0)
+    high: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> BaseRateAnchor:
+        if self.low > self.high:
+            raise ValueError(f"BaseRateAnchor requires low <= high, got low={self.low}, high={self.high}")
+        return self
 
 
-class TailMass(BaseModel):
-    """Declared mass outside the question's declared numeric range."""
+class CriteriaClause(BaseModel):
+    """One priced resolution clause from the conjunctive-criteria table (telemetry only).
+
+    The product of clause probabilities is compared against the declared
+    posterior by ``tool_runner``; divergence is logged, never enforced.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    below_min_expected: float = Field(ge=0.0, le=1.0)
-    above_max_expected: float = Field(ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def _check_sum(self) -> TailMass:
-        total = self.below_min_expected + self.above_max_expected
-        if total >= _TAIL_MASS_SUM_CEILING:
-            raise ValueError(
-                f"TailMass sum must be < {_TAIL_MASS_SUM_CEILING}, got {total} "
-                f"(below_min_expected={self.below_min_expected}, above_max_expected={self.above_max_expected})"
-            )
-        return self
+    name: str = Field(min_length=1)
+    prob: float = Field(ge=0.0, le=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +214,10 @@ class BinaryStructured(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     posterior_prob: float = Field(ge=0.0, le=1.0)
+    # Telemetry-only optional fields (2026-07-08): stated outside-view range and
+    # priced resolution clauses. Old blocks without them must keep parsing.
+    base_rate_anchor: BaseRateAnchor | None = None
+    criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
 
     @field_validator("scenarios")
     @classmethod
@@ -227,45 +232,13 @@ class NumericStructured(BaseModel):
 
     question_type: Literal["numeric"]
     prior: StatedPrior | None = None
-    # Optional ONLY when a valid mixture_components is present (enforced by
-    # _require_percentiles_or_mixture). A percentile-only block must still
-    # supply this with p10/p50/p90 + strictly-increasing values.
     declared_percentiles: dict[float, float] | None = None
-    distribution_family_hint: Literal["normal", "lognormal", "student_t", "skew_normal", "beta", "other"] | None = None
-    student_t_df: float | None = None
-    tails: TailMass | None = None
+    outcome_type: Literal["discrete_integer", "continuous"] | None = None
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
-    mixture_components: list[MixtureComponentDeclaration] | None = None
-
-    @field_validator("mixture_components")
-    @classmethod
-    def _check_mixture_components(
-        cls, v: list[MixtureComponentDeclaration] | None
-    ) -> list[MixtureComponentDeclaration] | None:
-        if v is None:
-            return None
-        if len(v) < 2:
-            raise ValueError(f"mixture_components requires at least 2 components (got {len(v)})")
-        total = sum(c.weight for c in v)
-        if not (0.999 <= total <= 1.001):
-            raise ValueError(f"mixture_components weights must sum to 1.0 within 1e-3, got {total}")
-        return v
-
-    @field_validator("student_t_df")
-    @classmethod
-    def _check_df(cls, v: float | None) -> float | None:
-        if v is not None and v <= 1:
-            raise ValueError(f"NumericStructured.student_t_df must be > 1 if set, got {v}")
-        return v
 
     @field_validator("declared_percentiles")
     @classmethod
     def _check_percentiles(cls, v: dict[float, float] | None) -> dict[float, float] | None:
-        # None / empty is allowed here so a mixture-only block can omit
-        # declared_percentiles entirely. The "at least one of percentiles or
-        # mixture" requirement is enforced by _require_percentiles_or_mixture.
-        # When percentiles ARE supplied, the full p10/p50/p90 + monotonic
-        # contract still applies.
         if not v:
             return v
         missing = _REQUIRED_NUMERIC_PERCENTILES - set(v.keys())
@@ -290,18 +263,10 @@ class NumericStructured(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _require_percentiles_or_mixture(self) -> NumericStructured:
-        # numeric_prompt OPTION B lets a model emit only a mixture and omit the
-        # percentile lines. By the time this runs, _check_mixture_components has
-        # already guaranteed mixture_components is None or a valid (>=2 comps,
-        # weights ~1.0) list, and _check_percentiles has enforced the p10/p50/p90
-        # contract on any supplied percentiles. So we only need to reject the
-        # block where BOTH are absent — nothing to build a CDF from.
-        if not self.declared_percentiles and self.mixture_components is None:
+    def _require_percentiles(self) -> NumericStructured:
+        if not self.declared_percentiles:
             raise ValueError(
-                "NumericStructured requires either declared_percentiles (with at least "
-                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}) or a valid mixture_components "
-                "(>=2 components, weights summing to ~1.0); both were absent"
+                f"NumericStructured requires declared_percentiles with at least {sorted(_REQUIRED_NUMERIC_PERCENTILES)}"
             )
         return self
 
@@ -489,40 +454,36 @@ def extract_first_balanced_braces(s: str) -> str | None:
     return None
 
 
-def parse_structured_block(
-    rationale_text: str,
+def parse_structured_payload(
+    raw_json: str,
     question_type: Literal["binary", "numeric", "multiple_choice"],
 ) -> StructuredBlock | None:
     """
-    Extract and validate a structured JSON block from a rationale.
+    Validate a raw JSON payload string against the structured-block schemas.
 
-    Returns the parsed Pydantic model or None. None on:
-      - No fenced JSON block (logged at DEBUG)
-      - Malformed JSON (logged at WARNING)
-      - Pydantic validation error (logged at WARNING)
-      - question_type mismatch between argument and JSON payload (WARNING)
+    Callers that already have the block body in hand (e.g. after
+    ``extract_json_block`` or a ``json_repair`` pass) use this to run the
+    size cap, ``json.loads``, dict-shape check, ``question_type`` inject /
+    mismatch guard, and Pydantic ``model_validate`` (including the binary
+    telemetry strip-and-retry). Returns ``None`` on any failure; the calling
+    ladder decides how to log and whether to fall through to the next rung.
 
     ``"discrete_count"`` is intentionally unsupported at runtime — see the
     module docstring.
     """
-    raw = extract_json_block(rationale_text)
-    if raw is None:
-        logger.debug("No JSON block found in rationale for question_type=%s", question_type)
-        return None
-
-    if len(raw) > _MAX_STRUCTURED_BLOCK_BYTES:
+    if len(raw_json) > _MAX_STRUCTURED_BLOCK_BYTES:
         logger.warning(
             "Structured block exceeds size cap (%d bytes > %d); refusing to parse (question_type=%s)",
-            len(raw),
+            len(raw_json),
             _MAX_STRUCTURED_BLOCK_BYTES,
             question_type,
         )
         return None
 
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        snippet = raw[:200].replace("\n", " ")
+        snippet = raw_json[:200].replace("\n", " ")
         logger.warning(
             "Malformed JSON in structured block (question_type=%s): %s. Snippet: %s", question_type, exc, snippet
         )
@@ -553,9 +514,66 @@ def parse_structured_block(
     try:
         return model_cls.model_validate(payload)  # type: ignore[return-value]
     except ValidationError as exc:
+        # Strip-and-retry for malformed BINARY telemetry (2026-07-08). The
+        # ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY
+        # ONLY — nothing in the pipeline reads them to clamp or mutate a
+        # forecast. But without this branch, a malformed anchor / clauses
+        # payload (canonical failure modes: ``criteria_clauses: null`` even
+        # though the prompt says "omit"; a reversed ``{low > high}`` anchor)
+        # would make us drop the ENTIRE block — including a perfectly good
+        # posterior_prob — silently disappearing the forecaster's base-rate
+        # blend and prior/posterior contributions from the cross-model
+        # aggregation. That would let a pure formatting bug in a telemetry
+        # field shift stacker input, violating the telemetry rollout's
+        # zero-behavior-change invariant.
+        #
+        # NOT a schema-wide before-validator: those silently coerce bad
+        # clause probs and miss the reversed-anchor case. Retry with only
+        # the telemetry fields dropped, so any error in a core field
+        # (posterior_prob, prior, base_rate, hazard, evidence, scenarios)
+        # still surfaces via the None return.
+        _TELEMETRY_FIELDS = {"base_rate_anchor", "criteria_clauses"}
+        if question_type == "binary" and _TELEMETRY_FIELDS & payload.keys():
+            stripped_keys = sorted(_TELEMETRY_FIELDS & payload.keys())
+            stripped_payload = {k: v for k, v in payload.items() if k not in _TELEMETRY_FIELDS}
+            try:
+                retry = model_cls.model_validate(stripped_payload)  # type: ignore[assignment]
+            except ValidationError:
+                pass
+            else:
+                logger.warning(
+                    "Dropping malformed telemetry fields %s and keeping core binary block (original error: %s)",
+                    stripped_keys,
+                    exc,
+                )
+                return retry  # type: ignore[return-value]
         logger.warning(
             "Structured block failed validation for question_type=%s: %s",
             question_type,
             exc,
         )
         return None
+
+
+def parse_structured_block(
+    rationale_text: str,
+    question_type: Literal["binary", "numeric", "multiple_choice"],
+) -> StructuredBlock | None:
+    """
+    Extract and validate a structured JSON block from a rationale.
+
+    Returns the parsed Pydantic model or None. None on:
+      - No fenced JSON block (logged at INFO)
+      - Malformed JSON (logged at WARNING)
+      - Pydantic validation error (logged at WARNING)
+      - question_type mismatch between argument and JSON payload (WARNING)
+
+    ``"discrete_count"`` is intentionally unsupported at runtime — see the
+    module docstring.
+    """
+    raw = extract_json_block(rationale_text)
+    if raw is None:
+        logger.info("No JSON block found in rationale for question_type=%s", question_type)
+        return None
+
+    return parse_structured_payload(raw, question_type)

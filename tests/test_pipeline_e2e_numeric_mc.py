@@ -1,7 +1,7 @@
 """End-to-end pipeline tests for numeric and multiple-choice question types.
 
 Exercises the full _research_and_make_predictions flow for numeric (percentile
-branch, mixture branch, discrete snap, unit mismatch, high-spread stacking)
+branch, discrete snap, unit mismatch, high-spread stacking)
 and MC (low-spread median, clamping/renorm, high-spread stacking) questions.
 Also tests cross-cutting batch behavior and comment markers.
 """
@@ -131,8 +131,8 @@ def _make_bot(n_forecasters: int = 3, strategy: AggregationStrategy = Aggregatio
 
 
 def _numeric_percentiles(median: float, scale: float = 1.0, bounds: tuple[float, float] = (0.0, 20.0)):
-    """Build 11 standard percentiles centered on `median`."""
-    offsets = [-3.5, -3.0, -2.5, -1.8, -0.5, 0.0, 0.5, 1.8, 2.5, 3.0, 3.5]
+    """Build 13 standard percentiles centered on `median`."""
+    offsets = [-4.0, -3.5, -3.0, -2.5, -1.8, -0.5, 0.0, 0.5, 1.8, 2.5, 3.0, 3.5, 4.0]
     lo, hi = bounds
     return [
         Percentile(percentile=pct, value=max(lo + 0.01, min(hi - 0.01, median + off * scale)))
@@ -187,7 +187,7 @@ def _mc_option_list(probs: list[float], options: list[str] | None = None) -> Pre
 
 
 class TestNumericPercentileBranch:
-    """Numeric question through the standard 11-percentile path produces a valid CDF."""
+    """Numeric question through the standard 13-percentile path produces a valid CDF."""
 
     @pytest.mark.asyncio
     @pytest.mark.e2e
@@ -230,78 +230,6 @@ class TestNumericPercentileBranch:
         assert isinstance(aggregated, NumericDistribution)
 
         cdf_points = aggregated.cdf
-        assert len(cdf_points) == 201
-
-        prob_values = [p.percentile for p in cdf_points]
-        for i in range(len(prob_values) - 1):
-            assert prob_values[i] <= prob_values[i + 1], f"CDF not monotonic at index {i}"
-
-        assert prob_values[0] >= 0.001
-        assert prob_values[-1] <= 0.999
-
-        for i in range(len(prob_values) - 1):
-            step = prob_values[i + 1] - prob_values[i]
-            assert step >= 5e-5 - 1e-10, f"Min step violation at index {i}: step={step}"
-
-
-class TestNumericMixtureBranch:
-    """Numeric question through the mixture-of-normals path produces a valid CDF."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.e2e
-    async def test_numeric_mixture_branch_produces_valid_cdf(self):
-        bot = _make_bot(n_forecasters=1, strategy=AggregationStrategy.MEDIAN)
-        bot.min_forecasters_to_publish = 1
-        question = _make_numeric_question()
-
-        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-        from metaculus_bot.probabilistic_tools.mixtures import (
-            MixtureComponent,
-            MixtureOfNormals,
-            percentiles_to_metaculus_cdf_via_mixture,
-        )
-
-        mixture = MixtureOfNormals(
-            components=(
-                MixtureComponent(weight=0.6, mean=5.0, sd=1.5),
-                MixtureComponent(weight=0.4, mean=8.0, sd=2.0),
-            )
-        )
-        cdf_percentiles = percentiles_to_metaculus_cdf_via_mixture(mixture, question)
-        cdf_values = [float(p.percentile) for p in cdf_percentiles]
-
-        declared = []
-        for target_pct in STANDARD_PERCENTILES:
-            hit = next((p for p in cdf_percentiles if p.percentile >= target_pct), cdf_percentiles[-1])
-            declared.append(Percentile(percentile=target_pct, value=float(hit.value)))
-
-        prediction_dist = create_pchip_numeric_distribution(cdf_values, declared, question, zero_point=None)
-
-        prediction = ReasonedPrediction(
-            prediction_value=prediction_dist,
-            reasoning="Model: m1\n\nMixture branch output",
-        )
-
-        with (
-            patch.object(bot, "_get_notepad") as mock_notepad,
-            patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
-            patch.object(
-                bot,
-                "_forecaster_with_soft_deadline",
-                new=AsyncMock(return_value=prediction),
-            ),
-        ):
-            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = ([prediction], [], None)
-
-            result = await bot._research_and_make_predictions(question)
-
-        assert len(result.predictions) == 1
-        dist = result.predictions[0].prediction_value
-        assert isinstance(dist, NumericDistribution)
-
-        cdf_points = dist.cdf
         assert len(cdf_points) == 201
 
         prob_values = [p.percentile for p in cdf_points]

@@ -7,6 +7,8 @@ warning could be deleted from a prompt and no test would catch it —
 backtest scores would silently get polluted with prediction-market data.
 """
 
+import json
+import re
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -314,25 +316,32 @@ class TestForecastingWindowAnchor:
 
 
 class TestMcPromptInterpolatesRealOptionNames:
-    """Strict parsers (e.g. gemma-4-31b-it) refuse to map literal ``Option_A: NN%``
+    """Strict parsers (e.g. gemma-4-31b-it) refuse to map literal ``Option_A``
     placeholders onto real option names in the allowed-list — they correctly
     emit ``<<NOT_FOUND>>`` because the prompt example does not contain anything
     semantically tied to the question's actual options.
 
-    Fix: the example block in both ``multiple_choice_prompt`` and
-    ``stacking_multiple_choice_prompt`` must interpolate the real option names
-    so the LLM emits text the parser can directly recognize.
+    Fix: the STRUCTURED FORECAST JSON block in both ``multiple_choice_prompt``
+    and ``stacking_multiple_choice_prompt`` must use the REAL option names as
+    JSON keys so the LLM emits text the parser can directly recognize.
+
+    Post-refactor: the trailing prose "{opt}: NN%" answer lines are gone;
+    ``option_probs`` in the JSON block is the sole forecast surface.
     """
 
-    def test_stacking_mc_prompt_emits_real_option_names(self) -> None:
+    def test_stacking_mc_prompt_emits_real_option_names_in_json_block(self) -> None:
         q = _mc_q()
         q.options = ["Apple", "Banana", "Cherry"]
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
-        assert "Apple: NN%" in result
-        assert "Banana: NN%" in result
-        assert "Cherry: NN%" in result
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        for opt in ("Apple", "Banana", "Cherry"):
+            assert f'"{opt}"' in structured_section, f"option {opt!r} missing from option_probs JSON example"
+        # Trailing prose per-option lines must be gone.
+        assert "Apple: NN%" not in result
+        assert "Banana: NN%" not in result
+        assert "Cherry: NN%" not in result
 
     def test_stacking_mc_prompt_drops_literal_option_a_b_placeholders(self) -> None:
         q = _mc_q()
@@ -340,19 +349,26 @@ class TestMcPromptInterpolatesRealOptionNames:
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
+        assert '"Option_A"' not in result
+        assert '"Option_B"' not in result
+        assert '"Option_N"' not in result
+        # Also the old prose placeholders.
         assert "Option_A: NN%" not in result
         assert "Option_B: NN%" not in result
         assert "Option_N: NN%" not in result
 
-    def test_multiple_choice_prompt_emits_real_option_names(self) -> None:
+    def test_multiple_choice_prompt_emits_real_option_names_in_json_block(self) -> None:
         q = _mc_q()
         q.options = ["Apple", "Banana", "Cherry"]
 
         result = multiple_choice_prompt(q, research="r")
 
-        assert "Apple: NN%" in result
-        assert "Banana: NN%" in result
-        assert "Cherry: NN%" in result
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        for opt in ("Apple", "Banana", "Cherry"):
+            assert f'"{opt}"' in structured_section, f"option {opt!r} missing from option_probs JSON example"
+        assert "Apple: NN%" not in result
+        assert "Banana: NN%" not in result
+        assert "Cherry: NN%" not in result
 
     def test_multiple_choice_prompt_drops_literal_option_a_b_placeholders(self) -> None:
         q = _mc_q()
@@ -360,26 +376,27 @@ class TestMcPromptInterpolatesRealOptionNames:
 
         result = multiple_choice_prompt(q, research="r")
 
-        # Note: the JSON schema example block still uses Option_A/B/C as JSON
-        # keys to illustrate the mapping shape; that's fine. What we don't want
-        # is the literal "Option_A: NN%" answer-line example, since that's the
-        # text the parser actually has to map onto real option names.
+        # No literal "Option_A" placeholders anywhere — not in the JSON block
+        # (real option names go there), not in prose (prose forecast lines gone).
+        assert '"Option_A"' not in result
+        assert '"Option_B"' not in result
+        assert '"Option_N"' not in result
         assert "Option_A: NN%" not in result
         assert "Option_B: NN%" not in result
         assert "Option_N: NN%" not in result
 
-    def test_stacking_mc_prompt_preserves_options_in_order(self) -> None:
-        """The example answer lines must list options in the same order as
-        ``question.options`` — the trailing answer lines downstream rely on
-        that ordering to carry into the LLM's output."""
+    def test_stacking_mc_prompt_preserves_options_in_order_in_json_block(self) -> None:
+        """The JSON-block ``option_probs`` example must list options in the same
+        order as ``question.options`` — a strict parser matching on positional
+        alignment depends on that ordering."""
         q = _mc_q()
         q.options = ["Manufacturing PMI higher", "Services PMI higher", "Equal"]
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
-        idx_mfg = result.find("Manufacturing PMI higher: NN%")
-        idx_svc = result.find("Services PMI higher: NN%")
-        idx_eq = result.find("Equal: NN%")
+        idx_mfg = result.find('"Manufacturing PMI higher"')
+        idx_svc = result.find('"Services PMI higher"')
+        idx_eq = result.find('"Equal"')
         assert idx_mfg >= 0
         assert idx_svc >= 0
         assert idx_eq >= 0
@@ -552,3 +569,237 @@ class TestSourceProvenanceLadder:
         lowered = " ".join(result.lower().split())
         assert "most recent authoritative measurement" in lowered
         assert "centered near this value" in lowered
+
+
+class TestStatusQuoDerivation:
+    """Every forecaster prompt must open PHASE 0 with a mandatory status-quo
+    DERIVATION — a question the model answers itself before reviewing any
+    research — not a rule/warning. Rules-as-warnings get argued away as
+    boilerplate (qid 42024: 4/5 models dismissed the "not yet satisfied"
+    line); a derivation the model writes in its own words is stickier."""
+
+    def _assert_derivation_present(self, prompt: str) -> None:
+        lowered = " ".join(prompt.lower().split())
+        assert "status-quo derivation" in lowered
+        # The model must state the platform-state premise in its own words...
+        assert "open and unresolved as of" in lowered
+        # ...with today's date interpolated so the statement is concrete.
+        assert datetime.now().strftime("%Y-%m-%d") in prompt
+        # Moving off the status quo requires naming a post-open trigger.
+        assert "post-open event" in lowered
+        # And an explicit commitment about the window.
+        assert "no qualifying event has yet occurred inside the window" in lowered
+
+    def _assert_derivation_before_outside_view(self, prompt: str) -> None:
+        idx_derivation = prompt.find("Status-quo derivation")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert idx_derivation >= 0
+        assert idx_phase1 >= 0
+        assert idx_derivation < idx_phase1, "status-quo derivation must come before the outside view"
+
+    def test_binary_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+        # In binary, the derivation must be the TOP of PHASE 0 — before the resolution check.
+        assert prompt.find("Status-quo derivation") < prompt.find("Resolution check")
+
+    def test_multiple_choice_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = multiple_choice_prompt(_mc_q(), research="r")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+
+    def test_numeric_prompt_has_status_quo_derivation_first(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_derivation_present(prompt)
+        self._assert_derivation_before_outside_view(prompt)
+
+    def test_binary_resolution_check_retained_after_derivation(self) -> None:
+        """Regression: adding the derivation must not displace the 0a resolution
+        check or the 0b decomposition."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        assert "Resolution check" in prompt
+        assert "Resolution decomposition" in prompt
+
+
+class TestConjunctiveCriteriaPricing:
+    """Change #2: the binary prompt upgrades the qualitative Boolean-product
+    decomposition with a NUMERIC pricing table — placed LATE in the flow
+    (after evidence review and red-team) so the red-team can causally affect
+    the clause probabilities. PHASE 0b keeps only the qualitative listing."""
+
+    def test_binary_prompt_has_pricing_table_section(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert "conjunctive criteria pricing" in lowered
+        assert "one row per resolution clause" in lowered
+        assert "product" in lowered
+
+    def test_pricing_table_comes_after_red_team_and_before_final_rationale(self) -> None:
+        """ORDERING IS LOAD-BEARING: clause numbers must be emitted after the
+        red-team/bear-bull section so red-teaming can move them, and before
+        the final rationale that reconciles against the product."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        idx_red_team = prompt.find("Red-team both")
+        idx_pricing = prompt.find("Conjunctive criteria pricing")
+        idx_final = prompt.find("Final rationale and calibration")
+        assert 0 <= idx_red_team < idx_pricing < idx_final
+
+    def test_phase0b_keeps_listing_but_defers_numbers(self) -> None:
+        """PHASE 0b still lists/structures the clauses (early structure
+        identification is fine) but must explicitly defer the probabilities
+        to the late pricing step."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        assert "Resolution decomposition" in prompt
+        assert "Boolean product" in prompt
+        lowered = " ".join(prompt.lower().split())
+        assert "do not assign probabilities to the clauses yet" in lowered
+        # The deferral must appear inside 0b, i.e. before PHASE 1.
+        idx_defer = prompt.find("Do NOT assign probabilities to the clauses yet")
+        assert 0 <= idx_defer < prompt.find("PHASE 1")
+
+    def test_reconciliation_requires_named_clause_dependence(self) -> None:
+        """pgodzinai 42855 failure mode: a computed clause product coexisting
+        with free-form narrative adjustment gets nullified (82% computed →
+        87% via 'season-specific upward adjustment'). Any deviation from the
+        product must operate through the clause probabilities themselves or a
+        named clause dependence; overrides that route around the clauses are
+        explicitly forbidden."""
+        prompt = binary_prompt(_binary_q(), research="r")
+        lowered = " ".join(prompt.lower().split())
+        assert "you have exactly two valid moves" in lowered
+        assert "revise the clause probabilities themselves and recompute" in lowered
+        assert "name a specific dependence between clauses" in lowered
+        assert (
+            "all hedging and adjustment must operate through the clause probabilities or their dependence, "
+            "not around them" in lowered
+        )
+        assert "if neither applies, stay at the product" in lowered
+
+
+class TestNumericPromptThirteenPercentiles:
+    """The numeric prompts must document all 13 standard percentile keys in
+    the STRUCTURED FORECAST JSON schema example (P1 first, P99 last) and
+    never tell the model to emit exactly 11.
+
+    Post-refactor: the ONLY forecast surface is ``declared_percentiles`` in the
+    JSON block — the old trailing "Percentile X: [value]" prose lines are gone.
+    We assert on the JSON-key form ("0.01" .. "0.99")."""
+
+    _PERCENTILE_KEYS = (
+        "0.01",
+        "0.025",
+        "0.05",
+        "0.1",
+        "0.2",
+        "0.4",
+        "0.5",
+        "0.6",
+        "0.8",
+        "0.9",
+        "0.95",
+        "0.975",
+        "0.99",
+    )
+
+    def test_numeric_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        indices = []
+        for key in self._PERCENTILE_KEYS:
+            token = f'"{key}"'
+            assert token in structured_section, f"missing percentile key {token} in declared_percentiles example"
+            indices.append(structured_section.find(token))
+        # Keys appear in the declared order: 0.01 < 0.025 < ... < 0.99.
+        assert indices == sorted(indices), f"percentile keys out of order: {indices}"
+        # No trailing prose "Percentile 1: [value]" block anywhere.
+        assert "Percentile 1:" not in result
+        assert "Percentile 99:" not in result
+
+    def test_numeric_prompt_says_13_not_11(self) -> None:
+        result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        lowered = " ".join(result.lower().split())
+        assert "all 13 percentiles" in lowered or "all 13 standard" in lowered
+        assert "13 standard percentiles" in lowered
+        assert "11 percentiles" not in lowered
+        assert "11 standard percentiles" not in lowered
+
+    def test_stacking_numeric_prompt_says_13_not_11(self) -> None:
+        result = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        lowered = " ".join(result.lower().split())
+        assert "all 13 percentiles" in lowered or "all 13 standard" in lowered
+        assert "11 percentiles" not in lowered
+
+    def test_stacking_numeric_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
+        result = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        indices = []
+        for key in self._PERCENTILE_KEYS:
+            token = f'"{key}"'
+            assert token in structured_section, (
+                f"missing percentile key {token} in stacking declared_percentiles example"
+            )
+            indices.append(structured_section.find(token))
+        assert indices == sorted(indices), f"stacking percentile keys out of order: {indices}"
+        # No trailing prose "Percentile 1: [value]" block.
+        assert "Percentile 1:" not in result
+        assert "Percentile 99:" not in result
+
+
+class TestOptionProbsExampleJsonValidity:
+    """The MC schema example is the forecaster's authoritative template — it must
+    be VALID JSON for any real option names, including ones carrying quotes,
+    backslashes, or newlines (F2). A naive f-string concat emitted invalid JSON
+    for those and silently taught the model a broken schema."""
+
+    @staticmethod
+    def _extract_last_json_block(prompt: str) -> str:
+        blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)
+        assert blocks, "no fenced json block found in prompt"
+        return blocks[-1]
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ['He said "yes"', r"C:\Windows", "Option C"],
+            ["Line\nbreak", "Plain"],
+        ],
+    )
+    def test_mc_prompt_block_example_parses_for_special_char_options(self, options: list[str]) -> None:
+        q = _mc_q()
+        q.options = options
+        prompt = multiple_choice_prompt(q, research="r")
+        body = self._extract_last_json_block(prompt)
+        parsed = json.loads(body)
+        assert list(parsed["option_probs"].keys()) == options
+
+    def test_stacking_mc_prompt_block_example_parses_for_special_char_options(self) -> None:
+        options = ['He said "yes"', r"C:\Windows", "Option C"]
+        q = _mc_q()
+        q.options = options
+        prompt = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1"])
+        body = self._extract_last_json_block(prompt)
+        parsed = json.loads(body)
+        assert list(parsed["option_probs"].keys()) == options
+
+    def test_example_probs_valid_for_large_option_count(self) -> None:
+        options = [f"Bucket {i}" for i in range(12)]
+        q = _mc_q()
+        q.options = options
+        prompt = multiple_choice_prompt(q, research="r")
+        parsed = json.loads(self._extract_last_json_block(prompt))
+        probs = list(parsed["option_probs"].values())
+        assert sum(probs) == pytest.approx(1.0, abs=0.02)
+        assert all(0.0 < p < 1.0 for p in probs)
