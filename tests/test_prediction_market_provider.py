@@ -151,6 +151,9 @@ def polymarket_payload():
                         "volume24hr": 12500.0,
                         "bestBid": 0.73,
                         "bestAsk": 0.75,
+                        "volumeNum": 987654.0,
+                        "liquidityNum": 45000.0,
+                        "openInterest": 60000.0,
                     }
                 ],
             },
@@ -182,6 +185,9 @@ def manifold_payload():
             "creatorUsername": "spaceFan",
             "probability": 0.62,
             "volume24Hours": 500.0,
+            "volume": 8200.0,
+            "totalLiquidity": 1500.0,
+            "uniqueBettorCount": 42,
             "closeTime": 1782086400000,  # ms: 2026-06-20
             "textDescription": "YES if SpaceX Starship reaches orbit before July 1 2026.",
             "isResolved": False,
@@ -206,6 +212,9 @@ def kalshi_events_payload():
                         "yes_bid_dollars": "0.68",
                         "yes_ask_dollars": "0.72",
                         "volume_24h_fp": "2500.0",
+                        "volume": 82000.0,
+                        "open_interest": 15000.0,
+                        "liquidity_dollars": 9000.0,
                         "close_time": "2026-12-31T23:59:59Z",
                     }
                 ],
@@ -217,6 +226,56 @@ def kalshi_events_payload():
             },
         ],
         "cursor": "",
+    }
+
+
+@pytest.fixture
+def predictit_payload():
+    """PredictIt /api/marketdata/all/ shape (verified live). US-politics only,
+    no volume/liquidity/OI fields anywhere."""
+    return {
+        "markets": [
+            {
+                "id": 7456,
+                "name": "Will SpaceX Starship reach orbit before July 2026?",
+                "shortName": "Starship orbit 2026",
+                "url": "https://www.predictit.org/markets/detail/7456/starship-orbit",
+                "contracts": [
+                    {
+                        "id": 100,
+                        "name": "Yes",
+                        "shortName": "Yes",
+                        "lastTradePrice": 0.58,
+                        "bestBuyYesCost": 0.59,
+                        "bestBuyNoCost": 0.42,
+                        "lastClosePrice": 0.57,
+                        "status": "Open",
+                    }
+                ],
+            },
+            {
+                "id": 7999,
+                "name": "Unrelated 2028 primary market",
+                "shortName": "2028 primary",
+                "url": "https://www.predictit.org/markets/detail/7999/2028-primary",
+                "contracts": [
+                    {
+                        "id": 200,
+                        "name": "Candidate A",
+                        "shortName": "A",
+                        "lastTradePrice": 0.25,
+                        "status": "Open",
+                    },
+                    {
+                        "id": 201,
+                        "name": "Candidate B",
+                        "shortName": "B",
+                        "lastTradePrice": 0.20,
+                        "status": "Open",
+                    },
+                ],
+            },
+        ]
     }
 
 
@@ -241,6 +300,11 @@ class TestPolymarket:
         assert top.market_url.startswith("https://polymarket.com/")
         assert top.bid == pytest.approx(0.73)
         assert top.ask == pytest.approx(0.75)
+        # Previously-discarded liquidity fields now populate from volumeNum / liquidityNum / openInterest.
+        assert top.total_volume == pytest.approx(987654.0)
+        assert top.liquidity == pytest.approx(45000.0)
+        assert top.open_interest == pytest.approx(60000.0)
+        assert top.num_bettors is None  # not a Polymarket concept
 
     @pytest.mark.asyncio
     async def test_match_confidence_is_nonzero_for_strong_match(self, polymarket_payload):
@@ -339,6 +403,10 @@ class TestKalshi:
         assert top.implied_prob_yes == pytest.approx(0.70, abs=0.01)
         assert top.market_url.startswith("https://kalshi.com/")
         assert "orbital velocity" in top.raw_rules.lower()
+        # Previously-discarded liquidity fields now populate from volume / open_interest / liquidity_dollars.
+        assert top.total_volume == pytest.approx(82000.0)
+        assert top.open_interest == pytest.approx(15000.0)
+        assert top.liquidity == pytest.approx(9000.0)
 
     @pytest.mark.asyncio
     async def test_prefetch_handles_http_error(self, caplog):
@@ -410,6 +478,10 @@ class TestManifold:
         assert m.implied_prob_yes == pytest.approx(0.62)
         assert "Starship" in m.market_title
         assert m.is_resolved is False
+        # Previously-discarded participation fields now populate from volume / totalLiquidity / uniqueBettorCount.
+        assert m.total_volume == pytest.approx(8200.0)
+        assert m.liquidity == pytest.approx(1500.0)
+        assert m.num_bettors == 42
 
     @pytest.mark.asyncio
     async def test_non_list_payload_returns_empty(self, caplog):
@@ -433,6 +505,178 @@ class TestManifold:
         assert len(matches) == 1
         # Title is "Will Starship reach orbit before July 2026?" — strong overlap.
         assert matches[0].match_confidence > 0.5
+
+    def test_rules_fallback_to_description_tiptap_doc(self):
+        """3b: the search endpoint often omits `textDescription`; the rich body
+        lives in the `description` TipTap/ProseMirror doc. `raw_rules` must fall
+        back to the flattened text-node content, not an empty string."""
+        from metaculus_bot.research.prediction_market import _parse_manifold_matches
+
+        payload = [
+            {
+                "id": "xyz",
+                "question": "Will the Fed cut rates in Q3?",
+                "slug": "fed-cut-q3",
+                "creatorUsername": "econWatcher",
+                "probability": 0.4,
+                # textDescription absent (or empty) — must fall back to `description`.
+                "textDescription": "",
+                "description": {
+                    "type": "doc",
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {"type": "text", "text": "Resolves YES if the FOMC cuts"},
+                                {"type": "text", "text": " the target rate at any Q3 meeting."},
+                            ],
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "Per official Fed statements."}],
+                        },
+                    ],
+                },
+                "isResolved": False,
+            }
+        ]
+        matches = _parse_manifold_matches(payload, query="Fed cut rates")
+        assert len(matches) == 1
+        rules = matches[0].raw_rules
+        assert rules  # non-empty
+        assert "Resolves YES if the FOMC cuts" in rules
+        assert "target rate at any Q3 meeting" in rules
+        assert "official Fed statements" in rules
+
+    def test_rules_fallback_to_question_title_when_no_description(self):
+        """When both textDescription and description are missing, fall back to the title."""
+        from metaculus_bot.research.prediction_market import _parse_manifold_matches
+
+        payload = [
+            {
+                "id": "q1",
+                "question": "Will it rain tomorrow?",
+                "slug": "rain",
+                "creatorUsername": "weather",
+                "probability": 0.3,
+                "isResolved": False,
+            }
+        ]
+        matches = _parse_manifold_matches(payload, query="rain")
+        assert matches[0].raw_rules == "Will it rain tomorrow?"
+
+
+# ---------------------------------------------------------------------------
+# PredictIt tests (prefetch full dump + client-side fuzzy match)
+# ---------------------------------------------------------------------------
+
+
+class TestPredictIt:
+    @pytest.mark.asyncio
+    async def test_prefetch_and_local_fuzzy_match(self, predictit_payload):
+        from metaculus_bot.research.prediction_market import _predictit_prefetch, _predictit_search_local
+
+        session = FakeSession({"https://www.predictit.org/api/marketdata/all/": FakeResponse(200, predictit_payload)})
+        markets = await _predictit_prefetch(session)
+        assert len(markets) == 2
+
+        matches = _predictit_search_local(markets, "Starship orbit 2026", top_k=3, min_score=30.0)
+        assert len(matches) >= 1
+        top = matches[0]
+        assert top.platform == "predictit"
+        assert "Starship" in top.market_title
+        # implied_prob_yes comes straight from the first contract's lastTradePrice.
+        assert top.implied_prob_yes == pytest.approx(0.58)
+        assert top.market_url.startswith("https://www.predictit.org/")
+        # Strong title match -> nonzero confidence.
+        assert top.match_confidence > 0.5
+
+    def test_predictit_has_no_liquidity_fields(self, predictit_payload):
+        """PredictIt exposes no volume/liquidity/OI/bettor data -> all None."""
+        from metaculus_bot.research.prediction_market import _predictit_search_local
+
+        matches = _predictit_search_local(predictit_payload["markets"], "Starship orbit 2026", min_score=30.0)
+        assert matches
+        top = matches[0]
+        assert top.total_volume is None
+        assert top.liquidity is None
+        assert top.open_interest is None
+        assert top.num_bettors is None
+        assert top.volume_24h is None
+
+    def test_multi_contract_market_names_the_contract_in_title(self, predictit_payload):
+        """A market with >1 contract tags the priced contract into the title
+        so the forecaster can tell which sub-outcome the price refers to."""
+        from metaculus_bot.research.prediction_market import _predictit_search_local
+
+        matches = _predictit_search_local(predictit_payload["markets"], "2028 primary", top_k=3, min_score=30.0)
+        assert matches
+        top = matches[0]
+        assert "2028 primary" in top.market_title.lower()
+        # Some contract name is disambiguated into the title (query has no
+        # candidate name, so contract choice falls back to the first).
+        assert "Candidate" in top.market_title
+
+    def test_multi_contract_prices_query_matching_contract(self):
+        """A multi-contract market must price the contract whose name matches the
+        query, not blindly contracts[0] (that would attach the wrong outcome's
+        price to a good market match)."""
+        from metaculus_bot.research.prediction_market import _predictit_search_local
+
+        markets = [
+            {
+                "id": 42,
+                "name": "Who wins the 2028 Democratic nomination?",
+                "shortName": "2028 Dem nom",
+                "url": "https://www.predictit.org/markets/detail/42/dem-nom",
+                "contracts": [
+                    {"id": 1, "name": "Gavin Newsom", "lastTradePrice": 0.31, "status": "Open"},
+                    {"id": 2, "name": "Alexandria Ocasio-Cortez", "lastTradePrice": 0.12, "status": "Open"},
+                    {"id": 3, "name": "Josh Shapiro", "lastTradePrice": 0.09, "status": "Open"},
+                ],
+            }
+        ]
+        matches = _predictit_search_local(
+            markets, "Will Josh Shapiro win the 2028 Democratic nomination?", min_score=30.0
+        )
+        assert matches
+        top = matches[0]
+        # Shapiro's contract (0.09), not Newsom's contracts[0] (0.31), must be priced.
+        assert top.implied_prob_yes == pytest.approx(0.09)
+        assert "Josh Shapiro" in top.market_title
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_returns_empty_and_warns(self, caplog):
+        from metaculus_bot.research.prediction_market import _predictit_prefetch
+
+        session = FakeSession({"https://www.predictit.org/api/marketdata/all/": FakeResponse(200, payload=[1, 2, 3])})
+        with caplog.at_level(logging.WARNING):
+            markets = await _predictit_prefetch(session)
+        assert markets == []
+        assert any("predictit" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_missing_markets_key_returns_empty_and_warns(self, caplog):
+        from metaculus_bot.research.prediction_market import _predictit_prefetch
+
+        session = FakeSession(
+            {"https://www.predictit.org/api/marketdata/all/": FakeResponse(200, payload={"unexpected": "shape"})}
+        )
+        with caplog.at_level(logging.WARNING):
+            markets = await _predictit_prefetch(session)
+        assert markets == []
+        assert any("predictit" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_reset_session_caches_clears_predictit_cache(self):
+        """The autouse fixture resets caches; this pins that _PREDICTIT_CACHE is
+        actually part of _reset_session_caches (regression guard)."""
+        from metaculus_bot.research import prediction_market as pmp
+
+        pmp._PREDICTIT_CACHE["markets"] = (0.0, [{"id": 1}])
+        assert pmp._PREDICTIT_CACHE
+        pmp._reset_session_caches()
+        assert pmp._PREDICTIT_CACHE == {}
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +790,7 @@ class TestKeywordExtractor:
 class TestFetchMarketSnapshot:
     @pytest.mark.asyncio
     async def test_full_orchestrator_returns_matches(
-        self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload
+        self, mock_question, polymarket_payload, manifold_payload, kalshi_events_payload, predictit_payload
     ):
         from metaculus_bot.research import prediction_market as pmp
 
@@ -554,6 +798,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, predictit_payload),
         }
 
         class FakeLlm:
@@ -569,11 +814,14 @@ class TestFetchMarketSnapshot:
         ):
             snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
 
-        # Should find at least one match from each of the three platforms
+        # Should find at least one match from each of the four platforms. PredictIt's
+        # presence exercises the dedup/assembly footgun literals (by_platform,
+        # seen_urls_per_platform, and the assembly-loop tuple).
         platforms = {m.platform for m in snapshot.matches}
         assert "polymarket" in platforms
         assert "kalshi" in platforms
         assert "manifold" in platforms
+        assert "predictit" in platforms
 
     @pytest.mark.asyncio
     async def test_as_of_filter_drops_post_as_of_matches(self, mock_question):
@@ -608,6 +856,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, {"events": [], "markets": []}),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, []),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, late_close_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
         class FakeLlm:
@@ -653,6 +902,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, {"events": [], "markets": []}),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, []),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, closed_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
         # Fresh cache
         pmp._reset_session_caches()
@@ -696,6 +946,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": _boom,
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": _boom,
+            "https://www.predictit.org/api/marketdata/all/": _boom,
         }
 
         class FakeLlm:
@@ -731,6 +982,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
         class FakeLlm:
@@ -767,6 +1019,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
         class FakeLlm:
@@ -870,6 +1123,7 @@ class TestProviderFactory:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
         class FakeLlm:
@@ -914,6 +1168,7 @@ class TestProviderFactory:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
         class FakeLlm:
@@ -964,6 +1219,9 @@ class TestFormatter:
                     is_resolved=False,
                     match_confidence=0.85,
                     raw_rules="If Starship achieves orbital velocity in 2026 per SpaceX confirmation.",
+                    total_volume=987654.0,
+                    liquidity=45000.0,
+                    open_interest=60000.0,
                 )
             ]
         )
@@ -977,10 +1235,17 @@ class TestFormatter:
         assert "verify" in formatted.lower()
         assert "resolution date" in formatted.lower()
         assert "discount" in formatted.lower()
-        # Columns per the plan
+        # New columns per the plan: total_vol + OI + signal replace the misleading 24h vol column.
         assert "platform" in formatted.lower()
+        assert "total_vol" in formatted.lower()
+        assert "| oi |" in formatted.lower()
+        assert "signal" in formatted.lower()
         assert "polymarket" in formatted.lower()
         assert "0.74" in formatted
+        # total_volume=987654 rendered (not the 12500 24h vol), open_interest=60000, deep signal.
+        assert "987654" in formatted
+        assert "60000" in formatted
+        assert "deep" in formatted.lower()
         # Raw rules included
         assert "orbital velocity" in formatted.lower()
 
@@ -1018,3 +1283,87 @@ class TestFormatter:
         formatted = format_snapshot_for_research(snap)
         # Should NOT contain the full 2000-char string
         assert "a" * 500 not in formatted  # i.e. truncated well below full length
+
+    @pytest.mark.parametrize(
+        ("total_volume", "expected"),
+        [(1_000.0, "thin"), (20_000.0, "decent"), (100_000.0, "deep")],
+    )
+    def test_liquidity_label_real_money_thresholds(self, total_volume, expected):
+        from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_label
+
+        m = MarketMatch(
+            platform="polymarket",
+            market_title="x",
+            market_url="",
+            implied_prob_yes=0.5,
+            bid=None,
+            ask=None,
+            spread=None,
+            volume_24h=None,
+            close_time=None,
+            is_resolved=False,
+            match_confidence=0.5,
+            raw_rules="",
+            total_volume=total_volume,
+        )
+        assert _liquidity_label(m) == expected
+
+    @pytest.mark.parametrize(
+        ("num_bettors", "expected"),
+        [(5, "thin"), (50, "decent"), (200, "high")],
+    )
+    def test_liquidity_label_manifold_bettor_thresholds(self, num_bettors, expected):
+        from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_label
+
+        m = MarketMatch(
+            platform="manifold",
+            market_title="x",
+            market_url="",
+            implied_prob_yes=0.5,
+            bid=None,
+            ask=None,
+            spread=None,
+            volume_24h=None,
+            close_time=None,
+            is_resolved=False,
+            match_confidence=0.5,
+            raw_rules="",
+            num_bettors=num_bettors,
+        )
+        assert _liquidity_label(m) == expected
+
+    def test_formatter_all_none_predictit_row_renders_no_liquidity_data(self):
+        from metaculus_bot.research.prediction_market import (
+            MarketMatch,
+            MarketSnapshot,
+            format_snapshot_for_research,
+        )
+
+        snap = MarketSnapshot(
+            matches=[
+                MarketMatch(
+                    platform="predictit",
+                    market_title="Will X win?",
+                    market_url="https://www.predictit.org/markets/detail/1/x",
+                    implied_prob_yes=0.4,
+                    bid=None,
+                    ask=None,
+                    spread=None,
+                    volume_24h=None,
+                    close_time=None,
+                    is_resolved=False,
+                    match_confidence=0.6,
+                    raw_rules="Will X win?",
+                )
+            ]
+        )
+        formatted = format_snapshot_for_research(snap)
+        assert "predictit" in formatted.lower()
+        assert "no-liquidity-data" in formatted
+        # total_vol and OI render as "-" for an all-None row.
+        row = [ln for ln in formatted.splitlines() if ln.startswith("| predictit")][0]
+        cells = [c.strip() for c in row.split("|")]
+        # cells: ['', platform, title, prob, total_vol, OI, signal, close, conf, '']
+        assert cells[4] == "-"  # total_vol
+        assert cells[5] == "-"  # OI
+        assert cells[6] == "no-liquidity-data"  # signal

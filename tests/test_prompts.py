@@ -488,6 +488,8 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
+        # The new liquidity-weighting sentence: weight a crowd signal by how informative it is.
+        assert "weight each market/crowd signal by its stated liquidity/participation label" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
