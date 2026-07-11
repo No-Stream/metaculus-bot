@@ -106,13 +106,21 @@ async def test_numeric_parsing_raises_on_wrong_count():
     llm = SimpleNamespace(model="dummy")
     llm.invoke = AsyncMock(return_value="rationale")
 
-    # Patch the salvage-rung LLM parser so the ladder's block+repair rungs (both
-    # fail because "rationale" has no fenced block) fall through to LLM salvage
-    # returning the wrong-count list, then validate_numeric raises → wrapped as
+    # Two independent module bindings are patched here: the C3 outcome_type read
+    # goes through forecaster_runners.parse_structured, while the ladder's
+    # rung-3 salvage calls value_extraction.parse_structured. The salvage rung
+    # returns the wrong-count list (block+repair rungs fail — "rationale" has no
+    # fenced block), _validate_numeric rejects the non-13 set, and rung 4 raises
     # ValueExtractionError.
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), bad],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.value_extraction.parse_structured",
+            new=AsyncMock(return_value=bad),
+        ),
     ):
         with pytest.raises(ValueExtractionError):
             await bot._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

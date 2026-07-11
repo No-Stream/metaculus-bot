@@ -36,8 +36,14 @@ def build_mc_prediction(
     - Applies clamping to [MC_PROB_MIN, MC_PROB_MAX] followed by a second renormalization.
     - Preserves the order of `allowed_options` in the final list.
     """
-    # Map normalized allowed names to canonical
-    allowed_norm_to_canonical = {opt.lower(): opt for opt in allowed_options}
+    # Map normalized allowed names to canonical. Both sides must normalize the
+    # SAME way: incoming items run through _normalize_name (which strips a leading
+    # "Option " token), so the allowed lookup must too — otherwise a canonical
+    # option literally named "Option A" is keyed "option a" here but arrives as
+    # "a", never matches, and gets silently dropped into the even-distribution
+    # fallback (a fabricated uniform forecast). Keying by _normalize_name makes
+    # the match symmetric.
+    allowed_norm_to_canonical = {_normalize_name(opt): opt for opt in allowed_options}
 
     # Aggregate by canonical option name
     accum: dict[str, float] = {}

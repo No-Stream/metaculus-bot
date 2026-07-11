@@ -7,6 +7,8 @@ warning could be deleted from a prompt and no test would catch it —
 backtest scores would silently get polluted with prediction-market data.
 """
 
+import json
+import re
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -754,3 +756,50 @@ class TestNumericPromptThirteenPercentiles:
         # No trailing prose "Percentile 1: [value]" block.
         assert "Percentile 1:" not in result
         assert "Percentile 99:" not in result
+
+
+class TestOptionProbsExampleJsonValidity:
+    """The MC schema example is the forecaster's authoritative template — it must
+    be VALID JSON for any real option names, including ones carrying quotes,
+    backslashes, or newlines (F2). A naive f-string concat emitted invalid JSON
+    for those and silently taught the model a broken schema."""
+
+    @staticmethod
+    def _extract_last_json_block(prompt: str) -> str:
+        blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", prompt, re.DOTALL)
+        assert blocks, "no fenced json block found in prompt"
+        return blocks[-1]
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ['He said "yes"', r"C:\Windows", "Option C"],
+            ["Line\nbreak", "Plain"],
+        ],
+    )
+    def test_mc_prompt_block_example_parses_for_special_char_options(self, options: list[str]) -> None:
+        q = _mc_q()
+        q.options = options
+        prompt = multiple_choice_prompt(q, research="r")
+        body = self._extract_last_json_block(prompt)
+        parsed = json.loads(body)
+        assert list(parsed["option_probs"].keys()) == options
+
+    def test_stacking_mc_prompt_block_example_parses_for_special_char_options(self) -> None:
+        options = ['He said "yes"', r"C:\Windows", "Option C"]
+        q = _mc_q()
+        q.options = options
+        prompt = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1"])
+        body = self._extract_last_json_block(prompt)
+        parsed = json.loads(body)
+        assert list(parsed["option_probs"].keys()) == options
+
+    def test_example_probs_valid_for_large_option_count(self) -> None:
+        options = [f"Bucket {i}" for i in range(12)]
+        q = _mc_q()
+        q.options = options
+        prompt = multiple_choice_prompt(q, research="r")
+        parsed = json.loads(self._extract_last_json_block(prompt))
+        probs = list(parsed["option_probs"].values())
+        assert sum(probs) == pytest.approx(1.0, abs=0.02)
+        assert all(0.0 < p < 1.0 for p in probs)

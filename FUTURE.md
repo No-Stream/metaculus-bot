@@ -117,10 +117,12 @@ to native `response_format` structured outputs (OpenRouter silent-degradation fo
 load-bearing rationale channel, zero competitive precedent — no upstream layer uses it
 either). Instead:
 
-- **Workstream A (soon, free until one smoke run):** shadow divergence logging
-  (parser-extracted vs JSON-block values, both already computed per question) + strict
-  json_schema on the *parser call only* via `GeneralLlm(response_format=...)` — works on the
-  frozen 0.2.54 pin — with framework `structure_output` kept as fallback.
+- **Workstream A — DONE and superseded.** Shadow divergence logging shipped, served its
+  purpose, and was deleted 2026-07-10 when the block became authoritative (see the DONE
+  entry below; `EXTRACTION_RUNG` telemetry replaced it). The strict json_schema on the
+  *parser call* via `GeneralLlm(response_format=...)` also shipped (`structured_parse.py`,
+  constrained primary + framework `structure_output` fallback) and now serves as the
+  ladder's rung-3 salvage parser.
 - **Workstream B (between rounds, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 →
   0.2.92+. Two verified breaks: our PCHIP subclasses override `.cdf` but HEAD internals moved
   to `get_cdf()` (silent bypass of our CDF machinery); `fetch_hardening` patch target moved

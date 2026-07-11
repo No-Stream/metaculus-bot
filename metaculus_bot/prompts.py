@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Literal
 
@@ -9,6 +10,33 @@ from forecasting_tools import (
 )
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+
+# Decimal places for illustrative example probabilities in ``_option_probs_example``.
+_EXAMPLE_PROB_DECIMALS = 4
+# Lower/upper safety epsilons for illustrative example probs so no bucket lands
+# at exactly 0.0 or 1.0 (the prompt tells the model to use values in (0, 1)).
+_EXAMPLE_PROB_FLOOR = 0.01
+_EXAMPLE_PROB_CEIL = 0.99
+
+
+def _build_example_probs(n_opts: int) -> list[float]:
+    """Illustrative per-option probabilities that always sum to ~1.0 in (0, 1).
+
+    Split ``1.0`` evenly across ``n_opts`` buckets, put the rounding remainder
+    on the first bucket, and clamp each bucket into ``(_EXAMPLE_PROB_FLOOR,
+    _EXAMPLE_PROB_CEIL)``. For any ``n_opts >= 1`` the returned list is
+    non-empty and its sum is within a few floating-point ulps of 1.0.
+    """
+    if n_opts <= 0:
+        return []
+    base = round(1.0 / n_opts, _EXAMPLE_PROB_DECIMALS)
+    remainder = round(1.0 - base * n_opts, _EXAMPLE_PROB_DECIMALS)
+    probs = [base] * n_opts
+    probs[0] = round(probs[0] + remainder, _EXAMPLE_PROB_DECIMALS)
+    # For very large n_opts, ``base`` can round to 0.0 or (n_opts == 1) to 1.0;
+    # keep every bucket in the (floor, ceil) band the prompt promises.
+    return [min(_EXAMPLE_PROB_CEIL, max(_EXAMPLE_PROB_FLOOR, p)) for p in probs]
+
 
 __all__ = [
     "binary_prompt",
@@ -107,17 +135,22 @@ def _option_probs_example(options: list[str]) -> str:
     options when the schema example carries the exact option strings — literal
     ``Option_A`` placeholders yield ``<<NOT_FOUND>>`` on strict parsers.
 
+    Uses ``json.dumps`` for both keys and values so option names carrying
+    ``"``, ``\\``, or newlines produce a syntactically valid JSON example (a
+    naive f-string would emit invalid JSON that misleads the LLM about the
+    schema). The caller wraps the returned fragment in an outer ``{{...}}`` so
+    we strip ``json.dumps``'s outer braces before returning.
+
     Returns the empty string for an empty options list so the caller can render
     ``{{}}`` degenerately without a special case.
     """
     if not options:
         return ""
-    n_opts = len(options)
-    base = round(1.0 / n_opts, 2)
-    remainder = round(1.0 - base * n_opts, 4)
-    example_probs = [base] * n_opts
-    example_probs[0] = round(example_probs[0] + remainder, 4)
-    return ", ".join(f'"{opt}": {prob}' for opt, prob in zip(options, example_probs))
+    example_probs = _build_example_probs(len(options))
+    body = json.dumps(dict(zip(options, example_probs)))
+    # ``body`` is ``{"opt1": p1, "opt2": p2, ...}`` — strip the outer braces
+    # because the template supplies them (``"option_probs": {{{example}}}``).
+    return body[1:-1]
 
 
 CitationStyle = Literal["markdown", "auto_annotated"]

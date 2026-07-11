@@ -104,17 +104,30 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
 @pytest.mark.asyncio
 async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
     # Rationale has neither a fenced JSON block nor rescuable braces, so the
-    # ladder's block+repair rungs fail; the LLM salvage rung (parse_structured)
-    # raises ValueExtractionError directly, which the ladder's terminal-rung
-    # catch folds into its typed ValueExtractionError. The old text-extraction
-    # "no declared_percentiles available" fallback is gone with the F5 router.
+    # ladder's block+repair rungs fail. The salvage rung's parser
+    # (value_extraction.parse_structured — an independent binding from the
+    # C3 outcome_type read in forecaster_runners) returns an insufficient
+    # 2-percentile list; _validate_numeric rejects the non-13 set and the
+    # ladder's terminal rung raises its typed ValueExtractionError. The old
+    # text-extraction "no declared_percentiles available" fallback is gone
+    # with the F5 router.
     rationale = "Percentile 10: 5\nPercentile 20: 6\n"
+    insufficient = [
+        FTPercentile(value=5.0, percentile=0.1),
+        FTPercentile(value=6.0, percentile=0.2),
+    ]
 
     q = make_dummy_numeric_question()
     llm = DummyLLM(rationale)
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=ValueExtractionError("LLM parser failed"),
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.value_extraction.parse_structured",
+            new=AsyncMock(return_value=insufficient),
+        ),
     ):
         with pytest.raises(ValueExtractionError):
             await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

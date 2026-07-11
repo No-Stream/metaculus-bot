@@ -43,6 +43,7 @@ from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
+    _MC_OPTION_PROB_SUM_TOLERANCE,
     BinaryStructured,
     MultipleChoiceStructured,
     NumericStructured,
@@ -67,8 +68,6 @@ _TAIL_SCAN_CHARS = 4000
 # Float tolerance when matching parsed percentile keys against the canonical
 # 13-set (guards against 0.1 vs 0.10000000001 drift from JSON round-trips).
 _PERCENTILE_KEY_TOLERANCE = 1e-6
-# Matches _MC_OPTION_PROB_SUM_TOLERANCE in structured_output_schema.
-_MC_SUM_TOLERANCE = 0.02
 
 
 @dataclass
@@ -207,8 +206,6 @@ def _binary_from_block(block: StructuredBlock) -> float:
 
 
 def _validate_binary(value: float) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"binary value must be a number, got {type(value).__name__}")
     value = float(value)
     if not (0.0 <= value <= 1.0):
         raise ValueError(f"binary probability {value} outside [0, 1]")
@@ -259,8 +256,6 @@ def _numeric_from_block(block: StructuredBlock) -> list[Percentile]:
 
 def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
     """Require ALL 13 standard percentiles; return exactly the canonical 13, never padded."""
-    if not isinstance(percentiles, list):
-        raise ValueError(f"numeric value must be a list of Percentile, got {type(percentiles).__name__}")
     matched: dict[float, Percentile] = {}
     for standard in STANDARD_PERCENTILES:
         for p in percentiles:
@@ -344,8 +339,6 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], Predi
 
 def _make_validate_mc(options: list[str]) -> Callable[[PredictedOptionList], PredictedOptionList]:
     def _validate_mc(pol: PredictedOptionList) -> PredictedOptionList:
-        if not isinstance(pol, PredictedOptionList):
-            raise ValueError(f"mc value must be PredictedOptionList, got {type(pol).__name__}")
         names = [o.option_name for o in pol.predicted_options]
         if set(names) != set(options):
             raise ValueError(f"option set mismatch: got {names}, expected {options}")
@@ -353,8 +346,8 @@ def _make_validate_mc(options: list[str]) -> Callable[[PredictedOptionList], Pre
             if not (0.0 <= option.probability <= 1.0):
                 raise ValueError(f"option {option.option_name!r} probability {option.probability} outside [0, 1]")
         total = sum(o.probability for o in pol.predicted_options)
-        if abs(total - 1.0) > _MC_SUM_TOLERANCE:
-            raise ValueError(f"option probabilities sum to {total}, outside 1.0 ± {_MC_SUM_TOLERANCE}")
+        if abs(total - 1.0) > _MC_OPTION_PROB_SUM_TOLERANCE:
+            raise ValueError(f"option probabilities sum to {total}, outside 1.0 ± {_MC_OPTION_PROB_SUM_TOLERANCE}")
         return pol
 
     return _validate_mc
@@ -375,9 +368,19 @@ async def extract_mc(
     async def _llm() -> PredictedOptionList:
         # Mirror the pre-ladder two-stage tolerant parse: strict
         # PredictedOptionList first, then the loose list[OptionProbability]
-        # form mapped through build_mc_prediction.
+        # form. BOTH sub-paths route through build_mc_prediction so parser
+        # output with case/prefix-variant option names ("option a") is
+        # canonicalized onto the question's option set before _validate_mc's
+        # exact set comparison — the parser prompt_notes explicitly allow
+        # case-insensitive matches, so the strict result can't be trusted to
+        # carry canonical spellings.
         try:
-            return await parse_structured(text, PredictedOptionList, parser_llm, prompt_notes=prompt_notes)
+            strict = await parse_structured(text, PredictedOptionList, parser_llm, prompt_notes=prompt_notes)
+            as_raw = [
+                OptionProbability(option_name=o.option_name, probability=o.probability)
+                for o in strict.predicted_options
+            ]
+            return build_mc_prediction(as_raw, options)
         except (ValidationError, ValueError) as exc:
             logger.warning("Primary MC parse failed in llm rung, using tolerant fallback: %s", exc)
             raw: list[OptionProbability] = await parse_structured(
