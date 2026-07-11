@@ -16,6 +16,11 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
+from metaculus_bot.value_extraction import ExtractionOutcome
+
+
+def _numeric_extract_mock(plist):
+    return AsyncMock(return_value=ExtractionOutcome(value=plist, rung="block", block_present=True))
 
 
 def _as_numeric_question(q: SimpleNamespace) -> NumericQuestion:
@@ -95,9 +100,12 @@ async def test_pchip_fallback_success(mock_format, mock_generate, caplog):
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
     ):
         caplog.clear()
         caplog.set_level("WARNING")
@@ -139,8 +147,9 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
     with (
         patch(
             "metaculus_bot.forecaster_runners.parse_structured",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
         ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
         patch("metaculus_bot.numeric.pchip_processing.NumericDistribution", FakeND),
     ):
         caplog.clear()
@@ -176,9 +185,12 @@ async def test_smoothing_respects_open_bounds(mock_format, caplog):
                 [0, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 100],
             )
         ]
-        with patch(
-            "metaculus_bot.forecaster_runners.parse_structured",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
         ):
             caplog.clear()
             caplog.set_level("WARNING")
@@ -234,9 +246,12 @@ async def test_discrete_zero_point_override(mock_format, mock_generate):
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), plist],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=_numeric_extract_mock(plist)),
     ):
         await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
@@ -306,15 +321,11 @@ async def test_binary_parse_additional_instructions_capture():
 
     seen = {}
 
-    class _Bin:
-        def __init__(self, val):
-            self.prediction_in_decimal = val
-
-    async def _fake_structure_output(*args, **kwargs):
+    async def _fake_extract_binary(*args, **kwargs):
         seen["prompt_notes"] = kwargs.get("prompt_notes", "")
-        return _Bin(0.5)
+        return ExtractionOutcome(value=0.5, rung="block", block_present=True)
 
-    with patch("metaculus_bot.forecaster_runners.parse_structured", _fake_structure_output):
+    with patch("metaculus_bot.forecaster_runners.extract_binary", _fake_extract_binary):
         await bot._run_forecast_on_binary(q, "", llm)
 
     ai = seen.get("prompt_notes", "")

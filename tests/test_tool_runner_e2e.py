@@ -42,7 +42,10 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.tool_runner import FEATURE_FLAG_ENV
+from metaculus_bot.value_extraction import ExtractionOutcome
 from tests.conftest import make_mock_numeric_question
+
+_ = ExtractionOutcome  # imported for use in _PromptCapture.extract_outcome below
 
 # ---------------------------------------------------------------------------
 # Common fixtures: bots and questions
@@ -219,6 +222,24 @@ class _PromptCapture:
         await asyncio.sleep(0)
         return self.parser_response
 
+    async def extract_outcome(self, *_args: Any, **_kwargs: Any) -> ExtractionOutcome[Any]:
+        """Ladder-seam replacement for ``parser_structure_output``.
+
+        ``run_stacking_{binary,mc,numeric}`` migrated off ``parse_structured``
+        onto ``metaculus_bot.stacking.extract_{binary,mc,numeric}``, which
+        return an ``ExtractionOutcome`` wrapping the *parsed value* — the
+        binary path in particular now unwraps ``BinaryPrediction`` internally,
+        so its ``ExtractionOutcome`` carries a raw ``float``. The old
+        ``parse_structured`` seam returned the whole ``BinaryPrediction``
+        pydantic model, so preserve callers' historical fixture values by
+        unwrapping it here.
+        """
+        await asyncio.sleep(0)
+        value = self.parser_response
+        if isinstance(value, BinaryPrediction):
+            value = float(value.prediction_in_decimal)
+        return ExtractionOutcome(value=value, rung="block", block_present=True)
+
 
 # ---------------------------------------------------------------------------
 # Gap 1A: Binary path — STACKING aggregation surfaces cross-model lines
@@ -244,7 +265,11 @@ class TestBinaryStackingCrossModelAggregation:
         )
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
+            with (
+                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+            ):
                 aggregated = await bot._aggregate_predictions(
                     posteriors,  # type: ignore[arg-type]
                     question,
@@ -304,7 +329,11 @@ class TestBinaryStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
+            with (
+                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+            ):
                 await bot._aggregate_predictions(
                     posteriors,  # type: ignore[arg-type]
                     question,
@@ -394,26 +423,18 @@ class TestNumericStackingCrossModelAggregation:
             _numeric_percentiles_rationale("m3", "normal", _NUMERIC_DECLARED["m3"]),
         ]
 
-        # Build NumericDistributions to feed _aggregate_predictions. We
-        # reuse the public router path for fidelity.
+        # Build NumericDistributions to feed _aggregate_predictions via the
+        # same pipeline main.py uses on the percentile path.
         from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-        from metaculus_bot.numeric_format_router import route_numeric_output
+        from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
         numeric_predictions = []
         for rationale, declared in zip(rationales, _NUMERIC_DECLARED.values()):
             pcts = _percentile_objs_from(declared)
-            # After the router collapse, route_numeric_output returns
-            # ``list[Percentile]`` directly (no more RoutedNumericForecast /
-            # ``question`` argument).
-            routed_pcts = route_numeric_output(rationale=rationale, declared_percentiles=pcts)
-            # Wrap in a NumericDistribution via the same builder ``main.py``
-            # uses on the percentile path.
-            from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
-
-            sanitized, zero_point = sanitize_percentiles(routed_pcts, question)
+            sanitized, zero_point = sanitize_percentiles(pcts, question)
             pred = build_numeric_distribution(sanitized, question, zero_point)
             numeric_predictions.append(pred)
-            _ = create_pchip_numeric_distribution  # silence unused-import lint
+            _ = rationale, create_pchip_numeric_distribution  # silence unused-import lint
 
         reasoned = [
             ReasonedPrediction(prediction_value=p, reasoning=r) for p, r in zip(numeric_predictions, rationales)
@@ -426,7 +447,11 @@ class TestNumericStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
+            with (
+                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+            ):
                 await bot._aggregate_predictions(
                     numeric_predictions,  # type: ignore[arg-type]
                     question,
@@ -485,7 +510,11 @@ class TestMcStackingCrossModelAggregation:
         from metaculus_bot.tool_runner import build_cross_model_aggregation
 
         with patch.object(GeneralLlm, "invoke", new=capture.stacker_invoke):
-            with patch("metaculus_bot.stacking.parse_structured", new=capture.parser_structure_output):
+            with (
+                patch("metaculus_bot.stacking.extract_binary", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_mc", new=capture.extract_outcome),
+                patch("metaculus_bot.stacking.extract_numeric", new=capture.extract_outcome),
+            ):
                 await bot._aggregate_predictions(
                     prediction_values,  # type: ignore[arg-type]
                     question,

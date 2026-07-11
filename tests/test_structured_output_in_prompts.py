@@ -81,15 +81,19 @@ class TestBinaryPromptSchemaInstruction:
                 f"tier-2 field {field!r} should not be demanded in the STRUCTURED FORECAST schema block"
             )
 
-    def test_schema_block_precedes_answer_line(self):
-        # Critical ordering constraint: JSON block must appear BEFORE the
-        # final "Probability: ZZ%" line so the parser picks the right text.
+    def test_schema_block_is_last_forecast_surface(self):
+        # Critical ordering constraint (post-block-only refactor): the JSON
+        # block is the LAST forecast surface — the old "Probability: ZZ%" prose
+        # line is gone. Only the schema block carries a machine-readable
+        # forecast. The prompt closes with the "write nothing after it"
+        # instruction attached to the block section.
         prompt = binary_prompt(_make_binary_q(), research="R")
-        schema_idx = prompt.find('"question_type"')
-        answer_idx = prompt.find('"Probability: ZZ%"')
-        assert schema_idx >= 0, "schema block missing"
-        assert answer_idx >= 0, "answer line missing"
-        assert schema_idx < answer_idx, "JSON schema must come before the final answer line (Option A ordering)"
+        assert '"question_type"' in prompt, "schema block missing"
+        assert '"Probability: ZZ%"' not in prompt, "trailing prose answer line must be gone"
+        assert "Probability: ZZ%" not in prompt, "trailing prose answer line must be gone"
+        # The final section header before the tail should be STRUCTURED FORECAST.
+        assert "STRUCTURED FORECAST" in prompt
+        assert prompt.rstrip().endswith("Write nothing after it."), "prompt must end with the block-is-last instruction"
 
     def test_telemetry_fields_documented_in_binary_schema(self):
         """Anchor + clause telemetry fields (2026-07-08) are shown in the schema
@@ -122,16 +126,20 @@ class TestMultipleChoicePromptSchemaInstruction:
                 f"tier-2 field {field!r} should not be demanded in the MC STRUCTURED FORECAST schema block"
             )
 
-    def test_schema_block_precedes_option_answer_lines(self):
+    def test_schema_block_is_last_forecast_surface(self):
+        # Post-refactor: the trailing "Red: NN%" prose lines are gone. The
+        # JSON block's `option_probs` (keyed by real option names) is the
+        # only per-option forecast surface, and the block closes the prompt.
         prompt = multiple_choice_prompt(_make_mc_q(), research="R")
-        schema_idx = prompt.find('"question_type"')
-        # The trailing answer block now interpolates real option names rather
-        # than literal Option_A placeholders, so we anchor on the first real
-        # option from the test fixture (`_make_mc_q` uses ["Red","Blue","Green"]).
-        answer_idx = prompt.find("Red: NN%")
-        assert schema_idx >= 0
-        assert answer_idx >= 0
-        assert schema_idx < answer_idx, "JSON schema must come before final per-option answer lines (Option A ordering)"
+        assert '"question_type"' in prompt, "schema block missing"
+        assert "Red: NN%" not in prompt, "trailing prose per-option lines must be gone"
+        assert "Blue: NN%" not in prompt
+        assert "Green: NN%" not in prompt
+        # Real option names must still appear inside the JSON block itself.
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        for opt in ("Red", "Blue", "Green"):
+            assert f'"{opt}"' in structured_section, f"option {opt!r} missing from option_probs JSON example"
+        assert prompt.rstrip().endswith("Write nothing after it."), "prompt must end with the block-is-last instruction"
 
 
 class TestNumericPromptSchemaInstruction:
@@ -158,12 +166,16 @@ class TestNumericPromptSchemaInstruction:
                 f"tier-2 field {field!r} should not be demanded in the numeric STRUCTURED FORECAST schema block"
             )
 
-    def test_numeric_percentiles_match_trailing_lines_note_present(self):
-        # Reminder that JSON declared_percentiles should reflect the trailing
-        # "Percentile X: ..." lines — see activation doc §253-261.
+    def test_numeric_prompt_declares_block_as_only_forecast_source(self):
+        # Post-refactor: no trailing "Percentile X: ..." prose lines exist —
+        # the declared_percentiles block is the ONLY forecast surface. The
+        # numeric prompt says so explicitly so the model doesn't split its
+        # forecast across two places.
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        assert "match your final Percentile" in prompt or "match your final percentile" in prompt.lower(), (
-            "numeric prompt should note that JSON percentiles should match the trailing Percentile lines"
+        structured_section = prompt[prompt.find("STRUCTURED FORECAST") :]
+        lowered = structured_section.lower()
+        assert "only source of your forecast" in lowered or "only authoritative source" in lowered, (
+            "numeric prompt should state that the JSON block is the sole forecast surface"
         )
 
     def test_numeric_schema_example_carries_all_thirteen_percentile_keys(self):
@@ -179,11 +191,14 @@ class TestNumericPromptSchemaInstruction:
         assert "all 13" in structured_section, "note must state the full 13-percentile requirement"
         assert "at least" not in structured_section, "stale 'at least {0.1, 0.5, 0.9}' wording must be gone"
 
-    def test_schema_block_precedes_percentile_answer_lines(self):
+    def test_schema_block_is_last_forecast_surface(self):
+        # Post-refactor: the trailing "Percentile X: [value]" prose lines are
+        # gone. The declared_percentiles JSON block is the only forecast
+        # surface, and the prompt closes with the block-is-last instruction.
         prompt = numeric_prompt(_make_numeric_q(), research="R", lower_bound_message="", upper_bound_message="")
-        schema_idx = prompt.find('"question_type"')
-        # Last percentile example — must come after the JSON block.
-        answer_idx = prompt.find("Percentile 97.5:")
-        assert schema_idx >= 0
-        assert answer_idx >= 0
-        assert schema_idx < answer_idx, "JSON schema must come before the final Percentile lines (Option A ordering)"
+        assert '"question_type"' in prompt, "schema block missing"
+        assert "Percentile 97.5:" not in prompt, "trailing Percentile prose lines must be gone"
+        assert "Percentile 1:" not in prompt, "trailing Percentile prose lines must be gone"
+        assert "Percentile 99:" not in prompt, "trailing Percentile prose lines must be gone"
+        assert "STRUCTURED FORECAST" in prompt
+        assert prompt.rstrip().endswith("Write nothing after it."), "prompt must end with the block-is-last instruction"

@@ -29,12 +29,21 @@ aggregate, so per-base-model values are only recoverable from reasoning prose.
 import logging
 import re
 from collections.abc import Iterator
+from typing import Literal
 
 from metaculus_bot.comment.markers import (
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
     STACKER_OUTCOME_RE,
+)
+from metaculus_bot.structured_output_schema import (
+    BinaryStructured,
+    MultipleChoiceStructured,
+    NumericStructured,
+    StructuredBlock,
+    extract_json_block,
+    parse_structured_block,
 )
 
 
@@ -384,6 +393,73 @@ def _iter_per_model_blocks(
         yield key, prose, False
 
 
+# ---------------------------------------------------------------------------
+# Structured-block extraction (block-first, prose-regex fallback)
+#
+# Since 2026-07 the forecaster prompts emit forecast values ONLY inside the
+# fenced ```json STRUCTURED FORECAST block; the trailing prose value lines
+# ("Probability: NN%", "Percentile X: V", "- Option: NN%") are gone from new
+# rationales. Historical comments carry the prose lines and often no block, so
+# the per-model reasoning-body parsers below try the JSON block first and fall
+# back to the prose regexes — no era detection, just per-body try-then-fallback.
+#
+# NOTE: this applies only to parsers that read the R1 REASONING bodies (via
+# ``_iter_per_model_blocks``). ``parse_per_model_mc_option_probs`` reads the
+# SUMMARY bullet region, which is bot-rendered display text
+# (``forecasting_tools.forecast_bots.forecast_bot`` formats each parsed
+# prediction via ``make_readable_prediction`` → ``- {option}: {prob}%`` lines),
+# unaffected by the prompt change — it stays prose-only.
+# ---------------------------------------------------------------------------
+
+
+def _parse_block_in_body(
+    body_text: str,
+    question_type: Literal["binary", "numeric", "multiple_choice"],
+) -> StructuredBlock | None:
+    """Parse the structured JSON block in a per-model reasoning body, if any.
+
+    Pre-checks for a fenced block so historical prose-only bodies skip the
+    full parse (and its per-body "no JSON block" logging) entirely.
+    ``parse_structured_block`` returns None on malformed JSON / validation
+    failure, so callers just fall back to the prose regex on None.
+    """
+    if extract_json_block(body_text) is None:
+        return None
+    return parse_structured_block(body_text, question_type)
+
+
+def _numeric_percentiles_from_block(body_text: str) -> list[tuple[float, float]] | None:
+    """Return sorted (percentile, value) pairs from the body's JSON block, or None.
+
+    The block stores percentile keys as decimals (0.025, 0.5, 0.9) while the
+    prose convention downstream expects the raw percent labels the regex path
+    captures (2.5, 50, 90) — convert so consumers see identical shapes
+    regardless of comment era. Rounded to 6 places to cancel float noise
+    (0.1 * 100 == 10.000000000000002), matching the label rounding in
+    ``stacker_detection``.
+    """
+    block = _parse_block_in_body(body_text, "numeric")
+    if not isinstance(block, NumericStructured) or not block.declared_percentiles:
+        return None
+    return sorted((round(pct * 100.0, 6), value) for pct, value in block.declared_percentiles.items())
+
+
+def _binary_prob_from_block(body_text: str) -> float | None:
+    """Return the declared posterior probability from the body's JSON block, or None."""
+    block = _parse_block_in_body(body_text, "binary")
+    if not isinstance(block, BinaryStructured):
+        return None
+    return block.posterior_prob
+
+
+def _mc_option_probs_from_block(body_text: str) -> dict[str, float] | None:
+    """Return {option_name: probability} from the body's JSON block, or None."""
+    block = _parse_block_in_body(body_text, "multiple_choice")
+    if not isinstance(block, MultipleChoiceStructured):
+        return None
+    return dict(block.option_probs)
+
+
 def parse_per_model_numeric_percentiles(
     comment_text: str,
     model_names: list[str] | None = None,
@@ -417,7 +493,9 @@ def parse_per_model_numeric_percentiles(
     """
     result: dict[str, list[tuple[float, float]]] = {}
     for key, body_text, _is_stacker_meta in _iter_per_model_blocks(comment_text, model_names):
-        percentiles = [(float(m.group(1)), float(m.group(2))) for m in _PERCENTILE_LINE_RE.finditer(body_text)]
+        percentiles = _numeric_percentiles_from_block(body_text)
+        if percentiles is None:
+            percentiles = [(float(m.group(1)), float(m.group(2))) for m in _PERCENTILE_LINE_RE.finditer(body_text)]
         if not percentiles:
             continue
         result[key] = percentiles
@@ -599,6 +677,17 @@ def parse_per_model_mc_option_probs(
 
     Attribution uses the same fallback chain as ``parse_per_model_forecasts``:
     inline name in bullet > ``Model:`` line in R1 section > ``Forecaster N``.
+
+    Deliberately prose-only (no structured-block path): this function reads
+    the SUMMARY bullet region, which is bot-rendered display text — the
+    framework formats each parsed prediction via
+    ``MultipleChoiceReport.make_readable_prediction`` into
+    ``- {option}: {prob}%`` lines (``forecasting_tools/forecast_bots/
+    forecast_bot.py::_format_and_expand_research_summary``). The 2026-07
+    block-only prompt change alters what the MODEL writes in its R1 rationale,
+    not how the bot renders the summary, so these bullets keep their prose
+    form across eras. The forecaster's JSON block lives in the R1 reasoning
+    body and is handled by the ``_iter_per_model_blocks`` consumers.
     """
     if not comment_text:
         return {}
@@ -680,16 +769,20 @@ def parse_per_base_model_forecasts(
             continue
 
         if q_type == "binary":
-            prob = _extract_last_probability_from_body(body_text)
+            prob = _binary_prob_from_block(body_text)
+            if prob is None:
+                prob = _extract_last_probability_from_body(body_text)
             if prob is not None:
                 result[model_name] = f"{prob * 100:.1f}%"
 
         elif q_type == "multiple_choice":
-            options: dict[str, float] = {}
-            for opt_match in _MC_OPTION_LINE_RE.finditer(body_text):
-                option_name = opt_match.group(1).strip()
-                prob_pct = float(opt_match.group(2))
-                options[option_name] = prob_pct / 100.0
+            options = _mc_option_probs_from_block(body_text)
+            if options is None:
+                options = {}
+                for opt_match in _MC_OPTION_LINE_RE.finditer(body_text):
+                    option_name = opt_match.group(1).strip()
+                    prob_pct = float(opt_match.group(2))
+                    options[option_name] = prob_pct / 100.0
             if options:
                 result[model_name] = options
 

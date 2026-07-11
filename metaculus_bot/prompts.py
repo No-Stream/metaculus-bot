@@ -98,6 +98,28 @@ def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
     return f"\n── Cross-model aggregation (deterministic math) ──\n{aggregated_tool_output}\n"
 
 
+def _option_probs_example(options: list[str]) -> str:
+    """Render the ``option_probs`` JSON-body fragment for MC schema examples.
+
+    Both ``multiple_choice_prompt`` and ``stacking_multiple_choice_prompt`` need
+    the same shape: real option names as JSON keys with illustrative decimal
+    probs that sum to ~1.0. A parser can only bind LLM output to the allowed
+    options when the schema example carries the exact option strings — literal
+    ``Option_A`` placeholders yield ``<<NOT_FOUND>>`` on strict parsers.
+
+    Returns the empty string for an empty options list so the caller can render
+    ``{{}}`` degenerately without a special case.
+    """
+    if not options:
+        return ""
+    n_opts = len(options)
+    base = round(1.0 / n_opts, 2)
+    remainder = round(1.0 - base * n_opts, 4)
+    example_probs = [base] * n_opts
+    example_probs[0] = round(example_probs[0] + remainder, 4)
+    return ", ".join(f'"{opt}": {prob}' for opt, prob in zip(options, example_probs))
+
+
 CitationStyle = Literal["markdown", "auto_annotated"]
 
 
@@ -306,9 +328,9 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             • Blind-spot scenario most likely to make this forecast wrong; direction of impact.
 
             ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-            You MUST emit a fenced ```json block below, immediately after your analysis
-            and BEFORE your final answer line(s). This block is required for scoring —
-            responses without it are discarded.
+            This block is the ONLY authoritative source of your forecast — a
+            downstream deterministic parser reads it and nothing else. Responses
+            without it are discarded.
             Schema:
 
             ```json
@@ -320,20 +342,20 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             }}
             ```
 
-            `posterior_prob`: ALWAYS populate. Must match your final "Probability: X%" value (as a decimal, 0-1).
+            `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
             `base_rate_anchor`: populate with the outside-view base-rate range you stated in PHASE 1 (as decimals, 0-1). Omit only if you truly stated no outside-view range.
             `criteria_clauses`: populate from your conjunctive criteria pricing table in 5b (one entry per clause, probs as decimals). Omit for single-condition questions.
 
-            Emit the JSON block BEFORE the final Probability line below.
-
-            [The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"]
-            An example response is: "Probability: 50%"
+            The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
             """
     )
 
 
 def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> str:
-    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
+    # Build the STRUCTURED FORECAST block example with the REAL option names as
+    # JSON keys — a strict parser can only map placeholder keys like "Option_A"
+    # back onto real options via prose lines, and we no longer emit those.
+    option_probs_example = _option_probs_example(question.options)
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
@@ -436,25 +458,22 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.]
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-        You MUST emit a fenced ```json block below, immediately after your analysis
-        and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded.
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
         Schema (`option_probs` is REQUIRED; others optional):
 
         ```json
         {{
           "question_type": "multiple_choice",
-          "option_probs": {{"Option_A": 0.5, "Option_B": 0.3, "Option_C": 0.2}},
+          "option_probs": {{{option_probs_example}}},
           "other_mass": 0.0,
           "concentration": 20.0
         }}
         ```
 
         The `option_probs` object must sum to 1.0 and use the exact option names above.
-        Emit the JSON block BEFORE the final per-option answer lines.
-
-        ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        {answer_example_lines}
+        The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )
 
@@ -584,9 +603,8 @@ def numeric_prompt(
             Determine whether the resolution value for this question will always be a whole integer
             (e.g. counts, rankings, number of events, number of countries) or can be any real number
             (e.g. temperatures, percentages, dollar amounts, ratios).
-            Output exactly one of:
-            OUTCOME_TYPE: DISCRETE
-            OUTCOME_TYPE: CONTINUOUS
+            Record this decision in the `outcome_type` field of the STRUCTURED FORECAST block below
+            ("discrete_integer" for whole-integer resolutions, "continuous" otherwise).
 
         (9b) Forecastability classification
             How inherently predictable is this quantity on the given time horizon?
@@ -614,9 +632,9 @@ def numeric_prompt(
             - Forecastability check: does your interval width match the forecastability classification?
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
-        You MUST emit a fenced ```json block below, immediately after your analysis
-        and BEFORE your final answer line(s). This block is required for scoring —
-        responses without it are discarded.
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
         Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
         percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
         0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
@@ -633,41 +651,17 @@ def numeric_prompt(
         ```
 
         Notes:
-        - `declared_percentiles` MUST contain all 13 standard percentiles (0.01,
-          0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99)
-          and MUST match your final Percentile lines below exactly. If the trailing
-          Percentile lines are dropped, this block is the only recoverable source of
-          your forecast, and a partial set cannot be salvaged.
+        - The `declared_percentiles` block is the ONLY source of your forecast — it
+          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
+          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
+          salvaged.
+        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
+          equal); floating-point numbers in the base unit; no scientific notation.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
           whole number (counts, rankings, number of events, number of countries),
           "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
 
-        Emit the JSON block BEFORE the final Prediction block.
-
-        ── OUTPUT FORMAT ──
-
-        Emit the trailing {EXPECTED_PERCENTILE_COUNT} standard percentiles as your Prediction block.
-
-        Prediction:
-        [Reminders:
-        - Floating point numbers in the base unit
-        - Must be last lines, nothing after
-        - STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.)
-        Example:]
-
-        Percentile 1: 0.5
-        Percentile 2.5: 1.2
-        Percentile 5: 10.1
-        Percentile 10: 12.3
-        Percentile 20: 23.4
-        Percentile 40: 34.5
-        Percentile 50: 45.6
-        Percentile 60: 56.7
-        Percentile 80: 67.8
-        Percentile 90: 78.9
-        Percentile 95: 89.0
-        Percentile 97.5: 123.4
-        Percentile 99: 140.2
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 
@@ -713,24 +707,28 @@ def stacking_binary_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `posterior_prob`, a
+        decimal in [0,1]). Read those blocks to get each model's declared number,
+        and read the surrounding reasoning to weight the analysis.
         {predictions_text}
-        
+
         ── Meta-Analysis Framework ──
         1) Model agreement analysis
            • Where do the models agree? What shared evidence drives consensus?
            • Where do they disagree? What causes divergent reasoning?
            • Are disagreements due to different evidence weighting or different evidence sources?
-        
+
         2) Evidence synthesis
            • Which evidence appears most frequently across analyses? Is this justified?
            • What unique evidence does each model bring? How credible is it?
            • Are there systematic biases visible across models (overconfidence, anchoring, etc.)?
-        
+
         3) Reasoning quality assessment
            • Which models demonstrate strongest analytical rigor?
            • Which models best incorporate reference class reasoning?
            • Which models show appropriate uncertainty calibration?
-        
+
         4) Meta-level adjustments
            • Should I weight models equally or give more weight to better-reasoned analyses?
            • Are there blind spots that all models missed?
@@ -742,8 +740,22 @@ def stacking_binary_prompt(
            • Does this probability appropriately reflect the uncertainty in the question?
            • Sanity check: does this probability make sense given the base rate and evidence?
 
-        The last thing you write MUST BE your final answer as an INTEGER percentage. "Probability: ZZ%"
-        An example response is: "Probability: 50%"
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema:
+
+        ```json
+        {{
+          "question_type": "binary",
+          "posterior_prob": 0.28
+        }}
+        ```
+
+        `posterior_prob`: ALWAYS populate as a decimal in [0,1] (e.g., 0.28 for 28%).
+
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 
@@ -760,7 +772,9 @@ def stacking_multiple_choice_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
-    answer_example_lines = "\n".join(f"{opt}: NN%" for opt in question.options)
+    # Build the STRUCTURED FORECAST block example with the REAL option names as
+    # JSON keys — the downstream parser can only recognize the actual options.
+    option_probs_example = _option_probs_example(question.options)
 
     return clean_indents(
         f"""
@@ -785,6 +799,11 @@ def stacking_multiple_choice_prompt(
         {_forecasting_window_str(question)}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `option_probs`, keyed
+        by the exact option names, values as decimals summing to 1.0). Read those
+        blocks to get each model's declared distribution, and read the surrounding
+        reasoning to weight the analysis.
         {predictions_text}
 
         ── Meta-Analysis Framework ──
@@ -792,22 +811,22 @@ def stacking_multiple_choice_prompt(
            • Which options show consensus vs divergence across models?
            • What shared reasoning drives agreement on likely/unlikely options?
            • Where models disagree, what drives the different assessments?
-        
+
         2) Evidence synthesis across models
            • What evidence appears consistently? Is this justified by source quality?
            • What unique insights does each model contribute?
            • Are there systematic biases (overconfidence on favorites, neglect of tails)?
-        
+
         3) Probability distribution analysis
            • Which models show appropriate uncertainty (avoid 0%/100%)?
            • How do the models differ in their tail probability allocation?
            • Are there systematic patterns in how models distribute probability?
-        
+
         4) Reasoning quality assessment
            • Which analyses demonstrate strongest logical coherence?
            • Which models best incorporate reference class reasoning?
            • Which show most appropriate calibration for this question type?
-        
+
         5) Meta-level synthesis
            • Should models be weighted equally or by reasoning quality?
            • Are there overlooked scenarios that all models missed?
@@ -818,12 +837,25 @@ def stacking_multiple_choice_prompt(
            • What probability distribution best synthesizes all analyses?
            • Does my distribution appropriately reflect uncertainty?
            • Are my tail probabilities justified given the evidence?
-        
+
         **CRITICAL**: You MUST assign a probability (1-99%) to EVERY single option listed above.
         Even if an option seems very unlikely, assign it at least 1%. Never skip any option.
-        
-        ── Final answer (must be last lines, one line per option, all options included, in same order, nothing after) ──
-        {answer_example_lines}
+
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`option_probs` is REQUIRED):
+
+        ```json
+        {{
+          "question_type": "multiple_choice",
+          "option_probs": {{{option_probs_example}}}
+        }}
+        ```
+
+        The `option_probs` object must sum to 1.0 and use the exact option names above.
+        The LAST thing you write MUST be this fenced ```json block, with a probability for EVERY option above (keys = exact option names, in order). Write nothing after it.
         """
     )
 
@@ -878,6 +910,12 @@ def stacking_numeric_prompt(
         {upper_bound_message}
 
         ── Multiple Expert Analyses ──
+        Each base-model analysis above carries its final forecast inside a fenced
+        ```json STRUCTURED FORECAST block at its tail (field `declared_percentiles`,
+        an object keyed by the 13 standard percentiles as decimals from 0.01 through
+        0.99, with values in the base unit; plus `outcome_type`). Read those blocks
+        to get each model's declared distribution, and read the surrounding reasoning
+        to weight the analysis.
         {predictions_text}
 
         ── Meta-Analysis Framework ──
@@ -885,22 +923,22 @@ def stacking_numeric_prompt(
            • Compare the central tendencies (medians) across models - what explains differences?
            • Compare uncertainty ranges (90% intervals) - which models show appropriate calibration?
            • Are there systematic patterns in how models approach this forecasting problem?
-        
+
         2) Evidence synthesis
            • What evidence/approaches appear across multiple analyses?
            • What unique insights or data does each model contribute?
            • Which models demonstrate strongest analytical rigor for this question type?
-        
+
         3) Calibration assessment
            • Which models show appropriate uncertainty given the available evidence?
            • Are any models systematically overconfident (too narrow ranges)?
            • Which uncertainty ranges seem most justified by the evidence quality?
-        
+
         4) Reference class integration
            • How do models differ in their reference class selection?
            • Which outside view approaches seem most appropriate?
            • Should I favor models with stronger reference class reasoning?
-        
+
         5) Meta-level synthesis
            • Should I weight models equally or by reasoning quality?
            • Are there blind spots or scenarios all models missed?
@@ -915,22 +953,37 @@ def stacking_numeric_prompt(
         Remember: Think in ranges, not points. Keep your extreme tails (P1 and P99) appropriately wide.
         Ensure strictly increasing percentiles and respect the bounds above.
 
-        OUTPUT FORMAT, floating point numbers
-        Must be last lines, nothing after, STRICTLY INCREASING percentiles meaning e.g. p20 > p10 and not equal.
+        ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
+        This block is the ONLY authoritative source of your forecast — a downstream
+        deterministic parser reads it and nothing else. Responses without it are
+        discarded.
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
+        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
+        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
 
-        Percentile 1: [value]
-        Percentile 2.5: [value]
-        Percentile 5: [value]
-        Percentile 10: [value]
-        Percentile 20: [value]
-        Percentile 40: [value]
-        Percentile 50: [value]
-        Percentile 60: [value]
-        Percentile 80: [value]
-        Percentile 90: [value]
-        Percentile 95: [value]
-        Percentile 97.5: [value]
-        Percentile 99: [value]
+        ```json
+        {{
+          "question_type": "numeric",
+          "declared_percentiles": {{
+            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
+            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
+          }},
+          "outcome_type": "continuous"
+        }}
+        ```
+
+        Notes:
+        - The `declared_percentiles` block is the ONLY source of your forecast — it
+          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
+          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
+          salvaged.
+        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
+          equal); floating-point numbers in the base unit; no scientific notation.
+        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
+          whole number (counts, rankings, number of events, number of countries),
+          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
+
+        The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
     )
 

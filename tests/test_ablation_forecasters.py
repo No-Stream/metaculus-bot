@@ -1381,6 +1381,22 @@ def test_parse_retry_after_seconds_clamps_negative_past_date_to_zero() -> None:
     assert parsed == pytest.approx(0.0)
 
 
+def test_infer_failure_stage_tags_value_extraction_error_as_parser() -> None:
+    """A ValueExtractionError from the ladder classifies as a parser-stage failure.
+
+    The extraction ladder is the successor to the standalone parser call; any
+    terminal ladder failure surfaces as ``ValueExtractionError`` and must be
+    tagged ``parser`` regardless of exception message content.
+    """
+    from metaculus_bot.ablation.forecasters import _infer_failure_stage
+    from metaculus_bot.exceptions import ValueExtractionError
+
+    # Include a model-slug substring in the message to prove the isinstance
+    # branch wins over the "slug in msg → forecaster" textual heuristic.
+    exc = ValueExtractionError("all rungs failed for question=42 model=some-model")
+    assert _infer_failure_stage(exc, "some-model") == "parser"
+
+
 # ---------------------------------------------------------------------------
 # C1 — Soft-deadline timeout
 #

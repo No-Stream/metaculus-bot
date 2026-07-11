@@ -98,22 +98,25 @@ Thresholds (`metaculus_bot/constants.py:245-249`):
 
 Each forecaster emits the 13 standard percentiles `{1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99}` as plain text (prompt example in `prompts.numeric_prompt`). Per-model stages:
 
-1. Parser LLM extracts `list[Percentile]`.
+1. Value extraction ladder (`value_extraction.py` `extract_numeric`): deterministic block-first parse of the fenced ```json STRUCTURED FORECAST block into `list[Percentile]`, with json-repair salvage and the parser LLM (`parse_structured`) only as rung-3 salvage. Returns exactly the 13 canonical percentiles (or raises `ValueExtractionError`).
 2. `sanitize_percentiles` (`numeric/pipeline.py`): filter to the 13, validate, sort, spread count-like clusters, jitter duplicates, clamp to bounds, ensure strictly increasing, optionally widen tails.
 3. `widen_declared_percentiles` (`numeric/tail_widening.py`): bound-aware stretch of distance-from-median by `k_tail=1.0` (identity by default; widening only kicks in when callers raise `k_tail` above 1.0) with `span_floor_gamma=0.0` (no span-floor enforcement by default). Both knobs are configurable per-call.
 4. `build_numeric_distribution` → `generate_pchip_cdf_with_smoothing` produces 201-point PCHIP CDF → ramp smoothing for min-step → validation. On failure: `create_fallback_numeric_distribution` delegates CDF build to forecasting-tools.
 5. **Discrete integer snapping**: if a majority of forecasters vote DISCRETE, snap the distribution to integers.
 6. **Unit-mismatch guard** (`numeric/validation.py` `detect_unit_mismatch`): withholds the prediction if values look off by orders of magnitude.
 
-### Numeric format router (`numeric_format_router.py`)
+### Value extraction ladder (`value_extraction.py`)
 
-`route_numeric_output(rationale, declared_percentiles) -> list[Percentile]` is a thin fallback shim after the 2026-07-08 mixture-branch removal (Workstream C1 mixtures had zero prod fires in the 90-day window and never beat percentiles+PCHIP in benchmarks). It always returns a `list[Percentile]` that the caller feeds into `sanitize_percentiles` → `build_numeric_distribution`. The forecaster is responsible for calling `parse_structured` on the trailing `Percentile X.X: ...` lines first; the router just picks between the parser's result and the F5 block-lifted fallback:
+Since 2026-07-10, forecast values (binary probability, MC option probabilities, numeric percentiles) come out of the fenced ```json STRUCTURED FORECAST block via a deterministic four-rung ladder — the block is the authoritative source, and the parser LLM survives only as a salvage rung. `extract_binary`, `extract_mc`, and `extract_numeric` share the same driver and are called by both `forecaster_runners.py` (per-model forecasts) and `stacking.py` (stacker output), so both flows share one extraction path:
 
-1. If `declared_percentiles` was extracted by the parser (the common path), return it verbatim.
-2. **F5 fallback**: if the parser missed the trailing lines (returned `None`) but the fenced structured JSON block carries a `declared_percentiles` dict, lift those into `Percentile(percentile=..., value=...)` objects and return them — so a rationale that dropped the trailing lines but kept the structured block still yields a forecast.
-3. Otherwise raise `ValueError` — the numeric forecaster has no percentile source and the caller propagates the failure.
+1. **block** — deterministic parse of the fenced ```json block (`parse_structured_block`: `json.loads` + Pydantic validation against `BinaryStructured` / `MultipleChoiceStructured` / `NumericStructured`). This absorbs the old numeric_format_router F5 block-lift: when the schema-valid numeric block carries a `declared_percentiles` dict, it is lifted directly into `Percentile(percentile=..., value=...)` objects.
+2. **repair** — deterministic JSON repair (`json_repair`) of a malformed fenced block, or a balanced-braces scan of the last ~4000 chars of the rationale when no fence survived.
+3. **llm** — the existing LLM parser (`parse_structured`) run over the full rationale as a last-resort salvage. Post-rung validation stays strict (bounds, all 13 canonical percentiles for numeric, option-set match for MC) so the parser can never smuggle in a fabricated value.
+4. Raise `ValueExtractionError` — the numeric forecaster (or the stacker) has no usable value source; the caller drops or soft-fails the forecaster exactly as parser failures propagated before the ladder.
 
-The `mixture_components` schema slot, `RoutedNumericForecast` return type, and `numeric_format=...` logging were all deleted in the collapse; discrete-integer snapping is decided by the C3 block-read in `forecaster_runners.run_numeric_forecast` (which reads `NumericStructured.outcome_type` before falling back to a parser LLM call for `OutcomeTypeResult`), not by the router.
+Every successful extraction emits one `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...` INFO log line — this is the drift-signal telemetry that superseded the deleted shadow-divergence comparison. Watch `rung=llm` salvages and `block_present=false` in prod logs; those are the two symptoms that indicate a forecaster stopped emitting a well-formed block.
+
+Discrete-integer snapping is decided separately by the C3 block-read in `forecaster_runners.run_numeric_forecast` — it reads `NumericStructured.outcome_type` directly before falling back to a parser LLM call for `OutcomeTypeResult`, and the ladder does not touch that path.
 
 **Ensemble aggregation** (`numeric/utils.py` `aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 
@@ -146,8 +149,8 @@ In production (AskNews creds present) Exa/Perplexity/OpenRouter do NOT run. They
 ### Prompts (`metaculus_bot/prompts.py`)
 
 - `_benchmarking_warning`, `_forecasting_window_str`, `web_research_prompt`.
-- Base: `binary_prompt`, `multiple_choice_prompt`, `numeric_prompt`. Each base prompt now embeds the STRUCTURED FORECAST JSON-block schema instruction (Workstream C activation) so forecaster rationales emit machine-readable blocks for `tool_runner` to consume.
-- Stacking: `stacking_binary_prompt`, `stacking_multiple_choice_prompt`, `stacking_numeric_prompt`. The stacker prompts include a "Cross-model aggregation (deterministic math)" block at the top when `build_cross_model_aggregation` returns markdown.
+- Base: `binary_prompt`, `multiple_choice_prompt`, `numeric_prompt`. Each base prompt embeds the STRUCTURED FORECAST JSON-block schema instruction and requires the fenced ```json block to be the **last** output — no trailing prose value lines. The value extraction ladder relies on this: rung 1 parses the block deterministically, and the tail-scan repair rung reads only the final few KB of the rationale.
+- Stacking: `stacking_binary_prompt`, `stacking_multiple_choice_prompt`, `stacking_numeric_prompt`. Same block-last schema instruction as the base prompts (the stacker output flows through the same ladder). The stacker prompts also include a "Cross-model aggregation (deterministic math)" block at the top when `build_cross_model_aggregation` returns markdown.
 - Conditional-stacking support: `disagreement_crux_prompt`, `targeted_search_prompt`.
 - Gap-fill: `gap_fill_analyzer_prompt`, `gap_fill_search_prompt`.
 
@@ -271,7 +274,7 @@ The donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) is shared and r
 
 `forecaster.py` keeps a handful of `from x import y` statements inside functions instead of at module scope, each tagged `# noqa: PLC0415  # function-scoped: see AGENTS.md`. Two reasons drive this:
 
-1. **Optional dependency loading.** `prediction_market_provider` pulls in `rapidfuzz`; `tool_runner`, `numeric_format_router`, etc. only matter when their corresponding feature flag is on. Importing them at function scope keeps the cold-start path lean and avoids surprising errors when an optional dep isn't installed.
+1. **Optional dependency loading.** `prediction_market_provider` pulls in `rapidfuzz`; `tool_runner` only matters when `PROBABILISTIC_TOOLS_ENABLED` is on. Importing them at function scope keeps the cold-start path lean and avoids surprising errors when an optional dep isn't installed.
 2. **Ruff auto-formatter behavior.** When a usage edit is staged separately from the import edit (common during refactors and subagent dispatches), Ruff's auto-formatter strips the now-unused top-level import between cycles. Function-scoped imports survive this because the symbol is referenced in the same statement block.
 
 Don't hoist these to the top of `forecaster.py` without first checking that both reasons no longer apply.

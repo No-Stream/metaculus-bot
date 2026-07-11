@@ -57,6 +57,7 @@ from metaculus_bot.ablation.forecaster_lineup import (
 from metaculus_bot.ablation.window_patch import patched_window_for_question
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import FORECASTER_SOFT_DEADLINE
+from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
 
@@ -220,11 +221,16 @@ def _infer_failure_stage(exc: Exception, forecaster_model_slug: str) -> str:
     """Heuristically tag which stage of ``_make_prediction`` raised.
 
     ``_make_prediction`` calls (1) the forecaster LLM via
-    ``_run_forecast_on_<type>``, then (2) the parser LLM via
-    ``structure_output``. The exception message rarely identifies which model
-    raised — exception types are litellm-generic. We use textual heuristics
-    that survived first-light:
+    ``_run_forecast_on_<type>``, then (2) the value_extraction ladder (which
+    subsumes the old parser LLM stage — see ``metaculus_bot.value_extraction``).
+    The exception message rarely identifies which model raised — exception
+    types are litellm-generic. We use textual heuristics that survived
+    first-light:
 
+    * :class:`ValueExtractionError` → parser. The extraction ladder is the
+      successor to the parser stage, so its typed terminal failure is a
+      "parser"-stage failure. Checked first so the typed signal wins before
+      any textual heuristic can miscategorize it.
     * ``"no allowed providers"`` → almost always the parser. The donated-key
       allowed-providers 404 hits the parser specifically (the parser is the
       OAI-prefixed model in the ablation; production forecasters route via
@@ -239,6 +245,9 @@ def _infer_failure_stage(exc: Exception, forecaster_model_slug: str) -> str:
     exception is always preserved in the payload's ``errors`` list — this tag
     is purely advisory for log readers.
     """
+    # Typed extraction-ladder failure — ranks above textual heuristics.
+    if isinstance(exc, ValueExtractionError):
+        return "parser"
     msg = str(exc).lower()
     # Donated-key allowed-providers 404. Parser uses the OAI-prefixed model
     # in production llm_configs (and historically did in the ablation, before

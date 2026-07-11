@@ -314,25 +314,32 @@ class TestForecastingWindowAnchor:
 
 
 class TestMcPromptInterpolatesRealOptionNames:
-    """Strict parsers (e.g. gemma-4-31b-it) refuse to map literal ``Option_A: NN%``
+    """Strict parsers (e.g. gemma-4-31b-it) refuse to map literal ``Option_A``
     placeholders onto real option names in the allowed-list — they correctly
     emit ``<<NOT_FOUND>>`` because the prompt example does not contain anything
     semantically tied to the question's actual options.
 
-    Fix: the example block in both ``multiple_choice_prompt`` and
-    ``stacking_multiple_choice_prompt`` must interpolate the real option names
-    so the LLM emits text the parser can directly recognize.
+    Fix: the STRUCTURED FORECAST JSON block in both ``multiple_choice_prompt``
+    and ``stacking_multiple_choice_prompt`` must use the REAL option names as
+    JSON keys so the LLM emits text the parser can directly recognize.
+
+    Post-refactor: the trailing prose "{opt}: NN%" answer lines are gone;
+    ``option_probs`` in the JSON block is the sole forecast surface.
     """
 
-    def test_stacking_mc_prompt_emits_real_option_names(self) -> None:
+    def test_stacking_mc_prompt_emits_real_option_names_in_json_block(self) -> None:
         q = _mc_q()
         q.options = ["Apple", "Banana", "Cherry"]
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
-        assert "Apple: NN%" in result
-        assert "Banana: NN%" in result
-        assert "Cherry: NN%" in result
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        for opt in ("Apple", "Banana", "Cherry"):
+            assert f'"{opt}"' in structured_section, f"option {opt!r} missing from option_probs JSON example"
+        # Trailing prose per-option lines must be gone.
+        assert "Apple: NN%" not in result
+        assert "Banana: NN%" not in result
+        assert "Cherry: NN%" not in result
 
     def test_stacking_mc_prompt_drops_literal_option_a_b_placeholders(self) -> None:
         q = _mc_q()
@@ -340,19 +347,26 @@ class TestMcPromptInterpolatesRealOptionNames:
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
+        assert '"Option_A"' not in result
+        assert '"Option_B"' not in result
+        assert '"Option_N"' not in result
+        # Also the old prose placeholders.
         assert "Option_A: NN%" not in result
         assert "Option_B: NN%" not in result
         assert "Option_N: NN%" not in result
 
-    def test_multiple_choice_prompt_emits_real_option_names(self) -> None:
+    def test_multiple_choice_prompt_emits_real_option_names_in_json_block(self) -> None:
         q = _mc_q()
         q.options = ["Apple", "Banana", "Cherry"]
 
         result = multiple_choice_prompt(q, research="r")
 
-        assert "Apple: NN%" in result
-        assert "Banana: NN%" in result
-        assert "Cherry: NN%" in result
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        for opt in ("Apple", "Banana", "Cherry"):
+            assert f'"{opt}"' in structured_section, f"option {opt!r} missing from option_probs JSON example"
+        assert "Apple: NN%" not in result
+        assert "Banana: NN%" not in result
+        assert "Cherry: NN%" not in result
 
     def test_multiple_choice_prompt_drops_literal_option_a_b_placeholders(self) -> None:
         q = _mc_q()
@@ -360,26 +374,27 @@ class TestMcPromptInterpolatesRealOptionNames:
 
         result = multiple_choice_prompt(q, research="r")
 
-        # Note: the JSON schema example block still uses Option_A/B/C as JSON
-        # keys to illustrate the mapping shape; that's fine. What we don't want
-        # is the literal "Option_A: NN%" answer-line example, since that's the
-        # text the parser actually has to map onto real option names.
+        # No literal "Option_A" placeholders anywhere — not in the JSON block
+        # (real option names go there), not in prose (prose forecast lines gone).
+        assert '"Option_A"' not in result
+        assert '"Option_B"' not in result
+        assert '"Option_N"' not in result
         assert "Option_A: NN%" not in result
         assert "Option_B: NN%" not in result
         assert "Option_N: NN%" not in result
 
-    def test_stacking_mc_prompt_preserves_options_in_order(self) -> None:
-        """The example answer lines must list options in the same order as
-        ``question.options`` — the trailing answer lines downstream rely on
-        that ordering to carry into the LLM's output."""
+    def test_stacking_mc_prompt_preserves_options_in_order_in_json_block(self) -> None:
+        """The JSON-block ``option_probs`` example must list options in the same
+        order as ``question.options`` — a strict parser matching on positional
+        alignment depends on that ordering."""
         q = _mc_q()
         q.options = ["Manufacturing PMI higher", "Services PMI higher", "Equal"]
 
         result = stacking_multiple_choice_prompt(q, research="r", base_predictions=["a1", "a2"])
 
-        idx_mfg = result.find("Manufacturing PMI higher: NN%")
-        idx_svc = result.find("Services PMI higher: NN%")
-        idx_eq = result.find("Equal: NN%")
+        idx_mfg = result.find('"Manufacturing PMI higher"')
+        idx_svc = result.find('"Services PMI higher"')
+        idx_eq = result.find('"Equal"')
         assert idx_mfg >= 0
         assert idx_svc >= 0
         assert idx_eq >= 0
@@ -661,24 +676,48 @@ class TestConjunctiveCriteriaPricing:
 
 
 class TestNumericPromptThirteenPercentiles:
-    """The numeric prompts must enumerate all 13 percentile lines (P1 first, P99 last)
-    and never tell the model to emit exactly 11."""
+    """The numeric prompts must document all 13 standard percentile keys in
+    the STRUCTURED FORECAST JSON schema example (P1 first, P99 last) and
+    never tell the model to emit exactly 11.
 
-    def test_numeric_prompt_example_block_has_p1_and_p99(self) -> None:
+    Post-refactor: the ONLY forecast surface is ``declared_percentiles`` in the
+    JSON block — the old trailing "Percentile X: [value]" prose lines are gone.
+    We assert on the JSON-key form ("0.01" .. "0.99")."""
+
+    _PERCENTILE_KEYS = (
+        "0.01",
+        "0.025",
+        "0.05",
+        "0.1",
+        "0.2",
+        "0.4",
+        "0.5",
+        "0.6",
+        "0.8",
+        "0.9",
+        "0.95",
+        "0.975",
+        "0.99",
+    )
+
+    def test_numeric_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
-        # P1 line comes first, P99 line comes last in the enumerated Option-A block.
-        assert "Percentile 1:" in result
-        assert "Percentile 99:" in result
-        assert "Percentile 2.5:" in result
-        assert "Percentile 97.5:" in result
-        # P1 must precede P2.5; P99 must follow P97.5.
-        assert result.find("Percentile 1:") < result.find("Percentile 2.5:")
-        assert result.find("Percentile 99:") > result.find("Percentile 97.5:")
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        indices = []
+        for key in self._PERCENTILE_KEYS:
+            token = f'"{key}"'
+            assert token in structured_section, f"missing percentile key {token} in declared_percentiles example"
+            indices.append(structured_section.find(token))
+        # Keys appear in the declared order: 0.01 < 0.025 < ... < 0.99.
+        assert indices == sorted(indices), f"percentile keys out of order: {indices}"
+        # No trailing prose "Percentile 1: [value]" block anywhere.
+        assert "Percentile 1:" not in result
+        assert "Percentile 99:" not in result
 
     def test_numeric_prompt_says_13_not_11(self) -> None:
         result = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
         lowered = " ".join(result.lower().split())
-        assert "all 13 percentiles" in lowered
+        assert "all 13 percentiles" in lowered or "all 13 standard" in lowered
         assert "13 standard percentiles" in lowered
         assert "11 percentiles" not in lowered
         assert "11 standard percentiles" not in lowered
@@ -692,10 +731,10 @@ class TestNumericPromptThirteenPercentiles:
             upper_bound_message="ubm",
         )
         lowered = " ".join(result.lower().split())
-        assert "all 13 percentiles" in lowered
+        assert "all 13 percentiles" in lowered or "all 13 standard" in lowered
         assert "11 percentiles" not in lowered
 
-    def test_stacking_numeric_prompt_example_block_has_p1_and_p99(self) -> None:
+    def test_stacking_numeric_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
         result = stacking_numeric_prompt(
             _numeric_q(),
             research="r",
@@ -703,7 +742,15 @@ class TestNumericPromptThirteenPercentiles:
             lower_bound_message="lbm",
             upper_bound_message="ubm",
         )
-        assert "Percentile 1:" in result
-        assert "Percentile 99:" in result
-        assert result.find("Percentile 1:") < result.find("Percentile 2.5:")
-        assert result.find("Percentile 99:") > result.find("Percentile 97.5:")
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        indices = []
+        for key in self._PERCENTILE_KEYS:
+            token = f'"{key}"'
+            assert token in structured_section, (
+                f"missing percentile key {token} in stacking declared_percentiles example"
+            )
+            indices.append(structured_section.find(token))
+        assert indices == sorted(indices), f"stacking percentile keys out of order: {indices}"
+        # No trailing prose "Percentile 1: [value]" block.
+        assert "Percentile 1:" not in result
+        assert "Percentile 99:" not in result

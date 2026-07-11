@@ -127,14 +127,20 @@ either). Instead:
   to the new `MetaculusClient` (silent no-op). Plus a validator audit — HEAD's new
   `_check_too_far_from_bounds` (25% wiggle) may conflict with our beyond-range open-bound
   percentile design. Unlocks the litellm/cryptography CVE fixes below.
-- **Deferred:** JSON-block-as-authoritative for binary/MC — gated on Workstream A's shadow
-  data, decide at a round boundary. **Concrete trigger (operator, 2026-07-08): once ~50
-  questions of shadow divergence data exist, check parser-vs-block agreement; if the
-  structured block is reliably consistent (near-zero divergence, no missing-block cases the
-  parser rescued), promote the block to authoritative and drop the parser LLM call for
-  binary/MC — no reason to burn LLM calls (however cheap) on parsing that deterministic
-  block-reads handle.** Numeric keeps the parser longer (percentile extraction is the
-  hard case; the F5 block-lift fallback already covers block-only rationales).
+- **DONE (2026-07-10): JSON-block-as-authoritative for ALL question types
+  (binary, MC, numeric) AND the stacker.** Value extraction runs through the
+  deterministic four-rung ladder in `metaculus_bot/value_extraction.py`:
+  fenced ```json block parse → json-repair salvage → LLM-parser salvage
+  (`parse_structured`) → `ValueExtractionError`. The old Workstream A trigger
+  ("wait for ~50 questions of shadow-divergence agreement data") was
+  **consciously waived by the operator** in favor of two lighter-weight
+  verification channels: (a) the `EXTRACTION_RUNG` INFO telemetry emitted on
+  every extraction — `rung=llm` salvages and `block_present=false` are the
+  drift signals to watch in prod logs; and (b) a user-gated live `test_bot`
+  rerun that eyeballs those rungs before the first tournament run. The
+  shadow-divergence logging module and its tests were deleted (superseded
+  by rung telemetry); the F5 block-lift fallback was absorbed into rung 1
+  of the numeric ladder.
 
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 

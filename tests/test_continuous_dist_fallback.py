@@ -1,14 +1,15 @@
 # type: ignore
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
-from pydantic import ValidationError
 
 from main import TemplateForecaster
+from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.value_extraction import ExtractionOutcome
 
 
 def _stub_open_time() -> datetime:
@@ -80,9 +81,15 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
         )
     ]
 
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.forecaster_runners.extract_numeric",
+            new=AsyncMock(return_value=ExtractionOutcome(value=fake_percentiles, rung="block", block_present=True)),
+        ),
     ):
         result = await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]
 
@@ -96,13 +103,18 @@ async def test_numeric_parsing_success_without_fallback(dummy_forecaster):
 
 @pytest.mark.asyncio
 async def test_fallback_reraises_when_insufficient_numbers(dummy_forecaster):
+    # Rationale has neither a fenced JSON block nor rescuable braces, so the
+    # ladder's block+repair rungs fail; the LLM salvage rung (parse_structured)
+    # raises ValueExtractionError directly, which the ladder's terminal-rung
+    # catch folds into its typed ValueExtractionError. The old text-extraction
+    # "no declared_percentiles available" fallback is gone with the F5 router.
     rationale = "Percentile 10: 5\nPercentile 20: 6\n"
 
     q = make_dummy_numeric_question()
     llm = DummyLLM(rationale)
     with patch(
         "metaculus_bot.forecaster_runners.parse_structured",
-        side_effect=ValidationError.from_exception_data("NumericDistribution", []),
+        side_effect=ValueExtractionError("LLM parser failed"),
     ):
-        with pytest.raises(ValueError, match="no declared_percentiles available"):
+        with pytest.raises(ValueExtractionError):
             await dummy_forecaster._run_forecast_on_numeric(q, "", llm)  # type: ignore[arg-type]

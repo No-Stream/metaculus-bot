@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 
 from forecasting_tools import (
-    BinaryPrediction,
     BinaryQuestion,
     GeneralLlm,
     MultipleChoiceQuestion,
@@ -23,24 +22,20 @@ from forecasting_tools import (
     ReasonedPrediction,
     clean_indents,
 )
-from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
-from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
 from metaculus_bot.numeric.diagnostics import log_final_prediction
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.numeric_format_router import route_numeric_output
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
-from metaculus_bot.shadow_divergence import log_parser_vs_block_divergence
-from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_parse import parse_structured
+from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
 logger = logging.getLogger(__name__)
 
@@ -125,27 +120,15 @@ async def run_binary_forecast(
         "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
         "Do not return percentages, strings, or any extra fields."
     )
-    binary_prediction: BinaryPrediction = await parse_structured(
+    outcome = await extract_binary(
         reasoning,
-        BinaryPrediction,
         parser_llm,
         prompt_notes=binary_parse_instructions,
-    )
-
-    # A0 shadow divergence (F6): compare the block against the RAW parser value,
-    # BEFORE the clamp below — so max_abs_diff reflects true parser-vs-block
-    # drift, not deterministic post-processing. Observability only.
-    log_parser_vs_block_divergence(
-        question=question,
-        raw_parser_value=binary_prediction.prediction_in_decimal,
-        reasoning=reasoning,
+        question_id=question.id_of_question,
         model_name=forecaster_llm.model,
     )
 
-    decimal_pred = max(
-        BINARY_PROB_MIN,
-        min(BINARY_PROB_MAX, binary_prediction.prediction_in_decimal),
-    )
+    decimal_pred = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, outcome.value))
 
     logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}")
     return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
@@ -174,44 +157,19 @@ async def run_mc_forecast(
         """
     )
 
+    outcome = await extract_mc(
+        reasoning,
+        list(question.options),
+        parser_llm,
+        prompt_notes=parsing_instructions,
+        question_id=question.id_of_question,
+        model_name=forecaster_llm.model,
+    )
+    predicted_option_list = outcome.value
     try:
-        predicted_option_list: PredictedOptionList = await parse_structured(
-            reasoning,
-            PredictedOptionList,
-            parser_llm,
-            prompt_notes=parsing_instructions,
-        )
-        # A0 shadow divergence (F6): log BEFORE clamp_and_renormalize_mc — it
-        # mutates the option list in place, so this is the only point where the
-        # raw parser probabilities still exist. Observability only.
-        log_parser_vs_block_divergence(
-            question=question,
-            raw_parser_value=predicted_option_list,
-            reasoning=reasoning,
-            model_name=forecaster_llm.model,
-        )
-        try:
-            predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
-        except ValueError as e:
-            logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
-    except (ValidationError, ValueError) as exc:
-        logger.warning(f"Primary MC parse failed: {exc}")
-        raw_options: list[OptionProbability] = await parse_structured(
-            reasoning,
-            list[OptionProbability],
-            parser_llm,
-            prompt_notes=parsing_instructions,
-        )
-        predicted_option_list = build_mc_prediction(raw_options, list(question.options))
-        # Fallback path: build_mc_prediction's output is the closest-to-raw
-        # parser value available here (the primary PredictedOptionList parse
-        # failed), so compare the block against it.
-        log_parser_vs_block_divergence(
-            question=question,
-            raw_parser_value=predicted_option_list,
-            reasoning=reasoning,
-            model_name=forecaster_llm.model,
-        )
+        predicted_option_list = clamp_and_renormalize_mc(predicted_option_list)
+    except ValueError as e:
+        logger.warning(f"MC clamp/renormalize failed, using raw predictions: {e}")
 
     logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}")
     return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
@@ -283,38 +241,14 @@ async def run_numeric_forecast(
 
     parse_notes = build_parse_notes(question)
 
-    percentile_list: list[Percentile] | None
-    try:
-        percentile_list = await parse_structured(
-            reasoning,
-            list[Percentile],
-            parser_llm,
-            prompt_notes=parse_notes,
-        )
-    except (ValidationError, ValueError):
-        # Parser couldn't extract percentile lines - the router's F5 fallback
-        # will try to lift declared_percentiles from the JSON block instead.
-        percentile_list = None
-
-    # A0 shadow divergence (F6): compare the block against the RAW parser
-    # percentile list, BEFORE route_numeric_output / sanitize_percentiles /
-    # distribution building — the keys are percentile labels here, matching
-    # the block's declared_percentiles (the post-processed distribution's
-    # discrete resampling rekeyed onto cumulative CDF probabilities, making
-    # the old comparison meaningless on DISCRETE questions). None (parser
-    # failed) logs max_abs_diff=N/A. Observability only.
-    log_parser_vs_block_divergence(
-        question=question,
-        raw_parser_value=percentile_list,
-        reasoning=reasoning,
+    outcome = await extract_numeric(
+        reasoning,
+        parser_llm,
+        prompt_notes=parse_notes,
+        question_id=qid,
         model_name=forecaster_llm.model,
     )
-
-    effective_percentiles = route_numeric_output(
-        rationale=reasoning,
-        declared_percentiles=percentile_list,
-    )
-    sanitized_percentiles, zero_point = sanitize_percentiles(effective_percentiles, question)
+    sanitized_percentiles, zero_point = sanitize_percentiles(outcome.value, question)
 
     prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point)
 

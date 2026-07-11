@@ -1,7 +1,7 @@
 """Shared question-type dispatch, decoupled from the tool-runner import graph.
 
-Hoisted out of ``tool_runner`` (F3/F11) so light observability modules
-(e.g. ``shadow_divergence``) can map a ``MetaculusQuestion`` to its
+Hoisted out of ``tool_runner`` (F3/F11) so light observability and
+value-extraction consumers can map a ``MetaculusQuestion`` to its
 structured-block question-type string without importing ``tool_runner``,
 which drags the full ``probabilistic_tools`` package into the import
 graph. Keep this module's imports minimal — nothing here may import

@@ -11,6 +11,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
+from metaculus_bot.value_extraction import ExtractionOutcome
 
 
 def _stub_open_time() -> datetime:
@@ -239,9 +240,15 @@ class TestTailWideningIntegration:
         llm.model = "m"
         llm.invoke = AsyncMock(return_value="rationale")
 
-        with patch(
-            "metaculus_bot.forecaster_runners.parse_structured",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), declared],
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(return_value=ExtractionOutcome(value=declared, rung="block", block_present=True)),
+            ),
         ):
             result = await bot._run_forecast_on_numeric(cast(NumericQuestion, nq), "", llm)
 

@@ -454,40 +454,36 @@ def extract_first_balanced_braces(s: str) -> str | None:
     return None
 
 
-def parse_structured_block(
-    rationale_text: str,
+def parse_structured_payload(
+    raw_json: str,
     question_type: Literal["binary", "numeric", "multiple_choice"],
 ) -> StructuredBlock | None:
     """
-    Extract and validate a structured JSON block from a rationale.
+    Validate a raw JSON payload string against the structured-block schemas.
 
-    Returns the parsed Pydantic model or None. None on:
-      - No fenced JSON block (logged at DEBUG)
-      - Malformed JSON (logged at WARNING)
-      - Pydantic validation error (logged at WARNING)
-      - question_type mismatch between argument and JSON payload (WARNING)
+    Callers that already have the block body in hand (e.g. after
+    ``extract_json_block`` or a ``json_repair`` pass) use this to run the
+    size cap, ``json.loads``, dict-shape check, ``question_type`` inject /
+    mismatch guard, and Pydantic ``model_validate`` (including the binary
+    telemetry strip-and-retry). Returns ``None`` on any failure; the calling
+    ladder decides how to log and whether to fall through to the next rung.
 
     ``"discrete_count"`` is intentionally unsupported at runtime — see the
     module docstring.
     """
-    raw = extract_json_block(rationale_text)
-    if raw is None:
-        logger.info("No JSON block found in rationale for question_type=%s", question_type)
-        return None
-
-    if len(raw) > _MAX_STRUCTURED_BLOCK_BYTES:
+    if len(raw_json) > _MAX_STRUCTURED_BLOCK_BYTES:
         logger.warning(
             "Structured block exceeds size cap (%d bytes > %d); refusing to parse (question_type=%s)",
-            len(raw),
+            len(raw_json),
             _MAX_STRUCTURED_BLOCK_BYTES,
             question_type,
         )
         return None
 
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        snippet = raw[:200].replace("\n", " ")
+        snippet = raw_json[:200].replace("\n", " ")
         logger.warning(
             "Malformed JSON in structured block (question_type=%s): %s. Snippet: %s", question_type, exc, snippet
         )
@@ -557,3 +553,27 @@ def parse_structured_block(
             exc,
         )
         return None
+
+
+def parse_structured_block(
+    rationale_text: str,
+    question_type: Literal["binary", "numeric", "multiple_choice"],
+) -> StructuredBlock | None:
+    """
+    Extract and validate a structured JSON block from a rationale.
+
+    Returns the parsed Pydantic model or None. None on:
+      - No fenced JSON block (logged at INFO)
+      - Malformed JSON (logged at WARNING)
+      - Pydantic validation error (logged at WARNING)
+      - question_type mismatch between argument and JSON payload (WARNING)
+
+    ``"discrete_count"`` is intentionally unsupported at runtime — see the
+    module docstring.
+    """
+    raw = extract_json_block(rationale_text)
+    if raw is None:
+        logger.info("No JSON block found in rationale for question_type=%s", question_type)
+        return None
+
+    return parse_structured_payload(raw, question_type)

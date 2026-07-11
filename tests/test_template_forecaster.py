@@ -4,13 +4,16 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from forecasting_tools import BinaryQuestion, GeneralLlm, MetaculusQuestion, ReasonedPrediction
+from forecasting_tools import BinaryQuestion, GeneralLlm, MetaculusQuestion, PredictedOptionList, ReasonedPrediction
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
 
 from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.value_extraction import ExtractionOutcome
 
 
 def _stub_open_time() -> datetime:
@@ -278,14 +281,15 @@ async def test_run_forecast_on_binary_uses_provided_llm(mock_binary_question, mo
     }
     bot = TemplateForecaster(llms=llms_config)
 
-    # Mock parse_structured to avoid external parsing LLM calls
-    with patch(
-        "metaculus_bot.forecaster_runners.parse_structured",
-        return_value=type("_Bin", (), {"prediction_in_decimal": 0.65})(),
-    ) as mock_struct:
+    # Patch the ladder seam so the forecaster LLM is exercised without hitting
+    # the real parser: extract_binary returns a canned block-rung outcome.
+    async def _fake_extract(*_args, **_kwargs) -> ExtractionOutcome[float]:
+        return ExtractionOutcome(value=0.65, rung="block", block_present=True)
+
+    with patch("metaculus_bot.forecaster_runners.extract_binary", side_effect=_fake_extract) as mock_extract:
         result = await bot._run_forecast_on_binary(mock_binary_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
-        mock_struct.assert_called_once()
+        mock_extract.assert_called_once()
         assert result.prediction_value == 0.65
         assert "mock reasoning" in result.reasoning
 
@@ -301,11 +305,23 @@ async def test_run_forecast_on_multiple_choice_uses_provided_llm(mock_metaculus_
     bot = TemplateForecaster(llms=llms_config)
     mock_metaculus_question.options = ["A", "B"]
 
-    # Mock parse_structured for multiple-choice
-    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=MagicMock()) as mock_struct:
+    # Patch the ladder seam for MC. Construct a well-formed PredictedOptionList
+    # so the downstream clamp/renormalize step doesn't reject it.
+
+    fake_pol = PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name="A", probability=0.6),
+            PredictedOption(option_name="B", probability=0.4),
+        ]
+    )
+
+    async def _fake_extract(*_args, **_kwargs) -> ExtractionOutcome[PredictedOptionList]:
+        return ExtractionOutcome(value=fake_pol, rung="block", block_present=True)
+
+    with patch("metaculus_bot.forecaster_runners.extract_mc", side_effect=_fake_extract) as mock_extract:
         result = await bot._run_forecast_on_multiple_choice(mock_metaculus_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
-        mock_struct.assert_called_once()
+        mock_extract.assert_called_once()
         assert result.prediction_value is not None
         assert "mock reasoning" in result.reasoning
 
@@ -321,7 +337,6 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     bot = TemplateForecaster(llms=llms_config)
 
     # Mock bound_messages and structured_output to return a valid percentile list
-    from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
 
     fake_percentiles = [
         FTPercentile(value=v, percentile=p)
@@ -338,17 +353,29 @@ async def test_run_forecast_on_numeric_uses_provided_llm(mock_metaculus_question
     mock_metaculus_question.zero_point = None
     mock_metaculus_question.cdf_size = 201
 
+    # Percentile extraction now routes through the ladder seam (extract_numeric);
+    # only the OutcomeTypeResult classification still goes through parse_structured
+    # (and only when the block-first read in run_numeric_forecast doesn't find an
+    # outcome_type in the reasoning, which is the case for "mock reasoning").
+    async def _fake_extract_numeric(*_args, **_kwargs) -> ExtractionOutcome[list[FTPercentile]]:
+        return ExtractionOutcome(value=fake_percentiles, rung="block", block_present=True)
+
     with (
         patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("", "")) as mock_bounds,
         patch(
             "metaculus_bot.forecaster_runners.parse_structured",
-            side_effect=[OutcomeTypeResult(is_discrete_integer=False), fake_percentiles],
+            side_effect=[OutcomeTypeResult(is_discrete_integer=False)],
         ) as mock_struct,
+        patch(
+            "metaculus_bot.forecaster_runners.extract_numeric",
+            side_effect=_fake_extract_numeric,
+        ) as mock_extract,
     ):
         result = await bot._run_forecast_on_numeric(mock_metaculus_question, "some research", mock_general_llm)
         mock_general_llm.invoke.assert_called_once()
         mock_bounds.assert_called_once()
-        assert mock_struct.call_count == 2  # outcome type classification + percentiles
+        assert mock_struct.call_count == 1  # outcome type classification only; percentiles route through the ladder
+        mock_extract.assert_called_once()
         assert result.prediction_value is not None
         assert "mock reasoning" in result.reasoning
 

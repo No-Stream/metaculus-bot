@@ -214,7 +214,12 @@ class TestStackingPrompts:
         assert "Model 2 Analysis:" in prompt
         assert "Analysis 1: Based on weather patterns" in prompt
         assert "Analysis 2: Meteorological data" in prompt
-        assert "Probability: ZZ%" in prompt
+        # Post-refactor: the trailing "Probability: ZZ%" prose line is gone;
+        # `posterior_prob` in the STRUCTURED FORECAST JSON block is the only
+        # forecast surface. Assert on the block instead.
+        assert "Probability: ZZ%" not in prompt
+        assert '"question_type": "binary"' in prompt
+        assert "posterior_prob" in prompt
 
     def test_stacking_multiple_choice_prompt(self):
         """Test multiple choice stacking prompt generation."""
@@ -243,11 +248,17 @@ class TestStackingPrompts:
         assert "Previous balls were mostly red" in prompt
         assert "Model 1 Analysis:" in prompt
         assert "Red seems most likely" in prompt
-        # The trailing answer-format example interpolates real option names so
-        # strict parsers can map LLM output directly to question.options.
-        assert "Red: NN%" in prompt
-        assert "Blue: NN%" in prompt
-        assert "Green: NN%" in prompt
+        # Post-refactor: the STRUCTURED FORECAST JSON block uses real option
+        # names as `option_probs` keys — the trailing "{opt}: NN%" prose lines
+        # are gone. Strict parsers still get exact-string matches from the
+        # JSON keys.
+        assert '"question_type": "multiple_choice"' in prompt
+        assert '"Red"' in prompt
+        assert '"Blue"' in prompt
+        assert '"Green"' in prompt
+        assert "Red: NN%" not in prompt
+        assert "Blue: NN%" not in prompt
+        assert "Green: NN%" not in prompt
 
     def test_stacking_numeric_prompt(self):
         """Test numeric stacking prompt generation."""
@@ -282,7 +293,16 @@ class TestStackingPrompts:
         assert "Based on trends, I expect around 400-600" in prompt
         assert "Lower bound: 0" in prompt
         assert "Upper bound: 1000" in prompt
-        assert "Percentile 5:" in prompt
+        # Post-refactor: the trailing "Percentile 5: [value]" prose lines are
+        # gone; `declared_percentiles` in the STRUCTURED FORECAST JSON block
+        # (keyed by "0.01" .. "0.99") is the only forecast surface.
+        assert '"question_type": "numeric"' in prompt
+        assert '"declared_percentiles"' in prompt
+        assert '"0.05"' in prompt
+        assert '"0.5"' in prompt
+        assert '"0.95"' in prompt
+        assert "Percentile 5:" not in prompt
+        assert "Percentile 99:" not in prompt
 
 
 class TestModelNameStripping:
@@ -1152,13 +1172,16 @@ class TestStackerTransientRetry:
         stacker.invoke = AsyncMock(
             side_effect=[litellm_exc.Timeout("blip", model="m", llm_provider="openrouter"), "meta text"]
         )
+        stacker.model = "stub-stacker"
         parser = Mock(spec=GeneralLlm)
+
+        from metaculus_bot.value_extraction import ExtractionOutcome
 
         with (
             patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
             patch(
-                "metaculus_bot.stacking.parse_structured",
-                new=AsyncMock(return_value=Mock(prediction_in_decimal=0.42)),
+                "metaculus_bot.stacking.extract_binary",
+                new=AsyncMock(return_value=ExtractionOutcome(value=0.42, rung="block", block_present=True)),
             ),
         ):
             value, meta = await run_stacking_binary(
@@ -1231,20 +1254,22 @@ class TestStackingNumericParseNotes:
 
     @staticmethod
     async def _capture_parse_notes(question: "NumericQuestion") -> str:
-        """Run run_stacking_numeric with structure_output stubbed and return the parser notes."""
+        """Run run_stacking_numeric with the extraction ladder stubbed and return the parser notes."""
         from metaculus_bot.stacking import run_stacking_numeric
+        from metaculus_bot.value_extraction import ExtractionOutcome
 
         stacker = Mock(spec=GeneralLlm)
         stacker.invoke = AsyncMock(return_value="meta text")
+        stacker.model = "stub-stacker"
         parser = Mock(spec=GeneralLlm)
 
         captured: dict[str, str] = {}
 
         async def _capture(*_args, prompt_notes: str = "", **_kwargs):
             captured["notes"] = prompt_notes
-            return []
+            return ExtractionOutcome(value=[], rung="block", block_present=True)
 
-        with patch("metaculus_bot.stacking.parse_structured", new=AsyncMock(side_effect=_capture)):
+        with patch("metaculus_bot.stacking.extract_numeric", new=AsyncMock(side_effect=_capture)):
             await run_stacking_numeric(
                 stacker,
                 parser,
