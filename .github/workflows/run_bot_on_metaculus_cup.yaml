@@ -26,11 +26,23 @@ jobs:
       - name: Install dependencies
         run: uv sync --no-dev --frozen
       - name: Run bot
+        shell: bash
+        # Repo is public, so uploaded artifacts are effectively public. Log content
+        # (question URLs, predictions, degradation counters) is already public via
+        # Metaculus — acceptable, no redaction. A secret-leakage audit passed: no
+        # logger emits credentials; keys travel only in request headers.
+        # shell: bash yields `set -eo pipefail`, so the `python | tee` pipeline
+        # preserves the intentional sys.exit(1) degradation alert (cli.py ~L186);
+        # a bare `run:` (bash -e, no pipefail) would swallow it as tee's exit 0.
         run: |
-          uv run --frozen --no-dev python main.py --mode metaculus_cup
+          mkdir -p run_logs
+          uv run --frozen --no-dev python main.py --mode metaculus_cup 2>&1 | tee "run_logs/run_${GITHUB_RUN_ID}_$(date -u +%Y%m%dT%H%M%SZ).log"
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
+          # Unbuffered stdout/stderr so log lines stream in real time and nothing
+          # is lost if the run crashes before a buffer flush.
+          PYTHONUNBUFFERED: '1'
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
@@ -98,6 +110,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: research-${{ github.run_id }}
-          path: research_outputs/
+          path: |
+            research_outputs/
+            run_logs/
           retention-days: 90
           if-no-files-found: ignore
