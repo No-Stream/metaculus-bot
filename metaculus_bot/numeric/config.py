@@ -87,6 +87,12 @@ MAX_DIAGNOSTIC_PERCENTILES: int = 5
 
 EXTREME_STEP_THRESHOLD: float = NUM_MAX_STEP * 0.9
 
+# Top/bottom-bin mass at or above this fraction, with no percentile placed beyond the open
+# edge, flags open-bound percentile piling (models treating an open edge as a hard cap).
+# n=1 calibration: fires on the two observed crammers (0.20 and 0.126 top-bin mass) but not
+# the four correct handlers (all <= 0.073). K is intentionally tunable as more data arrives.
+OPEN_BOUND_PILING_THRESHOLD: float = 0.10
+
 # --- PCHIP Fallback Configuration ---
 
 MAX_PCHIP_ATTEMPTS: int = 3

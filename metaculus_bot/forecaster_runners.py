@@ -28,7 +28,7 @@ from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
-from metaculus_bot.numeric.diagnostics import log_final_prediction
+from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
@@ -263,4 +263,5 @@ async def run_numeric_forecast(
         )
 
     log_final_prediction(prediction, question)
+    log_open_bound_piling_diagnostics(prediction, question, forecaster_llm.model, sanitized_percentiles)
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote

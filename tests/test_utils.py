@@ -14,10 +14,12 @@ from forecasting_tools.data_models.questions import (
 )
 from pydantic import Field
 
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
 from metaculus_bot.numeric.utils import (
     aggregate_binary_mean,
     aggregate_numeric,
     bound_messages,
+    nominal_bounds,
 )
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.utils.logging_utils import compact_log_report_summary
@@ -298,6 +300,54 @@ def test_bound_messages_discrete_fallback():
     # Should derive nominal bounds: step = (9.5 - (-0.5)) / (11 - 1) = 1.0
     # nominal_lower = -0.5 + 1.0/2 = 0.0, nominal_upper = 9.5 - 1.0/2 = 9.0
     assert "9.0" in upper and "0.0" in lower
+
+
+def _numeric_bounds_q(
+    *,
+    lower_bound: float = 0.0,
+    upper_bound: float = 100.0,
+    cdf_size: int = PCHIP_CDF_POINTS,
+) -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=20,
+        id_of_post=20,
+        page_url="example",
+        question_text="?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=True,
+        open_upper_bound=True,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=cdf_size,
+    )
+
+
+def test_nominal_bounds_continuous_returns_raw_bounds():
+    """Continuous open question with no nominal_* attrs → raw (upper, lower)."""
+    q = _numeric_bounds_q(lower_bound=0.0, upper_bound=100.0)
+    upper, lower = nominal_bounds(q)
+    assert (upper, lower) == (100.0, 0.0)
+
+
+def test_nominal_bounds_discrete_half_step_derivation():
+    """Discrete question (cdf_size != PCHIP_CDF_POINTS, no nominal attrs) → half-step derived."""
+    # Q38195-class: raw bounds [-0.5, 7.5], cdf_size 9 (0..7 = 8 values + 1) → step 1.0.
+    q = _numeric_bounds_q(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+    upper, lower = nominal_bounds(q)
+    assert (upper, lower) == (7.0, 0.0)
+
+
+def test_nominal_bounds_cdf_size_equals_pchip_points_returns_raw():
+    """When cdf_size == PCHIP_CDF_POINTS the half-step branch is skipped → raw bounds."""
+    q = _numeric_bounds_q(lower_bound=-0.5, upper_bound=7.5, cdf_size=PCHIP_CDF_POINTS)
+    upper, lower = nominal_bounds(q)
+    assert (upper, lower) == (7.5, -0.5)
 
 
 # ---------- Compact logger --------------------------------------------------

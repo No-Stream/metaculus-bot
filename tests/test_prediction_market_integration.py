@@ -101,6 +101,44 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+async def test_predictit_real_prefetch_and_search_returns_parseable_response():
+    """PredictIt's /marketdata/all/ is free + no-auth. Assert the schema
+    (top-level `markets` list, contracts carrying `lastTradePrice`) and that a
+    US-politics query fuzzy-matches. Schema breaks fail loud; transient errors
+    and sparse-topic zero-results skip."""
+    from metaculus_bot.research.prediction_market import _predictit_prefetch, _predictit_search_local
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            markets = await _predictit_prefetch(session)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            pytest.skip(f"PredictIt prefetch transient error: {e}")
+
+    if not markets:
+        pytest.skip("PredictIt prefetch returned no markets (transient)")
+
+    # Schema contract: every market carries a name and a contract list; contracts
+    # carry lastTradePrice. Fail loud on a schema break.
+    sample = markets[0]
+    assert isinstance(sample, dict)
+    assert sample.get("name") or sample.get("shortName")
+    contracts = sample.get("contracts")
+    assert isinstance(contracts, list) and contracts
+    assert "lastTradePrice" in contracts[0]
+
+    matches = _predictit_search_local(markets, "Trump president 2026", top_k=3, min_score=30.0)
+    for m in matches:
+        assert m.platform == "predictit"
+        assert m.market_title
+        if m.implied_prob_yes is not None:
+            assert 0.0 <= m.implied_prob_yes <= 1.0
+        # PredictIt exposes no liquidity fields.
+        assert m.total_volume is None
+        assert m.open_interest is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
 async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
     from metaculus_bot.research import prediction_market as pmp
 
@@ -117,5 +155,5 @@ async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
         pytest.skip("No matches across any platform (transient or zero-result)")
 
     for m in snapshot.matches:
-        assert m.platform in ("polymarket", "kalshi", "manifold")
+        assert m.platform in ("polymarket", "kalshi", "manifold", "predictit")
         assert m.market_title

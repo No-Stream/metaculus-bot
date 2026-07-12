@@ -1,7 +1,7 @@
 """Prediction-market research provider.
 
-Queries Polymarket + Kalshi + Manifold for markets that resolve on the same
-(or adjacent) event as a given Metaculus question, and returns a
+Queries Polymarket + Kalshi + Manifold + PredictIt for markets that resolve on
+the same (or adjacent) event as a given Metaculus question, and returns a
 `MarketSnapshot` the forecaster can read as a peer cross-check.
 
 Design anchors (from the G0 empirical study, 2026-05-12 -- see
@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -69,6 +70,7 @@ logger = logging.getLogger(__name__)
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 MANIFOLD_SEARCH_URL = "https://api.manifold.markets/v0/search-markets"
 KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
+PREDICTIT_URL = "https://www.predictit.org/api/marketdata/all/"
 
 # Bounded retry-with-backoff for transient 403/429/5xx. The s4_s5_union strategy
 # already issues 2 queries per platform; one-and-done retries suffice.
@@ -78,6 +80,19 @@ HTTP_RETRY_BACKOFF_SECS = 0.5
 
 # Client-side Kalshi fuzzy-match threshold below which we drop candidates.
 KALSHI_MIN_FUZZY_SCORE = 40.0
+
+# Client-side PredictIt fuzzy-match threshold (mirrors Kalshi; PredictIt has no
+# keyword-search endpoint, so we prefetch the full market dump and fuzzy-match).
+PREDICTIT_MIN_FUZZY_SCORE = 40.0
+
+# Liquidity / participation signal-label thresholds. Low-volume markets are
+# often bot-dominated (roughly sub-$10k), so a "thin" label is a real noise
+# warning, not a formality. These cutoffs are a tunable first pass, not
+# calibrated values — the "thin" ceiling sits at $5k deliberately conservatively.
+LIQUIDITY_THIN_USD = 5_000.0
+LIQUIDITY_DEEP_USD = 50_000.0
+MANIFOLD_THIN_BETTORS = 20
+MANIFOLD_HIGH_BETTORS = 100
 
 # Per-platform search timeout (s). Wrapped in an outer `timeout` in
 # fetch_market_snapshot; this is the per-HTTP-call cap.
@@ -89,6 +104,9 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 # Kalshi events cache TTL.
 KALSHI_CACHE_TTL_S = 6 * 60 * 60  # 6h
+
+# PredictIt markets cache TTL (mirrors Kalshi; the /all/ dump is a full snapshot).
+PREDICTIT_CACHE_TTL_S = 6 * 60 * 60  # 6h
 
 # Max events to prefetch from Kalshi (G0 used 3k; cap matches).
 KALSHI_PREFETCH_EVENT_LIMIT = 3000
@@ -109,7 +127,7 @@ RAW_RULES_MAX_CHARS = 200
 
 @dataclass
 class MarketMatch:
-    platform: Literal["polymarket", "kalshi", "manifold"]
+    platform: Literal["polymarket", "kalshi", "manifold", "predictit"]
     market_title: str
     market_url: str
     implied_prob_yes: float | None
@@ -121,11 +139,49 @@ class MarketMatch:
     is_resolved: bool
     match_confidence: float
     raw_rules: str
+    # Liquidity / participation fields. Previously received-but-discarded; now
+    # parsed so the formatter can label how informative each crowd signal is.
+    total_volume: float | None = None
+    liquidity: float | None = None
+    open_interest: float | None = None
+    num_bettors: int | None = None
 
 
 @dataclass
 class MarketSnapshot:
     matches: list[MarketMatch] = field(default_factory=list)
+
+
+def _liquidity_label(m: MarketMatch) -> str:
+    """Label how informative a market's price is, given its liquidity/participation.
+
+    Real-money venues (Polymarket, Kalshi) score on dollar volume / open interest;
+    Manifold (play-money) scores on unique bettor count instead. A thin market is
+    a noise warning: sub-$10k volume is often bot-dominated, so its price should be
+    discounted relative to a deep, actively-traded market. Thresholds are tunable.
+    """
+    if m.platform == "predictit":
+        # PredictIt exposes no volume/liquidity/OI fields in its all-markets dump.
+        return "no-liquidity-data"
+
+    if m.platform == "manifold":
+        if m.num_bettors is None:
+            return "no-liquidity-data"
+        if m.num_bettors < MANIFOLD_THIN_BETTORS:
+            return "thin"
+        if m.num_bettors <= MANIFOLD_HIGH_BETTORS:
+            return "decent"
+        return "high"
+
+    # Real-money venues: score on the larger of total volume and open interest.
+    if m.total_volume is None and m.open_interest is None:
+        return "no-liquidity-data"
+    score = max(m.total_volume or 0.0, m.open_interest or 0.0)
+    if score < LIQUIDITY_THIN_USD:
+        return "thin"
+    if score <= LIQUIDITY_DEEP_USD:
+        return "decent"
+    return "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +190,8 @@ class MarketSnapshot:
 
 # Kalshi events cache: (timestamp_monotonic, events_list).
 _KALSHI_CACHE: dict[str, tuple[float, list[dict]]] = {}
+# PredictIt markets cache: (timestamp_monotonic, markets_list).
+_PREDICTIT_CACHE: dict[str, tuple[float, list[dict]]] = {}
 # Keyword-extraction cache: qid -> list[query_str].
 _KEYWORD_CACHE: dict[int, list[str]] = {}
 # Snapshot cache keyed by (qid, as_of_iso). The as_of leg keeps backtest runs
@@ -144,6 +202,7 @@ _SNAPSHOT_CACHE: dict[tuple[int, str], MarketSnapshot] = {}
 def _reset_session_caches() -> None:
     """Clear all per-session caches. Called between tests and at session start."""
     _KALSHI_CACHE.clear()
+    _PREDICTIT_CACHE.clear()
     _KEYWORD_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
 
@@ -198,7 +257,7 @@ def _clean_llm_query(content: str) -> str:
     for line in (content or "").splitlines():
         line = line.strip().strip('"').strip("'")
         if line and not line.lower().startswith(("search query", "query:", "answer")):
-            return line[:200]
+            return line[:200]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # query length cap, not data sampling
     return (content or "").strip().strip('"').strip("'")[:200]
 
 
@@ -220,7 +279,7 @@ class KeywordExtractor:
     async def extract(self, question: Any) -> list[str]:  # noqa: ASYNC910
         qid = getattr(question, "id_of_question", None)
         if qid is not None and qid in _KEYWORD_CACHE:
-            return list(_KEYWORD_CACHE[qid])  # noqa: ASYNC910
+            return list(_KEYWORD_CACHE[qid])  # noqa: ASYNC910  # noqa: HARNESS-SCAN-EXEMPT-object-explosion
 
         question_text = getattr(question, "question_text", "") or ""
         title = getattr(question, "title", "") or question_text
@@ -256,7 +315,7 @@ class KeywordExtractor:
         return deduped  # noqa: ASYNC910
 
     async def _run_llm(self, prompt_template: str, title: str, rc: str) -> str:
-        prompt = prompt_template.format(title=title[:400], rc=rc[:400])
+        prompt = prompt_template.format(title=title[:400], rc=rc[:400])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
         # Constructor errors are config bugs (bad model slug, missing API key wiring,
         # etc.) and should crash loudly. Only the .invoke call is expected to face
         # transient LLM errors -- those soft-fall to "" so the snapshot still runs.
@@ -413,7 +472,7 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
     q_lower = (query or "").lower()
 
     events = payload.get("events") or []
-    for ev in events[:10]:
+    for ev in events[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
         title = ev.get("title") or ev.get("question") or ""
         slug = ev.get("slug") or ""
         url = f"https://polymarket.com/event/{slug}" if slug else ""
@@ -426,6 +485,9 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
         bid: float | None = None
         ask: float | None = None
         vol_24h: float | None = None
+        total_volume: float | None = None
+        liquidity: float | None = None
+        open_interest: float | None = None
         markets = ev.get("markets") or []
         if markets and isinstance(markets[0], dict):
             m0 = markets[0]
@@ -433,6 +495,17 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
             bid = _safe_float(m0.get("bestBid"))
             ask = _safe_float(m0.get("bestAsk"))
             vol_24h = _safe_float(m0.get("volume24hr"))
+            # volumeNum is Gamma's total (all-time) volume; fall back to the
+            # event-level or market-level `volume` when volumeNum is absent.
+            total_volume = _safe_float(m0.get("volumeNum"))
+            if total_volume is None:
+                total_volume = volume if volume is not None else _safe_float(m0.get("volume"))
+            liquidity = _safe_float(m0.get("liquidityNum"))
+            if liquidity is None:
+                liquidity = _safe_float(m0.get("liquidity"))
+            open_interest = _safe_float(m0.get("openInterest"))
+        else:
+            total_volume = volume
         spread = (ask - bid) if (bid is not None and ask is not None) else None
 
         confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
@@ -450,19 +523,28 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
                 close_time=close_time,
                 is_resolved=bool(ev.get("closed")) or bool(ev.get("resolved")),
                 match_confidence=confidence,
-                raw_rules=description[:2000],
+                raw_rules=description[:2000],  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
+                total_volume=total_volume,
+                liquidity=liquidity,
+                open_interest=open_interest,
             )
         )
 
     # Fallback to top-level markets if events were empty.
     if not out:
         markets = payload.get("markets") or []
-        for m in markets[:10]:
+        for m in markets[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
             title = m.get("question") or m.get("title") or ""
             slug = m.get("slug") or ""
             url = f"https://polymarket.com/market/{slug}" if slug else ""
             implied = _prob_from_prices(m.get("outcomePrices"))
             confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
+            total_volume = _safe_float(m.get("volumeNum"))
+            if total_volume is None:
+                total_volume = _safe_float(m.get("volume"))
+            liquidity = _safe_float(m.get("liquidityNum"))
+            if liquidity is None:
+                liquidity = _safe_float(m.get("liquidity"))
             out.append(
                 MarketMatch(
                     platform="polymarket",
@@ -477,6 +559,9 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
                     is_resolved=bool(m.get("closed")),
                     match_confidence=confidence,
                     raw_rules=(m.get("description") or "")[:2000],
+                    total_volume=total_volume,
+                    liquidity=liquidity,
+                    open_interest=_safe_float(m.get("openInterest")),
                 )
             )
 
@@ -489,7 +574,7 @@ async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
         POLYMARKET_SEARCH_URL,
         {"q": query, "limit_per_type": "10"},
         max_attempts=POLYMARKET_MAX_ATTEMPTS,
-        label=f"Polymarket q={query[:40]!r}",
+        label=f"Polymarket q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return []
@@ -501,6 +586,51 @@ async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
 # ---------------------------------------------------------------------------
 
 
+def _walk_tiptap_text(node: Any) -> list[str]:
+    """Recursively collect all `text` string nodes from a TipTap/ProseMirror doc.
+
+    Manifold's rich `description` is a nested `{type, content: [...], text: "..."}`
+    document. We depth-first walk `content` arrays and gather leaf `text` strings.
+    """
+    out: list[str] = []
+    if isinstance(node, dict):
+        text = node.get("text")
+        if isinstance(text, str) and text:
+            out.append(text)
+        content = node.get("content")
+        if isinstance(content, list):
+            for child in content:
+                out.extend(_walk_tiptap_text(child))
+    elif isinstance(node, list):
+        for child in node:
+            out.extend(_walk_tiptap_text(child))
+    return out
+
+
+def _manifold_rules_text(m: dict) -> str:
+    """Resolve a Manifold market's rules text, truncated to 2000 chars.
+
+    Fallback chain: (1) `textDescription` if non-empty (the search endpoint
+    usually omits it); (2) the flattened `description` TipTap doc; (3) the
+    question title. A `str(...)` dump of the description is a pragmatic fallback
+    if the doc shape is unexpected.
+    """
+    text_description = m.get("textDescription")
+    if isinstance(text_description, str) and text_description.strip():
+        return text_description[:2000]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
+
+    description = m.get("description")
+    if isinstance(description, dict):
+        collected = _walk_tiptap_text(description)
+        if collected:
+            return " ".join(collected)[:2000]
+        return str(description)[:2000]
+    if isinstance(description, str) and description.strip():
+        return description[:2000]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
+
+    return (m.get("question") or "")[:2000]
+
+
 def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
     if not isinstance(payload, list):
         logger.warning("Manifold returned non-list payload")
@@ -508,7 +638,7 @@ def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
 
     q_lower = (query or "").lower()
     out: list[MarketMatch] = []
-    for m in payload[:10]:
+    for m in payload[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
         if not isinstance(m, dict):
             continue
         title = m.get("question") or ""
@@ -539,7 +669,10 @@ def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
                 close_time=close_time,
                 is_resolved=bool(m.get("isResolved")),
                 match_confidence=confidence,
-                raw_rules=(m.get("textDescription") or "")[:2000],
+                raw_rules=_manifold_rules_text(m),
+                total_volume=_safe_float(m.get("volume")),
+                liquidity=_safe_float(m.get("totalLiquidity")),
+                num_bettors=_safe_int(m.get("uniqueBettorCount")),
             )
         )
     return out
@@ -552,7 +685,7 @@ async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
         {"term": query, "contractType": "BINARY", "limit": "10"},
         max_attempts=MANIFOLD_MAX_ATTEMPTS,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold q={query[:40]!r}",
+        label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return []
@@ -641,6 +774,9 @@ def _kalshi_search_local(
         yes_bid: float | None = None
         yes_ask: float | None = None
         volume_24h: float | None = None
+        total_volume: float | None = None
+        open_interest: float | None = None
+        liquidity: float | None = None
         is_resolved = False
         if nested and isinstance(nested[0], dict):
             first = nested[0]
@@ -649,6 +785,9 @@ def _kalshi_search_local(
             yes_bid = _safe_float(first.get("yes_bid_dollars"))
             yes_ask = _safe_float(first.get("yes_ask_dollars"))
             volume_24h = _safe_float(first.get("volume_24h_fp"))
+            total_volume = _safe_float(first.get("volume"))
+            open_interest = _safe_float(first.get("open_interest"))
+            liquidity = _safe_float(first.get("liquidity_dollars"))
             is_resolved = (first.get("status") or "").lower() in ("settled", "finalized", "closed")
 
         title_score = fuzz.token_set_ratio(q_lower, title.lower())
@@ -681,7 +820,159 @@ def _kalshi_search_local(
                     close_time=close_time,
                     is_resolved=is_resolved,
                     match_confidence=combined / 100.0,
-                    raw_rules=rules_primary[:2000],
+                    raw_rules=rules_primary[:2000],  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
+                    total_volume=total_volume,
+                    open_interest=open_interest,
+                    liquidity=liquidity,
+                ),
+            )
+        )
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [pm for _, pm in scored[:top_k]]
+
+
+# ---------------------------------------------------------------------------
+# PredictIt (prefetch full market dump + client-side fuzzy match)
+# ---------------------------------------------------------------------------
+
+
+async def _predictit_prefetch(session: Any) -> list[dict]:
+    """Fetch the full PredictIt market dump. Returns (possibly empty) list on error.
+
+    PredictIt exposes a single unpaginated `/marketdata/all/` endpoint (no auth,
+    no query param), so we fetch once, cache for ~6h, and fuzzy-match client-side
+    (mirrors the Kalshi prefetch-and-local-match pattern).
+    """
+    cached = _PREDICTIT_CACHE.get("markets")
+    if cached is not None:
+        ts, markets = cached
+        if (time.monotonic() - ts) < PREDICTIT_CACHE_TTL_S:
+            return markets  # noqa: ASYNC910
+
+    payload = await _http_get_with_backoff(
+        session,
+        PREDICTIT_URL,
+        {},
+        max_attempts=2,
+        label="PredictIt prefetch",
+    )
+    if not isinstance(payload, dict):
+        if payload is not None:
+            logger.warning("PredictIt returned non-dict payload")
+        return []  # noqa: ASYNC910
+
+    markets = payload.get("markets")
+    if not isinstance(markets, list):
+        logger.warning("PredictIt payload missing 'markets' list")
+        return []  # noqa: ASYNC910
+
+    markets = [m for m in markets if isinstance(m, dict)]
+    _PREDICTIT_CACHE["markets"] = (time.monotonic(), markets)
+    return markets  # noqa: ASYNC910
+
+
+def _select_predictit_contract(contracts: list, q_lower: str) -> dict:
+    """Pick the contract whose name best matches the query.
+
+    A PredictIt market bundles one binary contract per outcome (candidate/party).
+    Pricing `contracts[0]` blindly can attach the wrong outcome's price to a
+    good market match; instead we fuzzy-match each contract name against the
+    query and price the best one. Falls back to the first contract when nothing
+    scores (single-contract binaries, or an empty query).
+    """
+    dict_contracts = [c for c in contracts if isinstance(c, dict)]
+    if not dict_contracts:
+        return {}
+    if len(dict_contracts) == 1 or not q_lower:
+        return dict_contracts[0]
+
+    def _contract_score(c: dict) -> float:
+        cname = (c.get("name") or c.get("shortName") or "").lower()
+        return fuzz.token_set_ratio(q_lower, cname) if cname else 0.0
+
+    return max(dict_contracts, key=_contract_score)
+
+
+def _predictit_search_local(
+    markets: list[dict], query: str, top_k: int = 5, min_score: float = PREDICTIT_MIN_FUZZY_SCORE
+) -> list[MarketMatch]:
+    """Fuzzy-match PredictIt markets by name/shortName; return top_k MarketMatch.
+
+    PredictIt markets bundle multiple binary contracts (e.g. "which candidate
+    wins", one contract per candidate). We emit ONE row per market (to avoid row
+    explosion, mirroring Kalshi's single-row-per-event) and price the contract
+    whose name best matches the query — so a "Trump wins 2028?" query surfaces
+    the Trump contract's price, not whichever contract happens to be first. For a
+    single-contract binary that just picks the sole contract. PredictIt carries no
+    volume/liquidity/OI fields, so those stay None and the formatter renders
+    `no-liquidity-data`.
+    """
+    q_lower = (query or "").lower()
+    scored: list[tuple[float, MarketMatch]] = []
+
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        name = market.get("name") or ""
+        short_name = market.get("shortName") or ""
+        if not name and not short_name:
+            continue
+
+        name_score = fuzz.token_set_ratio(q_lower, name.lower()) if name else 0.0
+        short_score = fuzz.token_set_ratio(q_lower, short_name.lower()) if short_name else 0.0
+        score = max(name_score, short_score)
+        if score < min_score:
+            continue
+
+        # Boundary validation of external API data (mirrors the payload/markets isinstance
+        # checks in _predictit_prefetch): a non-list here would TypeError past the narrow
+        # per-platform catch and soft-fail the entire four-venue snapshot.
+        contracts = market.get("contracts")
+        if not isinstance(contracts, list):
+            contracts = []
+        contract = _select_predictit_contract(contracts, q_lower)
+        contract_name = contract.get("name") or ""
+
+        market_name = name or short_name
+        # Disambiguate multi-contract markets by naming the contract we priced.
+        if len(contracts) > 1 and contract_name and contract_name != market_name:
+            title = f"{market_name} — {contract_name}"
+        else:
+            title = market_name
+
+        status = (contract.get("status") or "").lower()
+        is_resolved = status != "" and status != "open"
+
+        # Price from the live order book when both sides exist (mirrors Kalshi):
+        # bestBuyYesCost is the current YES ask; 1 - bestBuyNoCost is the YES bid.
+        # lastTradePrice can be stale on thin markets, so it's only the fallback.
+        yes_ask = _safe_float(contract.get("bestBuyYesCost"))
+        no_ask = _safe_float(contract.get("bestBuyNoCost"))
+        yes_bid = 1.0 - no_ask if no_ask is not None else None
+        if yes_bid is not None and yes_ask is not None:
+            implied = (yes_bid + yes_ask) / 2.0
+            spread = yes_ask - yes_bid
+        else:
+            implied = _safe_float(contract.get("lastTradePrice"))
+            spread = None
+
+        scored.append(
+            (
+                score,
+                MarketMatch(
+                    platform="predictit",
+                    market_title=title,
+                    market_url=market.get("url") or "",
+                    implied_prob_yes=implied,
+                    bid=yes_bid,
+                    ask=yes_ask,
+                    spread=spread,
+                    volume_24h=None,
+                    close_time=None,
+                    is_resolved=is_resolved,
+                    match_confidence=score / 100.0,
+                    raw_rules=f"{market_name} — {contract_name}" if contract_name else market_name,
                 ),
             )
         )
@@ -706,12 +997,12 @@ def _as_of_cache_key(as_of: datetime | None) -> str:
 async def fetch_market_snapshot(
     question: Any,
     *,
-    platforms: tuple[str, ...] = ("polymarket", "kalshi", "manifold"),
+    platforms: tuple[str, ...] = ("polymarket", "kalshi", "manifold", "predictit"),
     max_matches_per_platform: int = 3,
     timeout: float = 5.0,  # noqa: ASYNC109
     as_of: datetime | None = None,
 ) -> MarketSnapshot:
-    """Fan out to all three platforms in parallel, collect matches, apply filters.
+    """Fan out to all four platforms in parallel, collect matches, apply filters.
 
     Soft-fails on any error: returns empty MarketSnapshot + WARNING log. A
     broken prediction-market API should never break a forecast run.
@@ -746,7 +1037,7 @@ async def fetch_market_snapshot(
             except asyncio.TimeoutError:
                 logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
                 return MarketSnapshot(matches=[])  # noqa: ASYNC910
-    except Exception:
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
         # Outer safety net; should not normally fire -- investigate if seen.
         # Re-raise after logging would defeat the soft-fail contract that the
         # rest of the bot depends on, so we swallow + log here. Inner narrow
@@ -801,6 +1092,15 @@ async def _fetch_market_snapshot_impl(
             merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
         return merged
 
+    async def _predictit_for_all_queries() -> list[MarketMatch]:
+        # Prefetch the full market dump once, then fuzzy-match each query locally
+        # (mirrors the Kalshi prefetch-and-local-match pattern).
+        markets = await _predictit_prefetch(session)
+        merged: list[MarketMatch] = []
+        for q in queries:
+            merged.extend(_predictit_search_local(markets, q, top_k=max_matches_per_platform + 2))
+        return merged
+
     platform_tasks: list[tuple[str, asyncio.Task]] = []
     if "polymarket" in platforms:
         platform_tasks.append(("polymarket", asyncio.create_task(_poly_for_all_queries())))
@@ -808,6 +1108,8 @@ async def _fetch_market_snapshot_impl(
         platform_tasks.append(("manifold", asyncio.create_task(_manifold_for_all_queries())))
     if "kalshi" in platforms:
         platform_tasks.append(("kalshi", asyncio.create_task(_kalshi_for_all_queries())))
+    if "predictit" in platforms:
+        platform_tasks.append(("predictit", asyncio.create_task(_predictit_for_all_queries())))
 
     for platform, task in platform_tasks:
         try:
@@ -821,8 +1123,13 @@ async def _fetch_market_snapshot_impl(
         all_matches.extend(matches)
 
     # Dedup within-platform by market_url (or title fallback), cap per platform.
-    by_platform: dict[str, list[MarketMatch]] = {"polymarket": [], "kalshi": [], "manifold": []}
-    seen_urls_per_platform: dict[str, set[str]] = {"polymarket": set(), "kalshi": set(), "manifold": set()}
+    by_platform: dict[str, list[MarketMatch]] = {"polymarket": [], "kalshi": [], "manifold": [], "predictit": []}
+    seen_urls_per_platform: dict[str, set[str]] = {
+        "polymarket": set(),
+        "kalshi": set(),
+        "manifold": set(),
+        "predictit": set(),
+    }
 
     for m in all_matches:
         # as_of filter: drop matches that closed at or before as_of.
@@ -840,7 +1147,7 @@ async def _fetch_market_snapshot_impl(
             by_platform[m.platform].append(m)
 
     combined: list[MarketMatch] = []
-    for plat in ("polymarket", "kalshi", "manifold"):
+    for plat in ("polymarket", "kalshi", "manifold", "predictit"):
         combined.extend(by_platform[plat])
 
     return MarketSnapshot(matches=combined)
@@ -876,18 +1183,22 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     lines.append(
         "STRONG EVIDENCE -- weight these markets heavily. Verify each market's resolution criteria AND "
         "resolution date against the question: if they match, anchor on the price; if they differ, discount "
-        "proportionally to the specific mismatch."
+        "proportionally to the specific mismatch. The `signal` column labels each market's liquidity/participation "
+        "(thin/decent/deep or thin/decent/high); the raw total volume and open interest are shown alongside. Treat "
+        "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy."
     )
     lines.append("")
-    lines.append("| platform | title | prob | vol | close | conf |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| platform | title | prob | total_vol | OI | signal | close | conf |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for m in snapshot.matches:
         prob = f"{m.implied_prob_yes:.2f}" if m.implied_prob_yes is not None else "-"
-        vol = f"{m.volume_24h:.0f}" if m.volume_24h is not None else "-"
+        total_vol = f"{m.total_volume:.0f}" if m.total_volume is not None else "-"
+        oi = f"{m.open_interest:.0f}" if m.open_interest is not None else "-"
+        signal = _liquidity_label(m)
         close = m.close_time.strftime("%Y-%m-%d") if m.close_time else "-"
         conf = f"{m.match_confidence:.2f}"
         safe_title = (m.market_title or "")[:80].replace("|", "/")
-        lines.append(f"| {m.platform} | {safe_title} | {prob} | {vol} | {close} | {conf} |")
+        lines.append(f"| {m.platform} | {safe_title} | {prob} | {total_vol} | {oi} | {signal} | {close} | {conf} |")
 
     lines.append("")
     lines.append("### Resolution criteria / rules")
@@ -953,6 +1264,15 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(v: Any) -> int | None:
+    f = _safe_float(v)
+    # json.loads (used by aiohttp) accepts bare NaN/Infinity literals, and int(nan)/int(inf)
+    # raise — a helper named _safe_* must return None on those, not blow up.
+    if f is None or not math.isfinite(f):
+        return None
+    return int(f)
 
 
 def _parse_iso(s: Any) -> datetime | None:

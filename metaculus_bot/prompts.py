@@ -10,6 +10,7 @@ from forecasting_tools import (
 )
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+from metaculus_bot.numeric.utils import nominal_bounds
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
@@ -248,6 +249,47 @@ _SOURCE_PROVENANCE_LADDER = """
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
 
 
+# The new liquidity/participation weighting sentence, appended to the shared
+# strong-evidence clause so every forecaster prompt tells the model to weight a
+# crowd signal by how informative it is (the prediction-market provider now emits
+# a per-market `signal` label plus raw volume/OI).
+_MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
+    "Weight each market/crowd signal by its stated liquidity/participation label: treat deep / "
+    "high-liquidity markets as a strong anchor, and discount thin markets (low volume, few participants) "
+    "as noisy."
+)
+
+
+def _strong_evidence_market_clause(
+    *,
+    subject: str,
+    signal_noun: str,
+    anchor_tail: str,
+    extrapolate_target: str,
+    projection: str,
+) -> str:
+    """Shared "prediction markets are STRONG EVIDENCE" clause for the three forecaster prompts.
+
+    The framing is identical across binary / MC / numeric; only a few type-specific words differ
+    (the signal noun, the anchor verb phrase, the extrapolation target, and the projection tail).
+    Centralizing it keeps the strong-evidence framing AND the liquidity-weighting sentence in sync
+    across all three prompts. Spliced into each prompt's ``clean_indents`` f-string; the embedded
+    newlines are cosmetic (``clean_indents`` and the whitespace-collapsing tests both ignore them).
+    """
+    return (
+        "Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research "
+        f"includes a market on this {subject}, default to treating {signal_noun} as a serious signal: if the "
+        "market's resolution criteria, resolution date, and other material terms MATCH this question, it is "
+        f"extremely strong evidence and {anchor_tail}. If the resolution date or criteria DIFFER, discount it "
+        "proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The "
+        "burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. "
+        "When the criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do "
+        f"NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE {extrapolate_target} to our resolution date with a "
+        f"simple model and STATE the assumption. {projection} "
+        f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE}"
+    )
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -260,18 +302,20 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from
             your training that the research reports don't cover, you may rely on it. You are not required to ground
             every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
-            Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
-            includes a market on this question, default to treating its price as a serious signal: if the market's
-            resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
-            strong evidence and should anchor your forecast. If the resolution date or criteria DIFFER, discount it
-            proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
-            burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off as
-            "not an anchor." When the criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the
-            resolution DATE, do NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our
-            resolution date with a simple model and STATE the assumption. Treat the market price as a probability at
-            its date and project to ours under a constant-hazard / base-rate-over-time assumption (or whatever simple
-            model fits): a longer window to our date implies a higher cumulative probability, a shorter window a
-            lower one (e.g. 30% YES by an earlier date X projects upward by our later date Y). Show the arithmetic.
+            {
+            _strong_evidence_market_clause(
+                subject="question",
+                signal_noun="its price",
+                anchor_tail="should anchor your forecast",
+                extrapolate_target="the market's probability",
+                projection=(
+                    "Treat the market price as a probability at its date and project to ours under a "
+                    "constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer "
+                    "window to our date implies a higher cumulative probability, a shorter window a lower one "
+                    "(e.g. 30% YES by an earlier date X projects upward by our later date Y). Show the arithmetic."
+                ),
+            )
+        }
 
             Your Metaculus question is:
             {question.question_text}
@@ -297,7 +341,9 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             PHASE 0: PRELIMINARY CHECK
 
             0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-               • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (or a qualifying event is so recent that resolution simply lags — the resolution check in 0a below covers that case).
+               • State in your own words: "This question is open and unresolved as of {
+            _today_str()
+        }. If nothing changed between now and resolution, how would it resolve?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (or a qualifying event is so recent that resolution simply lags — the resolution check in 0a below covers that case).
                • To move off this status-quo answer, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
             0a) Resolution check
@@ -397,17 +443,20 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
         in the research; just be clear when you're drawing on your own knowledge versus the research.
-        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
-        includes a market on this question, default to treating its prices as a serious signal: if the market's
-        resolution criteria, resolution date, and other material terms MATCH this question, it is extremely strong
-        evidence and should anchor your distribution. If the resolution date or criteria DIFFER, discount it
-        proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The burden
-        is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
-        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
-        vague haircut — EXPLICITLY EXTRAPOLATE the market's probability to our resolution date with a simple model and
-        STATE the assumption. Treat the market price as a probability at its date and project to ours under a
-        constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer window to our date
-        implies a higher cumulative probability, a shorter window a lower one. Show the arithmetic.
+        {
+            _strong_evidence_market_clause(
+                subject="question",
+                signal_noun="its prices",
+                anchor_tail="should anchor your distribution",
+                extrapolate_target="the market's probability",
+                projection=(
+                    "Treat the market price as a probability at its date and project to ours under a "
+                    "constant-hazard / base-rate-over-time assumption (or whatever simple model fits): a longer "
+                    "window to our date implies a higher cumulative probability, a shorter window a lower one. "
+                    "Show the arithmetic."
+                ),
+            )
+        }
 
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
@@ -433,7 +482,9 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
         PHASE 0: PRELIMINARY CHECK
 
         (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-            • State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (with one exception: if a qualifying event is so recent that resolution simply lags, treat the criteria as effectively met and weight your distribution accordingly).
+            • State in your own words: "This question is open and unresolved as of {
+            _today_str()
+        }. If nothing changed between now and resolution, which option would it resolve to?" Derive the answer from that platform state alone — an open question means the resolution criteria have not yet been satisfied (with one exception: if a qualifying event is so recent that resolution simply lags, treat the criteria as effectively met and weight your distribution accordingly).
             • To move probability mass off that status-quo option, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
@@ -518,6 +569,7 @@ def numeric_prompt(
     upper_bound_message: str,
 ) -> str:
     unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
+    nom_upper, nom_lower = nominal_bounds(question)
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
@@ -533,18 +585,20 @@ def numeric_prompt(
         Do not over-hedge on quantities you can actually predict well.
         Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
         but penalties for overly wide intervals on predictable quantities also accumulate.
-        Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research
-        includes a market on this quantity, default to treating its implied range as a serious signal: if the
-        market's resolution criteria, resolution date, and other material terms MATCH this question, it is extremely
-        strong evidence and your percentiles should center on it. If the resolution date or criteria DIFFER, discount
-        it proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The
-        burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. When the
-        criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do NOT apply a
-        vague haircut — EXPLICITLY EXTRAPOLATE the market's implied value/probability to our resolution date with a
-        simple model and STATE the assumption. Project from the market's date to ours under a constant-hazard,
-        trend-continuation, or base-rate-over-time assumption (or whatever simple model fits): a longer window to our
-        date generally widens the spread and shifts the implied level, a shorter window tightens it.
-        Show the arithmetic.
+        {
+            _strong_evidence_market_clause(
+                subject="quantity",
+                signal_noun="its implied range",
+                anchor_tail="your percentiles should center on it",
+                extrapolate_target="the market's implied value/probability",
+                projection=(
+                    "Project from the market's date to ours under a constant-hazard, trend-continuation, or "
+                    "base-rate-over-time assumption (or whatever simple model fits): a longer window to our date "
+                    "generally widens the spread and shifts the implied level, a shorter window tightens it. "
+                    "Show the arithmetic."
+                ),
+            )
+        }
 
         ── Question ──
         {question.question_text}
@@ -555,11 +609,13 @@ def numeric_prompt(
         {question.resolution_criteria}
         {question.fine_print}
 
-        ── Units & Bounds (must follow) ──
+        ── Units & Bounds ──
         • Base units for output values: {unit_str}
-        • Allowed range (in base units): [{question.lower_bound}, {question.upper_bound}]
-        • Note: allowed range is suggestive of units! If needed, you may use it to infer units.
-        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • Displayed range (in base units): [{nom_lower}, {nom_upper}]
+        • Note: displayed range is suggestive of units! If needed, you may use it to infer units.
+        • All {
+            EXPECTED_PERCENTILE_COUNT
+        } percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
 
         ── Scoring Rule ──
@@ -580,7 +636,9 @@ def numeric_prompt(
         PHASE 0: PRELIMINARY CHECK
 
         (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-            - State in your own words: "This question is open and unresolved as of {_today_str()}. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
+            - State in your own words: "This question is open and unresolved as of {
+            _today_str()
+        }. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
             - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
@@ -630,7 +688,7 @@ def numeric_prompt(
             - Keep your extreme tails (P1 and P99) far apart to allow for unknown unknowns.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
-            - Respect the explicit bounds above.
+            - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
         (9) Outcome type classification
             Determine whether the resolution value for this question will always be a whole integer
@@ -651,7 +709,7 @@ def numeric_prompt(
             FORECASTABILITY: HIGH
             FORECASTABILITY: MEDIUM
             FORECASTABILITY: LOW
-            For LOW forecastability, your IQR should span a large fraction of the allowed range.
+            For LOW forecastability, your IQR should span a large fraction of the displayed range (or beyond where a bound is open).
             For HIGH, your IQR can be as narrow as the historical data justifies.
 
         (10) Brief checklist
@@ -907,6 +965,7 @@ def stacking_numeric_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
+    nom_upper, nom_lower = nominal_bounds(question)
 
     return clean_indents(
         f"""
@@ -925,9 +984,9 @@ def stacking_numeric_prompt(
         
         Units: {question.unit_of_measure or "Not stated: infer if possible"}
         
-        ── Units & Bounds (must follow) ─────────────────────────────────────
+        ── Units & Bounds ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
-        • Allowed range (base units): [{question.lower_bound}, {question.upper_bound}]
+        • Displayed range (base units): [{nom_lower}, {nom_upper}]
         • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
@@ -984,7 +1043,8 @@ def stacking_numeric_prompt(
            • Are my tails justified given the potential for unknown unknowns?
 
         Remember: Think in ranges, not points. Keep your extreme tails (P1 and P99) appropriately wide.
-        Ensure strictly increasing percentiles and respect the bounds above.
+        Ensure strictly increasing percentiles.
+        For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream

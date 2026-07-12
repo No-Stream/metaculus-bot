@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from forecasting_tools import NumericQuestion
 
 from metaculus_bot.numeric.utils import bound_messages
-from metaculus_bot.prompts import numeric_prompt
+from metaculus_bot.prompts import numeric_prompt, stacking_numeric_prompt
 
 _OPEN = datetime.now() - timedelta(days=30)
 _RESOLVE = datetime.now() + timedelta(days=365)
@@ -104,3 +104,89 @@ class TestNumericPromptOpenLowerGuidance:
         assert "median" in collapsed
         assert "below" in collapsed
         assert "only way" in collapsed or "only channel" in collapsed
+
+
+def _discrete_question() -> NumericQuestion:
+    """Q38195-class discrete count: raw bounds [-0.5, 7.5], cdf_size 9 (0..7 → 8 values + 1).
+
+    Half-step derivation yields nominal (displayed) bounds [0.0, 7.0].
+    """
+    return NumericQuestion(
+        id_of_question=38195,
+        id_of_post=38195,
+        page_url="https://example.com/q/38195",
+        question_text="How many events?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        open_time=_OPEN,
+        scheduled_resolution_time=_RESOLVE,
+        lower_bound=-0.5,
+        upper_bound=7.5,
+        open_lower_bound=False,
+        open_upper_bound=True,
+        unit_of_measure="events",
+        zero_point=None,
+        cdf_size=9,
+    )
+
+
+class TestNumericPromptDisplaysNominalBounds:
+    """De-contradiction fix: the prompt must render the nominal/displayed bound (not the raw
+    scaling bound) and must not carry hard-cap phrasing that overrides the open-bound notes."""
+
+    def test_numeric_prompt_renders_nominal_range_not_raw(self):
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
+        assert "Displayed range (in base units): [0.0, 7.0]" in prompt
+        assert "[-0.5, 7.5]" not in prompt
+
+    def test_numeric_prompt_drops_hard_cap_phrasing(self):
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
+        assert "(must follow)" not in prompt
+        assert "Respect the explicit bounds" not in prompt
+        assert "Allowed range" not in prompt
+
+    def test_stacking_numeric_prompt_renders_nominal_range_not_raw(self):
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = stacking_numeric_prompt(
+            q,
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message=lower_msg,
+            upper_bound_message=upper_msg,
+        )
+        assert "Displayed range (base units): [0.0, 7.0]" in prompt
+        assert "[-0.5, 7.5]" not in prompt
+        assert "(must follow)" not in prompt
+        assert "Allowed range" not in prompt
+
+    def test_numeric_prompt_carries_replacement_open_bound_guidance(self):
+        """Positive assertions on the NEW guidance (not just absence of the old): the
+        closed/open replacement sentence, the displayed-units note, and the open-aware IQR line."""
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
+        assert "the displayed edge is NOT a hard limit" in prompt
+        assert "For a closed bound, no percentile may cross it." in prompt
+        assert "displayed range is suggestive of units" in prompt
+        assert "IQR should span a large fraction of the displayed range (or beyond where a bound is open)" in prompt
+
+    def test_stacking_numeric_prompt_carries_replacement_open_bound_guidance(self):
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = stacking_numeric_prompt(
+            q,
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message=lower_msg,
+            upper_bound_message=upper_msg,
+        )
+        assert "the displayed edge is NOT a hard limit" in prompt
+        assert "For a closed bound, no percentile may cross it." in prompt
