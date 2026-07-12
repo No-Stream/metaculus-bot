@@ -1040,6 +1040,82 @@ here so future sessions don't re-recommend them without new data.
   fuse. Config-era bucketing (keyed on submission time) already handles this; the new prompt
   era starts at `30bca2f`.
 
+## Killed / evaluated 2026-07-11 (blind-forecaster review + crowd-signal audit)
+
+Context: blind (model-IDs-stripped) judge pass over the 2026-07-11 `test_bot` run
+(`scratch/test_bot_july_11_2026 .md`), plus a live-API audit of surfacing crowd-signal
+informativeness (forecaster counts / market liquidity) in research packets.
+
+- **Metaculus `similar-posts` endpoint as a research provider** — KILLED. Audited live
+  across 23 source posts / 160 related rows (`GET /api/posts/{id}/similar-posts/`). Two
+  dealbreakers, both confirmed at scale: (1) the community-prediction VALUE is `null` for our
+  bot account on 160/160 rows (`aggregations.recency_weighted.latest`), and (2) it returns
+  ONLY open questions — 160/160 unresolved, even when the source has obvious resolved
+  monthly/weekly siblings (probed TSA-weekly, cabinet-departure, WatchCharts) — so the
+  base-rate payload we wanted is absent. What remains is title + `nr_forecasters` +
+  un-followable link = decorative (tells a forecaster a related question *exists*, not what
+  the crowd thinks). Match quality is also sharply bimodal: good for AI-frontier / US-politics
+  / geopolitics / broad-finance, garbage for weather / sports / non-US elections / niche
+  product events (a Boston-Marathon source returned the "2026 World Bog Snorkelling
+  Championships" and a Zambian election), and the endpoint pads to exactly 8 with no relevance
+  score so a provider couldn't filter the junk. Also rate-limits at ~10 rapid calls → 429.
+  NOTE: exact-match Metaculus community-prediction surfacing is separately pointless in prod —
+  tournament questions are bot-specific so there's no meaningful CP, on top of the bot-account
+  API hiding (which itself is Metaculus defending against systematic CP scraping).
+
+- **Resolved-sibling base-rate lookup** (`GET /api/posts/?search=<kw>&statuses=resolved`) —
+  general version KILLED; a narrow self-history salvage is a LOW-PRIORITY optional experiment.
+  Audited live 2026-07-11 (~110 calls). The hypothesis — "full-text search over resolved
+  Metaculus questions = a leakage-safe base-rate library (past Fed cycles, Bitcoin, ACX
+  classics)" — is dead on a dealbreaker: **Metaculus null-outs `question.resolution` (plus
+  description/resolution_criteria/fine_print/CP) on every post this bot account did NOT itself
+  forecast** (view-level, presumably AIB anti-cheating; verified ~15 detail fetches, zero
+  counterexamples, no bypass via `with_cp`/`minimize`/`include_descriptions`). So the
+  Metaculus-wide resolved corpus is unreadable to our token. Endpoint mechanics all work
+  (`statuses=` plural; `resolution` null on list rows, populated on detail for
+  bot-forecast posts; formats: binary `yes`/`no`, MC option string, numeric stringified-float
+  or `above_upper_bound`/`below_lower_bound`, plus `annulled` rows to filter; server-side
+  `scheduled_resolve_time__lt` / `open_time__lt` work, `actual_resolve_time__lt` and
+  `order_by=-scheduled_resolve_time` are silently broken).
+  **Salvage (optional, low priority):** a `forecaster_id=275109&statuses=resolved` self-history
+  lookup over the bot's own ~770 resolved posts (~9mo of fall-aib + spring-aib + cup). AIB
+  recycles templates heavily, so sibling quality is excellent for recurring indicators (TSA
+  weekly volume, Fed funds bound, ISM PMIs) and repeated event-window binaries (cabinet
+  departures, city-rain, AI-benchmark thresholds); naive title-as-query works (no LLM keyword
+  step). Backtest-MEASURABLE (unlike prediction_market) via a `actual_resolve_time < question.
+  open_time` date-filter rather than a hard `is_benchmarking` disable. Design if pursued:
+  title-as-query, self-history filter, K=5, resolve-date guard, drop `annulled`. Ranked below
+  recent pipeline work on impact/complexity — the indicator series it surfaces are already
+  pulled by the resolution-source fetcher + financial-data provider (FRED/TSA.gov); its only
+  UNIQUE value is structured prior-outcomes for repeated event-window binaries not otherwise
+  in the briefing.
+
+- **Crowd-signal informativeness surfacing (forecaster count + market liquidity)** — WORTH
+  DOING, plan pending. Findings: `nr_forecasters` is already on the fetched question object
+  (forecasting-tools `MetaculusQuestion.num_forecasters`, populated from the post payload the
+  bot already fetches — zero extra HTTP). Market fetchers (`research/prediction_market.py`)
+  already RECEIVE but DISCARD total volume / open-interest / liquidity / `uniqueBettorCount`,
+  and the one liquidity number they DO print (`vol` = 24h volume) is ~always ≈0 for the
+  long-horizon questions we forecast — systematically misleading. Proposed labels (raw shown
+  alongside): Metaculus <30 thin / 30–49 decent / 50–99 good / ≥100 high-confidence;
+  real-money <$5k thin / $5k–50k decent / >$50k deep (sub-$10k is bot-dominated, may raise the
+  thin cutoff); Manifold on `uniqueBettorCount` <20/20–100/>100. Aggregators evaluated and
+  SKIPPED: Metaforecast is shut down (offline July 2026, repo archived, search API erroring);
+  Adjacent News covers only Kalshi+Polymarket (redundant) with unpriced API. PredictIt is an
+  optional cheap politics-only add (free/no-auth, but price-only, no volume/liquidity). PMXT
+  ("CCXT for prediction markets") is the thing to evaluate only if venue breadth becomes a
+  binding constraint.
+
+- **Open-bound tail-cramming on discrete/open-upper numeric** — FIX IN PROGRESS (see the
+  dedicated review). gpt-5.6-sol and gpt-5.5 crammed ~20% / ~12.6% of probability mass onto
+  the top displayed bin of Q38195 (open upper bound) instead of placing percentiles above the
+  ceiling, because a prompt line ("Allowed range … Respect the explicit bounds") is read by
+  literal-minded models as a hard cap that overrides the open-bound carve-out. Fix = prompt
+  clarification (pending redundancy check vs the existing open-bound guidance series) + a
+  WARN-only boundary-piling detector routed into GHA artifacts (EXTRACTION_RUNG-style
+  telemetry). Model-family split was clean: both OpenAI models failed, all of
+  Claude/Gemini/Grok handled it correctly.
+
 ## Instrumentation bugs
 
 > **All three identified in May 2026 closing analysis are FIXED.** See commits in
