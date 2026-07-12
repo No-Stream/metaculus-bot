@@ -174,11 +174,22 @@ def aggregate_numeric(
 
 
 def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:
-    """Return (upper, lower) nominal/displayed bounds; derive from half-step for discrete Qs."""
+    """Return (upper, lower) nominal/displayed bounds; derive from half-step for discrete Qs.
+
+    The half-step branch requires ``cdf_size > 1`` — the API derives cdf_size as
+    ``inbound_outcome_count + 1`` so real questions are always >= 2, but a degenerate
+    stub would otherwise divide by zero.
+    """
     nominal_upper = getattr(question, "nominal_upper_bound", None)
     nominal_lower = getattr(question, "nominal_lower_bound", None)
     cdf_size = getattr(question, "cdf_size", None)
-    if nominal_upper is None and nominal_lower is None and cdf_size is not None and cdf_size != PCHIP_CDF_POINTS:
+    if (
+        nominal_upper is None
+        and nominal_lower is None
+        and cdf_size is not None
+        and cdf_size > 1
+        and cdf_size != PCHIP_CDF_POINTS
+    ):
         step = (question.upper_bound - question.lower_bound) / (cdf_size - 1)
         nominal_upper = question.upper_bound - step / 2
         nominal_lower = question.lower_bound + step / 2

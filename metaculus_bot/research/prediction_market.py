@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -256,7 +257,7 @@ def _clean_llm_query(content: str) -> str:
     for line in (content or "").splitlines():
         line = line.strip().strip('"').strip("'")
         if line and not line.lower().startswith(("search query", "query:", "answer")):
-            return line[:200]
+            return line[:200]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # query length cap, not data sampling
     return (content or "").strip().strip('"').strip("'")[:200]
 
 
@@ -278,7 +279,7 @@ class KeywordExtractor:
     async def extract(self, question: Any) -> list[str]:  # noqa: ASYNC910
         qid = getattr(question, "id_of_question", None)
         if qid is not None and qid in _KEYWORD_CACHE:
-            return list(_KEYWORD_CACHE[qid])  # noqa: ASYNC910
+            return list(_KEYWORD_CACHE[qid])  # noqa: ASYNC910  # noqa: HARNESS-SCAN-EXEMPT-object-explosion
 
         question_text = getattr(question, "question_text", "") or ""
         title = getattr(question, "title", "") or question_text
@@ -314,7 +315,7 @@ class KeywordExtractor:
         return deduped  # noqa: ASYNC910
 
     async def _run_llm(self, prompt_template: str, title: str, rc: str) -> str:
-        prompt = prompt_template.format(title=title[:400], rc=rc[:400])
+        prompt = prompt_template.format(title=title[:400], rc=rc[:400])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
         # Constructor errors are config bugs (bad model slug, missing API key wiring,
         # etc.) and should crash loudly. Only the .invoke call is expected to face
         # transient LLM errors -- those soft-fall to "" so the snapshot still runs.
@@ -471,7 +472,7 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
     q_lower = (query or "").lower()
 
     events = payload.get("events") or []
-    for ev in events[:10]:
+    for ev in events[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
         title = ev.get("title") or ev.get("question") or ""
         slug = ev.get("slug") or ""
         url = f"https://polymarket.com/event/{slug}" if slug else ""
@@ -522,7 +523,7 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
                 close_time=close_time,
                 is_resolved=bool(ev.get("closed")) or bool(ev.get("resolved")),
                 match_confidence=confidence,
-                raw_rules=description[:2000],
+                raw_rules=description[:2000],  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
                 total_volume=total_volume,
                 liquidity=liquidity,
                 open_interest=open_interest,
@@ -532,7 +533,7 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
     # Fallback to top-level markets if events were empty.
     if not out:
         markets = payload.get("markets") or []
-        for m in markets[:10]:
+        for m in markets[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
             title = m.get("question") or m.get("title") or ""
             slug = m.get("slug") or ""
             url = f"https://polymarket.com/market/{slug}" if slug else ""
@@ -573,7 +574,7 @@ async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
         POLYMARKET_SEARCH_URL,
         {"q": query, "limit_per_type": "10"},
         max_attempts=POLYMARKET_MAX_ATTEMPTS,
-        label=f"Polymarket q={query[:40]!r}",
+        label=f"Polymarket q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return []
@@ -616,7 +617,7 @@ def _manifold_rules_text(m: dict) -> str:
     """
     text_description = m.get("textDescription")
     if isinstance(text_description, str) and text_description.strip():
-        return text_description[:2000]
+        return text_description[:2000]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
 
     description = m.get("description")
     if isinstance(description, dict):
@@ -625,7 +626,7 @@ def _manifold_rules_text(m: dict) -> str:
             return " ".join(collected)[:2000]
         return str(description)[:2000]
     if isinstance(description, str) and description.strip():
-        return description[:2000]
+        return description[:2000]  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
 
     return (m.get("question") or "")[:2000]
 
@@ -637,7 +638,7 @@ def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
 
     q_lower = (query or "").lower()
     out: list[MarketMatch] = []
-    for m in payload[:10]:
+    for m in payload[:10]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # top-N search results cap
         if not isinstance(m, dict):
             continue
         title = m.get("question") or ""
@@ -684,7 +685,7 @@ async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
         {"term": query, "contractType": "BINARY", "limit": "10"},
         max_attempts=MANIFOLD_MAX_ATTEMPTS,
         retryable_statuses=(429, 500, 502, 503, 504),
-        label=f"Manifold q={query[:40]!r}",
+        label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
         return []
@@ -819,7 +820,7 @@ def _kalshi_search_local(
                     close_time=close_time,
                     is_resolved=is_resolved,
                     match_confidence=combined / 100.0,
-                    raw_rules=rules_primary[:2000],
+                    raw_rules=rules_primary[:2000],  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
                     total_volume=total_volume,
                     open_interest=open_interest,
                     liquidity=liquidity,
@@ -924,7 +925,12 @@ def _predictit_search_local(
         if score < min_score:
             continue
 
-        contracts = market.get("contracts") or []
+        # Boundary validation of external API data (mirrors the payload/markets isinstance
+        # checks in _predictit_prefetch): a non-list here would TypeError past the narrow
+        # per-platform catch and soft-fail the entire four-venue snapshot.
+        contracts = market.get("contracts")
+        if not isinstance(contracts, list):
+            contracts = []
         contract = _select_predictit_contract(contracts, q_lower)
         contract_name = contract.get("name") or ""
 
@@ -938,6 +944,19 @@ def _predictit_search_local(
         status = (contract.get("status") or "").lower()
         is_resolved = status != "" and status != "open"
 
+        # Price from the live order book when both sides exist (mirrors Kalshi):
+        # bestBuyYesCost is the current YES ask; 1 - bestBuyNoCost is the YES bid.
+        # lastTradePrice can be stale on thin markets, so it's only the fallback.
+        yes_ask = _safe_float(contract.get("bestBuyYesCost"))
+        no_ask = _safe_float(contract.get("bestBuyNoCost"))
+        yes_bid = 1.0 - no_ask if no_ask is not None else None
+        if yes_bid is not None and yes_ask is not None:
+            implied = (yes_bid + yes_ask) / 2.0
+            spread = yes_ask - yes_bid
+        else:
+            implied = _safe_float(contract.get("lastTradePrice"))
+            spread = None
+
         scored.append(
             (
                 score,
@@ -945,10 +964,10 @@ def _predictit_search_local(
                     platform="predictit",
                     market_title=title,
                     market_url=market.get("url") or "",
-                    implied_prob_yes=_safe_float(contract.get("lastTradePrice")),
-                    bid=None,
-                    ask=None,
-                    spread=None,
+                    implied_prob_yes=implied,
+                    bid=yes_bid,
+                    ask=yes_ask,
+                    spread=spread,
                     volume_24h=None,
                     close_time=None,
                     is_resolved=is_resolved,
@@ -1018,7 +1037,7 @@ async def fetch_market_snapshot(
             except asyncio.TimeoutError:
                 logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
                 return MarketSnapshot(matches=[])  # noqa: ASYNC910
-    except Exception:
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
         # Outer safety net; should not normally fire -- investigate if seen.
         # Re-raise after logging would defeat the soft-fail contract that the
         # rest of the bot depends on, so we swallow + log here. Inner narrow
@@ -1249,7 +1268,9 @@ def _safe_float(v: Any) -> float | None:
 
 def _safe_int(v: Any) -> int | None:
     f = _safe_float(v)
-    if f is None:
+    # json.loads (used by aiohttp) accepts bare NaN/Infinity literals, and int(nan)/int(inf)
+    # raise — a helper named _safe_* must return None on those, not blow up.
+    if f is None or not math.isfinite(f):
         return None
     return int(f)
 
