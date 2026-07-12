@@ -263,5 +263,5 @@ async def run_numeric_forecast(
         )
 
     log_final_prediction(prediction, question)
-    log_open_bound_piling_diagnostics(prediction, question, forecaster_llm.model)
+    log_open_bound_piling_diagnostics(prediction, question, forecaster_llm.model, sanitized_percentiles)
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote

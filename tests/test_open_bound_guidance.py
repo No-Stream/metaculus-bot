@@ -166,3 +166,27 @@ class TestNumericPromptDisplaysNominalBounds:
         assert "[-0.5, 7.5]" not in prompt
         assert "(must follow)" not in prompt
         assert "Allowed range" not in prompt
+
+    def test_numeric_prompt_carries_replacement_open_bound_guidance(self):
+        """Positive assertions on the NEW guidance (not just absence of the old): the
+        closed/open replacement sentence, the displayed-units note, and the open-aware IQR line."""
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
+        assert "the displayed edge is NOT a hard limit" in prompt
+        assert "For a closed bound, no percentile may cross it." in prompt
+        assert "displayed range is suggestive of units" in prompt
+        assert "IQR should span a large fraction of the displayed range (or beyond where a bound is open)" in prompt
+
+    def test_stacking_numeric_prompt_carries_replacement_open_bound_guidance(self):
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = stacking_numeric_prompt(
+            q,
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message=lower_msg,
+            upper_bound_message=upper_msg,
+        )
+        assert "the displayed edge is NOT a hard limit" in prompt
+        assert "For a closed bound, no percentile may cross it." in prompt

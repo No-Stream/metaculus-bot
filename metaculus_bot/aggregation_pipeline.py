@@ -25,7 +25,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 
-from metaculus_bot import stacking
+from metaculus_bot import calibration, stacking
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
     combine_binary_predictions,
@@ -33,10 +33,13 @@ from metaculus_bot.aggregation_strategies import (
     combine_numeric_predictions,
 )
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
+from metaculus_bot.exceptions import UnitMismatchError
+from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages
 from metaculus_bot.numeric.validation import detect_unit_mismatch
+from metaculus_bot.post_processing import apply_platt_calibration, maybe_snap_to_integers
 
 logger = logging.getLogger(__name__)
 
@@ -165,8 +168,6 @@ class AggregationPipeline:
 
             mismatch, reason = detect_unit_mismatch(percentile_list, question)  # type: ignore[arg-type]
             if mismatch:
-                from metaculus_bot.exceptions import UnitMismatchError
-
                 logger.error(
                     f"Unit mismatch likely for Q {qid} | URL {page_url} | reason={reason}. Withholding prediction."
                 )
@@ -175,7 +176,7 @@ class AggregationPipeline:
                 )
 
             prediction = build_numeric_distribution(percentile_list, question, zero_point)
-            log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model)
+            log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
             log_final_prediction(prediction, question)
             logger.info(f"Stacked numeric prediction for {page_url}")
             return prediction
@@ -314,7 +315,9 @@ class AggregationPipeline:
             )
             self.outcomes[qid_for_outcome] = "primary"
             return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
-        except Exception as primary_exc:
+        # Deliberate fallback ladder: ANY primary-stacker failure (timeout, API, parse)
+        # degrades to the fallback LLM rather than dropping the question.
+        except Exception as primary_exc:  # HARNESS-SCAN-EXEMPT-broad-except
             if not self.stacking_fallback_on_failure:
                 raise
 
@@ -325,8 +328,6 @@ class AggregationPipeline:
                 type(primary_exc).__name__,
                 primary_exc,
             )
-
-            from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
 
             try:
                 self.counters.stacker_fallback_used_count += 1
@@ -347,7 +348,8 @@ class AggregationPipeline:
                 )
                 self.outcomes[qid_for_outcome] = "fallback_llm"
                 return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
-            except Exception as fallback_exc:
+            # Last rung of the ladder: fallback-stacker failure degrades to MEDIAN, never drops.
+            except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except
                 self.counters.stacker_fallback_failed_count += 1
                 self.counters.stacking_fallback_count += 1
                 logger.error(
@@ -446,14 +448,13 @@ class AggregationPipeline:
         raise ValueError(f"Unsupported prediction type for {error_context}: {type(first)}")
 
     def _apply_platt_calibration(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        from metaculus_bot.calibration import BINARY_PLATT_PARAMS, MC_PLATT_PARAMS
-        from metaculus_bot.post_processing import apply_platt_calibration
-
-        return apply_platt_calibration(prediction, question, BINARY_PLATT_PARAMS, MC_PLATT_PARAMS)
+        # Params read via the module attribute (not from-imported) so test monkeypatching
+        # of metaculus_bot.calibration.{BINARY,MC}_PLATT_PARAMS is observed.
+        return apply_platt_calibration(
+            prediction, question, calibration.BINARY_PLATT_PARAMS, calibration.MC_PLATT_PARAMS
+        )
 
     def _maybe_snap_to_integers(self, prediction: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
-        from metaculus_bot.post_processing import maybe_snap_to_integers
-
         if not isinstance(prediction, NumericDistribution) or not isinstance(question, NumericQuestion):
             return prediction
         qid = question.id_of_question
