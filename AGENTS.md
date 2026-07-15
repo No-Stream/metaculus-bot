@@ -68,7 +68,7 @@ See `metaculus_bot/llm_configs.py` for the authoritative list (rotates frequentl
 
 Support models (also in `llm_configs.py`):
 
-- **Stacker**: `claude-fable-5` (primary, since 2026-07-07; effort-based adaptive thinking `reasoning={"effort": "high"}`, not a max_tokens budget), `gpt-5.6-sol` (cross-provider fallback for independence if Anthropic thrashes). Both `allowed_tries=1` — on stall, we fall back rather than burn budget retrying the same provider.
+- **Stacker**: `claude-fable-5` (primary, since 2026-07-07; effort-based adaptive thinking `reasoning={"effort": "xhigh"}` since 2026-07-15, not a max_tokens budget), `gpt-5.6-sol` (cross-provider fallback for independence if Anthropic thrashes; stays at effort=high — it fires on a tight 300s budget). Both `allowed_tries=1` — on stall, we fall back rather than burn budget retrying the same provider. OpenRouter's full effort enum (live-verified 2026-07-15): none/minimal/low/medium/high/xhigh/max; the xhigh-capable slots (gpt-5.6-sol, gpt-5.5, opus-4.8 forecasters + the Fable stacker) run at xhigh, with "max" held back for latency.
 - **Disagreement analyzer**: `gpt-5.6-sol` (low-effort crux extractor; quality drives targeted-search query, with a 180s soft deadline).
 - **Summarizer / researcher**: `gpt-5.6-sol` (low effort, deterministic). Top tier because the summarizer decides what is load-bearing in the briefing every forecaster reads; low effort keeps latency in check.
 - **Parser**: `gpt-5.4-mini` (low effort, deterministic; saturated extraction task, still cheaper than gpt-5.6-luna).

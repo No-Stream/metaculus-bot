@@ -58,23 +58,30 @@ ACCEPTABLE_QUANTS = [
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
 FORECASTER_LLMS: list[GeneralLlm] = [
-    # 2026-07-09: OpenAI flagship (5.6 series, released today); replaces gpt-5.4. High effort —
-    # forecaster quality is the product. (Date anchors the config era for residual analysis.)
+    # 2026-07-09: OpenAI flagship (5.6 series, released today); replaces gpt-5.4.
+    # 2026-07-15: effort high -> xhigh (top OpenAI tier; forecaster quality is the
+    # product). Live-verified: OpenRouter's effort enum is
+    # max|xhigh|high|medium|low|minimal|none and all four bumped models accept
+    # xhigh (bogus values 400). (Dates anchor config eras for residual analysis.)
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.6-sol",
-        reasoning={"effort": "high"},
+        reasoning={"effort": "xhigh"},
         **_FORECASTER_CONFIG,
     ),
     # Kept (not migrated to sol) to preserve intra-OpenAI generation diversity
-    # alongside gpt-5.6-sol in the ensemble.
+    # alongside gpt-5.6-sol in the ensemble. 2026-07-15: effort high -> xhigh.
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.5",
-        reasoning={"effort": "high"},
+        reasoning={"effort": "xhigh"},
         **_FORECASTER_CONFIG,
     ),
+    # 2026-07-15: enabled:True (provider-default adaptive thinking) -> explicit
+    # effort=xhigh. Anthropic also exposes "max" one tier above xhigh — held back
+    # deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; see the opus-4.6
+    # adaptive-thinking stall note below).
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
-        reasoning={"enabled": True},
+        reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
     ),
@@ -158,9 +165,12 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/anthropic/claude-fable-5",
-    # Fable 5 uses effort-based adaptive thinking (none/low/medium/high/max), not a
-    # max_tokens budget. effort=high + verbosity=high matches the opus-4.8 forecaster slot.
-    reasoning={"effort": "high"},
+    # Fable 5 uses effort-based adaptive thinking, not a max_tokens budget. Live-verified
+    # OpenRouter effort enum: none/minimal/low/medium/high/xhigh/max. 2026-07-15: effort
+    # high -> xhigh, matching the opus-4.8 forecaster slot. "max" (one tier above xhigh)
+    # is deliberately held back for latency — the stacker runs under STACKER_SOFT_DEADLINE
+    # (500s).
+    reasoning={"effort": "xhigh"},
     extra_body={"verbosity": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
@@ -170,6 +180,8 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # deliberately cross-provider from the Anthropic Fable primary so an Anthropic
 # stall doesn't take both attempts down. Tighter timeout and single try since
 # we're already running late on the critical path by the time this fires.
+# Stays at high (not xhigh) for that same reason — the 2026-07-15 xhigh bump
+# covers the primary stacker and forecaster slots, not this 300s-budget path.
 STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "high"},
