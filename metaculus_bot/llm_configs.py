@@ -62,7 +62,9 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     # 2026-07-15: effort high -> xhigh (top OpenAI tier; forecaster quality is the
     # product). Live-verified: OpenRouter's effort enum is
     # max|xhigh|high|medium|low|minimal|none and all four bumped models accept
-    # xhigh (bogus values 400). (Dates anchor config eras for residual analysis.)
+    # xhigh (bogus values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling
+    # is xhigh and OpenAI rejects max upstream even though OpenRouter's enum
+    # validation admits it. (Dates anchor config eras for residual analysis.)
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.6-sol",
         reasoning={"effort": "xhigh"},
