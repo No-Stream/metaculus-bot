@@ -9,12 +9,19 @@
 > (`mixture_components`/`tails`) or `concentration: 0.0`, which the strict
 > `parse_structured_block` schemas reject wholesale — so the collector recovered
 > nothing for gemini despite it forecasting and publishing on all 4. Gemini's true
-> summer miss rate is 1/45 (2.2%), and its member stats below are computed on a
-> needlessly reduced n=40 subset. A tolerant raw-JSON salvage rung was added to
-> `performance_analysis/parsing.py` the same day; a dataset rebuild would recover
-> 43746 + 43656 fully (43652/43747 declared only 3 percentiles in the retired
-> mixture-era format and would still fail the ≥5-distinct-percentile rule).
-> Claims marked ~~struck~~ below are superseded by this correction.
+> summer miss rate is 1/45 (2.2%), single 600s stall, cause indeterminate at n=1.
+> A tolerant raw-JSON salvage rung was added to `performance_analysis/parsing.py` the
+> same day (commit `f530968`), the dataset was rebuilt from the stored comment text
+> (`rebuild_per_model_fields.py`), and the screening re-run. The rebuild recovered
+> gemini on 43746 (numeric, 11 percentiles) and 43656 (MC) → summer gemini n=40→42;
+> 43652/43747 declared only 3 percentiles in the retired mixture-era format and still
+> fail the ≥5-distinct-percentile rule (as does a newly salvaged gpt-5.4 3-percentile
+> entry on 43729 — the only non-gemini gain). All tables and numbers below are from
+> the re-run. Net effect: pooled drop-gemini −2.16 → −2.14 (still CI-solid); the one
+> substantive change is the summer individual-member ranking — gemini's mean log fell
+> from +51.6 (n=40, ranked #1) to +48.4 (n=42, ranked #2 behind claude-opus-4.8's
+> +50.5 at n=20), because the two recovered questions scored below its prior average.
+> No conclusion changes direction. Claims marked ~~struck~~ below are superseded.
 
 **Question:** using per-forecaster predictions recovered from the bot's own published
 Metaculus comments on resolved questions, would the published ensemble aggregate have
@@ -25,31 +32,35 @@ deliverable is "is any model clearly helping or hurting", with honest uncertaint
 **Reproduce:** `uv run python scratch/ensemble_composition_2026-07-15/ensemble_screen.py`
 (reads the tagged collector dataset at `scratch/coherence_2026-07-15/perf_all_tagged.json`;
 100% offline — no API, LLM, or paid calls). Full generated tables in `tables.md`,
-machine-readable results in `results.json`.
+machine-readable results in `results.json`. The dataset's per-model fields were rebuilt
+post-correction with `rebuild_per_model_fields.py` (re-runs the fixed parser over the
+stored comment text; the pre-rebuild original is kept as
+`perf_all_tagged.pre_tolerant_backup.json`).
 
 ## TL;DR
 
 - **openai-gpt5 is the one clearly load-bearing family.** Removing it hurts in 6 of 8
   eras, with per-era CIs excluding zero in three of them and a pooled delta of
-  −2.55 log points [95% CI −3.87, −1.27]. Keep.
-- **gemini is not deadweight.** Pooled drop-gemini = −2.16 [−3.67, −0.58]; it hurts to
+  −2.56 log points [95% CI −3.90, −1.25]. Keep.
+- **gemini is not deadweight.** Pooled drop-gemini = −2.14 [−3.62, −0.62]; it hurts to
   remove in both large spring eras, and in the current summer era gemini-3.1-pro-preview
-  is the *best individual member* (+51.6 mean log) with a binary-Brier degradation on
-  removal whose CI excludes zero (+0.0127 [+0.0038, +0.0237]). The suspicion that
+  is a top-2 individual member (+48.4 mean log, n=42; behind only claude-opus-4.8's
+  +50.5 on a half-era n=20) with a binary-Brier degradation on
+  removal whose CI excludes zero (+0.0127 [+0.0039, +0.0238]). The suspicion that
   gemini-3.1-pro is deadweight is not supported.
 - **grok is the closest thing to deadweight, but it isn't hurting.** It is the worst
   individual member in every era it appears (grok-4-fast +45.7 vs peers ~55-60;
   grok-4.1-fast +18.6, worst; grok-4.3 +27.3, worst). Yet removal deltas straddle zero
-  everywhere (pooled +0.24 [−1.12, +1.49]) — the median aggregate mostly ignores it.
+  everywhere (pooled +0.24 [−1.13, +1.48]) — the median aggregate mostly ignores it.
   Evidence supports "contributes nothing measurable", not "actively harmful".
 - **anthropic is era-dependent.** In spring-aib-2026 the opus-4.5/4.6 pair actively
   hurt: drop-anthropic in spring_5m_b = **+3.29** [+0.26, +6.47] with binary Brier
   improving −0.0164 [−0.0294, −0.0048], and the adjacent transitional era agrees. In
   the current summer era (opus-4.6/4.7/4.8) the sign flips back to helpful
-  (−1.70 [−3.84, +0.66], opus-4.8 second-best individual member). No action indicated
+  (−1.71 [−3.85, +0.65], opus-4.8 the top summer individual member). No action indicated
   today, but the spring result is a reminder that a stale anthropic version can drag.
 - **Nothing supports shrinking the ensemble.** drop-grok+gemini (4-model ensemble) in
-  summer = −0.16 [−2.18, +1.86]; top-3-families (leave-one-question-out selection)
+  summer = −0.17 [−2.24, +1.83]; top-3-families (leave-one-question-out selection)
   never beats the full ensemble in any era where it's computable.
 
 **The biggest caveat:** the *current* roster slots (grok-4.5 since 2026-07-08,
@@ -190,6 +201,10 @@ Member-level and stacked-question losses (from `drop_counts` in results.json):
   instead of 11 percentiles (33 lists); members with ≥5 distinct percentiles were kept
   — PCHIP handles sparse percentile sets, and dropping them would have biased against
   verbose models.
+- 3 member entries salvaged by the post-correction tolerant parse (gemini on
+  43652/43747, gpt-5.4 on 43729) declared only 3 percentiles (the retired
+  mixture-era format) and fail the ≥5-distinct-percentile rule — counted in
+  `numeric_member_too_few_percentiles`, expected per the CORRECTION header.
 
 ## Per-era results (abridged — full tables in `tables.md`)
 
@@ -207,8 +222,8 @@ helping). ΔBrier on binary subset: positive = removal hurts.
 | spring_trans | 37 | −8.32 [−19.24, +0.50] | +0.026 |
 | spring_5m_b | 137 | **−5.18 [−9.13, −1.90]** | **+0.023 [+0.011, +0.036]** |
 | spring_6m | 13 | −0.18 [−6.57, +4.91] | +0.002 |
-| summer_6m | 45 | +1.01 [−2.31, +3.78] | −0.003 |
-| **pooled** | 653 | **−2.55 [−3.87, −1.27]** | |
+| summer_6m | 45 | +0.96 [−2.40, +3.76] | −0.003 |
+| **pooled** | 653 | **−2.56 [−3.90, −1.25]** | |
 
 Consistently load-bearing; the summer point estimate is mildly positive but well inside
 noise (n=45, and gpt-5.4 was the weaker of the two openai slots there).
@@ -221,14 +236,15 @@ noise (n=45, and gpt-5.4 was the weaker of the two openai slots there).
 | spring_trans | 37 | **−4.12 [−9.00, −0.75]** | +0.006 |
 | spring_5m_b | 138 | **−2.05 [−3.72, −0.41]** | +0.006 |
 | spring_6m | 13 | −0.05 [−1.65, +2.08] | −0.000 |
-| summer_6m | 40 | −1.45 [−4.03, +1.32] | **+0.013 [+0.004, +0.024]** |
-| **pooled** | 297 | **−2.16 [−3.67, −0.58]** | |
+| summer_6m | 42 | −1.40 [−3.85, +1.20] | **+0.013 [+0.004, +0.024]** |
+| **pooled** | 299 | **−2.14 [−3.62, −0.62]** | |
 
-Helping in every era with meaningful n. In summer, gemini-3.1-pro-preview is the top
-individual member (+51.6 mean log over 40 questions; ~~it missed 5 questions to
+Helping in every era with meaningful n. In summer, gemini-3.1-pro-preview is the
+second-best individual member (+48.4 mean log over 42 questions, behind opus-4.8's
++50.5 at n=20; ~~it missed 5 questions to
 soft-deadline drops — that unreliability is the honest knock on it, not forecast
 quality~~ — see the CORRECTION header: 4 of those 5 were recovery-parse artifacts,
-only 1 was a real drop).
+only 1 was a real drop, and the post-rebuild n is 42).
 
 ### grok
 
@@ -236,8 +252,8 @@ only 1 was a real drop).
 |---|---|---|---|
 | fall_6m | 270 | +0.36 [−1.17, +1.71] | −0.004 [−0.008, −0.000] |
 | spring_6m | 12 | +1.07 [−0.73, +3.29] | −0.000 |
-| summer_6m | 45 | −0.65 [−5.32, +2.78] | −0.007 |
-| **pooled** | 327 | +0.24 [−1.12, +1.49] | |
+| summer_6m | 45 | −0.67 [−5.28, +2.74] | −0.007 |
+| **pooled** | 327 | +0.24 [−1.13, +1.48] | |
 
 Never load-bearing anywhere; the one CI that grazes zero (fall_6m binary Brier
 *improving* on removal) is the sole hint of active harm, and it doesn't replicate in
@@ -255,8 +271,8 @@ appears. Diversity value to the median: not detectable at these n.
 | spring_trans | 37 | +4.18 [−1.10, +10.36] | **−0.018 [−0.040, −0.001]** |
 | spring_5m_b | 137 | **+3.29 [+0.25, +6.47]** | **−0.016 [−0.029, −0.005]** |
 | spring_6m | 13 | +0.29 [−5.36, +5.64] | +0.003 |
-| summer_6m | 45 | −1.70 [−3.84, +0.66] | +0.005 |
-| pooled | 649 | +0.36 [−0.81, +1.52] | |
+| summer_6m | 45 | −1.71 [−3.85, +0.65] | +0.005 |
+| pooled | 649 | +0.36 [−0.84, +1.50] | |
 
 The pooled null hides real era structure (this is why era-bucketing is mandatory):
 helpful in fall (sonnet-4.5) and summer (opus-4.8), actively harmful in spring
@@ -266,14 +282,14 @@ bigger surgery than other families' LOO.
 
 ### Hypothesis subsets and top-3
 
-- **drop_grok+gemini (summer):** −0.16 [−2.18, +1.86]. A 4-model ensemble would have
+- **drop_grok+gemini (summer):** −0.17 [−2.24, +1.83]. A 4-model ensemble would have
   been statistically indistinguishable over this sample — but the point estimate is
   negative and the gemini-side evidence above argues against it.
 - **top3_families_LOQO:** +1.60 (fall_5m), +1.13 (fall_6m), +0.98 (spring_6m),
-  −0.65 (summer). Never a significant improvement; ensembling breadth is not obviously
+  −0.67 (summer). Never a significant improvement; ensembling breadth is not obviously
   costing anything, and honest per-question selection doesn't beat just keeping
   everyone.
-- **o3 (historical):** pooled −1.33 [−2.69, −0.08] — it was quietly load-bearing in
+- **o3 (historical):** pooled −1.33 [−2.70, −0.10] — it was quietly load-bearing in
   fall alongside gpt-5. kimi (+0.47) and qwen (−0.39): nulls.
 
 ## Conclusions (plain prose)
@@ -281,10 +297,13 @@ bigger surgery than other families' LOO.
 1. Keep the openai flagship slot(s); it has been the most consistently load-bearing
    family across three tournaments.
 2. Keep gemini-3.1-pro on forecast quality — the deadweight suspicion is not supported;
-   it is currently the best individual scorer. ~~Its real cost is reliability (missed 5
+   it is a top-2 summer individual scorer (best among members present all era) and the
+   only summer family whose removal degrades binary Brier with a CI excluding zero.
+   ~~Its real cost is reliability (missed 5
    of 45 summer questions), which is an ops issue, not an ensemble-math one.~~ See the
-   CORRECTION header: the true summer miss rate is 1/45; the reliability knock mostly
-   belonged to the recovery parser, not the model.
+   CORRECTION header: the true summer miss rate is 1/45 (one 600s stall, cause
+   indeterminate at n=1); the reliability knock belonged to the recovery parser, not
+   the model.
 3. Grok is where the evidence points if a slot must be freed: worst individual member
    in every era, no detectable contribution to (or drag on) the median aggregate.
    Swapping it for a candidate with better solo scores has upside and, on these data,
@@ -312,7 +331,7 @@ bigger surgery than other families' LOO.
   discrete native-grid resample) — cancels in paired deltas, but absolute per-era log
   levels are not comparable to Metaculus's own scores in early eras.
 - Small eras (spring_6m n=13, fall_5m/spring_trans n≈36) are directional at best.
-- Member absences (real drops OR recovery-parse losses — see the CORRECTION header)
+- Member absences (real drops OR residual recovery losses — see the CORRECTION header)
   mean LOO for family m runs only on questions where m has recovered values; families
-  with reduced coverage (gemini in summer, n=40) are screened on a slightly
+  with reduced coverage (gemini in summer, n=42 post-rebuild) are screened on a slightly
   easier/different question mix than always-present families.

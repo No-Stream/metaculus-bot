@@ -169,23 +169,23 @@ Families: anthropic=['claude-opus-4.6', 'claude-opus-4.7', 'claude-opus-4.8']; g
 
 | comparison | n_q | mean Δlog vs replica | 95% CI | ΔBrier (binary) | Brier CI |
 |---|---|---|---|---|---|
-| drop_anthropic | 45 | -1.70 | [-3.84, +0.66] | +0.0047 (n=15) | [-0.0165, +0.0212] |
-| drop_gemini | 40 | -1.45 | [-4.03, +1.32] | +0.0127 (n=14) | [+0.0038, +0.0237] |
-| drop_grok | 45 | -0.65 | [-5.32, +2.78] | -0.0069 (n=15) | [-0.0176, +0.0020] |
-| drop_openai-gpt5 | 45 | +1.01 | [-2.31, +3.78] | -0.0026 (n=15) | [-0.0208, +0.0237] |
-| drop_grok+gemini | 45 | -0.16 | [-2.18, +1.86] | +0.0020 (n=15) | [-0.0054, +0.0084] |
-| top3_families_LOQO | 45 | -0.65 | [-5.34, +2.67] | -0.0069 (n=15) | [-0.0173, +0.0022] |
-| unstacked_only/drop_anthropic | 41 | -1.06 | [-3.12, +1.31] | -0.0026 (n=12) | [-0.0243, +0.0119] |
-| unstacked_only/drop_gemini | 37 | -0.90 | [-3.54, +1.91] | +0.0093 (n=11) | [+0.0018, +0.0182] |
-| unstacked_only/drop_grok | 41 | -1.26 | [-6.37, +2.41] | -0.0031 (n=12) | [-0.0127, +0.0054] |
-| unstacked_only/drop_openai-gpt5 | 41 | +0.12 | [-3.41, +3.05] | +0.0047 (n=12) | [-0.0130, +0.0329] |
+| drop_anthropic | 45 | -1.71 | [-3.85, +0.65] | +0.0047 (n=15) | [-0.0165, +0.0212] |
+| drop_gemini | 42 | -1.40 | [-3.85, +1.20] | +0.0127 (n=14) | [+0.0039, +0.0238] |
+| drop_grok | 45 | -0.67 | [-5.28, +2.74] | -0.0069 (n=15) | [-0.0172, +0.0019] |
+| drop_openai-gpt5 | 45 | +0.96 | [-2.40, +3.76] | -0.0026 (n=15) | [-0.0209, +0.0225] |
+| drop_grok+gemini | 45 | -0.17 | [-2.24, +1.83] | +0.0020 (n=15) | [-0.0056, +0.0082] |
+| top3_families_LOQO | 45 | -0.67 | [-5.29, +2.79] | -0.0069 (n=15) | [-0.0171, +0.0022] |
+| unstacked_only/drop_anthropic | 41 | -1.06 | [-3.14, +1.20] | -0.0026 (n=12) | [-0.0251, +0.0121] |
+| unstacked_only/drop_gemini | 38 | -0.88 | [-3.40, +1.98] | +0.0093 (n=11) | [+0.0018, +0.0182] |
+| unstacked_only/drop_grok | 41 | -1.26 | [-6.41, +2.37] | -0.0031 (n=12) | [-0.0128, +0.0053] |
+| unstacked_only/drop_openai-gpt5 | 41 | +0.12 | [-3.52, +3.06] | +0.0047 (n=12) | [-0.0130, +0.0332] |
 
 Per-member mean log score (n≥5):
 
 | model | n | mean log |
 |---|---|---|
-| gemini-3.1-pro-preview | 40 | +51.57 |
 | claude-opus-4.8 | 20 | +50.52 |
+| gemini-3.1-pro-preview | 42 | +48.43 |
 | gpt-5.5 | 45 | +39.44 |
 | claude-opus-4.6 | 45 | +38.51 |
 | claude-opus-4.7 | 25 | +34.41 |
@@ -196,13 +196,13 @@ Per-member mean log score (n≥5):
 
 | comparison | n_q | eras | mean Δlog | 95% CI |
 |---|---|---|---|---|
-| drop_grok | 327 | fall_6m,spring_6m,summer_6m | +0.24 | [-1.12, +1.49] |
-| drop_gemini | 297 | spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | -2.16 | [-3.67, -0.58] |
-| drop_anthropic | 649 | fall_mean3,fall_5m,fall_6m,spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | +0.36 | [-0.81, +1.52] |
-| drop_openai-gpt5 | 653 | fall_mean3,fall_5m,fall_6m,spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | -2.55 | [-3.87, -1.27] |
-| drop_openai-o3 | 354 | fall_mean3,fall_5m,fall_6m | -1.33 | [-2.69, -0.08] |
-| drop_kimi | 310 | fall_5m,fall_6m | +0.47 | [-0.60, +1.52] |
-| drop_qwen | 311 | fall_5m,fall_6m | -0.39 | [-1.87, +0.89] |
+| drop_grok | 327 | fall_6m,spring_6m,summer_6m | +0.24 | [-1.13, +1.48] |
+| drop_gemini | 299 | spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | -2.14 | [-3.62, -0.62] |
+| drop_anthropic | 649 | fall_mean3,fall_5m,fall_6m,spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | +0.36 | [-0.84, +1.50] |
+| drop_openai-gpt5 | 653 | fall_mean3,fall_5m,fall_6m,spring_5m_a,spring_trans,spring_5m_b,spring_6m,summer_6m | -2.56 | [-3.90, -1.25] |
+| drop_openai-o3 | 354 | fall_mean3,fall_5m,fall_6m | -1.33 | [-2.70, -0.10] |
+| drop_kimi | 310 | fall_5m,fall_6m | +0.47 | [-0.59, +1.50] |
+| drop_qwen | 311 | fall_5m,fall_6m | -0.39 | [-1.78, +0.92] |
 
 ## Drop counts
 
@@ -211,6 +211,7 @@ Per-member mean log score (n≥5):
 - no_members_multiple_choice: 2
 - no_members_numeric: 14
 - numeric_member_pchip_failed: 2
+- numeric_member_too_few_percentiles: 3
 - stacked_binary_unrecoverable: 12
 - stacked_multiple_choice_unrecoverable: 2
 - stacked_numeric_unrecoverable: 4
