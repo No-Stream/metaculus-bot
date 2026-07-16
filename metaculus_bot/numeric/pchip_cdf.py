@@ -67,12 +67,25 @@ def _redistribute_excess_probability(cdf: np.ndarray, max_step: float) -> np.nda
     return new_cdf
 
 
-def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool) -> np.ndarray:
+def safe_cdf_bounds(
+    cdf: np.ndarray,
+    open_lower: bool,
+    open_upper: bool,
+    *,
+    min_step: float = NUM_MIN_PROB_STEP,
+    max_step: float = NUM_MAX_STEP,
+) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
     • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
-    • No single step may exceed 0.2
-    • Adjacent steps stay ≥ NUM_MIN_PROB_STEP (re-enforced after pin+cummax)
+    • No single step may exceed ``max_step``
+    • Adjacent steps stay ≥ ``min_step`` (re-enforced after pin+cummax)
+
+    ``min_step`` / ``max_step`` default to the 201-point-grid constants
+    (``NUM_MIN_PROB_STEP`` / ``NUM_MAX_STEP``). A caller building a CDF on a non-201 grid
+    (a discrete question with ``cdf_size != 201``) must pass the grid-scaled values so the
+    per-bin constraints match the server's ``round(0.01 / N, 9)`` min-step and
+    ``0.2 * 200 / N`` max-step formulas, where ``N = cdf_size - 1``.
     """
     # Work on a copy to avoid mutating callers unexpectedly
     cdf = cdf.copy()
@@ -85,14 +98,14 @@ def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool) -> np.n
 
     # Enforce the maximum step rule iteratively
     pre_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
-    if pre_max_step > NUM_MAX_STEP + 1e-12:
-        cdf = _redistribute_excess_probability(cdf, NUM_MAX_STEP)
+    if pre_max_step > max_step + 1e-12:
+        cdf = _redistribute_excess_probability(cdf, max_step)
         post_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
         logger.debug(
             "CDF max-step redistribution applied | pre_max_step=%.8f | post_max_step=%.8f | max_step=%.8f",
             pre_max_step,
             post_max_step,
-            NUM_MAX_STEP,
+            max_step,
         )
 
     # Ensure monotonicity and clamp to legal probability range
@@ -108,11 +121,11 @@ def safe_cdf_bounds(cdf: np.ndarray, open_lower: bool, open_upper: bool) -> np.n
     if cdf.size > 1:
         np.maximum.accumulate(cdf, out=cdf)
         # Pinning cdf[0] up to 0.001 + cummax flattens any sub-0.001 prefix into
-        # 0-step bins, violating the server's 5e-5 min-step (the framework then
+        # 0-step bins, violating the server's min-step (the framework then
         # drops the prediction on open-bound fallback questions). Re-enforce.
         upper_cap = 0.999 if open_upper else 1.0
         lower_cap = 0.001 if open_lower else 0.0
-        cdf = enforce_min_steps(cdf, NUM_MIN_PROB_STEP, upper_cap=upper_cap, lower_cap=lower_cap)
+        cdf = enforce_min_steps(cdf, min_step, upper_cap=upper_cap, lower_cap=lower_cap)
 
     return cdf
 

@@ -9,6 +9,7 @@ against median on the tournament log-score metric. Nothing here runs live.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from scipy.stats import norm
 
@@ -350,3 +351,111 @@ class TestQuestionGridZeroPoint:
         ]
         pooled = log_pool_cdfs(cdfs, question)
         _assert_valid_cdf(pooled, question, expected_grid=geom_grid)
+
+
+class TestNonStandardGridLength:
+    """The pooled CDF grid length must follow the INPUT CDFs, not a hard-coded 201.
+
+    Discrete questions carry ``cdf_size = inbound_outcome_count + 1 != 201`` (e.g. the
+    'integer count 0..15' question qid 42752 has cdf_size 17). Its per-forecaster CDFs are
+    length 17, so the pooled CDF must also be length 17 to score against the right buckets.
+    Before the fix ``log_pool_cdfs`` raised ``ValueError`` (``np.diff`` broadcast into the
+    201-length interior slice) and ``vincentize_cdfs`` silently emitted a 201-point CDF.
+    """
+
+    # Mirrors the real discrete question qid 42752: integer counts 0..15 on [-0.5, 15.5],
+    # open upper bound, cdf_size 17 (16 inbound buckets).
+    DISCRETE_N = 17
+    DISCRETE_LOWER = -0.5
+    DISCRETE_UPPER = 15.5
+
+    def _discrete_question(self):
+        return make_mock_numeric_question(
+            lower_bound=self.DISCRETE_LOWER,
+            upper_bound=self.DISCRETE_UPPER,
+            open_upper_bound=True,
+            cdf_size=self.DISCRETE_N,
+        )
+
+    def _discrete_min_step(self, n: int) -> float:
+        # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
+        return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
+
+    def test_log_pool_at_discrete_length(self):
+        question = self._discrete_question()
+        grid = build_cdf_value_grid(self.DISCRETE_LOWER, self.DISCRETE_UPPER, None, self.DISCRETE_N)
+        cdfs = [
+            _normal_cdf_on_grid(grid, mean=5.0, sd=3.0),
+            _normal_cdf_on_grid(grid, mean=9.0, sd=3.5),
+        ]
+        pooled = log_pool_cdfs(cdfs, question)
+        # Output length follows the inputs (17), NOT PCHIP_CDF_POINTS (201).
+        assert len(pooled) == self.DISCRETE_N
+        _assert_valid_cdf(
+            pooled,
+            question,
+            n_points=self.DISCRETE_N,
+            min_step=self._discrete_min_step(self.DISCRETE_N),
+            expected_grid=grid,
+        )
+
+    def test_vincentize_at_discrete_length(self):
+        question = self._discrete_question()
+        grid = build_cdf_value_grid(self.DISCRETE_LOWER, self.DISCRETE_UPPER, None, self.DISCRETE_N)
+        cdfs = [
+            _normal_cdf_on_grid(grid, mean=4.0, sd=2.5),
+            _normal_cdf_on_grid(grid, mean=10.0, sd=3.0),
+        ]
+        for method in ("mean", "median"):
+            pooled = vincentize_cdfs(cdfs, question, method=method)
+            assert len(pooled) == self.DISCRETE_N
+            _assert_valid_cdf(
+                pooled,
+                question,
+                n_points=self.DISCRETE_N,
+                min_step=self._discrete_min_step(self.DISCRETE_N),
+                expected_grid=grid,
+            )
+
+    def test_apply_tail_floor_at_discrete_length(self):
+        # apply_tail_floor already derives its grid from len(cdf_values); the fix additionally
+        # scales the min-step to the discrete grid. Output length == input length, min-step honored.
+        question = self._discrete_question()
+        grid = build_cdf_value_grid(self.DISCRETE_LOWER, self.DISCRETE_UPPER, None, self.DISCRETE_N)
+        raw = norm.cdf(grid, loc=6.0, scale=3.0)
+        out = np.asarray(apply_tail_floor(list(raw), question, floor_eps=1e-3), dtype=float)
+        assert out.size == self.DISCRETE_N
+        assert np.all(np.diff(out) >= self._discrete_min_step(self.DISCRETE_N) - 1e-10)
+
+    def test_pooling_at_mid_range_length_101(self):
+        # A coarser-than-201 grid that is not the real discrete size, to guard the general path.
+        n = 101
+        question = make_mock_numeric_question(lower_bound=0.0, upper_bound=50.0, cdf_size=n)
+        grid = np.linspace(0.0, 50.0, n)
+        cdfs = [
+            _normal_cdf_on_grid(grid, mean=20.0, sd=6.0),
+            _normal_cdf_on_grid(grid, mean=30.0, sd=7.0),
+            _normal_cdf_on_grid(grid, mean=25.0, sd=5.0),
+        ]
+        pooled_log = log_pool_cdfs(cdfs, question)
+        pooled_vin = vincentize_cdfs(cdfs, question, method="mean")
+        assert len(pooled_log) == n
+        assert len(pooled_vin) == n
+        min_step = self._discrete_min_step(n)
+        _assert_valid_cdf(pooled_log, question, n_points=n, min_step=min_step, expected_grid=grid)
+        _assert_valid_cdf(pooled_vin, question, n_points=n, min_step=min_step, expected_grid=grid)
+
+    def test_mixed_length_inputs_raise_valueerror(self):
+        # Inputs of differing lengths mean the caller mixed CDFs from different questions — a
+        # genuine bug. Both pooling functions must raise a clear ValueError, not silently pick.
+        question = make_mock_numeric_question(lower_bound=0.0, upper_bound=100.0)
+        grid_a = np.linspace(0.0, 100.0, PCHIP_CDF_POINTS)
+        grid_b = np.linspace(0.0, 100.0, 101)
+        mixed = [
+            _normal_cdf_on_grid(grid_a, mean=40.0, sd=10.0),
+            _normal_cdf_on_grid(grid_b, mean=60.0, sd=10.0),
+        ]
+        with pytest.raises(ValueError, match="same length|share one length|length"):
+            log_pool_cdfs(mixed, question)
+        with pytest.raises(ValueError, match="same length|share one length|length"):
+            vincentize_cdfs(mixed, question, method="mean")
