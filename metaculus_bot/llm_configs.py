@@ -77,25 +77,35 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         reasoning={"effort": "xhigh"},
         **_FORECASTER_CONFIG,
     ),
+    # 2026-07-15: Fable-5 joins the forecaster roster (roster change = new config
+    # era for residual analysis). Previously stacker-only — but stacking is
+    # disabled in prod (all workflow yamls pin *_STACKING_ENABLED=false), so our
+    # top Anthropic tier was idle in every prod run. Same effort=xhigh +
+    # verbosity=high config as its stacker slot; "max" held back for latency
+    # (FORECASTER_SOFT_DEADLINE=600s). Cost: $10/$50 per M in/out — 2x opus-4.8;
+    # donated-key eligible (Anthropic provider).
+    build_llm_with_openrouter_fallback(
+        model="openrouter/anthropic/claude-fable-5",
+        reasoning={"effort": "xhigh"},
+        extra_body={"verbosity": "high"},
+        **_FORECASTER_CONFIG,
+    ),
     # 2026-07-15: enabled:True (provider-default adaptive thinking) -> explicit
     # effort=xhigh. Anthropic also exposes "max" one tier above xhigh — held back
-    # deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; see the opus-4.6
-    # adaptive-thinking stall note below).
+    # deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; unbounded adaptive
+    # thinking caused silent 600s soft-deadline stalls on the retired opus-4.6
+    # slot, e.g. Q14333 on 2026-05-07).
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
         reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
     ),
-    build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.6",
-        # Explicit max_tokens forces budget-based thinking. Without it, Opus 4.6 defaults to
-        # "adaptive thinking" (OpenRouter 4.6 migration guide) which is unbounded and has
-        # caused silent 600s soft-deadline stalls on hard questions (e.g. Q14333 on 2026-05-07).
-        reasoning={"max_tokens": 32_000},
-        extra_body={"verbosity": "high"},
-        **_FORECASTER_CONFIG,
-    ),
+    # 2026-07-15: opus-4.6 retired from the roster — Fable-5 takes the second
+    # Anthropic slot, keeping ensemble size at 6 and provider balance at
+    # 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI. (4.6 was the older Anthropic
+    # tier; its adaptive-thinking stall workaround — reasoning={"max_tokens":
+    # 32_000} instead of effort-based — goes with it. See git history.)
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3.1-pro-preview",
         **_FORECASTER_CONFIG,
