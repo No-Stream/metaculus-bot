@@ -144,6 +144,23 @@ either). Instead:
   by rung telemetry); the F5 block-lift fallback was absorbed into rung 1
   of the numeric ladder.
 
+### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
+
+Found during the coherence-study cleanup. A numeric STRUCTURED FORECAST block whose
+`declared_percentiles` keys are percent-form ("2.5", "5", …, "97.5") instead of fraction-form
+(0.025, …) is dropped by BOTH recovery rungs in `performance_analysis/parsing.py`: the strict
+`parse_structured_block` rejects the schema, and the tolerant salvage rung (added in `f530968`)
+drops the keys on its own `0 < pct < 1` guard. Historically harmless — the prose
+"Percentile 2.5: X" lines rescued these (that's exactly how qid 43684 / grok-4.3 survived) —
+but post-2026-07 prompts are block-last-with-NO-prose-value-lines, so a future percent-form
+block has no fallback and that model's percentiles vanish silently from residual analysis.
+Fix is small and localized: teach the tolerant rung to detect an exact canonical-set×100 key
+match and rescale deterministically — the validator + canonical sets already exist
+(`_validate_percentile_labels`, `_CANONICAL_PERCENT_LABEL_SETS`, parsing.py:600-650, shipped
+in the same commit); the rung just needs to route through them instead of hard-dropping.
+Watch signal until fixed: a model whose per-question percentile coverage drops to zero in a
+post-flip pull while its `EXTRACTION_RUNG` prod telemetry stays healthy.
+
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
 `make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
