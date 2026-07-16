@@ -31,6 +31,7 @@ class Finding(BaseModel):
     date: str = ""
     retrieved_how: str = ""
     topic: str = "general"
+    discrepancy: bool = False
 
 
 class GhostForecast(BaseModel):

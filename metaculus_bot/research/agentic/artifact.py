@@ -43,11 +43,31 @@ def render_findings(findings: list[Finding], pending_leads: list[str]) -> str:
     if not findings and not pending_leads:
         return ""
 
+    corrections = [finding for finding in findings if finding.discrepancy]
     grouped: dict[str, list[Finding]] = defaultdict(list)
     for finding in findings:
+        if finding.discrepancy:
+            continue
         grouped[finding.topic].append(finding)
 
     lines = ["## Agentic Research Findings"]
+    if corrections:
+        lines.append("")
+        lines.append("### ⚠ Corrections to the briefing")
+        lines.append(
+            "The verified findings below contradict the research briefing and supersede the corresponding briefing content."
+        )
+        lines.append("")
+        for finding in corrections:
+            lines.append(f"Claim: {finding.claim}")
+            lines.append(f"Source: {finding.source_url}")
+            lines.append("Quote:")
+            lines.extend(_quote_lines(finding.quote))
+            lines.append(f"Date: {finding.date}")
+            lines.append(f"Retrieved how: {finding.retrieved_how}")
+            lines.append("")
+        lines.pop()
+
     for topic in sorted(grouped):
         lines.append("")
         lines.append(f"### {topic}")

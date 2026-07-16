@@ -44,6 +44,70 @@ def test_render_findings_is_deterministic_and_topic_sorted() -> None:
     assert "Pending leads:\n- Check the appendix PDF." in rendered
 
 
+def test_render_findings_hoists_discrepancies_to_corrections_block_first() -> None:
+    findings = [
+        Finding(
+            claim="The briefing says the rate is 7%, but the source says 5.2%.",
+            source_url="https://example.com/correction",
+            quote="The unemployment rate was 5.2%.",
+            date="2026-07-10",
+            retrieved_how="fetch",
+            topic="labor",
+            discrepancy=True,
+        ),
+        Finding(
+            claim="The ministry published a bulletin.",
+            source_url="https://example.com/bulletin",
+            quote="Bulletin issued July 10.",
+            date="2026-07-10",
+            retrieved_how="fetch",
+            topic="labor",
+        ),
+    ]
+
+    rendered = render_findings(findings, [])
+
+    assert "### ⚠ Corrections to the briefing" in rendered
+    assert rendered.index("### ⚠ Corrections to the briefing") < rendered.index("### labor")
+    assert (
+        "The verified findings below contradict the research briefing and supersede the corresponding briefing content."
+        in rendered
+    )
+    assert "The briefing says the rate is 7%, but the source says 5.2%." in rendered
+
+
+def test_render_findings_without_discrepancies_has_no_corrections_block() -> None:
+    rendered = render_findings(
+        [
+            Finding(
+                claim="The ministry published a bulletin.",
+                source_url="https://example.com/bulletin",
+                quote="Bulletin issued July 10.",
+                date="2026-07-10",
+                retrieved_how="fetch",
+                topic="labor",
+            )
+        ],
+        [],
+    )
+
+    assert "### ⚠ Corrections to the briefing" not in rendered
+    assert rendered.startswith("## Agentic Research Findings\n\n### labor")
+
+
+def test_detachment_lint_flags_discrepancy_claims_too() -> None:
+    violations = detachment_lint(
+        Finding(
+            claim="The briefing likely overstates the rate.",
+            source_url="https://example.com/correction",
+            quote="The rate was 5.2%.",
+            discrepancy=True,
+        )
+    )
+
+    assert "claim contains banned register 'likely'" in violations
+
+
 def test_detachment_lint_flags_claim_and_topic_only() -> None:
     finding = Finding(
         claim="This likely resolves in 2026.",

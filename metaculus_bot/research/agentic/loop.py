@@ -84,6 +84,7 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
                         "date": {"type": "string"},
                         "retrieved_how": {"type": "string"},
                         "topic": {"type": "string"},
+                        "discrepancy": {"type": "boolean"},
                     },
                     "required": ["claim", "source_url", "quote"],
                     "additionalProperties": True,
