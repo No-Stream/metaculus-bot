@@ -28,6 +28,49 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 
 ## Near-term (worth exploring soon)
 
+### Agentic gap-fill v2: plan agreed, implementation starting (added 2026-07-16)
+
+Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 2, self-contained —
+that doc is the source of truth; this entry is a pointer). Summary: a bounded agentic tool loop
+becomes the second-pass research stage — a driver LLM (dev on gpt-5.6-luna, then vibe-eval
+luna / terra / sol-low / sonnet-5.0) is briefed with the actual forecaster prompt template,
+privately dry-runs the forecast to find fill/verify targets, then iterates over four tools:
+`search_news` (existing AskNews rate-limit machinery), `search_web` (Exa direct on the
+operator's new key — `~/.keys/exa_key` locally, GHA secret `exa_key`), `fetch`
+(auto-escalating ladder plain → headless Chromium → Gemini url_context), and `read_document`
+(Gemini flash url_context). Output is a detached, citation-only findings artifact appended to
+the bundle; a ghost forecast is logged for telemetry only (never published). The loop is DIY
+litellm-direct, no framework — append-only message array for prompt-cache discipline is the
+reason. Codex agents implement; Fable orchestrates and writes the driver prompt + tool
+descriptions with operator review.
+
+**Rollout: BOTH v1 and v2 gap-fill run in prod during an overlap window** — two independent
+flags (`GAP_FILL_ENABLED`, `GAP_FILL_V2_ENABLED`), both `'true'`, distinct research-section
+headers, artifact diffs + resolution scoring harvested from the both-on era. **Turning v1 OFF
+afterwards is a deliberate pending step the operator must remember** ("i just have to remember
+to turn it off") — nothing does it automatically.
+
+Evidence base (details + citations in the plan doc §7): Metaculus Fall 2025 bot survey —
+research breadth correlates with accuracy at r=0.42; FutureSearch sits #1 with agentic
+research at ~$1/question; Bridgewater's ablation points the same direction; and date-filtered
+live search leaks resolution info on 41–55% of resolved questions (prompt-side "ignore
+post-cutoff knowledge" fails), so **`make backtest_*` is uninterpretable for research-stage
+changes** — eval is test_bot QA then an early prod flip, not backtests.
+
+### AskNews DeepNews integration — two options (added 2026-07-16, LOW priority)
+
+DeepNews is AskNews's agentic iterative research product (AskNews KG + Google/Wiki/X/Reddit,
+OpenAI-SDK-compatible endpoint). Our current integration only calls the basic HOT+HISTORICAL
+news endpoints. Two options, relative to the gap-fill v2 driver above:
+
+- **(a)** expose DeepNews as an optional heavy tool `search_news_deep(query, max_depth)` the
+  v2 driver can escalate to when basic `search_news` comes up thin;
+- **(b)** upgrade the basic `search_news` backend to DeepNews with a depth param.
+
+**Blocked on: operator checking DeepNews limits/pricing.** It's a separate quota pool from the
+OpenRouter donated key, possibly subsidized for tournament participants — if cheap/free there's
+a solid case for (a).
+
 ### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
 
 The 2026-06-28 research-quality audit found **zero positive evidence** that Gemini's `url_context`
@@ -106,6 +149,10 @@ Follow-ups:
    (Gemini `url_context` or OpenAI native-search URL-read).
    **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
    (added 2026-06-28) — no point building on url_context until we know it fires.
+   *Note 2026-07-16:* the gap-fill v2 fetch ladder (plain → headless Chromium → Gemini
+   url_context; see the agentic gap-fill v2 entry above) gives the driver this capability
+   inside the loop — the js_wall slice may get covered agentically before a dedicated
+   Tier-2 resolution-source pass is built. Re-assess after the v2 overlap window.
 4. **LOW — minor follow-up from review, explicitly deferred:** module split of
    `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
 
@@ -315,6 +362,12 @@ Today's status: code falls back automatically via `FallbackOpenRouterLlm` (added
 Priority: HIGH — it's free money to reclaim, and the same guardrail may bite us when the next OpenAI/Anthropic/Google migration comes up.
 
 ### Second-pass web search + scrape pipeline
+
+> **SUPERSEDED 2026-07-16** by the agentic gap-fill v2 plan
+> (`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`; near-term entry above). The three
+> use cases below are covered by the v2 tool loop. Firecrawl/Olostep were rejected in favor of
+> a DIY fetch ladder (plain → headless Chromium → Gemini url_context). Kept for historical
+> context.
 
 Our first-pass research (AskNews API dump, Grok native search) is a black box — we can't
 control what gets fetched, can't parse PDFs or JS-heavy pages, and can't follow up on gaps.
@@ -940,6 +993,11 @@ prompt already tells forecasters spiky tricks don't pay).
 ## Longer-term (significant R&D)
 
 ### Agentic deep research (ReAct loop)
+
+> **In progress as of 2026-07-16**: the gap-fill v2 plan (near-term entry above;
+> `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) is exactly this — a bounded
+> tool-loop second pass. The cost blocker below is resolved by budget caps (~$0.50/q target)
+> and encouraged early-stop; selective activation happens via the template dry-run.
 
 Move from one-shot research to an iterative research agent that can: execute search queries,
 evaluate results, identify gaps, execute follow-up queries, run code for analysis, and
