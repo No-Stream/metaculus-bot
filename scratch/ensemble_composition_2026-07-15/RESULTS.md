@@ -1,5 +1,21 @@
 # Retrospective ensemble-composition screening — 2026-07-15
 
+> **CORRECTION (2026-07-15, post-publication debugging):** this report originally
+> claimed gemini-3.1-pro-preview "missed 5 of 45 summer questions to soft-deadline
+> drops." GHA run-log verification of all 5 (qids 44136, 43747, 43746, 43656, 43652)
+> shows only **1** was a real soft-deadline drop (44136, 2026-06-19). The other 4 were
+> **dataset-recovery artifacts**: gemini emitted block-only rationales in that era
+> (no prose value lines), and its blocks carried retired tier-2 fields
+> (`mixture_components`/`tails`) or `concentration: 0.0`, which the strict
+> `parse_structured_block` schemas reject wholesale — so the collector recovered
+> nothing for gemini despite it forecasting and publishing on all 4. Gemini's true
+> summer miss rate is 1/45 (2.2%), and its member stats below are computed on a
+> needlessly reduced n=40 subset. A tolerant raw-JSON salvage rung was added to
+> `performance_analysis/parsing.py` the same day; a dataset rebuild would recover
+> 43746 + 43656 fully (43652/43747 declared only 3 percentiles in the retired
+> mixture-era format and would still fail the ≥5-distinct-percentile rule).
+> Claims marked ~~struck~~ below are superseded by this correction.
+
 **Question:** using per-forecaster predictions recovered from the bot's own published
 Metaculus comments on resolved questions, would the published ensemble aggregate have
 scored better or worse under alternative compositions (leave-one-family-out, drop-grok,
@@ -209,9 +225,10 @@ noise (n=45, and gpt-5.4 was the weaker of the two openai slots there).
 | **pooled** | 297 | **−2.16 [−3.67, −0.58]** | |
 
 Helping in every era with meaningful n. In summer, gemini-3.1-pro-preview is the top
-individual member (+51.6 mean log over 40 questions; it missed 5 questions to
+individual member (+51.6 mean log over 40 questions; ~~it missed 5 questions to
 soft-deadline drops — that unreliability is the honest knock on it, not forecast
-quality).
+quality~~ — see the CORRECTION header: 4 of those 5 were recovery-parse artifacts,
+only 1 was a real drop).
 
 ### grok
 
@@ -264,8 +281,10 @@ bigger surgery than other families' LOO.
 1. Keep the openai flagship slot(s); it has been the most consistently load-bearing
    family across three tournaments.
 2. Keep gemini-3.1-pro on forecast quality — the deadweight suspicion is not supported;
-   it is currently the best individual scorer. Its real cost is reliability (missed 5
-   of 45 summer questions), which is an ops issue, not an ensemble-math one.
+   it is currently the best individual scorer. ~~Its real cost is reliability (missed 5
+   of 45 summer questions), which is an ops issue, not an ensemble-math one.~~ See the
+   CORRECTION header: the true summer miss rate is 1/45; the reliability knock mostly
+   belonged to the recovery parser, not the model.
 3. Grok is where the evidence points if a slot must be freed: worst individual member
    in every era, no detectable contribution to (or drag on) the median aggregate.
    Swapping it for a candidate with better solo scores has upside and, on these data,
@@ -293,6 +312,7 @@ bigger surgery than other families' LOO.
   discrete native-grid resample) — cancels in paired deltas, but absolute per-era log
   levels are not comparable to Metaculus's own scores in early eras.
 - Small eras (spring_6m n=13, fall_5m/spring_trans n≈36) are directional at best.
-- Soft-deadline drops mean LOO for family m runs only on questions where m actually
-  forecast; families with many drops (gemini in summer) are screened on a slightly
+- Member absences (real drops OR recovery-parse losses — see the CORRECTION header)
+  mean LOO for family m runs only on questions where m has recovered values; families
+  with reduced coverage (gemini in summer, n=40) are screened on a slightly
   easier/different question mix than always-present families.
