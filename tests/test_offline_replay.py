@@ -144,8 +144,12 @@ class TestBinaryConfigs:
         record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.2, 0.4, 0.9], p_maths=[])
         configs = build_binary_configs()
         median = float(np.median(record.p_models))
-        # Every shrinkage config must fall back to the median p_model when no p_math exists.
+        # Every shrinkage/clamp config must fall back to the median p_model when no p_math
+        # exists. geo_odds is excluded: it is a distinct (geometric-mean-of-odds) pool, not a
+        # median-preserving arm, so it legitimately differs from the median even here.
         for name, config in configs.items():
+            if name == "geo_odds":
+                continue
             assert config(record) == pytest.approx(median), name
 
     def test_shrinkage_pulls_toward_p_math(self, binary_question):
@@ -175,6 +179,41 @@ class TestBinaryConfigs:
         confident = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.9], p_maths=[])
         unsure = BinaryRecord(qid=2, question=binary_question, outcome=True, p_models=[0.5], p_maths=[])
         assert score_binary(confident, 0.9)[0] > score_binary(unsure, 0.5)[0]
+
+
+class TestBinaryGeoOdds:
+    """Geometric-mean-of-odds base-combine: sigmoid(mean(logit(p))), clamped to [0.02, 0.98]."""
+
+    def test_geo_odds_registered(self, binary_question):
+        assert "geo_odds" in build_binary_configs()
+
+    def test_geo_odds_equals_value_when_all_agree(self, binary_question):
+        # log_pool of identical probs is that prob — identical to the median when models agree.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.7, 0.7, 0.7], p_maths=[])
+        out = build_binary_configs()["geo_odds"](record)
+        assert out == pytest.approx(0.7)
+        assert out == pytest.approx(float(np.median(record.p_models)))
+
+    def test_geo_odds_sharpens_relative_to_median_on_disagreement(self, binary_question):
+        # p_models skewed high: logit-mean pool is MORE confident than the (invariant) median.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.6, 0.7, 0.9], p_maths=[])
+        out = build_binary_configs()["geo_odds"](record)
+        median = float(np.median(record.p_models))
+        assert out > median  # sharpened toward YES
+        assert out == pytest.approx(0.759, abs=1e-3)
+
+    def test_geo_odds_clamped_to_binary_bounds(self, binary_question):
+        # Extreme inputs are pulled back to the [0.02, 0.98] incumbent bounds.
+        high = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.999, 0.999], p_maths=[])
+        low = BinaryRecord(qid=2, question=binary_question, outcome=False, p_models=[0.0001, 0.0001], p_maths=[])
+        configs = build_binary_configs()
+        assert configs["geo_odds"](high) == pytest.approx(0.98)
+        assert configs["geo_odds"](low) == pytest.approx(0.02)
+
+    def test_geo_odds_symmetric_disagreement_stays_at_half(self, binary_question):
+        # Symmetric-in-logit disagreement leaves both median and geo-odds at 0.5.
+        record = BinaryRecord(qid=1, question=binary_question, outcome=True, p_models=[0.2, 0.8], p_maths=[])
+        assert build_binary_configs()["geo_odds"](record) == pytest.approx(0.5)
 
 
 class TestBinaryClampConfigs:

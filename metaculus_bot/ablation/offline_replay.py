@@ -65,8 +65,10 @@ from metaculus_bot.ablation.cli import _build_question_shim_from_manifest_entry,
 from metaculus_bot.ablation.forecasters import deserialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.backtest.scoring import GroundTruth, _canonicalize_mc_option, numeric_crps
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.prob_math_utils import clamp_prob, logit
+from metaculus_bot.probabilistic_tools.aggregation import log_pool
 from metaculus_bot.probabilistic_tools.binary_pooling import (
     adaptive_weight,
     overconfidence_divergence,
@@ -499,6 +501,19 @@ def _binary_median_p_math(record: BinaryRecord) -> float | None:
     return float(np.median(record.p_maths))
 
 
+def _binary_geo_odds(record: BinaryRecord) -> float:
+    """Geometric-mean-of-odds pool of the per-forecaster probs, clamped to [0.02, 0.98].
+
+    ``log_pool`` = ``sigmoid(mean(logit(p)))``, the normalized geometric-mean-of-odds for
+    binary. MEDIAN is invariant to the logit transform, so this is the only mean-type pool that
+    can differ from ``median_baseline``: it sharpens toward the tails when forecasters agree and
+    stays near the median when they don't. The clamp matches the incumbent's [0.02, 0.98] bounds
+    for a fair head-to-head — a no-op on the already-clamped cache, kept for parity with the live
+    per-model clamp. ``logit`` self-clamps at 1e-4, so log_pool is safe against 0/1 inputs.
+    """
+    return min(max(log_pool(record.p_models), BINARY_PROB_MIN), BINARY_PROB_MAX)
+
+
 def _make_binary_shrinkage_config(w: float) -> BinaryConfig:
     def config(record: BinaryRecord) -> float:
         p_model = _binary_median_p_model(record)
@@ -601,11 +616,17 @@ def build_binary_configs(weights_by_qid_model: WeightLookup | None = None) -> di
     whether a TIGHTER ceiling/floor (after-median primary, per-forecaster-before-median
     secondary) bounds the saturation tail enough to win on log score.
 
+    ``geo_odds`` is the geometric-mean-of-odds pool (``sigmoid(mean(logit(p)))``, clamped to
+    [0.02, 0.98]). MEDIAN is invariant to the logit transform, so this is the only mean-type
+    pool that can differ from ``median_baseline`` — it sharpens toward the tails when the
+    forecasters agree, tests whether that sharpening helps or hurts the ensemble log score.
+
     When ``weights_by_qid_model`` is supplied, a ``coherence_softweight`` arm is added:
     the weighted median of the per-forecaster probs (equal weights reproduce
     ``median_baseline``). Weights are pre-computed by the caller under era-blocking.
     """
     configs: dict[str, BinaryConfig] = {MEDIAN_BASELINE: _binary_median_p_model}
+    configs["geo_odds"] = _binary_geo_odds
     for w in BINARY_SHRINKAGE_WEIGHTS:
         if w == 0.0:
             continue  # w=0 is identical to median_baseline; skip the redundant arm
