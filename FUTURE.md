@@ -127,15 +127,48 @@ monolithic-file threshold — split is a separate refactor if it bothers anyone.
 
 Two independent findings (papers-skeptic + eval-repos) plus a codebase check converge here.
 
-**(a) Statistical rigor — parent (paired) is a must.** Our backtest sizes (4/12/32/100) are far
-too small to support the deltas we read off them, and we report pooled means without CIs.
-Add **paired per-question** comparison (the same questions across arms) with uncertainty.
-Operator preference on method: a **proper probabilistic model + MCMC as the primary tool**
-(the calibration audit's 2-D-grid / conjugate approach is a working template), a **Bayesian
-bootstrap as a lighter-weight backstop**, and **naive percentile bootstrap flagged as
-inappropriate** for the heavily-skewed score distributions (CRPS, log-loss) — bootstrap is not
-one-size-fits-all. `performance_analysis` already era-buckets + paired-bootstraps; the gap is in
-`backtest.py` itself.
+**(a) Statistical rigor — AUDITED 2026-07-16, now a scoped consolidation program.** A full
+methodology audit (per-surface scorecard, same-day) confirmed the split: the recent scratch
+analyses are strong-to-gold-standard (coherence phase2: two-way FE + cluster-robust SEs by qid;
+`ensemble_screen`: paired-vs-replica deltas + era-bucketing; calibration audit: full Bayesian
+posteriors + power sim), but the **standing, always-on pipeline is the thinnest machinery in
+the repo** — and it is weak in exactly the two ways the house rubric names as mandatory
+(pairing, era-bucketing). **Operator directive: promote the scratch machinery into the standing
+pipeline — no point building elegant scratch stats and relying on lower-quality code for the
+repeated analyses.** Ranked gaps from the audit:
+
+1. **`backtest.py` never pairs** (highest leverage): it runs multiple bots on identical
+   questions, persists per-qid scores (`backtest/analysis.py:205`), then reports pooled means +
+   population SD with zero inferential content (`analysis.py:43-58,104-118`). Fix: join arms on
+   qid, per-qid deltas, and **import the inference primitives that already exist in-repo** —
+   `ablation/scoring.py` `bootstrap_mean_ci`/`bootstrap_median_ci`/`sign_test`/
+   `wilcoxon_signed_rank`.
+2. **`performance_analysis/analysis.py` emits pooled, CI-free, era-blind calibration — the
+   actively-misleading item**: it still produces exactly the pooled numbers that flipped three
+   times (pooled slope ~1 masking opposite-signed eras; base-rate-confounded bias_pp). Fix:
+   Beta-Binomial CIs on every bucket (`calibration_audit/binary_calibration.py:53-56` is a
+   4-line drop-in) + a first-class era key so the standing report *cannot* emit pooled-only
+   calibration. This is where the calibration-monitor promotion (see the calibration entry
+   above) lands.
+3. **Per-model comparisons unpaired** in both standing surfaces — same fix as (1), free power.
+4. **Percentile bootstrap on heavy-tailed log-score deltas under-covers** — ablation Path A
+   already hedges (median bootstrap + NoSat panels); `ensemble_screen` doesn't — add a
+   median/robust hedge (or Bayesian bootstrap, per operator preference; naive percentile
+   bootstrap is NOT one-size-fits-all on skewed CRPS/log-loss).
+5. **No clustering/effective-N outside coherence phase2** — correlated question families make
+   CIs too narrow everywhere else; mirror phase2's `cluster_bootstrap_mean` where a cheap
+   cluster key exists.
+6. **No multiplicity correction** in ablation (~15 comparisons) or ensemble_screen (~48) — BH
+   q-values or partial-pooling shrinkage (the audit's normal-normal template). Low priority.
+
+**Explicitly NOT broken (don't make work):** the scoring/metric layer
+(`backtest/scoring.py` CRPS/log-score implementations — correct, leave alone), `audit.py`
+(appropriately non-inferential), ablation Path B's fold-std (self-labeled stability
+diagnostic), and plain means on large-n bounded proportions. The problem is never "a mean was
+used" — it's "a mean was used as the *comparison* with no pairing, CI, or era split."
+Reusable-machinery map: inference primitives `ablation/scoring.py`; era-bucketing template
+`ensemble_screen.py:109-140`; Bayesian CI drop-in `calibration_audit/binary_calibration.py:53-56`;
+cluster-robust template `coherence_2026-07-15/phase2_lib.py:176-345`.
 
 **(b) Leak-aware replay — the plumbing already exists, the archive quality is the gap.** Verified
 (2026-07-16): our default `backtest_{smoke,small,medium,large}` targets **re-run live research
@@ -213,24 +246,46 @@ building against the Metaculus community prediction: these are bot-only tourname
 account). Note the subset is small (~8% × question stream), so this diagnostic accumulates
 signal slowly — set expectations accordingly.
 
-### JS-divergence diversity lens on the ensemble-screening benchmark (added 2026-07-16, medium)
+### ~~JS-divergence diversity lens on ensemble screening~~ — BUILT 2026-07-16, verdict: NOT a selection signal (paper's heuristic INVERTS under median)
 
-The "Diversity is the Strength of the AI Crowd" paper (arXiv 2606.29661) argues solo accuracy is
-near-useless for roster decisions when models correlate — decorrelation is what matters (their
-Grok was least-replaceable despite ranking 3rd solo, mirroring our "grok deadweight-but-harmless"
-memory). Verified (2026-07-16) we already have **half** of this: `scratch/ensemble_composition_2026-07-15/ensemble_screen.py`
-ranks by **realized marginal contribution** (leave-one-family-out + leave-one-question-out,
-era-bucketed, 4000-rep bootstrap CIs) — already past the "solo Brier is the wrong axis"
-critique, arguably more rigorous than the paper's proxy. The **gap** is a distributional-diversity
-metric: nothing measures **JS divergence between members' full predictive distributions**. (The
-older `ensemble_analysis/` tool has only `1−mean|Pearson|` on collapsed point predictions —
-misses tail disagreement — and is stale/degenerate: its checked-in artifact is 1 question × 3
-models, all-NaN.) `ensemble_screen.py` already builds per-member 201-pt PCHIP CDFs, so JS
-divergence between member CDFs/PMFs slots on top of the existing recovery pipeline. **Binding
-caveat:** current slots (grok-4.5, gpt-5.6-sol, fable-5) have zero resolved questions, so any
-divergence ranking screens predecessor lineages, not today's exact models — informative for
-screening, not for optimizing current slots. Medium priority (dropped from higher on cost — the
-ensemble is already very valuable and no subset beats the full roster).
+Background: the "Diversity is the Strength of the AI Crowd" paper (arXiv 2606.29661) argues
+decorrelation matters more than solo accuracy for roster decisions (their Grok was
+least-replaceable despite ranking 3rd solo). We already had the marginal-contribution half
+(`ensemble_screen.py`: LOO + leave-one-question-out, era-bucketed, bootstrap CIs); the gap was
+a distributional-diversity metric. Prototyped same day:
+`scratch/js_divergence_2026-07-16/js_divergence.py` (imports ensemble_screen's loaders /
+era-bucketing / `member_cdf` wholesale; JS in bits over Bernoulli / option-simplex / 202-bin
+PMFs incl. out-of-bounds tail mass; results in `js_results.json`).
+
+**Findings:**
+
+- **The metric is internally valid** — it measures real error-decorrelation: Spearman(pairwise
+  JS, pairwise per-question score-correlation) is negative and significant wherever n is real
+  (pooled −0.67, p≈1e-9, n=65 pairs). High-JS pairs genuinely make independent errors, and JS
+  is not redundant with solo score.
+- **But under our MEDIAN aggregation, decorrelation is INVERSELY related to marginal
+  contribution** — Spearman(decorr, removal-drop) = **+0.83** in the only era with enough
+  families to rank (fall_6m): the most-decorrelated members (kimi, grok) are the *least*
+  load-bearing; the consensus-hugging accurate models (gpt-5, o3, anthropic) carry the
+  ensemble. **Opposite of the paper's operational conclusion.**
+- **Grok puzzle reconciled mechanistically:** our grok has exactly the paper's profile (worst
+  solo, most decorrelated) but its independence is *incompetent* independence — off in a
+  different direction, not right-when-others-wrong — and MEDIAN discards outliers rather than
+  harvesting them (the paper's combiner was learned, not median). The "keep the decorrelated
+  underdog" heuristic is an artifact of their aggregator; importing it under median would
+  protect exactly the deadweight slot the marginal benchmark correctly flags as replaceable.
+- **One genuinely additive use — redundancy detection:** the pairwise JS matrix cleanly
+  surfaces near-clone slots the LOO benchmark only sees indirectly: spring
+  `opus-4.5|opus-4.6 = 0.017`, summer `gpt-5.4|gpt-5.5 = 0.018` bits. An "are we double-paying
+  for two clones" check when composing rosters.
+
+**Verdict: do NOT promote JS as a roster-selection signal; the marginal-contribution benchmark
+stays the decision instrument.** Keep the scratch code for two minor uses: (a) redundancy/
+near-clone detection on candidate rosters, (b) the error-complementarity Spearman as a validity
+sanity check. Caveats: screens predecessor lineages (current slots have zero resolved; fable
+absent entirely); the inversion is median-specific (a learned combiner or stacker could exploit
+decorrelation — relevant only if the stacker-revisit ever lands); family n is 3–6/era so only
+fall_6m has ranking resolution.
 
 ### Revisit the conditional stacker with the AIA supervisor evidence (added 2026-07-16, medium — larger item)
 
@@ -247,19 +302,44 @@ data to re-measure the real treatment effect). Larger item to revisit, not a nea
 (Operator note: the stacker is what originally motivated joining the tournament; empirically it
 just hasn't worked yet.)
 
-### Time-series anchor for the finance/econ numeric subset (added 2026-07-16, bottom-of-medium)
+### Time-series anchor for numeric questions — GATE PASSED 2026-07-16 (53% applicability, ~5x the bar): promote to a real build item
 
-For numeric questions that resolve on a fetchable series (CPI, index close, spread, jobless
-claims), fit a cheap probabilistic TS model (`statsforecast` AutoARIMA/ETS/Theta — light dep,
-no GPU) to the history our `financial_data` provider already pulls, and render a model-implied
-quantile block in the briefing — same shape as the prediction-market snapshot. **TS-as-anchor,
-not TS-as-answer** (pure extrapolation is blind to the news/policy/structural-break info our
-research surfaces; Metaculus numerics are full of exactly those). A principled version of the
-existing "status-quo / last-print anchor" finding — counters forecasters degrading a value
-research already nailed by layering speculative drift (q43647 / q43611 / q43591). Pattern from
-TimeCopilot (arch-repos): LLM proposes candidates, deterministic CV selects, must beat
-SeasonalNaive. **Gate first:** measure what fraction of our numeric questions map to a fetchable
-series — if <10%, skip. Do NOT take TimeCopilot as a dependency; only `statsforecast`.
+For numeric questions that resolve on a fetchable series, fit a cheap probabilistic TS model
+(`statsforecast` AutoARIMA/ETS/Theta — light dep, no GPU) and render a model-implied
+P10/P50/P90 quantile block in the briefing — same shape as the prediction-market snapshot.
+**TS-as-anchor, not TS-as-answer.** A principled version of the "status-quo / last-print
+anchor" finding. Do NOT take TimeCopilot as a dependency; only `statsforecast`.
+
+**Applicability gate RUN same-day (offline classification of all 231 numeric+discrete recovered
+questions; auditable per-question labels in `scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`):
+53.2% (123/231) map to a standard fetchable series** — fall 57%, spring 41%, summer 75% —
+vs the ~10% skip bar; even the strictest level-anchors-only reading is 27%. Class A is
+dominated by recurring templates (10Y yield, HY OAS, VIX, index/commodity returns, gasoline,
+unemployment, CPI, payrolls, approval/generic-ballot averages, TSA volume), so it's
+representative of forward mix. **Applicability is no longer the question; design is:**
+
+- **Strong-value core = the 63 level anchors** (macro prints, rates, spreads, poll averages,
+  TSA) — where a fitted quantile band directly disciplines the documented over-reasoning
+  failure. Spot-check of the three canonical cases: q43611/q43591 (poll averages) were off in
+  exactly the direction a live poll-average anchor corrects; q43647 (HY OAS) was
+  center-correct and would be sharpened. (n=3, anecdotal.)
+- **The 47 relative-return spread questions need the anchor fit on the SPREAD series**
+  (center≈0 + historical-vol band), not a naive level forecast — otherwise they add noise.
+  The 13 max-functional questions (VIX/commodity highs) need window logic on top of a level
+  model.
+- **Net-new vs `financial_data`:** the provider's curated allowlist misses HY OAS, gasoline,
+  Brent, **VIX**, poll averages, and TSA (4/5 spot-checked FRED series not in the allowlist;
+  all exist with decades of history) — and for series it does cover it emits a raw last-6-
+  observations table, not a fitted band. Historical "already-served" counts are era-confounded
+  (provider effectively off before summer: 0/73 fall, 1/32 spring, 14/18 summer).
+- **Class B later-add:** Mauna Loa CO2 + Norwegian EV-share are the most deterministically
+  fittable series in the corpus — held out of A only on ingestion; cheap to fold in once
+  statsforecast wiring exists.
+
+Was bottom-of-medium pending the gate; **with a 53% hit rate it merits promotion — solid
+medium, arguably higher** (operator to confirm). Validation note: prompt-visible research
+changes can't be measured by the leakage-exposed backtest — use the gap-fill v2 eval-ladder
+pattern (artifact QA + both-on overlap + era-bucketed residuals incl. calibration).
 
 ### Necessary-condition / scenario decomposition scaffold (added 2026-07-16, bottom-of-medium)
 
