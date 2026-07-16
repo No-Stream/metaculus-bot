@@ -26,11 +26,313 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 >    `analysis_stacking_historical_treatment.md`). First measurable signal in the project's
 >    history; needs the marker fix for definitive measurement.
 
+## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
+
+> Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting
+> literature (evaluation pitfalls, prompting, ensembling, calibration, research harnesses,
+> market-lifecycle) and the open-source forecasting-agent repos (Gnosis, MiroFlow,
+> predictionprophet, vox, TimeCopilot, ForecastBench, futuresim, Bench-to-the-Future),
+> plus two codebase verifications and a rigorous era-bucketed calibration audit. Entries
+> below are grouped by priority within this block; thread them into the topical sections
+> above if they survive discussion. Every "why it helps" from a repo is a mechanism argument
+> unless a paper number is cited. The killed items are logged at the bottom so they aren't
+> re-litigated.
+
+### Calibration is probably NOT a realistic improvement lever for us (added 2026-07-16, decision) — but promote the audit to a monitoring module
+
+Rigorous era-bucketed Bayesian calibration audit (2026-07-16; scripts in
+`scratch/calibration_audit_2026-07-16/`, data = `scratch/coherence_2026-07-15/perf_all_tagged.json`,
+694 records). **Conclusions:**
+
+- **The bot is not cleanly over- or under-confident — it flips by era.** Bayesian logistic
+  fit (2-D grid quadrature, no MCMC needed): fall-aib-2025 slope **1.70 [1.28, 2.20]**
+  (under-confident), spring-aib-2026 slope **0.83 [0.58, 1.10]** (over-confident), summer n=15
+  uninformative. The opposite-signed eras cancel to a ~calibrated-looking pooled slope
+  (1.17 [0.95, 1.40]) — this is exactly why past pooled calibration reads were contradictory.
+  Even *within* spring the early/late temporal split flips slope 0.64 → 1.25 (roster churn
+  inside one tournament).
+- **The "we get more NO right than YES right" pattern is a base-rate artifact, NOT a
+  directional miscalibration.** Tournament YES-rate is 24% (fall) / 33% (spring) / 60%
+  (summer n=15); a calibrated forecaster naturally "gets more NO questions right" because more
+  resolve NO. The decisive test (observed hit-rate vs expected-if-calibrated, per side,
+  Beta-Binomial CIs) is **consistent with calibration on both sides in every era**. Puzzle
+  resolved.
+- **The killed spring YES-overconfidence finding reproduces as spring-local** (intercept
+  −0.40 [−0.80, 0.00], P(a>0)=0.017; high-confidence YES bins under-resolve) **and is
+  untestable on the current post-flip roster** (n=15, intercept CI [−1.85, +1.40]). Fall shows
+  the opposite sign. Consistent with the scar tissue; nothing to fit.
+- **We are chronically data-starved for the miscalibrations a fitted layer would target.**
+  Bayesian power sim (type-I correctly ~0.05): detecting mild overconfidence (slope 0.85) has
+  power ~0.25 even at **N=400**; moderate (slope 0.80) reaches only ~0.49 at N=400; a
+  spring-like directional bias (intercept −0.40) reaches ~0.67 at N=400. A roster era yields
+  only ~150–210 resolved binaries before the roster churns (fall 210/96d, spring 167/92d,
+  summer 15 so far). So we can catch only *large* miscalibrations, never the subtle ones — and
+  any fit spans eras with opposite-signed calibration, i.e. a drift bomb by construction.
+
+**Decision (operator, 2026-07-16): calibration is not a realistic source of improvement given
+our budget.** Well-funded entrants can run multi-hundred-to-multi-thousand-question paid
+backtests to fit and validate a calibration layer; we cannot, and the power analysis says even
+that volume barely detects moderate effects. **Prefer SOTA forecasters over fitted
+calibration** — now the evidenced call, not just the instinct. Do NOT ship isotonic / Platt /
+directional-shrink layers (see the killed-calibration entries elsewhere in this file; the
+Beta-Bernoulli "calibrator" from arXiv 2605.27668 is a mini-forecaster on the wrong shift axis
+for our roster-drift trap, and its own tables show Platt/isotonic degrade OOD — cite it as
+anti-adoption evidence).
+
+**DO promote the audit to a standing monitoring module (free, high-insight, zero scar risk).**
+It is complementary to, not duplicative of, `performance_analysis/analysis.py`: the existing
+module gives per-tournament point-estimate calibration buckets, a single `no_bias_check`
+`bias_pp` scalar, and PIT coverage. The audit adds (1) automatic multi-era comparison in one
+view, (2) Beta-Binomial credible intervals per bucket, (3) the slope/intercept logistic
+decomposition (separates confidence from directional bias — the `bias_pp` scalar conflates
+them), (4) the YES/NO base-rate-artifact test, (5) the power/data-adequacy sim, (6) partial
+pooling across eras. Build it to **reuse** the existing `_interpolate_pit` (has the log-grid
+fix) and bucket plumbing, layering the Bayesian/era/power machinery on top. Monitoring cadence:
+on each roster change, print era-bucketed slope/intercept credible intervals + reliability
+table + the base-rate-artifact check; **act only if a CI excludes the null AND reproduces
+across ≥2 eras** — expect "inconclusive" to be the honest default (that's correct, not a
+failure). This is the practical payoff and it's free (read-only `performance_analysis` pull).
+
+### ~~Geometric-mean-of-odds base-combine vs MEDIAN~~ — RUN 2026-07-16, DECISIVE NULL (keep MEDIAN)
+
+Background: verified 2026-07-16 that the prior aggregation rejection covered **arithmetic
+mean** and geometric pooling for **MC**/**numeric**, but never binary geometric-mean-of-odds
+as the scored base-combine (the `log_pool` fn existed but only printed a stacker-prompt display
+line). MEDIAN is logit-invariant, so only a mean-type pool can differ from it — so this was a
+genuinely open (if headwind-facing) experiment.
+
+**Run same day (offline replay, zero API): NULL everywhere.** A `geo_odds` arm
+(`sigmoid(mean(logit(p)))`, reusing `log_pool`, output clamped [0.02,0.98] for parity) was
+added to `ablation/offline_replay.py::build_binary_configs` (~:502/:624, +5 tests) and
+era-bucketed via the validated comment-recovery dataset (the ablation cache is single-era;
+driver in `scratch/geo_odds_2026-07-16/run_geo_odds.py`). Paired per-question deltas, 5000-rep
+bootstrap CIs, sign + Wilcoxon tests: **no era's CI excludes zero on either metric** — fall
+n=208 logΔ +0.32 [−1.34, +2.04]; spring n=149 +2.14 [−0.52, +5.34] (the only faintly
+suggestive cell, Wilcoxon p=0.16); summer n=12 uninformative; pooled +1.07 [−0.40, +2.68].
+Brier deltas tiny and *opposite-signed* to log-score (wash tell). The operators genuinely
+diverge (~95% of questions differ) — the divergence just doesn't reliably help. On the
+full-ensemble (n≥5) filter, fall FLIPS to −0.61 [−2.16, +0.83]: **confirms the documented
+"sharpening pools wash out on the diffuse 6-model ensemble" headwind** (the trio-win half was
+untestable — no confident-trio binary cohort exists). Cross-check on the harness's own
+spring-only cache: +0.66 [−9.33, +11.27], consistent.
+
+**Verdict: keep MEDIAN; geo-odds joins the settled dead paths** (with mean, stacking-as-default,
+coherence-weighting). Do not re-run absent a materially different ensemble regime (e.g. a
+confident small-N roster) or post-flip data showing a qualitatively different disagreement
+structure. The arm + tests stay in the harness for cheap future re-runs. Lint/typecheck/422
+tests green. Advisory: the +20 lines tipped `offline_replay.py` over the 1000-line
+monolithic-file threshold — split is a separate refactor if it bothers anyone.
+
+### Backtest statistical hardening + leak-aware replay (added 2026-07-16)
+
+Two independent findings (papers-skeptic + eval-repos) plus a codebase check converge here.
+
+**(a) Statistical rigor — parent (paired) is a must.** Our backtest sizes (4/12/32/100) are far
+too small to support the deltas we read off them, and we report pooled means without CIs.
+Add **paired per-question** comparison (the same questions across arms) with uncertainty.
+Operator preference on method: a **proper probabilistic model + MCMC as the primary tool**
+(the calibration audit's 2-D-grid / conjugate approach is a working template), a **Bayesian
+bootstrap as a lighter-weight backstop**, and **naive percentile bootstrap flagged as
+inappropriate** for the heavily-skewed score distributions (CRPS, log-loss) — bootstrap is not
+one-size-fits-all. `performance_analysis` already era-buckets + paired-bootstraps; the gap is in
+`backtest.py` itself.
+
+**(b) Leak-aware replay — the plumbing already exists, the archive quality is the gap.** Verified
+(2026-07-16): our default `backtest_{smoke,small,medium,large}` targets **re-run live research
+providers at replay time** (leakage-exposed — live search returns post-resolution info; a
+leakage *detector* drops contaminated questions but that's a filter, not a fix). A frozen-replay
+mode **already exists** (`--research-dir` flag → `make backtest_with_cache` → orchestrator
+short-circuits to cached research, skips providers). Code distance to leak-free replay ≈ zero.
+**The real gap is archive quality:** of 921 records in `backtests/research_archive/latest/`, only
+**19 are genuine GHA-captured provider payloads**; **902 are reconstructed from published
+Metaculus comments** (trimmed/summarized, empty `providers_used`), and uncached qids silently
+fall back to live fetch. So: (1) flip the default backtest targets to `--research-dir`, and
+(2) grow genuine GHA-captured coverage from prod runs so replay isn't mostly comment
+reconstructions. This is the cheap, near-term version of RetroSearch (below).
+
+**Framing takeaway (papers-skeptic, arXiv 2506.00723 + the Vaticinus preprint):** the re-run
+backtest is an optimistic **upper bound**; the calibration-on-own-published-forecasts pipeline
+(genuinely elicited at forecast time, leak-free) is the trustworthy axis. Also: **stop treating
+"community Brier − our Brier" as edge-over-market** — it's provably an affine shift of Brier on
+a balanced panel (ρ=1.000 across 25 rounds) and encodes zero edge. If any comment/analysis
+marker frames "we beat the community by X Brier" that way, it's not an edge claim.
+
+### Forecaster-prompt audit — verified clean, no action on harmful-scaffold grounds (added 2026-07-16)
+
+The preregistered Schoenegger/Tetlock result (arXiv 2506.01578) found two prompt scaffolds
+reliably *hurt* forecast accuracy via miscalibrated over-decisiveness: an explicit step-by-step
+"Bayesian reasoning" (state prior → sequential likelihood updates → running posterior) and
+"propose-evaluate-select". Audit (2026-07-16) of `prompts.py`: **neither harmful form is
+present.** The closest thing (binary:394 "My base rate was X%… moving to Y% because…") is
+single-narrative anchor-and-adjust — the benign Tetlock outside-view move the study explicitly
+carves out, further guarded by the "anchor on your math" clauses that forbid vibe-hedging both
+directions. The three base prompts (~11.7k / 7.8k / 12.8k chars) are **focused, not bloated** —
+nearly all load-bearing gotchas (the `_forecasting_window_str` "events before open don't count"
+guard, status-quo derivation, bait-and-switch check, conjunctive-clause pricing,
+open-vs-closed-bound handling, units gotcha, MC must-assign-every-option, stacker dissent
+clause). **No action.** One minor follow-up: verify whether the `base_rate_anchor` /
+`criteria_clauses` optional JSON fields (binary schema) are still consumed downstream — the
+coherence-study memory flags the anchor telemetry channel as structurally dead (0/2203 archived
+rows); if nothing reads them they're dead schema weight and can be dropped.
+
+### Market-deference: time-to-close term MEASURED DEAD; liquidity fixes survive, downsized (updated 2026-07-16 same-day)
+
+The applicability gate was run same-day (offline, archive mining; scripts referenced in the
+2026-07-16 audit notes) and it kills the headline half of this entry:
+
+- **Time-to-close term: structural null — drop to bottom-of-low.** Of 285 matches with real
+  close dates in the provider-ran archive window (n=64 questions, essentially July 2026),
+  **0.0% are within 30 days of close** (median 185d, min 45d), and the liquid∧near-close
+  intersection is exactly **zero**. This is structural, not small-n: a near-identical market
+  closes ≈ when the question resolves, we forecast near open (verified:
+  `skip_previously_forecasted_questions=True` in all prod modes, `cli.py:119-148` — the bot
+  never re-forecasts late), and the `as_of` leakage filter drops markets closing before
+  resolution. TimeSeek's "models lose near close" dynamic is real but never binds on our
+  question stream. Revisit only if we ever add late re-forecasting.
+- **What survives — three small liquidity/matching fixes (top-of-low / bottom-of-medium):**
+  (1) **Fallback-chain bug**: 39 real-money matches render `no-liquidity-data` because
+  volume/OI fields are dropped rather than absent — fix the `total_volume`/`open_interest`
+  fallback chain (`prediction_market.py:498-506`). (2) **The fuzzy floor (40) is so loose that
+  "match" ≈ topical-adjacent**: 100% of provider-ran questions "match" but match confidence
+  never exceeds 0.77, and ≥0.7-confidence (the actual near-identical/defer trigger) is only
+  ~8% of questions; ≥decent-liquidity matches are ~12%. Consider raising the floor or adding a
+  confidence tier so "near-identical" means what the defer policy needs it to mean.
+  (3) Optionally a mild deference nudge for deep+high-confidence matches — the plumbing
+  (liquidity labels, `_strong_evidence_market_clause` prompt weighting, close dates) already
+  exists; this is prompt/render-level, not new fetching.
+- Useful mechanics documented by the gate: the `## Prediction Market Snapshot` header only
+  renders on ≥1 match (`orchestrator.py:401-403`), so header-absence ≠ provider-off — use
+  `providers_attempted` to disambiguate; market close dates ARE already captured for
+  Polymarket/Kalshi/Manifold (only PredictIt lacks them).
+
+**Rides along here (low-value general case, per operator 2026-07-16):** a bias-corrected
+**∆LL-over-matched-market diagnostic** on the ~8% near-identical-match subset — tells us
+whether, on those questions, we add signal beyond the price or should defer harder. NOT worth
+building against the Metaculus community prediction: these are bot-only tournament questions
+(CP is a pool of mostly-poor bots, a bar we already clear; CP is also null-hidden for our
+account). Note the subset is small (~8% × question stream), so this diagnostic accumulates
+signal slowly — set expectations accordingly.
+
+### JS-divergence diversity lens on the ensemble-screening benchmark (added 2026-07-16, medium)
+
+The "Diversity is the Strength of the AI Crowd" paper (arXiv 2606.29661) argues solo accuracy is
+near-useless for roster decisions when models correlate — decorrelation is what matters (their
+Grok was least-replaceable despite ranking 3rd solo, mirroring our "grok deadweight-but-harmless"
+memory). Verified (2026-07-16) we already have **half** of this: `scratch/ensemble_composition_2026-07-15/ensemble_screen.py`
+ranks by **realized marginal contribution** (leave-one-family-out + leave-one-question-out,
+era-bucketed, 4000-rep bootstrap CIs) — already past the "solo Brier is the wrong axis"
+critique, arguably more rigorous than the paper's proxy. The **gap** is a distributional-diversity
+metric: nothing measures **JS divergence between members' full predictive distributions**. (The
+older `ensemble_analysis/` tool has only `1−mean|Pearson|` on collapsed point predictions —
+misses tail disagreement — and is stale/degenerate: its checked-in artifact is 1 question × 3
+models, all-NaN.) `ensemble_screen.py` already builds per-member 201-pt PCHIP CDFs, so JS
+divergence between member CDFs/PMFs slots on top of the existing recovery pipeline. **Binding
+caveat:** current slots (grok-4.5, gpt-5.6-sol, fable-5) have zero resolved questions, so any
+divergence ranking screens predecessor lineages, not today's exact models — informative for
+screening, not for optimizing current slots. Medium priority (dropped from higher on cost — the
+ensemble is already very valuable and no subset beats the full roster).
+
+### Revisit the conditional stacker with the AIA supervisor evidence (added 2026-07-16, medium — larger item)
+
+papers-ensemble found our disagreement → targeted-search → stacker path **is** the AIA
+Forecaster's single biggest aggregation lever (arXiv 2511.07678: agentic supervisor 0.1125 vs
+no-supervisor 0.1199 ≈ 0.0074 Brier, *larger* than single→mean-of-10 at ~0.0042), and AIA warns
+hard against "best-of / pick-the-best-model" selection (structurally can't beat its best input;
+picks among the worst 7.2% of the time). We run our stacker **disabled in prod** because our own
+benchmark found it counterproductive on the current ensemble. This is a reason to eventually
+revisit an **era-bucketed median-vs-conditional-stacker head-to-head on the disagreement subset
+specifically** — distinct from the learned stacking we rejected. **Not viable now** (our
+benchmark evidence says it hurts on the current ensemble; needs post-flip marker-era resolved
+data to re-measure the real treatment effect). Larger item to revisit, not a near-term flip.
+(Operator note: the stacker is what originally motivated joining the tournament; empirically it
+just hasn't worked yet.)
+
+### Time-series anchor for the finance/econ numeric subset (added 2026-07-16, bottom-of-medium)
+
+For numeric questions that resolve on a fetchable series (CPI, index close, spread, jobless
+claims), fit a cheap probabilistic TS model (`statsforecast` AutoARIMA/ETS/Theta — light dep,
+no GPU) to the history our `financial_data` provider already pulls, and render a model-implied
+quantile block in the briefing — same shape as the prediction-market snapshot. **TS-as-anchor,
+not TS-as-answer** (pure extrapolation is blind to the news/policy/structural-break info our
+research surfaces; Metaculus numerics are full of exactly those). A principled version of the
+existing "status-quo / last-print anchor" finding — counters forecasters degrading a value
+research already nailed by layering speculative drift (q43647 / q43611 / q43591). Pattern from
+TimeCopilot (arch-repos): LLM proposes candidates, deterministic CV selects, must beat
+SeasonalNaive. **Gate first:** measure what fraction of our numeric questions map to a fetchable
+series — if <10%, skip. Do NOT take TimeCopilot as a dependency; only `statsforecast`.
+
+### Necessary-condition / scenario decomposition scaffold (added 2026-07-16, bottom-of-medium)
+
+Gnosis ThinkThoroughly (gnosis-repos): generate ~3 necessary preconditions + ~5 hypothetical
+scenarios (incl. the negation) as sub-questions, research/score each, synthesize. Highest
+ceiling of the "experiment" bucket, weakest evidence (no in-repo ablation; the PROPHET benchmark
+found agentic-RAG scaffolding gave only marginal Brier improvement and naive RAG sometimes
+*hurt*). Overlaps gap-fill v2's private dry-run (a lighter cousin). **Operator prior:** prompting
+tricks mostly don't work — bots check the boxes you give them then put down what they want. File
+it; gate hard on beating a flat forecaster in our own backtest before shipping.
+
+### Lower-priority / logged (added 2026-07-16)
+
+- **Embedding-NN market matcher + LLM resolution-equivalence check (low).** Replace/augment our
+  fuzzy-string market matching (rapidfuzz) with embedding nearest-neighbor + similarity
+  threshold (Gnosis pattern), plus an LLM "is this really the same resolution criterion" gate on
+  top — catches paraphrase matches we miss, serves defer-to-market. Low-risk recall win, but low
+  priority.
+- **Consistency-check as an offline diagnostic (bottom of low).** The 0.85 consistency↔Brier
+  correlation (arXiv 2412.18544) is a cheap no-resolutions-needed roster-health signal — probe
+  members with negation/paraphrase variants, flag incoherent ones. **Diagnostic only** — the
+  paper's own experiments show enforcing consistency does NOT reliably improve accuracy, and we
+  killed coherence-*weighting* on 2026-07-15. Never in the prediction path.
+- **Deterministic coherence projection (bottom of low).** KL/Brier projection onto monotone
+  deadline/threshold ladders + MC-sum-to-1. Survives the era-test trivially (it's algebra, not a
+  fit) but **rarely binds** — most AIB questions are standalone; sibling A/¬A/A⇒B ladders are
+  rare (unlike a market book). We already enforce the two that apply (MC renormalize, CDF
+  monotonicity). Low-yield; build a lightweight same-tournament ladder detector only if the
+  ladder frequency turns out non-trivial.
+- **ForecastBench external submission (bottom of low).** MIT code, open submission,
+  contamination-free scoreboard vs superforecasters + other bots (arXiv 2409.19839). Genuinely
+  useful for knowing where we stand leak-free — but **not free to forecast** (spends API on the
+  submission question set), so it sits at the bottom.
+
+### Study-only / longer-term (added 2026-07-16)
+
+- **RetroSearch-style frozen point-in-time corpus** (FutureSearch, Bench-to-the-Future): live
+  Google for ranking quality, filtered so the agent only ever receives pages already in a frozen,
+  date-bounded per-question snapshot ("no tool returns a document from after the simulated now").
+  The rigorous fix for backtest leakage. **Reproduce the design only** — RetroSearch code+corpus
+  are proprietary; futuresim (openforecaster.github.io/futuresim) has NO license (study, don't
+  copy). Cheaper reproducible variant: date-gated CommonCrawl News + LanceDB with query
+  date-range control (both open). The near-term substitute is the frozen-artifact-replay in the
+  backtest-hardening entry above — do that first.
+- **Longitudinal trajectory scoring** (futuresim: sum of Brier-skill-score over timesteps;
+  rewards correctness + calibration + timeliness). Suggestive that *timing* matters (TimeSeek),
+  but no paper shows re-forecasting the same question over calendar time improves a bot's score,
+  and it's an uncertain fit for single-shot Metaculus tournament scoring. Longer-term R&D.
+
+### Answer to "should we go end-to-end agentic research?" — NO (shared, not integrated) (added 2026-07-16)
+
+The strongest evidence (BTF-2, arXiv 2604.26106) argues against per-forecaster integrated
+research+forecast pipelines: the single most accurate forecast in that study was a **strong
+prompt on good shared/fixed research** (0.129 Brier), edging the best self-directed integrated
+agent (0.131), and integrated-vs-shared was **model-dependent** — only the Opus-class model
+clearly benefited from running its own search; Gemini was slightly *better* on fixed shared
+research. Our architecture (multi-provider shared briefing + gap-fill + 6-model ensemble +
+median) already **is** BTF-2's winning recipe, at ~7 calls vs ~5N for full pipelines. The lever
+is **shared-research quality + a strong prompt**, not integration topology. So: make the shared
+research more agentic and higher-quality (the gap-fill v2 plan in
+`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`), do NOT rebuild into per-forecaster
+agents. If per-forecaster search is ever tried, give it only to the Opus-class slot. Calibration
+caveat (research-repos + papers-skeptic): all these agentic-research wins optimize pass@1
+accuracy, and edge-over-consensus has a *flat-to-negative* trend across a dozen model
+generations — "more search → more decisive" can trade calibration for sharpness, so track
+era-bucketed calibration slope/intercept alongside Brier when validating any research change.
+See the deeper stub under "Longer-term → Agentic deep research" below (superseded by this).
+
 ## Near-term (worth exploring soon)
 
 ### Agentic gap-fill v2: plan agreed, implementation starting (added 2026-07-16)
 
-Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 2, self-contained —
+Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 4, self-contained —
 that doc is the source of truth; this entry is a pointer). Summary: a bounded agentic tool loop
 becomes the second-pass research stage — a driver LLM (dev on gpt-5.6-luna, then vibe-eval
 luna / terra / sol-low / sonnet-5.0) is briefed with the actual forecaster prompt template,
@@ -57,7 +359,15 @@ live search leaks resolution info on 41–55% of resolved questions (prompt-side
 post-cutoff knowledge" fails), so **`make backtest_*` is uninterpretable for research-stage
 changes** — eval is test_bot QA then an early prod flip, not backtests.
 
-### AskNews DeepNews integration — two options (added 2026-07-16, LOW priority)
+**Post-review additions (2026-07-16, external design review folded into plan rev 4):**
+
+- Duplicate-query semantic stuck-detector + dedup-vs-primary-provider queries: deferred
+  enhancement — v1 ships only a per-run dup-counter (`dup_tool_calls=N` on the marker line
+  plus a gentle warning on the duplicate's tool result).
+- Traditional-researcher tier-tagging (`web_research_prompt` + AskNews summarizer don't carry
+  the provenance ladder): follow-up, ship AT the v2 prod flip so it rides the same era boundary.
+- Era-bucketed calibration slope/intercept is now part of the v2 eval ladder alongside Brier
+  (plan §7) — guards against agentic-research over-decisiveness.
 
 DeepNews is AskNews's agentic iterative research product (AskNews KG + Google/Wiki/X/Reddit,
 OpenAI-SDK-compatible endpoint). Our current integration only calls the basic HOT+HISTORICAL
@@ -998,6 +1308,14 @@ prompt already tells forecasters spiky tricks don't pay).
 > `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) is exactly this — a bounded
 > tool-loop second pass. The cost blocker below is resolved by budget caps (~$0.50/q target)
 > and encouraged early-stop; selective activation happens via the template dry-run.
+>
+> **Direction confirmed by the 2026-07-16 lit survey (see the triage block near the top):**
+> keep this a **shared** agentic research stage (one loop → detached artifact all forecasters
+> read), NOT per-forecaster integrated research+forecast pipelines. BTF-2 (arXiv 2604.26106)
+> found a strong prompt on good shared research edged the best self-directed integrated agent,
+> and the integrated benefit was model-dependent (only the Opus-class model gained). Watch
+> era-bucketed calibration alongside Brier when validating — agentic-research wins optimize
+> pass@1 accuracy and can trade calibration for over-decisiveness.
 
 Move from one-shot research to an iterative research agent that can: execute search queries,
 evaluate results, identify gaps, execute follow-up queries, run code for analysis, and
