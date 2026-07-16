@@ -196,6 +196,14 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 # headroom above the normal retry envelope while still bounding a genuine hang.
 ASKNEWS_WALL_TIMEOUT: int = 300
 
+# --- OpenRouter credit telemetry ---
+# End-of-run floor for the DONATED key's remaining balance (limit_remaining).
+# Below this, cli.main logs a loud warning and exits non-zero AFTER all
+# forecasting/publishing completes — a reminder-to-refill signal, not an abort.
+# The floor is meaningless for the personal key (no limit_remaining), so it is
+# only checked against the donated key. See metaculus_bot/credit_telemetry.py.
+OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 50.0)
+
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
 # (Atlas publishes `0.96 * estimate + 0.02`; we adopt the clip portion only).
