@@ -81,14 +81,18 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 # flag to ``'false'``
 # (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
 # so these HTML-comment markers are currently DORMANT in published prod
-# comments. What DOES land in every prod R1 rationale — regardless of the
-# flag — is the raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
-# forecaster writes into its own STRUCTURED FORECAST block; residual-replay
-# tooling should key off that raw JSON today and can compute the same
-# overshoot / divergence numbers offline. The markers below become the
-# primary channel only if ``PROBABILISTIC_TOOLS_ENABLED`` is ever flipped on.
-# TELEMETRY ONLY either way: nothing in the pipeline reads these back to
-# clamp or mutate a forecast.
+# comments. The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON that
+# once accompanied them is ALSO gone: the tier-2 scaffold that elicited those
+# fields was retired from the prompts in Workstream C2, so forecasters stopped
+# emitting them entirely. Archived prod comments do NOT contain them — 0 of
+# 2203 archived binary rows carry either field (verified 2026-07-15; receipts
+# in ``scratch/coherence_2026-07-15/synthesis.md``). Consequence: the
+# 2026-07-08 anchor-overshoot finding CANNOT be monitored from archived data,
+# and restoring this telemetry requires re-adding the elicitation to the
+# prompts — a deliberate config-era change, not a flag flip. The markers below
+# still become the primary channel if ``PROBABILISTIC_TOOLS_ENABLED`` is ever
+# flipped on. TELEMETRY ONLY either way: nothing in the pipeline reads these
+# back to clamp or mutate a forecast.
 ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
 CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"
 
