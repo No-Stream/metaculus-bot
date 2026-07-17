@@ -137,33 +137,37 @@ class ResearchOrchestrator:
             gap_fill_v2_payload: dict | None = None
 
             if gap_fill_v1_active or gap_fill_v2_active:
-                from metaculus_bot.research.agentic_gap_fill import (
-                    run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                )
-                from metaculus_bot.research.targeted import (
-                    run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                )
-
-                def _capture_gap_fill_v2(payload: dict) -> None:
-                    nonlocal gap_fill_v2_payload
-                    gap_fill_v2_payload = payload
-
-                async def _run_v1() -> str:
-                    if not gap_fill_v1_active:
-                        return ""
-                    return await run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking)
-
-                async def _run_v2() -> str:
-                    if not gap_fill_v2_active:
-                        return ""
-                    return await run_gap_fill_v2(
-                        question,
-                        research,
-                        is_benchmarking=self._is_benchmarking,
-                        archive_sink=_capture_gap_fill_v2,
+                try:
+                    from metaculus_bot.research.agentic_gap_fill import (
+                        run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                    )
+                    from metaculus_bot.research.targeted import (
+                        run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                     )
 
-                addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
+                    def _capture_gap_fill_v2(payload: dict) -> None:
+                        nonlocal gap_fill_v2_payload
+                        gap_fill_v2_payload = payload
+
+                    async def _run_v1() -> str:
+                        if not gap_fill_v1_active:
+                            return ""
+                        return await run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking)
+
+                    async def _run_v2() -> str:
+                        if not gap_fill_v2_active:
+                            return ""
+                        return await run_gap_fill_v2(
+                            question,
+                            research,
+                            is_benchmarking=self._is_benchmarking,
+                            archive_sink=_capture_gap_fill_v2,
+                        )
+
+                    addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
+                except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
+                    logger.exception("Gap-fill stage failed; proceeding without it")
+                    addendum, v2_findings = "", ""
                 if addendum:
                     research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
                 if v2_findings:
