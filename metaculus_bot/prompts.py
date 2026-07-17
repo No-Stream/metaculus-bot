@@ -238,6 +238,8 @@ PRIMARY SOURCES (preferred — cite these over aggregators/blogs when available)
 - Central banks and macro agencies (e.g. `federalreserve.gov`, `ecb.europa.eu`, `imf.org`, `worldbank.org`, `bls.gov`, `bts.gov`, `census.gov`, `tsa.gov`)
 - Wire services (AP, Reuters, Bloomberg, FT) are acceptable as secondary sources
 
+Where the question invites reference-class reasoning (how often events like this have happened historically), include the relevant historical frequency with its source and denominator when findable — especially when the reference class is niche, regional, or conditional; skip it for rates that are common knowledge.
+
 {_SOURCE_TIER_TAG_INSTRUCTION}
 
 QUESTION:

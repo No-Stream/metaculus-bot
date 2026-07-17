@@ -59,14 +59,21 @@ note:
     qualifying event.
   - BASE-RATE targets: if your dry run leaned on a reference class ("how
     often do incumbents lose", "how often does the FDA approve on first
-    review", "how many Cat-4+ hurricanes make US landfall per season"),
-    that base rate is a research target: find the actual historical data —
-    the real denominator and count, from a citable dataset or systematic
-    source — rather than letting the panel rely on remembered rates.
-    Record it as an ordinary finding (the numbers and source; no comment on
-    what they imply). If the data shows the remembered rate is materially
-    off, that is a normal finding too — not a discrepancy flag, which is
-    reserved for briefing errors.
+    review"), decide whether to research it:
+      RESEARCH the rate when ANY of these hold: you are not fully sure of
+      the number; the reference class is niche, regional, or
+      recent-era-only; the rate is CONDITIONAL ("given they led round
+      1...", "in years when X...") — conditional rates are far less
+      reliable from memory than simple ones; or being wrong by a plausible
+      margin would move your forecast by a medium or larger amount.
+      SKIP the lookup when the rate is common knowledge you are sure of
+      (roughly how often a major US party wins a presidential election) —
+      do not spend budget re-verifying what you know.
+    When researching: find the real denominator and count from a citable
+    dataset or systematic source. Record it as an ordinary finding (the
+    numbers and source; no comment on what they imply). If the data shows
+    the remembered rate is materially off, that is a normal finding too —
+    not a discrepancy flag, which is reserved for briefing errors.
 
   Question-type defaults (check even when the dry run feels clean):
   - Numeric: the most recent authoritative measurement of the quantity — with

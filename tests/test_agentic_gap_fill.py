@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
@@ -235,6 +236,20 @@ class TestRunGapFillV2Seam:
         ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
         assert roles[0] == "system"
         assert "tool" in roles
+
+
+class TestDriverSystemPromptBaseRateTriage:
+    """The BASE-RATE bullet must triage: research uncertain / niche / CONDITIONAL
+    rates, skip common-knowledge ones instead of burning budget re-verifying."""
+
+    def test_system_prompt_carries_research_and_skip_triggers(self) -> None:
+        prompt = build_system_prompt("2026-07-16")
+        assert "BASE-RATE targets" in prompt
+        assert "RESEARCH the rate when ANY of these hold" in prompt
+        assert "CONDITIONAL" in prompt
+        assert "SKIP the lookup" in prompt
+        assert "common knowledge" in prompt
+        assert "real denominator and count" in prompt
 
 
 @pytest.fixture

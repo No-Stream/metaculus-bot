@@ -443,6 +443,17 @@ class TestWebResearchPromptPrimarySources:
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
 
+    def test_reference_class_frequency_instruction_present(self) -> None:
+        """The prompt must ask for historical frequencies (with source and
+        denominator) on reference-class questions — prioritizing niche,
+        regional, or conditional rates and skipping common knowledge."""
+        for is_benchmarking in (False, True):
+            result = web_research_prompt("Will X happen?", is_benchmarking=is_benchmarking)
+            assert "reference-class reasoning" in result
+            assert "historical frequency with its source and denominator" in result
+            assert "niche, regional, or conditional" in result
+            assert "common knowledge" in result
+
 
 # Prediction-market framing (strong-evidence, criteria/date-matched weighting)
 
