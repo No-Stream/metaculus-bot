@@ -475,6 +475,11 @@ See the deeper stub under "Longer-term → Agentic deep research" below (superse
 
 ### Agentic gap-fill v2: plan agreed, implementation starting (added 2026-07-16)
 
+**FLAG STATUS (2026-07-17): `GAP_FILL_V2_ENABLED: 'false'` in all four workflow yamls.**
+Pending: paid smoke (operator-gated) → vibe-eval (luna/terra/sol/sonnet) → operator flips to
+`'true'` in prod yamls + note new config era in AGENTS.md. Do not let this rot — the feature
+is built, reviewed, and waiting on the flip.
+
 Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 4, self-contained —
 that doc is the source of truth; this entry is a pointer). Summary: a bounded agentic tool loop
 becomes the second-pass research stage — a driver LLM (dev on gpt-5.6-luna, then vibe-eval

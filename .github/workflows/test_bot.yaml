@@ -13,6 +13,9 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    # Backstop only: normal runs finish far sooner. Without this, a wedged run
+    # holds the concurrency group for GitHub's 6h default.
+    timeout-minutes: 300
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
