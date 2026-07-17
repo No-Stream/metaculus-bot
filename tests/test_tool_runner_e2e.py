@@ -566,7 +566,7 @@ class TestFlagOnNoStackerNoCrossModelSection:
 
         rationale = _binary_rationale("m1", posterior=0.32, prior=0.20, k=2, n=10)
 
-        async def fake_forecast(_q, _r, _llm):
+        async def fake_forecast(_q, _r, _llm, _chart_b64=None):
             await asyncio.sleep(0)
             return ReasonedPrediction(prediction_value=0.32, reasoning=rationale)
 

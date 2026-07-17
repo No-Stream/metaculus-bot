@@ -29,6 +29,7 @@ from forecasting_tools import (
     PredictedOptionList,
     ReasonedPrediction,
 )
+from forecasting_tools.ai_models.ai_utils.openai_utils import VisionMessageData
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
@@ -234,6 +235,84 @@ class TestForecasterBroadRetry:
                 await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
 
         assert invoke.await_count == 1
+
+
+def _last_invoke_arg(invoke: AsyncMock) -> object:
+    """Return the single positional arg of the most recent await, narrowing the
+    Optional ``await_args`` for the type checker."""
+    await_args = invoke.await_args
+    assert await_args is not None, "invoke was never awaited"
+    (arg,) = await_args.args
+    return arg
+
+
+class TestForecasterChartVision:
+    """The optional TS-anchor chart image (chart_b64) turns the forecaster invoke
+    input into a ``VisionMessageData``; absent it stays a bare prompt string. All
+    three runners share the ``_forecaster_input`` helper, so binary covers the wiring
+    and one numeric case confirms it threads through the numeric path too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_chart_invokes_with_bare_prompt(self, binary_question, forecaster_llm, parser_llm) -> None:
+        invoke = AsyncMock(return_value="Analysis.\n\nProbability: 40%")
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="PROMPT"),
+            patch.object(forecaster_llm, "invoke", new=invoke),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_binary",
+                new=AsyncMock(return_value=_binary_outcome(0.40)),
+            ),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm)
+
+        assert _last_invoke_arg(invoke) == "PROMPT"  # plain string, not VisionMessageData
+
+    @pytest.mark.asyncio
+    async def test_chart_wraps_invoke_in_vision_message(self, binary_question, forecaster_llm, parser_llm) -> None:
+        invoke = AsyncMock(return_value="Analysis.\n\nProbability: 40%")
+        with (
+            patch("metaculus_bot.forecaster_runners.binary_prompt", return_value="PROMPT"),
+            patch.object(forecaster_llm, "invoke", new=invoke),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_binary",
+                new=AsyncMock(return_value=_binary_outcome(0.40)),
+            ),
+        ):
+            await run_binary_forecast(binary_question, "research", forecaster_llm, parser_llm, chart_b64="ZmFrZQ==")
+
+        called_arg = _last_invoke_arg(invoke)
+        assert isinstance(called_arg, VisionMessageData)
+        assert called_arg.prompt == "PROMPT"
+        assert called_arg.b64_image == "ZmFrZQ=="
+        assert called_arg.image_resolution == "low"
+
+    @pytest.mark.asyncio
+    async def test_numeric_runner_wraps_chart(self, numeric_question, forecaster_llm, parser_llm) -> None:
+        invoke = AsyncMock(return_value="reasoning")
+        mock_parse_structured = AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=False))
+        with (
+            patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="PROMPT"),
+            patch("metaculus_bot.forecaster_runners.bound_messages", return_value=("upper", "lower")),
+            patch.object(forecaster_llm, "invoke", new=invoke),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=mock_parse_structured),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(
+                    return_value=ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
+                ),
+            ),
+            patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(_STANDARD_PERCENTILES, None)),
+            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+            patch("metaculus_bot.forecaster_runners.log_open_bound_piling_diagnostics"),
+        ):
+            await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm, chart_b64="ZmFrZQ==")
+
+        called_arg = _last_invoke_arg(invoke)
+        assert isinstance(called_arg, VisionMessageData)
+        assert called_arg.b64_image == "ZmFrZQ=="
 
 
 class TestRunMcForecast:

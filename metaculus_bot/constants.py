@@ -592,6 +592,13 @@ PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_uni
 # to resolution IS the answer (NOT scheduled_resolution − buffer), with ALFRED
 # vintages at as_of for revising series.
 TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
+# Chart-image side-channel: when on (and TS_ANCHOR_ENABLED is also on), the
+# provider renders an 800x400 PNG of the anchor (series + P10-P90 band) for
+# single-level questions and stashes it per-qid; the forecaster passes it to
+# each base model as a vision message. OFF everywhere until the text-vs-image
+# A/B (FUTURE.md "TS anchor chart image"). Independent of TS_ANCHOR_ENABLED so
+# the text anchor can ship before the (costlier, unvalidated) image does.
+TS_ANCHOR_CHART_ENABLED_ENV: str = "TS_ANCHOR_CHART_ENABLED"
 # Wall-clock cap on the whole provider (fetch fan-out + render). Fetches run in
 # asyncio.to_thread under asyncio.wait_for; a hung endpoint soft-fails to "".
 TS_ANCHOR_TIMEOUT: float = float(os.environ.get("TS_ANCHOR_TIMEOUT", "20.0"))

@@ -43,6 +43,7 @@ import pandas as pd
 from forecasting_tools.data_models.questions import MetaculusQuestion, NumericQuestion
 
 from metaculus_bot.constants import (
+    TS_ANCHOR_CHART_ENABLED_ENV,
     TS_ANCHOR_ENABLED_ENV,
     TS_ANCHOR_LOOKBACK_YEARS,
     TS_ANCHOR_MONTHLY_TABLE_ROWS,
@@ -301,6 +302,16 @@ def horizon_steps(freq: Freq, calendar_days: int) -> int:
     return max(1, h)
 
 
+def _horizon_end_date(as_of: pd.Timestamp, freq: Freq, h: int) -> pd.Timestamp:
+    """Approximate calendar date of the horizon end, for placing the projected
+    band ribbon on the chart (mirrors the replay's make_charts._horizon_dates)."""
+    if freq == "daily":
+        return as_of + pd.Timedelta(days=round(h * CALENDAR_DAYS_PER_YEAR / TRADING_DAYS_PER_YEAR))
+    if freq == "weekly":
+        return as_of + pd.Timedelta(weeks=h)
+    return as_of + pd.DateOffset(months=h)
+
+
 def _empirical_change_band(y: np.ndarray, h: int, *, use_log: bool, anchor: float) -> tuple[float, float, float]:
     """P10/P50/P90 of the h-step-ahead value: empirical quantiles of all overlapping
     h-step changes applied to ``anchor``. Log-multiplicative for positive series,
@@ -523,6 +534,50 @@ def _truncate_section(text: str) -> str:
     return text[: TS_ANCHOR_SECTION_MAX_CHARS - len(marker)].rstrip() + marker
 
 
+def _maybe_stash_single_chart(
+    series: pd.Series, *, route: _Route, question: MetaculusQuestion, as_of: datetime, calendar_days: int
+) -> None:
+    """Render + stash the anchor chart for a single LEVEL question when the chart
+    flag is on. No-op for max-window / spread / no-band cases (v1 charts only the
+    level shape, where the ribbon reads cleanly). Chart-render failures are
+    swallowed so a plotting hiccup never breaks the text section — the chart is a
+    strict add-on and the caller's soft-fail only guards the text.
+    """
+    if not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
+        return
+    qid = getattr(question, "id_of_question", None)
+    if qid is None:
+        return
+    is_max = route.is_max or route.spec.column == "High"
+    if is_max or not route.model_target:
+        return
+
+    freq = _detect_freq(pd.DatetimeIndex(series.index))
+    h = horizon_steps(freq, calendar_days)
+    y = series.to_numpy(dtype="float64")
+    if y.size <= h:
+        return  # band withheld in the text too; nothing to chart
+    last = float(series.iloc[-1])
+    use_log = bool(np.all(y > 0.0))
+    band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
+
+    from metaculus_bot.research.ts_chart import (
+        render_anchor_chart,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # matplotlib off the cold path
+    )
+
+    as_of_ts = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of)
+    try:
+        _session_charts[qid] = render_anchor_chart(
+            series,
+            as_of=as_of_ts,
+            horizon_end=_horizon_end_date(as_of_ts, freq, h),
+            band=band,
+            title=route.label,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("ts_anchor: chart render failed for qid=%s (%s): %s", qid, type(exc).__name__, exc)
+
+
 def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
     """Synchronous core: route, fetch point-in-time, render. Returns "" if unroutable.
 
@@ -546,6 +601,7 @@ def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
         return _truncate_section(_render_spread(series_a, series_b, route=route, calendar_days=calendar_days))
 
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)
+    _maybe_stash_single_chart(series, route=route, question=question, as_of=as_of, calendar_days=calendar_days)
     return _truncate_section(_render_single(series, route=route, ceiling=ceiling, calendar_days=calendar_days))
 
 
@@ -557,10 +613,18 @@ def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
 # at one as-of from reusing a section computed at another.
 _SECTION_CACHE: dict[tuple[int, str], str] = {}
 
+# Chart side-channel: qid -> base64 PNG. Populated by build_anchor_section only
+# when TS_ANCHOR_CHART_ENABLED is on AND the question routed to a single LEVEL
+# series (v1 skips max-window / spread charts). The provider returns only the
+# text section; the forecaster pulls the image from here to attach to each base
+# model's vision message. Never read by the stacker / summarizer / gap-fill.
+_session_charts: dict[int, str] = {}
+
 
 def _reset_session_caches() -> None:
-    """Clear the section cache and the underlying series cache (tests + session start)."""
+    """Clear the section + chart caches and the underlying series cache (tests + session start)."""
     _SECTION_CACHE.clear()
+    _session_charts.clear()
     _reset_series_cache()
 
 

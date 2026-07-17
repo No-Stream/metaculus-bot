@@ -38,6 +38,7 @@ from metaculus_bot.constants import (
     NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     STACKER_SOFT_DEADLINE,
+    TS_ANCHOR_CHART_ENABLED_ENV,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
@@ -133,6 +134,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Per-question votes from each LLM on whether outcomes are discrete integers
         self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
+        # Per-question chart image (base64 PNG) from the time-series-anchor provider,
+        # keyed by qid. Populated in _research_and_make_predictions only when
+        # TS_ANCHOR_CHART_ENABLED is on; each base forecaster attaches it as a vision
+        # message. Stacker / summarizer / gap-fill never read it. Popped after the
+        # per-question fan-out so it doesn't accumulate across a batch run.
+        self._research_images: dict[int, str] = {}
         # Conditional stacking thresholds (overridable per question type)
         _valid_threshold_keys = {"binary", "mc", "numeric"}
         if stacking_spread_thresholds is not None:
@@ -563,6 +570,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
+        # Pull the time-series-anchor chart image (if the chart flag rendered one
+        # this question) out of the provider's per-session cache and into our
+        # per-qid state so the base forecasters can attach it as a vision message.
+        # No-op unless TS_ANCHOR_CHART_ENABLED is on. The stacker path never reads
+        # _research_images, so the image reaches base models only.
+        chart_b64 = self._pull_research_chart(question.id_of_question)
+
         # A stub, not the full corpus: the framework embeds summary_report under
         # "### Research Summary" and research_report under "# RESEARCH", so
         # setting both to `research` duplicated it and bloated the comment past
@@ -575,7 +589,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
             [
-                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log)
+                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log, chart_b64)
                 for llm_instance in self._forecaster_llms
             ],
         )
@@ -854,6 +868,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research: str,
         llm: GeneralLlm,
         qid: int | None,
+        chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         """Run a single forecaster with FORECASTER_SOFT_DEADLINE.
 
@@ -866,11 +881,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         caller's _gather_results_and_exceptions treats it like any other failed
         forecaster (dropped from the ensemble; the other models in the ensemble
         carry the question).
+
+        ``chart_b64`` is the optional time-series-anchor chart image forwarded to
+        the base runners; None (the default) when the chart flag is off.
         """
         start = time.monotonic()
         try:
             return await asyncio.wait_for(
-                self._make_prediction(question, research, llm),
+                self._make_prediction(question, research, llm, chart_b64),
                 timeout=FORECASTER_SOFT_DEADLINE,
             )
         except asyncio.TimeoutError:
@@ -890,6 +908,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         llm_to_use: GeneralLlm | None = None,
+        chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         notepad = await self._get_notepad(question)
         notepad.total_predictions_attempted += 1
@@ -898,11 +917,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         forecast_function: Callable[..., Coroutine[Any, Any, ReasonedPrediction[Any]]]
         if isinstance(question, BinaryQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_binary(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_binary(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, MultipleChoiceQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, NumericQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, DateQuestion):
             raise NotImplementedError("Date questions not supported yet")
         else:
@@ -948,27 +967,50 @@ class TemplateForecaster(CompactLoggingForecastBot):
             predictions, question, research, reasoned_predictions, aggregated_tool_output
         )
 
-    async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm
+    def _pull_research_chart(self, qid: int | None) -> str | None:
+        """Pop the time-series-anchor chart image for this qid from the provider's
+        per-session cache into our per-qid state, returning the base64 PNG (or None).
+
+        No-op unless the chart flag rendered one. Popping keeps the provider cache
+        from growing across a batch; we hold the value in ``self._research_images``
+        so the plumbing is observable/testable, then hand it down the fan-out.
+        Gated on the chart flag so the provider (and matplotlib) stays off the cold
+        path when the feature is disabled — the default in prod.
+        """
+        if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
+            return None
+        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
+            _session_charts,
+        )
+
+        chart_b64 = _session_charts.pop(qid, None)
+        if chart_b64 is not None:
+            self._research_images[qid] = chart_b64
+        return chart_b64
+
+    async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[float]:
         from metaculus_bot.forecaster_runners import run_binary_forecast
 
-        return await run_binary_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
+        return await run_binary_forecast(
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
+        )
 
-    async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm
+    async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[PredictedOptionList]:
         from metaculus_bot.forecaster_runners import run_mc_forecast
 
-        return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
+        return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64)
 
-    async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
+    async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[NumericDistribution]:
         from metaculus_bot.forecaster_runners import run_numeric_forecast
 
         prediction, discrete_vote = await run_numeric_forecast(
-            question, research, llm_to_use, self.get_llm("parser", "llm")
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )
         qid = question.id_of_question
         if qid is not None and discrete_vote is not None:

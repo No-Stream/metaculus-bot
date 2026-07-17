@@ -13,6 +13,7 @@ from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
 from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.research import timeseries_anchor as ts_anchor
 from metaculus_bot.value_extraction import ExtractionOutcome
 
 
@@ -186,8 +187,9 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
     # summarization pass. AskNews-only summarization lives in the orchestrator
     # (see test_research_orchestrator.py).
     assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
+    # Trailing chart_b64 is None here (TS_ANCHOR_CHART_ENABLED off in the test env).
     bot._forecaster_with_soft_deadline.assert_any_call(
-        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question
+        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question, None
     )
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
@@ -236,7 +238,8 @@ async def test_make_prediction_with_provided_llm(mock_binary_question, mock_gene
     result = await bot._make_prediction(mock_binary_question, "some research", mock_general_llm)
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
-    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_general_llm)
+    # Trailing chart_b64 is None (TS_ANCHOR_CHART_ENABLED off in the test env).
+    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_general_llm, None)
     assert result.prediction_value == 0.7
     assert "Model: mock_model" in result.reasoning
     assert "binary forecast" in result.reasoning
@@ -265,7 +268,8 @@ async def test_make_prediction_without_provided_llm(mock_binary_question):
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
     bot.get_llm.assert_called_once_with("default", "llm")
-    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_default_llm)
+    # Trailing chart_b64 is None (TS_ANCHOR_CHART_ENABLED off in the test env).
+    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_default_llm, None)
     assert result.prediction_value == 0.8
     assert "Model: default_mock_model" in result.reasoning
     assert "default binary forecast" in result.reasoning
@@ -433,7 +437,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     # Tighten the deadline to a fraction of a second so the test is fast.
     monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
 
-    async def slow_make_prediction(question, research, llm):
+    async def slow_make_prediction(question, research, llm, chart_b64=None):
         await asyncio.sleep(5)
         return ReasonedPrediction(prediction_value=0.5, reasoning="never returned")
 
@@ -567,3 +571,53 @@ def test_alertable_count_zero_by_default(mock_general_llm):
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     assert bot.alertable_count == 0
+
+
+def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:
+    llms_config: dict[str, Any] = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    return TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+
+class TestResearchChartSideChannel:
+    """_pull_research_chart moves the TS-anchor chart from the provider's per-session
+    cache into self._research_images and returns it — but only when the chart flag
+    is on. Off (the prod default), it never touches the provider module."""
+
+    def test_pull_moves_chart_into_state_when_flag_on(self, mock_general_llm, monkeypatch):
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        ts_anchor._reset_session_caches()
+        ts_anchor._session_charts[777] = "Zm9v"  # a stashed chart for qid 777
+        try:
+            bot = _bot_with_one_forecaster(mock_general_llm)
+            chart = bot._pull_research_chart(777)
+        finally:
+            ts_anchor._reset_session_caches()
+
+        assert chart == "Zm9v"
+        assert bot._research_images[777] == "Zm9v"
+
+    def test_pull_returns_none_when_flag_off(self, mock_general_llm, monkeypatch):
+        monkeypatch.delenv("TS_ANCHOR_CHART_ENABLED", raising=False)
+        ts_anchor._reset_session_caches()
+        ts_anchor._session_charts[778] = "Zm9v"  # present, but the flag gate must skip it
+        try:
+            bot = _bot_with_one_forecaster(mock_general_llm)
+            chart = bot._pull_research_chart(778)
+        finally:
+            ts_anchor._reset_session_caches()
+
+        assert chart is None
+        assert 778 not in bot._research_images
+
+    def test_pull_returns_none_when_no_chart_stashed(self, mock_general_llm, monkeypatch):
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        ts_anchor._reset_session_caches()
+        bot = _bot_with_one_forecaster(mock_general_llm)
+        assert bot._pull_research_chart(779) is None
+        assert bot._research_images == {}

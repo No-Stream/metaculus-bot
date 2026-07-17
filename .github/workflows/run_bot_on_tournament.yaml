@@ -116,6 +116,13 @@ jobs:
           # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
           # Validated via live test_bot run 2026-07-10.
           RESOLUTION_SOURCE_ENABLED: 'true'
+          # Time-series anchor: deterministic empirical P10/P50/P90 band from a
+          # question's own resolution series (FRED/yfinance). OFF pending the paid
+          # validation ladder (see FUTURE.md "Time-series anchor").
+          TS_ANCHOR_ENABLED: 'false'
+          # TS anchor chart image side-channel (vision message to base models).
+          # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
+          TS_ANCHOR_CHART_ENABLED: 'false'
           # Disable stacking on all types. n=88 ablation: stacker hurts numeric CRPS
           # and is <= median on binary; 2026-05-29 peer recompute found the stacker's
           # own model (claude-opus-4.5) is one of the weakest base binary forecasters.

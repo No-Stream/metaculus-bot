@@ -382,6 +382,38 @@ def _strong_evidence_market_clause(
     )
 
 
+# Header the timeseries_anchor research provider emits (research/orchestrator.py
+# _provider_header). The numeric prompt gates its anchor clause on this substring
+# so the guidance only appears when an anchor section is actually present.
+TS_ANCHOR_SECTION_HEADER = "## Time Series Anchor"
+
+
+def _ts_anchor_evidence_clause() -> str:
+    """Numeric-only clause telling the forecaster how to weigh the Time Series
+    Anchor section when it is present.
+
+    The anchor is a purely-statistical extrapolation of the resolution series'
+    own history (blind to news/events/policy), so the empirical P10/P90 band is a
+    CALIBRATED reference for how much the quantity moves at this horizon. Its
+    reason for existing is to SHARPEN, not to license more widening: our published
+    low tails have been badly too wide (cov@10 ≈ 0.03 vs a 0.10 target), and the
+    anchor exists to pull those in. Kept to roughly the market clause's length.
+    """
+    return (
+        "When the research contains a `## Time Series Anchor` section, treat it as CALIBRATED "
+        "REFERENCE EVIDENCE, not decoration. It is a purely-statistical extrapolation of the "
+        "resolution series' own history — blind to news, events, and policy — so its empirical "
+        "P10/P50/P90 band is a well-grounded estimate of how much this quantity actually moves at "
+        "this horizon. Center your percentiles near the anchor's center and keep your interval "
+        "close to its band UNLESS the rest of the research names a concrete catalyst (a scheduled "
+        "event, a policy change, a regime break) that justifies departing. Do NOT widen beyond the "
+        "anchor's band without naming that driver: our published low tails have historically been "
+        "far too wide (only ~3% of outcomes fell below our P10 vs a 10% target), so the anchor is "
+        "here to SHARPEN your distribution, not to add another license to widen. It is rebuttable "
+        "evidence — weigh it against everything else, and say so when you override it."
+    )
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -662,6 +694,11 @@ def numeric_prompt(
 ) -> str:
     unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
     nom_upper, nom_lower = nominal_bounds(question)
+    # Only surface the anchor guidance when an anchor section is actually in the
+    # research (mirrors how the market clause's advice only bites when a market
+    # snapshot is present, but here we gate the text itself on a cheap substring
+    # check since the anchor provider is off by default).
+    ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
@@ -676,7 +713,7 @@ def numeric_prompt(
         climate data), anchor tightly to recent observations with historically-appropriate variance.
         Do not over-hedge on quantities you can actually predict well.
         Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
-        but penalties for overly wide intervals on predictable quantities also accumulate.
+        but penalties for overly wide intervals on predictable quantities also accumulate.{ts_anchor_clause}
         {
             _strong_evidence_market_clause(
                 subject="quantity",

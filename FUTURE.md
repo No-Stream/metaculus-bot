@@ -305,13 +305,39 @@ data to re-measure the real treatment effect). Larger item to revisit, not a nea
 (Operator note: the stacker is what originally motivated joining the tournament; empirically it
 just hasn't worked yet.)
 
-### Time-series anchor for numeric questions — GATE PASSED 2026-07-16 (53% applicability, ~5x the bar): promote to a real build item
+### Time-series anchor for numeric questions — Phase A verdict IN, Phase B shipped env-gated OFF (2026-07-16/17): validate then flip
 
-For numeric questions that resolve on a fetchable series, fit a cheap probabilistic TS model
-(`statsforecast` AutoARIMA/ETS/Theta — light dep, no GPU) and render a model-implied
-P10/P50/P90 quantile block in the briefing — same shape as the prediction-market snapshot.
-**TS-as-anchor, not TS-as-answer.** A principled version of the "status-quo / last-print
-anchor" finding. Do NOT take TimeCopilot as a dependency; only `statsforecast`.
+For numeric questions that resolve on a fetchable series, render an empirical
+P10/P50/P90 quantile band built from the series' own history into the briefing — same shape
+as the prediction-market snapshot. **TS-as-anchor, not TS-as-answer.** A principled version
+of the "status-quo / last-print anchor" finding. **Phase A rejected the CV-gated
+`statsforecast` model menu** (see below) — the shipped provider is deterministic naive/empirical,
+no statsforecast dependency, no model selection.
+
+**Phase A offline-replay verdict (receipts: `scratch/ts_anchor_replay_2026-07-16/synthesis.md`).**
+On the 105 mapped class-A resolved numeric questions the empirical anchor band beats our
+published Metaculus CDF: paired relative skill −1.17 (sign-flip permutation p=0.005 over 22
+clusters; the conservative CR2-t cross-check is p=0.15, so it's cluster-fragile but
+directionally robust). The decisive, less-ambiguous result is **coverage**: our published low
+tail is badly miscalibrated (only ~3% of resolutions fall below our published P10 vs a 10%
+target — the "our numeric forecasts are too wide" finding), while the anchor's P10 coverage is
+0.18 and its P90 is on target. So the anchor is sharper AND better-tail-calibrated; its job is
+to pull in our over-wide low tail. **CV model selection was rejected**: the must-beat-naive
+gate passed on 76% of questions but those picks beat naive out-of-sample only 43% of the time
+(worse than a coin flip) — the gate manufactures false wins, so we render the naive/empirical
+band directly (empirical h-step-change band for level/spread, empirical window-max for max).
+
+**Phase B shipped, env-gated OFF everywhere (commit ea889a6 + this commit).** The provider
+(`metaculus_bot/research/timeseries_anchor.py` + `ts_fetch.py`, deterministic routing +
+point-in-time/ALFRED-vintage fetch + empirical bands, `TS_ANCHOR_ENABLED`), the numeric prompt
+clause (`_ts_anchor_evidence_clause`, gated on the section header being present), and a gated
+chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`, next entry). Both flags are `'false'` in
+all four workflow yamls. **Remaining validation ladder before the prod flip** (each gates the
+next): paid 3-arm smoke (bare / stats / stats+chart on a hard resolved question) → a
+`test_bot.yaml` prod-mode run to eyeball live rendered sections → `make backtest_medium` with
+`TS_ANCHOR_ENABLED` on (leakage-safe: the provider date-ceilings the fetch to `open_time` under
+`is_benchmarking`, so it's the FIRST research provider measurable in backtest) → prod flip. A
+handoff/seed doc is at `scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`.
 
 **Applicability gate RUN same-day (offline classification of all 231 numeric+discrete recovered
 questions; auditable per-question labels in `scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`):
@@ -339,14 +365,44 @@ representative of forward mix. **Applicability is no longer the question; design
   fittable series in the corpus — held out of A only on ingestion; cheap to fold in once
   statsforecast wiring exists.
 
-Was bottom-of-medium pending the gate; **promoted to HIGH priority (operator confirmed
-2026-07-16)** given the 53% hit rate and the recurring-template structure of class A. A
-handoff/seed doc for the implementing session is at
-`scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`. Validation note: unlike
-prediction_market (hard-disabled when benchmarking), a TS anchor is **backtest-measurable if
-the series fetch is date-ceilinged** (fit only on observations ≤ the question's forecast
-date) — design that in from the start; plus the gap-fill v2 eval-ladder pattern (artifact QA +
-era-bucketed residuals incl. calibration) for prompt-visible effects.
+The applicability gate above (53% hit rate, recurring-template class A) is what promoted this
+to HIGH priority and motivated the Phase A replay; both are now done and the status is the
+Phase-B-shipped-gated-off block up top. Class B later-add (Mauna Loa CO2, Norwegian EV-share)
+is still just an ingestion follow-on. Backtest measurement uses the gap-fill v2 eval-ladder
+pattern (artifact QA + era-bucketed residuals incl. calibration) for the prompt-visible effect.
+
+### TS anchor chart image — enable + A/B (HIGH, added 2026-07-17)
+
+The text anchor above passes the *forecaster's reasoning* the P10/P50/P90 band as prose; the
+chart side-channel additionally passes each base model a rendered 800×400 PNG of the series +
+projected band as a vision message. **Skeleton shipped env-gated OFF** (`TS_ANCHOR_CHART_ENABLED`,
+`'false'` in all four yamls): `metaculus_bot/research/ts_chart.py` (`render_anchor_chart`,
+Agg/OO-API, DejaVu-only, deterministic base64 PNG), a provider hook that stashes the chart
+per-qid for single LEVEL questions only (max-window/spread charts deferred — the ribbon reads
+cleanly only on the level shape), and forecaster plumbing that threads the b64 from the provider
+→ `self._research_images[qid]` → the three runners, which wrap the prompt in
+`VisionMessageData(prompt=..., b64_image=..., image_resolution="low")`. All 6 roster models are
+vision-capable via OpenRouter (verified). The stacker/summarizer/gap-fill never see the image —
+only base-model generation does; the parser/extraction path consumes reasoning text only.
+
+**Cost:** ~$0.02/question at low resolution (one image per base model per numeric-anchored
+question), so cheap enough to A/B but not free — hence gated separately from the text anchor so
+the (validated) text can ship first.
+
+**What the A/B needs:**
+- *Arms:* bare (no anchor) / stats (text anchor only) / stats+chart (text + image), on live
+  and/or backtest numeric-anchored questions. The 3-arm smoke design (below) is the cheap first
+  cut; the real read is era-bucketed residuals on the level/spread cohort where the text anchor
+  already helps.
+- *Research-sink schema v3 (prerequisite for archived-replay measurement):* the current research
+  archive stores only the text research bundle. To replay chart arms offline (score the same
+  questions with/without the image without re-paying for the image render), the sink must persist
+  the rendered chart b64 (or the band + series slice needed to re-render deterministically)
+  alongside the text. Until v3 lands, chart-arm measurement is live-only.
+- *3-arm smoke (cheapest first signal):* pick one hard resolved numeric question that routes to a
+  level series, run gpt-5.6-sol at low effort three times (bare / stats / stats+chart), eyeball
+  whether the image moves the distribution beyond what the text already does. Paid — gate behind
+  operator sign-off per the repo cost rule.
 
 ### Necessary-condition / scenario decomposition scaffold (added 2026-07-16, bottom-of-medium)
 

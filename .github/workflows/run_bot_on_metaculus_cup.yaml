@@ -110,6 +110,13 @@ jobs:
           # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
           # Validated via live test_bot run 2026-07-10.
           RESOLUTION_SOURCE_ENABLED: 'true'
+          # Time-series anchor: deterministic empirical P10/P50/P90 band from a
+          # question's own resolution series (FRED/yfinance). OFF pending the paid
+          # validation ladder (see FUTURE.md "Time-series anchor").
+          TS_ANCHOR_ENABLED: 'false'
+          # TS anchor chart image side-channel (vision message to base models).
+          # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
+          TS_ANCHOR_CHART_ENABLED: 'false'
           # Stacking disabled on all types (ablation: stacker <= median on binary,
           # hurts numeric CRPS; stacker base model is a weak binary forecaster).
           NUMERIC_STACKING_ENABLED: 'false'

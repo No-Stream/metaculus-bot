@@ -16,6 +16,7 @@ import pytest
 
 from metaculus_bot.prompts import (
     _SOURCE_TIER_TAG_INSTRUCTION,
+    TS_ANCHOR_SECTION_HEADER,
     asknews_summarizer_prompt,
     binary_prompt,
     gap_fill_analyzer_prompt,
@@ -262,6 +263,31 @@ class TestForecastingWindowAnchor:
             numeric_prompt(q, research="r", lower_bound_message="lbm", upper_bound_message="ubm")
 
     # -- stacking variants -------------------------------------------------
+
+
+class TestTsAnchorClause:
+    """The numeric prompt surfaces the time-series-anchor guidance ONLY when the
+    research actually carries the anchor section header. Binary/MC never mention
+    it (the anchor routes to numeric questions only in v1)."""
+
+    _MARKER = "CALIBRATED REFERENCE EVIDENCE"
+
+    def test_clause_present_when_section_in_research(self) -> None:
+        research = f"Some news.\n\n{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20\n- band ..."
+        result = numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
+        assert self._MARKER in result
+        assert "sharpen your distribution" in result.lower()
+
+    def test_clause_absent_when_section_missing(self) -> None:
+        result = numeric_prompt(
+            _numeric_q(), research="Just some news, no anchor.", lower_bound_message="lbm", upper_bound_message="ubm"
+        )
+        assert self._MARKER not in result
+
+    def test_clause_not_in_binary_or_mc_even_with_section(self) -> None:
+        research = f"{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20"
+        assert self._MARKER not in binary_prompt(_binary_q(), research=research)
+        assert self._MARKER not in multiple_choice_prompt(_mc_q(), research=research)
 
     def test_stacking_binary_injects_window(self) -> None:
         q = _binary_q(

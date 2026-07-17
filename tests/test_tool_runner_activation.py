@@ -107,7 +107,7 @@ def _run_make_prediction(bot: TemplateForecaster, q, llm, rationale: str) -> Rea
     - _run_forecast_on_binary is the real LLM call we want to short-circuit.
     """
 
-    async def fake_forecast(_q, _r, _llm):
+    async def fake_forecast(_q, _r, _llm, _chart_b64=None):
         await asyncio.sleep(0)
         return ReasonedPrediction(prediction_value=0.35, reasoning=rationale)
 
