@@ -122,7 +122,7 @@ jobs:
           # Time-series anchor: deterministic empirical P10/P50/P90 band from a
           # question's own resolution series (FRED/yfinance). OFF pending the paid
           # validation ladder (see FUTURE.md "Time-series anchor").
-          TS_ANCHOR_ENABLED: 'false'
+          TS_ANCHOR_ENABLED: 'true'
           # TS anchor chart image side-channel (vision message to base models).
           # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
           TS_ANCHOR_CHART_ENABLED: 'false'
