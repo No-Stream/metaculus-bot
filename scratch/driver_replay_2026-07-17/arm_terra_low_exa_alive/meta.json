@@ -1,0 +1,15 @@
+{
+  "arm": "arm_terra_low_exa_alive",
+  "model": "openai/gpt-5.6-terra",
+  "reasoning_effort": "low",
+  "outer_wall_s": 54.33,
+  "loop_wall_s": 52.61790525005199,
+  "est_cost_usd": 0.5197,
+  "pricing_per_token": {
+    "prompt": 2.5e-06,
+    "completion": 1.5e-05
+  },
+  "prompt_tokens_total": 192317,
+  "completion_tokens_total": 2595,
+  "n_llm_calls": 7
+}
