@@ -1342,6 +1342,69 @@ Older (2026-05-10) framing, now superseded by the version-confound note above: P
 pipeline could use the forecastability classification (output by the prompt) to apply different tail-widening
 parameters, or use the FORECASTABILITY tag to adjust smoothing / tail-mass allocation / post-hoc CDF scaling.
 
+### Numeric-width history — receipts + ongoing monitor (added 2026-07-17)
+
+Consolidated, git-verified history of how we've configured (and prompted for) numeric distribution width, so
+future sessions never re-litigate this from memory. The bot has oscillated between too-wide and too-narrow; the
+short version is that we deliberately widened tails from 2025-09 to 2026-05, turned that off on 2026-05-12, and the
+2026-07-17 TS-anchor clause now pushes back toward sharpening.
+
+| Date | Change | Value before → after | Commit | Source |
+|---|---|---|---|---|
+| 2025-08-21 | Numeric prompt: earliest "widen" language added | (none) → "aim to produce somewhat wider and less confident predictions" | `4bd8685` | `prompts.py` |
+| 2025-09-06 | Numeric prompt: widen language strengthened | "somewhat wider" → "wider and less confident … penalties for narrow intervals are severe" | `0437f3e` | `prompts.py` |
+| 2025-09-07 | **Tail-widening machinery introduced** — `widen_declared_percentiles` + constants born | function default `k_tail=1.25`, `span_floor_gamma=1.0`; `TAIL_WIDEN_K_TAIL=1.25`, `TAIL_WIDEN_SPAN_FLOOR_GAMMA=1.0` | `4c6481b` | `tail_widening.py` + `numeric_config.py` |
+| 2026-03-30 | Numeric prompt: blanket-widen replaced by forecastability-conditional wording | "aim to produce wider … penalties for narrow intervals severe" → "produce wide, diffuse [for volatile] … anchor tightly [for stable] … penalties for overly wide intervals on predictable quantities also accumulate" | `3217aab` | `prompts.py` |
+| 2026-04-27 | Numeric prompt: added "Hedge audit" anti-over-widening clause | (none) → "Only widen tails when you can name specific evidence creating that uncertainty, not because it feels safer" | `95c4fff` | `prompts.py` |
+| **2026-05-12** | **`k_tail` 1.25 → 1.0 and `span_floor_gamma` 1.0 → 0.0** (function defaults AND both constants), plus `ValueError` guard on `k_tail<1` / negative params | `k_tail: 1.25 → 1.0`; `span_floor_gamma: 1.0 → 0.0` | `b8d730f` | `tail_widening.py` + `numeric_config.py` + `constants.py` |
+| 2026-06-01 | Subpackage move (no value change): `tail_widening.py`/`numeric_config.py` → `numeric/` | rename only | `78c5182` | subpackage extraction |
+| 2026-07-09 | Numeric prompt de-overfit prune; **kept** hedge-audit | large prune | `5c6640a` | `prompts.py` |
+| 2026-07-17 | Numeric prompt: **TS-anchor clause** reframes widening as the failure mode ("SHARPEN, not another license to widen"; "cov@10 ≈ 0.03 vs 0.10 target") | (none) → anchor clause | `3a7ba7d` | `prompts.py` |
+| 2026-07-17 | Numeric prompt: fixed the surviving blanket-widen contradiction — Phase-8 "keep tails far apart for unknown unknowns" scoped to *nameable* unknowns, not padded from generic caution or beyond a calibrated anchor's band | unconditional → conditional | (this branch) | `prompts.py` |
+
+Notes on the story:
+
+- **The `k_tail`/`span_floor_gamma` defaults have a two-point history, no intermediate values**: born at 1.25/1.0
+  on `4c6481b` (2025-09-07), flipped to 1.0/0.0 on `b8d730f` (2026-05-12). Function default and constant were always
+  changed together, so they've never disagreed. Current: `tail_widening.py` `k_tail=1.0`, `span_floor_gamma=0.0`;
+  `numeric/config.py` `TAIL_WIDEN_K_TAIL=1.0`, `TAIL_WIDEN_SPAN_FLOOR_GAMMA=0.0`.
+- **No constant literally named "PIT."** The operator's "PIT widening 1.25 → 1.0" memory = the `TAIL_WIDEN_K_TAIL`
+  flip. PIT is the *calibration metric* (`performance_analysis/analysis.py`) that *drove* the decision, not a
+  separate widening knob — same event, two names.
+- **The 2026-05-12 study** (`scratch_docs_and_planning/tail_widening_empirical_calibration.md` writeup +
+  `scratch/tail_widening_calibration_2026-05-12/` raw artifacts, 43 resolved numerics Feb–May 2026) concluded:
+  drop `k_tail` to 1.0 (every segment minimized |PIT std − 0.289| at 1.0; 1.25 moved PIT std *away* from the
+  uniform ideal); `span_floor_gamma` is a no-op on this data (drop to 0.0); no per-category `k_tail` (CIs overlap);
+  narrowing (`k_tail<1`) is a silent no-op in the code (motivated the `ValueError` guard). Caveat it flagged:
+  "revisit after ~150 resolved numerics."
+- Prompt-language and `k_tail`-code changes are **decoupled** — `b8d730f` didn't touch widening wording, and the
+  prompt swings above are separate commits.
+
+**Ongoing monitor: `metaculus_bot/performance_analysis/width_monitor.py`** (read-only, free — not cost-gated).
+Run: `uv run python -m metaculus_bot.performance_analysis.width_monitor --cached scratch/coherence_2026-07-15/perf_all_tagged.json`
+(or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist). Per config era it reports
+central-80% / central-50% coverage with Jeffreys CIs, cov@10/50/90, PIT std (uniform ideal 0.289 — below ⇒ too
+wide, above ⇒ too narrow), and median relative band width `(P90−P10)/|P50|` as the raw sharpness metric. Eras are
+the two width-relevant flips: `WIDENING_FLIP` (2026-05-12, k_tail 1.25→1.0) and `TS_ANCHOR_ENABLE` (2026-07-17); the
+`ts_anchor` bucket is intentionally empty until the anchor provider is flipped on in prod, so post-enable records
+land in their own era instead of contaminating the widening-off baseline.
+
+**Measured 2026-07-17 on the 231 recovered numeric+discrete questions** (`scratch/coherence_2026-07-15/perf_all_tagged.json`):
+
+| era | n | cov80 [95% CI] | cov50 | cov@10 | PIT std | med rel width |
+|---|---|---|---|---|---|---|
+| widening_on (k_tail=1.25) | 197 | 0.851 [0.798, 0.897] | 0.558 | 0.096 | 0.267 | 0.674 |
+| widening_off (k_tail=1.0) | 24 | 0.740 [0.555, 0.888] | 0.580 | 0.083 | 0.286 | 0.561 |
+| all | 231 | 0.847 [0.798, 0.890] | 0.567 | 0.091 | 0.267 | 0.647 |
+
+Reading: turning widening off moved PIT std 0.267 → 0.286 (toward the 0.289 uniform ideal) and cov80 0.851 → 0.740,
+and tightened the raw band (median rel width 0.674 → 0.561) — consistent with the 2026-05-12 study and confirming
+we are no longer over-wide in the body. The `widening_off` n is still only 24 (era-bucketing caveat: CIs are loose);
+this is the baseline to watch as the TS-anchor clause lands, since the forward risk is *over*-sharpening. Note the
+`cov@10` gap: even in the widening-off era only ~8% of resolutions fall below our published P10 (vs a 10% target and
+the ~3% headline the anchor clause cites for the live-prod low tail), so the low tail runs slightly wide — exactly
+what the anchor's better-calibrated P10 is meant to pull in.
+
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
 Source: a systematic dissection of 12 high-scoring forecast outputs from three competitor bots

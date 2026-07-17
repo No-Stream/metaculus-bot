@@ -814,7 +814,7 @@ def numeric_prompt(
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
-            - Keep your extreme tails (P1 and P99) far apart to allow for unknown unknowns.
+            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution (see the hedge audit above), and not beyond a calibrated anchor's band when one is present.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
             - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
