@@ -339,10 +339,14 @@ representative of forward mix. **Applicability is no longer the question; design
   fittable series in the corpus — held out of A only on ingestion; cheap to fold in once
   statsforecast wiring exists.
 
-Was bottom-of-medium pending the gate; **with a 53% hit rate it merits promotion — solid
-medium, arguably higher** (operator to confirm). Validation note: prompt-visible research
-changes can't be measured by the leakage-exposed backtest — use the gap-fill v2 eval-ladder
-pattern (artifact QA + both-on overlap + era-bucketed residuals incl. calibration).
+Was bottom-of-medium pending the gate; **promoted to HIGH priority (operator confirmed
+2026-07-16)** given the 53% hit rate and the recurring-template structure of class A. A
+handoff/seed doc for the implementing session is at
+`scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`. Validation note: unlike
+prediction_market (hard-disabled when benchmarking), a TS anchor is **backtest-measurable if
+the series fetch is date-ceilinged** (fit only on observations ≤ the question's forecast
+date) — design that in from the start; plus the gap-fill v2 eval-ladder pattern (artifact QA +
+era-bucketed residuals incl. calibration) for prompt-visible effects.
 
 ### Necessary-condition / scenario decomposition scaffold (added 2026-07-16, bottom-of-medium)
 

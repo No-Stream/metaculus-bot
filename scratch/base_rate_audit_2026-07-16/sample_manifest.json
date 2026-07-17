@@ -1,0 +1,1565 @@
+[
+  {
+    "post_id": 42116,
+    "question_id": 41879,
+    "title": "Will CDU win the most seats in the Baden-W\u00fcrttemberg Landtag election?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -19.606868147844363,
+    "spot_peer_score": -61.207194351213346,
+    "baseline_score": -64.9191668986567,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.88,
+    "per_model_forecasts": {
+      "gpt-5.2": "82.0%",
+      "gpt-5.1": "86.0%",
+      "claude-4.6-opus": "95.0%",
+      "claude-opus-4.5": "88.0%",
+      "gemini-3-pro-preview": "93.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-19T08:31:37.493008Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5.1",
+      "openrouter/anthropic/claude-4.6-opus"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43131,
+    "question_id": 43145,
+    "title": "Will Anthropic publicly release an Opus-class Claude model newer than Claude Opus 4.6 or Sonnet 4.6 before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -52.84790465739199,
+    "spot_peer_score": -94.5624040088864,
+    "baseline_score": -187.73860871281812,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.065,
+    "per_model_forecasts": {
+      "gpt-5.4": "9.0%",
+      "gpt-5.2": "13.0%",
+      "claude-opus-4.5": "6.0%",
+      "claude-opus-4.6": "7.0%",
+      "gemini-3.1-pro-preview": "5.0%",
+      "grok-4.1-fast": "6.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-04-12T00:32:36.353928Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.2",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/anthropic/claude-opus-4.6"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42926,
+    "question_id": 42864,
+    "title": "Will CDC report at least one newly identified human infection with a novel influenza A virus in the United States before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -58.22492255521308,
+    "spot_peer_score": -62.061178072556544,
+    "baseline_score": -46.14316445057513,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.65,
+    "per_model_forecasts": {
+      "gpt-5.2": "32.0%",
+      "gpt-5.1": "60.0%",
+      "claude-4.6-opus": "65.0%",
+      "claude-opus-4.5": "65.0%",
+      "gemini-3.1-pro-preview": "84.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-30T22:39:17.838562Z",
+    "models_read": [
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42514,
+    "question_id": 42312,
+    "title": "Will the April 2026 Android Security Bulletin list at least one vulnerability rated \u201cCritical\u201d in Android Framework or System?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -19.58650625783483,
+    "spot_peer_score": -27.470818434614454,
+    "baseline_score": 4.0222095766915755,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.52,
+    "per_model_forecasts": {
+      "gpt-5.2": "52.0%",
+      "gpt-5.1": "47.0%",
+      "claude-4.6-opus": "72.0%",
+      "claude-opus-4.5": "55.0%",
+      "gemini-3.1-pro-preview": "38.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-14T06:26:01.592903Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview",
+      "openrouter/openai/gpt-5.2"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41672,
+    "question_id": 41413,
+    "title": "Will the Community beat Nathan Young in the Metaculus Cup Spring 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -24.283456230928657,
+    "spot_peer_score": -24.22073003542288,
+    "baseline_score": -56.8858985985797,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.67,
+    "per_model_forecasts": {
+      "gpt-5.2": "55.0%",
+      "gpt-5": "67.0%",
+      "claude-opus-4.5": "57.0%",
+      "gemini-3-flash-preview": "78.0%",
+      "gemini-3-pro-preview": "78.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-21T15:34:36.149338Z",
+    "models_read": [
+      "openrouter/google/gemini-3-pro-preview",
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41835,
+    "question_id": 41571,
+    "title": "Will the US government enter a shutdown before February 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -55.89979832591586,
+    "spot_peer_score": -69.22551305321724,
+    "baseline_score": -176.62667125325677,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.11,
+    "per_model_forecasts": {
+      "gpt-5.2": "11.0%",
+      "gpt-5": "12.0%",
+      "claude-opus-4.5": "11.0%",
+      "gemini-3-flash-preview": "12.0%",
+      "gemini-3-pro-preview": "7.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-23T17:12:07.486269Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42646,
+    "question_id": 42591,
+    "title": "Will the next UN Security Council resolution renewing the UNMISS mandate be adopted with at least one abstention before April 30, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "worst",
+    "peer_score": -9.642510405911436,
+    "spot_peer_score": -20.484404868543155,
+    "baseline_score": -20.65900528552061,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.63,
+    "per_model_forecasts": {
+      "gpt-5.2": "53.0%",
+      "gpt-5.1": "60.0%",
+      "claude-4.6-opus": "65.0%",
+      "claude-opus-4.5": "82.0%",
+      "gemini-3.1-pro-preview": "63.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-19T05:17:12.106593Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.1",
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42120,
+    "question_id": 41883,
+    "title": "Will Frontier Group Holdings, Inc. file for bankruptcy protection before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 7.855068484754419,
+    "spot_peer_score": 9.430197835291997,
+    "baseline_score": 79.69207157861737,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.04,
+    "per_model_forecasts": {
+      "gpt-5.2": "6.0%",
+      "gpt-5.1": "4.0%",
+      "claude-4.6-opus": "4.0%",
+      "claude-opus-4.5": "7.0%",
+      "gemini-3.1-pro-preview": "1.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-22T09:13:47.691712Z",
+    "models_read": [
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42117,
+    "question_id": 41880,
+    "title": "Will AfD win the most seats in the Baden-W\u00fcrttemberg Landtag election?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 5.974252922887774,
+    "spot_peer_score": 8.925215227979438,
+    "baseline_score": 69.5619521490647,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.01,
+    "per_model_forecasts": {
+      "Forecaster 1": "1.0%",
+      "gpt-5.1": "1.0%",
+      "claude-4.6-opus": "2.0%",
+      "claude-opus-4.5": "2.0%",
+      "gemini-3-pro-preview": "1.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-19T09:26:28.528503Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3-pro-preview",
+      "unknown"
+    ],
+    "options": null,
+    "rationale_caveat": "first_section_model_line_trimmed"
+  },
+  {
+    "post_id": 42641,
+    "question_id": 42586,
+    "title": "Will Blue Origin launch its New Glenn rocket before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 15.840612186091665,
+    "spot_peer_score": 35.74855028232273,
+    "baseline_score": 21.822875743464262,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.7,
+    "per_model_forecasts": {
+      "Forecaster 1": "65.0%",
+      "gpt-5.1": "70.0%",
+      "claude-4.6-opus": "83.0%",
+      "claude-opus-4.5": "75.0%",
+      "gemini-3.1-pro-preview": "38.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-18T05:19:32.743851Z",
+    "models_read": [
+      "openrouter/google/gemini-3.1-pro-preview",
+      "unknown",
+      "openrouter/openai/gpt-5.1"
+    ],
+    "options": null,
+    "rationale_caveat": "first_section_model_line_trimmed"
+  },
+  {
+    "post_id": 43915,
+    "question_id": 43941,
+    "title": "Will FDA approve atacicept for IgA nephropathy before July 15, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 12.588876449507163,
+    "spot_peer_score": 13.995410084129828,
+    "baseline_score": 78.08375441558825,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.885,
+    "per_model_forecasts": {
+      "gpt-5.4": "86.0%",
+      "gpt-5.5": "88.0%",
+      "claude-opus-4.8": "89.0%",
+      "claude-opus-4.6": "91.0%",
+      "gemini-3.1-pro-preview": "91.0%",
+      "grok-4.3": "82.0%"
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-06-14T12:09:23.006693Z",
+    "models_read": [
+      "openrouter/google/gemini-3.1-pro-preview",
+      "openrouter/x-ai/grok-4.3",
+      "openrouter/openai/gpt-5.4"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41848,
+    "question_id": 41584,
+    "title": "Before March 1, 2026, will Meta settle the lawsuit brought by state attorneys general alleging the platform(s) were designed to foster compulsive use by minors?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 8.383387046559461,
+    "spot_peer_score": 11.40983517736357,
+    "baseline_score": 70.64843929312948,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.03,
+    "per_model_forecasts": {},
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-07T10:33:21.229092Z",
+    "models_read": [
+      "openrouter/openai/gpt-5",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3-flash-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41754,
+    "question_id": 41494,
+    "title": "Will Vladimir Putin cease to be the President of the Russian Federation before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 15.32483525631922,
+    "spot_peer_score": 17.654926667490724,
+    "baseline_score": 83.91802039328304,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.02,
+    "per_model_forecasts": {
+      "gpt-5.2": "1.0%",
+      "gpt-5": "1.0%",
+      "claude-opus-4.5": "3.0%",
+      "gemini-3-flash-preview": "6.0%",
+      "gemini-3-pro-preview": "2.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-28T21:12:12.804789Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3-flash-preview",
+      "openrouter/google/gemini-3-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43828,
+    "question_id": 43858,
+    "title": "Will Swiss voters approve the \"No to a Switzerland with 10 million\" population cap referendum?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "middling",
+    "peer_score": 8.786467343987754,
+    "spot_peer_score": 12.670526644826118,
+    "baseline_score": 51.92468362629811,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.17,
+    "per_model_forecasts": {
+      "gpt-5.4": "22.0%",
+      "gpt-5.5": "24.0%",
+      "claude-opus-4.8": "9.0%",
+      "claude-opus-4.6": "12.0%",
+      "gemini-3.1-pro-preview": "12.0%",
+      "grok-4.3": "28.0%"
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-06-09T13:22:10.639377Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.5",
+      "openrouter/anthropic/claude-opus-4.8",
+      "openrouter/anthropic/claude-opus-4.6"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43135,
+    "question_id": 43149,
+    "title": "Will U.S. spot Bitcoin ETFs take in at least $1 billion of net inflows during April 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 23.827719585671712,
+    "spot_peer_score": 30.600253628107033,
+    "baseline_score": 58.885535875026974,
+    "resolution": true,
+    "resolution_raw": "yes",
+    "our_prob_yes": 0.85,
+    "per_model_forecasts": {
+      "Forecaster 1": "85.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-04-12T15:20:46.434454Z",
+    "models_read": [
+      "unknown"
+    ],
+    "options": null,
+    "rationale_caveat": "single_section_stacker_meta"
+  },
+  {
+    "post_id": 41846,
+    "question_id": 41582,
+    "title": "Will there be a successful coup in Africa or Latin America before March 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 24.969143652574868,
+    "spot_peer_score": 24.894279612404674,
+    "baseline_score": 76.82146556055686,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.12,
+    "per_model_forecasts": {
+      "gpt-5.2": "11.0%",
+      "gpt-5": "9.0%",
+      "claude-opus-4.5": "12.0%",
+      "gemini-3-flash-preview": "16.0%",
+      "gemini-3-pro-preview": "14.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-06T12:36:26.917171Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43076,
+    "question_id": 43076,
+    "title": "Will global tensions push New York yellow globes over $10 per sack in April 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 27.165944692552145,
+    "spot_peer_score": 30.972477359615834,
+    "baseline_score": 32.721592650121046,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.35,
+    "per_model_forecasts": {
+      "Forecaster 1": "35.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-04-05T14:42:12.182739Z",
+    "models_read": [
+      "unknown"
+    ],
+    "options": null,
+    "rationale_caveat": "single_section_trimmed"
+  },
+  {
+    "post_id": 43058,
+    "question_id": 43058,
+    "title": "Will the CDC report at least 2,500 confirmed measles cases in the United States for 2026 before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 19.00029520691585,
+    "spot_peer_score": 27.364161612392717,
+    "baseline_score": 74.512035732369,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.12,
+    "per_model_forecasts": {
+      "Forecaster 1": "12.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-04-06T09:07:46.619600Z",
+    "models_read": [
+      "unknown"
+    ],
+    "options": null,
+    "rationale_caveat": "single_section_stacker_meta"
+  },
+  {
+    "post_id": 42119,
+    "question_id": 41882,
+    "title": "Will any state actor use chemical weapons in Ukraine before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 34.03884066604054,
+    "spot_peer_score": 44.14966694417447,
+    "baseline_score": 70.72952161621575,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.02,
+    "per_model_forecasts": {
+      "Forecaster 1": "2.0%",
+      "gpt-5.1": "1.0%",
+      "claude-4.6-opus": "3.0%",
+      "claude-opus-4.5": "13.0%",
+      "gemini-3.1-pro-preview": "1.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-22T03:24:26.230376Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview",
+      "unknown"
+    ],
+    "options": null,
+    "rationale_caveat": "first_section_model_line_trimmed"
+  },
+  {
+    "post_id": 42242,
+    "question_id": 42023,
+    "title": "Will the English Wikipedia have at least 7,190,000 articles before May 1, 2026?",
+    "type": "binary",
+    "raw_type": "binary",
+    "tercile": "good",
+    "peer_score": 42.43006380637193,
+    "spot_peer_score": 68.0572292560668,
+    "baseline_score": 57.731843227472496,
+    "resolution": false,
+    "resolution_raw": "no",
+    "our_prob_yes": 0.02,
+    "per_model_forecasts": {
+      "gpt-5.2": "2.0%",
+      "gpt-5.1": "2.0%",
+      "claude-4.6-opus": "5.0%",
+      "claude-opus-4.5": "4.0%",
+      "gemini-3.1-pro-preview": "2.0%"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-25T02:06:29.169939Z",
+    "models_read": [
+      "openrouter/google/gemini-3.1-pro-preview",
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5.1"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43652,
+    "question_id": 43656,
+    "title": "What share of Armenia\u2019s National Assembly seats will Civil Contract win in the June 2026 parliamentary election?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "worst",
+    "peer_score": -5.933181957245853,
+    "spot_peer_score": -13.840586930991252,
+    "baseline_score": 6.909364139183516,
+    "resolution": "At least 58% but less than 64% of all National Assembly seats",
+    "resolution_raw": "At least 58% but less than 64% of all National Assembly seats",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "Forecaster 1": {
+        "Less than 52% of all National Assembly seats": 0.18,
+        "At least 52% but less than 58% of all National Assembly seats": 0.33,
+        "At least 58% but less than 64% of all National Assembly seats": 0.23,
+        "At least 64% but less than two-thirds of all National Assembly seats": 0.16,
+        "At least two-thirds of all National Assembly seats": 0.1
+      }
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-05-29T19:48:23.857455Z",
+    "models_read": [
+      "unknown"
+    ],
+    "options": [
+      "Less than 52% of all National Assembly seats",
+      "At least 52% but less than 58% of all National Assembly seats",
+      "At least 58% but less than 64% of all National Assembly seats",
+      "At least 64% but less than two-thirds of all National Assembly seats",
+      "At least two-thirds of all National Assembly seats"
+    ],
+    "rationale_caveat": "single_section_stacker_meta"
+  },
+  {
+    "post_id": 42800,
+    "question_id": 42740,
+    "title": "Which month will have the highest officially reported TSMC consolidated net revenue among January, February, and March 2026?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "worst",
+    "peer_score": -7.029422272758471,
+    "spot_peer_score": -10.262909898319885,
+    "baseline_score": 6.421477995569038,
+    "resolution": "March 2026",
+    "resolution_raw": "March 2026",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": {
+        "January 2026": 0.62,
+        "February 2026": 0.01,
+        "March 2026": 0.37
+      },
+      "gpt-5.1": {
+        "January 2026": 0.64,
+        "February 2026": 0.01,
+        "March 2026": 0.35
+      },
+      "claude-4.6-opus": {
+        "January 2026": 0.47,
+        "February 2026": 0.01,
+        "March 2026": 0.52
+      },
+      "claude-opus-4.5": {
+        "January 2026": 0.58,
+        "February 2026": 0.01,
+        "March 2026": 0.41
+      },
+      "gemini-3.1-pro-preview": {
+        "January 2026": 0.71,
+        "February 2026": 0.01,
+        "March 2026": 0.28
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-22T03:29:09.945926Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.1",
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": [
+      "January 2026",
+      "February 2026",
+      "March 2026"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42438,
+    "question_id": 42236,
+    "title": "How far will the Duke Blue Devils advance in the NCAA's 2026 March Madness?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "worst",
+    "peer_score": -11.142190479043267,
+    "spot_peer_score": -12.779693160776835,
+    "baseline_score": 9.79854084641135,
+    "resolution": "Elite Eight",
+    "resolution_raw": "Elite Eight",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": {
+        "Round of 64": 0.04,
+        "Round of 32": 0.09,
+        "Sweet 16": 0.21,
+        "Elite Eight": 0.14,
+        "Final Four": 0.2,
+        "Championship Game (loss)": 0.12,
+        "Championship Game (win)": 0.2
+      },
+      "gpt-5.1": {
+        "Round of 64": 0.01,
+        "Round of 32": 0.08,
+        "Sweet 16": 0.11,
+        "Elite Eight": 0.27,
+        "Final Four": 0.18,
+        "Championship Game (loss)": 0.14,
+        "Championship Game (win)": 0.21
+      },
+      "claude-4.6-opus": {
+        "Round of 64": 0.01,
+        "Round of 32": 0.07,
+        "Sweet 16": 0.14,
+        "Elite Eight": 0.17,
+        "Final Four": 0.2,
+        "Championship Game (loss)": 0.17,
+        "Championship Game (win)": 0.24
+      },
+      "claude-opus-4.5": {
+        "Round of 64": 0.02,
+        "Round of 32": 0.08,
+        "Sweet 16": 0.13,
+        "Elite Eight": 0.17,
+        "Final Four": 0.23,
+        "Championship Game (loss)": 0.14,
+        "Championship Game (win)": 0.23
+      },
+      "gemini-3.1-pro-preview": {
+        "Round of 64": 0.03,
+        "Round of 32": 0.11,
+        "Sweet 16": 0.16,
+        "Elite Eight": 0.16,
+        "Final Four": 0.2,
+        "Championship Game (loss)": 0.13,
+        "Championship Game (win)": 0.21
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-06T00:04:19.318143Z",
+    "models_read": [
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview"
+    ],
+    "options": [
+      "Round of 64",
+      "Round of 32",
+      "Sweet 16",
+      "Elite Eight",
+      "Final Four",
+      "Championship Game (loss)",
+      "Championship Game (win)"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43982,
+    "question_id": 44009,
+    "title": "Which party\u2019s candidate will win the 2026 Saalekreis Landrat runoff election in Saxony-Anhalt, Germany?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "worst",
+    "peer_score": 1.7049366185074013,
+    "spot_peer_score": 13.46767790040739,
+    "baseline_score": -4.07291221900916,
+    "resolution": "Christian Democratic Union (CDU)",
+    "resolution_raw": "Christian Democratic Union (CDU)",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": {
+        "Alternative for Germany (AfD)": 0.55,
+        "Christian Democratic Union (CDU)": 0.45
+      },
+      "gpt-5.5": {
+        "Alternative for Germany (AfD)": 0.59,
+        "Christian Democratic Union (CDU)": 0.41
+      },
+      "claude-opus-4.8": {
+        "Alternative for Germany (AfD)": 0.48,
+        "Christian Democratic Union (CDU)": 0.52
+      },
+      "claude-opus-4.6": {
+        "Alternative for Germany (AfD)": 0.4,
+        "Christian Democratic Union (CDU)": 0.6
+      },
+      "gemini-3.1-pro-preview": {
+        "Alternative for Germany (AfD)": 0.24,
+        "Christian Democratic Union (CDU)": 0.76
+      },
+      "grok-4.3": {
+        "Alternative for Germany (AfD)": 0.57,
+        "Christian Democratic Union (CDU)": 0.43
+      }
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-06-17T06:13:10.110151Z",
+    "models_read": [
+      "openrouter/x-ai/grok-4.3",
+      "openrouter/openai/gpt-5.4",
+      "openrouter/openai/gpt-5.5"
+    ],
+    "options": [
+      "Alternative for Germany (AfD)",
+      "Christian Democratic Union (CDU)"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43635,
+    "question_id": 43639,
+    "title": "Which party's candidate will win the 2026 Makerfield by-election?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "middling",
+    "peer_score": 7.55181916144045,
+    "spot_peer_score": 10.907531756834288,
+    "baseline_score": 62.6882495803366,
+    "resolution": "Labour Party",
+    "resolution_raw": "Labour Party",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.62,
+        "Green Party": 0.01,
+        "Reform UK": 0.32,
+        "Liberal Democrats": 0.01,
+        "Restore Britain": 0.02,
+        "Other party or candidate": 0.01
+      },
+      "gpt-5.5": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.62,
+        "Green Party": 0.01,
+        "Reform UK": 0.3,
+        "Liberal Democrats": 0.01,
+        "Restore Britain": 0.04,
+        "Other party or candidate": 0.01
+      },
+      "claude-opus-4.7": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.63,
+        "Green Party": 0.01,
+        "Reform UK": 0.31,
+        "Liberal Democrats": 0.01,
+        "Restore Britain": 0.02,
+        "Other party or candidate": 0.01
+      },
+      "claude-opus-4.6": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.66,
+        "Green Party": 0.01,
+        "Reform UK": 0.27,
+        "Liberal Democrats": 0.01,
+        "Restore Britain": 0.02,
+        "Other party or candidate": 0.02
+      },
+      "gemini-3.1-pro-preview": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.6,
+        "Green Party": 0.01,
+        "Reform UK": 0.35,
+        "Liberal Democrats": 0.01,
+        "Restore Britain": 0.01,
+        "Other party or candidate": 0.01
+      },
+      "grok-4.3": {
+        "Conservative Party": 0.01,
+        "Labour Party": 0.57,
+        "Green Party": 0.02,
+        "Reform UK": 0.32,
+        "Liberal Democrats": 0.02,
+        "Restore Britain": 0.05,
+        "Other party or candidate": 0.01
+      }
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-05-27T15:45:27.810721Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.4",
+      "openrouter/openai/gpt-5.5",
+      "openrouter/anthropic/claude-opus-4.7"
+    ],
+    "options": [
+      "Conservative Party",
+      "Labour Party",
+      "Green Party",
+      "Reform UK",
+      "Liberal Democrats",
+      "Restore Britain",
+      "Other party or candidate"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43696,
+    "question_id": 43725,
+    "title": "Which U.S. Supreme Court Justice will write the majority opinion in Monsanto Company v. John L. Durnell?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "middling",
+    "peer_score": 13.880537006809183,
+    "spot_peer_score": 52.260327618264874,
+    "baseline_score": 7.326914326436093,
+    "resolution": "Brett M. Kavanaugh",
+    "resolution_raw": "Brett M. Kavanaugh",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": {
+        "John G. Roberts, Jr.": 0.18,
+        "Elena Kagan": 0.05,
+        "Clarence Thomas": 0.18,
+        "Amy Coney Barrett": 0.15,
+        "Samuel A. Alito, Jr.": 0.06,
+        "Sonia Sotomayor": 0.03,
+        "Neil M. Gorsuch": 0.12,
+        "Brett M. Kavanaugh": 0.21,
+        "Ketanji Brown Jackson": 0.02
+      },
+      "gpt-5.5": {
+        "John G. Roberts, Jr.": 0.19,
+        "Elena Kagan": 0.08,
+        "Clarence Thomas": 0.12,
+        "Amy Coney Barrett": 0.16,
+        "Samuel A. Alito, Jr.": 0.07,
+        "Sonia Sotomayor": 0.02,
+        "Neil M. Gorsuch": 0.12,
+        "Brett M. Kavanaugh": 0.22,
+        "Ketanji Brown Jackson": 0.02
+      },
+      "claude-opus-4.7": {
+        "John G. Roberts, Jr.": 0.18,
+        "Elena Kagan": 0.05,
+        "Clarence Thomas": 0.12,
+        "Amy Coney Barrett": 0.14,
+        "Samuel A. Alito, Jr.": 0.14,
+        "Sonia Sotomayor": 0.04,
+        "Neil M. Gorsuch": 0.1,
+        "Brett M. Kavanaugh": 0.19,
+        "Ketanji Brown Jackson": 0.04
+      },
+      "claude-opus-4.6": {
+        "John G. Roberts, Jr.": 0.16,
+        "Elena Kagan": 0.06,
+        "Clarence Thomas": 0.14,
+        "Amy Coney Barrett": 0.15,
+        "Samuel A. Alito, Jr.": 0.09,
+        "Sonia Sotomayor": 0.03,
+        "Neil M. Gorsuch": 0.16,
+        "Brett M. Kavanaugh": 0.18,
+        "Ketanji Brown Jackson": 0.03
+      },
+      "gemini-3.1-pro-preview": {
+        "John G. Roberts, Jr.": 0.16,
+        "Elena Kagan": 0.07,
+        "Clarence Thomas": 0.07,
+        "Amy Coney Barrett": 0.14,
+        "Samuel A. Alito, Jr.": 0.11,
+        "Sonia Sotomayor": 0.06,
+        "Neil M. Gorsuch": 0.13,
+        "Brett M. Kavanaugh": 0.19,
+        "Ketanji Brown Jackson": 0.07
+      },
+      "grok-4.3": {
+        "John G. Roberts, Jr.": 0.2,
+        "Elena Kagan": 0.03,
+        "Clarence Thomas": 0.18,
+        "Amy Coney Barrett": 0.1,
+        "Samuel A. Alito, Jr.": 0.05,
+        "Sonia Sotomayor": 0.04,
+        "Neil M. Gorsuch": 0.12,
+        "Brett M. Kavanaugh": 0.25,
+        "Ketanji Brown Jackson": 0.03
+      }
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-05-29T15:30:22.296997Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.5",
+      "openrouter/anthropic/claude-opus-4.7",
+      "openrouter/anthropic/claude-opus-4.6"
+    ],
+    "options": [
+      "John G. Roberts, Jr.",
+      "Elena Kagan",
+      "Clarence Thomas",
+      "Amy Coney Barrett",
+      "Samuel A. Alito, Jr.",
+      "Sonia Sotomayor",
+      "Neil M. Gorsuch",
+      "Brett M. Kavanaugh",
+      "Ketanji Brown Jackson"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42248,
+    "question_id": 42029,
+    "title": "Which country will be ranked #1 in the World Happiness Report 2026?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "middling",
+    "peer_score": 6.814016656988322,
+    "spot_peer_score": 7.092595012124811,
+    "baseline_score": 82.9414712862489,
+    "resolution": "Finland",
+    "resolution_raw": "Finland",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": {
+        "Finland": 0.81,
+        "Denmark": 0.1,
+        "Iceland": 0.04,
+        "Other": 0.05
+      },
+      "gpt-5.1": {
+        "Finland": 0.93,
+        "Denmark": 0.03,
+        "Iceland": 0.02,
+        "Other": 0.02
+      },
+      "claude-4.6-opus": {
+        "Finland": 0.88,
+        "Denmark": 0.05,
+        "Iceland": 0.03,
+        "Other": 0.04
+      },
+      "claude-opus-4.5": {
+        "Finland": 0.85,
+        "Denmark": 0.08,
+        "Iceland": 0.04,
+        "Other": 0.03
+      },
+      "gemini-3.1-pro-preview": {
+        "Finland": 0.86,
+        "Denmark": 0.1,
+        "Iceland": 0.02,
+        "Other": 0.02
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-28T01:36:14.856296Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.1",
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": [
+      "Finland",
+      "Denmark",
+      "Iceland",
+      "Other"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42805,
+    "question_id": 42745,
+    "title": "Which list will win the most seats in Bulgaria\u2019s 2026 parliamentary election?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "good",
+    "peer_score": 98.23064910704463,
+    "spot_peer_score": 121.22936860233503,
+    "baseline_score": 74.18592530726386,
+    "resolution": "Other or tie",
+    "resolution_raw": "Other or tie",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": {
+        "GERB-SDS": 0.17,
+        "PP-DB": 0.03,
+        "Revival (Vazrazhdane)": 0.02,
+        "Other or tie": 0.78
+      },
+      "gpt-5.1": {
+        "GERB-SDS": 0.16,
+        "PP-DB": 0.03,
+        "Revival (Vazrazhdane)": 0.01,
+        "Other or tie": 0.8
+      },
+      "claude-4.6-opus": {
+        "GERB-SDS": 0.17,
+        "PP-DB": 0.03,
+        "Revival (Vazrazhdane)": 0.01,
+        "Other or tie": 0.79
+      },
+      "claude-opus-4.5": {
+        "GERB-SDS": 0.13,
+        "PP-DB": 0.03,
+        "Revival (Vazrazhdane)": 0.01,
+        "Other or tie": 0.83
+      },
+      "gemini-3.1-pro-preview": {
+        "GERB-SDS": 0.15,
+        "PP-DB": 0.01,
+        "Revival (Vazrazhdane)": 0.01,
+        "Other or tie": 0.83
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-23T19:40:25.901636Z",
+    "models_read": [
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview"
+    ],
+    "options": [
+      "GERB-SDS",
+      "PP-DB",
+      "Revival (Vazrazhdane)",
+      "Other or tie"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42509,
+    "question_id": 42307,
+    "title": "Which range will the Europe Brent spot price (USD per barrel) fall in on April 30, 2026?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "good",
+    "peer_score": 51.15355508739779,
+    "spot_peer_score": 49.72792392717796,
+    "baseline_score": -6.102053292476778,
+    "resolution": "100.00 or higher",
+    "resolution_raw": "100.00 or higher",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": {
+        "Below 70.00": 0.1,
+        "70.00 to below 85.00": 0.3,
+        "85.00 to below 100.00": 0.45,
+        "100.00 or higher": 0.15
+      },
+      "gpt-5.1": {
+        "Below 70.00": 0.1,
+        "70.00 to below 85.00": 0.3,
+        "85.00 to below 100.00": 0.35,
+        "100.00 or higher": 0.25
+      },
+      "claude-4.6-opus": {
+        "Below 70.00": 0.06,
+        "70.00 to below 85.00": 0.25,
+        "85.00 to below 100.00": 0.44,
+        "100.00 or higher": 0.25
+      },
+      "claude-opus-4.5": {
+        "Below 70.00": 0.09,
+        "70.00 to below 85.00": 0.3,
+        "85.00 to below 100.00": 0.38,
+        "100.00 or higher": 0.23
+      },
+      "gemini-3.1-pro-preview": {
+        "Below 70.00": 0.13,
+        "70.00 to below 85.00": 0.35,
+        "85.00 to below 100.00": 0.34,
+        "100.00 or higher": 0.18
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-11T01:38:26.026063Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3.1-pro-preview",
+      "openrouter/openai/gpt-5.2"
+    ],
+    "options": [
+      "Below 70.00",
+      "70.00 to below 85.00",
+      "85.00 to below 100.00",
+      "100.00 or higher"
+    ],
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42110,
+    "question_id": 41873,
+    "title": "Who will win the Wisconsin Supreme Court election scheduled for April 7, 2026?",
+    "type": "multiple_choice",
+    "raw_type": "multiple_choice",
+    "tercile": "good",
+    "peer_score": 28.169632229740596,
+    "spot_peer_score": 31.503284279357313,
+    "baseline_score": 80.85233379975948,
+    "resolution": "Chris Taylor",
+    "resolution_raw": "Chris Taylor",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "Forecaster 1": {
+        "Maria Lazar": 0.1,
+        "Chris Taylor": 0.89,
+        "Someone else": 0.01
+      },
+      "gpt-5.1": {
+        "Maria Lazar": 0.09,
+        "Chris Taylor": 0.89,
+        "Someone else": 0.02
+      },
+      "claude-4.6-opus": {
+        "Maria Lazar": 0.04,
+        "Chris Taylor": 0.95,
+        "Someone else": 0.01
+      },
+      "claude-opus-4.5": {
+        "Maria Lazar": 0.09,
+        "Chris Taylor": 0.9,
+        "Someone else": 0.01
+      },
+      "gemini-3-pro-preview": {
+        "Maria Lazar": 0.06,
+        "Chris Taylor": 0.93,
+        "Someone else": 0.01
+      }
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-16T19:39:30.999896Z",
+    "models_read": [
+      "openrouter/google/gemini-3-pro-preview",
+      "unknown",
+      "openrouter/openai/gpt-5.1"
+    ],
+    "options": [
+      "Maria Lazar",
+      "Chris Taylor",
+      "Someone else"
+    ],
+    "rationale_caveat": "first_section_model_line_trimmed"
+  },
+  {
+    "post_id": 43906,
+    "question_id": 43932,
+    "title": "How much will Gold Futures total price returns exceed S&P 500 Futures in these biweekly periods of Q2 2026? (Jun 15 - Jun 26)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "worst",
+    "peer_score": -0.7846173675052781,
+    "spot_peer_score": 0.8570162287386658,
+    "baseline_score": 15.182938893583875,
+    "resolution": -2.369,
+    "resolution_raw": "-2.369",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": "Probability distribution:",
+      "gpt-5.5": "Probability distribution:",
+      "claude-opus-4.8": "Probability distribution:",
+      "claude-opus-4.6": "Probability distribution:",
+      "gemini-3.1-pro-preview": "Probability distribution:",
+      "grok-4.3": "Probability distribution:"
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-06-12T15:19:59.357251Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.4",
+      "openrouter/openai/gpt-5.5",
+      "openrouter/anthropic/claude-opus-4.8"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42648,
+    "question_id": 42593,
+    "title": "How many ICJ judgments, advisory opinions, and orders dated from March 5, 2026 through April 30, 2026 inclusive will appear on the ICJ Decisions page before April 30, 2026?",
+    "type": "numeric",
+    "raw_type": "discrete",
+    "tercile": "worst",
+    "peer_score": 4.168126784690993,
+    "spot_peer_score": 5.2523795628703365,
+    "baseline_score": 22.102865078487174,
+    "resolution": 3.0,
+    "resolution_raw": "3.0",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5.1": "Probability distribution:",
+      "claude-4.6-opus": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3.1-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-20T09:24:08.698730Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.1",
+      "openrouter/anthropic/claude-4.6-opus",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41836,
+    "question_id": 41572,
+    "title": "What will the seasonally adjusted unemployment rate be in Australia, for the following months? (January 2026)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "worst",
+    "peer_score": -5.341090617880919,
+    "spot_peer_score": -4.019689872463424,
+    "baseline_score": 76.9496883006093,
+    "resolution": 4.147,
+    "resolution_raw": "4.147",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3-flash-preview": "Probability distribution:",
+      "gemini-3-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-24T04:35:34.993428Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3-flash-preview",
+      "openrouter/google/gemini-3-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41841,
+    "question_id": 41577,
+    "title": "What will the United States score on the 2025 Corruption Perceptions Index?",
+    "type": "numeric",
+    "raw_type": "discrete",
+    "tercile": "worst",
+    "peer_score": -6.020106720346207,
+    "spot_peer_score": -6.644377564039912,
+    "baseline_score": 25.507369603846517,
+    "resolution": 64.0,
+    "resolution_raw": "64.0",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5": "Probability distribution:",
+      "gemini-3-flash-preview": "Probability distribution:",
+      "gemini-3-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-02-03T22:12:07.758187Z",
+    "models_read": [
+      "openrouter/openai/gpt-5",
+      "openrouter/google/gemini-3-flash-preview",
+      "openrouter/google/gemini-3-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 42355,
+    "question_id": 42145,
+    "title": "How much will Nasdaq-100 Futures total price returns exceed S&P 500 Futures in these biweekly periods of Q1 2026? (Mar 16 - Mar 27)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "middling",
+    "peer_score": 14.236829999733468,
+    "spot_peer_score": 14.228045314255965,
+    "baseline_score": 22.07906085538008,
+    "resolution": -1.087,
+    "resolution_raw": "-1.087",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5.1": "Probability distribution:",
+      "claude-4.6-opus": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3.1-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-03-02T19:38:31.253925Z",
+    "models_read": [
+      "openrouter/google/gemini-3.1-pro-preview",
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5.1"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41838,
+    "question_id": 41574,
+    "title": "What will Alphabet's Q4 2025 constant-currency revenues be in these global regions? (EMEA)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "middling",
+    "peer_score": 17.098079355760863,
+    "spot_peer_score": 18.831176416484478,
+    "baseline_score": 28.639056237906132,
+    "resolution": 31618000000.0,
+    "resolution_raw": "31618000000.0",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3-flash-preview": "Probability distribution:",
+      "gemini-3-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-31T16:34:12.618439Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5",
+      "openrouter/anthropic/claude-opus-4.5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43644,
+    "question_id": 43649,
+    "title": "How much will Nasdaq-100 Futures total price returns exceed S&P 500 Futures in these biweekly periods of Q2 2026? (Jun 1 - Jun 12)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "middling",
+    "peer_score": 7.057851011964224,
+    "spot_peer_score": 18.768018789858733,
+    "baseline_score": 17.562164319109097,
+    "resolution": -0.328,
+    "resolution_raw": "-0.328",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": "Probability distribution:",
+      "gpt-5.5": "Probability distribution:",
+      "claude-opus-4.7": "Probability distribution:",
+      "claude-opus-4.6": "Probability distribution:",
+      "gemini-3.1-pro-preview": "Probability distribution:",
+      "grok-4.3": "Probability distribution:"
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-05-29T15:27:34.424311Z",
+    "models_read": [
+      "openrouter/openai/gpt-5.4",
+      "openrouter/openai/gpt-5.5",
+      "openrouter/anthropic/claude-opus-4.7"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41665,
+    "question_id": 41406,
+    "title": "What will be the ending value of the ICE BofA US High Yield Option-Adjusted Spread for these biweekly periods of Q1 2026? (Feb 2 - Feb 13)",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "good",
+    "peer_score": 29.372667062324485,
+    "spot_peer_score": 34.65804723356614,
+    "baseline_score": 55.05029494707364,
+    "resolution": 2.95,
+    "resolution_raw": "2.95",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3-flash-preview": "Probability distribution:",
+      "gemini-3-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-19T19:47:28.415124Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.5",
+      "openrouter/google/gemini-3-flash-preview",
+      "openrouter/google/gemini-3-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 43614,
+    "question_id": 43611,
+    "title": "What will Democrats' lead be in the congressional generic ballot on June 14, 2026?",
+    "type": "numeric",
+    "raw_type": "discrete",
+    "tercile": "good",
+    "peer_score": 31.846321974023276,
+    "spot_peer_score": 36.13813334769241,
+    "baseline_score": 69.73509753250777,
+    "resolution": 6.4,
+    "resolution_raw": "6.4",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.4": "Probability distribution:",
+      "gpt-5.5": "Probability distribution:",
+      "claude-opus-4.7": "Probability distribution:",
+      "claude-opus-4.6": "Probability distribution:",
+      "gemini-3.1-pro-preview": "Probability distribution:",
+      "grok-4.3": "Probability distribution:"
+    },
+    "source_tournament": "summer-futureeval-2026",
+    "config_era": "post_flip",
+    "bot_comment_created_at": "2026-05-23T16:50:33.387030Z",
+    "models_read": [
+      "openrouter/anthropic/claude-opus-4.7",
+      "openrouter/anthropic/claude-opus-4.6",
+      "openrouter/google/gemini-3.1-pro-preview"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  },
+  {
+    "post_id": 41759,
+    "question_id": 41499,
+    "title": "What will be the State Bank of Pakistan's target policy rate as of May 1, 2026?",
+    "type": "numeric",
+    "raw_type": "numeric",
+    "tercile": "good",
+    "peer_score": 19.737373753161965,
+    "spot_peer_score": 30.730496362856893,
+    "baseline_score": 32.92674631316302,
+    "resolution": 11.5,
+    "resolution_raw": "11.5",
+    "our_prob_yes": null,
+    "per_model_forecasts": {
+      "gpt-5.2": "Probability distribution:",
+      "gpt-5": "Probability distribution:",
+      "claude-opus-4.5": "Probability distribution:",
+      "gemini-3-flash-preview": "Probability distribution:",
+      "gemini-3-pro-preview": "Probability distribution:"
+    },
+    "source_tournament": "spring-aib-2026",
+    "config_era": "pre_flip",
+    "bot_comment_created_at": "2026-01-30T00:24:24.707137Z",
+    "models_read": [
+      "openrouter/google/gemini-3-pro-preview",
+      "openrouter/openai/gpt-5.2",
+      "openrouter/openai/gpt-5"
+    ],
+    "options": null,
+    "rationale_caveat": null
+  }
+]

@@ -1,0 +1,129 @@
+[
+  {
+    "claim_id": "C1",
+    "post_id": 42438,
+    "topic": "NCAA #1 (overall) seed outcome distribution (Duke 2026 March Madness, resolved Elite Eight)",
+    "models": [
+      "claude-4.6-opus",
+      "claude-opus-4.5",
+      "gemini-3.1-pro"
+    ],
+    "remembered_rate": {
+      "claude-4.6-opus": "R64 ~1%, R32 ~9%, S16 ~16%, E8 ~20%, F4 ~16%, ChampL ~14%, ChampW ~24%; Final Four rate ~54-58%",
+      "claude-opus-4.5": "R64 ~1-2%, R32 ~8-10%, S16 ~13-17%, E8 ~18-22%, F4 ~20-25%, ChampL ~12-15%, ChampW ~18-25% (reach-F4-or-better sums to ~50-65%)",
+      "gemini-3.1-pro": "overall #1 seed reaches Final Four ~50%, wins title ~20%, loses R64/R32 ~15%"
+    },
+    "actual_rate": {
+      "generic_1_seed_final_four_rate": "~38-42% (60 Final Four appearances by #1 seeds since 1985 out of ~144-160 #1-seed slots)",
+      "generic_1_seed_title_rate_per_team": "~16% (26 titles by #1 seeds / 160 #1-seed slots = 16.25%)",
+      "share_of_champions_that_were_1_seeds": "65% (26 of 40 champions 1985-2025)",
+      "overall_1_seed_estimate": "the top-overall #1 seed (Duke's situation) runs modestly above a generic #1 seed: est. Final Four ~45-50%, title ~18-22%, early (R64/R32) exit ~15-19%"
+    },
+    "source": "Wikipedia 'NCAA Division I men's basketball tournament' (Final Four seed counts: 4 yrs three #1s, 13 yrs two, 14 yrs one, 2 yrs all four [2008, 2025], 3 yrs zero [2006, 2011, 2023]); bracketresearch.com/seeds-of-ncaa-tournament-champions (26 of 40 champions since 1985 were #1 seeds)",
+    "numerator_denominator": "Final Four: ~60 #1-seed F4 appearances / ~144-160 slots (1985-2025, ex-2020). Titles: 26 #1-seed champions / 40 tournaments = 65% of titles; 26/160 = 16% per #1-seed team",
+    "materially_off": true,
+    "error_size": "claude-4.6-opus most inflated: F4 54-58% vs actual generic ~40% / overall-#1 est ~45-50% (~10-15pp high), title 24% vs generic 16% / overall-#1 est ~18-22% (ratio ~1.2-1.5x). gemini-3.1-pro closest (F4 ~50%, title ~20%, early ~15%). claude-opus-4.5 range brackets reality but skews high.",
+    "direction": "toward",
+    "confidence": "medium",
+    "notes": "Duke was the 2026 KenPom #1 and top-overall #1 seed; it exited in the Elite Eight (did NOT reach Final Four). Bot published ~54-61% on Final Four+, i.e. only ~39-46% on the 'no Final Four' bucket that contains the E8 exit. True 'no Final Four' rate for an overall #1 seed is ~50-55%, so the E8/earlier-exit bucket WAS underweighted. gemini-3.1-pro was the best-calibrated of the three; claude-4.6-opus the most inflated on both F4 and championship. Correcting the inflated base rates down shifts mass to earlier exits = toward the resolved E8 outcome. Overall-#1-seed figures are an estimate anchored on solid generic-#1 data; year-by-year overall-#1 record not independently tabulated this session (hence medium confidence)."
+  },
+  {
+    "claim_id": "C2",
+    "post_id": 42438,
+    "topic": "'The best team wins the title only ~20-25% of the time regardless of metrics'",
+    "models": [
+      "claude-4.6-opus"
+    ],
+    "remembered_rate": "~20-25% (best/consensus-favorite team wins the title)",
+    "actual_rate": "KenPom database starts 2002 (23 tournaments through 2025 ex-2020). The KenPom-#1-entering-the-tournament has won the title only a handful of times; several recent KenPom #1s failed (2015 Kentucky lost F4, 2021 Gonzaga lost final). Best available anchor: any #1 SEED wins 65% of titles but a GIVEN #1 seed wins only ~16%, and the single pre-tournament favorite converts at roughly ~20-25%.",
+    "source": "collegebasketballtimes.com KenPom champion table 2002-2021; ncaa.com Jan-1 KenPom-rank-of-champions table; bracketresearch seed-of-champions",
+    "numerator_denominator": "Could not enumerate an exact 'KenPom #1 entering tournament won title' count this session; qualitative evidence (documented favorites like 2015 Kentucky, 2021 Gonzaga losing) supports the ~20-25% figure. Per-team #1-seed title rate 26/160 = 16% as a lower bound (favorite > average #1 seed).",
+    "materially_off": false,
+    "error_size": "small — remembered ~20-25% is within the plausible historical range for the pre-tournament favorite; not contradicted by any source found",
+    "direction": "neutral",
+    "confidence": "medium",
+    "notes": "This memory claim is essentially ACCURATE — the favorite winning ~1-in-4-to-5 is well supported (title is high-variance; even undefeated/KenPom-#1 teams routinely fall short). Could not pin an exact enumerated count for the KenPom-#1 subclass, so confidence is medium rather than high. No correction warranted."
+  },
+  {
+    "claim_id": "C3",
+    "post_id": 43982,
+    "topic": "AfD first-round-leader runoff conversion in eastern German executive (Landrat/OB) elections (Saalekreis Landrat runoff, resolved CDU — AfD lost)",
+    "models": [
+      "grok-4.3",
+      "gpt-5.4",
+      "gpt-5.5"
+    ],
+    "remembered_rate": {
+      "grok-4.3": "~30% conversion (3 wins of ~10 comparable cases)",
+      "gpt-5.4": "~40%",
+      "gpt-5.5": "~45% ('roughly coin-flip')"
+    },
+    "actual_rate": "~30-40% conversion. Eastern-German executive runoffs where the AfD LED round 1: WINS = Sonneberg Landrat 2023 (Sesselmann, led 46.7% -> won 52.8%), Pirna OB 2023 (Lochner, AfD-nominated, led -> won 38.5% three-way); (+ small-town Raguhn-Jeßnitz mayor 2023). LOSSES = Görlitz OB 2019 (Wippel, led -> lost 45/55), Nordhausen OB 2023 (Prophet, led ~42% -> lost 45.1/54.9), Saale-Orla-Kreis Landrat 2024 (Thrum, led 45.7% -> lost 47.6/52.4), Saalekreis Landrat 2026 (Arendt, led ~43% -> lost ~46/54, the question itself). => strict Landrat/OB: 2 wins / 6 = 33%; including Raguhn-Jeßnitz: 3/7 = 43%.",
+    "source": "DW (Nordhausen: AfD 45.1% vs 54.9%), Der Spiegel (Saale-Orla: Herrgott CDU 52.4% vs Thrum AfD, Thrum led R1 45.7%), MDR (Saalekreis 2026: Czekalla CDU ~54% vs Arendt AfD ~46%, Arendt led R1 ~43%), BBC/DW (Görlitz 2019: Ursu CDU 55%+ vs Wippel), Le Monde (Pirna 2023 AfD win), Al Jazeera (Frankfurt/Oder 2025 — AfD did NOT lead R1, excluded)",
+    "numerator_denominator": "2 wins / 6 strict Landrat+OB cases = 33% (or 3/7 = 43% incl. Raguhn-Jeßnitz town mayor)",
+    "materially_off": true,
+    "error_size": "The models PUBLISHED ~55-59% for AfD, ~15-25pp above the true ~30-40% base rate. grok's own 30% was accurate (~1x); gpt-5.5's 45% was high (~1.3-1.5x); the published 55-59% is materially off (~1.5-1.8x).",
+    "direction": "toward",
+    "confidence": "high",
+    "notes": "grok-4.3 was CLOSEST — its '3 wins, ~30%, ~10 cases' matches the real record almost exactly. The AfD lost (CDU won), so correcting the inflated ensemble estimate (55-59%) down to the true ~30-40% raises CDU probability = toward the resolved outcome. Notably the Saalekreis 2026 runoff being forecast IS itself another loss in the reference class, reinforcing the ~30% pattern. The recurring failure mode: first-round AfD leads collapse in runoffs as all mainstream parties consolidate against them (Görlitz, Nordhausen, Saale-Orla, Saalekreis all fit)."
+  },
+  {
+    "claim_id": "C4",
+    "post_id": "42116/42117",
+    "topic": "Baden-Württemberg CDU largest-party base rate (March 2026 Landtag; 42116 'CDU win most seats?' resolved NO, bot 88% YES; 42117 'AfD win most seats?' resolved NO, bot 1%)",
+    "models": [
+      "gpt-5.2",
+      "gpt-5.1"
+    ],
+    "remembered_rate": {
+      "gpt-5.2": "blended recent-era ~33% CDU-plurality with long-run CDU dominance -> ~55%",
+      "gpt-5.1": "blended -> ~65%"
+    },
+    "actual_rate": "CDU won most seats in only 2 of the last 5 BW elections (2006, 2011); the Greens have been the largest party in the last three straight (2016: Greens 47 vs CDU 42; 2021: Greens 58 vs CDU 42; 2026: Greens led votes 30.2% vs CDU 29.7%, tied 56-56 seats, Greens ranked first). Recent-era (2016-2026) CDU-plurality rate = 0/3 = 0%; since 2006 = 2/5 = 40%.",
+    "source": "Wikipedia 2011/2016/2021/2026 Baden-Württemberg state elections; DW & Wikipedia (2026: Greens 30.2%/56 seats, CDU 29.7%/56 seats, AfD 18.8%/35 seats; Greens largest, Özdemir to be Minister-President)",
+    "numerator_denominator": "CDU largest by seats: 2/5 elections since 2006 (2006, 2011); 0/3 in the current Green-incumbency era (2016, 2021, 2026)",
+    "materially_off": true,
+    "error_size": "Bot published 88% YES for CDU-most-seats; recent-era base rate is ~0-40%. Even gpt-5.2/gpt-5.1's blended 55-65% was 15-25pp too high vs the recent record, and the published 88% was a ~48-88pp overshoot. Huge miss.",
+    "direction": "toward",
+    "confidence": "high",
+    "notes": "The Greens have held the Minister-Presidency since 2011 (Kretschmann) and were the largest party in 2016 and 2021; blending toward pre-2011 CDU dominance was the core error. The recent-era rate (Greens incumbent, 0/3 CDU pluralities) should have dominated. Correcting to the recent record pushes CDU-most-seats probability down = toward the NO resolution. Note 2026 was a 56-56 seat tie with Greens leading on votes, so 42116 resolved NO. The AfD question (42117) resolving NO at 1% was well-calibrated (AfD third at 18.8%)."
+  },
+  {
+    "claim_id": "C5",
+    "post_id": 43828,
+    "topic": "Swiss SVP-initiative pass rate ('No to a 10-million Switzerland' sustainability initiative, resolved NO/rejected; bot 17% approve)",
+    "models": [
+      "gpt-5.5",
+      "claude-opus-4.8"
+    ],
+    "remembered_rate": {
+      "gpt-5.5": "~20% (SVP-backed immigration/population initiatives facing broad elite opposition, double-majority)",
+      "claude-opus-4.8": "8-15%"
+    },
+    "actual_rate": "Overall Swiss federal popular initiative pass rate ~11.5% (22 of 192 accepted through 2014; ~10-12% including recent years). SVP-backed: PASSED = minaret ban 2009, expulsion/deportation 2010, mass immigration Feb 2014 (a 2009-2014 hot streak). FAILED = self-determination 2018 (33.7% yes / 66.3% no), limitation/moderation initiative 2020 (rejected), and this sustainability/10-million initiative 2025 (rejected). Post-2014 SVP initiatives have consistently failed.",
+    "source": "Wikipedia 'List of federal popular initiatives (Switzerland)' (22/192 ≈ 11.5%); Wikipedia 2018 Swiss referendums (self-determination 33.7% yes, rejected)",
+    "numerator_denominator": "All initiatives: ~22/192 = 11.5% overall. SVP-specific: 3 passed (2009, 2010, 2014) in the immigration-salient era; 0-for-3+ since 2014 (2018, 2020, 2025)",
+    "materially_off": "uncertain",
+    "error_size": "claude-opus-4.8's 8-15% straddles the ~11% overall rate — accurate. gpt-5.5's 20% is ~1.8x the overall rate (arguably materially high) but defensible against the broader SVP catalog, which passes above the ~11% average; either way both correctly implied likely rejection.",
+    "direction": "neutral",
+    "confidence": "high",
+    "notes": "The initiative was rejected; bot's 17% approve was well-calibrated toward that. claude-opus-4.8 (8-15%) was closest to both the overall base rate and the recent SVP failure streak. gpt-5.5 (20%) is a touch high but still points firmly at rejection. Correcting gpt-5.5's 20% down to ~11% would reinforce (slightly toward) the rejection outcome; neither estimate materially harmed the forecast, hence net direction neutral. 2020 limitation-initiative failure is from general knowledge, not independently re-verified this session (not load-bearing for the verdict)."
+  },
+  {
+    "claim_id": "C6",
+    "post_id": 42110,
+    "topic": "Wisconsin Supreme Court election margins (RESEARCH-attributed, resolved 'Chris Taylor' / liberal; bot high liberal prob, peer +28)",
+    "models": [
+      "research-provided (not model memory)"
+    ],
+    "remembered_rate": "research claim: liberals won 2023 by ~11pp and 2025 by ~10pp; liberals won 4 of last 5",
+    "actual_rate": "2023 Protasiewicz 55.43% vs Kelly 44.39% = 11.04pp; 2025 Crawford 55.02% vs Schimel 44.92% = 10.10pp; liberals won 4 of last 5 statewide WI SC races (2018 Dallet, 2020 Karofsky, 2023 Protasiewicz, 2025 Crawford won; 2019 Hagedorn [conservative] the lone exception).",
+    "source": "Wikipedia 2023 Wisconsin Supreme Court election (Protasiewicz 55.43% / Kelly 44.39%); Wikipedia 2025 Wisconsin Supreme Court election (Crawford 55.02% / Schimel 44.92%)",
+    "numerator_denominator": "2023 margin 11.04pp; 2025 margin 10.10pp; liberals 4 of last 5 (2018/2020/2023/2025 won, 2019 lost)",
+    "materially_off": false,
+    "error_size": "none — research figures match the record within ~0.1-1pp (research said ~11pp / ~10pp; actual 11.04pp / 10.10pp) and the 4-of-5 record is exact",
+    "direction": "toward",
+    "confidence": "high",
+    "notes": "This is the control case: the RESEARCH-provided rates were accurate (unlike the memory-based claims in C1/C3/C4). They correctly supported a high liberal-win probability, and the seat resolved to the liberal (Chris Taylor). Accurate research reinforced the correct forecast = toward the resolved outcome. Demonstrates the audit's core contrast: research-sourced base rates held up, memory-sourced ones (C1, C3, C4) were inflated."
+  }
+]
