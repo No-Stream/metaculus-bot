@@ -77,8 +77,8 @@ Re-running the headline on the adjudicator's anchors reproduces the coin flip: *
 hurt 20, mean Δlog −0.056** (mine on the same subset: 20/20, −0.066). The adjudicator
 independently flagged the same hard borderline calls (41846 horizon, 41754 Putin-horizon,
 42119 chem-weapons war-lifetime, 42438 Duke cumulative). The conclusion is not an artifact
-of my anchor choices. (`interrater.py`; a second adjudicator `_adj_A.json` was dispatched
-and will fold in automatically if it lands — not required for the result.)
+of my anchor choices. (`interrater.py`; a second adjudicator was dispatched for redundancy
+but died on an API timeout mid-run — one blind cross-check is what we have, and it agrees.)
 
 ### Scoring
 
