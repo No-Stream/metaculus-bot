@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from urllib.parse import unquote
 
@@ -28,6 +29,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -267,22 +269,36 @@ def _parse_csv_field(raw: str) -> list[str]:
     return [item for item in items if item and item != "NONE"]
 
 
-def _fetch_yfinance_data(ticker: str) -> str:
+def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_benchmarking: bool = False) -> str:
     """Fetch price data and key metrics for a single ticker via yfinance.
 
     Sync function -- caller wraps in asyncio.to_thread().
     Returns formatted markdown or "" on any failure.
+
+    Live (``is_benchmarking=False``): unchanged — a trailing ``period="365d"``
+    window and the live ``.info`` fundamentals. Backtest (``is_benchmarking=True``):
+    ceiling the price history to ``as_of`` via ``history(start=..., end=...)`` (end
+    exclusive) and SKIP the ``.info`` call entirely — ``.info`` has no historical
+    mode, so its market cap / P/E / current price would leak TODAY's values into a
+    question resolved months ago. Current price then comes from the last ceilinged
+    close, and every derived stat (returns / vol / 52wk) computes off that frame.
     """
     try:
         ticker_obj = yfinance.Ticker(ticker)
-        period = f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d"
-        history = ticker_obj.history(period=period)
+        if is_benchmarking:
+            assert as_of is not None, "benchmarking yfinance fetch requires as_of"
+            start = (as_of - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+            end = (as_of + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
+            history = ticker_obj.history(start=start.isoformat(), end=end.isoformat())
+        else:
+            history = ticker_obj.history(period=f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d")
 
         if history.empty:
             logger.warning(f"yfinance returned empty history for {ticker=}")
             return ""
 
-        info = ticker_obj.info or {}
+        # Skip the live `.info` call under benchmarking (no historical mode → leakage).
+        info: dict = {} if is_benchmarking else (ticker_obj.info or {})
         close = history["Close"]
         current_price = close.iloc[-1]
 
@@ -310,10 +326,13 @@ def _fetch_yfinance_data(ticker: str) -> str:
         high_52w = year_slice.max()
         parts.append(f"- 52-week range: {low_52w:.2f} - {high_52w:.2f}")
 
-        # Optional fundamentals from .info
-        fundamentals = _format_fundamentals(info)
-        if fundamentals:
-            parts.append(fundamentals)
+        # Optional fundamentals from .info (live only; `info` is {} under benchmarking).
+        if is_benchmarking:
+            parts.append("- Fundamentals: [omitted under backtest — .info has no historical mode]")
+        else:
+            fundamentals = _format_fundamentals(info)
+            if fundamentals:
+                parts.append(fundamentals)
 
         # Last 5 closing prices
         last_5 = close.tail(5)
@@ -373,8 +392,46 @@ def _format_fundamentals(info: dict) -> str:
     return ""
 
 
+def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
+    """Render the derived-stat markdown block for a FRED series.
+
+    Shared by the live (fredapi) and benchmarking (keyless ts_fetch) paths so the two
+    render identically — latest/previous value, MoM + YoY change, last 6 observations.
+    ``data`` must already be dropna'd and sorted ascending by date.
+    """
+    parts = [f"### {series_id} ({title})"]
+
+    latest_value = data.iloc[-1]
+    latest_date = data.index[-1]
+    parts.append(f"- Latest value: {latest_value:.4g} ({latest_date.strftime('%Y-%m-%d')})")
+
+    if len(data) >= 2:
+        previous_value = data.iloc[-2]
+        parts.append(f"- Previous value: {previous_value:.4g}")
+
+    # Month-over-month change (if monthly-ish frequency)
+    if len(data) >= 2:
+        mom_change = latest_value - data.iloc[-2]
+        mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0
+        parts.append(f"- Change from previous: {mom_change:+.4g} ({mom_pct:+.2f}%)")
+
+    # Year-over-year change (try ~12 periods back)
+    if len(data) >= 13:
+        yoy_value = data.iloc[-13]
+        yoy_change = latest_value - yoy_value
+        yoy_pct = (yoy_change / abs(float(yoy_value))) * 100 if yoy_value != 0 else 0
+        parts.append(f"- Year-over-year change: {yoy_change:+.4g} ({yoy_pct:+.2f}%)")
+
+    # Last 6 observations
+    last_6 = data.tail(6)
+    obs_lines = [f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {val:.4g}" for date, val in last_6.items()]
+    parts.append("- Recent observations:\n" + "\n".join(obs_lines))
+
+    return "\n".join(parts)
+
+
 def _fetch_fred_data(series_id: str, api_key: str) -> str:
-    """Fetch economic data for a single FRED series.
+    """Fetch economic data for a single FRED series (live path, fredapi).
 
     Sync function -- caller wraps in asyncio.to_thread().
     Returns formatted markdown or "" on any failure.
@@ -402,42 +459,38 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
         except Exception:
             logger.debug(f"FRED series title lookup failed for {series_id=}", exc_info=True)
 
-        parts = [f"### {series_id} ({title})"]
-
-        latest_value = data.iloc[-1]
-        latest_date = data.index[-1]
-        parts.append(f"- Latest value: {latest_value:.4g} ({latest_date.strftime('%Y-%m-%d')})")
-
-        if len(data) >= 2:
-            previous_value = data.iloc[-2]
-            parts.append(f"- Previous value: {previous_value:.4g}")
-
-        # Month-over-month change (if monthly-ish frequency)
-        if len(data) >= 2:
-            mom_change = latest_value - data.iloc[-2]
-            mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0
-            parts.append(f"- Change from previous: {mom_change:+.4g} ({mom_pct:+.2f}%)")
-
-        # Year-over-year change (try ~12 periods back)
-        if len(data) >= 13:
-            yoy_value = data.iloc[-13]
-            yoy_change = latest_value - yoy_value
-            yoy_pct = (yoy_change / abs(float(yoy_value))) * 100 if yoy_value != 0 else 0
-            parts.append(f"- Year-over-year change: {yoy_change:+.4g} ({yoy_pct:+.2f}%)")
-
-        # Last 6 observations
-        last_6 = data.tail(6)
-        obs_lines = [f"  - {cast(pd.Timestamp, date).strftime('%Y-%m-%d')}: {val:.4g}" for date, val in last_6.items()]
-        parts.append("- Recent observations:\n" + "\n".join(obs_lines))
-
-        return "\n".join(parts)
+        return _render_fred_series(series_id, data, title)
 
     except Exception:
         logger.warning(f"FRED fetch failed for {series_id=}", exc_info=True)
         return ""
 
 
-def financial_data_provider() -> ResearchCallable:
+def _fetch_fred_data_ceiling(series_id: str, as_of: datetime) -> str:
+    """Point-in-time FRED fetch for backtests, via the keyless ts_fetch path.
+
+    Sync function -- caller wraps in asyncio.to_thread(). Reuses ``ts_fetch.fetch_series``
+    (fredgraph / ALFRED-vintage), so revised macro series (CPI, payrolls, GDP) return the
+    vintage KNOWN at ``as_of`` instead of today's revisions — a plain observation_end on
+    fredapi would still leak those. Keyless, so it works in CI without FRED_API_KEY.
+
+    Non-title header: get_series_info needs an API key, so the backtest block reuses the
+    series_id as the title — identical to the live path's metadata-failure fallback.
+    Returns formatted markdown or "" on any fetch/data error.
+    """
+    try:
+        # Default to ALFRED vintages for every revising macro series; only the curated
+        # non-revising allowlist is safe on plain fredgraph (same decision the anchor makes).
+        revises = series_id.upper() not in FRED_NON_REVISING_SERIES
+        spec = SeriesSpec(source="fred", series_id=series_id, revises=revises)
+        data = fetch_series(spec, as_of.date())
+        return _render_fred_series(series_id, data, series_id)
+    except (FetchError, ValueError):
+        logger.warning(f"FRED ceilinged fetch failed for {series_id=}", exc_info=True)
+        return ""
+
+
+def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
     """Factory function returning an async research callable for financial/economic data.
 
     The callable:
@@ -446,6 +499,14 @@ def financial_data_provider() -> ResearchCallable:
     3. Combines results into structured markdown.
 
     FRED gracefully degrades if FRED_API_KEY is not set.
+
+    Backtest-safe like ``timeseries_anchor``: under ``is_benchmarking`` every fetch is
+    ceilinged to ``question.open_time`` (NOT the resolution time — post-open data can
+    contain the resolution). Live (``is_benchmarking=False``) fetches are unchanged: a
+    trailing yfinance ``period=`` window and the fredapi path. yfinance ceilings via
+    ``history(start=..., end=...)`` and skips the leaky ``.info`` fundamentals; FRED
+    routes through the keyless ``ts_fetch`` fredgraph / ALFRED-vintage path so revised
+    macro series return the vintage known at forecast time rather than today's revisions.
     """
     classifier_llm = build_llm_with_openrouter_fallback(
         model=FINANCIAL_CLASSIFIER_MODEL,
@@ -463,6 +524,21 @@ def financial_data_provider() -> ResearchCallable:
     )
 
     async def _fetch(question: MetaculusQuestion) -> str:
+        # Ceiling every fetch to open_time under benchmarking (leakage-safe, mirrors
+        # timeseries_anchor). A missing open_time can't be ceilinged, so we bail rather
+        # than risk fetching today's data into a resolved question.
+        if is_benchmarking:
+            open_time = getattr(question, "open_time", None)
+            if not isinstance(open_time, datetime):
+                logger.warning(
+                    "financial_data: is_benchmarking but qid=%s has no open_time; skipping (leakage-safe)",
+                    getattr(question, "id_of_question", None),
+                )
+                return ""
+            as_of = open_time
+        else:
+            as_of = datetime.now(UTC)
+
         criteria_text = f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
         extracted = extract_financial_identifiers_from_criteria(criteria_text)
 
@@ -502,18 +578,27 @@ def financial_data_provider() -> ResearchCallable:
         # a valid-but-unlisted series shouldn't be dropped, just made visible.
         unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
 
-        fred_api_key = os.getenv(FRED_API_KEY_ENV)
-
         tasks: list[asyncio.Task] = []
 
         for ticker in tickers:
-            tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_yfinance_data, ticker)))
+            tasks.append(
+                asyncio.ensure_future(
+                    asyncio.to_thread(_fetch_yfinance_data, ticker, as_of=as_of, is_benchmarking=is_benchmarking)
+                )
+            )
 
-        if fred_api_key:
+        if is_benchmarking:
+            # Keyless ceilinged path — no FRED_API_KEY needed, works in CI, and returns
+            # point-in-time vintages instead of today's revisions.
             for series_id in fred_series:
-                tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
-        elif fred_series:
-            logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
+                tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
+        else:
+            fred_api_key = os.getenv(FRED_API_KEY_ENV)
+            if fred_api_key:
+                for series_id in fred_series:
+                    tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
+            elif fred_series:
+                logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
 
         if not tasks:
             return ""

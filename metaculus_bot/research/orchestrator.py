@@ -313,7 +313,7 @@ class ResearchOrchestrator:
                 financial_data_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
             )
 
-            providers.append((financial_data_provider(), "financial_data"))
+            providers.append((financial_data_provider(is_benchmarking=self._is_benchmarking), "financial_data"))
 
         if env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
             from metaculus_bot.research.timeseries_anchor import (

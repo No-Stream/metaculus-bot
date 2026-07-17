@@ -55,7 +55,13 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research.providers import ResearchCallable
-from metaculus_bot.research.ts_fetch import FetchError, SeriesSpec, _reset_series_cache, fetch_series
+from metaculus_bot.research.ts_fetch import (
+    FRED_NON_REVISING_SERIES,
+    FetchError,
+    SeriesSpec,
+    _reset_series_cache,
+    fetch_series,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +96,8 @@ _MARKDOWN_ESCAPE_RE = re.compile(r"\\([_&.\-#()])")
 # period-end level.
 _MAX_KEYWORD_RE = re.compile(r"\b(highest|peak|maximum|max)\b", re.IGNORECASE)
 
-# FRED series that genuinely do NOT revise (market prices / survey-level series):
-# these can be fetched from the plain fredgraph.csv safely. Everything else — every
-# revising macro series AND every unknown/URL-cited series — defaults to ALFRED
-# point-in-time vintages. That default is fail-safe: ALFRED returns identical values
-# for a non-revising series, so an over-inclusive guess costs nothing, but a
-# revising series routed to fredgraph would silently return TODAY's revised values
-# and leak into a backtest. An allowlist can only err toward ALFRED; a denylist
-# (the prior design) leaked any revising series not enumerated in it.
-_FRED_NON_REVISING_SERIES: frozenset[str] = frozenset({"DGS10", "BAMLH0A0HYM2", "DCOILBRENTEU", "GASREGW"})
+# The non-revising FRED allowlist lives in ts_fetch (fetch-layer knowledge shared with
+# financial_data); imported above as FRED_NON_REVISING_SERIES.
 
 
 @dataclass(frozen=True)
@@ -216,8 +215,8 @@ def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str)
     if source == "fred":
         # Default to ALFRED vintages (revises=True) for every fred series except the
         # curated non-revising allowlist. Unknown / URL-cited series therefore fetch
-        # point-in-time, which is leakage-safe (see _FRED_NON_REVISING_SERIES).
-        revises = series_id.upper() not in _FRED_NON_REVISING_SERIES
+        # point-in-time, which is leakage-safe (see FRED_NON_REVISING_SERIES).
+        revises = series_id.upper() not in FRED_NON_REVISING_SERIES
         return SeriesSpec(source="fred", series_id=series_id, revises=revises)
     column: YfColumn = "High" if _wants_max(text) else "Close"
     return SeriesSpec(source="yfinance", series_id=series_id, column=column)

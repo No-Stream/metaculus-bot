@@ -1,6 +1,7 @@
 """Tests for the financial data research provider (yfinance + FRED)."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, date, datetime
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,20 @@ def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> M
     q.question_text = text
     q.resolution_criteria = resolution_criteria
     q.fine_print = fine_print
+    return q
+
+
+# Fixed open_time used across the benchmarking date-ceiling tests. as_of derivation
+# under is_benchmarking pins to this, so the yfinance start/end and FRED ceiling are
+# both deterministic: end == open_time.date() + 1 day, start == open_time.date() - 365d.
+_BENCH_OPEN_TIME = datetime(2026, 3, 15, 14, 30, tzinfo=UTC)
+
+
+def _make_bench_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
+    """A _make_q with a concrete open_time so the benchmarking ceiling can be derived
+    (a bare MagicMock open_time isn't a datetime → the provider soft-skips as leakage-safe)."""
+    q = _make_q(text, resolution_criteria, fine_print)
+    q.open_time = _BENCH_OPEN_TIME
     return q
 
 
@@ -477,8 +492,10 @@ def _stub_fred_fetch(series_id: str, api_key: str) -> str:
     return f"### {series_id} (Test Series)\n- Latest value: 4.48 (2026-06-27)"
 
 
-def _stub_yfinance_fetch(ticker: str) -> str:
-    """Recognizable yfinance markdown so tests assert on routing, not the live API."""
+def _stub_yfinance_fetch(ticker: str, **kwargs: object) -> str:
+    """Recognizable yfinance markdown so tests assert on routing, not the live API.
+
+    Accepts **kwargs so the live-path call (as_of=..., is_benchmarking=...) matches."""
     return f"### {ticker}\n- Current price: 4.48"
 
 
@@ -770,3 +787,217 @@ class TestProviderSelection:
 
         provider_names = [name for _, name in providers]
         assert "financial_data" not in provider_names
+
+
+# ---------------------------------------------------------------------------
+# Backtest leakage guard: date-ceiling under is_benchmarking
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkingDateCeiling:
+    """Under is_benchmarking the provider must ceiling every fetch to open_time and
+    never touch live-only surfaces (yfinance .info, fredapi). Live path unchanged."""
+
+    def test_yfinance_benchmarking_uses_start_end_ceiling_and_skips_info(self) -> None:
+        """Benchmarking yfinance fetch: history is called with start/end (NOT period),
+        end == open_time.date() + 1 day, start == open_time.date() - 365d, and `.info`
+        is never accessed (a PropertyMock that would raise if touched)."""
+        dates = pd.date_range(end="2026-03-15", periods=252, freq="B")
+        close_prices = np.linspace(150.0, 200.0, 252)
+        mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
+
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = mock_history
+        # A PropertyMock that raises if `.info` is read at all — the benchmarking path
+        # must never touch it (it has no historical mode → leaks today's values).
+        info_prop = PropertyMock(side_effect=AssertionError(".info must not be read under benchmarking"))
+        type(mock_ticker).info = info_prop
+
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+
+            from metaculus_bot.research.financial_data import _fetch_yfinance_data
+
+            result = _fetch_yfinance_data("AAPL", as_of=_BENCH_OPEN_TIME, is_benchmarking=True)
+
+        info_prop.assert_not_called()
+        mock_ticker.history.assert_called_once()
+        _, kwargs = mock_ticker.history.call_args
+        assert "period" not in kwargs
+        assert kwargs["start"] == "2025-03-15"  # open_time.date() - 365d
+        assert kwargs["end"] == "2026-03-16"  # open_time.date() + 1d (end EXCLUSIVE)
+        assert "AAPL" in result
+        assert "[omitted under backtest" in result
+
+    def test_yfinance_live_path_unchanged_period_based(self) -> None:
+        """Live path (default is_benchmarking=False): period-based call preserved, no
+        start/end, and `.info` still consulted for fundamentals."""
+        dates = pd.date_range(end="2026-03-30", periods=252, freq="B")
+        close_prices = np.linspace(150.0, 200.0, 252)
+        mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
+
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = mock_history
+        mock_ticker.info = {"shortName": "Apple Inc.", "trailingPE": 28.5}
+
+        with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
+            mock_yf.Ticker.return_value = mock_ticker
+
+            from metaculus_bot.research.financial_data import _fetch_yfinance_data
+
+            result = _fetch_yfinance_data("AAPL")
+
+        mock_ticker.history.assert_called_once()
+        _, kwargs = mock_ticker.history.call_args
+        assert kwargs == {"period": "365d"}
+        assert "P/E ratio" in result  # .info fundamentals rendered
+
+    def test_fred_benchmarking_routes_through_ts_fetch_with_ceiling(self) -> None:
+        """Benchmarking FRED fetch routes through ts_fetch.fetch_series (keyless), with
+        the ceiling == open_time.date(), and a REVISING series (CPIAUCSL, not in the
+        non-revising allowlist) gets a vintage spec (revises=True)."""
+        fred_dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
+        fred_values = np.linspace(280.0, 310.0, 60)
+        mock_series = pd.Series(fred_values, index=fred_dates, name="CPIAUCSL")
+
+        captured: dict = {}
+
+        def fake_fetch_series(spec, ceiling, **kwargs):
+            captured["spec"] = spec
+            captured["ceiling"] = ceiling
+            return mock_series
+
+        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
+            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
+
+            result = _fetch_fred_data_ceiling("CPIAUCSL", _BENCH_OPEN_TIME)
+
+        assert captured["ceiling"] == date(2026, 3, 15)  # open_time.date()
+        assert captured["spec"].source == "fred"
+        assert captured["spec"].series_id == "CPIAUCSL"
+        assert captured["spec"].revises is True  # revising macro series → ALFRED vintage
+        assert "### CPIAUCSL" in result
+        assert "Latest value" in result
+
+    def test_fred_benchmarking_non_revising_series_no_vintage(self) -> None:
+        """A non-revising allowlisted series (DGS10) must NOT be routed to a vintage
+        fetch (revises=False) — plain fredgraph is leakage-safe for it."""
+        dgs_dates = pd.date_range(end="2026-03-15", periods=300, freq="B")
+        dgs_values = np.linspace(3.8, 4.4, 300)
+        mock_series = pd.Series(dgs_values, index=dgs_dates, name="DGS10")
+
+        captured: dict = {}
+
+        def fake_fetch_series(spec, ceiling, **kwargs):
+            captured["spec"] = spec
+            return mock_series
+
+        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series):
+            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
+
+            result = _fetch_fred_data_ceiling("DGS10", _BENCH_OPEN_TIME)
+
+        assert captured["spec"].revises is False
+        assert "### DGS10" in result
+
+    def test_fred_ceiling_fetch_soft_fails_on_fetch_error(self) -> None:
+        """A ts_fetch FetchError soft-fails to "" (never propagates)."""
+        from metaculus_bot.research.ts_fetch import FetchError
+
+        with patch("metaculus_bot.research.financial_data.fetch_series", side_effect=FetchError("bad id")):
+            from metaculus_bot.research.financial_data import _fetch_fred_data_ceiling
+
+            result = _fetch_fred_data_ceiling("BOGUS", _BENCH_OPEN_TIME)
+
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_provider_benchmarking_no_fred_key_still_fetches_fred(self) -> None:
+        """End-to-end benchmarking flow: FRED_API_KEY is UNSET yet the FRED series is
+        still fetched (keyless ts_fetch path), and yfinance never touches `.info`."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: UNRATE"
+
+        dates = pd.date_range(end="2026-03-15", periods=252, freq="B")
+        mock_history = pd.DataFrame({"Close": np.linspace(150.0, 200.0, 252)}, index=dates)
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = mock_history
+        info_prop = PropertyMock(side_effect=AssertionError(".info must not be read under benchmarking"))
+        type(mock_ticker).info = info_prop
+
+        unrate_dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
+        mock_unrate = pd.Series(np.linspace(3.5, 4.2, 60), index=unrate_dates, name="UNRATE")
+
+        def fake_fetch_series(spec, ceiling, **kwargs):
+            assert ceiling == date(2026, 3, 15)
+            return mock_unrate
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
+            patch("metaculus_bot.research.financial_data.fetch_series", side_effect=fake_fetch_series) as mock_fetch,
+        ):
+            mock_yf.Ticker.return_value = mock_ticker
+
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.delenv("FRED_API_KEY", raising=False)
+            try:
+                provider = financial_data_provider(is_benchmarking=True)
+                result = await provider(_make_bench_q("Will AAPL rise and unemployment stay below 5%?"))
+            finally:
+                monkeypatch.undo()
+
+        info_prop.assert_not_called()
+        mock_fetch.assert_called_once()  # keyless FRED fetch fired despite no API key
+        assert "### AAPL" in result
+        assert "### UNRATE" in result
+
+    @pytest.mark.asyncio
+    async def test_provider_benchmarking_missing_open_time_soft_skips(self) -> None:
+        """No open_time under benchmarking → can't ceiling → soft-skip to "" (never
+        fetch, since fetching would risk today's data leaking into a resolved question)."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NONE"
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            provider = financial_data_provider(is_benchmarking=True)
+            # _make_q leaves open_time as an auto-child MagicMock (not a datetime).
+            result = await provider(_make_q("Will Apple stock exceed $200?"))
+
+        assert result == ""
+        mock_yf.Ticker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_provider_default_is_live(self) -> None:
+        """Default (no is_benchmarking arg) → live path: period-based yfinance, `.info`
+        consulted, and no open_time needed."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NONE"
+
+        dates = pd.date_range(end="2026-03-30", periods=252, freq="B")
+        mock_history = pd.DataFrame({"Close": np.linspace(150.0, 200.0, 252)}, index=dates)
+        mock_ticker = MagicMock()
+        mock_ticker.history.return_value = mock_history
+        mock_ticker.info = {"shortName": "Apple Inc.", "trailingPE": 28.5}
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
+        ):
+            mock_yf.Ticker.return_value = mock_ticker
+
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            provider = financial_data_provider()
+            result = await provider(_make_q("Will Apple stock exceed $200?"))
+
+        _, kwargs = mock_ticker.history.call_args
+        assert kwargs == {"period": "365d"}
+        assert "### AAPL" in result

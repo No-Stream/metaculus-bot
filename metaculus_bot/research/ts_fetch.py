@@ -59,6 +59,18 @@ CSV_HEADER_PREFIX = "observation_date,"
 HTTP_TIMEOUT_S = TS_ANCHOR_HTTP_TIMEOUT
 POLITENESS_SLEEP_S = 0.5
 
+# FRED series that genuinely do NOT revise (market prices / survey-level series):
+# these can be fetched from the plain fredgraph.csv safely. Everything else — every
+# revising macro series AND every unknown/URL-cited series — defaults to ALFRED
+# point-in-time vintages. That default is fail-safe: ALFRED returns identical values
+# for a non-revising series, so an over-inclusive guess costs nothing, but a
+# revising series routed to fredgraph would silently return TODAY's revised values
+# and leak into a backtest. An allowlist can only err toward ALFRED; a denylist
+# leaks any revising series not enumerated in it. Fetch-layer knowledge, so it lives
+# here and is shared by every provider that ceilings FRED fetches (timeseries_anchor,
+# financial_data).
+FRED_NON_REVISING_SERIES: frozenset[str] = frozenset({"DGS10", "BAMLH0A0HYM2", "DCOILBRENTEU", "GASREGW"})
+
 
 class FetchError(Exception):
     """Bad series id, empty/malformed response, or transport failure. Fail fast."""
