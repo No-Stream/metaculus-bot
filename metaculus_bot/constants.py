@@ -579,5 +579,37 @@ PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEO
 PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
 PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
 
+# --- Time-Series Anchor Provider (Phase B) ---
+# Env-gated OFF by default. Renders a deterministic empirical-band anchor grounded
+# in the resolution series' OWN history (FRED/yfinance), for numeric questions that
+# route cleanly to a known series (via resolution-criteria URLs or a curated title
+# registry). No statsforecast / model selection — the Phase-A offline replay
+# (scratch/ts_anchor_replay_2026-07-16/synthesis.md) found CV-gated model picks beat
+# naive out-of-sample only 43% of the time; the empirical h-step-change band is the
+# render. Its value is grounding + SHARPENING our over-wide published low tail
+# (cov@10 was 0.02 vs a 0.10 target). Backtest-safe (the FIRST research provider that
+# is): live uses as_of=now, is_benchmarking uses question.open_time so series data up
+# to resolution IS the answer (NOT scheduled_resolution − buffer), with ALFRED
+# vintages at as_of for revising series.
+TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
+# Wall-clock cap on the whole provider (fetch fan-out + render). Fetches run in
+# asyncio.to_thread under asyncio.wait_for; a hung endpoint soft-fails to "".
+TS_ANCHOR_TIMEOUT: float = float(os.environ.get("TS_ANCHOR_TIMEOUT", "20.0"))
+# Per-request HTTP timeout for a single FRED/ALFRED/yfinance fetch.
+TS_ANCHOR_HTTP_TIMEOUT: float = 15.0
+# History lookback for both the displayed tables and the empirical change/window-max
+# distributions. Spread legs use a shorter window (below) to exclude the 2020-04-20
+# negative WTI settlement that breaks the strictly-positive log-return construction.
+TS_ANCHOR_LOOKBACK_YEARS: int = 15
+TS_ANCHOR_SPREAD_LOOKBACK_YEARS: int = 5
+# Char budget for the whole rendered section (self-budgeted like resolution_source;
+# per-leg render truncates history tables so multi-leg spreads stay bounded).
+TS_ANCHOR_SECTION_MAX_CHARS: int = 6000
+# History-table lengths per resolution: last-N native-freq observations, weekly
+# down-sampled closes (~3 months of trading weeks), monthly down-sampled (~2 years).
+TS_ANCHOR_NATIVE_TABLE_ROWS: int = 10
+TS_ANCHOR_WEEKLY_TABLE_ROWS: int = 13
+TS_ANCHOR_MONTHLY_TABLE_ROWS: int = 24
+
 # --- Research persistence (write path for backtest replay) ---
 PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"

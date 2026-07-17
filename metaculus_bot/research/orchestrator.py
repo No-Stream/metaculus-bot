@@ -36,6 +36,7 @@ from metaculus_bot.constants import (
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
     SUMMARIZER_WALL_TIMEOUT,
+    TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
 from metaculus_bot.llm_retry import invoke_with_broad_retry
@@ -314,6 +315,13 @@ class ResearchOrchestrator:
 
             providers.append((financial_data_provider(), "financial_data"))
 
+        if env_flag_enabled(TS_ANCHOR_ENABLED_ENV):
+            from metaculus_bot.research.timeseries_anchor import (
+                timeseries_anchor_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            )
+
+            providers.append((timeseries_anchor_provider(is_benchmarking=self._is_benchmarking), "timeseries_anchor"))
+
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
             from metaculus_bot.research.prediction_market import (
                 prediction_market_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
@@ -428,6 +436,7 @@ class ResearchOrchestrator:
             "native_search": "## Web Research (Native Search)",
             "gemini_search": "## Web Research (Google Search via Gemini)",
             "financial_data": "## Financial & Economic Data",
+            "timeseries_anchor": "## Time Series Anchor",
             "prediction_market": "## Prediction Market Snapshot",
             "resolution_source": "## Resolution Source Snapshot",
             "exa": "## Web Research (Exa)",
