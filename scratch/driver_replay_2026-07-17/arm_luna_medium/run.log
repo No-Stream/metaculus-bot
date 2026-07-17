@@ -1,0 +1,10 @@
+2026-07-17 14:46:48,076 - driver_replay - INFO - ARM START: arm_luna_medium model=openai/gpt-5.6-luna effort=medium
+2026-07-17 14:46:56,843 - google_genai.models - INFO - AFC is enabled with max remote calls: 10.
+2026-07-17 14:46:56,844 - google_genai.models - INFO - AFC is enabled with max remote calls: 10.
+2026-07-17 14:47:19,944 - google_genai.models - INFO - AFC is enabled with max remote calls: 10.
+2026-07-17 14:47:46,062 - google_genai.models - INFO - AFC is enabled with max remote calls: 10.
+2026-07-17 14:47:58,852 - metaculus_bot.structured_output_schema - WARNING - question_type mismatch: arg=binary, payload=numeric. Refusing to parse.
+2026-07-17 14:47:58,853 - metaculus_bot.structured_output_schema - WARNING - question_type mismatch: arg=multiple_choice, payload=numeric. Refusing to parse.
+2026-07-17 14:47:58,853 - metaculus_bot.research.agentic.loop - INFO - arm=arm_luna_medium GHOST_FORECAST: qtype=numeric summary=median=56.0
+2026-07-17 14:47:58,853 - metaculus_bot.research.agentic.loop - INFO - arm=arm_luna_medium GAP_FILL_V2: model=openai/gpt-5.6-luna steps=6 tool_calls=11 searches=3 fetches=5 rendered=0 reads=1 dup_tool_calls=0 deadline_hit=False concluded_early=True wall_s=68.25 findings=4 pending_leads=2 lint_rejections=0
+2026-07-17 14:47:58,917 - driver_replay - INFO - ARM DONE: arm_luna_medium wall_s=70.8 est_cost=0.16041599999999998 findings=4

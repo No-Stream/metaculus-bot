@@ -1,0 +1,15 @@
+{
+  "arm": "arm_sonnet5_medium",
+  "model": "anthropic/claude-sonnet-5",
+  "reasoning_effort": "medium",
+  "outer_wall_s": 67.67,
+  "loop_wall_s": 58.08442766708322,
+  "est_cost_usd": 0.5277,
+  "pricing_per_token": {
+    "prompt": 2e-06,
+    "completion": 1e-05
+  },
+  "prompt_tokens_total": 239150,
+  "completion_tokens_total": 4942,
+  "n_llm_calls": 7
+}

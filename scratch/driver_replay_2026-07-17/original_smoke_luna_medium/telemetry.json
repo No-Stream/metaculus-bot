@@ -1,0 +1,19 @@
+{
+  "model": "openai/gpt-5.6-luna",
+  "reasoning_effort": "medium",
+  "steps": 7,
+  "tool_calls": 15,
+  "searches": 4,
+  "fetches": 7,
+  "rendered_fetches": 0,
+  "reads": 1,
+  "dup_tool_calls": 0,
+  "deadline_hit": false,
+  "concluded_early": true,
+  "wall_s": 65.81,
+  "findings_count": 7,
+  "pending_leads_count": 4,
+  "lint_rejections": 0,
+  "source": "GAP_FILL_V2 log line, /tmp/v2-smoke.log 2026-07-17 11:11:41",
+  "note": "Transcript NOT persisted (PERSIST_RESEARCH_ENABLED off in smoke run); tool-call trace unrecoverable. Luna arm re-run live as arm_luna_medium."
+}

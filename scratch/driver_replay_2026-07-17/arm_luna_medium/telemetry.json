@@ -1,0 +1,20 @@
+{
+  "model": "openai/gpt-5.6-luna",
+  "steps": 6,
+  "tool_calls": 11,
+  "per_tool_counts": {
+    "fetch": 5,
+    "search_web": 3,
+    "record_findings": 1,
+    "read_document": 1,
+    "conclude": 1
+  },
+  "rendered_fetches": 0,
+  "dup_tool_calls": 0,
+  "deadline_hit": false,
+  "concluded_early": true,
+  "wall_s": 68.25176729192026,
+  "findings_count": 4,
+  "pending_leads_count": 2,
+  "lint_rejections": 0
+}
