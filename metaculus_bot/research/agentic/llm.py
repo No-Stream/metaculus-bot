@@ -30,6 +30,11 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             "messages": list(messages),
             "parallel_tool_calls": True,
             "reasoning_effort": config.reasoning_effort,
+            # litellm's OpenrouterConfig doesn't map reasoning_effort; without this
+            # it survives only because forecasting_tools sets litellm.drop_params=True
+            # globally (silently stripping it). Whitelisting passes the raw param
+            # through to OpenRouter (validated live by scratch/driver_replay_2026-07-17).
+            "allowed_openai_params": ["reasoning_effort"],
             "temperature": None,
         }
         if tools_json is not None:

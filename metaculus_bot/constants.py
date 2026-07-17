@@ -409,12 +409,15 @@ GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 # soft-fails to "" like v1. See scratch_docs_and_planning/
 # agentic_gap_fill_v2_plan.md.
 GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
-# Driver model + effort are the vibe-eval knobs (plan doc §3.5): candidates are
-# luna-medium, terra-{low,medium}, sol-low, sonnet-5.0 — all openai/anthropic,
-# so the loop's litellm binding routes them via the donated OpenRouter key.
-# luna-medium is the cheap+reliable dev default until the eval picks a winner.
-GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-luna"
-GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "medium"
+# Driver model + effort picked by the blind 5-arm replay eval 2026-07-17
+# (scratch/driver_replay_2026-07-17/blind_judge_report.md): terra-low ranked 1st
+# (fetch-verified grounding, best source mix, 30s wall, $0.36/q), terra-medium
+# 2nd; sol-low burned budget on near-duplicate searches (5th); sonnet-5 cited
+# unfetched URLs (disqualifying for a researcher). All candidates were
+# openai/anthropic, so the loop's litellm binding routes via the donated
+# OpenRouter key.
+GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-terra"
+GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
 # read_document backend model on the NATIVE google-genai path (tools.py
 # _run_document_read_sync). CAUTION: this id is UNVERIFIED on the native
 # AI Studio API until the paid smoke test — the repo's verified-model notes

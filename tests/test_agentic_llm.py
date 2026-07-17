@@ -68,6 +68,10 @@ class TestKwargsPassthrough:
         assert kwargs["model"] == "openrouter/openai/gpt-5.6-luna"
         assert kwargs["parallel_tool_calls"] is True
         assert kwargs["reasoning_effort"] == "high"
+        # litellm's OpenrouterConfig doesn't map reasoning_effort; without the
+        # whitelist, litellm.drop_params=True (set globally by forecasting_tools)
+        # silently strips it and drivers run at model-default effort.
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
         assert kwargs["temperature"] is None
         assert kwargs["tools"] == tools
         assert kwargs["api_key"] == _PERSONAL
