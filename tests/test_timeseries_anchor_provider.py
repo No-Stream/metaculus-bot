@@ -36,9 +36,11 @@ from forecasting_tools import BinaryQuestion, NumericQuestion
 from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
 from metaculus_bot.research.timeseries_anchor import (
+    _apply_derivation,
     _build_spread_series,
     _empirical_change_band,
     _empirical_max_band,
+    _realized_max_floor,
     _render_single,
     _render_spread,
     _reset_session_caches,
@@ -101,6 +103,15 @@ def _daily_positive_series(name: str, *, seed: int = 0, end: str = "2026-06-30",
     rng = np.random.default_rng(seed)
     walk = 20.0 + np.cumsum(rng.normal(0.0, 0.3, len(idx)))
     return pd.Series(np.abs(walk) + 8.0, index=idx, name=name)
+
+
+def _monthly_series(name: str, *, seed: int = 0, end: str = "2026-06-01", n: int = 96) -> pd.Series:
+    """A strictly-positive monthly (month-start) series, deterministic per seed. n months
+    ending at ``end`` — long enough that a small monthly horizon leaves ample overlap."""
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="MS")
+    rng = np.random.default_rng(seed)
+    walk = 200.0 + np.cumsum(rng.normal(0.0, 1.0, n))
+    return pd.Series(np.abs(walk) + 50.0, index=idx, name=name)
 
 
 def _make_numeric_q(
@@ -203,6 +214,94 @@ class TestRouting:
         assert route is not None
         assert route.spec.column == "High"
         assert route.is_max is True
+
+    def test_sp500_keyword_routes_to_gspc_level(self):
+        route = route_question(_make_numeric_q(question_text="Where will the S&P 500 close on Dec 31?"))
+        assert route is not None
+        assert route.spec.source == "yfinance"
+        assert route.spec.series_id == "^GSPC"
+        assert route.derivation == "level"
+
+    def test_bitcoin_highest_routes_to_btc_high_column_max(self):
+        route = route_question(_make_numeric_q(question_text="What is the highest price of Bitcoin in 2025?"))
+        assert route is not None
+        assert route.spec.series_id == "BTC-USD"
+        assert route.spec.column == "High"  # max/highest framing -> daily High
+        assert route.is_max is True
+
+    def test_silver_highest_routes_to_high_column(self):
+        route = route_question(_make_numeric_q(question_text="Highest silver price per troy oz in April?"))
+        assert route is not None
+        assert route.spec.series_id == "SI=F"
+        assert route.spec.column == "High"
+
+    def test_gold_level_routes_to_close_column(self):
+        route = route_question(_make_numeric_q(question_text="What will the price of gold be on the date?"))
+        assert route is not None
+        assert route.spec.series_id == "GC=F"
+        assert route.spec.column == "Close"  # no max framing -> Close
+
+    def test_case_shiller_routes_and_revises(self):
+        route = route_question(
+            _make_numeric_q(question_text="What will the Case-Shiller national home price index be?")
+        )
+        assert route is not None
+        assert route.spec.series_id == "CSUSHPISA"
+        assert route.spec.revises is True  # not in the non-revising allowlist -> ALFRED vintage
+
+    def test_fed_funds_upper_routes_and_non_revising(self):
+        route = route_question(
+            _make_numeric_q(question_text="What will the federal funds target range upper limit be?")
+        )
+        assert route is not None
+        assert route.spec.series_id == "DFEDTARU"
+        assert route.spec.revises is True  # DFEDTARU is NOT in the non-revising allowlist
+
+    def test_average_weekly_hours_routes_and_revises(self):
+        route = route_question(_make_numeric_q(question_text="What will average weekly hours (all employees) be?"))
+        assert route is not None
+        assert route.spec.series_id == "AWHAETP"
+        assert route.spec.revises is True
+
+    def test_australia_unemployment_routes_to_aus_series(self):
+        route = route_question(_make_numeric_q(question_text="What will the Australian unemployment rate be?"))
+        assert route is not None
+        assert route.spec.series_id == "LRHUTTTTAUM156S"
+
+    def test_us_unemployment_excludes_australia_entry(self):
+        # "unemployment rate" alone must route to US UNRATE, not double-match the AUS entry.
+        route = route_question(_make_numeric_q(question_text="What will the US unemployment rate be?"))
+        assert route is not None
+        assert route.spec.series_id == "UNRATE"
+
+    def test_payrolls_routes_to_mom_diff_with_scale(self):
+        route = route_question(_make_numeric_q(question_text="How many nonfarm payrolls jobs were added?"))
+        assert route is not None
+        assert route.spec.series_id == "PAYEMS"
+        assert route.derivation == "mom_diff"
+        assert route.scale == 1000.0
+        assert route.model_target is True  # no longer a level-with-caveat skip
+
+    def test_cpi_routes_to_mom_pct(self):
+        route = route_question(_make_numeric_q(question_text="What will month-over-month CPI inflation be?"))
+        assert route is not None
+        assert route.spec.series_id == "CPIAUCSL"
+        assert route.derivation == "mom_pct"
+
+    def test_gasoline_routes_to_monthly_avg(self):
+        route = route_question(
+            _make_numeric_q(question_text="What will the monthly average regular gasoline price be?")
+        )
+        assert route is not None
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == "monthly_avg"
+
+    def test_goods_trade_balance_routes_with_unit_scale(self):
+        route = route_question(_make_numeric_q(question_text="What will the US advance goods trade balance be?"))
+        assert route is not None
+        assert route.spec.series_id == "BOPGTB"
+        assert route.derivation == "level"
+        assert route.scale == pytest.approx(0.001)  # millions of USD -> billions
 
 
 # Fetch layer (real fetch_series over a faked _http_get).
@@ -395,6 +494,141 @@ class TestRenderSpread:
         assert "- ^GSPC recent:" in out
         assert "relative-return band" in out
         assert "P10 / P50 / P90 →" in out
+        # §g: spread sections carry an explicit mean-zero-prior disclaimer.
+        assert "mean-zero by construction" in out
+        assert "not a directional signal" in out
+
+
+# Derived-target math: hand-confirmed reference values from the replay (Phase A).
+class TestDerivedTargets:
+    def test_mom_diff_scaled_first_difference(self):
+        # PAYEMS-style: [100,110,105] x1000 -> diffs [10000, -5000].
+        idx = pd.to_datetime(["2026-01-01", "2026-02-01", "2026-03-01"])
+        s = pd.Series([100.0, 110.0, 105.0], index=idx)
+        out = _apply_derivation(s, "mom_diff", 1000.0)
+        assert out.tolist() == pytest.approx([10000.0, -5000.0])
+
+    def test_mom_pct_percent_change(self):
+        # CPI-style: [100,110,105] -> MoM % [10.0, -4.5455].
+        idx = pd.to_datetime(["2026-01-01", "2026-02-01", "2026-03-01"])
+        s = pd.Series([100.0, 110.0, 105.0], index=idx)
+        out = _apply_derivation(s, "mom_pct", 1.0)
+        assert out.tolist() == pytest.approx([10.0, -4.545454545454546])
+
+    def test_monthly_avg_of_weekly(self):
+        # Gasoline-style: weekly [3,4,5] in Jan + [15] in Feb -> {Jan 4.0, Feb 15.0}.
+        idx = pd.to_datetime(["2026-01-05", "2026-01-12", "2026-01-19", "2026-02-02"])
+        w = pd.Series([3.0, 4.0, 5.0, 15.0], index=idx)
+        out = _apply_derivation(w, "monthly_avg", 1.0)
+        assert [str(d.date()) for d in out.index] == ["2026-01-01", "2026-02-01"]
+        assert out.tolist() == pytest.approx([4.0, 15.0])
+
+    def test_level_scale_millions_to_billions(self):
+        # BOPGTB-style unit conversion: millions of USD -> billions via scale=0.001.
+        idx = pd.to_datetime(["2026-01-01"])
+        out = _apply_derivation(pd.Series([-81800.0], index=idx), "level", 0.001)
+        assert out.tolist() == pytest.approx([-81.8])
+
+    def test_level_scale_one_is_identity(self):
+        idx = pd.to_datetime(["2026-01-01", "2026-02-01"])
+        s = pd.Series([4.1, 4.3], index=idx)
+        out = _apply_derivation(s, "level", 1.0)
+        pd.testing.assert_series_equal(out, s)
+
+
+class TestRealizedMaxFloor:
+    def test_floor_is_elapsed_window_max(self):
+        idx = pd.date_range("2026-01-01", periods=10, freq="D")
+        s = pd.Series([10.0, 12.0, 11.0, 15.0, 13.0, 9.0, 8.0, 7.0, 6.0, 5.0], index=idx)
+        # Max over the elapsed portion [window_start, ceiling] = 15.0 (the fourth obs).
+        floor = _realized_max_floor(s, window_start=date(2026, 1, 1), ceiling=date(2026, 1, 5))
+        assert floor == pytest.approx(15.0)
+
+    def test_no_floor_when_window_not_yet_open(self):
+        # Benchmark path: window_start == ceiling -> no elapsed portion, no floor.
+        idx = pd.date_range("2026-01-01", periods=5, freq="D")
+        s = pd.Series([10.0, 12.0, 11.0, 15.0, 13.0], index=idx)
+        assert _realized_max_floor(s, window_start=date(2026, 1, 3), ceiling=date(2026, 1, 3)) is None
+        assert _realized_max_floor(s, window_start=None, ceiling=date(2026, 1, 3)) is None
+
+
+class TestRenderDerived:
+    def test_mom_diff_labels_derived_quantity_and_history(self):
+        # A monthly level series routed through mom_diff x1000 must render the DERIVED
+        # change values, not the raw level, and label them clearly.
+        series = _monthly_series("PAYEMS")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="fred", series_id="PAYEMS", revises=True),
+            label="Nonfarm payrolls — MoM change",
+            derivation="mom_diff",
+            scale=1000.0,
+        )
+
+        out = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
+
+        assert "latest derived value" in out
+        assert "month-over-month change" in out
+        assert "from raw level" in out  # the raw level is still surfaced for context
+        assert "(derived)" in out  # the history block is labeled as derived values
+        assert "P10 / P50 / P90 →" in out
+        assert "52-week range" not in out  # the level-only 52w line is skipped for derived Qs
+
+    def test_mom_pct_renders_percent_change_band(self):
+        series = _monthly_series("CPIAUCSL", seed=3)
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="fred", series_id="CPIAUCSL", revises=True),
+            label="CPI MoM % change",
+            derivation="mom_pct",
+        )
+
+        out = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
+
+        assert "month-over-month % change" in out
+        assert "P10 / P50 / P90 →" in out
+
+    def test_max_window_realized_floor_line_when_window_started(self):
+        # A daily High series, max framing, window already open before the ceiling ->
+        # the realized-max floor line appears and lifts the band.
+        series = _daily_positive_series("BTC-USD", end="2026-06-30")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="yfinance", series_id="BTC-USD", column="High"),
+            label="Bitcoin highest",
+            is_max=True,
+        )
+
+        out = _render_single(
+            series,
+            route=route,
+            ceiling=date(2026, 6, 30),
+            calendar_days=30,
+            window_start=date(2026, 1, 1),  # window opened months before the ceiling
+        )
+
+        assert "Realized max so far this window" in out
+        assert "HARD LOWER BOUND" in out
+        assert "forward-max" in out
+
+    def test_max_window_no_floor_line_when_window_not_open(self):
+        series = _daily_positive_series("^VIX", end="2026-06-30")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="yfinance", series_id="^VIX", column="High"),
+            label="VIX max",
+            is_max=True,
+        )
+        # Benchmark path: window_start == ceiling -> no elapsed portion, no floor line.
+        out = _render_single(
+            series,
+            route=route,
+            ceiling=date(2026, 6, 30),
+            calendar_days=14,
+            window_start=date(2026, 6, 30),
+        )
+        assert "Realized max so far this window" not in out
+        assert "forward-max" in out
 
 
 class TestTruncateSection:

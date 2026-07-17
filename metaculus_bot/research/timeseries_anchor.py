@@ -67,6 +67,13 @@ logger = logging.getLogger(__name__)
 
 Freq = Literal["daily", "weekly", "monthly"]
 YfColumn = Literal["Close", "High", "Low", "Open"]
+# How the fetched raw series is turned into the quantity the question resolves on.
+# Ported from the Phase-A replay's ``derive_config`` (scratch/ts_anchor_replay_2026-07-16):
+#   level       — raw period-end value (optionally unit-scaled, e.g. BOPGTB ÷1000).
+#   mom_diff    — month-over-month first difference (PAYEMS jobs added; scale ×1000).
+#   mom_pct     — month-over-month % change (CPI MoM inflation).
+#   monthly_avg — monthly mean of a higher-frequency series (weekly gasoline → month).
+Derivation = Literal["level", "mom_diff", "mom_pct", "monthly_avg"]
 
 # Horizon conversion constants (ported from the replay's run_replay.py).
 TRADING_DAYS_PER_YEAR = 252.0
@@ -106,9 +113,20 @@ class _TemplateEntry:
     series_id: str
     source: Literal["fred", "yfinance"]
     label: str
-    # PAYEMS-style series: the question resolves on the monthly CHANGE, not the
-    # level. v1 renders the level history + a note and skips the band (no derived-
-    # target modeling). model_target=False marks that.
+    # How the question resolves relative to the fetched series. Non-"level" entries
+    # (PAYEMS MoM change, CPI MoM inflation, gasoline monthly average) fit the band on
+    # the DERIVED quantity — the level-with-caveat hack is gone.
+    derivation: Derivation = "level"
+    # Unit conversion applied inside the derivation (BOPGTB is millions of USD, the
+    # trade-balance question resolves in billions → scale=0.001; PAYEMS diff ×1000 is
+    # carried by the mom_diff branch, applied on top of scale).
+    scale: float = 1.0
+    # Extra keyword logic to disambiguate near-collisions under substring matching. An
+    # entry matches iff (any `keywords`) AND (all `require_keywords`) AND (no
+    # `exclude_keywords`). Used to keep US vs. Australian unemployment questions from
+    # both matching (they share "unemployment rate").
+    require_keywords: tuple[str, ...] = ()
+    exclude_keywords: tuple[str, ...] = ()
     model_target: bool = True
     note: str = ""
     # NOTE: whether a fred series revises is NOT stored here — it is derived from the
@@ -145,7 +163,8 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         ("regular gasoline", "regular gas price", "gasoline price"),
         "GASREGW",
         "fred",
-        "US regular all-formulations gasoline price ($/gal)",
+        "US regular gasoline price — monthly average ($/gal)",
+        derivation="monthly_avg",
     ),
     _TemplateEntry(("brent",), "DCOILBRENTEU", "fred", "Brent crude spot ($/bbl)"),
     _TemplateEntry(("wti", "west texas intermediate"), "CL=F", "yfinance", "WTI crude front-month ($/bbl)"),
@@ -153,26 +172,92 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         ("cpi", "consumer price index"),
         "CPIAUCSL",
         "fred",
-        "CPI-U, all items (SA index)",
+        "CPI-U all items — month-over-month % change (SA)",
+        derivation="mom_pct",
     ),
-    _TemplateEntry(("unemployment rate",), "UNRATE", "fred", "US unemployment rate (%)"),
+    _TemplateEntry(
+        ("unemployment rate",),
+        "UNRATE",
+        "fred",
+        "US unemployment rate (%)",
+        exclude_keywords=("australia", "australian"),
+    ),
     _TemplateEntry(
         ("nonfarm payroll", "non-farm payroll", "payroll employment", "payrolls"),
         "PAYEMS",
         "fred",
-        "Total nonfarm payrolls (thousands of persons, LEVEL)",
-        model_target=False,
-        note=(
-            "This is the payrolls LEVEL series. The question most likely resolves on the monthly "
-            "CHANGE (jobs added); v1 shows the level history only and does NOT extrapolate a change "
-            "band — do not read a level anchor as a jobs-added forecast."
-        ),
+        "Nonfarm payrolls — month-over-month change (jobs added, persons)",
+        derivation="mom_diff",
+        scale=1000.0,  # PAYEMS is in thousands of persons; the question resolves in persons.
     ),
     _TemplateEntry(
         ("consumer sentiment", "michigan sentiment", "umich sentiment", "consumer confidence"),
         "UMCSENT",
         "fred",
         "U. Michigan consumer sentiment index",
+    ),
+    # --- Replay-validated additions (scratch/ts_anchor_replay_2026-07-16/series_map.json) ---
+    _TemplateEntry(
+        ("s&p 500", "s&p500", "sp 500", "sp500", "standard & poor's 500", "standard and poor's 500"),
+        "^GSPC",
+        "yfinance",
+        "S&P 500 index level",
+    ),
+    _TemplateEntry(
+        ("bitcoin", "btc-usd", "price of btc"),
+        "BTC-USD",
+        "yfinance",
+        "Bitcoin price ($; daily High on max/highest questions)",
+    ),
+    _TemplateEntry(
+        ("gold price", "price of gold", "spot gold", "gold futures"),
+        "GC=F",
+        "yfinance",
+        "Gold front-month futures ($/oz; daily High on max/highest questions)",
+    ),
+    _TemplateEntry(
+        ("silver price", "price of silver", "spot silver", "silver futures"),
+        "SI=F",
+        "yfinance",
+        "Silver front-month futures ($/oz; daily High on max/highest questions)",
+    ),
+    _TemplateEntry(
+        ("case-shiller", "case shiller", "national home price", "home price index", "house price index"),
+        "CSUSHPISA",
+        "fred",
+        "S&P/Case-Shiller US National Home Price Index (SA)",
+    ),
+    _TemplateEntry(
+        ("australia", "australian"),
+        "LRHUTTTTAUM156S",
+        "fred",
+        "Australia unemployment rate (%, SA; OECD/FRED mirror)",
+        require_keywords=("unemployment",),
+    ),
+    _TemplateEntry(
+        ("federal funds target", "fed funds target", "federal funds rate", "fed funds rate"),
+        "DFEDTARU",
+        "fred",
+        "Federal funds target range, upper limit (%)",
+    ),
+    _TemplateEntry(
+        ("average weekly hours", "weekly hours"),
+        "AWHAETP",
+        "fred",
+        "US average weekly hours, all employees, total private (SA)",
+    ),
+    _TemplateEntry(
+        (
+            "goods trade balance",
+            "advance goods trade",
+            "trade balance",
+            "goods trade deficit",
+            "trade deficit in goods",
+        ),
+        "BOPGTB",
+        "fred",
+        "US advance goods trade balance ($B)",
+        scale=0.001,  # FRED reports BOPGTB in millions of USD; the question resolves in billions.
     ),
 )
 
@@ -188,6 +273,8 @@ class _Route:
     label_b: str = ""
     model_target: bool = True
     is_max: bool = False  # forward-window-max question (VIX/Brent "highest") vs period-end level
+    derivation: Derivation = "level"  # how the raw series maps to the resolved quantity
+    scale: float = 1.0  # unit conversion inside the derivation (BOPGTB ÷1000, PAYEMS diff ×1000)
     note: str = ""
 
 
@@ -208,6 +295,17 @@ def _extract_url_identifiers(criteria: str, fine_print: str) -> tuple[list[str],
 
 def _wants_max(text: str) -> bool:
     return bool(_MAX_KEYWORD_RE.search(text))
+
+
+def _entry_matches(entry: _TemplateEntry, lowered: str) -> bool:
+    """An entry matches iff any of its keywords appear AND every require_keyword appears
+    AND no exclude_keyword appears (all case-folded). require/exclude disambiguate
+    substring collisions, e.g. US vs. Australian 'unemployment rate' questions."""
+    if not any(kw in lowered for kw in entry.keywords):
+        return False
+    if not all(kw in lowered for kw in entry.require_keywords):
+        return False
+    return not any(kw in lowered for kw in entry.exclude_keywords)
 
 
 def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str) -> SeriesSpec:
@@ -259,7 +357,7 @@ def route_question(question: MetaculusQuestion) -> _Route | None:
         return None
 
     lowered = text.lower()
-    matches = [e for e in _TEMPLATE_REGISTRY if any(kw in lowered for kw in e.keywords)]
+    matches = [e for e in _TEMPLATE_REGISTRY if _entry_matches(e, lowered)]
     if not matches:
         return None
     if len(matches) > 1:
@@ -278,6 +376,8 @@ def route_question(question: MetaculusQuestion) -> _Route | None:
         label=entry.label,
         model_target=entry.model_target,
         is_max=is_max,
+        derivation=entry.derivation,
+        scale=entry.scale,
         note=entry.note,
     )
 
@@ -402,8 +502,12 @@ def _downsample_last(series: pd.Series, rule: str) -> pd.Series:
     return series[keep]
 
 
-def _multi_res_history(series: pd.Series, freq: Freq) -> list[str]:
-    """Native + coarser down-samples per frequency, using the per-resolution row caps."""
+def _multi_res_history(series: pd.Series, freq: Freq, monthly_header: str = "Last monthly observations") -> list[str]:
+    """Native + coarser down-samples per frequency, using the per-resolution row caps.
+
+    ``monthly_header`` overrides the native-monthly block header so derived-quantity
+    questions (which collapse to a monthly series) label their history as the derived
+    values, not raw observations."""
     blocks: list[str] = []
     if freq == "daily":
         blocks.append(_history_lines(series, TS_ANCHOR_NATIVE_TABLE_ROWS, "Last daily observations"))
@@ -416,8 +520,64 @@ def _multi_res_history(series: pd.Series, freq: Freq) -> list[str]:
         monthly = _downsample_last(series, "M")
         blocks.append(_history_lines(monthly, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Monthly (last obs of month)"))
     else:  # monthly
-        blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Last monthly observations"))
+        blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, monthly_header))
     return blocks
+
+
+# ---------------------------------------------------------------------------
+# Derived-target transforms (ported from the replay's build_target_series)
+# ---------------------------------------------------------------------------
+
+# Human phrasing for the derived-quantity label line and the history-block header.
+_DERIVED_TARGET_DESC: dict[Derivation, str] = {
+    "mom_diff": "month-over-month change (first difference of the level)",
+    "mom_pct": "month-over-month % change",
+    "monthly_avg": "monthly average of the higher-frequency series",
+}
+_DERIVED_HISTORY_HEADER: dict[Derivation, str] = {
+    "mom_diff": "Last monthly MoM changes (derived)",
+    "mom_pct": "Last monthly MoM % changes (derived)",
+    "monthly_avg": "Last monthly averages (derived)",
+}
+
+
+def _apply_derivation(series: pd.Series, derivation: Derivation, scale: float) -> pd.Series:
+    """Turn the raw fetched series into the quantity the question resolves on.
+
+    Mirrors the Phase-A replay's ``build_target_series`` level family:
+      - level        → raw × scale (scale=1.0 is a no-op; BOPGTB uses 0.001, millions→billions).
+      - mom_diff      → month-over-month first difference × scale (PAYEMS ×1000, thousands→persons).
+      - mom_pct       → month-over-month % change (×100), first NaN dropped.
+      - monthly_avg   → calendar-month mean of a higher-frequency series (weekly gasoline → month).
+    """
+    if derivation == "level":
+        return series * scale if scale != 1.0 else series
+    if derivation == "mom_diff":
+        return series.diff().dropna() * scale
+    if derivation == "mom_pct":
+        return ((series / series.shift(1) - 1.0) * 100.0).dropna()
+    if derivation == "monthly_avg":
+        return series.resample("MS").mean().dropna()
+    raise ValueError(f"unhandled derivation {derivation!r}")  # unreachable via Literal
+
+
+def _realized_max_floor(series: pd.Series, window_start: date | None, ceiling: date) -> float | None:
+    """Max already observed within the elapsed part of a max-window question's window.
+
+    A forward max can only rise, so the max over ``[window_start, ceiling]`` is a hard
+    lower bound on the answer once the window has started (live case: window opened in the
+    past, ``ceiling`` = now). Returns None when the window hasn't opened yet (benchmark
+    case: ``ceiling`` = open_time, no elapsed portion) or no observation falls inside it.
+    Uses ``open_time`` as ``window_start``; for calendar-scoped questions (e.g. 'highest in
+    2025') that understates the true window, giving a looser — but still valid — lower bound.
+    """
+    if window_start is None or window_start >= ceiling:
+        return None
+    idx = pd.DatetimeIndex(series.index)
+    elapsed = series[(idx >= pd.Timestamp(window_start)) & (idx <= pd.Timestamp(ceiling))]
+    if elapsed.empty:
+        return None
+    return float(elapsed.max())
 
 
 def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
@@ -460,26 +620,54 @@ def _render_single(
     route: _Route,
     ceiling: date,
     calendar_days: int,
+    window_start: date | None = None,
 ) -> str:
-    freq = _detect_freq(pd.DatetimeIndex(series.index))
-    last = float(series.iloc[-1])
-    last_date = pd.DatetimeIndex(series.index)[-1].strftime("%Y-%m-%d")
+    # Everything downstream operates on the DERIVED quantity the question resolves on
+    # (level×scale for plain/unit-converted levels; MoM change / MoM % / monthly average
+    # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
+    # level path is byte-identical to before.
+    raw_last = float(series.iloc[-1])
+    raw_last_date = pd.DatetimeIndex(series.index)[-1].strftime("%Y-%m-%d")
+    derived = _apply_derivation(series, route.derivation, route.scale)
+    is_derived = route.derivation != "level"
+    # MoM change / MoM % / monthly-average all collapse to a monthly effective frequency;
+    # the horizon and band are computed on that, matching the replay's build_target_series.
+    freq: Freq = "monthly" if is_derived else _detect_freq(pd.DatetimeIndex(derived.index))
+    last = float(derived.iloc[-1])
     h = horizon_steps(freq, calendar_days)
-    use_log = bool(np.all(series.to_numpy(dtype="float64") > 0.0))
-    # A forward-window-max question (from title framing OR a High-column yfinance
-    # spec) resolves on the max over the window, not the period-end level.
+    y = derived.to_numpy(dtype="float64")
+    use_log = bool(np.all(y > 0.0))
+    # A forward-window-max question (from title framing OR a High-column yfinance spec)
+    # resolves on the max over the window, not the period-end level.
     is_max = route.is_max or route.spec.column == "High"
 
-    parts: list[str] = [f"**{route.label}** — latest {_fmt(last)} (as of {last_date}; series frequency: {freq})"]
+    if is_derived:
+        parts: list[str] = [
+            f"**{route.label}** — latest derived value {_fmt(last)} "
+            f"({_DERIVED_TARGET_DESC[route.derivation]}; from raw level {_fmt(raw_last)} "
+            f"as of {raw_last_date}; effective series frequency: {freq})"
+        ]
+    else:
+        parts = [f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}; series frequency: {freq})"]
     if route.note:
         parts.append(f"- Note: {route.note}")
-    parts.extend(_multi_res_history(series, freq))
-    parts.append(_fifty_two_week_line(series, ceiling, last))
 
-    y = series.to_numpy(dtype="float64")
+    if is_derived:
+        parts.extend(_multi_res_history(derived, freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))
+    else:
+        parts.extend(_multi_res_history(derived, freq))
+        parts.append(_fifty_two_week_line(derived, ceiling, last))
+
     if route.model_target and y.size > h:
         if is_max:
             band = _empirical_max_band(y, h, use_log=use_log, last=last)
+            floor = _realized_max_floor(derived, window_start, ceiling)
+            if floor is not None:
+                band = (max(band[0], floor), max(band[1], floor), max(band[2], floor))
+                parts.append(
+                    f"- Realized max so far this window: {_fmt(floor)} — a HARD LOWER BOUND on the answer "
+                    f"(the resolution window has already started; a forward max can only rise from here)."
+                )
             parts.append(_band_line("forward-max", freq, h, TS_ANCHOR_LOOKBACK_YEARS, band, last))
         else:
             band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
@@ -488,7 +676,7 @@ def _render_single(
         parts.append(f"- (Horizon {h} exceeds available history; empirical band withheld.)")
 
     if freq == "daily" and use_log:
-        vol_line = _realized_vol_line(series)
+        vol_line = _realized_vol_line(derived)
         if vol_line:
             parts.append(vol_line)
 
@@ -527,9 +715,13 @@ def _render_spread(
     parts.append(_history_lines(series_b, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label_b} recent"))
     unit = _FREQ_UNIT[freq]
     parts.append(
-        f"- Forward {h}-{unit} relative-return band (pp; ~mean-zero prior, empirical over the last "
+        f"- Forward {h}-{unit} relative-return band (pp, empirical over the last "
         f"~{TS_ANCHOR_SPREAD_LOOKBACK_YEARS} years):\n"
         f"  - P10 / P50 / P90 → {_fmt(band[0])} / {_fmt(band[1])} / {_fmt(band[2])}"
+    )
+    parts.append(
+        "- Relative-return spreads are ~mean-zero by construction; the band is an honest prior, "
+        "not a directional signal."
     )
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
     return "\n".join(parts)
@@ -546,11 +738,12 @@ def _truncate_section(text: str) -> str:
 def _maybe_stash_single_chart(
     series: pd.Series, *, route: _Route, question: MetaculusQuestion, as_of: datetime, calendar_days: int
 ) -> None:
-    """Render + stash the anchor chart for a single LEVEL question when the chart
-    flag is on. No-op for max-window / spread / no-band cases (v1 charts only the
-    level shape, where the ribbon reads cleanly). Chart-render failures are
-    swallowed so a plotting hiccup never breaks the text section — the chart is a
-    strict add-on and the caller's soft-fail only guards the text.
+    """Render + stash the anchor chart for a single plain-LEVEL question when the chart
+    flag is on. No-op for max-window / spread / derived-target / no-band cases (v1 charts
+    only the plain level shape, where the ribbon reads cleanly — a derived MoM/monthly-avg
+    band is on a different quantity than the level history this charts). Chart-render
+    failures are swallowed so a plotting hiccup never breaks the text section — the chart
+    is a strict add-on and the caller's soft-fail only guards the text.
     """
     if not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
         return
@@ -558,15 +751,21 @@ def _maybe_stash_single_chart(
     if qid is None:
         return
     is_max = route.is_max or route.spec.column == "High"
-    if is_max or not route.model_target:
+    # v1: chart only plain level questions. Derived targets (MoM diff / MoM % / monthly
+    # avg) render + fit the band on a derived quantity; the level-shape chart would
+    # mislead by pairing a level history with a change-quantity ribbon.
+    if is_max or route.derivation != "level" or not route.model_target:
         return
 
-    freq = _detect_freq(pd.DatetimeIndex(series.index))
+    # Chart the derived (unit-scaled) series so the ribbon matches the text band exactly;
+    # for plain level (scale=1.0) this is a no-op and identical to before.
+    charted = _apply_derivation(series, route.derivation, route.scale)
+    freq = _detect_freq(pd.DatetimeIndex(charted.index))
     h = horizon_steps(freq, calendar_days)
-    y = series.to_numpy(dtype="float64")
+    y = charted.to_numpy(dtype="float64")
     if y.size <= h:
         return  # band withheld in the text too; nothing to chart
-    last = float(series.iloc[-1])
+    last = float(charted.iloc[-1])
     use_log = bool(np.all(y > 0.0))
     band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
 
@@ -577,7 +776,7 @@ def _maybe_stash_single_chart(
     as_of_ts = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of)
     try:
         _session_charts[qid] = render_anchor_chart(
-            series,
+            charted,
             as_of=as_of_ts,
             horizon_end=_horizon_end_date(as_of_ts, freq, h),
             band=band,
@@ -611,7 +810,14 @@ def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
 
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)
     _maybe_stash_single_chart(series, route=route, question=question, as_of=as_of, calendar_days=calendar_days)
-    return _truncate_section(_render_single(series, route=route, ceiling=ceiling, calendar_days=calendar_days))
+    # For a forward-max question whose window has already opened, the max over the
+    # elapsed portion is a hard lower bound. Approximate window_start by open_time; when
+    # ceiling == open_time (benchmark path) there's no elapsed portion and no floor.
+    open_time = getattr(question, "open_time", None)
+    window_start = open_time.date() if isinstance(open_time, datetime) else None
+    return _truncate_section(
+        _render_single(series, route=route, ceiling=ceiling, calendar_days=calendar_days, window_start=window_start)
+    )
 
 
 # ---------------------------------------------------------------------------
