@@ -152,11 +152,15 @@ def main() -> None:
         elif run_mode == "test_questions":
             # Example questions are a good way to test the bot's performance on a single question
             EXAMPLE_QUESTIONS = [
-                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-                # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-                "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
-                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+                # TEMPORARY (2026-07-17): gap-fill v2 smoke question — research-rich numeric
+                # (named resolution source: Electoral Commission of Zambia; thin news coverage;
+                # niche conditional base rate). Restore the evergreen list after the smoke run.
+                "https://www.metaculus.com/questions/44229/",  # Zambia: Hichilema first-round vote % - Numeric
+                # Evergreen list (restore after smoke):
+                # "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
+                # "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
+                # "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
+                # "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
             ]
             template_bot.skip_previously_forecasted_questions = (
                 False  # obviously, we need to rerun test q predictions to test them :)
