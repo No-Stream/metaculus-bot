@@ -45,6 +45,7 @@ class _LoopState:
     telemetry: LoopTelemetry = field(default_factory=LoopTelemetry)
     findings: list[Finding] = field(default_factory=list)
     pending_leads: list[str] = field(default_factory=list)
+    seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     nudged_for_no_action: bool = False
     explicit_conclude: bool = False
     stop_loop: bool = False
@@ -62,6 +63,7 @@ class _ToolExecutionResult:
     tool_call_id: str
     tool_name: str
     content: str
+    method: str = ""
 
 
 def _tool_schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -384,7 +386,27 @@ async def _execute_one_tool_call(
         tool_call_id=tool_call.id,
         tool_name=tool_call.name,
         content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
+        method=outcome.method,
     )
+
+
+def _normalized_call_key(tool_call: _ToolCall) -> tuple[str, str]:
+    """(tool, normalized-args) identity for exact-duplicate detection.
+
+    JSON args are re-serialized with sorted keys so key-order shuffles still
+    count as the same call; unparseable args fall back to the raw string.
+    """
+    try:
+        normalized = json.dumps(json.loads(tool_call.arguments or "{}"), sort_keys=True)
+    except (json.JSONDecodeError, ValueError):
+        normalized = tool_call.arguments
+    return (tool_call.name, normalized)
+
+
+_DUPLICATE_CALL_WARNING = (
+    "\n[note: this exact tool call was already made earlier in this run — "
+    "its result will not have changed. Vary the query/URL or move on.]"
+)
 
 
 async def _execute_tool_batch(
@@ -395,21 +417,31 @@ async def _execute_tool_batch(
     config: LoopConfig,
     now: Callable[[], float],
 ) -> None:
+    duplicate_call_ids: set[str] = set()
     for tool_call in tool_calls:
         state.telemetry.tool_calls += 1
         state.telemetry.per_tool_counts[tool_call.name] = state.telemetry.per_tool_counts.get(tool_call.name, 0) + 1
+        call_key = _normalized_call_key(tool_call)
+        if call_key in state.seen_tool_calls:
+            state.telemetry.dup_tool_calls += 1
+            duplicate_call_ids.add(tool_call.id)
+        else:
+            state.seen_tool_calls.add(call_key)
 
     results = await asyncio.gather(
         *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in tool_calls]
     )
     budget_line = _budget_line(state, config, now)
     for result in results:
+        if result.method == "rendered":
+            state.telemetry.rendered_fetches += 1
+        warning = _DUPLICATE_CALL_WARNING if result.tool_call_id in duplicate_call_ids else ""
         state.messages.append(
             {
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
                 "name": result.tool_name,
-                "content": result.content + budget_line,
+                "content": result.content + warning + budget_line,
             }
         )
 
@@ -428,12 +460,23 @@ def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForeca
 
 
 def _log_completion(state: _LoopState, log_prefix: str) -> None:
+    # Marker shape per plan §6: model + per-surface counters make the run_logs
+    # grep enough for the driver vibe-eval (no research-archive JSON needed).
+    per_tool = state.telemetry.per_tool_counts
+    searches = per_tool.get("search_news", 0) + per_tool.get("search_web", 0)
     logger.info(
-        "%sGAP_FILL_V2: steps=%s tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
+        "%sGAP_FILL_V2: model=%s steps=%s tool_calls=%s searches=%s fetches=%s rendered=%s reads=%s "
+        "dup_tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
         "pending_leads=%s lint_rejections=%s",
         log_prefix,
+        state.telemetry.model,
         state.telemetry.steps,
         state.telemetry.tool_calls,
+        searches,
+        per_tool.get("fetch", 0),
+        state.telemetry.rendered_fetches,
+        per_tool.get("read_document", 0),
+        state.telemetry.dup_tool_calls,
         state.telemetry.deadline_hit,
         state.explicit_conclude and not state.telemetry.deadline_hit,
         state.telemetry.wall_s,
@@ -545,6 +588,7 @@ async def run_agentic_loop(
         started_at_s=now_fn(),
         deadline_at_s=now_fn() + config.wall_deadline_s,
     )
+    state.telemetry.model = config.model
 
     try:
         return await asyncio.wait_for(

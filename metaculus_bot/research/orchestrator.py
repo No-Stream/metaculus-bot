@@ -138,37 +138,47 @@ class ResearchOrchestrator:
             gap_fill_v2_payload: dict | None = None
 
             if gap_fill_v1_active or gap_fill_v2_active:
-                try:
-                    from metaculus_bot.research.agentic_gap_fill import (
-                        run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                    )
-                    from metaculus_bot.research.targeted import (
-                        run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-                    )
+                # v1 and v2 import + run inside their own guards so each pass
+                # degrades independently: a v2 code defect (import error in the
+                # agentic package, unhandled raise) must never zero v1's
+                # addendum in prod, and vice versa. The single gather keeps the
+                # research-phase wall-clock at max(v1, v2), not the sum.
+                def _capture_gap_fill_v2(payload: dict) -> None:
+                    nonlocal gap_fill_v2_payload
+                    gap_fill_v2_payload = payload
 
-                    def _capture_gap_fill_v2(payload: dict) -> None:
-                        nonlocal gap_fill_v2_payload
-                        gap_fill_v2_payload = payload
+                async def _run_v1() -> str:
+                    if not gap_fill_v1_active:
+                        return ""
+                    try:
+                        from metaculus_bot.research.targeted import (
+                            run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                        )
 
-                    async def _run_v1() -> str:
-                        if not gap_fill_v1_active:
-                            return ""
                         return await run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking)
+                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
+                        logger.exception("Gap-fill v1 stage failed; proceeding without it")
+                        return ""
 
-                    async def _run_v2() -> str:
-                        if not gap_fill_v2_active:
-                            return ""
+                async def _run_v2() -> str:
+                    if not gap_fill_v2_active:
+                        return ""
+                    try:
+                        from metaculus_bot.research.agentic_gap_fill import (
+                            run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                        )
+
                         return await run_gap_fill_v2(
                             question,
                             research,
                             is_benchmarking=self._is_benchmarking,
                             archive_sink=_capture_gap_fill_v2,
                         )
+                    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
+                        logger.exception("Gap-fill v2 stage failed; proceeding without it")
+                        return ""
 
-                    addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
-                except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
-                    logger.exception("Gap-fill stage failed; proceeding without it")
-                    addendum, v2_findings = "", ""
+                addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
                 if addendum:
                     research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
                 if v2_findings:

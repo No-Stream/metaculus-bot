@@ -415,6 +415,15 @@ GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
 # luna-medium is the cheap+reliable dev default until the eval picks a winner.
 GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-luna"
 GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "medium"
+# read_document backend model on the NATIVE google-genai path (tools.py
+# _run_document_read_sync). CAUTION: this id is UNVERIFIED on the native
+# AI Studio API until the paid smoke test — the repo's verified-model notes
+# ("gemini-3.5-flash works") all refer to the OpenRouter slug route, which maps
+# ids differently; the only id verified on the native SDK here is
+# GEMINI_SEARCH_DEFAULT_MODEL ("gemini-3-flash-preview"). A wrong id soft-fails
+# read_document (model-not-found -> error outcome), silently disabling the
+# directed-reading rung.
+GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
 # Parallel tool calls each count against the cap; steps are where latency
 # lives, so batching is encouraged rather than rationed.
 GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 14)

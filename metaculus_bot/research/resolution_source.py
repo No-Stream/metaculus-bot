@@ -54,6 +54,8 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
+    MAX_REDIRECTS,
+    REDIRECT_STATUSES,
     FilteringResolver,
     build_session,
     read_body_capped,
@@ -91,11 +93,9 @@ logger = logging.getLogger(__name__)
 # Gamma, Kalshi, Manifold) and doesn't need this. If a third caller lands in
 # http_fetch that also takes user-supplied URLs, hoist this guard there.
 #
-# Number of HTTP redirects to follow before giving up. Real-world resolution
-# sources chain at most 1-2 hops (protocol/canonicalization); 5 leaves slack for
-# tracker redirects while keeping the SSRF re-guard cost bounded.
-_MAX_REDIRECTS: int = 5
-_REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
+# Redirect policy (hop cap + 3xx status set) lives in http_fetch.py as
+# MAX_REDIRECTS / REDIRECT_STATUSES, shared with research.agentic.tools so the
+# two SSRF-guarded fetchers can't drift.
 
 
 def _ip_is_disallowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -507,7 +507,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     :func:`_get_session`) provides the actual DNS-rebinding boundary; these
     preflight checks are fast-fail observability so we surface
     ``ssrf_blocked`` without opening a session. Redirects are followed in-band
-    with a hard ``_MAX_REDIRECTS`` cap.
+    with a hard ``MAX_REDIRECTS`` cap.
 
     No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``.
     """
@@ -529,7 +529,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     # both context managers, releasing the semaphore before the next hop
     # acquires its own — no nesting, so no self-deadlock on revisited hosts).
     # Non-redirect responses fall through to the content-type routing below.
-    for _hop in range(_MAX_REDIRECTS + 1):
+    for _hop in range(MAX_REDIRECTS + 1):
         async with _sem_for_host(host_sems, current_url):
             try:
                 async with session.get(current_url, allow_redirects=False) as resp:
@@ -537,7 +537,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                     status = resp.status
                     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
 
-                    if status in _REDIRECT_STATUSES:
+                    if status in REDIRECT_STATUSES:
                         location = resp.headers.get("Location") if resp.headers else None
                         if not location:
                             # Malformed redirect — no Location header.
@@ -692,8 +692,8 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                     content_type=None,
                 )
 
-    # Fell out of the loop -> exceeded _MAX_REDIRECTS.
-    logger.info(f"resolution_source redirect chain exceeded {_MAX_REDIRECTS} hops (final={current_url})")
+    # Fell out of the loop -> exceeded MAX_REDIRECTS.
+    logger.info(f"resolution_source redirect chain exceeded {MAX_REDIRECTS} hops (final={current_url})")
     return FetchResult(
         url=current_url,
         status="error",

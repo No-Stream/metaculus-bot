@@ -53,9 +53,16 @@ class LoopConfig:
 
 @dataclass(slots=True)
 class LoopTelemetry:
+    model: str = ""
     steps: int = 0
     tool_calls: int = 0
     per_tool_counts: dict[str, int] = field(default_factory=dict)
+    # fetch calls whose outcome came from the headless-Chromium rung — a
+    # per-method count (per_tool_counts can't see which rung served a fetch).
+    rendered_fetches: int = 0
+    # Exact-duplicate (tool, normalized-args) repeats within the run — plan
+    # §3.1 v1-lite stuck-detection (counter + gentle warning, no enforcement).
+    dup_tool_calls: int = 0
     deadline_hit: bool = False
     concluded_early: bool = False
     wall_s: float = 0.0

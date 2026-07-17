@@ -79,6 +79,15 @@ class FilteringResolver(aiohttp.abc.AbstractResolver):
         await self._inner.close()
 
 
+# Shared redirect policy for the SSRF-guarded fetchers (resolution_source and
+# research.agentic.tools) — both follow redirects manually so each hop can be
+# re-guarded, and both must follow the SAME policy or the two fetchers drift
+# for the same URL. Real-world sources chain at most 1-2 hops; 5 leaves slack
+# for tracker redirects while keeping the per-hop re-guard cost bounded.
+MAX_REDIRECTS: int = 5
+REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
+
+
 # Safari-like UA + full Accept / Accept-Language / Accept-Encoding.
 # FINDINGS (resolution_source_probe): this exact header set recovered
 # 6 extra sources vs Chrome-UA-only (38/50 vs 32/50).

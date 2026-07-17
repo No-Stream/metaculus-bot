@@ -20,17 +20,16 @@ from metaculus_bot.constants import (
     ASKNEWS_SECRET_ENV,
     EXA_API_KEY_ENV,
     GAP_FILL_V2_MIN_CONTENT_CHARS,
+    GAP_FILL_V2_READER_MODEL,
     GOOGLE_API_KEY_ENV,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
-from metaculus_bot.research.http_fetch import BROWSER_HEADERS, read_body_capped
+from metaculus_bot.research.http_fetch import BROWSER_HEADERS, MAX_REDIRECTS, REDIRECT_STATUSES, read_body_capped
 
 logger = logging.getLogger(__name__)
-
-GAP_FILL_V2_READER_MODEL = "gemini-3.5-flash"
 
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
@@ -129,11 +128,9 @@ _READ_DOCUMENT_PARAMETERS = {
 _PDF_CONTENT_TYPE_TOKENS = ("application/pdf",)
 _IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
 _RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
-_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-_MAX_REDIRECTS = 5
 _TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
 _HTML_CONTENT_TYPE_TOKENS = ("text/html", "application/xhtml+xml")
-_EXA_RATE_LIMIT_RE = re.compile(r"\b(429|rate[\s-]?limit|too many requests|over limit|quota)\b", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"\b(429|rate[\s-]?limit|too many requests|over limit|quota)\b", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -336,8 +333,9 @@ def _warn_playwright_unavailable_once(exc: BaseException) -> None:
     logger.warning("agentic fetch rendered rung unavailable: %s: %s", type(exc).__name__, exc)
 
 
-def _is_exa_rate_limited(exc: BaseException) -> bool:
-    return bool(_EXA_RATE_LIMIT_RE.search(str(exc)))
+def _is_rate_limited_error(exc: BaseException) -> bool:
+    """Generic 429/rate-limit/quota classifier (Exa and AskNews retry paths)."""
+    return bool(_RATE_LIMIT_RE.search(str(exc)))
 
 
 async def _call_asknews_search(query: str) -> list[Any]:
@@ -367,7 +365,7 @@ async def _call_asknews_search(query: str) -> list[Any]:
                     return list(response.as_dicts or [])
                 except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
                     last_exc = exc
-                    if not _is_exa_rate_limited(exc) and not research_providers.is_asknews_subscription_error(exc):
+                    if not _is_rate_limited_error(exc) and not research_providers.is_asknews_subscription_error(exc):
                         msg = str(exc).lower()
                         if "concurrency limit" not in msg:
                             raise
@@ -405,7 +403,7 @@ async def _call_exa_search(query: str, end_published_date: str | None) -> list[A
                 results = _mapping_or_attrs_get(response, "results")
                 return list(results) if isinstance(results, list) else []
             except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
-                if attempt >= len(_EXA_RETRY_DELAYS_S) or not _is_exa_rate_limited(exc):
+                if attempt >= len(_EXA_RETRY_DELAYS_S) or not _is_rate_limited_error(exc):
                     raise
                 await asyncio.sleep(_EXA_RETRY_DELAYS_S[attempt])
     return []
@@ -428,13 +426,13 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
     session = resolution_source._get_session()
     async with session:
         current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
+        for _ in range(MAX_REDIRECTS + 1):
             async with _host_gate(current_url):
                 try:
                     async with session.get(current_url, allow_redirects=False) as resp:
                         status = resp.status
                         content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
-                        if status in _REDIRECT_STATUSES:
+                        if status in REDIRECT_STATUSES:
                             location = resp.headers.get("Location") if resp.headers else None
                             if not location:
                                 return PlainFetchResult(

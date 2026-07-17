@@ -95,7 +95,7 @@ async def run_gap_fill_v2(
             wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
             conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
         )
-        question_ref = question.page_url or str(getattr(question, "id_of_question", "unknown"))
+        question_ref = question.page_url or str(question.id_of_question)
         result = await run_agentic_loop(
             system_prompt,
             user_brief,

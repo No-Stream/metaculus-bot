@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import sys
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -21,6 +21,9 @@ from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
+from tests.agentic_fakes import FakeLlm
+from tests.agentic_fakes import response as _response
+from tests.agentic_fakes import tool_call as _tool_call
 from tests.pipeline_test_helpers import (
     make_real_binary_question,
     make_real_mc_question,
@@ -28,62 +31,6 @@ from tests.pipeline_test_helpers import (
 )
 
 BUNDLE = "## News Articles (AskNews)\nSome first-pass research prose about unemployment."
-
-
-# --- fake litellm-shaped responses (mirrors tests/test_agentic_loop.py) ---
-
-
-@dataclass
-class _FakeFunction:
-    name: str
-    arguments: str
-
-
-@dataclass
-class _FakeToolCall:
-    id: str
-    function: _FakeFunction
-
-
-@dataclass
-class _FakeMessage:
-    content: str
-    tool_calls: list[_FakeToolCall] | None = None
-
-
-@dataclass
-class _FakeChoice:
-    message: _FakeMessage
-
-
-@dataclass
-class _FakeResponse:
-    choices: list[_FakeChoice]
-
-
-def _tool_call(tool_id: str, name: str, arguments: dict[str, Any]) -> _FakeToolCall:
-    return _FakeToolCall(tool_id, _FakeFunction(name=name, arguments=json.dumps(arguments)))
-
-
-def _response(content: str = "", tool_calls: list[_FakeToolCall] | None = None) -> _FakeResponse:
-    return _FakeResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=tool_calls))])
-
-
-class FakeLlm:
-    """Scripted llm_call double; records every invocation."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self._responses = list(responses)
-        self.calls: list[list[dict[str, Any]]] = []
-
-    async def __call__(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> Any:
-        self.calls.append(messages)
-        if not self._responses:
-            raise AssertionError("FakeLlm ran out of scripted responses")
-        response = self._responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
 
 
 _FINDING = {
@@ -95,7 +42,7 @@ _FINDING = {
     "topic": "labor-market",
 }
 
-_GHOST_BLOCK = '```json\n{"forecast_type": "binary", "posterior_prob": 0.12}\n```'
+_GHOST_BLOCK = '```json\n{"question_type": "binary", "posterior_prob": 0.12}\n```'
 
 
 def _happy_path_llm() -> FakeLlm:
@@ -177,6 +124,10 @@ class TestRunGapFillV2Seam:
         messages = [record.getMessage() for record in caplog.records]
         assert any("GAP_FILL_V2:" in m for m in messages)
         assert any("GHOST_FORECAST:" in m for m in messages)
+        # The ghost block must actually parse (non-empty summary), not just log
+        # a marker — a broken parse degrades to qtype=unknown with summary="".
+        ghost_lines = [m for m in messages if "GHOST_FORECAST:" in m]
+        assert any("qtype=binary" in m and "summary=posterior_prob=0.1200" in m for m in ghost_lines)
         # log_prefix carries the question reference on the marker lines.
         assert any("question=https://www.metaculus.com/questions/" in m for m in messages if "GAP_FILL_V2:" in m)
 
@@ -190,7 +141,7 @@ class TestRunGapFillV2Seam:
         with llm_patch, tools_patch:
             await run_gap_fill_v2(question, BUNDLE, is_benchmarking=False)
 
-        first_messages = fake_llm.calls[0]
+        first_messages = fake_llm.calls[0]["messages"]
         assert first_messages[0]["role"] == "system"
         assert "research analyst" in first_messages[0]["content"]
         brief = first_messages[1]["content"]
@@ -327,6 +278,103 @@ class TestOrchestratorBothFlags:
         assert v2_mock.await_count == 0
         assert "## Targeted Gap-Fill (second pass)" in research
         assert "## Agentic Research Findings" not in research
+
+    @pytest.mark.asyncio
+    async def test_v2_import_error_leaves_v1_addendum_intact(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A v2 module-level import failure must degrade only v2, never v1.
+
+        Regression guard for the merged-guard bug: with one shared try block, a
+        broken v2 import zeroed v1's addendum too even with the v2 flag off in
+        every other respect.
+        """
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(
+            return_value="First-pass research prose long enough to pass the gap-fill min-chars gate. " * 4
+        )
+
+        # None in sys.modules makes `from metaculus_bot.research.agentic_gap_fill
+        # import run_gap_fill_v2` raise ImportError — the exact failure a broken
+        # v2 module tree produces at the orchestrator's function-level import.
+        monkeypatch.setitem(sys.modules, "metaculus_bot.research.agentic_gap_fill", None)
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
+                new_callable=AsyncMock,
+                return_value="v1 gap-fill addendum text",
+            ),
+        ):
+            research = await orch.run_research(make_real_binary_question())
+
+        assert "## Targeted Gap-Fill (second pass)" in research
+        assert "v1 gap-fill addendum text" in research
+        assert "## Agentic Research Findings" not in research
+
+    @pytest.mark.asyncio
+    async def test_v2_runtime_error_leaves_v1_addendum_intact(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(
+            return_value="First-pass research prose long enough to pass the gap-fill min-chars gate. " * 4
+        )
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
+                new_callable=AsyncMock,
+                return_value="v1 gap-fill addendum text",
+            ),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("v2 exploded"),
+            ),
+        ):
+            research = await orch.run_research(make_real_binary_question())
+
+        assert "## Targeted Gap-Fill (second pass)" in research
+        assert "## Agentic Research Findings" not in research
+
+    @pytest.mark.asyncio
+    async def test_v1_runtime_error_leaves_v2_findings_intact(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(
+            return_value="First-pass research prose long enough to pass the gap-fill min-chars gate. " * 4
+        )
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.targeted.run_gap_fill_pass",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("v1 exploded"),
+            ),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2",
+                new_callable=AsyncMock,
+                return_value="## Agentic Research Findings\n\nClaim: BLS says 4.1%.",
+            ),
+        ):
+            research = await orch.run_research(make_real_binary_question())
+
+        assert "## Targeted Gap-Fill (second pass)" not in research
+        assert "## Agentic Research Findings" in research
 
     @pytest.mark.asyncio
     async def test_archive_payload_carries_gap_fill_v2_key(

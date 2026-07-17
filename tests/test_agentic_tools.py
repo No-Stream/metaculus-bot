@@ -210,6 +210,93 @@ async def test_search_news_happy_path_uses_gate_and_semaphore(monkeypatch: pytes
     assert "Article title" in outcome.content_markdown
 
 
+class _FakeAskNewsSdk:
+    """Async-context AskNews SDK double with a scripted search_news."""
+
+    def __init__(self, search_news_mock: AsyncMock) -> None:
+        self.news = SimpleNamespace(search_news=search_news_mock)
+
+    async def __aenter__(self) -> "_FakeAskNewsSdk":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def _patch_asknews_env(monkeypatch: pytest.MonkeyPatch, search_news_mock: AsyncMock) -> AsyncMock:
+    """Wire creds + SDK + rate gate for a _call_asknews_search test; returns the sleep recorder."""
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+    monkeypatch.setenv("ASKNEWS_SECRET", "secret")
+    monkeypatch.setattr("metaculus_bot.research.providers._asknews_rate_gate", AsyncMock())
+    monkeypatch.setitem(
+        sys.modules, "asknews_sdk", SimpleNamespace(AsyncAskNewsSDK=lambda **_: _FakeAskNewsSdk(search_news_mock))
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", sleep_mock)
+    return sleep_mock
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_retries_rate_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(
+        side_effect=[
+            RuntimeError("429 too many requests"),
+            SimpleNamespace(as_dicts=[{"eng_title": "Recovered article"}]),
+        ]
+    )
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    articles = await agentic_tools._call_asknews_search("query")
+
+    assert len(articles) == 1
+    assert search_news.await_count == 2
+    # One backoff between the two attempts, on the provider's schedule.
+    expected_backoff = agentic_tools.ASKNEWS_BACKOFF_SECS * (10 + 3**1)
+    assert [call.args[0] for call in sleep_mock.await_args_list] == [expected_backoff]
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_retries_concurrency_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(
+        side_effect=[
+            RuntimeError("concurrency limit exceeded for plan"),
+            SimpleNamespace(as_dicts=[{"eng_title": "Recovered article"}]),
+        ]
+    )
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    articles = await agentic_tools._call_asknews_search("query")
+
+    assert len(articles) == 1
+    assert search_news.await_count == 2
+    assert sleep_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_non_retryable_error_raises_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(side_effect=RuntimeError("invalid credentials"))
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    with pytest.raises(RuntimeError, match="invalid credentials"):
+        await agentic_tools._call_asknews_search("query")
+
+    assert search_news.await_count == 1
+    assert sleep_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_rate_limit_exhausts_retries_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    tries = max(1, int(agentic_tools.ASKNEWS_MAX_TRIES))
+    search_news = AsyncMock(side_effect=RuntimeError("429 too many requests"))
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    with pytest.raises(RuntimeError, match="429"):
+        await agentic_tools._call_asknews_search("query")
+
+    assert search_news.await_count == tries
+    assert sleep_mock.await_count == tries - 1
+
+
 @pytest.mark.asyncio
 async def test_search_news_missing_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
@@ -438,7 +525,7 @@ async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pyt
 
 @pytest.mark.asyncio
 async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    hops = agentic_tools._MAX_REDIRECTS + 2
+    hops = agentic_tools.MAX_REDIRECTS + 2
     session = _FakeSession(
         *[_FakeResponse(status=302, headers={"Location": f"https://example.com/hop{i}"}) for i in range(hops)]
     )
@@ -449,7 +536,7 @@ async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) 
 
     assert result.status == "error"
     assert result.text == "Redirect limit exceeded."
-    assert len(session.calls) == agentic_tools._MAX_REDIRECTS + 1
+    assert len(session.calls) == agentic_tools.MAX_REDIRECTS + 1
 
 
 @pytest.mark.asyncio
@@ -462,6 +549,92 @@ async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: p
 
     assert result.status == "error"
     assert "Malformed redirect" in result.text
+
+
+@pytest.mark.asyncio
+async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plan §5 politeness: a plain and a rendered fetch to the same host must
+    contend on the same per-host Semaphore(1) and never run concurrently."""
+    events: list[str] = []
+    release_plain = asyncio.Event()
+
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    async def blocking_read(resp: object, label: str) -> bytes:
+        events.append("plain_read_started")
+        await release_plain.wait()
+        events.append("plain_read_finished")
+        return b"<html><body><p>Long body</p></body></html>"
+
+    monkeypatch.setattr(agentic_tools, "_read_response_body", blocking_read)
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="body text " * 60),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            # Runs strictly after _try_rendered_fetch acquires the host gate.
+            events.append("rendered_started")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
+    await asyncio.sleep(0)
+    assert events == ["plain_read_started"]  # plain holds the example.com gate
+
+    rendered_task = asyncio.create_task(agentic_tools._try_rendered_fetch("https://example.com/rendered-page"))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    # Rendered must be parked on the shared host gate while plain holds it.
+    assert "rendered_started" not in events
+
+    release_plain.set()
+    plain_result = await plain_task
+    rendered_result = await rendered_task
+
+    assert plain_result.status == "ok"
+    assert rendered_result is not None and rendered_result.method == "rendered"
+    assert events.index("plain_read_finished") < events.index("rendered_started")
 
 
 @pytest.mark.asyncio
