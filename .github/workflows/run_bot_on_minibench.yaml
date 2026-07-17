@@ -101,8 +101,9 @@ jobs:
           # parallel grounded Gemini searches resolve each. Fails soft.
           GAP_FILL_ENABLED: 'true'
           # Agentic gap-fill v2 (bounded research loop; runs concurrently with
-          # v1 when both are on). OFF until the vibe-eval/prod-flip decision.
-          GAP_FILL_V2_ENABLED: 'false'
+          # v1 when both are on). ON since 2026-07-17 after smoke + blind driver
+          # eval + Exa confirmation; v1 stays on for an overlap window.
+          GAP_FILL_V2_ENABLED: 'true'
           # Probabilistic tools post-processor: deterministic probability math
           # injected into per-forecaster rationales and the stacker's view.
           # Retired (C2): tier-2 scaffold fields no longer demanded in prompts;
