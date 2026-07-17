@@ -81,17 +81,21 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 # flag to ``'false'``
 # (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
 # so these HTML-comment markers are currently DORMANT in published prod
-# comments. The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON that
-# once accompanied them is ALSO gone: the tier-2 scaffold that elicited those
-# fields was retired from the prompts in Workstream C2, so forecasters stopped
-# emitting them entirely. Archived prod comments do NOT contain them — 0 of
-# 2203 archived binary rows carry either field (verified 2026-07-15; receipts
-# in ``scratch/coherence_2026-07-15/synthesis.md``). Consequence: the
-# 2026-07-08 anchor-overshoot finding CANNOT be monitored from archived data,
-# and restoring this telemetry requires re-adding the elicitation to the
-# prompts — a deliberate config-era change, not a flag flip. The markers below
-# still become the primary channel if ``PROBABILISTIC_TOOLS_ENABLED`` is ever
-# flipped on. TELEMETRY ONLY either way: nothing in the pipeline reads these
+# comments. NOTE: the ``base_rate_anchor`` / ``criteria_clauses`` fields are
+# live in the binary prompt (added ``30bca2f``, 2026-07-08) — they land
+# unconditionally in every prod binary comment's STRUCTURED FORECAST block.
+# The COMPUTED markers below (``ANCHOR_OVERSHOOT_PP`` /
+# ``CLAUSE_PRODUCT_DIVERGENCE_PP``) are dormant only because they emit from
+# ``tool_runner``, which is gated behind ``PROBABILISTIC_TOOLS_ENABLED`` (all
+# three prod workflows pin it to ``'false'``). While the flag is off, the
+# overshoot / divergence math is trivially replayable offline from the raw
+# JSON; the markers become the primary channel if it is ever flipped on.
+# (An earlier note here wrongly claimed the elicitation was retired in
+# Workstream C2 — that retirement covered the prior/base_rate/hazard/evidence/
+# scenario tier-2 fields; the anchor/clause fields shipped the next day as a
+# separate, still-live channel. The "0/2203 archived rows" reading was a
+# data-window artifact: the archive ended 2026-07-01, before ``30bca2f``.)
+# TELEMETRY ONLY either way: nothing in the pipeline reads these
 # back to clamp or mutate a forecast.
 ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
 CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"

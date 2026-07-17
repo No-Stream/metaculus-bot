@@ -203,10 +203,13 @@ directions. The three base prompts (~11.7k / 7.8k / 12.8k chars) are **focused, 
 nearly all load-bearing gotchas (the `_forecasting_window_str` "events before open don't count"
 guard, status-quo derivation, bait-and-switch check, conjunctive-clause pricing,
 open-vs-closed-bound handling, units gotcha, MC must-assign-every-option, stacker dissent
-clause). **No action.** One minor follow-up: verify whether the `base_rate_anchor` /
-`criteria_clauses` optional JSON fields (binary schema) are still consumed downstream — the
-coherence-study memory flags the anchor telemetry channel as structurally dead (0/2203 archived
-rows); if nothing reads them they're dead schema weight and can be dropped.
+clause). **No action.** One minor follow-up — **RESOLVED 2026-07-16:** the `base_rate_anchor` /
+`criteria_clauses` optional JSON fields (binary schema) are NOT dead — they are live-elicited in
+the binary prompt (added `30bca2f`, 2026-07-08) and land in every prod comment. The "0/2203
+archived rows" finding was a data-window artifact (the archive ended 2026-07-01, one week before
+the fields shipped). Two wrong-mechanism claims in `comment/markers.py` and
+`scratch/coherence_2026-07-15/synthesis.md` were fixed same-day. The guard-revival program's
+presence-rate check works once post-07-08 comments are pulled.
 
 ### Market-deference: time-to-close term MEASURED DEAD; liquidity fixes survive, downsized (updated 2026-07-16 same-day)
 
