@@ -4,6 +4,9 @@ Mocks the shared ``fetch_auth_key`` helper so no test touches the network or
 needs real keys. Pins:
 
 - start/end CREDIT_BALANCE marker lines + the CREDIT_SPEND run delta,
+- the delta source: ``limit_remaining`` drop preferred (covers BYOK-routed
+  spend that never hits ``usage`` — the 2026-07-17 frozen-usage bug), with the
+  ``usage`` delta as the uncapped-key fallback,
 - the donated-key floor check (below → True, at/above → False),
 - fetch failures → WARNING + never trip the floor (unknown ≠ low),
 - the personal key's missing ``limit_remaining`` (uncapped) rendering as n/a
@@ -90,6 +93,64 @@ class TestNormalDeltaLogging:
         assert below_floor is False
         messages = [record.getMessage() for record in caplog.records]
         assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=90.00" in messages
+
+
+class TestRunDeltaSource:
+    def test_byok_spend_with_frozen_usage_uses_remaining_delta(self, monkeypatch, caplog) -> None:
+        """The 2026-07-17 smoke-run bug: donated-key spend routes through BYOK
+        integrations, so ``usage`` sits frozen while ``limit_remaining`` drops.
+        The delta must come from the remaining drop, not the usage delta (which
+        would report 0.00 across a $3.34 run).
+        """
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(95.56, 4.16), _payload(92.22, 4.16)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=92.22" in messages
+        assert "run_delta_usd=0.00" not in "\n".join(messages)
+
+    def test_remaining_delta_preferred_over_usage_delta_when_both_move(self, monkeypatch, caplog) -> None:
+        """When both fields move, ``limit_remaining`` wins — ``usage`` only sees
+        the native-credit slice of the spend.
+        """
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(100.0, 4.0), _payload(95.0, 4.5)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=95.00" in messages
+
+    def test_remaining_missing_at_one_end_falls_back_to_usage(self, monkeypatch, caplog) -> None:
+        """A key whose ``limit_remaining`` is only reported at one end (e.g. a
+        limit added mid-run) can't diff remaining — fall back to usage.
+        """
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(None, 4.0), _payload(92.0, 6.5)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=donated run_delta_usd=2.50 remaining=92.00" in messages
+
+    def test_no_usable_fields_yields_na_delta(self, monkeypatch, caplog) -> None:
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(None, None), _payload(None, None)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=n/a" in messages
 
 
 class TestFloorCheck:
