@@ -24,7 +24,10 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            # Shallow copy: litellm may mutate the caller's list in place in some
+            # code paths; copying the container preserves the loop's append-only
+            # prefix (dict identity is kept — providers cache on it).
+            "messages": list(messages),
             "parallel_tool_calls": True,
             "reasoning_effort": config.reasoning_effort,
             "temperature": None,
@@ -41,7 +44,7 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             assert personal_key is not None
             try:
                 return await _call_once(messages, tools_json, donated_key)
-            except Exception as exc:
+            except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # classifier re-raises non-key-scoped errors
                 if not should_retry_with_general_key(exc):
                     raise
                 return await _call_once(messages, tools_json, personal_key)

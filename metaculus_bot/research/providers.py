@@ -66,6 +66,29 @@ async def _asknews_rate_gate() -> None:
         _ASKNEWS_LAST_CALL_TS = now
 
 
+async def asknews_rate_gate() -> None:
+    """Public seam for the process-wide AskNews RPS gate.
+
+    Delegates at call time so tests that monkeypatch ``_asknews_rate_gate``
+    keep intercepting calls routed through this public name (used by
+    ``research.agentic.tools``).
+    """
+    await _asknews_rate_gate()
+
+
+def get_asknews_semaphore() -> asyncio.Semaphore:
+    """Get-or-create the single process-wide AskNews concurrency semaphore.
+
+    Owns the only lazy-init of ``_ASKNEWS_GLOBAL_SEMAPHORE`` so every AskNews
+    caller (the two-phase provider here and ``research.agentic.tools``)
+    contends on the same throttle.
+    """
+    global _ASKNEWS_GLOBAL_SEMAPHORE
+    if _ASKNEWS_GLOBAL_SEMAPHORE is None:
+        _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max(1, int(ASKNEWS_MAX_CONCURRENCY)))
+    return _ASKNEWS_GLOBAL_SEMAPHORE
+
+
 def is_asknews_subscription_error(exc: BaseException) -> bool:
     """True iff exc is AskNews's 403011 subscription-inactive signature.
 
@@ -81,11 +104,7 @@ def is_asknews_subscription_error(exc: BaseException) -> bool:
 
 
 def _asknews_provider() -> ResearchCallable:
-    global _ASKNEWS_GLOBAL_SEMAPHORE
-    if _ASKNEWS_GLOBAL_SEMAPHORE is None:
-        # Initialize a single global semaphore to throttle concurrency across all bots
-        max_c = max(1, int(ASKNEWS_MAX_CONCURRENCY))
-        _ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max_c)
+    get_asknews_semaphore()
 
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         # Hard wall-clock timeout around the full provider. AskNews's internal

@@ -24,8 +24,14 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, response: _FakeResponse) -> None:
-        self._response = response
+    """Serves a queued sequence of responses; the last response repeats.
+
+    Single-response construction keeps the original fixed-response behavior;
+    multi-response construction lets redirect tests script a chain of hops.
+    """
+
+    def __init__(self, *responses: _FakeResponse) -> None:
+        self._responses = list(responses)
         self.calls: list[tuple[str, bool]] = []
 
     async def __aenter__(self) -> "_FakeSession":
@@ -36,7 +42,9 @@ class _FakeSession:
 
     def get(self, url: str, *, allow_redirects: bool = False) -> _FakeResponse:
         self.calls.append((url, allow_redirects))
-        return self._response
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
 
 
 @pytest.fixture(autouse=True)
@@ -308,16 +316,43 @@ async def test_fetch_thin_content_escalates_to_rendered(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_fetch_pdf_content_type_returns_document_needed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_pdf_content_type_auto_escalates_to_document(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    read_document = AsyncMock(
+        return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
+    )
+    monkeypatch.setattr(agentic_tools, "read_document", read_document)
 
     outcome = await agentic_tools.fetch("https://example.com/file.pdf")
 
     assert outcome.status == "ok"
-    assert outcome.method == "document_needed"
-    assert "use read_document" in outcome.content_markdown
+    assert outcome.method == "document"
+    assert outcome.content_markdown == "Extracted PDF content."
+    read_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_document_escalation_generic_ask_contains_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    read_document = AsyncMock(
+        return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
+    )
+    monkeypatch.setattr(agentic_tools, "read_document", read_document)
+
+    tools = agentic_tools.build_gap_fill_tools("Will Nauru ratify the treaty?")
+    fetch_handler = next(tool.handler for tool in tools if tool.name == "fetch")
+
+    outcome = await fetch_handler(url="https://example.com/file.pdf")
+
+    assert outcome.method == "document"
+    read_document.assert_awaited_once_with(
+        "https://example.com/file.pdf",
+        "Extract the main content relevant to: Will Nauru ratify the treaty?",
+    )
 
 
 @pytest.mark.asyncio
@@ -352,6 +387,81 @@ def test_extract_links_caps_at_twenty_five() -> None:
     assert len(links) == 25
     assert links[0] == "https://example.com/0"
     assert links[-1] == "https://example.com/24"
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
+        _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(
+        agentic_tools,
+        "_read_response_body",
+        AsyncMock(return_value=b"<html><body><p>Final page body</p></body></html>"),
+    )
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="Final page body " * 40),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "ok"
+    assert result.url == "https://example.com/final"
+    assert "Final page body" in result.text
+    assert session.calls == [("https://example.com/start", False), ("https://example.com/final", False)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}),
+    )
+
+    async def is_public(url: str) -> bool:
+        return "169.254.169.254" not in url
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "blocked"
+    assert "non-public redirect target" in result.text
+    # The private hop must never be requested.
+    assert session.calls == [("https://example.com/start", False)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    hops = agentic_tools._MAX_REDIRECTS + 2
+    session = _FakeSession(
+        *[_FakeResponse(status=302, headers={"Location": f"https://example.com/hop{i}"}) for i in range(hops)]
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "error"
+    assert result.text == "Redirect limit exceeded."
+    assert len(session.calls) == agentic_tools._MAX_REDIRECTS + 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=302, headers={}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "error"
+    assert "Malformed redirect" in result.text
 
 
 @pytest.mark.asyncio
@@ -408,7 +518,12 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
         async def content(self) -> str:
             return '<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>'
 
+    routes: list[str] = []
+
     class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            routes.append(pattern)
+
         async def new_page(self) -> FakePage:
             return FakePage()
 
@@ -453,6 +568,97 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     assert outcome.method == "rendered"
     assert outcome.links == ["https://example.com/next"]
     assert semaphore_entries == ["entered"]
+    assert routes == ["**/*"]
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-hop route guard must abort requests to non-public hosts.
+
+    Simulates a page whose client-side redirect targets a private host: the
+    guard registered via context.route re-runs is_public_http_url per request,
+    aborts the private hop, and no below-bound content reaches the outcome.
+    """
+    aborted: list[tuple[str, str]] = []
+    continued: list[str] = []
+
+    class FakeRoute:
+        def __init__(self, url: str) -> None:
+            self.request = SimpleNamespace(url=url)
+
+        async def continue_(self) -> None:
+            continued.append(self.request.url)
+
+        async def abort(self, error_code: str) -> None:
+            aborted.append((self.request.url, error_code))
+
+    guard_holder: list = []
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            # Drive the guard the way Chromium would: the public main-frame
+            # request continues; the page's client-side redirect to the
+            # private host is aborted.
+            guard = guard_holder[0]
+            main_route = FakeRoute(url)
+            await guard(main_route, main_route.request)
+            private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
+            await guard(private_route, private_route.request)
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>public content only</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            guard_holder.append(handler)
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def fake_is_public(url: str) -> bool:
+        return "169.254.169.254" not in url
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="public content only")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
+
+    assert outcome is not None
+    assert continued == ["https://example.com/page"]
+    assert aborted == [("http://169.254.169.254/latest/meta-data/", "blockedbyclient")]
+    assert "169.254.169.254" not in outcome.text
+    assert outcome.text == "public content only"
 
 
 @pytest.mark.asyncio

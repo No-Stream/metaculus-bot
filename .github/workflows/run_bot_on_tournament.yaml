@@ -35,6 +35,7 @@ jobs:
       # degrades to plain fetch if the browser is missing, so this step is
       # belt-and-suspenders rather than run-critical.
       - name: Install Playwright Chromium
+        continue-on-error: true
         run: uv run --frozen --no-dev playwright install --with-deps chromium
       - name: Run bot
         shell: bash

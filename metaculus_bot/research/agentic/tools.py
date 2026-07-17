@@ -16,7 +16,6 @@ import aiohttp
 from metaculus_bot.constants import (
     ASKNEWS_BACKOFF_SECS,
     ASKNEWS_CLIENT_ID_ENV,
-    ASKNEWS_MAX_CONCURRENCY,
     ASKNEWS_MAX_TRIES,
     ASKNEWS_SECRET_ENV,
     EXA_API_KEY_ENV,
@@ -341,13 +340,6 @@ def _is_exa_rate_limited(exc: BaseException) -> bool:
     return bool(_EXA_RATE_LIMIT_RE.search(str(exc)))
 
 
-def _ensure_asknews_semaphore() -> asyncio.Semaphore:
-    if research_providers._ASKNEWS_GLOBAL_SEMAPHORE is None:
-        max_concurrency = max(1, int(ASKNEWS_MAX_CONCURRENCY))
-        research_providers._ASKNEWS_GLOBAL_SEMAPHORE = asyncio.Semaphore(max_concurrency)
-    return research_providers._ASKNEWS_GLOBAL_SEMAPHORE
-
-
 async def _call_asknews_search(query: str) -> list[Any]:
     from asknews_sdk import AsyncAskNewsSDK  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
@@ -358,14 +350,14 @@ async def _call_asknews_search(query: str) -> list[Any]:
 
     tries = max(1, int(ASKNEWS_MAX_TRIES))
     backoff = float(ASKNEWS_BACKOFF_SECS)
-    semaphore = _ensure_asknews_semaphore()
+    semaphore = research_providers.get_asknews_semaphore()
 
     async with semaphore:
         async with AsyncAskNewsSDK(client_id=client_id, client_secret=secret, scopes={"news"}) as sdk:
             last_exc: Exception | None = None
             for attempt in range(1, tries + 1):
                 try:
-                    await research_providers._asknews_rate_gate()
+                    await research_providers.asknews_rate_gate()
                     response = await sdk.news.search_news(
                         query=query,
                         n_articles=6,
@@ -576,6 +568,21 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
                     user_agent=BROWSER_HEADERS["User-Agent"],
                     extra_http_headers={key: value for key, value in BROWSER_HEADERS.items() if key != "User-Agent"},
                 )
+
+                # Re-apply the SSRF check to EVERY request Chromium makes (main-frame
+                # goto, server and client-side redirects, subresources) — Chromium does
+                # its own DNS resolution and redirect-following outside the aiohttp
+                # FilteringResolver boundary. Residual DNS-rebinding TOCTOU: the route
+                # handler's getaddrinfo resolves independently of Chromium's connect,
+                # so unlike the aiohttp FilteringResolver this is not airtight; a
+                # filtering forward proxy would be — deferred as its own change.
+                async def _guard_route(route: Any, request: Any) -> None:
+                    if await resolution_source.is_public_http_url(request.url):
+                        await route.continue_()
+                    else:
+                        await route.abort("blockedbyclient")
+
+                await context.route("**/*", _guard_route)
                 page = await context.new_page()
                 try:
                     response = await page.goto(url, wait_until="networkidle", timeout=_RENDERED_FETCH_TIMEOUT_MS)
@@ -667,7 +674,11 @@ async def search_web(query: str, end_published_date: str | None = None) -> ToolO
     return ToolOutcome(content_markdown=_format_exa_results(results), method="search")
 
 
-async def fetch(url: str, start_char: int = 0) -> ToolOutcome:
+def _generic_document_ask(question_topic: str) -> str:
+    return f"Extract the main content relevant to: {question_topic}"
+
+
+async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> ToolOutcome:
     cached = _fetch_from_cache(url, start_char)
     if cached is not None:
         return cached
@@ -676,7 +687,10 @@ async def fetch(url: str, start_char: int = 0) -> ToolOutcome:
     if plain.status == "blocked":
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="blocked")
     if plain.method == "document_needed":
-        return ToolOutcome(content_markdown=plain.text, method="document_needed")
+        # Rung 3: auto-escalate PDFs/images to the read_document backend so the
+        # driver keeps its "handled automatically" contract without spending a
+        # second tool call. read_document stays separately exposed for directed asks.
+        return await read_document(plain.url, _generic_document_ask(question_topic))
     if plain.status != "ok":
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
     if not plain.escalate_rendered:
@@ -686,7 +700,7 @@ async def fetch(url: str, start_char: int = 0) -> ToolOutcome:
     if rendered is None:
         return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
     if rendered.method == "document_needed":
-        return ToolOutcome(content_markdown=rendered.text, method="document_needed")
+        return await read_document(rendered.url, _generic_document_ask(question_topic))
     if rendered.status == "ok" and rendered.text:
         return _render_fetch_outcome(url, rendered.text, rendered.links, "rendered", start_char)
     return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
@@ -707,7 +721,11 @@ async def read_document(url: str, ask: str) -> ToolOutcome:
 
 
 def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
-    del question_topic
+    async def _fetch_with_topic(url: str, start_char: int = 0) -> ToolOutcome:
+        # Binds the question topic for rung-3 document auto-escalation; the
+        # driver-facing schema stays (url, start_char) only.
+        return await fetch(url, start_char, question_topic=question_topic)
+
     return [
         ToolSpec(
             name="search_news",
@@ -727,8 +745,10 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             name="fetch",
             description=FETCH_DESCRIPTION,
             parameters=_FETCH_PARAMETERS,
-            handler=fetch,
-            timeout_s=60,
+            handler=_fetch_with_topic,
+            # 60s fetch budget + headroom for the rung-3 document auto-escalation
+            # (read_document's internal timeout is 60s).
+            timeout_s=90,
         ),
         ToolSpec(
             name="read_document",

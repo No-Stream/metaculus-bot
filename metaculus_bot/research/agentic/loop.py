@@ -22,6 +22,12 @@ from metaculus_bot.research.agentic.types import (
     ToolOutcome,
     ToolSpec,
 )
+from metaculus_bot.structured_output_schema import (
+    BinaryStructured,
+    MultipleChoiceStructured,
+    NumericStructured,
+    parse_structured_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,7 +373,7 @@ async def _execute_one_tool_call(
             method="internal",
             status="error",
         )
-    except Exception as exc:
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # tool-execution boundary: any tool failure becomes an error outcome, never a loop crash
         outcome = ToolOutcome(
             content_markdown=f"{type(exc).__name__}: {exc}",
             method="internal",
@@ -438,16 +444,6 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
 
 
 def _summarize_ghost(raw_text: str) -> tuple[str, str]:
-    try:
-        from metaculus_bot.structured_output_schema import (
-            BinaryStructured,
-            MultipleChoiceStructured,
-            NumericStructured,
-            parse_structured_block,
-        )
-    except ImportError:
-        return "unknown", ""
-
     for qtype in ("binary", "multiple_choice", "numeric"):
         block = parse_structured_block(raw_text, qtype)
         if isinstance(block, BinaryStructured):
@@ -476,7 +472,7 @@ async def _run_ghost_phase(
     except asyncio.TimeoutError:
         logger.warning("%sGhost phase timed out after 60s", log_prefix)
         return None
-    except Exception as exc:
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase
         logger.warning("%sGhost phase failed: %s: %s", log_prefix, type(exc).__name__, exc)
         return None
 
