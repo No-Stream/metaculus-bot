@@ -585,39 +585,38 @@ def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:
 
 
 class TestResearchChartSideChannel:
-    """_pull_research_chart moves the TS-anchor chart from the provider's per-session
-    cache into self._research_images and returns it — but only when the chart flag
-    is on. Off (the prod default), it never touches the provider module."""
+    """_pull_research_chart pops the TS-anchor chart from the provider's per-session
+    cache and returns it — but only when the chart flag is on. Off (the prod default),
+    it never touches the provider module and leaves the cache intact."""
 
-    def test_pull_moves_chart_into_state_when_flag_on(self, mock_general_llm, monkeypatch):
+    def test_pull_returns_chart_and_drains_cache_when_flag_on(self, mock_general_llm, monkeypatch):
         monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
         ts_anchor._reset_session_caches()
         ts_anchor._session_charts[777] = "Zm9v"  # a stashed chart for qid 777
         try:
             bot = _bot_with_one_forecaster(mock_general_llm)
             chart = bot._pull_research_chart(777)
+
+            assert chart == "Zm9v"
+            assert 777 not in ts_anchor._session_charts  # popped exactly once, cache drained
         finally:
             ts_anchor._reset_session_caches()
 
-        assert chart == "Zm9v"
-        assert bot._research_images[777] == "Zm9v"
-
-    def test_pull_returns_none_when_flag_off(self, mock_general_llm, monkeypatch):
+    def test_pull_returns_none_and_leaves_cache_when_flag_off(self, mock_general_llm, monkeypatch):
         monkeypatch.delenv("TS_ANCHOR_CHART_ENABLED", raising=False)
         ts_anchor._reset_session_caches()
         ts_anchor._session_charts[778] = "Zm9v"  # present, but the flag gate must skip it
         try:
             bot = _bot_with_one_forecaster(mock_general_llm)
             chart = bot._pull_research_chart(778)
+
+            assert chart is None
+            assert ts_anchor._session_charts[778] == "Zm9v"  # flag-off leaves the provider cache untouched
         finally:
             ts_anchor._reset_session_caches()
-
-        assert chart is None
-        assert 778 not in bot._research_images
 
     def test_pull_returns_none_when_no_chart_stashed(self, mock_general_llm, monkeypatch):
         monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
         ts_anchor._reset_session_caches()
         bot = _bot_with_one_forecaster(mock_general_llm)
         assert bot._pull_research_chart(779) is None
-        assert bot._research_images == {}

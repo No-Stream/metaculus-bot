@@ -134,12 +134,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Per-question votes from each LLM on whether outcomes are discrete integers
         self._discrete_integer_votes: defaultdict[int, list[bool]] = defaultdict(list)
-        # Per-question chart image (base64 PNG) from the time-series-anchor provider,
-        # keyed by qid. Populated in _research_and_make_predictions only when
-        # TS_ANCHOR_CHART_ENABLED is on; each base forecaster attaches it as a vision
-        # message. Stacker / summarizer / gap-fill never read it. Popped after the
-        # per-question fan-out so it doesn't accumulate across a batch run.
-        self._research_images: dict[int, str] = {}
         # Conditional stacking thresholds (overridable per question type)
         _valid_threshold_keys = {"binary", "mc", "numeric"}
         if stacking_spread_thresholds is not None:
@@ -571,10 +565,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research = await self.run_research(question)
 
         # Pull the time-series-anchor chart image (if the chart flag rendered one
-        # this question) out of the provider's per-session cache and into our
-        # per-qid state so the base forecasters can attach it as a vision message.
-        # No-op unless TS_ANCHOR_CHART_ENABLED is on. The stacker path never reads
-        # _research_images, so the image reaches base models only.
+        # this question) out of the provider's per-session cache so the base
+        # forecasters can attach it as a vision message. No-op unless
+        # TS_ANCHOR_CHART_ENABLED is on. The stacker path never receives chart_b64,
+        # so the image reaches base models only.
         chart_b64 = self._pull_research_chart(question.id_of_question)
 
         # A stub, not the full corpus: the framework embeds summary_report under
@@ -969,13 +963,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     def _pull_research_chart(self, qid: int | None) -> str | None:
         """Pop the time-series-anchor chart image for this qid from the provider's
-        per-session cache into our per-qid state, returning the base64 PNG (or None).
+        per-session cache and return the base64 PNG (or None).
 
-        No-op unless the chart flag rendered one. Popping keeps the provider cache
-        from growing across a batch; we hold the value in ``self._research_images``
-        so the plumbing is observable/testable, then hand it down the fan-out.
-        Gated on the chart flag so the provider (and matplotlib) stays off the cold
-        path when the feature is disabled — the default in prod.
+        Popping keeps the provider cache from growing across a batch; the returned
+        value is handed straight down the fan-out. Gated on the chart flag so the
+        provider (and matplotlib) stays off the cold path when the feature is
+        disabled — the default in prod.
         """
         if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
             return None
@@ -983,10 +976,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             _session_charts,
         )
 
-        chart_b64 = _session_charts.pop(qid, None)
-        if chart_b64 is not None:
-            self._research_images[qid] = chart_b64
-        return chart_b64
+        return _session_charts.pop(qid, None)
 
     async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None

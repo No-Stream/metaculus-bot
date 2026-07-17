@@ -90,10 +90,15 @@ _MARKDOWN_ESCAPE_RE = re.compile(r"\\([_&.\-#()])")
 # period-end level.
 _MAX_KEYWORD_RE = re.compile(r"\b(highest|peak|maximum|max)\b", re.IGNORECASE)
 
-# FRED series that get REVISED after first release — must fetch via ALFRED vintages.
-_FRED_REVISING_SERIES: frozenset[str] = frozenset(
-    {"CPIAUCSL", "CPILFESL", "PCEPI", "PAYEMS", "UNRATE", "UMCSENT", "GDP", "GDPC1", "RSAFS", "BOPGTB", "BOPGSTB"}
-)
+# FRED series that genuinely do NOT revise (market prices / survey-level series):
+# these can be fetched from the plain fredgraph.csv safely. Everything else — every
+# revising macro series AND every unknown/URL-cited series — defaults to ALFRED
+# point-in-time vintages. That default is fail-safe: ALFRED returns identical values
+# for a non-revising series, so an over-inclusive guess costs nothing, but a
+# revising series routed to fredgraph would silently return TODAY's revised values
+# and leak into a backtest. An allowlist can only err toward ALFRED; a denylist
+# (the prior design) leaked any revising series not enumerated in it.
+_FRED_NON_REVISING_SERIES: frozenset[str] = frozenset({"DGS10", "BAMLH0A0HYM2", "DCOILBRENTEU", "GASREGW"})
 
 
 @dataclass(frozen=True)
@@ -108,9 +113,10 @@ class _TemplateEntry:
     model_target: bool = True
     note: str = ""
     # NOTE: whether a fred series revises is NOT stored here — it is derived from the
-    # single source of truth `_FRED_REVISING_SERIES` in `_single_spec`, so URL-routed
-    # and registry-routed series share one revises decision. A per-entry flag here
-    # would silently do nothing (and mask a leakage bug if it disagreed with the set).
+    # single source of truth `_FRED_NON_REVISING_SERIES` in `_single_spec` (default:
+    # revises=True unless allowlisted), so URL-routed and registry-routed series share
+    # one revises decision. A per-entry flag here would silently do nothing (and mask a
+    # leakage bug if it disagreed with the allowlist).
 
 
 # Conservative curated registry: title keyword(s) → resolving series. Kept small
@@ -208,7 +214,11 @@ def _wants_max(text: str) -> bool:
 def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str) -> SeriesSpec:
     """Build the SeriesSpec for one leg, honoring ALFRED-revising and daily-High."""
     if source == "fred":
-        return SeriesSpec(source="fred", series_id=series_id, revises=series_id.upper() in _FRED_REVISING_SERIES)
+        # Default to ALFRED vintages (revises=True) for every fred series except the
+        # curated non-revising allowlist. Unknown / URL-cited series therefore fetch
+        # point-in-time, which is leakage-safe (see _FRED_NON_REVISING_SERIES).
+        revises = series_id.upper() not in _FRED_NON_REVISING_SERIES
+        return SeriesSpec(source="fred", series_id=series_id, revises=revises)
     column: YfColumn = "High" if _wants_max(text) else "Close"
     return SeriesSpec(source="yfinance", series_id=series_id, column=column)
 

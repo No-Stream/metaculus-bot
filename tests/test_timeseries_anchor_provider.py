@@ -36,11 +36,15 @@ from forecasting_tools import BinaryQuestion, NumericQuestion
 from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
 from metaculus_bot.research.timeseries_anchor import (
+    _build_spread_series,
+    _empirical_change_band,
+    _empirical_max_band,
     _render_single,
     _render_spread,
     _reset_session_caches,
     _Route,
     _truncate_section,
+    horizon_steps,
     route_question,
     timeseries_anchor_provider,
 )
@@ -133,7 +137,7 @@ class TestRouting:
         assert route.kind == "single"
         assert route.spec.source == "fred"
         assert route.spec.series_id == "DGS10"
-        assert route.spec.revises is False  # DGS10 is not in the revising set
+        assert route.spec.revises is False  # DGS10 is in the non-revising allowlist
 
     def test_routes_via_fred_url_revising_series_uses_alfred_spec(self):
         rc = "Resolves per https://fred.stlouisfed.org/series/CPIAUCSL."
@@ -141,6 +145,16 @@ class TestRouting:
         assert route is not None
         assert route.spec.series_id == "CPIAUCSL"
         assert route.spec.revises is True  # CPIAUCSL revises -> ALFRED vintage fetch
+
+    def test_url_cited_unlisted_series_defaults_to_alfred_vintage(self):
+        # A revising series NOT in the (small) non-revising allowlist — INDPRO revises
+        # heavily but was never enumerated. The allowlist default (revises=True) sends
+        # it to ALFRED point-in-time, so a plain-fredgraph revision leak is impossible.
+        rc = "Resolves per https://fred.stlouisfed.org/series/INDPRO on the resolution date."
+        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "INDPRO"
+        assert route.spec.revises is True  # unlisted -> fail-safe ALFRED vintage
 
     def test_routes_via_yahoo_url_single(self):
         # %5E is the URL-encoded caret for ^VIX; the extractor url-decodes before matching.
@@ -250,6 +264,84 @@ class TestFetchLayer:
         pd.testing.assert_series_equal(first, second)
 
 
+# yfinance fetch path (real fetch_series over a faked yfinance.Ticker).
+
+
+def _yf_ohlc(dates: list[str], *, close: list[float], high: list[float]) -> pd.DataFrame:
+    """Canned yfinance history frame: tz-aware DatetimeIndex + full OHLCV columns,
+    mirroring what ``yfinance.Ticker(...).history()`` returns."""
+    idx = pd.DatetimeIndex(pd.to_datetime(dates)).tz_localize("America/New_York")
+    return pd.DataFrame(
+        {"Open": close, "High": high, "Low": close, "Close": close, "Volume": [0] * len(dates)},
+        index=idx,
+    )
+
+
+def _fake_yf_ticker(frame: pd.DataFrame) -> tuple[type, list[dict[str, str]]]:
+    """Return a (Ticker-class, calls-list) pair; the class records every history() kwargs."""
+    calls: list[dict[str, str]] = []
+
+    class _Ticker:
+        def __init__(self, symbol: str) -> None:
+            self.symbol = symbol
+
+        def history(self, **kwargs: str) -> pd.DataFrame:
+            calls.append(kwargs)
+            return frame
+
+    return _Ticker, calls
+
+
+class TestYfinanceFetch:
+    def test_high_column_spec_reads_high(self, monkeypatch):
+        frame = _yf_ohlc(["2026-06-29", "2026-06-30"], close=[18.0, 19.0], high=[20.0, 22.0])
+        ticker, _ = _fake_yf_ticker(frame)
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        series = fetch_series(SeriesSpec(source="yfinance", series_id="^VIX", column="High"), date(2026, 6, 30))
+
+        assert float(series.iloc[-1]) == pytest.approx(22.0)  # High, not Close
+        assert float(series.iloc[0]) == pytest.approx(20.0)
+
+    def test_default_spec_reads_close(self, monkeypatch):
+        frame = _yf_ohlc(["2026-06-29", "2026-06-30"], close=[18.0, 19.0], high=[20.0, 22.0])
+        ticker, _ = _fake_yf_ticker(frame)
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        series = fetch_series(SeriesSpec(source="yfinance", series_id="^VIX"), date(2026, 6, 30))
+
+        assert float(series.iloc[-1]) == pytest.approx(19.0)  # Close (default column)
+
+    def test_empty_frame_raises_fetch_error(self, monkeypatch):
+        ticker, _ = _fake_yf_ticker(pd.DataFrame())
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        with pytest.raises(FetchError, match="empty history"):
+            fetch_series(SeriesSpec(source="yfinance", series_id="^VIX"), date(2026, 6, 30))
+
+    def test_missing_requested_column_raises_fetch_error(self, monkeypatch):
+        # A frame with no High column, but the spec asks for High -> FetchError.
+        frame = _yf_ohlc(["2026-06-30"], close=[19.0], high=[22.0]).drop(columns=["High"])
+        ticker, _ = _fake_yf_ticker(frame)
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        with pytest.raises(FetchError, match="no 'High' column"):
+            fetch_series(SeriesSpec(source="yfinance", series_id="^VIX", column="High"), date(2026, 6, 30))
+
+    def test_ceiling_respected_end_to_end(self, monkeypatch):
+        # yfinance end is EXCLUSIVE, so the fetch must request end = ceiling + 1 day,
+        # and the returned series must carry no observation after the ceiling.
+        frame = _yf_ohlc(["2026-06-28", "2026-06-29", "2026-06-30"], close=[17.0, 18.0, 19.0], high=[19.0, 20.0, 22.0])
+        ticker, calls = _fake_yf_ticker(frame)
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        ceiling = date(2026, 6, 30)
+        series = fetch_series(SeriesSpec(source="yfinance", series_id="^VIX"), ceiling)
+
+        assert calls[0]["end"] == date(2026, 7, 1).isoformat()  # ceiling + 1 (exclusive end)
+        assert series.index.max().date() <= ceiling  # leakage guard held on the yfinance path
+
+
 # Render.
 class TestRenderSingle:
     def test_latest_value_first_line_and_band_line(self):
@@ -321,6 +413,80 @@ class TestTruncateSection:
 
 
 PROVENANCE_MARKER = "Statistical extrapolation of the resolution series' own history"
+
+
+# Estimator math: known input -> hand-computed expected output. These pin the
+# band/horizon arithmetic against silent mutations (e.g. a base/fwd swap or a
+# swapped horizon constant) that a string-presence render test cannot see.
+class TestEstimatorMath:
+    def test_horizon_steps_matches_documented_formula(self):
+        # daily: round(days * 252/365); weekly: round(days/7); monthly: round(days/30.4375).
+        assert horizon_steps("daily", 30) == 21  # round(30 * 252 / 365) = round(20.7123)
+        assert horizon_steps("weekly", 21) == 3  # round(21 / 7)
+        assert horizon_steps("monthly", 90) == 3  # round(90 / 30.4375) = round(2.9569)
+
+    def test_horizon_steps_floored_at_one(self):
+        # round(5 / 30.4375) = round(0.164) = 0 -> floored to 1 (never a 0-step horizon).
+        assert horizon_steps("monthly", 5) == 1
+
+    def test_change_band_additive_ramp_is_exactly_h_step(self):
+        # Constant-step additive ramp: every overlapping h-step change equals h*step
+        # exactly, so P10=P50=P90 collapse. anchor=0 -> band returns the raw change,
+        # which must be +h*step (a base/fwd swap would flip the sign to -h*step).
+        step = 10.0
+        y = np.arange(0, 20, dtype="float64") * step + 10.0  # 10, 20, 30, ...
+        h = 3
+        p10, p50, p90 = _empirical_change_band(y, h, use_log=False, anchor=0.0)
+        assert p10 == pytest.approx(h * step)
+        assert p50 == pytest.approx(h * step)
+        assert p90 == pytest.approx(h * step)
+
+    def test_change_band_log_branch_constant_ratio(self):
+        # Constant-ratio positive series y = 100 * 1.01^t: every h-step log change is
+        # exactly h*log(1.01), so the log-multiplicative band collapses to last*1.01^h.
+        t = np.arange(0, 51, dtype="float64")
+        ratio = 1.01
+        y = 100.0 * ratio**t
+        h = 3
+        last = float(y[-1])
+        expected = last * ratio**h
+        p10, p50, p90 = _empirical_change_band(y, h, use_log=True, anchor=last)
+        assert p10 == pytest.approx(expected)
+        assert p50 == pytest.approx(expected)
+        assert p90 == pytest.approx(expected)
+
+    def test_max_band_hand_computed_window_max(self):
+        # y=[1,3,2,5,4], h=2. Forward 2-windows: [1,3],[3,2],[2,5],[5,4] ->
+        # window_max=[3,3,5,5], win_anchor=y[:4]=[1,3,2,5], diffs=[2,0,3,0].
+        # sorted diffs=[0,0,2,3]; numpy linear quantiles at (.10,.50,.90):
+        #   .10 -> pos 0.3 -> 0.0;  .50 -> pos 1.5 -> 1.0;  .90 -> pos 2.7 -> 2.7.
+        # anchor last=10 -> (10.0, 11.0, 12.7). A window_max/anchor swap flips the
+        # diffs negative and this fails.
+        y = np.array([1.0, 3.0, 2.0, 5.0, 4.0])
+        p10, p50, p90 = _empirical_max_band(y, 2, use_log=False, last=10.0)
+        assert p10 == pytest.approx(10.0)
+        assert p50 == pytest.approx(11.0)
+        assert p90 == pytest.approx(12.7)
+
+    def test_build_spread_series_relative_returns(self):
+        # a=[10,20,25], b=[5,5,10] on aligned dates. rel = 100*[(logA-logA0)-(logB-logB0)]:
+        #   t0: 0
+        #   t1: 100*(log2 - 0)        = 100*ln(2)    ~= 69.3147
+        #   t2: 100*(log2.5 - log2)   = 100*ln(1.25) ~= 22.3144
+        idx = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+        a = pd.Series([10.0, 20.0, 25.0], index=idx)
+        b = pd.Series([5.0, 5.0, 10.0], index=idx)
+        spread = _build_spread_series(a, b)
+        assert spread.iloc[0] == pytest.approx(0.0)
+        assert spread.iloc[1] == pytest.approx(100.0 * float(np.log(2.0)))
+        assert spread.iloc[2] == pytest.approx(100.0 * float(np.log(1.25)))
+
+    def test_build_spread_series_disjoint_calendar_raises(self):
+        # No overlapping dates -> inner join empty -> ValueError (the documented contract).
+        a = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-01-01", "2026-01-02"]))
+        b = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-02-01", "2026-02-02"]))
+        with pytest.raises(ValueError, match="no overlapping dates"):
+            _build_spread_series(a, b)
 
 
 # Provider factory (flag gating, benchmark ceiling, soft-fail, determinism).
