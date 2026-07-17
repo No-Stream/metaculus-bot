@@ -15,6 +15,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaculus_bot.prompts import (
+    _SOURCE_TIER_TAG_INSTRUCTION,
+    asknews_summarizer_prompt,
     binary_prompt,
     gap_fill_analyzer_prompt,
     gap_fill_search_prompt,
@@ -26,9 +28,7 @@ from metaculus_bot.prompts import (
     web_research_prompt,
 )
 
-# ---------------------------------------------------------------------------
 # gap_fill_analyzer_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestGapFillAnalyzerPrompt:
@@ -98,9 +98,7 @@ class TestGapFillAnalyzerPrompt:
         assert "(none provided)" in result
 
 
-# ---------------------------------------------------------------------------
 # gap_fill_search_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestGapFillSearchPrompt:
@@ -151,9 +149,7 @@ class TestGapFillSearchPrompt:
         assert "Will the treaty be in force by 2027?" in result
 
 
-# ---------------------------------------------------------------------------
 # Forecasting-window anchor (binary / MC / numeric + stacking variants)
-# ---------------------------------------------------------------------------
 
 
 def _binary_q(
@@ -310,9 +306,7 @@ class TestForecastingWindowAnchor:
             stacking_binary_prompt(q, research="r", base_predictions=["a"])
 
 
-# ---------------------------------------------------------------------------
 # web_research_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestMcPromptInterpolatesRealOptionNames:
@@ -450,9 +444,7 @@ class TestWebResearchPromptPrimarySources:
         assert "Prediction market odds" not in bench
 
 
-# ---------------------------------------------------------------------------
 # Prediction-market framing (strong-evidence, criteria/date-matched weighting)
-# ---------------------------------------------------------------------------
 
 
 class TestPredictionMarketFraming:
@@ -536,9 +528,7 @@ class TestPredictionMarketFraming:
         assert "Prediction market" not in bench
 
 
-# ---------------------------------------------------------------------------
 # Source-provenance / motivation trust ladder
-# ---------------------------------------------------------------------------
 
 
 class TestSourceProvenanceLadder:
@@ -805,3 +795,93 @@ class TestOptionProbsExampleJsonValidity:
         probs = list(parsed["option_probs"].values())
         assert sum(probs) == pytest.approx(1.0, abs=0.02)
         assert all(0.0 < p < 1.0 for p in probs)
+
+
+def _summarizer_prompt(**overrides) -> str:
+    """Build the AskNews summarizer prompt with representative defaults."""
+    kwargs = dict(
+        question_text="Will X happen by 2027?",
+        resolution_criteria="Resolves YES if X happens",
+        fine_print="fp",
+        open_date="2026-03-15",
+        research="raw asknews articles",
+    )
+    kwargs.update(overrides)
+    return asknews_summarizer_prompt(**kwargs)
+
+
+class TestSourceTierTagging:
+    """Both TRADITIONAL research prompts (web research + AskNews summarizer)
+    must instruct the model to tag factual claims with the A-D source-tier
+    vocabulary — otherwise a C-tier aggregator claim arrives in the briefing
+    looking identical to a B-tier wire fact and the forecaster prompts'
+    provenance ladder has nothing left to weight."""
+
+    def _assert_tier_tag_instruction(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        collapsed = " ".join(prompt.split())
+        assert "SOURCE TIER TAGS" in collapsed
+        # Inline tag examples using the shared vocabulary.
+        for example in ('"[A: official]"', '"[B: Reuters]"', '"[C: aggregator]"', '"[D: social]"'):
+            assert example in collapsed, f"missing tag example {example}"
+        # The condensed A-D definitions mirror the forecaster ladder's vocabulary.
+        lowered = collapsed.lower()
+        assert "official / primary" in lowered
+        assert "wire services and papers of record" in lowered
+        assert "aggregators, advocacy or partisan outlets" in lowered
+        assert "anonymous, social, rumor" in lowered
+        # Tag only when clear; never drop a low-tier fact.
+        assert "tag only when the tier is reasonably clear" in lowered
+        assert "never discard a fact because its tier is low" in lowered
+
+    def test_web_research_prompt_carries_tier_tag_instruction(self) -> None:
+        self._assert_tier_tag_instruction(web_research_prompt("Will X happen?", is_benchmarking=False))
+
+    def test_web_research_prompt_carries_tier_tag_instruction_when_benchmarking(self) -> None:
+        """The tier-tag steer is orthogonal to the benchmarking carve-out."""
+        self._assert_tier_tag_instruction(web_research_prompt("Will X happen?", is_benchmarking=True))
+
+    def test_summarizer_prompt_carries_tier_tag_instruction(self) -> None:
+        self._assert_tier_tag_instruction(_summarizer_prompt())
+
+    def test_instruction_is_shared_constant_verbatim(self) -> None:
+        """Both prompts must interpolate the SAME module-level constant — a
+        drift between the two vocabularies would let the summarizer emit tags
+        the forecaster ladder doesn't recognize."""
+        collapsed_instruction = " ".join(_SOURCE_TIER_TAG_INSTRUCTION.split())
+        for prompt in (
+            web_research_prompt("Q?", is_benchmarking=False),
+            _summarizer_prompt(),
+        ):
+            assert collapsed_instruction in " ".join(prompt.split())
+
+
+class TestAskNewsSummarizerPrompt:
+    """The summarizer prompt moved from ResearchOrchestrator._summarize_asknews
+    to prompts.py (2026-07). These lock the load-bearing content that
+    tests/test_research_orchestrator.py asserts through the orchestrator, plus
+    argument threading now that the text is a standalone function."""
+
+    def test_threads_all_arguments(self) -> None:
+        prompt = _summarizer_prompt(
+            question_text="Will the treaty be in force by 2027?",
+            resolution_criteria="Resolves YES if in force.",
+            fine_print="Per the depositary's records.",
+            open_date="2026-01-02",
+            research="ARTICLE BODY HERE",
+        )
+        assert "Will the treaty be in force by 2027?" in prompt
+        assert "Resolves YES if in force." in prompt
+        assert "Per the depositary's records." in prompt
+        assert "opened on 2026-01-02" in " ".join(prompt.split())
+        assert "<research>\nARTICLE BODY HERE\n</research>" in prompt
+
+    def test_retains_window_stamping_and_no_forecast_rules(self) -> None:
+        """Regression: the move + tier-tag insertion must not displace the
+        summarizer's existing critical rules."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Date every fact precisely" in collapsed
+        assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "[SINGLE-SOURCE]" in collapsed
+        assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
+        assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
