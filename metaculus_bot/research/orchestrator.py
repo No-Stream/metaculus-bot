@@ -26,6 +26,7 @@ from metaculus_bot.constants import (
     FINANCIAL_DATA_ENABLED_ENV,
     GAP_FILL_ENABLED_ENV,
     GAP_FILL_MIN_RESEARCH_CHARS,
+    GAP_FILL_V2_ENABLED_ENV,
     GEMINI_SEARCH_ENABLED_ENV,
     GEMINI_SEARCH_MODEL_ENV,
     NATIVE_SEARCH_ENABLED_ENV,
@@ -123,16 +124,52 @@ class ResearchOrchestrator:
 
             research, provider_results = await self._run_providers_parallel(question, providers)
 
-            if env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
-                from metaculus_bot.research.targeted import run_gap_fill_pass
+            # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
+            # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
+            # is max(v1, v2), not the sum — v2's 540s deadline fits inside v1's
+            # worst-case envelope only under this parallelism). Consequence: the
+            # v2 driver's brief sees the bundle WITHOUT v1's addendum. v2's
+            # section appends after v1's, both before the diagnostics block.
+            gap_fill_v1_active = (
+                env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
+            )
+            gap_fill_v2_active = env_flag_enabled(GAP_FILL_V2_ENABLED_ENV)
+            gap_fill_v2_payload: dict | None = None
 
-                addendum = await run_gap_fill_pass(
-                    question,
-                    research,
-                    is_benchmarking=self._is_benchmarking,
+            if gap_fill_v1_active or gap_fill_v2_active:
+                from metaculus_bot.research.agentic_gap_fill import (
+                    run_gap_fill_v2,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                 )
+                from metaculus_bot.research.targeted import (
+                    run_gap_fill_pass,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                )
+
+                def _capture_gap_fill_v2(payload: dict) -> None:
+                    nonlocal gap_fill_v2_payload
+                    gap_fill_v2_payload = payload
+
+                async def _run_v1() -> str:
+                    if not gap_fill_v1_active:
+                        return ""
+                    return await run_gap_fill_pass(question, research, is_benchmarking=self._is_benchmarking)
+
+                async def _run_v2() -> str:
+                    if not gap_fill_v2_active:
+                        return ""
+                    return await run_gap_fill_v2(
+                        question,
+                        research,
+                        is_benchmarking=self._is_benchmarking,
+                        archive_sink=_capture_gap_fill_v2,
+                    )
+
+                addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
                 if addendum:
                     research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
+                if v2_findings:
+                    # v2_findings carries its own "## Agentic Research Findings"
+                    # header (render_findings) — distinct from v1's section.
+                    research = f"{research}\n\n---\n\n{v2_findings}"
 
             gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
 
@@ -162,8 +199,11 @@ class ResearchOrchestrator:
                             provider_results=[asdict(r) for r in provider_results],
                             providers_attempted=provider_names,
                             providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
+                            gap_fill_v2=gap_fill_v2_payload,
                         )
-                    except Exception:
+                    except (
+                        Exception
+                    ):  # HARNESS-SCAN-EXEMPT-broad-except — archive write is best-effort; never blocks the forecast
                         logger.exception("Research sink failed for qid=%d; continuing", qid)
 
             return research
@@ -251,7 +291,9 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(GEMINI_SEARCH_ENABLED_ENV):
-            from metaculus_bot.research.gemini_search import gemini_search_provider
+            from metaculus_bot.research.gemini_search import (
+                gemini_search_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            )
 
             gemini_model = os.getenv(GEMINI_SEARCH_MODEL_ENV)
             providers.append(
@@ -262,17 +304,23 @@ class ResearchOrchestrator:
             )
 
         if env_flag_enabled(FINANCIAL_DATA_ENABLED_ENV):
-            from metaculus_bot.research.financial_data import financial_data_provider
+            from metaculus_bot.research.financial_data import (
+                financial_data_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            )
 
             providers.append((financial_data_provider(), "financial_data"))
 
         if env_flag_enabled(PREDICTION_MARKETS_ENABLED_ENV):
-            from metaculus_bot.research.prediction_market import prediction_market_provider  # noqa: PLC0415
+            from metaculus_bot.research.prediction_market import (
+                prediction_market_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            )
 
             providers.append((prediction_market_provider(is_benchmarking=self._is_benchmarking), "prediction_market"))
 
         if env_flag_enabled(RESOLUTION_SOURCE_ENABLED_ENV):
-            from metaculus_bot.research.resolution_source import resolution_source_provider  # noqa: PLC0415
+            from metaculus_bot.research.resolution_source import (
+                resolution_source_provider,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            )
 
             providers.append((resolution_source_provider(is_benchmarking=self._is_benchmarking), "resolution_source"))
 
@@ -290,7 +338,9 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
     ) -> tuple[str, list[ProviderResult]]:
-        from metaculus_bot.research.providers import is_asknews_subscription_error
+        from metaculus_bot.research.providers import (
+            is_asknews_subscription_error,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, ProviderResult]:
             started = time.monotonic()
@@ -324,7 +374,7 @@ class ResearchOrchestrator:
                     latency_ms=latency_ms,
                 )
                 return (raw, result)
-            except Exception as e:
+            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
                 latency_ms = int((time.monotonic() - started) * 1000)
                 if name == "asknews" and is_asknews_subscription_error(e):
                     status = "inactive"
@@ -338,7 +388,9 @@ class ResearchOrchestrator:
                     status = "errored"
                     self.timeout_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
-                    from metaculus_bot.fallback_openrouter import _record_deprecation_if_matched
+                    from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+                        _record_deprecation_if_matched,
+                    )
 
                     _record_deprecation_if_matched(f"<provider:{name}>", str(e))
                 result = ProviderResult(
@@ -423,7 +475,7 @@ class ResearchOrchestrator:
             if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
                 return await self._call_exa_smart_searcher(question_text)
-        except Exception as fallback_exc:
+        except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
             logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
         return None
 

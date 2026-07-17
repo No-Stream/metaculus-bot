@@ -401,6 +401,35 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-sol"
 GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 
+# --- Agentic gap-fill v2 (bounded research loop) ---
+# Second-generation gap-fill: a bounded agentic loop (metaculus_bot/research/
+# agentic/) that dry-runs the panel's own forecasting template to identify
+# fill/verify/resolution targets, then pursues them with search/fetch/read
+# tools. Runs CONCURRENTLY with v1 during the overlap window (both flags on);
+# soft-fails to "" like v1. See scratch_docs_and_planning/
+# agentic_gap_fill_v2_plan.md.
+GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
+# Driver model + effort are the vibe-eval knobs (plan doc §3.5): candidates are
+# luna-medium, terra-{low,medium}, sol-low, sonnet-5.0 — all openai/anthropic,
+# so the loop's litellm binding routes them via the donated OpenRouter key.
+# luna-medium is the cheap+reliable dev default until the eval picks a winner.
+GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-luna"
+GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "medium"
+# Parallel tool calls each count against the cap; steps are where latency
+# lives, so batching is encouraged rather than rationed.
+GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 14)
+# Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
+# 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
+# no research-phase wall-clock. The loop is anytime: hitting the deadline
+# emits banked findings, never "".
+GAP_FILL_V2_WALL_DEADLINE: float = _float_env("GAP_FILL_V2_WALL_DEADLINE", 540.0)
+# With less than this many seconds remaining, the harness rejects every tool
+# except conclude, forcing the loop to wrap up inside the wall deadline.
+GAP_FILL_V2_CONCLUDE_THRESHOLD: float = _float_env("GAP_FILL_V2_CONCLUDE_THRESHOLD", 90.0)
+# Below this many extracted chars, the fetch ladder escalates plain HTTP to
+# headless-Chromium rendering (JS-wall heuristic; tools.py consumes this).
+GAP_FILL_V2_MIN_CONTENT_CHARS: int = _int_env("GAP_FILL_V2_MIN_CONTENT_CHARS", 500)
+
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
 FRED_API_KEY_ENV: str = "FRED_API_KEY"
