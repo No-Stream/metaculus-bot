@@ -1,0 +1,19 @@
+{
+  "role": "native_search",
+  "arm": "sol_low",
+  "model": "openrouter/openai/gpt-5.6-sol",
+  "reasoning_effort": "low",
+  "wall_s": 115.4,
+  "output_chars": 7931,
+  "usage": {
+    "prompt_tokens": 55766,
+    "completion_tokens": 2641,
+    "total_tokens": 58407,
+    "framework_cost": 0.0
+  },
+  "est_cost_usd_ex_webtool": 0.3581,
+  "pricing_per_m": {
+    "prompt": 5.0,
+    "completion": 30.0
+  }
+}

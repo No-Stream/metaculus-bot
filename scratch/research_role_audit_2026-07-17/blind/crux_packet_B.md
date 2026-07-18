@@ -1,0 +1,5 @@
+# Role: crux — Packet B
+
+How should the large undecided/refusal bloc in the ZEREN survey—especially the 26% among registered/likely voters—be allocated between Hichilema, the opposition, and nonvoters?  
+
+How much of Edgar Lungu’s former 2021 support will Brian Mundubile consolidate, versus fragment among multiple opposition candidates or shift to Hichilema, and does the 85% market probability of Hichilema eventually winning imply a high probability of clearing 50% in the first round?

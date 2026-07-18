@@ -1,0 +1,19 @@
+{
+  "role": "native_search",
+  "arm": "terra_low",
+  "model": "openrouter/openai/gpt-5.6-terra",
+  "reasoning_effort": "low",
+  "wall_s": 136.0,
+  "output_chars": 8788,
+  "usage": {
+    "prompt_tokens": 62842,
+    "completion_tokens": 3345,
+    "total_tokens": 66187,
+    "framework_cost": 0.0
+  },
+  "est_cost_usd_ex_webtool": 0.2073,
+  "pricing_per_m": {
+    "prompt": 2.5,
+    "completion": 15.0
+  }
+}

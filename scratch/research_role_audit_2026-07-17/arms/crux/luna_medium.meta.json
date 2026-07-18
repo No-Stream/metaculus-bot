@@ -1,0 +1,19 @@
+{
+  "role": "crux",
+  "arm": "luna_medium",
+  "model": "openrouter/openai/gpt-5.6-luna",
+  "reasoning_effort": "medium",
+  "wall_s": 2.0,
+  "output_chars": 464,
+  "usage": {
+    "prompt_tokens": 12387,
+    "completion_tokens": 110,
+    "total_tokens": 12497,
+    "framework_cost": 0.0
+  },
+  "est_cost_usd_ex_webtool": 0.013,
+  "pricing_per_m": {
+    "prompt": 1.0,
+    "completion": 6.0
+  }
+}
