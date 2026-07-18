@@ -926,3 +926,66 @@ class TestAskNewsSummarizerPrompt:
         assert "[SINGLE-SOURCE]" in collapsed
         assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
         assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
+
+    def test_supersession_and_deadline_arithmetic_rule(self) -> None:
+        """2026-07-18 AskNews audit R2: newer facts govern, superseded ones are
+        compressed, and deadline questions must surface the arithmetic inputs
+        rather than an unsupported conclusion (the q44255 failure — briefing
+        had every input to 'Jun 29 + 10 non-Sundays > Jul 4', did no math, and
+        asserted Yes anyway)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "state which version governs" in collapsed
+        assert "compress the superseded version to one line" in collapsed
+        assert "QUOTE the relevant inputs explicitly" in collapsed
+        assert "verify the arithmetic" in collapsed
+        assert "do not assert a deadline conclusion without showing the facts it rests on" in collapsed
+
+    def test_evidence_age_disclosure_opens_briefing(self) -> None:
+        """2026-07-18 AskNews audit R4: the briefing must open with the age of
+        the newest directly-relevant evidence, or say no article directly
+        reports the resolution quantity (the q44219 failure — a 67-day-old
+        leaderboard read as current)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Newest directly-relevant article" in collapsed
+        assert "DIRECTLY bears on the resolution" in collapsed
+        assert "background rather than signal" in collapsed
+        # The disclosure is requirement #1, ahead of the extraction bullets.
+        assert collapsed.index("Newest directly-relevant article") < collapsed.index("Extracts ALL facts")
+
+    def test_proportionality_rule_scopes_comprehensiveness(self) -> None:
+        """2026-07-18 AskNews audit (operator-designed proportionality rule):
+        length tracks decision-relevant content; tangential-only article sets
+        yield a short briefing with a screened-out list, and the
+        comprehensiveness mandate is scoped to decision-relevant material so
+        the two rules can't be read as contradicting."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Length must track decision-relevant content, not article count" in collapsed
+        assert "Screened out as not decision-relevant" in collapsed
+        assert "do not pad with tangential material to appear thorough" in collapsed
+        # Comprehensiveness survives, but scoped to decision-relevant material.
+        assert "Be COMPREHENSIVE about DECISION-RELEVANT material" in collapsed
+        assert "Be COMPREHENSIVE — do not omit relevant details" not in collapsed
+
+    def test_hard_relevance_gate_drops_offtopic_articles(self) -> None:
+        """2026-07-18 AskNews audit R3: a hard per-article screen against the
+        resolution criteria (the semantic-drift padding class — Microsoft
+        surveys and crypto incidents extracted in full for unrelated
+        questions). Off-topic articles are DROPPED to a one-line list, not
+        summarized 'briefly'."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "screen each article for relevance to the resolution criteria" in collapsed
+        assert "NO direct bearing on how this question resolves" in collapsed
+        assert "must be DROPPED entirely" in collapsed
+        assert "plausibly affect a forecaster's reasoning on THIS question" in collapsed
+
+    def test_recency_first_ordering_replaces_input_mirroring(self) -> None:
+        """2026-07-18 AskNews audit R1: the briefing leads with the newest,
+        most resolution-relevant facts instead of mirroring AskNews's
+        Historical/Recent input structure (the q44555 failure — obsolete
+        chronology buried the live matchup)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "lead with the most recent and most resolution-relevant facts" in collapsed
+        assert "Do not mirror the raw input's section structure" in collapsed
+        assert "organize by recency and relevance to the question" in collapsed
+        # The old input-mirroring instruction it replaced must be gone.
+        assert "Maintains the section structure" not in collapsed

@@ -546,13 +546,25 @@ entry (Medium-term) called for.
    ~$190/quarter savings from retiring v1 is correct only if quality is preserved. **Gate:**
    compare v1 vs v2 findings sections on the first ~20 prod questions where both are present;
    flip is safe only if v2 consistently surfaces the same decisive facts v1 did.
-2. **AskNews reform needed (medium priority).** Content audit: 44% of the bundle by tokens,
-   57% padding, AND stale/directionally-wrong in 5/10 sampled questions while smaller
+2. **AskNews reform — shipped 2026-07-18.** Content audit: 44% of the bundle by
+   tokens, 57% padding, AND stale/directionally-wrong in 5/10 sampled questions while smaller
    sections had the right answer. The summarizer's "longer is better" nudge was removed in
-   `5cfb6cd`; next step is a dedicated AskNews quality audit — what's being included, what
-   the summarizer prompt actually produces, how to iterate. Do NOT blindly halve the section
-   — per operator directive, this is a prioritization-instruction change with a before/after
-   eyeball, not a cap.
+   `5cfb6cd`; the dedicated quality audit ran 2026-07-18
+   (`scratch/asknews_quality_audit_2026-07-18/RESULTS.md` — R1-R5 reform proposals with a
+   per-failure prevention matrix). **Shipped (this commit): R1** (recency-first ordering —
+   lead with the newest resolution-relevant facts, don't mirror the raw Historical/Recent
+   input structure; shipped directly per operator decision, no replay validation required),
+   **R2** (supersession + quote-the-deadline-inputs arithmetic transparency), **R3** (hard
+   per-article relevance gate — off-topic articles DROPPED to a one-line screened-out list),
+   **R4** (evidence-age disclosure opening the briefing), and an operator-designed
+   **proportionality rule** (length tracks decision-relevant content; tangential-only sets
+   yield a short briefing), all in `asknews_summarizer_prompt`. The audit's hygiene rec —
+   archiving raw pre-summarization AskNews text as `asknews_raw` in the research-persistence
+   record so future audits and summarizer replays are free — is a separate in-flight change
+   on this branch (orchestrator + persistence). The R1/R3 replay-validation arm from audit
+   §5 is no longer needed. R5 (fetch query enrichment) remains the optional param
+   experiment. Do NOT blindly halve the section — per operator directive, this is a
+   prioritization-instruction change with a before/after eyeball, not a cap.
 3. **Prediction-market header revision (low effort, medium impact).** The
    `STRONG EVIDENCE -- weight these markets heavily` header fires unconditionally in the
    research snapshot (`research/prediction_market.py:1184`) even when fuzzy-match relevance
@@ -1562,11 +1574,17 @@ strictly subsumes a single normal and additionally supports mixtures via OPTION 
 "spike" grid-compliance trick (we solve grid validity deterministically in `pchip_cdf.py` and our
 prompt already tells forecasters spiky tricks don't pay).
 
-### Summarizer model: bench sol-low vs terra-low (added 2026-07-17, bottom-of-medium)
+### ~~Summarizer model: bench sol-low vs terra-low~~ — DECIDED 2026-07-18 by operator (added 2026-07-17)
 
 The 2026-07-17 role audit kept sol — best synthesis/provenance precision, terra 2nd with one
-attribution blur; gap "MARGINAL EDGE", $0.09/q. Re-bench on more questions before switching;
-see `scratch/research_role_audit_2026-07-17/`.
+attribution blur; gap "MARGINAL EDGE", $0.09/q. The planned re-bench was superseded by a
+value-based operator call 2026-07-18: **switched to terra-low.** Rationale: AskNews is an
+auxiliary/augmenting source (content audit: 16% unique content vs native-search 54% /
+gap-fill 59%), so the absolute-frontier tier isn't warranted; terra was 2nd with one
+attribution blur and no fabrications; and the AskNews quality audit
+(`scratch/asknews_quality_audit_2026-07-18/`) attributed 4/5 briefing failures to prompt-era
+issues (mini summarizer + missing no-forecast rule), not model tier. Terra: −43% cost,
+~50s vs ~118s wall. See `scratch/research_role_audit_2026-07-17/` for the original packets.
 
 ## Longer-term (significant R&D)
 

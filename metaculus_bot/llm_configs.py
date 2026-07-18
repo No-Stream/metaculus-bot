@@ -137,16 +137,21 @@ def _forecaster_display_name(llm: GeneralLlm) -> str:
 FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
 # Summarizer: compresses raw AskNews article markdown into an analyst briefing
-# (AskNews-only; all other providers already emit LLM prose). NOT a saturated
-# task — it decides what is load-bearing and which sources to trust in the
-# briefing every forecaster reads, which rewards the top tier; low effort keeps
-# latency in check (sol-low ≈ terra-medium quality per the AA Pareto frontier).
+# (AskNews-only; all other providers already emit LLM prose). sol → terra
+# 2026-07-18 operator decision: AskNews is an auxiliary/augmenting source
+# (content audit: 16% unique content vs native-search 54% / gap-fill 59%), so
+# the absolute-frontier tier isn't warranted. The role audit
+# (scratch/research_role_audit_2026-07-17/) had sol 1st but verdict "MARGINAL
+# EDGE" with terra 2nd (one attribution blur, no fabrications), and 4/5 briefing
+# failures in the AskNews quality audit (scratch/asknews_quality_audit_2026-07-18/)
+# were prompt-era (mini summarizer + missing no-forecast rule), not model-tier.
+# Terra: −43% cost, ~50s vs ~118s wall. Effort stays low (latency).
 # allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
 # 30s-gated retry (orchestrator._summarize_asknews) to impose the universal
 # "no retry after 30s" deadline rule. Per-instance override so PARSER_LLM (which
 # also uses UTILITY_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.6-sol",
+    "openrouter/openai/gpt-5.6-terra",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )
