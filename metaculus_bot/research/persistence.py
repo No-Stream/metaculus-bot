@@ -31,6 +31,7 @@ class ResearchPersistenceWriter:
         providers_attempted: list[str] | None = None,
         providers_succeeded: list[str] | None = None,
         gap_fill_v2: dict | None = None,
+        provider_diagnostics_block: str | None = None,
     ) -> None:
         """Record a single question's research output.
 
@@ -44,6 +45,11 @@ class ResearchPersistenceWriter:
         ``gap_fill_v2`` carries the agentic-loop trace (``transcript`` +
         ``telemetry`` dicts) when the v2 loop ran; the key is written only in
         that case so records stay compact when the flag is off.
+
+        ``provider_diagnostics_block`` is the rendered ``## Provider Diagnostics``
+        markdown. Since the diagnostics seam (2026-07) it is no longer embedded in
+        ``research_text`` (forecasters must not see it), so it is archived as its
+        own field to keep records self-contained for grep-based triage.
         """
         record: dict[str, object] = {
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -64,6 +70,8 @@ class ResearchPersistenceWriter:
         }
         if gap_fill_v2 is not None:
             record["gap_fill_v2"] = gap_fill_v2
+        if provider_diagnostics_block:
+            record["provider_diagnostics_block"] = provider_diagnostics_block
         self._records.append(record)
 
     def flush(self, output_dir: str = "research_outputs") -> Path | None:

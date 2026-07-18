@@ -340,6 +340,35 @@ class TestConditionalStackingBinaryTrigger:
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
 
+    @pytest.mark.asyncio
+    async def test_diagnostics_seam_on_stacking_paths(self):
+        """Both conditional-stacking branches re-append the popped diagnostics block to the
+        comment-bound research_report while the stacker consumes the clean research text."""
+        diagnostics_block = "---\n\n## Provider Diagnostics\n\n- asknews: ok | 10 chars | 5 ms"
+
+        # Triggered branch: stacker research stays clean, comment carries the block last.
+        bot = _make_bot()
+        bot._research.pop_provider_diagnostics = Mock(return_value=diagnostics_block)
+        question = _make_binary_question()
+        with mock_stacking_pipeline(
+            bot,
+            predictions=_HIGH_SPREAD_BINARY,
+            aggregate_return=0.72,
+        ) as mocks:
+            result = await bot._research_and_make_predictions(question)
+            assert "## Provider Diagnostics" not in mocks["aggregate"].call_args[1]["research"]
+            assert "## Provider Diagnostics" in result.research_report
+            assert result.research_report.index("Targeted Research") < result.research_report.index(
+                "## Provider Diagnostics"
+            )
+
+        # Skipped (low-spread) branch: same seam on the median path.
+        bot = _make_bot()
+        bot._research.pop_provider_diagnostics = Mock(return_value=diagnostics_block)
+        with mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY):
+            result = await bot._research_and_make_predictions(_make_binary_question())
+            assert "## Provider Diagnostics" in result.research_report
+
 
 class TestConditionalStackingFallbacks:
     """Tests for graceful degradation when pipeline components fail."""

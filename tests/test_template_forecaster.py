@@ -196,6 +196,40 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
 
 
 @pytest.mark.asyncio
+async def test_diagnostics_seam_forecasters_clean_comment_carries_block(mock_general_llm, mock_binary_question):
+    """Diagnostics seam: forecaster prompts receive the clean research text while the
+    comment-bound research_report gets the provider-diagnostics block re-appended."""
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    diagnostics_block = "---\n\n## Provider Diagnostics\n\n- asknews: ok | 100 chars | 50 ms"
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="clean research")
+    bot._research.pop_provider_diagnostics = MagicMock(return_value=diagnostics_block)
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test")
+    )
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    # Forecasters got the clean text (no diagnostics).
+    for call in bot._forecaster_with_soft_deadline.call_args_list:
+        assert call[0][1] == "clean research"
+    # The comment-bound research_report carries the block, appended after the research body.
+    assert "## Provider Diagnostics" in result.research_report
+    assert result.research_report.index("clean research") < result.research_report.index("## Provider Diagnostics")
+    bot._research.pop_provider_diagnostics.assert_called_once_with(mock_binary_question.id_of_question)
+
+
+@pytest.mark.asyncio
 async def test_research_and_make_predictions_without_forecasters(mock_binary_question):
     llms_config = {
         "default": GeneralLlm(model="test_default"),

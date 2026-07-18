@@ -298,7 +298,7 @@ def asknews_summarizer_prompt(
         - Single-source rule: when a claim rests on ONE source/outlet, label it "[SINGLE-SOURCE]" and carry
           the original hedges forward verbatim ("reportedly", "according to X"). NEVER promote a
           single-source claim to a confirmed or factual statement.
-        - Be COMPREHENSIVE — do not omit relevant details. A longer, thorough summary is better than a short one.
+        - Be COMPREHENSIVE — do not omit relevant details.
         - Include direct quotes from experts and officials where available.
         - If the research contains prediction market data, include exact numbers and odds.
         - Preserve all numerical data: poll numbers, vote counts, market prices, growth rates, dates, etc.

@@ -10,6 +10,7 @@ Verifies that the orchestrator:
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -631,26 +632,47 @@ class TestProviderDiagnosticsCapture:
         assert by_name["gemini_search"].status == "errored"
 
     @pytest.mark.asyncio
-    async def test_diagnostics_block_appended_to_research(self, mock_llm, question):
+    async def test_diagnostics_block_withheld_from_research_but_logged_and_poppable(self, mock_llm, question, caplog):
+        """Diagnostics seam: run_research output (the forecaster-facing text) must NOT
+        carry the block, but it must still be (a) logged at INFO and (b) stashed for the
+        comment path via pop_provider_diagnostics."""
+
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         ok = AsyncMock(return_value="native prose")
         failing = AsyncMock(side_effect=RuntimeError("timeout"))
 
-        with patch.object(
-            orch,
-            "_select_research_providers",
-            return_value=[(ok, "native_search"), (failing, "gemini_search")],
+        with (
+            patch.object(
+                orch,
+                "_select_research_providers",
+                return_value=[(ok, "native_search"), (failing, "gemini_search")],
+            ),
+            caplog.at_level(logging.INFO),
         ):
             research = await orch.run_research(question)
 
-        assert "## Provider Diagnostics" in research
-        diag_lines = [line for line in research.splitlines() if line.startswith("- ")]
+        # Forecaster-facing research is clean.
+        assert "## Provider Diagnostics" not in research
+        assert "native prose" in research
+
+        # Logged at INFO for run-log triage.
+        diag_log = next(rec.message for rec in caplog.records if "Provider diagnostics for URL" in rec.message)
+        assert "## Provider Diagnostics" in diag_log
+
+        # Stashed for the comment path, keyed by qid.
+        block = orch.pop_provider_diagnostics(question.id_of_question)
+        assert "## Provider Diagnostics" in block
+        diag_lines = [line for line in block.splitlines() if line.startswith("- ")]
         assert any(line.startswith("- native_search: ok |") for line in diag_lines)
         errored_line = next(line for line in diag_lines if line.startswith("- gemini_search: errored |"))
         assert "RuntimeError" in errored_line
 
+        # Pop semantics: a second pop returns empty (stash must not grow across a batch).
+        assert orch.pop_provider_diagnostics(question.id_of_question) == ""
+        assert orch.pop_provider_diagnostics(None) == ""
+
     @pytest.mark.asyncio
-    async def test_diagnostics_block_after_gap_fill(self, mock_llm, question, monkeypatch):
+    async def test_gap_fill_research_stays_clean_of_diagnostics(self, mock_llm, question, monkeypatch):
         monkeypatch.setenv("GAP_FILL_ENABLED", "true")
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="A" * 200)
@@ -665,8 +687,10 @@ class TestProviderDiagnosticsCapture:
         ):
             research = await orch.run_research(question)
 
-        # Ordering: providers -> gap-fill -> provider diagnostics.
-        assert research.index("Targeted Gap-Fill") < research.index("## Provider Diagnostics")
+        # Gap-fill addendum lands in the forecaster-facing text; diagnostics do not.
+        assert "Targeted Gap-Fill" in research
+        assert "## Provider Diagnostics" not in research
+        assert "## Provider Diagnostics" in orch.pop_provider_diagnostics(question.id_of_question)
 
     @pytest.mark.asyncio
     async def test_sink_receives_attempted_and_succeeded_excluding_failures(self, mock_llm, question, monkeypatch):

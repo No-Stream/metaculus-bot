@@ -24,6 +24,8 @@ async def test_run_research_priority():
         question_text="Test question",
         page_url="http://example.com",
         open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        # Required by the diagnostics seam: the comment-bound block is stashed per-qid.
+        id_of_question=777,
     )
 
     # Test AskNews priority (highest priority when available)
@@ -109,8 +111,11 @@ async def test_run_research_priority():
 
             research = await forecaster.run_research(question)
             mock_empty_func.assert_called_once_with(question)
-            # Empty results don't get a provider header; the only body is the
-            # provider-diagnostics block recording the empty outcome for triage.
+            # Empty results don't get a provider header, and the forecaster-facing
+            # text stays clean of diagnostics; the empty outcome is recorded in the
+            # comment-bound block popped via the orchestrator seam.
             assert "## Research (fallback)" not in research
-            assert "## Provider Diagnostics" in research
-            assert "- fallback: empty | 0 chars |" in research
+            assert "## Provider Diagnostics" not in research
+            block = forecaster._research.pop_provider_diagnostics(question.id_of_question)
+            assert "## Provider Diagnostics" in block
+            assert "- fallback: empty | 0 chars |" in block

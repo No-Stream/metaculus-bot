@@ -1199,6 +1199,14 @@ case vs. parser/clamp regression risk — not worth it).
 
 ## Medium-term (requires more exploration)
 
+### Bundle section-content audit before any content cuts (added 2026-07-17, medium)
+
+Operator directive 2026-07-17: no willy-nilly trimming. A Fable-judged per-section
+value/redundancy audit over multiple questions is the prerequisite for any cut beyond the
+diagnostics-seam change; the token-level measurements are in
+`scratch/bundle_token_audit_2026-07-17/`. AskNews summarizer "longer is better" nudge removed
+(no cap added) — watch whether average briefing length drifts down naturally.
+
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
 
 Motivated by the qid 42304 INES miss: the then-native-search provider (`x-ai/grok-4.1-fast`,
@@ -1513,6 +1521,12 @@ switching numeric to parametric mean/sigma representation (our percentile→PCHI
 strictly subsumes a single normal and additionally supports mixtures via OPTION B); the open-tail
 "spike" grid-compliance trick (we solve grid validity deterministically in `pchip_cdf.py` and our
 prompt already tells forecasters spiky tricks don't pay).
+
+### Summarizer model: bench sol-low vs terra-low (added 2026-07-17, bottom-of-medium)
+
+The 2026-07-17 role audit kept sol — best synthesis/provenance precision, terra 2nd with one
+attribution blur; gap "MARGINAL EDGE", $0.09/q. Re-bench on more questions before switching;
+see `scratch/research_role_audit_2026-07-17/`.
 
 ## Longer-term (significant R&D)
 

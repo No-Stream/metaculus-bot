@@ -49,8 +49,9 @@ async def test_run_research_falls_back_to_openrouter(monkeypatch, question, base
 
 @pytest.mark.asyncio
 async def test_run_research_returns_empty_when_all_providers_fail(monkeypatch, question, base_llms):
-    """When all providers fail, run_research degrades gracefully: no provider research body,
-    only the provider-diagnostics block (which now durably records the failure for triage)."""
+    """When all providers fail, run_research degrades gracefully: empty forecaster-facing
+    text, with the failure durably recorded in the comment-bound diagnostics block
+    (popped via the orchestrator seam) for triage."""
     bot = TemplateForecaster(
         llms=base_llms,
         aggregation_strategy=AggregationStrategy.MEAN,
@@ -67,9 +68,12 @@ async def test_run_research_returns_empty_when_all_providers_fail(monkeypatch, q
     monkeypatch.delenv("EXA_API_KEY", raising=False)
 
     result = await bot.run_research(question)
-    # No provider research content — the only body is the diagnostics block recording the failure.
+    # Forecaster-facing text is empty — no provider content and no diagnostics block.
     assert "## News Articles (AskNews)" not in result
-    assert "## Provider Diagnostics" in result
-    assert "- asknews: errored | 0 chars |" in result
-    assert "RuntimeError" in result
+    assert "## Provider Diagnostics" not in result
+    # The failure is recorded in the comment-bound diagnostics block instead.
+    block = bot._research.pop_provider_diagnostics(question.id_of_question)
+    assert "## Provider Diagnostics" in block
+    assert "- asknews: errored | 0 chars |" in block
+    assert "RuntimeError" in block
     assert failing_provider.await_count == 1

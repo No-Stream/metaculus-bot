@@ -564,6 +564,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
+        # Diagnostics seam: run_research returns forecaster-clean text (the
+        # provider-diagnostics block is withheld so it never reaches forecaster
+        # prompts, the stacker, or the gap-fill v2 driver brief). It must still
+        # reach the published comment, so re-append it to the comment-bound
+        # research_report strings only.
+        diagnostics_block = self._research.pop_provider_diagnostics(question.id_of_question)
+
+        def _with_diagnostics(text: str) -> str:
+            return f"{text}\n\n{diagnostics_block}" if diagnostics_block else text
+
         # Pull the time-series-anchor chart image (if the chart flag rendered one
         # this question) out of the provider's per-session cache so the base
         # forecasters can attach it as a vision message. No-op unless
@@ -656,7 +666,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 valid_predictions,
                 research_for_stacking=research_to_use,
-                research_report=research,
+                research_report=_with_diagnostics(research),
                 summary_report=summary_report,
                 errors=errors,
                 default_meta_reasoning="Stacked prediction aggregated from multiple models",
@@ -756,7 +766,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question,
                     valid_predictions,
                     research_for_stacking=combined_research,
-                    research_report=combined_research,
+                    research_report=_with_diagnostics(combined_research),
                     summary_report=summary_report,
                     errors=errors,
                     default_meta_reasoning=(
@@ -783,7 +793,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self._register_expected_base_combine(question)
                 self._stacker_outcome[question.id_of_question] = "skipped"
                 return ResearchWithPredictions(
-                    research_report=research,
+                    research_report=_with_diagnostics(research),
                     summary_report=summary_report,
                     errors=errors,
                     predictions=valid_predictions,
@@ -795,7 +805,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # them. For the skip case, _stacker_outcome was already set to
         # "fallback_median" upstream so the comment-marker reflects reality.
         return ResearchWithPredictions(
-            research_report=research,
+            research_report=_with_diagnostics(research),
             summary_report=summary_report,
             errors=errors,
             predictions=valid_predictions,

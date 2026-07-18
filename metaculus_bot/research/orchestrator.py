@@ -105,6 +105,10 @@ class ResearchOrchestrator:
         self._allow_research_fallback = allow_research_fallback
         self._concurrency_limiter = asyncio.Semaphore(max_concurrent_research)
         self._research_sink = research_sink
+        # Comment-bound provider-diagnostics blocks, keyed by qid. run_research
+        # returns forecaster-clean text; TemplateForecaster pops the block via
+        # pop_provider_diagnostics when assembling the published comment.
+        self._comment_diagnostics: dict[int, str] = {}
         self.timeout_count: int = 0
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -130,7 +134,7 @@ class ResearchOrchestrator:
             # is max(v1, v2), not the sum — v2's 540s deadline fits inside v1's
             # worst-case envelope only under this parallelism). Consequence: the
             # v2 driver's brief sees the bundle WITHOUT v1's addendum. v2's
-            # section appends after v1's, both before the diagnostics block.
+            # section appends after v1's.
             gap_fill_v1_active = (
                 env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
             )
@@ -188,18 +192,24 @@ class ResearchOrchestrator:
 
             gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
 
-            # Block ordering in the returned text (and therefore the comment):
-            # providers -> gap-fill -> provider diagnostics. Appended last so the
-            # diagnostics never perturb the gap-fill threshold/detection above.
+            # Diagnostics seam: the block is deliberately NOT appended to the
+            # returned research — forecasters (and the gap-fill v2 driver brief)
+            # consume that text verbatim and must never see it. It still reaches
+            # its three destinations: (a) the INFO log line just below, (b) the
+            # research archive via the sink's provider_diagnostics_block kwarg,
+            # and (c) the published comment — stashed per-qid here and popped by
+            # TemplateForecaster.pop_provider_diagnostics at comment-build time.
             diagnostics_block = format_provider_diagnostics_block(provider_results)
+            qid = getattr(question, "id_of_question", None)
             if diagnostics_block:
-                research = f"{research}\n\n{diagnostics_block}"
+                logger.info(f"Provider diagnostics for URL {question.page_url}:\n{diagnostics_block}")
+                if qid is not None:
+                    self._comment_diagnostics[qid] = diagnostics_block
 
             self._store_research_cache(cache_key, research)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
 
             if self._research_sink is not None:
-                qid = getattr(question, "id_of_question", None)
                 if qid is not None:
                     try:
                         # provider_results is the authoritative per-provider outcome;
@@ -215,6 +225,7 @@ class ResearchOrchestrator:
                             providers_attempted=provider_names,
                             providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
                             gap_fill_v2=gap_fill_v2_payload,
+                            provider_diagnostics_block=diagnostics_block,
                         )
                     except (
                         Exception
@@ -222,6 +233,19 @@ class ResearchOrchestrator:
                         logger.exception("Research sink failed for qid=%d; continuing", qid)
 
             return research
+
+    def pop_provider_diagnostics(self, qid: int | None) -> str:
+        """Return-and-clear the comment-bound provider-diagnostics block for a question.
+
+        The other half of the diagnostics seam in ``run_research``: the block is
+        withheld from the forecaster-facing research text, and the forecaster pops
+        it here when assembling ``research_report`` (the published comment).
+        Popping keeps the stash from growing across a batch. Returns ``""`` when
+        no diagnostics were recorded for the qid.
+        """
+        if qid is None:
+            return ""
+        return self._comment_diagnostics.pop(qid, "")
 
     async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
         """Compress raw AskNews article markdown into an analyst briefing.

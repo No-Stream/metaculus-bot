@@ -167,6 +167,7 @@ class TestWritePathE2E:
             ],
             providers_attempted=["asknews", "native_search", "gemini_search"],
             providers_succeeded=["asknews", "native_search"],
+            provider_diagnostics_block="---\n\n## Provider Diagnostics\n\n- asknews: ok | 100 chars | 50 ms",
         )
 
         assert len(writer._records) == 1
@@ -175,6 +176,23 @@ class TestWritePathE2E:
         assert record["providers_attempted"] == ["asknews", "native_search", "gemini_search"]
         assert record["providers_succeeded"] == ["asknews", "native_search"]
         assert [r["name"] for r in record["provider_results"]] == ["asknews", "native_search", "gemini_search"]
+        # Diagnostics seam: the block is archived as its own field (no longer
+        # embedded in research_text) so archive triage stays self-contained.
+        assert "## Provider Diagnostics" in record["provider_diagnostics_block"]
+
+    def test_empty_diagnostics_block_omitted_from_record(self) -> None:
+        """A falsy diagnostics block (no providers ran) must not add a key to the record."""
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer.record(
+            qid=1,
+            page_url="https://www.metaculus.com/questions/1/",
+            question_text="Q?",
+            research_text="body",
+            providers_used=[],
+            gap_fill_used=False,
+            provider_diagnostics_block="",
+        )
+        assert "provider_diagnostics_block" not in writer._records[0]
 
     def test_multiple_questions_in_single_flush(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="minibench", tournament_id="bench-1", run_id="local-42")
