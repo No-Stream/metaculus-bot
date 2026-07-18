@@ -918,7 +918,11 @@ class TestAskNewsSummarizerPrompt:
         summarizer's existing critical rules."""
         collapsed = " ".join(_summarizer_prompt().split())
         assert "Date every fact precisely" in collapsed
+        # First occurrence carries the full tag; repeats use the short tag (display
+        # compression only — the pre-window warning semantics must stay intact).
         assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
+        assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
         assert "[SINGLE-SOURCE]" in collapsed
         assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
         assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed

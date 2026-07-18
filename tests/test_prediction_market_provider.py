@@ -1151,7 +1151,7 @@ class TestProviderFactory:
             out = await provider(mock_question)
 
         assert isinstance(out, str)
-        assert "STRONG EVIDENCE" in out
+        assert "MAY be relevant" in out
         assert "polymarket" in out.lower() or "manifold" in out.lower() or "kalshi" in out.lower()
 
 
@@ -1186,13 +1186,19 @@ class TestFormatter:
 
         formatted = format_snapshot_for_research(snap)
 
-        # The strong-evidence caveat is the load-bearing framing for the forecaster prompt:
-        # markets are weighted heavily, discounted only on a specific resolution mismatch.
-        assert "STRONG EVIDENCE" in formatted
-        assert "weight these markets heavily" in formatted.lower()
-        assert "verify" in formatted.lower()
+        # The conditioned-relevance header is the load-bearing framing for the forecaster
+        # prompt: the fuzzy match may be off-topic, so relevance must be verified before
+        # weighting — a criteria+date match is extremely strong evidence, a mismatch is
+        # discounted proportionally (possibly to nothing).
+        assert "MAY be relevant" in formatted
+        assert "verify each market's resolution criteria" in formatted.lower()
+        assert "extremely strong evidence" in formatted.lower()
+        assert "anchor on its price" in formatted.lower()
         assert "resolution date" in formatted.lower()
-        assert "discount" in formatted.lower()
+        assert "name the specific mismatch and discount accordingly" in formatted.lower()
+        assert "worth little or nothing" in formatted.lower()
+        # The old unconditional header must be gone.
+        assert "weight these markets heavily" not in formatted.lower()
         # New columns per the plan: total_vol + OI + signal replace the misleading 24h vol column.
         assert "platform" in formatted.lower()
         assert "total_vol" in formatted.lower()

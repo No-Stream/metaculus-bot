@@ -1172,18 +1172,23 @@ def _flatten_results(results: list[Any], platform: str) -> list[MarketMatch]:
 def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     """Compact markdown block for the research prompt.
 
-    Emits a table + raw-rules section + a strong-evidence caveat: markets are
-    weighted heavily when their resolution criteria and date match the
-    question, and discounted proportionally to any specific mismatch.
+    Emits a table + raw-rules section + a conditioned-relevance header: the
+    fuzzy match MAY be off-topic, so forecasters must verify criteria, date,
+    and topic against the question before weighting — a matched market is
+    extremely strong evidence, a mismatched one is discounted proportionally
+    (possibly to nothing).
     """
     if not snapshot.matches:
         return ""
 
     lines: list[str] = []
     lines.append(
-        "STRONG EVIDENCE -- weight these markets heavily. Verify each market's resolution criteria AND "
-        "resolution date against the question: if they match, anchor on the price; if they differ, discount "
-        "proportionally to the specific mismatch. The `signal` column labels each market's liquidity/participation "
+        "The following prediction markets MAY be relevant — the match below is fuzzy, so verify each market's "
+        "resolution criteria, resolution date, and topic against THIS question before weighting. A market whose "
+        "criteria and date match this question is extremely strong evidence — anchor on its price. A market on a "
+        "related but different event, different date, or different criteria carries proportionally less weight — "
+        "name the specific mismatch and discount accordingly; a poorly-matched market may be worth little or "
+        "nothing. The `signal` column labels each market's liquidity/participation "
         "(thin/decent/deep or thin/decent/high); the raw total volume and open interest are shown alongside. Treat "
         "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy."
     )

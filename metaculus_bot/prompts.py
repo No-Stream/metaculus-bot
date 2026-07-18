@@ -292,9 +292,11 @@ def asknews_summarizer_prompt(
         - NEVER paraphrase numbers, percentages, probabilities, dates, or quantitative data. Copy them EXACTLY.
           BAD:  "The Fed indicated a low-medium recession risk"
           GOOD: "The Fed's March 2025 report estimated a 30% probability of recession by Q4"
-        - Date every fact precisely. Explicitly flag as "[PRE-WINDOW — occurred before question open,
-          cannot itself satisfy the criteria]" any event that could otherwise be read as already satisfying
-          the resolution criteria. Keep such facts in the briefing as base-rate/context evidence.
+        - Date every fact precisely. Explicitly flag any event that could otherwise be read as already
+          satisfying the resolution criteria: the FIRST time such a flag appears in the briefing, use the
+          full tag "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]";
+          for every subsequent occurrence use the short tag "[PRE-WINDOW]" (same meaning). Keep such
+          facts in the briefing as base-rate/context evidence.
         - Single-source rule: when a claim rests on ONE source/outlet, label it "[SINGLE-SOURCE]" and carry
           the original hedges forward verbatim ("reportedly", "according to X"). NEVER promote a
           single-source claim to a confirmed or factual statement.

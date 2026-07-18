@@ -170,9 +170,12 @@ class TestAskNewsSummarization:
         assert "opened on 2026-03-15" in collapsed
         # (b) Lighter window-stamping: precise dating, targeted PRE-WINDOW label
         #     only for facts that could look like they satisfy the criteria; no
-        #     blanket IN-WINDOW stamps.
+        #     blanket IN-WINDOW stamps. Full tag on first occurrence, short
+        #     "[PRE-WINDOW]" tag on repeats (display compression only).
         assert "Date every fact precisely" in collapsed
         assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
+        assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
         assert "[IN-WINDOW]" not in collapsed
         assert "base-rate" in collapsed
         # (c) Single-source rule: label + carry hedges + no promotion to confirmed.
