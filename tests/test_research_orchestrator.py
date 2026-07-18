@@ -550,7 +550,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="some research prose")
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert len(results) == 1
         assert results[0].name == "native_search"
@@ -567,7 +567,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="   ")
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert results[0].status == "empty"
         assert results[0].chars == 0
@@ -577,7 +577,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(side_effect=RuntimeError("boom"))
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert results[0].status == "errored"
         assert results[0].chars == 0
@@ -595,7 +595,7 @@ class TestProviderDiagnosticsCapture:
 
         provider = AsyncMock(side_effect=ForbiddenError("403011 - subscription is not currently active"))
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "asknews")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "asknews")])
 
         assert results[0].status == "inactive"
         assert results[0].chars == 0
@@ -615,7 +615,7 @@ class TestProviderDiagnosticsCapture:
             new_callable=AsyncMock,
             return_value="perplexity fallback prose",
         ):
-            text, results = await orch._run_providers_parallel(question, [(asknews, "asknews")])
+            text, results, _ = await orch._run_providers_parallel(question, [(asknews, "asknews")])
 
         assert results[0].status == "fallback"
         assert results[0].name == "asknews"
@@ -628,7 +628,9 @@ class TestProviderDiagnosticsCapture:
         ok = AsyncMock(return_value="native prose")
         failing = AsyncMock(side_effect=RuntimeError("timeout"))
 
-        _, results = await orch._run_providers_parallel(question, [(ok, "native_search"), (failing, "gemini_search")])
+        _, results, _ = await orch._run_providers_parallel(
+            question, [(ok, "native_search"), (failing, "gemini_search")]
+        )
 
         by_name = {r.name: r for r in results}
         assert by_name["native_search"].status == "ok"
@@ -785,6 +787,53 @@ class TestProviderDiagnosticsCapture:
         assert captured["providers_attempted"] == ["asknews"]
         assert captured["providers_succeeded"] == ["asknews"]  # fallback status counts as succeeded
         assert captured["provider_results"][0]["status"] == "fallback"
+        # Fallback prose is not AskNews articles — no raw capture (empty string,
+        # which the persistence writer omits from the record).
+        assert captured["asknews_raw"] == ""
+
+    @pytest.mark.asyncio
+    async def test_sink_receives_raw_asknews_text_pre_summarization(self, mock_llm, question, monkeypatch):
+        """2026-07-18 audit hygiene: the archive stores only the post-summarization
+        briefing, so the sink must also receive the raw pre-summarization AskNews
+        article text — otherwise FETCH-vs-SUMMARIZE attribution and summarizer
+        replays require fresh paid pulls."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+
+        captured: dict = {}
+
+        def sink(**kwargs) -> None:  # noqa: ANN003
+            captured.update(kwargs)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+            allow_research_fallback=False,
+            research_sink=sink,
+        )
+        asknews = AsyncMock(return_value="raw asknews articles")
+        native = AsyncMock(return_value="native search prose")
+
+        with (
+            patch.object(
+                orch,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews"), (native, "native_search")],
+            ),
+            patch.object(
+                orch._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="ASKNEWS BRIEFING",
+            ),
+        ):
+            research = await orch.run_research(question)
+
+        # Forecaster-facing text carries the briefing; the sink carries the raw.
+        assert "ASKNEWS BRIEFING" in research
+        assert "raw asknews articles" not in research
+        assert captured["asknews_raw"] == "raw asknews articles"
+        # The raw is a sibling field, never folded into research_text.
+        assert "raw asknews articles" not in captured["research_text"]
 
 
 class TestDemoteInnerHeadings:

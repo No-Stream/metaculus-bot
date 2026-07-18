@@ -332,7 +332,7 @@ class TestParallelExecution:
         provider2 = AsyncMock(return_value="Research from provider 2")
 
         providers = [(provider1, "asknews"), (provider2, "native_search")]
-        result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        result, _, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from provider 1" in result
         assert "Research from provider 2" in result
@@ -353,7 +353,7 @@ class TestParallelExecution:
         working_provider = AsyncMock(return_value="Research from working provider")
 
         providers = [(failing_provider, "failing"), (working_provider, "working")]
-        result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        result, _, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from working provider" in result
 
@@ -420,7 +420,7 @@ class TestAskNewsSubscriptionErrorHandling:
             raise ForbiddenError("403011 - subscription is not currently active")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.orchestrator"):
-            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
         assert orch.timeout_count == 0, "Off-season subscription-inactive must NOT count as an alertable failure."
@@ -449,7 +449,7 @@ class TestAskNewsSubscriptionErrorHandling:
         asknews_provider = AsyncMock(side_effect=RuntimeError("connection timeout"))
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.orchestrator"):
-            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
         assert orch.timeout_count == 1

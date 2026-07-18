@@ -168,6 +168,7 @@ class TestWritePathE2E:
             providers_attempted=["asknews", "native_search", "gemini_search"],
             providers_succeeded=["asknews", "native_search"],
             provider_diagnostics_block="---\n\n## Provider Diagnostics\n\n- asknews: ok | 100 chars | 50 ms",
+            asknews_raw="**Article 1 (2026-07-14)**\nRaw pre-summarization article text.",
         )
 
         assert len(writer._records) == 1
@@ -179,6 +180,9 @@ class TestWritePathE2E:
         # Diagnostics seam: the block is archived as its own field (no longer
         # embedded in research_text) so archive triage stays self-contained.
         assert "## Provider Diagnostics" in record["provider_diagnostics_block"]
+        # Raw AskNews capture (audit hygiene): archived as its own field so
+        # summarizer replays don't require fresh paid pulls.
+        assert record["asknews_raw"] == "**Article 1 (2026-07-14)**\nRaw pre-summarization article text."
 
     def test_empty_diagnostics_block_omitted_from_record(self) -> None:
         """A falsy diagnostics block (no providers ran) must not add a key to the record."""

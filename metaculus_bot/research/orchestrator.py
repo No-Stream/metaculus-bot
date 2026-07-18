@@ -127,7 +127,7 @@ class ResearchOrchestrator:
             provider_names = [name for _, name in providers]
             logger.info(f"Using research providers: {provider_names}")
 
-            research, provider_results = await self._run_providers_parallel(question, providers)
+            research, provider_results, asknews_raw = await self._run_providers_parallel(question, providers)
 
             # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
             # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
@@ -226,6 +226,7 @@ class ResearchOrchestrator:
                             providers_succeeded=[r.name for r in provider_results if r.status in SUCCEEDED_STATUSES],
                             gap_fill_v2=gap_fill_v2_payload,
                             provider_diagnostics_block=diagnostics_block,
+                            asknews_raw=asknews_raw,
                         )
                     except (
                         Exception
@@ -383,10 +384,17 @@ class ResearchOrchestrator:
         self,
         question: MetaculusQuestion,
         providers: list[tuple[ResearchCallable, str]],
-    ) -> tuple[str, list[ProviderResult]]:
+    ) -> tuple[str, list[ProviderResult], str]:
         from metaculus_bot.research.providers import (
             is_asknews_subscription_error,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
+
+        # Raw pre-summarization AskNews article text, captured for the research
+        # archive (2026-07-18 audit hygiene: the archive otherwise stores only the
+        # post-summarization briefing, so FETCH-vs-SUMMARIZE attribution and
+        # summarizer replays required fresh paid pulls). Empty when AskNews didn't
+        # run, errored, or fell back to already-prose providers.
+        asknews_raw_holder: dict[str, str] = {}
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, ProviderResult]:
             started = time.monotonic()
@@ -404,6 +412,8 @@ class ResearchOrchestrator:
                 # AskNews fails and we fall back to Perplexity/Exa, that fallback
                 # is already prose, so skip summarization too.
                 if name == "asknews" and not used_fallback:
+                    if raw and raw.strip():
+                        asknews_raw_holder["text"] = raw
                     raw = await self._summarize_asknews(question, raw)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 has_output = bool(raw and raw.strip())
@@ -461,7 +471,7 @@ class ResearchOrchestrator:
                 combined_parts.append(f"{header}\n{_demote_inner_headings(raw)}")
 
         combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
-        return combined, provider_results
+        return combined, provider_results, asknews_raw_holder.get("text", "")
 
     @staticmethod
     def _provider_header(name: str) -> str:
