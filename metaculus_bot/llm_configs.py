@@ -224,12 +224,14 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 # the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE (180s);
 # effort deliberately low since 2026-05-20 for latency — the tier was upgraded
 # instead (smarter-model-at-lower-effort beats more effort on a smaller model).
+# 2026-07-17: sol→terra per the role audit; terra 2nd (sol 3rd) at −49% cost;
+# the role fires rarely (stacking disabled in prod).
 # allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
 # 30s-gated retry (targeted.extract_disagreement_crux) to impose the universal
 # "no retry after 30s" deadline rule on the conditional-stacking critical path.
 # Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.6-sol",
+    "openrouter/openai/gpt-5.6-terra",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )

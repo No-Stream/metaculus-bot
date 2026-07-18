@@ -261,11 +261,12 @@ NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
 # Default model for native search (without openrouter/ prefix).
 # Critical-path research — this constant covers BOTH the always-on native-search
 # provider (every question) and the targeted search on the stacking path.
-# Strongest OpenAI tier because research depth compounds into every forecaster
-# prompt; effort stays at the env default LOW (see
-# NATIVE_SEARCH_REASONING_EFFORT_DEFAULT below) — sol-low ≥ terra-medium per
-# the AA Pareto frontier at similar latency.
-NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.6-sol"
+# Effort stays at the env default LOW (see NATIVE_SEARCH_REASONING_EFFORT_DEFAULT
+# below).
+# 2026-07-17: sol→terra per blind research-role audit
+# (scratch/research_role_audit_2026-07-17/ — terra won native-search role 1st;
+# sol 2nd; luna 3rd; verdict "MARGINAL EDGE").
+NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.6-terra"
 # No temperature / top_p: reasoning models defer to provider defaults; the LLM
 # is built with temperature=None so litellm omits the param (see build_native_search_llm).
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
