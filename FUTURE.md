@@ -480,8 +480,9 @@ flipped ON 2026-07-17 after the paid smoke, the blind driver eval (winner: gpt-5
 effort=low, now the prod default), and the Exa-alive confirmation replay
 (`scratch/driver_replay_2026-07-17/arm_terra_low_exa_alive/`). Remaining pending items:
 turn v1 gap-fill OFF after the overlap window (operator must remember — nothing does it
-automatically), the 3.5-flash researcher switch is undecided, and the sol→terra
-research-role audit is in flight.
+automatically; **now explicitly gated on quality, not just time — see the 2026-07-18
+content-audit entry below**), the 3.5-flash researcher switch is undecided, and the
+sol→terra research-role audit is in flight.
 
 Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 4, self-contained —
 that doc is the source of truth; this entry is a pointer). Summary: a bounded agentic tool loop
@@ -531,6 +532,41 @@ news endpoints. Two options, relative to the gap-fill v2 driver above:
 **Blocked on: operator checking DeepNews limits/pricing.** It's a separate quota pool from the
 OpenRouter donated key, possibly subsidized for tournament participants — if cheap/free there's
 a solid case for (a).
+
+### Bundle content-audit findings: v1 retirement gate, AskNews reform, market header (added 2026-07-18)
+
+Three findings from the 2026-07-18 bundle content audit
+(`scratch/bundle_content_audit_2026-07-17/RESULTS.md`) — the Fable-judged per-section
+value/redundancy audit that the "Bundle section-content audit before any content cuts"
+entry (Medium-term) called for.
+
+1. **Gap-fill v1 retirement risk — do NOT flip v1 off on the calendar alone.** The audit
+   found v1 is the MOST load-bearing section per token: 59% unique content, and it carried
+   the decisive single-source fact in the majority of sampled questions. The token audit's
+   ~$190/quarter savings from retiring v1 is correct only if quality is preserved. **Gate:**
+   compare v1 vs v2 findings sections on the first ~20 prod questions where both are present;
+   flip is safe only if v2 consistently surfaces the same decisive facts v1 did.
+2. **AskNews reform needed (medium priority).** Content audit: 44% of the bundle by tokens,
+   57% padding, AND stale/directionally-wrong in 5/10 sampled questions while smaller
+   sections had the right answer. The summarizer's "longer is better" nudge was removed in
+   `5cfb6cd`; next step is a dedicated AskNews quality audit — what's being included, what
+   the summarizer prompt actually produces, how to iterate. Do NOT blindly halve the section
+   — per operator directive, this is a prioritization-instruction change with a before/after
+   eyeball, not a cap.
+3. **Prediction-market header revision (low effort, medium impact).** The
+   `STRONG EVIDENCE -- weight these markets heavily` header fires unconditionally in the
+   research snapshot (`research/prediction_market.py:1184`) even when fuzzy-match relevance
+   is low — ~56% of sampled questions had off-topic or loosely-matched markets, and
+   forecasters anchor on irrelevant market prices. Fix: (a) qualify the research-side header
+   by match confidence (e.g. "STRONG EVIDENCE if resolution criteria + date match this
+   question; may not be directly relevant otherwise — verify match before weighting")
+   instead of unconditionally asserting strength; (b) the forecaster-prompt-side clause
+   (`prompts.py:372`) already has the "discount proportionally to the SPECIFIC mismatch"
+   language — that part is fine; the problem is the research-side header priming the model
+   before it even reads the prompt. **Caution:** the `[PRE-WINDOW]` apparatus in the
+   summarizer output is load-bearing (prevents pre-open events being treated as resolutions
+   — has saved multiple questions). Do NOT collapse or remove it; at most abbreviate the
+   repeated full phrase to a shorter marker after its first occurrence per bundle.
 
 ### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
 
@@ -1199,13 +1235,17 @@ case vs. parser/clamp regression risk — not worth it).
 
 ## Medium-term (requires more exploration)
 
-### Bundle section-content audit before any content cuts (added 2026-07-17, medium)
+### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
 
 Operator directive 2026-07-17: no willy-nilly trimming. A Fable-judged per-section
 value/redundancy audit over multiple questions is the prerequisite for any cut beyond the
 diagnostics-seam change; the token-level measurements are in
 `scratch/bundle_token_audit_2026-07-17/`. AskNews summarizer "longer is better" nudge removed
 (no cap added) — watch whether average briefing length drifts down naturally.
+
+**Audit ran 2026-07-18** (`scratch/bundle_content_audit_2026-07-17/RESULTS.md`); findings and
+follow-ups logged in the Near-term entry "Bundle content-audit findings: v1 retirement gate,
+AskNews reform, market header (added 2026-07-18)".
 
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
 
