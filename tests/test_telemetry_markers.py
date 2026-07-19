@@ -8,6 +8,7 @@ tests loudly instead of silently dropping records from the archive:
 * GAP_FILL_V2       -> metaculus_bot/research/agentic/loop.py:_log_completion
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
+* CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
   -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
@@ -53,6 +54,15 @@ GHOST_FORECAST_JSON_NUMERIC_LINE = (
 OPEN_BOUND_PILING_LINE = (
     PFX_WARN + "OPEN_BOUND_PILING: question=51000 model=gemini-3.1-pro-preview bound=upper "
     "bin_mass=0.153 declared_edge=1000 bound_value=1000"
+)
+# Copied from metaculus_bot/close_margin.py:format_close_margin_marker output.
+CLOSE_MARGIN_LINE = (
+    PFX + "CLOSE_MARGIN: question=44620 close_time=2026-07-20T00:00:00+00:00 "
+    "submitted_at=2026-07-19T13:50:00+00:00 window_s=864000 margin_s=36600 margin_frac=0.0424"
+)
+CLOSE_MARGIN_NA_LINE = (
+    PFX + "CLOSE_MARGIN: question=44620 close_time=2026-07-20T00:00:00+00:00 "
+    "submitted_at=2026-07-19T00:00:00+00:00 window_s=n/a margin_s=86400 margin_frac=n/a"
 )
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
@@ -245,6 +255,27 @@ class TestOpenBoundPiling:
         assert rec["bin_mass"] == 0.153
         assert rec["declared_edge"] == 1000
         assert rec["bound_value"] == 1000
+
+
+class TestCloseMargin:
+    def test_full_fields(self):
+        rec = _parse_one(CLOSE_MARGIN_LINE)
+        assert rec["marker"] == "close_margin"
+        assert rec["question"] == "44620"
+        assert rec["qid"] == 44620
+        # ISO timestamps stay strings (float() fails, so coerce_value leaves them be).
+        assert rec["close_time"] == "2026-07-20T00:00:00+00:00"
+        assert rec["submitted_at"] == "2026-07-19T13:50:00+00:00"
+        assert rec["window_s"] == 864000
+        assert isinstance(rec["window_s"], int)
+        assert rec["margin_s"] == 36600
+        assert rec["margin_frac"] == 0.0424
+
+    def test_na_window_and_frac(self):
+        rec = _parse_one(CLOSE_MARGIN_NA_LINE)
+        assert rec["window_s"] is None
+        assert rec["margin_frac"] is None
+        assert rec["margin_s"] == 86400
 
 
 class TestCredit:

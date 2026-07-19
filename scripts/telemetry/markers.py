@@ -11,6 +11,7 @@ against the ACTUAL emitted format strings (the source of truth):
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
+* ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
   ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
@@ -113,8 +114,8 @@ def _parse_line_ts(line: str) -> str | None:
 # ``question=`` on GAP_FILL_V2 / GHOST_FORECAST / GHOST_FORECAST_JSON comes from
 # ``log_prefix`` (see ``agentic_gap_fill.py``: ``f"question={ref} "``) and is
 # prepended BEFORE the marker token, so it's an optional leading group there. On
-# EXTRACTION_RUNG / OPEN_BOUND_PILING the ``question=`` is a normal field AFTER
-# the token.
+# EXTRACTION_RUNG / OPEN_BOUND_PILING / CLOSE_MARGIN the ``question=`` is a normal
+# field AFTER the token.
 MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "extraction_rung",
@@ -158,6 +159,14 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"OPEN_BOUND_PILING:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
             r"\s+bound=(?P<bound>\S+)\s+bin_mass=(?P<bin_mass>\S+)"
             r"\s+declared_edge=(?P<declared_edge>\S+)\s+bound_value=(?P<bound_value>\S+)"
+        ),
+    ),
+    MarkerSpec(
+        "close_margin",
+        re.compile(
+            r"CLOSE_MARGIN:\s*question=(?P<question>\S+)\s+close_time=(?P<close_time>\S+)"
+            r"\s+submitted_at=(?P<submitted_at>\S+)\s+window_s=(?P<window_s>\S+)"
+            r"\s+margin_s=(?P<margin_s>\S+)\s+margin_frac=(?P<margin_frac>\S+)"
         ),
     ),
     MarkerSpec(

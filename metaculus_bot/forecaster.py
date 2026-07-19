@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
@@ -23,6 +24,7 @@ from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
+from metaculus_bot.close_margin import format_close_margin_marker
 from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -544,6 +546,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
             errors=errors,
             predictions=[aggregated_prediction],
         )
+
+    async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
+        """Run the base per-question pipeline, then log the close-margin marker on submit.
+
+        The base method publishes the report to Metaculus at its tail (when
+        ``publish_reports_to_metaculus`` is set), so the moment it returns is the
+        submission time. We gate the marker on that flag: backtests/benchmarks don't
+        submit and run resolved (past-close) questions, so a margin there would be a
+        meaningless negative — the marker is a *submission*-latency watch signal.
+        """
+        report = await super()._run_individual_question(question)
+        if self.publish_reports_to_metaculus:
+            marker = format_close_margin_marker(question, datetime.now(timezone.utc))
+            if marker is not None:
+                logger.info(marker)
+        return report
 
     async def _research_and_make_predictions(
         self,
