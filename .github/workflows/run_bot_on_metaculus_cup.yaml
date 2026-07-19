@@ -33,8 +33,12 @@ jobs:
       # degrades to plain fetch if the browser is missing, so this step is
       # belt-and-suspenders rather than run-critical.
       - name: Install Playwright Chromium
+        id: playwright_install
         continue-on-error: true
         run: uv run --frozen --no-dev playwright install --with-deps chromium
+      - name: Warn if Playwright install failed
+        if: steps.playwright_install.outcome == 'failure'
+        run: echo "::warning title=Playwright install failed::Chromium install failed — gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
       - name: Run bot
         shell: bash
         # Repo is public, so uploaded artifacts are effectively public. Log content
