@@ -98,6 +98,24 @@ via the existing CDF machinery, with a regex fallback for the pre-upgrade marker
 the legacy `GHOST_FORECAST` marker exposes only a numeric median, so numeric ghosts were
 countable but not scoreable — the operator wants gap-free ghost-vs-published analysis.
 
+### Re-evaluate the grok drop (6→5) once grok-4.5 has ~20-30 resolved questions (added 2026-07-19, HIGH)
+
+Status: decision DEFERRED 2026-07-19 pending grok-4.5 evidence — do NOT act yet.
+
+A paired leave-one-out replay on 2026-07-19 found that dropping grok from the 6-model roster
+IMPROVES binary accuracy: Δlog-score **+1.83 [+0.74, +3.00]** favoring the drop (n=184). But
+that signal is entirely **grok-4.3-lineage** — grok-4.5 (the current slot) has too few resolved
+questions to score. Grok has long read as deadweight-but-harmless in the ensemble-composition
+screening (the 8-era LOO replay found no subset beats the full roster, grok the least
+load-bearing — see the "Ensemble composition screening 2026-07" memory); this is the first data
+pointing at mild HARM rather than neutrality, but on the retired lineage.
+
+**Gate:** re-run once grok-4.5 has ~20-30 resolved questions. The replay script
+`scratch/residual_2026-07-18/followups/grok_loo_replay.py` is parameterized and free to re-run
+(offline, no API). If grok-4.5 reproduces the drop-helps sign with a CI excluding zero, drop to
+n=5 and rebalance the provider mix; if it's neutral/positive, keep grok. Era-bucket the read (a
+roster swap starts a new era) — do NOT pool 4.3 and 4.5 evidence.
+
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
 > Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting
@@ -837,6 +855,24 @@ them OUT of feature work, land as their own PRs.
   get/set/clear surface instead of touching the global directly.
 
 ## Medium-term (requires more exploration)
+
+### Consider migrating scheduled runs off GitHub Actions cron (added 2026-07-19, MEDIUM)
+
+The 2026-07-18 latency/completeness audit
+(`scratch/residual_2026-07-18/followups/latency_completeness.md`) traced ~80% of the
+submission-latency p90 creep (24 → 58 min) to GitHub Actions cron STARVATION: the scheduled
+workflows fire ~36 times/day against a nominal 72 (GHA silently drops scheduled runs under
+load). Queue-delay p90 is already 82 min against 90-minute question windows, so worst-case
+queue (82) + pipeline (12 p90) breaches the close deadline — and a missed close forfeits the
+whole spot score. Gap-fill v2 (up to 540s wall) stacks more pipeline time on top once the
+july15 branch merges.
+
+Time-sensitive because the failure mode is a hard forfeit, not a soft regression. No clean easy
+migration exists (hence MEDIUM, not HIGH) — alternatives to scope: a self-hosted GHA runner
+(kills queue starvation, adds ops burden), EventBridge Scheduler → `workflow_dispatch`, or a
+small VM / fly.io cron firing `workflow_dispatch`. The new CLOSE_MARGIN watch
+(`make close_margin_watch`) is the instrument to confirm the problem persists and to measure any
+migration's effect.
 
 ### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
 
