@@ -189,15 +189,22 @@ def download_and_harvest(
     workflow_map = build_workflow_map(repo)
     logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
 
+    # Dedup by run_id so a pagination-duplicated artifact is downloaded at most once
+    # (mirrors download_research.py). research-<id> and logs-<id> never collide on
+    # run_id — they come from different workflow runs.
+    by_run: dict[int, dict] = {}
+    for art in live:
+        run_id = art.get("run_id")
+        if run_id is None:
+            logger.warning(f"Live artifact {art.get('name')} has no workflow_run id, skipping")
+            continue
+        by_run.setdefault(run_id, art)
+
     runs: list[HarvestedRun] = []
     with tempfile.TemporaryDirectory(prefix="run_logs_dl_") as tmpdir:
         tmp_path = Path(tmpdir)
-        for idx, art in enumerate(sorted(live, key=lambda a: a.get("created_at", "")), 1):
-            run_id = art.get("run_id")
+        for idx, (run_id, art) in enumerate(sorted(by_run.items(), key=lambda kv: kv[1].get("created_at", "")), 1):
             name = art.get("name", "")
-            if run_id is None:
-                logger.warning(f"Live artifact {name} has no workflow_run id, skipping")
-                continue
             run_dir = _download_artifact_to(run_id, repo, name, tmp_path)
             if run_dir is None:
                 continue
@@ -211,7 +218,7 @@ def download_and_harvest(
             if harvested is not None:
                 runs.append(harvested)
             if idx % 25 == 0:
-                print(f"  processed {idx}/{len(live)} artifacts, {len(runs)} with logs", flush=True)
+                print(f"  processed {idx}/{len(by_run)} artifacts, {len(runs)} with logs", flush=True)
 
     totals = merge_and_write(archive_dir, runs)
     return totals, runs, len(expired)
