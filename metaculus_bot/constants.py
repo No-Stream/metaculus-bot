@@ -603,6 +603,18 @@ PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEO
 PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
 PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
 
+# Relevance gate for the prediction-market snapshot. A matched contract is labelled
+# ``likely-relevant`` (and its question earns the strong-evidence preamble) only when the
+# content-word overlap between the question (title + resolution criteria) and the contract
+# (title + rules) is >= MARKET_RELEVANCE_OVERLAP_MIN AND the matcher confidence is
+# >= MARKET_RELEVANCE_CONF_MIN; otherwise it is ``verify-carefully`` and the question gets a
+# neutral "fuzzy-matched, verify before weighting" preamble. Nothing is dropped — the gate only
+# governs labels + the header. Tuned on 403 hand-graded contracts (2026-07-19): 60% contract
+# precision / 57% recall, question-level header precision 34%->68%, false-strong 100%->17%. See
+# scratch/new_analyses_2026-07-18/threshold_sanity.md and market_match_precision.md §d.
+MARKET_RELEVANCE_OVERLAP_MIN: int = 3
+MARKET_RELEVANCE_CONF_MIN: float = 0.50
+
 # --- Time-Series Anchor Provider (Phase B) ---
 # Env-gated OFF by default. Renders a deterministic empirical-band anchor grounded
 # in the resolution series' OWN history (FRED/yfinance), for numeric questions that

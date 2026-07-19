@@ -396,6 +396,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         "https://gamma-api.polymarket.com/public-search": _FakeResponse(200, _make_polymarket_payload()),
         "https://api.manifold.markets/v0/search-markets": _FakeResponse(200, _make_manifold_payload()),
         "https://api.elections.kalshi.com/trade-api/v2/events": _FakeResponse(200, _make_kalshi_events_payload()),
+        "https://api.elections.kalshi.com/trade-api/v2/series": _FakeResponse(200, {"series": []}),
         "https://www.predictit.org/api/marketdata/all/": _FakeResponse(200, {"markets": []}),
     }
 
@@ -534,6 +535,7 @@ async def test_prediction_market_provider_as_of_derives_from_question(mock_os_ge
         "https://gamma-api.polymarket.com/public-search": _FakeResponse(200, _make_polymarket_payload()),
         "https://api.manifold.markets/v0/search-markets": _FakeResponse(200, _make_manifold_payload()),
         "https://api.elections.kalshi.com/trade-api/v2/events": _FakeResponse(200, _make_kalshi_events_payload()),
+        "https://api.elections.kalshi.com/trade-api/v2/series": _FakeResponse(200, {"series": []}),
         "https://www.predictit.org/api/marketdata/all/": _FakeResponse(200, {"markets": []}),
     }
 
