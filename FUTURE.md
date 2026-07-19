@@ -602,6 +602,23 @@ entry (Medium-term) called for.
    — has saved multiple questions). Do NOT collapse or remove it; at most abbreviate the
    repeated full phrase to a shorter marker after its first occurrence per bundle.
 
+### Score the archived gap-fill v2 ghost forecasts (added 2026-07-18, medium-high, cheap)
+
+Both approach reviews on this branch (`scratch/branch_review_july15/reviews/`) flagged the
+gap-fill v2 ghost forecast as a latent asset that nothing scores. The loop already privately
+dry-runs a forecast per question and archives it — the transcript + telemetry go through
+`archive_sink=_capture_gap_fill_v2` (`research/orchestrator.py`) and a `GHOST_FORECAST`
+marker lands in the run logs — but it is only ever logged for telemetry, never scored against
+resolution. Build an offline harness that CRPS/log-scores three things per resolved question:
+ghost-with-findings, resolution, and the panel's published forecast. **Interpretation
+guardrail:** the ghost is a same-model (terra-low driver) counterfactual, NOT a panel proxy —
+it measures whether the v2 findings alone, forecast by one cheap model, land near truth, not
+whether v2 would improve the 6-model ensemble. This is the most decision-relevant single
+number for the gap-fill-v1-retirement call (see the v1-retirement gate in the "Bundle
+content-audit findings" entry above): v1 currently carries the decisive single-source fact in
+most sampled questions, and a ghost score is the cheapest read on whether v2 findings stand on
+their own before v1 goes off.
+
 ### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
 
 The 2026-06-28 research-quality audit found **zero positive evidence** that Gemini's `url_context`
@@ -1274,6 +1291,27 @@ floor (residual/"Other" options keep honest mass — asymmetric by option type).
 itself stays (operator decision 2026-07-09: sub-1% headroom is ~+0.01 nats/question ideal
 case vs. parser/clamp regression risk — not worth it).
 
+### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
+
+Structure findings from the branch-review forge + structure reviewers
+(`scratch/branch_review_july15/reviews/`). Each is a clean behavior-neutral refactor — keep
+them OUT of feature work, land as their own PRs.
+
+- **Three files over the monolith threshold** (measured 2026-07-18):
+  `research/timeseries_anchor.py` (986 LoC — split the routing registry out into
+  `ts_routing.py` per the structure reviews), `research/agentic/tools.py` (784 — split the
+  search vs fetch subsystems), `tests/test_agentic_tools.py` (1055 after this branch's added
+  tests).
+- **Promote the shared SSRF/fetch primitives into `http_fetch.py`.** `agentic/tools.py`
+  currently reaches into `resolution_source.py`'s private functions — it calls
+  `resolution_source._get_session`, `_sem_for_host`, and `_extract_main_text` directly
+  (`agentic/tools.py:217,448,529,625`). That private-function coupling across modules is the
+  smell; hoist those three into the shared `research/http_fetch.py` as public primitives and
+  have both call sites use them.
+- **Give the anchor-chart `_session_charts` global a public accessor.** It's a module-level
+  dict in `research/timeseries_anchor.py:919` mutated/read by qid; expose a small
+  get/set/clear surface instead of touching the global directly.
+
 ## Medium-term (requires more exploration)
 
 ### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
@@ -1501,6 +1539,36 @@ this is the baseline to watch as the TS-anchor clause lands, since the forward r
 `cov@10` gap: even in the widening-off era only ~8% of resolutions fall below our published P10 (vs a 10% target and
 the ~3% headline the anchor clause cites for the live-prod low tail), so the low tail runs slightly wide — exactly
 what the anchor's better-calibrated P10 is meant to pull in.
+
+### Width post-ship watch + monitor attribution tagging (added 2026-07-18, medium)
+
+Two follow-ups from the 2026-07-18 full-branch width audit
+(`scratch/width_audit_2026-07-18/synthesis.md`). The audit found no era-stable width
+bias and motivated Option B, shipped in `f4f7984`: delete the Step-7 hedge-audit
+narrowing push and Step-9b's LOW→wide IQR prescription from the numeric prompt.
+
+1. **Post-ship over-sharpening watch (the load-bearing gate).** Option B removed a
+   one-directional narrowing instruction, so the forward risk flips from over-wide to
+   over-sharp. Watch criterion over the next ~15 numeric resolutions on the
+   `width_monitor`: if `cov80` climbs back toward ~0.88+ WITH PIT std below ~0.25 (the
+   pre-flip over-wide signature reappearing), the deleted hedge audit was load-bearing
+   and should be re-added — but as a SYMMETRIC clause ("match width to your reasoning;
+   don't pad OR sharpen from generic disposition"), never the one-directional narrowing
+   form just cut. Standing gate unchanged: n≥25 with theme diversity before fitting any
+   width knob (the 2026-05-12 study's "revisit after ~150 numerics" caveat still governs
+   a fitted change). Do NOT cite `cov@10 ≈ 0.03` as a too-wide-low-tail signal here: that
+   headline is a pooling artifact; the current-era value is 0.107 (on the 0.10 target).
+   The ~0.03 the TS-anchor prompt clause quotes is the live-prod low tail, a different
+   cohort.
+2. **Tag monitor records with `anchor_present` / `gap_fill_v2_present` (low effort).**
+   The `ts_anchor` era bucket is confounded — TS anchor, gap-fill v2, and the
+   native-search/crux terra swaps all flipped 2026-07-17 in one era boundary — AND it
+   pools treated with untreated questions, since only ~53% of numerics route to a
+   fetchable series (the TS-anchor applicability gate). So the monitor cannot attribute a
+   width change to the anchor. Fix: at collection time grep the record's research text
+   for the `## Time Series Anchor` and `## Agentic Research Findings` section headers,
+   thread the two booleans into the width-monitor record, and split the era rows by
+   presence. Cheap; unblocks any real anchor-effect read.
 
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
