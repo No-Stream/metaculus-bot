@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research backfill_research download_research backfill_comments backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_all backfill_research download_research download_run_logs backfill_comments score_ghosts backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -190,6 +190,38 @@ sync_research:
 	uv run python scripts/download_research.py $(ARGS)
 	@echo ""
 	@echo "Archive ready at backtests/research_archive/latest/"
+
+# Harvest run-log telemetry markers (EXTRACTION_RUNG, GAP_FILL_V2, GHOST_FORECAST,
+# OPEN_BOUND_PILING, CREDIT_*) from GHA artifacts into the durable local archive
+# (backtests/telemetry_archive/). Prod runs bundle run_logs/ inside research-* and
+# test_bot uploads a separate logs-* artifact, so the downloader pulls both families.
+# Read-only + free (GitHub API only) and idempotent (replace-by-run), so it's safe on
+# the weekly schedule. Pass ARGS="--since-days N" to scope the pull.
+sync_telemetry:
+	@echo "=== Harvesting run-log telemetry from GHA artifacts ==="
+	uv run python scripts/download_run_logs.py $(ARGS)
+	@echo ""
+	@echo "Telemetry archive ready at backtests/telemetry_archive/"
+
+# Pull EVERYTHING sync-shaped in one command: the research archive AND the telemetry
+# archive. Residual analyses should call this (never a single sync) so a future source
+# is never silently missed. Read-only + free. NOTE: bare ARGS is forwarded to BOTH
+# download scripts, so pass ARGS only when both accept the flag (e.g. --since-days).
+sync_all: sync_research sync_telemetry
+	@echo ""
+	@echo "=== sync_all complete: research + telemetry archives refreshed ==="
+
+# Score gap-fill v2 GHOST_FORECAST markers vs published forecasts on resolved questions
+# (paired log-score deltas — the retire-v1 gate). Read-only + free. Expects ~0
+# scoreable today (v2 shipped 2026-07-17); pass ARGS="--tournament <slug>" for a live
+# read-only resolutions pull, or ARGS="--perf-json <path>" for a pre-built dataset.
+score_ghosts:
+	uv run python scripts/score_ghosts.py $(ARGS)
+
+# Download run-log artifacts + harvest telemetry only (no research sync). Same script
+# as sync_telemetry; kept as a named target for parity with download_research.
+download_run_logs:
+	uv run python scripts/download_run_logs.py $(ARGS)
 
 # Backfill research from existing GitHub Actions logs (Nov 2025 onward).
 # Pass ARGS="--limit 100 --status completed" to customize.

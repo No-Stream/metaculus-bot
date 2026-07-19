@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Wrapper for the scheduled research-archive sync (launchd job
-# com.metaculusbot.research-sync). Cd's to the repo, runs `make sync_research`,
-# and appends a timestamped, dated logfile.
+# Wrapper for the scheduled archive sync (launchd job
+# com.metaculusbot.research-sync). Cd's to the repo, runs `make sync_all`, and
+# appends a timestamped, dated logfile.
 #
-# WHY: GHA uploads each bot run's research_outputs/ artifact with retention-days: 90.
-# After 90 days the artifact is gone forever and backtests/research_archive/ is the
-# only durable copy. This wrapper is what the launchd job invokes weekly so the pull
-# happens automatically, well inside the retention window. See README.md for install.
+# WHY: GHA uploads each bot run's research_outputs/ AND run_logs/ artifacts with
+# retention-days: 90. After 90 days the artifacts are gone forever and the local
+# archives (backtests/research_archive/ and backtests/telemetry_archive/) are the
+# only durable copies. `make sync_all` pulls BOTH — research + run-log telemetry — so
+# neither silently goes stale. This wrapper is what the launchd job invokes weekly so
+# the pull happens automatically, well inside the retention window. See README.md.
 #
 # launchd runs jobs with a minimal PATH (typically /usr/bin:/bin:/usr/sbin:/sbin),
 # so `uv` and `gh` are NOT on PATH by default. We prepend their known locations.
@@ -34,6 +36,6 @@ cd "${REPO_DIR}"
   echo "research-sync starting at $(date '+%Y-%m-%d %H:%M:%S %z')"
   echo "PATH=${PATH}"
   echo "=========================================================="
-  make sync_research
+  make sync_all
   echo "research-sync finished OK at $(date '+%Y-%m-%d %H:%M:%S %z')"
 } >>"${LOG_FILE}" 2>&1
