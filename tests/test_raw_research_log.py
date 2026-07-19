@@ -164,3 +164,31 @@ class TestNeverBreaksForecast:
 
         # Must not raise.
         record_raw_research(qid=1, provider="asknews", phase="hot", payload={"a": 1})
+
+    def test_payload_encoder_raising_arbitrary_error_is_swallowed(self, enabled_log_dir: Path):
+        # A payload whose model_dump raises a non-(TypeError|ValueError) error
+        # (RuntimeError here) is invoked by json.dumps via `default=`. The old
+        # serialization guard only caught (TypeError, ValueError), so this
+        # escaped and broke the forecast. Must now be caught, logged, swallowed.
+        class ExplodingPayload:
+            def model_dump(self, mode: str = "python") -> dict:
+                raise RuntimeError("boom from model_dump")
+
+        record_raw_research(qid=1, provider="asknews", phase="hot", payload=[ExplodingPayload()])
+
+        files = list(enabled_log_dir.glob("raw_research_*.jsonl"))
+        if files:
+            assert files[0].read_text().strip() == ""
+
+    def test_lone_surrogate_payload_is_swallowed(self, enabled_log_dir: Path):
+        # A lone surrogate serializes fine under json.dumps(ensure_ascii=False)
+        # but raises UnicodeEncodeError (a ValueError subclass, NOT OSError) at
+        # f.write() on the utf-8 file handle. The old write guard only caught
+        # OSError, so this escaped and broke the forecast. Must now be swallowed.
+        record_raw_research(qid=1, provider="asknews", phase="hot", payload={"text": "bad\ud800surrogate"})
+
+        # No exception; the write failed, so the log is empty (partial writes to
+        # a text stream flush nothing before the encode raises).
+        files = list(enabled_log_dir.glob("raw_research_*.jsonl"))
+        if files:
+            assert files[0].read_text().strip() == ""

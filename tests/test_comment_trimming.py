@@ -13,7 +13,13 @@ import math
 
 import pytest
 
-from metaculus_bot.comment.trimming import TRIM_NOTICE, TrimConfig, trim_comment, trim_section
+from metaculus_bot.comment.trimming import (
+    TRIM_NOTICE,
+    TrimConfig,
+    _allocate_block_budgets,
+    trim_comment,
+    trim_section,
+)
 from metaculus_bot.constants import (
     COMMENT_CHAR_LIMIT,
     FORECASTS_SECTION_CHAR_LIMIT,
@@ -765,3 +771,72 @@ class TestFullCommentPreservesAttribution:
 
         percentiles = parse_per_model_numeric_percentiles(final)
         assert len(percentiles) == 6, f"lost per-model JSON blocks: {sorted(percentiles)}"
+
+
+# ---------------------------------------------------------------------------
+# Water-fill allocator (_allocate_block_budgets)
+#
+# The block-aware FORECASTS trim splits its budget across per-forecaster blocks
+# via this allocator. The tests above build near-equal blocks, so ``fits`` is
+# always empty and the allocator degenerates to a flat ``total // n`` split —
+# the redistribution branch (keep small blocks whole, hand the freed budget to
+# the large ones) is never exercised there. These tests hit it directly. The
+# load-bearing invariant: under a shortfall the budgets sum to EXACTLY ``total``
+# — a reclaim/remainder accounting bug that overshot would push the assembled
+# comment past COMMENT_CHAR_LIMIT and Metaculus would reject the submission.
+# ---------------------------------------------------------------------------
+
+
+class TestAllocateBlockBudgets:
+    def test_tiny_block_kept_whole_freed_budget_redistributed(self) -> None:
+        # One tiny block beside several large ones, with a budget well below
+        # their combined size — the common prod case (a soft-deadline-truncated
+        # rationale next to full-length ones).
+        sizes = [100, 40_000, 40_000, 40_000]
+        total = 60_000
+        assert total < sum(sizes), "precondition: shortfall — exercises the redistribution branch"
+
+        budgets = _allocate_block_budgets(sizes, total)
+
+        # (a) whole budget consumed exactly — nothing lost or invented.
+        assert sum(budgets) == total
+        # (b) the tiny block is kept whole (redistribution didn't trim it).
+        assert budgets[0] == 100
+        # (c) each large block gets strictly more than the flat even split,
+        # because the tiny block's unused share was handed back to them.
+        flat_share = total // len(sizes)
+        for i in (1, 2, 3):
+            assert budgets[i] > flat_share
+        # No block is ever budgeted above its own size.
+        for size, budget in zip(sizes, budgets, strict=True):
+            assert budget <= size
+
+    def test_multi_round_water_fill_keeps_unequal_small_blocks_whole(self) -> None:
+        # Genuinely multi-round: block 1 (25k) does NOT fit the round-1 share of
+        # 20k (= 60k // 3), but once block 0's budget is reclaimed the round-2
+        # share rises to ~29.5k (= 59k // 2) and block 1 then fits. Both small
+        # blocks must survive whole; only the largest is trimmed.
+        sizes = [1_000, 25_000, 40_000]
+        total = 60_000
+        assert total < sum(sizes)
+
+        budgets = _allocate_block_budgets(sizes, total)
+
+        assert sum(budgets) == total
+        assert budgets[0] == 1_000  # round-1 fit, kept whole
+        assert budgets[1] == 25_000  # round-2 fit, kept whole
+        assert budgets[2] < 40_000  # the only genuinely overflowing block is trimmed
+        assert budgets[2] > total // len(sizes)  # ...and gets more than the flat share
+
+    def test_budget_at_least_sum_keeps_every_block_whole(self) -> None:
+        # Surplus budget: everything fits, so each block keeps its full size and
+        # the total is deliberately NOT fully allocated.
+        sizes = [100, 200, 300]
+        budgets = _allocate_block_budgets(sizes, total=10_000)
+        assert budgets == sizes
+
+    def test_single_block_trimmed_to_total(self) -> None:
+        assert _allocate_block_budgets([5_000], total=3_000) == [3_000]
+
+    def test_single_block_kept_whole_when_it_fits(self) -> None:
+        assert _allocate_block_budgets([5_000], total=8_000) == [5_000]

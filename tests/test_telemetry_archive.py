@@ -10,7 +10,15 @@ schedule without duplicating or losing records.
 import json
 from pathlib import Path
 
-from scripts.telemetry.archive import HarvestedRun, load_marker_records, load_run_manifest, merge_and_write
+import pytest
+
+from scripts.telemetry.archive import (
+    HarvestedRun,
+    _write_jsonl,
+    load_marker_records,
+    load_run_manifest,
+    merge_and_write,
+)
 
 
 def _run(run_id: str, records: dict[str, list[dict]], *, workflow: str = "tournament") -> HarvestedRun:
@@ -106,3 +114,33 @@ class TestMergeAndWrite:
         totals = merge_and_write(tmp_path, [run])
         assert totals["extraction_rung"] == 2
         assert totals["ghost_forecast"] == 1
+
+
+class TestAtomicWrite:
+    """``_write_jsonl`` rewrites the only durable archive in place, so it must be atomic:
+    a crash mid-serialization must leave the previous file intact and leave no temp residue.
+    """
+
+    def test_roundtrip_and_no_temp_residue(self, tmp_path: Path):
+        path = tmp_path / "x.jsonl"
+        _write_jsonl(path, [{"a": 1}, {"a": 2}])
+        lines = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+        assert lines == [{"a": 1}, {"a": 2}]
+        assert {p.name for p in tmp_path.iterdir()} == {"x.jsonl"}, "no temp sibling should survive a normal write"
+
+    def test_crash_mid_write_leaves_original_intact(self, tmp_path: Path):
+        path = tmp_path / "x.jsonl"
+        _write_jsonl(path, [{"good": 1}])
+        original = path.read_text()
+
+        class _Unserializable:
+            pass
+
+        # The second record can't be JSON-serialized: json.dumps raises AFTER the temp
+        # file is partly written but BEFORE os.replace, so the original must survive and
+        # the temp file must be cleaned up in the finally block.
+        with pytest.raises(TypeError):
+            _write_jsonl(path, [{"good": 2}, {"bad": _Unserializable()}])
+
+        assert path.read_text() == original, "a mid-write crash must not truncate the durable archive"
+        assert {p.name for p in tmp_path.iterdir()} == {"x.jsonl"}, "temp file must be cleaned up on failure"

@@ -44,6 +44,12 @@ RUN_LOG_ARTIFACT_PREFIXES: tuple[str, ...] = ("research-", "logs-")
 DEFAULT_REPO = "No-Stream/metaculus-bot"
 DEFAULT_ARCHIVE_DIR = "backtests/telemetry_archive"
 
+# subprocess.run timeouts (seconds). Bounding both keeps one slow/hung `gh` call from
+# stalling the whole weekly harvest: a per-artifact download that times out is skipped
+# (the other artifacts still process), and the run-enumeration call can't block forever.
+ARTIFACT_DOWNLOAD_TIMEOUT_S = 180
+GH_API_TIMEOUT_S = 120
+
 
 def workflow_slug_from_path(path: str) -> str:
     """Map a workflow file path to a short slug (``run_bot_on_tournament.yaml`` -> ``tournament``)."""
@@ -80,7 +86,11 @@ def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
         "--jq",
         ".workflow_runs[] | {id, path}",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"workflow-runs enumeration timed out ({GH_API_TIMEOUT_S}s); using prefix inference only")
+        return {}
     if result.returncode != 0:
         logger.warning(f"workflow-runs enumeration failed ({result.stderr.strip()}); using prefix inference only")
         return {}
@@ -163,7 +173,13 @@ def _download_artifact_to(run_id: int, repo: str, artifact_name: str, dest_dir: 
     run_dir = dest_dir / str(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["gh", "run", "download", str(run_id), "--repo", repo, "--name", artifact_name, "--dir", str(run_dir)]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"Timed out ({ARTIFACT_DOWNLOAD_TIMEOUT_S}s) downloading {artifact_name} (run {run_id}); skipping"
+        )
+        return None
     if result.returncode != 0:
         logger.warning(f"Failed to download {artifact_name} (run {run_id}): {result.stderr.strip()}")
         return None

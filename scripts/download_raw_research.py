@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from pathlib import Path
 # workflow-agnostic; raw research rides in the same artifacts as the run logs.
 from scripts.download_research import _parse_created_at, list_research_artifacts, verify_gh_cli
 from scripts.download_run_logs import _download_artifact_to, filter_run_log_artifacts
+from scripts.telemetry.jsonl import load_jsonl_records
 
 logger = logging.getLogger(__name__)
 
@@ -47,19 +49,6 @@ DEFAULT_ARCHIVE_DIR = "backtests/research_archive/raw"
 # raw_research_<run_id>.jsonl — the run_id is the GITHUB_RUN_ID stamped at write time
 # (or "local"), which equals the artifact's originating workflow_run id.
 RAW_LOG_FILENAME_RE = re.compile(r"^raw_research_(?P<run_id>.+)\.jsonl$")
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    records: list[dict] = []
-    for line_num, line in enumerate(path.read_text().splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            logger.warning(f"Malformed JSON at {path}:{line_num}, skipping")
-    return records
 
 
 def harvest_raw_logs_from_dir(run_dir: Path) -> dict[str, list[dict]]:
@@ -74,7 +63,7 @@ def harvest_raw_logs_from_dir(run_dir: Path) -> dict[str, list[dict]]:
         match = RAW_LOG_FILENAME_RE.match(path.name)
         if match is None:
             continue
-        out.setdefault(match.group("run_id"), []).extend(_read_jsonl(path))
+        out.setdefault(match.group("run_id"), []).extend(load_jsonl_records(path))
     return out
 
 
@@ -92,6 +81,26 @@ def _dedup_run_records(records: list[dict]) -> list[dict]:
     )
 
 
+def _write_jsonl_atomic(path: Path, records: list[dict]) -> None:
+    """Atomically write ``records`` to ``path`` as JSONL (temp sibling + ``os.replace``).
+
+    This rewrites a run's ONLY durable raw-research copy in place. An in-place
+    ``open(path, "w")`` truncates the file on open, so a mid-write crash would leave it
+    truncated; instead we stream into a sibling temp file and atomically rename over the
+    target, keeping the existing file intact until the full new content is on disk. The
+    temp file shares ``path``'s directory so the rename is same-filesystem.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def merge_and_write(archive_dir: Path, harvested: dict[str, list[dict]]) -> dict[str, int]:
     """Write ``<archive_dir>/<run_id>.jsonl`` for each harvested run (replace-by-run).
 
@@ -104,10 +113,7 @@ def merge_and_write(archive_dir: Path, harvested: dict[str, list[dict]]) -> dict
     totals: dict[str, int] = {}
     for run_id, records in harvested.items():
         deduped = _dedup_run_records(records)
-        out_path = archive_dir / f"{run_id}.jsonl"
-        with open(out_path, "w", encoding="utf-8") as f:
-            for record in deduped:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _write_jsonl_atomic(archive_dir / f"{run_id}.jsonl", deduped)
         totals[run_id] = len(deduped)
     return totals
 

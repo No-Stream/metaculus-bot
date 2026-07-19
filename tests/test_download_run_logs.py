@@ -6,8 +6,11 @@ mirrors scripts/download_research.py (shared ``list_research_artifacts`` /
 ``verify_gh_cli``) and is not re-tested here.
 """
 
+import logging
+import subprocess
 from pathlib import Path
 
+import scripts.download_run_logs as dl
 from scripts.download_run_logs import (
     RUN_LOG_ARTIFACT_PREFIXES,
     filter_run_log_artifacts,
@@ -105,3 +108,57 @@ class TestHarvestRunLogsFromDir:
             tmp_path, run_id="500", workflow="tournament", artifact="research-500", run_date="2026-07-17T00:00:00Z"
         )
         assert run is None
+
+
+class TestDownloadTimeoutResilience:
+    """A single slow `gh` call must not sink the whole weekly harvest: a per-artifact
+    download timeout is skipped (loop continues), and the run-enumeration timeout falls
+    back to prefix inference instead of raising.
+    """
+
+    def test_per_artifact_timeout_returns_none_not_raises(self, tmp_path: Path, monkeypatch, caplog):
+        def _raise_timeout(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd=["gh", "run", "download"], timeout=dl.ARTIFACT_DOWNLOAD_TIMEOUT_S)
+
+        monkeypatch.setattr(dl.subprocess, "run", _raise_timeout)
+        with caplog.at_level(logging.WARNING):
+            result = dl._download_artifact_to(7, "owner/repo", "research-7", tmp_path)
+        assert result is None
+        assert any("Timed out" in r.getMessage() for r in caplog.records)
+
+    def test_workflow_map_timeout_returns_empty_map(self, monkeypatch, caplog):
+        def _raise_timeout(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd=["gh", "api"], timeout=dl.GH_API_TIMEOUT_S)
+
+        monkeypatch.setattr(dl.subprocess, "run", _raise_timeout)
+        with caplog.at_level(logging.WARNING):
+            result = dl.build_workflow_map("owner/repo")
+        assert result == {}
+        assert any("timed out" in r.getMessage().lower() for r in caplog.records)
+
+    def test_timed_out_artifact_does_not_abort_harvest(self, tmp_path: Path, monkeypatch):
+        # Two live artifacts; the first "times out" (download returns None), the second
+        # succeeds. The good one must still be harvested — the loop skips, never aborts.
+        artifacts = [
+            {"name": "research-1", "run_id": 1, "expired": False, "created_at": "2026-07-18T00:00:00Z"},
+            {"name": "research-2", "run_id": 2, "expired": False, "created_at": "2026-07-19T00:00:00Z"},
+        ]
+        monkeypatch.setattr(dl, "verify_gh_cli", lambda: None)
+        monkeypatch.setattr(dl, "list_research_artifacts", lambda repo: artifacts)
+        monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {})
+        # Patch the archive writer so this test is independent of the archive module.
+        monkeypatch.setattr(dl, "merge_and_write", lambda archive_dir, runs: {})
+
+        def _fake_download(run_id, repo, name, dest_dir):
+            if run_id == 1:
+                return None  # simulates a TimeoutExpired-skipped artifact
+            log_dir = dest_dir / str(run_id) / "run_logs"
+            log_dir.mkdir(parents=True)
+            (log_dir / "run.log").write_text(EXTRACTION_LINE + "\n")
+            return dest_dir / str(run_id)
+
+        monkeypatch.setattr(dl, "_download_artifact_to", _fake_download)
+
+        _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, tmp_path)
+        assert {r.run_id for r in runs} == {"2"}, "the surviving artifact must still be harvested"
+        assert len(runs[0].records["extraction_rung"]) == 1

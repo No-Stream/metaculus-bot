@@ -5,11 +5,17 @@ scripts/telemetry/markers.py. These tests pin the emitted format so a producer-s
 change breaks loudly (same source-of-truth stance as tests/test_telemetry_markers.py).
 """
 
+import logging
 from datetime import datetime, timezone
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from forecasting_tools import ForecastBot, GeneralLlm, MetaculusQuestion
 from forecasting_tools.data_models.questions import BinaryQuestion
 
 from metaculus_bot.close_margin import format_close_margin_marker
+from metaculus_bot.forecaster import TemplateForecaster
 
 
 def _question(*, close_time, open_time, qid=44620) -> BinaryQuestion:
@@ -80,3 +86,85 @@ class TestFormatCloseMarginMarker:
         naive = datetime(2026, 7, 19, 13, 50, 0)
         aware = datetime(2026, 7, 19, 13, 50, 0, tzinfo=timezone.utc)
         assert format_close_margin_marker(q, naive) == format_close_margin_marker(q, aware)
+
+
+def _mock_forecaster_llm() -> MagicMock:
+    llm = MagicMock(spec=GeneralLlm)
+    llm.model = "mock_model"
+    llm.invoke = AsyncMock(return_value="mock reasoning")
+    return llm
+
+
+def _make_bot(*, publish: bool) -> TemplateForecaster:
+    """A minimal 2-forecaster bot; only ``publish_reports_to_metaculus`` matters for the seam."""
+    llm = _mock_forecaster_llm()
+    llms_config = {
+        "forecasters": [llm, llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    return TemplateForecaster(
+        llms=cast("dict[str, str | GeneralLlm]", llms_config),
+        publish_reports_to_metaculus=publish,
+        min_forecasters_to_publish=1,
+    )
+
+
+class TestRunIndividualQuestionEmitsMarker:
+    """The forecaster.py emit seam: ``_run_individual_question`` calls ``super()`` then logs
+    the CLOSE_MARGIN marker only when publishing (submission time) AND only when the formatter
+    returns a line. ``format_close_margin_marker`` itself is covered above; here we pin the
+    gating + logging around it, with the parent method and the formatter both patched.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marker_logged_when_publishing_and_marker_present(self, caplog):
+        bot = _make_bot(publish=True)
+        question = MagicMock(spec=MetaculusQuestion)
+        sentinel_report = object()
+        marker_line = "CLOSE_MARGIN: question=42 close_time=2026-07-20T00:00:00+00:00 margin_s=100"
+        with (
+            patch.object(ForecastBot, "_run_individual_question", new=AsyncMock(return_value=sentinel_report)),
+            patch("metaculus_bot.forecaster.format_close_margin_marker", return_value=marker_line) as fmt,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"),
+        ):
+            result = await bot._run_individual_question(question)
+
+        assert result is sentinel_report, "the base report must pass through unchanged"
+        fmt.assert_called_once()
+        assert any(marker_line in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_marker_when_publishing_disabled(self, caplog):
+        bot = _make_bot(publish=False)
+        question = MagicMock(spec=MetaculusQuestion)
+        sentinel_report = object()
+        with (
+            patch.object(ForecastBot, "_run_individual_question", new=AsyncMock(return_value=sentinel_report)),
+            patch("metaculus_bot.forecaster.format_close_margin_marker", return_value="CLOSE_MARGIN: ...") as fmt,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"),
+        ):
+            result = await bot._run_individual_question(question)
+
+        assert result is sentinel_report
+        # gated behind publish_reports_to_metaculus, so the formatter is never even called
+        fmt.assert_not_called()
+        assert not any("CLOSE_MARGIN" in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_marker_logged_when_formatter_returns_none(self, caplog):
+        bot = _make_bot(publish=True)
+        question = MagicMock(spec=MetaculusQuestion)
+        sentinel_report = object()
+        with (
+            patch.object(ForecastBot, "_run_individual_question", new=AsyncMock(return_value=sentinel_report)),
+            patch("metaculus_bot.forecaster.format_close_margin_marker", return_value=None) as fmt,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"),
+        ):
+            result = await bot._run_individual_question(question)
+
+        assert result is sentinel_report
+        fmt.assert_called_once()
+        assert not any("CLOSE_MARGIN" in rec.getMessage() for rec in caplog.records)

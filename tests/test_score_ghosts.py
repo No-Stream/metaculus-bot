@@ -30,8 +30,12 @@ def _json_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z")
 
 
 def _binary_record(qid: int, resolution, our_prob_yes) -> dict:
+    # The scorer joins ghosts on ``post_id`` (a ghost's qid is the Metaculus post id
+    # parsed from page_url). ``question_id`` is the disjoint sub-question id, so set it
+    # to a deliberately-different value to keep the fixtures honest about the join key.
     return {
-        "question_id": qid,
+        "post_id": qid,
+        "question_id": qid + 100_000,
         "type": "binary",
         "resolution_parsed": resolution,
         "our_prob_yes": our_prob_yes,
@@ -50,8 +54,11 @@ def _numeric_record(
     open_upper=False,
     zero_point=None,
 ) -> dict:
+    # post_id is the join key (ghost qid == post id); question_id is the disjoint
+    # sub-question id — kept different on purpose (see _binary_record).
     return {
-        "question_id": qid,
+        "post_id": qid,
+        "question_id": qid + 100_000,
         "type": "numeric",
         "resolution_parsed": resolution,
         "our_forecast_values": published_cdf,
@@ -119,6 +126,31 @@ class TestJoinAndScore:
         assert summary["n_joined"] == 0
         assert summary["n_scored"] == 0
 
+    def test_join_keys_on_post_id_not_question_id(self):
+        # A ghost's qid is the Metaculus POST id (from page_url); the collector emits
+        # post_id and the disjoint sub-question question_id separately. The join MUST
+        # key on post_id: a record whose question_id equals the ghost qid but whose
+        # post_id does not must NOT join (this is exactly what the old question_id-keyed
+        # code got wrong — it joined on the disjoint id space and always missed).
+        ghost = [_legacy_ghost(42, "binary", "posterior_prob=0.90")]
+        wrong_key = {
+            "post_id": 999,  # ghost qid (42) != post_id -> no join
+            "question_id": 42,  # equals ghost qid, but question_id is NOT the join key
+            "type": "binary",
+            "resolution_parsed": True,
+            "our_prob_yes": 0.5,
+            "our_forecast_values": [0.5],
+        }
+        summary = join_and_score([], ghost, [wrong_key])
+        assert summary["n_joined"] == 0
+        assert summary["n_scored"] == 0
+
+        # Positive case: post_id == ghost qid joins even though question_id differs.
+        right_key = {**wrong_key, "post_id": 42, "question_id": 42_000}
+        summary = join_and_score([], ghost, [right_key])
+        assert summary["n_joined"] == 1
+        assert summary["n_scored"] == 1
+
     def test_unresolved_record_joined_but_not_scored(self):
         legacy = [_legacy_ghost(1, "binary", "posterior_prob=0.5")]
         summary = join_and_score([], legacy, [_binary_record(1, None, 0.5)])
@@ -158,7 +190,8 @@ class TestJsonSourceGhosts:
     def test_json_mc_scored(self):
         json_ghosts = [_json_ghost(1, {"qtype": "multiple_choice", "option_probs": {"Blue": 0.2, "Red": 0.8}})]
         record = {
-            "question_id": 1,
+            "post_id": 1,
+            "question_id": 100_001,
             "type": "multiple_choice",
             "resolution_parsed": "Red",
             "options": ["Blue", "Red"],
@@ -218,7 +251,8 @@ class TestNumericPairedScoring:
 
     def test_numeric_unscoreable_when_no_published_cdf(self):
         record = {
-            "question_id": 1,
+            "post_id": 1,
+            "question_id": 100_001,
             "type": "numeric",
             "resolution_parsed": 50.0,
             "our_forecast_values": None,
@@ -286,7 +320,8 @@ class TestNumericPairedScoring:
         # so a valid published CDF + valid ghost percentiles still can't be paired.
         published_cdf = _pchip_cdf({5: 10, 50: 50, 95: 90})
         record = {
-            "question_id": 1,
+            "post_id": 1,
+            "question_id": 100_001,
             "type": "numeric",
             "resolution_parsed": 50.0,
             "our_forecast_values": published_cdf,
@@ -308,3 +343,27 @@ class TestNumericPairedScoring:
         summary = join_and_score(json_ghosts, [], [record])
         assert summary["numeric"]["n"] == 0
         assert summary["numeric"]["unscoreable_reasons"] == {"cdf_build_failed": 1}
+
+    def test_native_discrete_ghost_scored_on_reduced_grid(self):
+        # Native-discrete questions (Metaculus type == "discrete") publish a CDF on a
+        # reduced grid (cdf_size != 201). Prod resamples the aggregate onto that grid;
+        # _score_numeric mirrors it by building the ghost with num_points=len(published_cdf),
+        # so the reduced-grid case pairs cleanly instead of being dropped. (This is the
+        # discrete mechanism the scorer CAN reproduce from the record — integer-snap on
+        # 201-point continuous questions is a separate, prod-side-only decision; see the
+        # _score_numeric docstring.)
+        min_step = round(0.01 / 20, 9)
+        published_cdf, _ = generate_pchip_cdf(
+            {5: 5, 50: 10, 95: 15}, False, False, 20.0, 0.0, None, min_step=min_step, num_points=21
+        )
+        assert len(published_cdf) == 21  # reduced grid, not the continuous 201
+        record = _numeric_record(1, 10.0, published_cdf, lower=0.0, upper=20.0)
+        record["type"] = "discrete"
+        json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 6, 0.5: 11, 0.95: 14}})]
+        summary = join_and_score(json_ghosts, [], [record])
+        assert summary["numeric"]["n"] == 1
+        assert summary["numeric"]["n_unscoreable"] == 0
+        row = summary["numeric"]["rows"][0]
+        assert math.isfinite(row["ghost_log_score"])
+        assert math.isfinite(row["published_log_score"])
+        assert math.isfinite(row["delta"])

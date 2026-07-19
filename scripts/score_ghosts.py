@@ -222,6 +222,28 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     same Metaculus PMF-bucket log score on identical bounds/scaling — so the delta is
     a clean paired comparison. Always returns a dict with ``scoreable``; when False,
     ``reason`` names the gap so the report can surface it instead of silently dropping.
+
+    Discrete handling — two prod mechanisms, handled differently:
+
+    * Native-discrete questions (Metaculus ``type == "discrete"``) publish a CDF on a
+      reduced grid (``cdf_size != 201``). Prod resamples the aggregate onto that grid
+      with ``generate_pchip_cdf`` (see ``numeric/pipeline.build_numeric_distribution``
+      and ``numeric/utils._postprocess_ensemble_cdf``). We mirror it exactly: the ghost
+      is built with ``num_points=len(published_cdf)``, so both sides share the native
+      grid and the pairing stays clean. No integer-snap is involved (``discrete_snap``
+      explicitly skips ``cdf_size != 201``).
+    * Continuous questions (``cdf_size == 201``) are integer-*snapped* by prod only when
+      a strict majority of the ensemble's forecasters vote the outcome is integer-valued
+      (``post_processing.maybe_snap_to_integers`` → ``discrete_snap.snap_distribution_to_integers``).
+      That per-forecaster ``outcome_type`` vote is prod-side state absent from both the
+      resolved record and the ghost payload, and the snap is not reliably recoverable
+      from the published CDF's shape (peaked distributions get smeared back toward smooth
+      by the max-step cap, so a snapped CDF can be indistinguishable from a smooth one).
+      We therefore score the ghost as the smooth distribution it declared — a documented
+      approximation. Residual effect: on the integer-outcome minority the snapped
+      published forecast concentrates a little extra mass on the resolution bucket, so
+      those deltas are mildly biased against the ghost; it is bounded and affects only
+      that minority, not the continuous questions that make up the bulk of the gate.
     """
     qid = ghost["qid"]
     percentiles = _numeric_percentiles(ghost)
@@ -304,8 +326,18 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
     for the same qid. Binary, MC, and — new with the JSON marker — numeric ghosts are
     all scoreable. Everything is pure/in-memory so the n=0 path (no resolved v2-era
     questions yet) is exercised in tests.
+
+    Join key is ``post_id``, NOT ``question_id``. A ghost's qid is parsed by
+    ``qid_from_ref`` from the marker's ``question=`` field, which the gap-fill v2 seam
+    sets to ``question.page_url`` (``.../questions/{post_id}``) — a Metaculus POST id.
+    The collector keys ``question_id`` on the sub-question id (``q["id"]``) and emits
+    ``post_id`` separately; the two id spaces are disjoint on real data, so keying on
+    ``question_id`` here would make every join silently miss. (Group/conditional posts
+    hold several sub-question records under one ``post_id``; both the ghost marker and
+    this dict collapse those to one — a known limitation of the post-level ghost ref,
+    not something the join key can resolve.)
     """
-    records_by_qid = {r.get("question_id"): r for r in records}
+    records_by_post_id = {r.get("post_id"): r for r in records}
     selected = _select_ghost_per_qid(json_ghosts, legacy_ghosts)
 
     source_counts: dict[str, int] = {"json": 0, "legacy": 0}
@@ -320,7 +352,7 @@ def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: 
     n_joined = 0
 
     for qid, ghost in selected.items():
-        record = records_by_qid.get(qid)
+        record = records_by_post_id.get(qid)
         if record is None:
             continue
         n_joined += 1

@@ -41,6 +41,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from scripts.telemetry.jsonl import load_jsonl_records
+
 logger = logging.getLogger(__name__)
 
 # Artifacts whose name starts with this prefix are bot research uploads. Every bot
@@ -54,6 +56,12 @@ RESEARCH_ARTIFACT_PREFIX = "research-"
 # records and would corrupt the archive's (qid, run_id) dedup, so the main-archive
 # glob must skip these files. scripts/download_raw_research.py archives them separately.
 RAW_RESEARCH_LOG_PREFIX = "raw_research_"
+
+# subprocess.run timeouts (seconds). Bounding both keeps one slow/hung `gh` call from
+# stalling the whole scheduled pull: a per-artifact download that times out is skipped
+# (the other artifacts still process), and the artifacts enumeration can't block forever.
+ARTIFACT_DOWNLOAD_TIMEOUT_S = 120
+GH_API_TIMEOUT_S = 120
 
 
 def research_jsonl_files(run_dir: Path) -> list[Path]:
@@ -109,7 +117,11 @@ def list_research_artifacts(repo: str) -> list[dict]:
         "--jq",
         (".artifacts[] | {id, name, created_at, expires_at, expired, size_in_bytes, run_id: .workflow_run.id}"),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_API_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.error(f"gh api artifacts listing timed out ({GH_API_TIMEOUT_S}s) for {repo}")
+        sys.exit(1)
     if result.returncode != 0:
         logger.error(f"gh api artifacts listing failed for {repo}: {result.stderr.strip()}")
         sys.exit(1)
@@ -149,27 +161,18 @@ def download_artifact(run_id: int, repo: str, artifact_name: str, dest_dir: Path
         "--dir",
         str(run_dir),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"Timed out ({ARTIFACT_DOWNLOAD_TIMEOUT_S}s) downloading {artifact_name} (run {run_id}); skipping"
+        )
+        return []
     if result.returncode != 0:
         logger.warning(f"Failed to download {artifact_name} (run {run_id}): {result.stderr.strip()}")
         return []
 
     return research_jsonl_files(run_dir)
-
-
-def load_jsonl_records(path: Path) -> list[dict]:
-    """Load all records from a JSONL file, skipping malformed lines."""
-    records = []
-    with open(path) as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning(f"Malformed JSON at {path}:{line_num}, skipping")
-    return records
 
 
 def load_backfill(backfill_dir: Path) -> list[dict]:

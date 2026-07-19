@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts.telemetry.jsonl import load_jsonl_records
 from scripts.telemetry.markers import MARKER_SPECS
 
 logger = logging.getLogger(__name__)
@@ -50,36 +53,36 @@ class HarvestedRun:
         return sum(len(v) for v in self.records.values())
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    records: list[dict] = []
-    for line_num, line in enumerate(path.read_text().splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            logger.warning(f"Malformed JSON at {path}:{line_num}, skipping")
-    return records
-
-
 def _write_jsonl(path: Path, records: list[dict]) -> None:
+    """Atomically write ``records`` to ``path`` as JSONL (temp sibling + ``os.replace``).
+
+    ``merge_and_write`` rewrites the ONLY durable telemetry archive in place. An in-place
+    ``open(path, "w")`` truncates the file at the moment it opens, so a crash mid-write
+    (serialization error, SIGKILL) would leave the archive truncated or empty. We stream
+    into a sibling temp file first and atomically rename it over the target — the original
+    stays intact until the full new content is on disk. The temp file shares ``path``'s
+    directory so the rename is same-filesystem (a prerequisite for ``os.replace`` atomicity).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for record in records:
-            f.write(json.dumps(record) + "\n")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def load_marker_records(archive_dir: Path, marker: str) -> list[dict]:
     """Load all archived records for one marker type."""
-    return _read_jsonl(Path(archive_dir) / f"{marker}.jsonl")
+    return load_jsonl_records(Path(archive_dir) / f"{marker}.jsonl")
 
 
 def load_run_manifest(archive_dir: Path) -> list[dict]:
     """Load the run manifest (one record per harvested run)."""
-    return _read_jsonl(Path(archive_dir) / RUNS_MANIFEST_FILE)
+    return load_jsonl_records(Path(archive_dir) / RUNS_MANIFEST_FILE)
 
 
 def _sort_key(record: dict) -> tuple:

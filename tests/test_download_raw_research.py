@@ -9,8 +9,11 @@ download path reuses scripts/download_run_logs.py's enumeration + both-prefix do
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.download_raw_research import (
     RAW_LOG_FILENAME_RE,
+    _write_jsonl_atomic,
     harvest_raw_logs_from_dir,
     merge_and_write,
 )
@@ -134,3 +137,25 @@ class TestMainArchiveExcludesRawLogs:
 
         found = {p.name for p in research_jsonl_files(tmp_path)}
         assert found == {"research_20260719.jsonl"}
+
+
+class TestAtomicWrite:
+    """``_write_jsonl_atomic`` rewrites a run's only durable raw-research copy in place, so a
+    crash mid-serialization must leave the previous file intact and leave no temp residue.
+    """
+
+    def test_crash_mid_write_leaves_original_intact(self, tmp_path: Path):
+        path = tmp_path / "500.jsonl"
+        _write_jsonl_atomic(path, [_rec(1, "asknews", "hot")])
+        original = path.read_text()
+
+        class _Unserializable:
+            pass
+
+        # json.dumps raises on the second record, AFTER the temp file is partly written
+        # but BEFORE os.replace — the original must survive and the temp must be cleaned up.
+        with pytest.raises(TypeError):
+            _write_jsonl_atomic(path, [_rec(2, "asknews", "hot"), {"bad": _Unserializable()}])
+
+        assert path.read_text() == original, "a mid-write crash must not truncate the run's archive"
+        assert {p.name for p in tmp_path.iterdir()} == {"500.jsonl"}, "temp file must be cleaned up on failure"

@@ -83,9 +83,10 @@ def record_raw_research(
 
     try:
         payload_json = json.dumps(payload, default=_json_default, ensure_ascii=False)
-    except (TypeError, ValueError) as exc:
-        # Serialization guard: a non-str dict key (the one thing `default=` can't
-        # rescue) or similar must not propagate into the forecast.
+    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
+        # Serialization guard: a non-str dict key `default=` can't rescue (TypeError),
+        # or an arbitrary error raised inside a payload's model_dump/__str__
+        # (RuntimeError, AttributeError, ...) must not propagate into the forecast.
         logger.warning(
             "raw_research: could not serialize payload for qid=%s provider=%s phase=%s: %s",
             qid,
@@ -123,5 +124,8 @@ def record_raw_research(
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # broad by contract: side-channel must never break a forecast (see module docstring)
+        # Write guard: OSError from a bad path, but also UnicodeEncodeError (a
+        # ValueError, not OSError) when a payload carries a lone surrogate that
+        # survives json.dumps(ensure_ascii=False) and only fails at utf-8 encode.
         logger.warning("raw_research: failed to append record to %s: %s", path, exc)
