@@ -446,6 +446,78 @@ def _ts_anchor_evidence_clause() -> str:
     )
 
 
+# Resolution-metric echo — a PHASE 0 disambiguation step that fires when the
+# resolution criteria name an official statistical series. The qid 44211 miss
+# (June 2026 CBP southwest-border encounters) had all six forecasters price the
+# USBP-apprehensions *component* of a series that resolves on the *total*: the
+# research carried the definitional wedge, the historical conversion, and an
+# explicit provider warning, and every model still resolved the ambiguity the
+# same wrong way. Naming the exact series and enumerating its variants BEFORE
+# forecasting is the checklist-shaped guard (option a in
+# scratch/residual_2026-07-18/followups/border_generalizability.md) — inert on
+# questions with no named series, and a measured 3-5/30 worst-miss family.
+# Design sibling: the window-anchor block (``_forecasting_window_str``). The
+# bullets are pre-indented to 15 spaces so ``clean_indents`` keeps them nested
+# under the prompt-native step header in both the binary (baseline 12) and
+# numeric (baseline 8) prompts — the same trick ``_SOURCE_PROVENANCE_LADDER`` uses.
+_RESOLUTION_METRIC_ECHO_HEADER = "Resolution-metric echo (named-series questions only)"
+
+
+def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"]) -> str:
+    """Bullet body for the resolution-metric echo step (binary 0c / numeric 0a).
+
+    ``question_type`` selects the reconciliation anchor — a numeric question's
+    displayed range vs. a binary question's stated threshold — and which research
+    sections to point at (the ``## Time Series Anchor`` is numeric-only). The
+    reconciliation is deliberately anti-oracle: the 44211 trap was reading the
+    bounds as an authority that confirmed the ~10k headline series, when the
+    true ~13k total sat at the bounds midpoint.
+    """
+    if question_type == "numeric":
+        reconcile = (
+            "Reconcile each candidate against the displayed range above: the bounds were set by someone "
+            "who could see the real series, so a candidate that falls far outside the range is probably "
+            'the wrong variant. But do NOT read "inside the range" as confirming the headline or component '
+            "series — if several candidates fit, the range does not pick between them (the resolving value "
+            "can sit anywhere inside, including near the midpoint)."
+        )
+        sections = (
+            "The `## Resolution Source Snapshot` and `## Time Series Anchor` sections (when present in the "
+            "briefing) may settle which variant resolves — use them rather than eyeballing."
+        )
+    else:
+        reconcile = (
+            "Reconcile each candidate against the threshold or comparison stated in the resolution criteria: "
+            "work out whether YES or NO obtains under each variant and note where the variants disagree — do "
+            "NOT let the variant nearest a round threshold stand in for the one the criteria actually name."
+        )
+        sections = (
+            "The `## Resolution Source Snapshot` section (when present in the briefing) may settle which "
+            "variant resolves — use it rather than eyeballing."
+        )
+    bullets = [
+        (
+            "If the resolution criteria name an official statistical series or source (a government "
+            "statistic, a market index, an agency release), name the EXACT series that resolves this "
+            "question and its latest published value. If no official series is named, write "
+            '"no named series, metric echo skipped" and move on.'
+        ),
+        (
+            "Enumerate the plausible variants of that series — component vs total, regional vs national, "
+            "seasonally-adjusted vs not, gross vs net, headline vs revised — and give each candidate's "
+            "latest known value."
+        ),
+        reconcile,
+        (
+            "Do NOT discard a candidate variant just because one retrieved estimate of it looks implausible "
+            "— flag the discrepancy and recompute the candidate from its components where you can (one bad "
+            f"number is not a reason to abandon the branch). {sections}"
+        ),
+    ]
+    indent = " " * 15
+    return "\n".join(f"{indent}• {b}" for b in bullets)
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -511,6 +583,9 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
                • Write one worked Yes example (a concrete scenario where every factor = 1) and one worked No example (a concrete scenario where exactly one factor = 0, with that factor named). This is mechanical bait-and-switch protection: it forces the resolution criteria to be consumed as structured constraints rather than treated as a prose paraphrase.
                • Do NOT assign probabilities to the clauses yet — that happens in step 5b, after the evidence review and red-team.
                • For single-condition questions ("Will Z happen?"), write "single-condition, decomposition skipped" and move on.
+
+            0c) {_RESOLUTION_METRIC_ECHO_HEADER}
+{_resolution_metric_echo_bullets("binary")}
 
             PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 
@@ -803,6 +878,9 @@ def numeric_prompt(
             _today_str()
         }. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
             - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
+
+        (0a) {_RESOLUTION_METRIC_ECHO_HEADER}
+{_resolution_metric_echo_bullets("numeric")}
 
         PHASE 1: OUTSIDE VIEW (anchor on historical context above)
 

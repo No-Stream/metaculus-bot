@@ -734,6 +734,97 @@ class TestConjunctiveCriteriaPricing:
         assert "if none applies, stay at the product" in lowered
 
 
+class TestResolutionMetricEcho:
+    """PHASE 0 resolution-metric echo: when the resolution criteria name an
+    official statistical series, force the forecaster to name the exact
+    resolving series and enumerate its variants (component vs total, etc.)
+    before forecasting. Motivated by qid 44211 — all six models priced the
+    USBP-apprehensions *component* of a series that resolves on the *total*,
+    even though the research carried the wedge, the historical conversion, and
+    an explicit provider warning. Scoped to the numeric prompt (which also
+    serves discrete-integer questions — outcome_type is decided in the block,
+    there is no separate discrete prompt) and the binary prompt. MC and the
+    prod-disabled stacking prompts are deliberately untouched."""
+
+    _HEADER = "resolution-metric echo (named-series questions only)"
+    _INERT = "no named series, metric echo skipped"
+
+    @staticmethod
+    def _collapsed(prompt: str) -> str:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        return " ".join(prompt.lower().split())
+
+    def _assert_core_block(self, prompt: str) -> None:
+        c = self._collapsed(prompt)
+        assert self._HEADER in c
+        assert "name the exact series that resolves this question" in c
+        assert "enumerate the plausible variants" in c
+        assert "component vs total" in c
+        # Inert escape: questions with no named series skip the step.
+        assert self._INERT in c
+        # Don't-discard-on-one-implausible-estimate: the gemini-31k poisoning lesson.
+        assert "do not discard a candidate variant" in c
+        assert "recompute the candidate from its components" in c
+
+    def test_numeric_prompt_has_metric_echo(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_core_block(prompt)
+        c = self._collapsed(prompt)
+        # Numeric reconciles against the displayed range — but NOT as an oracle
+        # (the 44211 trap: the true total was the bounds midpoint).
+        assert "reconcile each candidate against the displayed range" in c
+        assert 'do not read "inside the range" as confirming' in c
+        # Points at both numeric-available research sections (synergy, not duplication).
+        assert "## Resolution Source Snapshot" in prompt
+        assert "## Time Series Anchor" in prompt
+
+    def test_binary_prompt_has_metric_echo(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        self._assert_core_block(prompt)
+        c = self._collapsed(prompt)
+        # Binary reconciles against the criteria's threshold/comparison (no displayed range).
+        assert "reconcile each candidate against the threshold or comparison" in c
+        # Points at the resolution-source snapshot only — the TS anchor is numeric-only.
+        assert "## Resolution Source Snapshot" in prompt
+        assert "## Time Series Anchor" not in prompt
+
+    def test_binary_metric_echo_after_decomposition_before_phase1(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        idx_decomp = prompt.find("Resolution decomposition")
+        idx_echo = prompt.find("Resolution-metric echo")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert 0 <= idx_decomp < idx_echo < idx_phase1
+
+    def test_numeric_metric_echo_after_status_quo_before_phase1(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        idx_sq = prompt.find("Status-quo derivation")
+        idx_echo = prompt.find("Resolution-metric echo")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert 0 <= idx_sq < idx_echo < idx_phase1
+
+    def test_mc_prompt_omits_metric_echo(self) -> None:
+        # MC questions resolve to an enumerated option, not a value read off a
+        # named statistical series, so the component-vs-total ambiguity does not
+        # arise. The measured miss family (44211 numeric, 42018/41801 binary)
+        # contains zero MC cases — scoping decision locked here.
+        prompt = multiple_choice_prompt(_mc_q(), research="r")
+        assert "Resolution-metric echo" not in prompt
+
+    def test_stacking_prompts_omit_metric_echo(self) -> None:
+        # Stacking is prod-disabled; those prompts are left untouched.
+        binary = stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"])
+        mc = stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"])
+        numeric = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        for p in (binary, mc, numeric):
+            assert "Resolution-metric echo" not in p
+
+
 class TestNumericPromptThirteenPercentiles:
     """The numeric prompts must document all 13 standard percentile keys in
     the STRUCTURED FORECAST JSON schema example (P1 first, P99 last) and
