@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
 
 _INTERNAL_TOOL_TIMEOUT_S = 5.0
+_INTERNAL_TOOL_NAMES = ("record_findings", "conclude")
 _NUDGE = "call conclude or use tools"
 
 
@@ -338,11 +339,7 @@ async def _execute_one_tool_call(
             content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
         )
 
-    if tool_call.name == "record_findings":
-        handler = _record_findings_tool(state, arguments)
-        timeout_s = _INTERNAL_TOOL_TIMEOUT_S
-    elif tool_call.name == "conclude":
-        handler = _conclude_tool(state, arguments)
+    if tool_call.name in _INTERNAL_TOOL_NAMES:
         timeout_s = _INTERNAL_TOOL_TIMEOUT_S
     else:
         spec = tools_by_name.get(tool_call.name)
@@ -357,10 +354,23 @@ async def _execute_one_tool_call(
                 tool_name=tool_call.name,
                 content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
             )
-        handler = spec.handler(**arguments)
         timeout_s = spec.timeout_s
 
     try:
+        # Instantiate the handler coroutine INSIDE the boundary. External-tool
+        # handlers have concrete signatures, and async-def binds kwargs eagerly:
+        # a missing/typo'd/extra key in the LLM-emitted `arguments` raises
+        # TypeError at bind time, before any await. Doing the bind here means
+        # that failure becomes a status="error" outcome (via the except below)
+        # instead of escaping the batch gather and aborting the whole pass —
+        # matching the unknown-tool path. Internal tools bind positionally and
+        # can't hit this.
+        if tool_call.name == "record_findings":
+            handler = _record_findings_tool(state, arguments)
+        elif tool_call.name == "conclude":
+            handler = _conclude_tool(state, arguments)
+        else:
+            handler = tools_by_name[tool_call.name].handler(**arguments)
         raw_outcome = await asyncio.wait_for(handler, timeout=timeout_s)
         outcome = ToolOutcome.model_validate(raw_outcome)
     except asyncio.TimeoutError:
@@ -409,6 +419,19 @@ _DUPLICATE_CALL_WARNING = (
 )
 
 
+def _budget_rejected_content(tool_name: str, config: LoopConfig) -> str:
+    outcome = ToolOutcome(
+        content_markdown=(
+            f"Tool call rejected: the {config.max_tool_calls}-call research budget is exhausted. "
+            "No further external tool calls will run — call conclude to finish, "
+            "or record_findings to bank what you already have."
+        ),
+        method="internal",
+        status="error",
+    )
+    return _format_tool_content(tool_name, outcome, config.max_result_chars)
+
+
 async def _execute_tool_batch(
     tool_calls: list[_ToolCall],
     *,
@@ -418,7 +441,22 @@ async def _execute_tool_batch(
     now: Callable[[], float],
 ) -> None:
     duplicate_call_ids: set[str] = set()
+    rejected_call_ids: set[str] = set()
+    accepted: list[_ToolCall] = []
+
+    # Clamp the batch to the remaining call slots. With parallel_tool_calls a
+    # single turn can emit more calls than budget allows; without this an
+    # over-budget batch executes (and bills) every external call, overshooting
+    # the max_tool_calls anytime ceiling. Internal bookkeeping tools
+    # (record_findings/conclude) are never rejected so the driver can always
+    # bank/finish. Rejected calls are NOT counted as executed, so
+    # telemetry.tool_calls stays consistent with _must_conclude's gate.
     for tool_call in tool_calls:
+        is_internal = tool_call.name in _INTERNAL_TOOL_NAMES
+        if not is_internal and state.telemetry.tool_calls >= config.max_tool_calls:
+            rejected_call_ids.add(tool_call.id)
+            continue
+
         state.telemetry.tool_calls += 1
         state.telemetry.per_tool_counts[tool_call.name] = state.telemetry.per_tool_counts.get(tool_call.name, 0) + 1
         call_key = _normalized_call_key(tool_call)
@@ -427,21 +465,32 @@ async def _execute_tool_batch(
             duplicate_call_ids.add(tool_call.id)
         else:
             state.seen_tool_calls.add(call_key)
+        accepted.append(tool_call)
 
     results = await asyncio.gather(
-        *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in tool_calls]
+        *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in accepted]
     )
-    budget_line = _budget_line(state, config, now)
     for result in results:
         if result.method == "rendered":
             state.telemetry.rendered_fetches += 1
-        warning = _DUPLICATE_CALL_WARNING if result.tool_call_id in duplicate_call_ids else ""
+    results_by_id = {result.tool_call_id: result for result in results}
+
+    # Exactly one tool message per tool_call_id, in the assistant's original
+    # order, or the next LLM turn 400s. Rejected calls get a synthetic
+    # budget-exhausted error response.
+    budget_line = _budget_line(state, config, now)
+    for tool_call in tool_calls:
+        if tool_call.id in rejected_call_ids:
+            content = _budget_rejected_content(tool_call.name, config)
+        else:
+            result = results_by_id[tool_call.id]
+            content = result.content + (_DUPLICATE_CALL_WARNING if tool_call.id in duplicate_call_ids else "")
         state.messages.append(
             {
                 "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "name": result.tool_name,
-                "content": result.content + warning + budget_line,
+                "tool_call_id": tool_call.id,
+                "name": tool_call.name,
+                "content": content + budget_line,
             }
         )
 

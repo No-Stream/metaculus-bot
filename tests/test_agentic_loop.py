@@ -412,6 +412,132 @@ async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
     assert result.telemetry.tool_calls == 2
 
 
+_CLEAN_FINDING = {
+    "claim": "The report was published on July 1.",
+    "source_url": "https://example.com",
+    "quote": "Published on July 1, 2026.",
+    "topic": "timeline",
+}
+
+
+@pytest.mark.asyncio
+async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continues() -> None:
+    """An LLM-emitted extra kwarg makes spec.handler(**arguments) raise TypeError
+    at bind time (async-def binds eagerly). It must surface as a status=error
+    tool result inside the per-tool boundary, not crash the batch gather and
+    abort the whole pass. The loop keeps running and banked findings survive."""
+    invoked: list[str] = []
+
+    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("bad1", "strict_tool", {"query": "x", "unexpected": 1})]),
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+    )
+
+    assert result.telemetry.steps == 3  # loop ran all three turns — no abort
+    bad_message = _tool_messages(result)[0]
+    assert bad_message["tool_call_id"] == "bad1"
+    assert "status: error" in bad_message["content"]
+    assert "TypeError" in bad_message["content"]
+    assert invoked == []  # handler body never ran; failure was at bind time
+    assert "The report was published on July 1." in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_continues() -> None:
+    """A missing required kwarg raises TypeError at bind time too; same contract:
+    error tool result, loop continues, banked findings survive."""
+    invoked: list[str] = []
+
+    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("bad1", "strict_tool", {})]),  # no `query`
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+    )
+
+    assert result.telemetry.steps == 3
+    bad_message = _tool_messages(result)[0]
+    assert bad_message["tool_call_id"] == "bad1"
+    assert "status: error" in bad_message["content"]
+    assert "TypeError" in bad_message["content"]
+    assert invoked == []
+    assert "The report was published on July 1." in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls() -> None:
+    """A single turn can emit more calls than budget allows (parallel_tool_calls).
+    The batch is clamped to the remaining external-call slots: in-budget calls run,
+    overflow external calls are rejected with a synthetic budget-exhausted error,
+    every tool_call_id still gets exactly one response, and internal tools
+    (record_findings) keep working past the ceiling."""
+    invoked: list[str] = []
+
+    async def search_web(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown=f"result {query}", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call("c1", "search_web", {"query": "q1"}),
+                    _tool_call("c2", "search_web", {"query": "q2"}),
+                    _tool_call("c3", "search_web", {"query": "q3"}),
+                ]
+            ),
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(max_tool_calls=2),
+        llm_call=fake_llm,
+    )
+
+    # Only the two in-budget external calls executed; the third never bound.
+    assert set(invoked) == {"q1", "q2"}
+    assert len(invoked) == 2
+    assert result.telemetry.per_tool_counts["search_web"] == 2
+
+    # Every tool_call_id in the batch got exactly one response, in order.
+    batch_messages = _tool_messages(result)[:3]
+    assert [message["tool_call_id"] for message in batch_messages] == ["c1", "c2", "c3"]
+
+    rejected_message = next(message for message in batch_messages if message["tool_call_id"] == "c3")
+    assert "status: error" in rejected_message["content"]
+    assert "budget is exhausted" in rejected_message["content"]
+    accepted_messages = [message for message in batch_messages if message["tool_call_id"] in {"c1", "c2"}]
+    assert all("budget is exhausted" not in message["content"] for message in accepted_messages)
+
+    # record_findings ran past the ceiling — internal tools are not budget-gated.
+    assert "The report was published on July 1." in result.findings_markdown
+
+
 @pytest.mark.asyncio
 async def test_append_only_message_history_is_preserved_across_steps() -> None:
     async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
@@ -544,7 +670,7 @@ class TestSummarizeGhost:
         model_construct and stub the parse to return it."""
         block = NumericStructured.model_construct(question_type="numeric", declared_percentiles={0.1: 10.0, 0.9: 30.0})
 
-        def fake_parse(raw_text: str, qtype: str) -> Any:
+        def fake_parse(_raw_text: str, qtype: str) -> Any:
             return block if qtype == "numeric" else None
 
         monkeypatch.setattr("metaculus_bot.research.agentic.loop.parse_structured_block", fake_parse)
