@@ -633,3 +633,26 @@ TS_ANCHOR_MONTHLY_TABLE_ROWS: int = 24
 
 # --- Research persistence (write path for backtest replay) ---
 PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"
+
+# --- Raw research-provider payload logging (durable GHA-artifact tape) ---
+# Independent from PERSIST_RESEARCH (which archives the post-summarizer research
+# text keyed per question). This captures each provider's RAW return — AskNews
+# article dicts per phase, native/gemini raw responses + grounding, prediction-
+# market contracts, resolution-source per-URL fetches, gap-fill search results —
+# appended as JSONL to a run_logs/ file so the raw evidence behind every forecast
+# survives the 90-day artifact window without depending on published comments.
+# OFF by default in code (unset env) so tests/local runs never write; the four
+# workflow yamls set it ON.
+RAW_RESEARCH_LOG_ENABLED_ENV: str = "RAW_RESEARCH_LOG_ENABLED"
+# Directory the raw-research JSONL is appended to. Defaults to run_logs/, which
+# every workflow tees stdout to and uploads wholesale as an artifact — so the raw
+# log rides along with no upload-glob change. Overridable (tests point it at a
+# tmp dir) via the RAW_RESEARCH_LOG_DIR env var.
+RAW_RESEARCH_LOG_DIR_ENV: str = "RAW_RESEARCH_LOG_DIR"
+RAW_RESEARCH_LOG_DIR_DEFAULT: str = "run_logs"
+# Per-record serialized-payload cap. A raw AskNews dual-phase pull or a grounded
+# Gemini response can be large; beyond this many chars the payload is replaced
+# with a bounded truncation marker (preview + original length) so one giant pull
+# can't blow up the log file. GHA zips the artifact on upload, so on-disk size is
+# the only concern; 200 KB/record is generous headroom for real payloads.
+RAW_RESEARCH_MAX_PAYLOAD_CHARS: int = 200_000
