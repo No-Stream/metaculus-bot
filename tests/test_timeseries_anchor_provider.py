@@ -168,6 +168,41 @@ class TestRouting:
         assert route.spec.series_id == "INDPRO"
         assert route.spec.revises is True  # unlisted -> fail-safe ALFRED vintage
 
+    def test_url_cited_registry_series_carries_registry_derivation(self):
+        # F10: a question citing a FRED URL for a registry-derived series (PAYEMS resolves
+        # on the MoM jobs-added change, scaled x1000) must inherit the registry's
+        # derivation/scale/label, NOT render a raw unscaled level band. Before the fix the
+        # URL branch used dataclass defaults (derivation='level', scale=1.0), which is
+        # actively misleading — a level band for a change-quantity question.
+        rc = "Resolves per https://fred.stlouisfed.org/series/PAYEMS on the release date."
+        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "PAYEMS"
+        assert route.derivation == "mom_diff"  # from the registry, not the 'level' default
+        assert route.scale == 1000.0
+        assert "payrolls" in route.label.lower()  # registry label, not the bare series_id
+
+    def test_url_cited_registry_series_carries_unit_scale(self):
+        # BOPGTB is a plain level but unit-scaled (millions -> billions). A cited URL must
+        # still carry scale=0.001 from the registry.
+        rc = "Resolves per https://fred.stlouisfed.org/series/BOPGTB on the release date."
+        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "BOPGTB"
+        assert route.derivation == "level"
+        assert route.scale == pytest.approx(0.001)
+
+    def test_url_cited_unregistered_series_keeps_level_defaults(self):
+        # INDPRO is not in the registry -> URL routing keeps the dataclass defaults
+        # (level, scale=1.0, label==series_id): the fix only carries metadata for MATCHES.
+        rc = "Resolves per https://fred.stlouisfed.org/series/INDPRO on the release date."
+        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "INDPRO"
+        assert route.derivation == "level"
+        assert route.scale == 1.0
+        assert route.label == "INDPRO"
+
     def test_routes_via_yahoo_url_single(self):
         # %5E is the URL-encoded caret for ^VIX; the extractor url-decodes before matching.
         rc = "Tracks https://finance.yahoo.com/quote/%5EVIX at close."
@@ -719,17 +754,34 @@ class TestEstimatorMath:
         assert p90 == pytest.approx(expected)
 
     def test_max_band_hand_computed_window_max(self):
-        # y=[1,3,2,5,4], h=2. Forward 2-windows: [1,3],[3,2],[2,5],[5,4] ->
-        # window_max=[3,3,5,5], win_anchor=y[:4]=[1,3,2,5], diffs=[2,0,3,0].
-        # sorted diffs=[0,0,2,3]; numpy linear quantiles at (.10,.50,.90):
-        #   .10 -> pos 0.3 -> 0.0;  .50 -> pos 1.5 -> 1.0;  .90 -> pos 2.7 -> 2.7.
-        # anchor last=10 -> (10.0, 11.0, 12.7). A window_max/anchor swap flips the
-        # diffs negative and this fails.
+        # y=[1,3,2,5,4], h=2. Each window spans h+1=3 points (an h-step horizon, matching
+        # the change band's y[i+h]-vs-y[i] span): [1,3,2],[3,2,5],[2,5,4] ->
+        # window_max=[3,5,5], win_anchor=y[:3]=[1,3,2], diffs=[2,2,3].
+        # sorted diffs=[2,2,3]; numpy linear quantiles at (.10,.50,.90) over n=3:
+        #   .10 -> pos 0.2 -> 2.0;  .50 -> pos 1.0 -> 2.0;  .90 -> pos 1.8 -> 2.8.
+        # anchor last=10 -> (12.0, 12.0, 12.8). A window_max/anchor swap flips the
+        # diffs negative and this fails; a length-h (not h+1) window regresses to the
+        # old [2,0,3,0] -> (10.0, 11.0, 12.7).
         y = np.array([1.0, 3.0, 2.0, 5.0, 4.0])
         p10, p50, p90 = _empirical_max_band(y, 2, use_log=False, last=10.0)
-        assert p10 == pytest.approx(10.0)
-        assert p50 == pytest.approx(11.0)
-        assert p90 == pytest.approx(12.7)
+        assert p10 == pytest.approx(12.0)
+        assert p50 == pytest.approx(12.0)
+        assert p90 == pytest.approx(12.8)
+
+    def test_max_band_log_branch_hand_computed(self):
+        # F12: the use_log=True branch is the production path for every strictly-positive
+        # financial series (VIX/BTC/gold "highest value" questions) — hand-pin it.
+        # y=[1,2,1,4,2], h=2. Windows span h+1=3 points: [1,2,1],[2,1,4],[1,4,2] ->
+        # window_max=[2,4,4], win_anchor=y[:3]=[1,2,1].
+        # log-ratios = [ln(2/1), ln(4/2), ln(4/1)] = [ln2, ln2, 2*ln2].
+        # sorted=[ln2, ln2, 2*ln2]; numpy linear quantiles over n=3:
+        #   .10 -> pos 0.2 -> ln2;  .50 -> pos 1.0 -> ln2;  .90 -> pos 1.8 -> 1.8*ln2.
+        # last=10, band = last*exp(r) -> (10*2, 10*2, 10*2^1.8) = (20.0, 20.0, ~34.822).
+        y = np.array([1.0, 2.0, 1.0, 4.0, 2.0])
+        p10, p50, p90 = _empirical_max_band(y, 2, use_log=True, last=10.0)
+        assert p10 == pytest.approx(20.0)
+        assert p50 == pytest.approx(20.0)
+        assert p90 == pytest.approx(10.0 * 2.0**1.8)  # ~34.822
 
     def test_build_spread_series_relative_returns(self):
         # a=[10,20,25], b=[5,5,10] on aligned dates. rel = 100*[(logA-logA0)-(logB-logB0)]:
@@ -788,7 +840,9 @@ class TestProviderFactory:
 
         assert isinstance(out, str)
         assert out  # non-empty section
-        assert out.splitlines()[0].startswith("**DGS10** — latest ")
+        # DGS10 is a registry entry, so URL routing carries the registry's descriptive
+        # label (F10 fix) rather than the bare series_id.
+        assert out.splitlines()[0].startswith("**10-Year Treasury constant-maturity yield (%)** — latest ")
         assert "P10 / P50 / P90 →" in out
 
     @pytest.mark.asyncio

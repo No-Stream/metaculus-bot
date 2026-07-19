@@ -308,6 +308,18 @@ def _entry_matches(entry: _TemplateEntry, lowered: str) -> bool:
     return not any(kw in lowered for kw in entry.exclude_keywords)
 
 
+def _registry_entry_for_series(series_id: str, source: Literal["fred", "yfinance"]) -> _TemplateEntry | None:
+    """Registry entry whose series_id matches (case-insensitive) a URL-cited series.
+
+    A URL pins WHICH series resolves the question, but the registry still holds HOW the
+    raw series maps to the resolved quantity (derivation / scale / model_target / note /
+    label). Without this, a question citing a FRED URL for e.g. PAYEMS or CPIAUCSL would
+    render a raw unscaled level band for a MoM-change / MoM-% quantity — actively
+    misleading. None when no registry entry declares this series."""
+    sid = series_id.upper()
+    return next((e for e in _TEMPLATE_REGISTRY if e.source == source and e.series_id.upper() == sid), None)
+
+
 def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str) -> SeriesSpec:
     """Build the SeriesSpec for one leg, honoring ALFRED-revising and daily-High."""
     if source == "fred":
@@ -318,6 +330,27 @@ def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str)
         return SeriesSpec(source="fred", series_id=series_id, revises=revises)
     column: YfColumn = "High" if _wants_max(text) else "Close"
     return SeriesSpec(source="yfinance", series_id=series_id, column=column)
+
+
+def _single_url_route(series_id: str, source: Literal["fred", "yfinance"], text: str, *, is_max: bool) -> _Route:
+    """Route a single URL-cited series. The URL pins WHICH series; a matching registry
+    entry still supplies HOW to derive/scale/label it (else a MoM-change or unit-scaled
+    question renders a misleading raw-level band). Non-matching series keep dataclass
+    defaults (level, scale=1.0)."""
+    spec = _single_spec(series_id, source, text)
+    entry = _registry_entry_for_series(series_id, source)
+    if entry is None:
+        return _Route(kind="single", spec=spec, label=series_id, is_max=is_max)
+    return _Route(
+        kind="single",
+        spec=spec,
+        label=entry.label,
+        model_target=entry.model_target,
+        is_max=is_max,
+        derivation=entry.derivation,
+        scale=entry.scale,
+        note=entry.note,
+    )
 
 
 def route_question(question: MetaculusQuestion) -> _Route | None:
@@ -344,10 +377,8 @@ def route_question(question: MetaculusQuestion) -> _Route | None:
             )
         if total_ids == 1:
             if fred:
-                spec = _single_spec(fred[0], "fred", text)
-                return _Route(kind="single", spec=spec, label=fred[0], is_max=is_max)
-            spec = _single_spec(tickers[0], "yfinance", text)
-            return _Route(kind="single", spec=spec, label=tickers[0], is_max=is_max)
+                return _single_url_route(fred[0], "fred", text, is_max=is_max)
+            return _single_url_route(tickers[0], "yfinance", text, is_max=is_max)
         logger.info(
             "ts_anchor: ambiguous URL routing (fred=%s tickers=%s) for qid=%s — skipping",
             fred,
@@ -435,8 +466,13 @@ def _empirical_change_band(y: np.ndarray, h: int, *, use_log: bool, anchor: floa
 
 def _empirical_max_band(y: np.ndarray, h: int, *, use_log: bool, last: float) -> tuple[float, float, float]:
     """P10/P50/P90 of the MAX over the forward h-window: empirical quantiles of the
-    window-max / window-anchor ratio (or difference) applied to the last value."""
-    windows = np.lib.stride_tricks.sliding_window_view(y, h)  # (n-h+1, h)
+    window-max / window-anchor ratio (or difference) applied to the last value.
+
+    Each window spans y[i..i+h] (h+1 points = an h-step horizon), matching the change
+    band's y[i+h]-vs-y[i] span. Length-h windows would cover only y[i..i+h-1] and
+    understate the h-step-ahead max (and collapse to ``last`` at h=1). The caller only
+    invokes this when y.size > h, so the length-(h+1) view is always non-empty."""
+    windows = np.lib.stride_tricks.sliding_window_view(y, h + 1)  # (n-h, h+1)
     window_max = windows.max(axis=1)
     win_anchor = y[: window_max.size]
     if use_log:
@@ -689,7 +725,7 @@ def _render_single(
                     f"- Realized max so far this window: {_fmt(floor)} — a HARD LOWER BOUND on the answer "
                     f"(the resolution window has already started; a forward max can only rise from here)."
                 )
-            # sliding_window_view yields y.size - h + 1 forward windows.
+            # sliding_window_view over length-(h+1) windows yields y.size - h forward windows.
             parts.append(
                 _band_line(
                     "forward-max",
@@ -698,7 +734,7 @@ def _render_single(
                     TS_ANCHOR_LOOKBACK_YEARS,
                     band,
                     last,
-                    n_windows=int(y.size) - h + 1,
+                    n_windows=int(y.size) - h,
                     n_eff=n_eff,
                 )
             )
