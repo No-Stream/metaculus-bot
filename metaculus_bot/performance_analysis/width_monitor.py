@@ -49,6 +49,7 @@ from scipy import stats
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -137,26 +138,6 @@ def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
     lo = float(stats.beta.ppf((1 - cl) / 2, a, b))
     hi = float(stats.beta.ppf(1 - (1 - cl) / 2, a, b))
     return mean, lo, hi
-
-
-def _grid_zero_point(zero_point_raw: float | int | None, range_min: float) -> float | None:
-    """Interpret ``scaling.zero_point`` for grid reconstruction.
-
-    A linear-scaled question serializes ``zero_point`` as ``null``; a log-scaled
-    question with a positive floor legitimately carries ``zero_point == 0`` (the
-    geometric grid then has ``ratio = range_max / range_min``). Treating that 0
-    as the linear sentinel builds a linear grid where the API grid is geometric
-    and corrupts the reconstructed value grid (up to ~0.55 span-normalized error,
-    observed on 9 log-scale questions in the 2026-07-18 width audit). So only
-    drop ``zero_point`` when it is genuinely absent, or when a non-positive
-    ``range_min`` rules out a log transform.
-    """
-    if zero_point_raw is None:
-        return None
-    zp = float(zero_point_raw)
-    if zp == 0.0:
-        return 0.0 if range_min > 0 else None
-    return zp
 
 
 def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:

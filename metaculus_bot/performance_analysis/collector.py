@@ -21,6 +21,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_resolution,
     parse_stacked_marker,
 )
+from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -382,8 +383,10 @@ def resolve_numeric_record_to_score_inputs(
     Returns None when the record can't be scored (missing bounds,
     unrecognized resolution). ``above_upper_bound`` / ``below_lower_bound``
     are coerced to ``upper + 1.0`` / ``lower - 1.0`` to feed
-    ``numeric_log_score``'s out-of-bounds branch. ``zero_point`` is None
-    when scaling.zero_point is None or 0/0.0 (the linear-scale sentinel).
+    ``numeric_log_score``'s out-of-bounds branch. ``zero_point`` is
+    interpreted via :func:`grid_zero_point` (a serialized ``0`` stays log when
+    ``range_min`` is positive, and only genuinely-absent/non-positive-floor
+    cases collapse to the linear ``None`` sentinel).
 
     Shared by ``_compute_scores`` (record-level scoring) and
     ``audit._rank_numeric`` (per-model scoring) so both paths follow the
@@ -398,8 +401,7 @@ def resolve_numeric_record_to_score_inputs(
     lower_bound = float(lower_raw)
     upper_bound = float(upper_raw)
 
-    zero_point_raw = scaling.get("zero_point")
-    zero_point = float(zero_point_raw) if zero_point_raw not in (None, 0, 0.0) else None
+    zero_point = grid_zero_point(scaling.get("zero_point"), lower_bound)
 
     resolution = record.get("resolution_parsed")
     if resolution == "above_upper_bound":
