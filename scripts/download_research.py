@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 # so this single prefix captures all of them via the (workflow-agnostic) artifacts API.
 RESEARCH_ARTIFACT_PREFIX = "research-"
 
+# The raw research-provider payload log (metaculus_bot.research.raw_log) rides in
+# run_logs/ INSIDE the same research-* artifact as research_outputs/. Its records
+# (qid/provider/phase/payload) are a different shape from the per-question research
+# records and would corrupt the archive's (qid, run_id) dedup, so the main-archive
+# glob must skip these files. scripts/download_raw_research.py archives them separately.
+RAW_RESEARCH_LOG_PREFIX = "raw_research_"
+
+
+def research_jsonl_files(run_dir: Path) -> list[Path]:
+    """List the per-question research JSONL under ``run_dir``, excluding raw-research logs."""
+    return [p for p in run_dir.glob("**/*.jsonl") if not p.name.startswith(RAW_RESEARCH_LOG_PREFIX)]
+
 
 def verify_gh_cli() -> None:
     """Ensure gh CLI is installed and authenticated."""
@@ -142,7 +154,7 @@ def download_artifact(run_id: int, repo: str, artifact_name: str, dest_dir: Path
         logger.warning(f"Failed to download {artifact_name} (run {run_id}): {result.stderr.strip()}")
         return []
 
-    return list(run_dir.glob("**/*.jsonl"))
+    return research_jsonl_files(run_dir)
 
 
 def load_jsonl_records(path: Path) -> list[dict]:
