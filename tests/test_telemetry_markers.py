@@ -124,6 +124,21 @@ class TestExtractionRung:
         assert rec["workflow"] == "tournament"
         assert rec["artifact"] == "research-999"
 
+    def test_verbatim_real_prod_line(self):
+        # Grounding: this line is copied byte-for-byte from a real prod tournament run
+        # log (run 29633926137, 2026-07-18) — not reconstructed. Guards against the
+        # regexes drifting from the actual emitted format.
+        real = (
+            "2026-07-18 06:30:01,112 - metaculus_bot.value_extraction - INFO - "
+            "EXTRACTION_RUNG: question=44620 model=openrouter/x-ai/grok-4.5 qtype=binary rung=block block_present=True"
+        )
+        rec = _parse_one(real)
+        assert rec["qid"] == 44620
+        assert rec["model"] == "openrouter/x-ai/grok-4.5"
+        assert rec["qtype"] == "binary"
+        assert rec["rung"] == "block"
+        assert rec["block_present"] is True
+
     def test_llm_salvage_rung(self):
         line = PFX + "EXTRACTION_RUNG: question=None model=grok-4.5 qtype=numeric rung=llm block_present=False"
         rec = _parse_one(line)

@@ -237,6 +237,14 @@ def download_and_harvest(
     return totals, runs, len(expired)
 
 
+# Markers that live in the PUBLISHED comment, not stdout/stderr (see markers.py
+# docstring) — the framework logs only "Posted comment on post N", never the body,
+# so these ~never appear in run logs. A zero count here is expected, not a miss.
+_COMMENT_ONLY_MARKERS: frozenset[str] = frozenset(
+    {"stacker_outcome", "tools_used", "anchor_overshoot_pp", "clause_product_divergence_pp"}
+)
+
+
 def _report(totals: dict[str, int], runs: list[HarvestedRun], expired_count: int) -> None:
     dates = sorted(r.run_date for r in runs if r.run_date)
     coverage = f"{dates[0]} .. {dates[-1]}" if dates else "(none)"
@@ -246,6 +254,22 @@ def _report(totals: dict[str, int], runs: list[HarvestedRun], expired_count: int
     logger.info("Per-marker archive totals:")
     for marker, count in sorted(totals.items()):
         logger.info(f"  {marker:32s} {count}")
+
+    # A marker reads 0 for one of two reasons, NEITHER of which is a parse failure:
+    #  (1) it's a comment-only marker (never logged), or
+    #  (2) its emitting code isn't on the branch the scheduled prod runs execute from
+    #      yet (scheduled workflows run the DEFAULT branch — so a marker added on a
+    #      feature branch stays 0 in the logs until that branch merges to main and a
+    #      run executes). To disambiguate a real regression from expected-zero, grep a
+    #      recent run_logs/*.log for the marker token AND confirm the emitter is on main.
+    zero_log_markers = sorted(m for m, c in totals.items() if c == 0 and m not in _COMMENT_ONLY_MARKERS)
+    if zero_log_markers:
+        logger.info(
+            "NOTE: %d log-marker(s) at 0 (%s). Expected if the emitter isn't on the prod branch (main) yet; "
+            "verify by grepping a recent log for the token before treating as a regression.",
+            len(zero_log_markers),
+            ", ".join(zero_log_markers),
+        )
 
 
 def main() -> None:
