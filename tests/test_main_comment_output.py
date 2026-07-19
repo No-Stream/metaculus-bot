@@ -49,6 +49,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
+    STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
 )
 from metaculus_bot.performance_analysis.collector import _process_single_question
 from metaculus_bot.performance_analysis.parsing import (
@@ -213,6 +214,25 @@ class TestStackedMarkerInjection:
         assert STACKED_MARKER_FALSE in out
         assert STACKED_MARKER_TRUE not in out
         assert parse_stacker_outcome_marker(out) == "skipped"
+        assert parse_stacked_marker(out) is False
+
+    def test_stacking_skipped_config_off_emits_marker_and_legacy_false(self):
+        # skipped_config_off (CONDITIONAL_STACKING above threshold, but the
+        # per-type <TYPE>_STACKING_ENABLED gate was off) → STACKER_OUTCOME=
+        # skipped_config_off AND legacy STACKED=false. Round-trips through the
+        # parser so residual pulls can tell config-suppression from
+        # below-threshold skips without git archaeology.
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        q = _make_binary_question()
+        bot._stacker_outcome[q.id_of_question] = "skipped_config_off"
+
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [], 0.5, 0.01, 1.0)
+
+        assert STACKER_OUTCOME_SKIPPED_CONFIG_OFF in out
+        assert STACKED_MARKER_FALSE in out
+        assert STACKED_MARKER_TRUE not in out
+        assert parse_stacker_outcome_marker(out) == "skipped_config_off"
         assert parse_stacked_marker(out) is False
 
     def test_stacking_budget_skip_emits_fallback_mean_marker(self):

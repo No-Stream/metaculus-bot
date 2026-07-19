@@ -55,8 +55,11 @@ def parse_stacker_outcome_marker(comment_text: str) -> str | None:
     """Return the STACKER_OUTCOME literal in ``comment_text``, else None.
 
     Returns one of ``"primary"``, ``"fallback_llm"``, ``"fallback_median"``,
-    ``"skipped"`` (always lower-cased), or ``None`` if no marker is present.
-    Older comments predating the tri-state marker return ``None``.
+    ``"fallback_mean"``, ``"skipped"``, ``"skipped_config_off"`` (always
+    lower-cased), or ``None`` if no marker is present. Older comments
+    predating the tri-state marker return ``None``; comments published before
+    ``skipped_config_off`` shipped (2026-07-19) collapse both skip reasons
+    into ``"skipped"``.
     """
     match = STACKER_OUTCOME_RE.search(comment_text)
     if match is None:

@@ -74,6 +74,12 @@ class TestHasStackerBodyMarker:
         record = {"comment_text": "text <!-- STACKER_OUTCOME=skipped --> end"}
         assert has_stacker_body_marker(record) is False
 
+    def test_stacker_outcome_skipped_config_off(self):
+        # config-suppressed skip (per-type gate off despite high spread) —
+        # the stacker did NOT fire, so this must classify as median.
+        record = {"comment_text": "text <!-- STACKER_OUTCOME=skipped_config_off --> end"}
+        assert has_stacker_body_marker(record) is False
+
     def test_stacker_outcome_fallback_median(self):
         # fallback_median means stacker failed, fell back to median — NOT stacker
         record = {"comment_text": "text <!-- STACKER_OUTCOME=fallback_median --> end"}

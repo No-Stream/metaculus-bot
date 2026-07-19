@@ -22,6 +22,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
+    STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
 )
@@ -219,6 +220,23 @@ class TestBuildUnifiedExplanation:
             stacker_outcome="skipped",
         )
         assert STACKER_OUTCOME_SKIPPED in result
+        assert STACKED_MARKER_FALSE in result
+        assert STACKED_MARKER_TRUE not in result
+
+    def test_stacking_skipped_config_off_emits_correct_markers(self):
+        # skipped_config_off: spread exceeded the threshold but the per-type
+        # <TYPE>_STACKING_ENABLED gate was off. Distinguished from plain
+        # "skipped" (spread below threshold) so residual analysis doesn't need
+        # git archaeology to re-attribute config-off suppressions.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped_config_off",
+        )
+        assert STACKER_OUTCOME_SKIPPED_CONFIG_OFF in result
         assert STACKED_MARKER_FALSE in result
         assert STACKED_MARKER_TRUE not in result
 

@@ -249,6 +249,12 @@ class TestHtmlCommentMarkers:
         assert rec["marker"] == "stacker_outcome"
         assert rec["outcome"] == "primary"
 
+    def test_stacker_outcome_skipped_config_off(self):
+        # Longer literal must win over its "skipped" prefix in the alternation.
+        rec = _parse_one("<!-- STACKER_OUTCOME=skipped_config_off -->")
+        assert rec["marker"] == "stacker_outcome"
+        assert rec["outcome"] == "skipped_config_off"
+
     def test_tools_used(self):
         rec = _parse_one("<!-- TOOLS_USED=false -->")
         assert rec["marker"] == "tools_used"

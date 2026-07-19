@@ -46,8 +46,12 @@ DetectorVerdict = Literal[
 # Stacker outcomes that indicate the stacker LLM actually produced a value
 _STACKER_FIRED_OUTCOMES: frozenset[str] = frozenset({"primary", "fallback_llm"})
 
-# Stacker outcomes that indicate the stacker did NOT produce a value
-_STACKER_MEDIAN_OUTCOMES: frozenset[str] = frozenset({"skipped", "fallback_median", "fallback_mean"})
+# Stacker outcomes that indicate the stacker did NOT produce a value.
+# "skipped" = spread at/below threshold; "skipped_config_off" = spread exceeded
+# the threshold but the per-type <TYPE>_STACKING_ENABLED gate was off.
+_STACKER_MEDIAN_OUTCOMES: frozenset[str] = frozenset(
+    {"skipped", "skipped_config_off", "fallback_median", "fallback_mean"}
+)
 
 
 # ---------------------------------------------------------------------------

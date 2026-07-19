@@ -2,7 +2,7 @@
 
 Two marker families coexist on every stacked comment for one round of back-compat:
 
-* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|fallback_mean|skipped>``
+* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|fallback_mean|skipped|skipped_config_off>``
   — the tri-state-plus marker. ``primary`` and ``fallback_llm`` mean a stacker
   LLM produced the value; ``fallback_median`` means both stacker LLMs failed
   and MEDIAN aggregation was used (CONDITIONAL_STACKING budget-skip path);
@@ -10,11 +10,18 @@ Two marker families coexist on every stacked comment for one round of back-compa
   skip path, where the base-combine re-entry uses MEAN rather than MEDIAN
   (F15 — keeps the marker truthful for residual analysis cuts that bucket on
   aggregation strategy); ``skipped`` means the conditional-stacking trigger
-  short-circuited the stacker entirely.
+  short-circuited the stacker because spread stayed at/below the threshold;
+  ``skipped_config_off`` means spread EXCEEDED the threshold but the per-type
+  ``<TYPE>_STACKING_ENABLED`` env gate was off, so the stacker was deliberately
+  bypassed (2026-07 residual round: 22 numeric "skipped" suppressions had to be
+  re-attributed to config-off via git archaeology — this value makes the reason
+  durable in the published record). Comments published before this value
+  shipped collapse both skip reasons into ``skipped``; disambiguating those
+  requires the workflow-yaml flag history.
 * ``STACKED=<true|false>`` — legacy binary marker derived from the new outcome
   (true ↔ outcome ∈ {primary, fallback_llm}, false ↔ outcome ∈ {skipped,
-  fallback_median, fallback_mean}). Kept around for one round so any external
-  parsers don't break the day this fix lands.
+  skipped_config_off, fallback_median, fallback_mean}). Kept around for one
+  round so any external parsers don't break the day this fix lands.
 
 Both are injected into each published Metaculus comment by the bot's
 ``_create_unified_explanation`` override (see ``main.py``), and parsed back out
@@ -56,9 +63,15 @@ STACKER_OUTCOME_FALLBACK_MEDIAN: str = "<!-- STACKER_OUTCOME=fallback_median -->
 # strategy from other signals.
 STACKER_OUTCOME_FALLBACK_MEAN: str = "<!-- STACKER_OUTCOME=fallback_mean -->"
 STACKER_OUTCOME_SKIPPED: str = "<!-- STACKER_OUTCOME=skipped -->"
+# Spread exceeded the threshold but the per-type <TYPE>_STACKING_ENABLED gate
+# was off — the stacker was config-suppressed, not spread-suppressed.
+STACKER_OUTCOME_SKIPPED_CONFIG_OFF: str = "<!-- STACKER_OUTCOME=skipped_config_off -->"
 
+# ``skipped_config_off`` precedes ``skipped`` in the alternation so the longer
+# literal wins on first match rather than relying on backtracking after the
+# ``skipped`` branch fails the trailing ``-->``.
 STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|fallback_mean|skipped)\s*-->",
+    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|fallback_mean|skipped_config_off|skipped)\s*-->",
     re.IGNORECASE,
 )
 
@@ -169,6 +182,17 @@ assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_MEAN) is not None, (
 assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED) is not None, (
     f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED={STACKER_OUTCOME_SKIPPED!r}"
 )
+_skipped_config_off_match = STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED_CONFIG_OFF)
+assert _skipped_config_off_match is not None, (
+    f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED_CONFIG_OFF={STACKER_OUTCOME_SKIPPED_CONFIG_OFF!r}"
+)
+# Guard the alternation-order subtlety: the full literal must be captured, not
+# just its "skipped" prefix.
+assert _skipped_config_off_match.group(1) == "skipped_config_off", (
+    f"STACKER_OUTCOME_RE captured {_skipped_config_off_match.group(1)!r} from "
+    f"{STACKER_OUTCOME_SKIPPED_CONFIG_OFF!r}; expected 'skipped_config_off'"
+)
+del _skipped_config_off_match
 assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
     f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_TRUE={TOOLS_USED_MARKER_TRUE!r}"
 )
@@ -197,6 +221,7 @@ __all__ = [
     "STACKER_OUTCOME_FALLBACK_MEDIAN",
     "STACKER_OUTCOME_FALLBACK_MEAN",
     "STACKER_OUTCOME_SKIPPED",
+    "STACKER_OUTCOME_SKIPPED_CONFIG_OFF",
     "STACKER_OUTCOME_RE",
     "STACKER_META_ANALYSIS_HEADER",
     "STACKED_BASE_REASONING_HEADER",

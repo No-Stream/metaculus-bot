@@ -163,7 +163,9 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "stacker_outcome",
         re.compile(
-            r"<!--\s*STACKER_OUTCOME=(?P<outcome>primary|fallback_llm|fallback_median|fallback_mean|skipped)\s*-->",
+            r"<!--\s*STACKER_OUTCOME="
+            r"(?P<outcome>primary|fallback_llm|fallback_median|fallback_mean|skipped_config_off|skipped)"
+            r"\s*-->",
             re.IGNORECASE,
         ),
     ),

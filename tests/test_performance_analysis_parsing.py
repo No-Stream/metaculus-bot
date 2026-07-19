@@ -85,6 +85,13 @@ class TestParseStackerOutcomeMarker:
     def test_skipped_marker(self):
         assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=skipped -->\n") == "skipped"
 
+    def test_skipped_config_off_marker(self):
+        # The alternation-order case: "skipped" must not shadow the longer
+        # "skipped_config_off" literal (config-suppressed vs below-threshold).
+        assert (
+            parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=skipped_config_off -->\n") == "skipped_config_off"
+        )
+
     def test_absent_marker_returns_none(self):
         assert parse_stacker_outcome_marker("# SUMMARY\nNo marker here\n") is None
 

@@ -791,7 +791,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         question.id_of_question,
                     )
                 self._register_expected_base_combine(question)
-                self._stacker_outcome[question.id_of_question] = "skipped"
+                # "skipped_config_off" (spread exceeded the threshold but the
+                # per-type gate was off) vs plain "skipped" (spread at/below
+                # threshold) — keeps the suppression reason durable in the
+                # published marker instead of requiring git archaeology over
+                # workflow-yaml flag history.
+                self._stacker_outcome[question.id_of_question] = (
+                    "skipped_config_off" if type_stacking_disabled else "skipped"
+                )
                 return ResearchWithPredictions(
                     research_report=_with_diagnostics(research),
                     summary_report=summary_report,

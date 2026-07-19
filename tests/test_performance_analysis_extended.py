@@ -364,6 +364,14 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome"] == "skipped"
         assert rec["stacker_outcome_source"] == "marker_outcome"
 
+    def test_outcome_marker_skipped_config_off(self):
+        # Config-suppressed skip (per-type gate off despite high spread) must
+        # survive the collector round-trip distinct from plain "skipped" — this
+        # is the field the 0/22-numeric-suppression re-attribution needed.
+        rec = self._run(3, 33, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped_config_off -->\n")
+        assert rec["stacker_outcome"] == "skipped_config_off"
+        assert rec["stacker_outcome_source"] == "marker_outcome"
+
     def test_legacy_marker_only_maps_to_primary(self):
         rec = self._run(4, 44, "*Forecaster 1*: 70%\n<!-- STACKED=true -->\n")
         assert rec["stacker_outcome"] == "primary"

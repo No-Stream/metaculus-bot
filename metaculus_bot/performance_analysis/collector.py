@@ -335,11 +335,14 @@ def _process_single_question(
         # and stacking status can't be determined. Kept for back-compat;
         # prefer stacker_outcome below for new analyses.
         "was_stacked": was_stacked,
-        # Tri-state stacker outcome ("primary"|"fallback_llm"|"fallback_median"
-        # |"skipped") with provenance string ("marker_outcome"|"marker_legacy"|
-        # "historical_body"|"none"). Distinguishes median-fallback from skipped
-        # at the record level — the legacy `was_stacked` collapses both to
-        # False/None and so is lossy for stacking-treatment-effect cuts.
+        # Stacker outcome ("primary"|"fallback_llm"|"fallback_median"|
+        # "fallback_mean"|"skipped"|"skipped_config_off") with provenance
+        # string ("marker_outcome"|"marker_legacy"|"historical_body"|"none").
+        # Distinguishes median-fallback from skipped at the record level — the
+        # legacy `was_stacked` collapses both to False/None and so is lossy for
+        # stacking-treatment-effect cuts. "skipped_config_off" (added
+        # 2026-07-19) separates config-suppressed skips from below-threshold
+        # skips; earlier comments collapse both into "skipped".
         "stacker_outcome": stacker_outcome,
         "stacker_outcome_source": stacker_outcome_source,
         "scaling": scaling,

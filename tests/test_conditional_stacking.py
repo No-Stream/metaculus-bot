@@ -823,7 +823,7 @@ class TestNumericStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_binary_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
@@ -903,7 +903,7 @@ class TestNumericStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_numeric_stacking_enabled_explicit_true(self, monkeypatch):
@@ -963,7 +963,7 @@ class TestBinaryStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_binary_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
@@ -988,7 +988,7 @@ class TestBinaryStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_binary_stacking_enabled_explicit_true(self, monkeypatch):
@@ -1098,7 +1098,7 @@ class TestMCStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_mc_stacking_enabled_unset_defaults_to_DISABLED(self, monkeypatch):
@@ -1126,7 +1126,7 @@ class TestMCStackingEnabled:
             assert len(result.predictions) == 2
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
-            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
 
     @pytest.mark.asyncio
     async def test_mc_stacking_enabled_explicit_true(self, monkeypatch):
