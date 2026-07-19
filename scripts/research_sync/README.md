@@ -35,18 +35,27 @@ for a missed week.
 
 1. `cd`s to the repo,
 2. prepends the dirs holding `uv` and `gh` to `PATH` (launchd jobs get a minimal PATH),
-3. runs `make sync_all`, which chains:
-   - `sync_research` — enumerates EVERY `research-*` artifact via the complete, paginated
-     artifacts REST endpoint (no 1000-result `gh run list` cap, so nothing in the 90-day
-     window is missed), backfills from Metaculus comments, rebuilds the research archive;
-   - `sync_telemetry` — enumerates EVERY `research-*` AND `logs-*` artifact (prod runs
-     bundle `run_logs/` inside `research-*`; test_bot uploads a separate `logs-*`),
-     parses the run-log markers, and merges them into the telemetry archive
-     (replace-by-run, idempotent);
-   - `sync_raw_research` — enumerates the same two artifact families, harvests the
-     `raw_research_<run_id>.jsonl` raw-payload logs from `run_logs/`, and writes one file
-     per run to `backtests/research_archive/raw/` (replace-by-run, idempotent);
+3. runs `make sync_all`, which:
+   - backfills from Metaculus comments (`backfill_research_from_comments.py`) FIRST — it
+     hits Metaculus, not GHA, and writes `comments_backfill.jsonl` for the research build
+     to load;
+   - then runs the **single-pass** driver `scripts/sync_all.py`, which enumerates EVERY
+     `research-*` AND `logs-*` artifact ONCE via the complete, paginated artifacts REST
+     endpoint (no 1000-result `gh run list` cap, so nothing in the 90-day window is
+     missed), downloads each unique artifact ONCE into a shared temp dir, and runs all
+     three harvests over the same downloaded run dirs:
+     - research JSONL (research-* dirs only) → rebuilds the research archive (download
+       records + comment backfill, dedup, build);
+     - run-log telemetry markers → merged into the telemetry archive (replace-by-run);
+     - `raw_research_<run_id>.jsonl` raw-payload logs → one file per run under
+       `backtests/research_archive/raw/` (replace-by-run);
 4. appends a dated logfile under `scripts/research_sync/logs/`.
+
+Running the driver in one pass avoids the three-pass waste of the old chain (each of the
+three standalone `sync_*` targets re-enumerated every artifact and re-downloaded the
+overlapping `research-*`/`logs-*` families into its own temp dir). The three standalone
+targets (`sync_research` / `sync_telemetry` / `sync_raw_research`) still exist for a
+single-archive refresh.
 
 `sync_all` hits only the **read-only, free** GitHub + Metaculus APIs — no paid
 LLM/research calls and no publishing.

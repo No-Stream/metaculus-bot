@@ -7,10 +7,11 @@ The bot's four workflows tee stdout+stderr to ``run_logs/`` and upload it:
 * ``test_bot`` uploads ``run_logs/`` as a SEPARATE ``logs-<run_id>`` artifact.
 
 So harvesting run logs means pulling BOTH artifact families and reading the ``*.log``
-files under ``run_logs/``. This mirrors ``scripts/download_research.py`` (and reuses its
-paginated, no-cap artifact enumeration): enumerate every live artifact, filter to the
-two prefixes, download each, parse the logs via :mod:`scripts.telemetry.markers`, and
-merge into ``backtests/telemetry_archive/`` (replace-by-run, idempotent).
+files under ``run_logs/``. Enumeration + download run through the shared
+``scripts.gha_artifacts`` core (paginated, no-cap artifact enumeration): enumerate every
+live artifact, filter to the two prefixes, download each, parse the logs via
+:mod:`scripts.telemetry.markers`, and merge into ``backtests/telemetry_archive/``
+(replace-by-run, idempotent).
 
 WHY THIS MUST RUN REGULARLY: GHA deletes artifacts after 90 days (``retention-days: 90``
 on every upload step). The local telemetry archive is the only durable copy of the
@@ -25,13 +26,10 @@ import json
 import logging
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Reuse the research downloader's paginated artifact enumeration + gh preflight; both
-# are workflow-agnostic (``list_research_artifacts`` lists EVERY artifact in the repo).
-from scripts.download_research import _parse_created_at, list_research_artifacts, verify_gh_cli
+from scripts.gha_artifacts import GH_API_TIMEOUT_S, download_run_dirs, select_run_artifacts, split_by_family
 from scripts.telemetry.archive import HarvestedRun, merge_and_write
 from scripts.telemetry.markers import parse_log_text
 
@@ -43,12 +41,6 @@ RUN_LOG_ARTIFACT_PREFIXES: tuple[str, ...] = ("research-", "logs-")
 
 DEFAULT_REPO = "No-Stream/metaculus-bot"
 DEFAULT_ARCHIVE_DIR = "backtests/telemetry_archive"
-
-# subprocess.run timeouts (seconds). Bounding both keeps one slow/hung `gh` call from
-# stalling the whole weekly harvest: a per-artifact download that times out is skipped
-# (the other artifacts still process), and the run-enumeration call can't block forever.
-ARTIFACT_DOWNLOAD_TIMEOUT_S = 180
-GH_API_TIMEOUT_S = 120
 
 
 def workflow_slug_from_path(path: str) -> str:
@@ -123,10 +115,7 @@ def infer_workflow(artifact_name: str, run_id: int, workflow_map: dict[int, str]
 
 def filter_run_log_artifacts(artifacts: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split artifacts into (live, expired) run-log artifacts (research-* / logs-*)."""
-    run_log = [a for a in artifacts if str(a.get("name", "")).startswith(RUN_LOG_ARTIFACT_PREFIXES)]
-    live = [a for a in run_log if not a.get("expired")]
-    expired = [a for a in run_log if a.get("expired")]
-    return live, expired
+    return split_by_family(artifacts, RUN_LOG_ARTIFACT_PREFIXES)
 
 
 def harvest_run_logs_from_dir(
@@ -168,89 +157,39 @@ def harvest_run_logs_from_dir(
     )
 
 
-def _download_artifact_to(run_id: int, repo: str, artifact_name: str, dest_dir: Path) -> Path | None:
-    """Download one artifact into ``dest_dir/<run_id>``; return the dir or None on failure."""
-    run_dir = dest_dir / str(run_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cmd = ["gh", "run", "download", str(run_id), "--repo", repo, "--name", artifact_name, "--dir", str(run_dir)]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTIFACT_DOWNLOAD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            f"Timed out ({ARTIFACT_DOWNLOAD_TIMEOUT_S}s) downloading {artifact_name} (run {run_id}); skipping"
-        )
-        return None
-    if result.returncode != 0:
-        logger.warning(f"Failed to download {artifact_name} (run {run_id}): {result.stderr.strip()}")
-        return None
-    return run_dir
-
-
 def download_and_harvest(
     repo: str, since_days: int, archive_dir: Path
 ) -> tuple[dict[str, int], list[HarvestedRun], int]:
     """Enumerate + download every live run-log artifact, harvest markers, merge into the archive.
 
-    Returns ``(per_marker_totals, harvested_runs, expired_count)``.
+    Enumeration + download go through the shared core; this function contributes only the
+    run-log-specific harvest (``harvest_run_logs_from_dir``) and merge. Returns
+    ``(per_marker_totals, harvested_runs, expired_count)``.
     """
-    verify_gh_cli()
-
-    all_artifacts = list_research_artifacts(repo)
-    live, expired = filter_run_log_artifacts(all_artifacts)
-    logger.info(
-        f"Artifacts endpoint returned {len(all_artifacts)} total, "
-        f"{len(live)} live + {len(expired)} expired run-log artifacts"
+    selection = select_run_artifacts(
+        repo, family_prefixes=RUN_LOG_ARTIFACT_PREFIXES, since_days=since_days, family_label="run-log"
     )
-
-    if expired:
-        logger.warning(f"{len(expired)} run-log artifact(s) are EXPIRED and UNRECOVERABLE (past 90-day retention):")
-        for art in sorted(expired, key=lambda a: a.get("created_at", "")):
-            logger.warning(f"  LOST: {art.get('name')} (created_at={art.get('created_at')})")
-    else:
-        logger.info("No expired run-log artifacts — nothing lost to the 90-day window.")
-
-    if since_days > 0:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
-        before = len(live)
-        live = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
-        logger.info(f"--since-days={since_days} post-filter: {len(live)}/{before} live artifacts within window")
 
     workflow_map = build_workflow_map(repo)
     logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
 
-    # Dedup by run_id so a pagination-duplicated artifact is downloaded at most once
-    # (mirrors download_research.py). research-<id> and logs-<id> never collide on
-    # run_id — they come from different workflow runs.
-    by_run: dict[int, dict] = {}
-    for art in live:
-        run_id = art.get("run_id")
-        if run_id is None:
-            logger.warning(f"Live artifact {art.get('name')} has no workflow_run id, skipping")
-            continue
-        by_run.setdefault(run_id, art)
-
     runs: list[HarvestedRun] = []
-    with tempfile.TemporaryDirectory(prefix="run_logs_dl_") as tmpdir:
-        tmp_path = Path(tmpdir)
-        for idx, (run_id, art) in enumerate(sorted(by_run.items(), key=lambda kv: kv[1].get("created_at", "")), 1):
-            name = art.get("name", "")
-            run_dir = _download_artifact_to(run_id, repo, name, tmp_path)
-            if run_dir is None:
-                continue
-            harvested = harvest_run_logs_from_dir(
-                run_dir,
-                run_id=str(run_id),
-                workflow=infer_workflow(name, run_id, workflow_map),
-                artifact=name,
-                run_date=art.get("created_at", ""),
-            )
-            if harvested is not None:
-                runs.append(harvested)
-            if idx % 25 == 0:
-                print(f"  processed {idx}/{len(by_run)} artifacts, {len(runs)} with logs", flush=True)
+    for run_id, art, run_dir in download_run_dirs(
+        selection, repo, tmp_prefix="run_logs_dl_", progress_noun="run-log artifacts"
+    ):
+        name = art.get("name", "")
+        harvested = harvest_run_logs_from_dir(
+            run_dir,
+            run_id=str(run_id),
+            workflow=infer_workflow(name, run_id, workflow_map),
+            artifact=name,
+            run_date=art.get("created_at", ""),
+        )
+        if harvested is not None:
+            runs.append(harvested)
 
     totals = merge_and_write(archive_dir, runs)
-    return totals, runs, len(expired)
+    return totals, runs, len(selection.expired)
 
 
 # Markers that live in the PUBLISHED comment, not stdout/stderr (see markers.py

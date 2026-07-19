@@ -216,10 +216,22 @@ sync_raw_research:
 
 # Pull EVERYTHING sync-shaped in one command: the research archive, the telemetry
 # archive, AND the raw research-provider payload archive. Residual analyses should call
-# this (never a single sync) so a future source is never silently missed. Read-only +
-# free. NOTE: bare ARGS is forwarded to ALL download scripts, so pass ARGS only when
-# they all accept the flag (e.g. --since-days).
-sync_all: sync_research sync_telemetry sync_raw_research
+# this (never a single sync) so a future source is never silently missed. Read-only + free.
+#
+# SINGLE-PASS: unlike running the three sync_* targets in sequence (which each
+# re-enumerate every artifact and re-download the overlapping research-*/logs-* families
+# into their own temp dir — ~300 downloads for ~100 artifacts), scripts/sync_all.py
+# enumerates ONCE over the union family and downloads each artifact ONCE, then runs all
+# three harvests over the shared run dirs. The Metaculus-comment backfill runs FIRST
+# (it hits Metaculus, not GHA) so its comments_backfill.jsonl is on disk when the
+# driver's research build loads it. NOTE: ARGS is forwarded only to sync_all.py, which
+# accepts --repo / --since-days (and the per-archive --*-dir overrides).
+sync_all:
+	@echo "=== Backfilling from Metaculus comments (historical) ==="
+	uv run python scripts/backfill_research_from_comments.py
+	@echo ""
+	@echo "=== Single-pass GHA sync: research + telemetry + raw-research (one download pass) ==="
+	uv run python scripts/sync_all.py $(ARGS)
 	@echo ""
 	@echo "=== sync_all complete: research + telemetry + raw-research archives refreshed ==="
 

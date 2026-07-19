@@ -1,9 +1,9 @@
 """Tests for the run-log downloader (scripts/download_run_logs.py).
 
 Network-free: exercises the pure artifact-filtering / workflow-inference logic and
-the local log->HarvestedRun harvest against temp files. The GitHub download path
-mirrors scripts/download_research.py (shared ``list_research_artifacts`` /
-``verify_gh_cli``) and is not re-tested here.
+the local log->HarvestedRun harvest against temp files. The GitHub enumeration +
+download path lives in the shared core (scripts.gha_artifacts) — the resilience tests
+here monkeypatch that module's seams; the enumeration internals are tested there.
 """
 
 import logging
@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import scripts.download_run_logs as dl
+import scripts.gha_artifacts as gha
 from scripts.download_run_logs import (
     RUN_LOG_ARTIFACT_PREFIXES,
     filter_run_log_artifacts,
@@ -117,12 +118,14 @@ class TestDownloadTimeoutResilience:
     """
 
     def test_per_artifact_timeout_returns_none_not_raises(self, tmp_path: Path, monkeypatch, caplog):
+        # ``_download_artifact_to`` now lives in the shared core (scripts.gha_artifacts);
+        # monkeypatch its subprocess there.
         def _raise_timeout(*_args, **_kwargs):
-            raise subprocess.TimeoutExpired(cmd=["gh", "run", "download"], timeout=dl.ARTIFACT_DOWNLOAD_TIMEOUT_S)
+            raise subprocess.TimeoutExpired(cmd=["gh", "run", "download"], timeout=gha.ARTIFACT_DOWNLOAD_TIMEOUT_S)
 
-        monkeypatch.setattr(dl.subprocess, "run", _raise_timeout)
+        monkeypatch.setattr(gha.subprocess, "run", _raise_timeout)
         with caplog.at_level(logging.WARNING):
-            result = dl._download_artifact_to(7, "owner/repo", "research-7", tmp_path)
+            result = gha._download_artifact_to(7, "owner/repo", "research-7", tmp_path)
         assert result is None
         assert any("Timed out" in r.getMessage() for r in caplog.records)
 
@@ -143,8 +146,10 @@ class TestDownloadTimeoutResilience:
             {"name": "research-1", "run_id": 1, "expired": False, "created_at": "2026-07-18T00:00:00Z"},
             {"name": "research-2", "run_id": 2, "expired": False, "created_at": "2026-07-19T00:00:00Z"},
         ]
-        monkeypatch.setattr(dl, "verify_gh_cli", lambda: None)
-        monkeypatch.setattr(dl, "list_research_artifacts", lambda repo: artifacts)
+        # Enumeration + download go through the shared core now; monkeypatch those seams
+        # in scripts.gha_artifacts. build_workflow_map + merge_and_write stay in dl.
+        monkeypatch.setattr(gha, "verify_gh_cli", lambda: None)
+        monkeypatch.setattr(gha, "list_research_artifacts", lambda repo: artifacts)
         monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {})
         # Patch the archive writer so this test is independent of the archive module.
         monkeypatch.setattr(dl, "merge_and_write", lambda archive_dir, runs: {})
@@ -157,7 +162,7 @@ class TestDownloadTimeoutResilience:
             (log_dir / "run.log").write_text(EXTRACTION_LINE + "\n")
             return dest_dir / str(run_id)
 
-        monkeypatch.setattr(dl, "_download_artifact_to", _fake_download)
+        monkeypatch.setattr(gha, "_download_artifact_to", _fake_download)
 
         _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, tmp_path)
         assert {r.run_id for r in runs} == {"2"}, "the surviving artifact must still be harvested"

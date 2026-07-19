@@ -19,7 +19,7 @@ harvest (expired artifact) are left untouched. Re-running neither dupes nor lose
 WHY THIS MUST RUN REGULARLY: GHA deletes artifacts after 90 days. This local archive
 is the only durable copy of the raw evidence behind each forecast. Read-only + free
 (GitHub API only); no paid LLM/research calls, no publishing. Wrapped by
-``make sync_raw_research`` and chained into ``make sync_all``.
+``make sync_raw_research`` and folded into the single-pass ``make sync_all``.
 """
 
 from __future__ import annotations
@@ -31,14 +31,13 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Reuse the paginated enumeration + gh preflight (download_research) and the
-# both-prefix filter + per-artifact download (download_run_logs). Both are
-# workflow-agnostic; raw research rides in the same artifacts as the run logs.
-from scripts.download_research import _parse_created_at, list_research_artifacts, verify_gh_cli
-from scripts.download_run_logs import _download_artifact_to, filter_run_log_artifacts
+# Enumeration + download go through the shared core; the run-log family (research-* +
+# logs-*) constant lives with the run-log harvester. Raw research rides in the same
+# artifacts as the run logs.
+from scripts.download_run_logs import RUN_LOG_ARTIFACT_PREFIXES
+from scripts.gha_artifacts import download_run_dirs, select_run_artifacts
 from scripts.telemetry.jsonl import load_jsonl_records
 
 logger = logging.getLogger(__name__)
@@ -121,53 +120,23 @@ def merge_and_write(archive_dir: Path, harvested: dict[str, list[dict]]) -> dict
 def download_and_harvest(repo: str, since_days: int, archive_dir: Path) -> tuple[dict[str, int], int]:
     """Enumerate + download every live run-log artifact, harvest raw logs, merge into the archive.
 
-    Returns ``(per_run_totals, expired_count)``.
+    Enumeration + download go through the shared core; this function contributes only the
+    raw-research-specific harvest (``harvest_raw_logs_from_dir``) and merge. Returns
+    ``(per_run_totals, expired_count)``.
     """
-    verify_gh_cli()
-
-    all_artifacts = list_research_artifacts(repo)
-    live, expired = filter_run_log_artifacts(all_artifacts)
-    logger.info(
-        f"Artifacts endpoint returned {len(all_artifacts)} total, "
-        f"{len(live)} live + {len(expired)} expired run-log artifacts"
+    selection = select_run_artifacts(
+        repo, family_prefixes=RUN_LOG_ARTIFACT_PREFIXES, since_days=since_days, family_label="run-log"
     )
 
-    if expired:
-        logger.warning(f"{len(expired)} run-log artifact(s) are EXPIRED and UNRECOVERABLE (past 90-day retention):")
-        for art in sorted(expired, key=lambda a: a.get("created_at", "")):
-            logger.warning(f"  LOST: {art.get('name')} (created_at={art.get('created_at')})")
-    else:
-        logger.info("No expired run-log artifacts — nothing lost to the 90-day window.")
-
-    if since_days > 0:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
-        before = len(live)
-        live = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
-        logger.info(f"--since-days={since_days} post-filter: {len(live)}/{before} live artifacts within window")
-
-    # Dedup by run_id so a pagination-duplicated artifact is downloaded at most once.
-    by_run: dict[int, dict] = {}
-    for art in live:
-        run_id = art.get("run_id")
-        if run_id is None:
-            logger.warning(f"Live artifact {art.get('name')} has no workflow_run id, skipping")
-            continue
-        by_run.setdefault(run_id, art)
-
     harvested: dict[str, list[dict]] = {}
-    with tempfile.TemporaryDirectory(prefix="raw_research_dl_") as tmpdir:
-        tmp_path = Path(tmpdir)
-        for idx, (run_id, art) in enumerate(sorted(by_run.items(), key=lambda kv: kv[1].get("created_at", "")), 1):
-            run_dir = _download_artifact_to(run_id, repo, art.get("name", ""), tmp_path)
-            if run_dir is None:
-                continue
-            for harvested_run_id, records in harvest_raw_logs_from_dir(run_dir).items():
-                harvested.setdefault(harvested_run_id, []).extend(records)
-            if idx % 25 == 0:
-                print(f"  processed {idx}/{len(by_run)} artifacts, {len(harvested)} runs with raw logs", flush=True)
+    for _run_id, _art, run_dir in download_run_dirs(
+        selection, repo, tmp_prefix="raw_research_dl_", progress_noun="run-log artifacts"
+    ):
+        for harvested_run_id, records in harvest_raw_logs_from_dir(run_dir).items():
+            harvested.setdefault(harvested_run_id, []).extend(records)
 
     totals = merge_and_write(archive_dir, harvested)
-    return totals, len(expired)
+    return totals, len(selection.expired)
 
 
 def main() -> None:

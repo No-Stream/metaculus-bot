@@ -17,13 +17,9 @@ from unittest import mock
 from backtest import _load_research_from_archive
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from scripts.backfill_research_from_logs import existing_records, parse_research_blocks
-from scripts.download_research import (
-    build_archive,
-    deduplicate_records,
-    download_research_artifacts,
-    list_research_artifacts,
-)
+from scripts.download_research import build_archive, deduplicate_records, download_research_artifacts
 from scripts.download_research import main as download_research_main
+from scripts.gha_artifacts import list_research_artifacts
 
 # --- Realistic test data ---
 
@@ -486,7 +482,8 @@ class TestArtifactsEndpointSweep:
             _artifact("some-other-artifact", 300, now - timedelta(days=3)),
         ]
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=_gh_stdout(artifacts), stderr="")
-        with mock.patch("scripts.download_research.subprocess.run", return_value=completed) as run:
+        # Enumeration lives in the shared core now; patch its subprocess.
+        with mock.patch("scripts.gha_artifacts.subprocess.run", return_value=completed) as run:
             parsed = list_research_artifacts("repo")
 
         # The REST endpoint is NOT workflow-scoped: it returns ALL artifacts (filtering
@@ -500,7 +497,7 @@ class TestArtifactsEndpointSweep:
     def test_list_research_artifacts_exits_on_gh_failure(self) -> None:
         """A gh error is fail-fast (sys.exit), never silently swallowed."""
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
-        with mock.patch("scripts.download_research.subprocess.run", return_value=failed):
+        with mock.patch("scripts.gha_artifacts.subprocess.run", return_value=failed):
             try:
                 list_research_artifacts("repo")
             except SystemExit as exc:
@@ -509,7 +506,13 @@ class TestArtifactsEndpointSweep:
                 raise AssertionError("expected SystemExit on gh failure")
 
     def test_only_live_research_artifacts_downloaded_expired_logged(self, caplog) -> None:  # noqa: ANN001
-        """Live research-* downloaded; expired logged (not downloaded); non-research ignored."""
+        """Live research-* downloaded; expired logged (not downloaded); non-research ignored.
+
+        Enumeration + download live in the shared core (scripts.gha_artifacts), so the
+        seams patched here are ``gha.verify_gh_cli`` / ``gha.list_research_artifacts`` /
+        ``gha._download_artifact_to``. ``_download_artifact_to`` writes a real run dir so
+        ``research_jsonl_files`` + ``load_jsonl_records`` run for real.
+        """
         now = datetime.now(timezone.utc)
         artifacts = [
             _artifact("research-100", 100, now - timedelta(days=1)),
@@ -518,20 +521,21 @@ class TestArtifactsEndpointSweep:
             _artifact("benchmark-results", 300, now - timedelta(days=1)),  # not research-*
         ]
 
-        records_by_run = {
-            100: [{"qid": 1, "run_id": "100", "timestamp": "t1"}],
-            200: [{"qid": 2, "run_id": "200", "timestamp": "t2"}],
-        }
-
         def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
-            return [run_id] if records_by_run.get(run_id) else []
+            # qid mirrors the run id (100 -> 1, 200 -> 2) so the aggregated qids are checkable.
+            run_dir = Path(dest_dir) / str(run_id)
+            out = run_dir / "research_outputs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"{artifact_name}.jsonl").write_text(
+                json.dumps({"qid": run_id // 100, "run_id": str(run_id), "timestamp": "t"}) + "\n"
+            )
+            return run_dir
 
         with (
-            mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
-            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
-            mock.patch("scripts.download_research.load_jsonl_records", side_effect=lambda f: records_by_run[f]),
-            caplog.at_level("WARNING", logger="scripts.download_research"),
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download) as dl,
+            caplog.at_level("WARNING", logger="scripts.gha_artifacts"),
         ):
             records = download_research_artifacts(repo="repo", since_days=0)
 
@@ -556,16 +560,18 @@ class TestArtifactsEndpointSweep:
         ]
 
         def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
-            return [run_id]
+            run_dir = Path(dest_dir) / str(run_id)
+            out = run_dir / "research_outputs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"{run_id}.jsonl").write_text(
+                json.dumps({"qid": run_id, "run_id": str(run_id), "timestamp": "t"}) + "\n"
+            )
+            return run_dir
 
         with (
-            mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
-            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
-            mock.patch(
-                "scripts.download_research.load_jsonl_records",
-                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
-            ),
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download) as dl,
         ):
             download_research_artifacts(repo="repo", since_days=0)
 
@@ -581,16 +587,18 @@ class TestArtifactsEndpointSweep:
         ]
 
         def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
-            return [run_id]
+            run_dir = Path(dest_dir) / str(run_id)
+            out = run_dir / "research_outputs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"{run_id}.jsonl").write_text(
+                json.dumps({"qid": run_id, "run_id": str(run_id), "timestamp": "t"}) + "\n"
+            )
+            return run_dir
 
         with (
-            mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
-            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download) as dl,
-            mock.patch(
-                "scripts.download_research.load_jsonl_records",
-                side_effect=lambda f: [{"qid": f, "run_id": str(f), "timestamp": "t"}],
-            ),
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download) as dl,
         ):
             download_research_artifacts(repo="repo", since_days=7)
 
@@ -610,11 +618,17 @@ class TestArtifactsEndpointSweep:
             "providers_used": ["asknews"],
         }
 
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            run_dir = Path(dest_dir) / str(run_id)
+            out = run_dir / "research_outputs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"{run_id}.jsonl").write_text(json.dumps(record) + "\n")
+            return run_dir
+
         with (
-            mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
-            mock.patch("scripts.download_research.download_artifact", return_value=[100]),
-            mock.patch("scripts.download_research.load_jsonl_records", return_value=[record]),
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download),
         ):
             records = download_research_artifacts(repo="repo", since_days=0)
 
@@ -687,15 +701,16 @@ class TestSyncResearchNoClobber:
             "providers_used": ["asknews", "native_search"],
         }
 
-        # Mock only the gh-touching pieces; let load_jsonl_records run for real so it
-        # parses BOTH the downloaded artifact file and the on-disk comment backfill (the
-        # earlier mistake of mocking load_jsonl_records globally hijacked backfill loading).
+        # Mock only the gh-touching pieces (in the shared core); let research_jsonl_files
+        # + load_jsonl_records run for real so the build parses BOTH the downloaded
+        # artifact file and the on-disk comment backfill (mocking load_jsonl_records
+        # globally would hijack backfill loading).
         def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
             run_dir = Path(dest_dir) / str(run_id)
-            run_dir.mkdir(parents=True, exist_ok=True)
-            jsonl = run_dir / f"{artifact_name}.jsonl"
-            jsonl.write_text(json.dumps(artifact_record) + "\n")
-            return [jsonl]
+            out = run_dir / "research_outputs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"{artifact_name}.jsonl").write_text(json.dumps(artifact_record) + "\n")
+            return run_dir
 
         argv = [
             "download_research.py",
@@ -708,9 +723,9 @@ class TestSyncResearchNoClobber:
         ]
         with (
             mock.patch("sys.argv", argv),
-            mock.patch("scripts.download_research.verify_gh_cli"),
-            mock.patch("scripts.download_research.list_research_artifacts", return_value=artifacts),
-            mock.patch("scripts.download_research.download_artifact", side_effect=fake_download),
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download),
         ):
             download_research_main()
 
