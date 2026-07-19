@@ -51,19 +51,32 @@ def workflow_slug_from_path(path: str) -> str:
     return stem.removeprefix("run_bot_on_")
 
 
-def build_workflow_map(repo: str) -> dict[int, str]:
+def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
     """Best-effort ``{run_id: workflow_slug}`` map via the workflow-runs endpoint.
 
-    The artifacts endpoint doesn't carry the workflow name, so we enumerate runs once
-    to attribute each artifact to its exact workflow (tournament vs cup vs minibench vs
-    test_bot). On any failure we return ``{}`` and callers fall back to prefix inference —
-    the map is a nicety for manifest bucketing, never load-bearing for the markers.
+    The artifacts endpoint doesn't carry the workflow name, so we enumerate runs to
+    attribute each artifact to its exact workflow (tournament vs cup vs minibench vs
+    test_bot). The enumeration is BOUNDED to runs created in the last ``since_days``
+    (default 120, comfortably past the 90-day artifact retention) via the API's
+    ``created`` filter — an unbounded ``--paginate`` walks the repo's ENTIRE run history
+    (thousands of runs) and stalls for minutes on a nicety. On any failure we return
+    ``{}`` and callers fall back to prefix inference; the map is manifest-bucketing
+    convenience, never load-bearing for the markers.
     """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%d")
     cmd = [
         "gh",
         "api",
         "--paginate",
-        f"/repos/{repo}/actions/runs?per_page=100",
+        # -X GET is required: gh api sends -f fields as a POST body by default (which
+        # 404s on this GET-only endpoint); -X GET makes them query params instead.
+        "-X",
+        "GET",
+        f"/repos/{repo}/actions/runs",
+        "-f",
+        "per_page=100",
+        "-f",
+        f"created=>={cutoff}",
         "--jq",
         ".workflow_runs[] | {id, path}",
     ]
