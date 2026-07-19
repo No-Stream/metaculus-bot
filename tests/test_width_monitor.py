@@ -7,9 +7,12 @@ records with linear CDFs (so PIT = (resolution - lower) / (upper - lower)).
 import numpy as np
 import pytest
 
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.width_monitor import (
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
+    _cdf_and_grid,
+    _grid_zero_point,
     assign_era,
     compute_all_eras,
     compute_era_metrics,
@@ -174,3 +177,68 @@ class TestComputeAllEras:
         assert "Numeric width / calibration monitor" in md
         assert "cov@10" in md
         assert "| all |" in md
+
+
+class TestLogScaleGrid:
+    """Regression: a log-scale question serializes ``zero_point == 0`` with a
+    positive ``range_min`` (the geometric grid uses ``ratio = range_max /
+    range_min``). The old code treated 0 as the linear sentinel and rebuilt a
+    linear grid, corrupting the value grid by up to ~0.55 span-normalized on
+    9 real questions in the 2026-07-18 width audit. The fix (a) prefers the
+    API's grid-exact ``continuous_range`` when present, (b) otherwise
+    reconstructs the geometric grid instead of a linear one.
+    """
+
+    def test_grid_zero_point_treats_zero_as_log_when_range_min_positive(self):
+        # zero_point==0 with a positive floor => genuine log scale (keep 0.0).
+        assert _grid_zero_point(0, 100.0) == 0.0
+        assert _grid_zero_point(0.0, 100.0) == 0.0
+        # zero_point==0 with a non-positive floor can't be a log transform => drop.
+        assert _grid_zero_point(0, 0.0) is None
+        assert _grid_zero_point(0, -5.0) is None
+        # A genuinely-absent zero_point is linear.
+        assert _grid_zero_point(None, 100.0) is None
+        # A real (nonzero) zero_point is passed through.
+        assert _grid_zero_point(50, 100.0) == 50.0
+
+    def test_reconstructed_grid_is_geometric_for_zero_point_zero(self):
+        # No continuous_range in the record -> _cdf_and_grid must reconstruct the
+        # GEOMETRIC grid (ratio = range_max / range_min), not a linear ramp.
+        lower, upper = 100.0, 1000.0
+        cdf = np.linspace(0.0, 1.0, GRID_N).tolist()
+        rec = {
+            "type": "numeric",
+            "our_forecast_values": cdf,
+            "resolution_parsed": 500.0,
+            "scaling": {"range_min": lower, "range_max": upper, "zero_point": 0},
+        }
+        built = _cdf_and_grid(rec)
+        assert built is not None
+        _cdf_arr, grid = built
+        expected_geometric = build_cdf_value_grid(lower, upper, 0.0, GRID_N)
+        expected_linear = build_cdf_value_grid(lower, upper, None, GRID_N)
+        # Matches the geometric grid, and is materially different from linear.
+        np.testing.assert_allclose(grid, expected_geometric, rtol=0, atol=1e-9)
+        assert float(np.max(np.abs(expected_geometric - expected_linear))) > 1.0
+
+    def test_continuous_range_is_preferred_when_present(self):
+        # When the API grid is present it is used verbatim (already log/linear
+        # correct), regardless of the zero_point sentinel.
+        lower, upper = 100.0, 1000.0
+        api_grid = build_cdf_value_grid(lower, upper, 0.0, GRID_N)
+        cdf = np.linspace(0.0, 1.0, GRID_N).tolist()
+        rec = {
+            "type": "numeric",
+            "our_forecast_values": cdf,
+            "resolution_parsed": 500.0,
+            "scaling": {
+                "range_min": lower,
+                "range_max": upper,
+                "zero_point": 0,
+                "continuous_range": api_grid.tolist(),
+            },
+        }
+        built = _cdf_and_grid(rec)
+        assert built is not None
+        _cdf_arr, grid = built
+        np.testing.assert_array_equal(grid, api_grid)

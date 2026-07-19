@@ -741,6 +741,8 @@ def numeric_prompt(
         For stable, well-measured indicators with recent data (economic indices, demographic measures,
         climate data), anchor tightly to recent observations with historically-appropriate variance.
         Do not over-hedge on quantities you can actually predict well.
+        Match your interval width to what your reasoning actually supports, and do not pad or sharpen
+        out of a generic disposition.
         Given the mathematics of log score, penalties for overconfident narrow intervals are severe,
         but penalties for overly wide intervals on predictable quantities also accumulate.{ts_anchor_clause}
         {
@@ -839,11 +841,10 @@ def numeric_prompt(
             - Trajectory check: consider whether "status quo" means "nothing changes" or "the current trajectory reaches its natural conclusion." Justify deviations from the most likely trajectory.
             - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
-            - Hedge audit: if your reasoning supports a tight distribution (stable indicator, strong recent data, clear trend) but you widened your percentiles out of general caution, you are losing points. Log score penalizes overly wide intervals on predictable quantities. Only widen tails when you can name specific evidence creating that uncertainty, not because it feels safer.
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
-            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution (see the hedge audit above).
+            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
             - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
@@ -867,8 +868,7 @@ def numeric_prompt(
             FORECASTABILITY: HIGH
             FORECASTABILITY: MEDIUM
             FORECASTABILITY: LOW
-            For LOW forecastability, your IQR should span a large fraction of the displayed range (or beyond where a bound is open).
-            For HIGH, your IQR can be as narrow as the historical data justifies.
+            Use this classification as a self-check: your interval width should match how predictable the quantity actually is on this horizon.
 
         (10) Brief checklist
             - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.

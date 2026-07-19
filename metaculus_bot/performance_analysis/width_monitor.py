@@ -138,18 +138,48 @@ def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
     return mean, lo, hi
 
 
+def _grid_zero_point(zero_point_raw: float | int | None, range_min: float) -> float | None:
+    """Interpret ``scaling.zero_point`` for grid reconstruction.
+
+    A linear-scaled question serializes ``zero_point`` as ``null``; a log-scaled
+    question with a positive floor legitimately carries ``zero_point == 0`` (the
+    geometric grid then has ``ratio = range_max / range_min``). Treating that 0
+    as the linear sentinel builds a linear grid where the API grid is geometric
+    and corrupts the reconstructed value grid (up to ~0.55 span-normalized error,
+    observed on 9 log-scale questions in the 2026-07-18 width audit). So only
+    drop ``zero_point`` when it is genuinely absent, or when a non-positive
+    ``range_min`` rules out a log transform.
+    """
+    if zero_point_raw is None:
+        return None
+    zp = float(zero_point_raw)
+    if zp == 0.0:
+        return 0.0 if range_min > 0 else None
+    return zp
+
+
 def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:
     """Return (cdf, value_grid) for a numeric/discrete record, or None if the
-    record lacks the bounds / CDF needed to build the grid."""
+    record lacks the bounds / CDF needed to build the grid.
+
+    Prefers the API's grid-exact ``scaling.continuous_range`` when present (it
+    already encodes log-vs-linear spacing, so no scale has to be re-derived from
+    ``zero_point``); falls back to reconstructing via ``build_cdf_value_grid``
+    with a zero_point interpretation that handles the ``zero_point == 0`` log
+    case (see ``_grid_zero_point``).
+    """
     cdf = record.get("our_forecast_values")
     scaling = record.get("scaling") or {}
     lo, hi = scaling.get("range_min"), scaling.get("range_max")
     if cdf is None or lo is None or hi is None or len(cdf) < 3:
         return None
-    zp_raw = scaling.get("zero_point")
-    zp = float(zp_raw) if zp_raw not in (None, 0, 0.0) else None
+    cdf_arr = np.asarray(cdf, dtype=float)
+    api_grid = scaling.get("continuous_range")
+    if api_grid is not None and len(api_grid) == len(cdf):
+        return cdf_arr, np.asarray(api_grid, dtype=float)
+    zp = _grid_zero_point(scaling.get("zero_point"), float(lo))
     grid = build_cdf_value_grid(float(lo), float(hi), zp, len(cdf))
-    return np.asarray(cdf, dtype=float), grid
+    return cdf_arr, grid
 
 
 def compute_pit(record: dict) -> float | None:
