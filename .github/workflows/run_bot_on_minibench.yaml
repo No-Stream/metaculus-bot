@@ -137,6 +137,13 @@ jobs:
           OPENAI_AGENTS_DISABLE_TRACING: 'true'
           # Persist research outputs as JSONL for offline backtest replay.
           PERSIST_RESEARCH_ENABLED: 'true'
+          # Raw research-provider payload log: each provider's RAW return (AskNews
+          # article dicts per phase, native/Gemini raw responses + grounding, market
+          # contracts, resolution-source fetches, gap-fill results) →
+          # run_logs/raw_research_<run_id>.jsonl, uploaded in this artifact. The
+          # durable raw evidence behind each forecast (independent of published
+          # comments); make sync_raw_research archives it.
+          RAW_RESEARCH_LOG_ENABLED: 'true'
       - name: Upload research outputs
         if: always()
         uses: actions/upload-artifact@v7

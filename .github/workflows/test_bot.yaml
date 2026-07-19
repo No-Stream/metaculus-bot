@@ -123,6 +123,12 @@ jobs:
           BINARY_STACKING_ENABLED: 'false'
           MC_STACKING_ENABLED: 'false'
           OPENAI_AGENTS_DISABLE_TRACING: 'true'
+          # Raw research-provider payload log: each provider's RAW return (AskNews
+          # article dicts per phase, native/Gemini raw responses + grounding, market
+          # contracts, resolution-source fetches, gap-fill results) →
+          # run_logs/raw_research_<run_id>.jsonl, uploaded in the logs-* artifact
+          # below. make sync_raw_research archives it (pulls research-* + logs-*).
+          RAW_RESEARCH_LOG_ENABLED: 'true'
       # Durable capture of run logs (telemetry lives on stderr, tee'd to run_logs/).
       # Artifact name is logs-* (NOT research-*) so scripts/download_research.py's
       # research-* enumeration never picks up test runs.

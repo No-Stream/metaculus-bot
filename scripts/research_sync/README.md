@@ -1,7 +1,7 @@
 # Scheduled archive sync (launchd)
 
-Keeps `backtests/research_archive/` AND `backtests/telemetry_archive/` fresh by
-running `make sync_all` on a weekly schedule.
+Keeps `backtests/research_archive/` (incl. `raw/`) AND `backtests/telemetry_archive/`
+fresh by running `make sync_all` on a weekly schedule.
 
 ## Why this exists
 
@@ -12,6 +12,13 @@ archives (both gitignored) are the only durable copies:
 
 - `backtests/research_archive/` — per-question research text; feeds the backtest replay
   (`make backtest_with_cache`) and residual / per-provider research attribution.
+- `backtests/research_archive/raw/` — the raw research-provider payloads
+  (`raw_research_<run_id>.jsonl`, one file per run) that `metaculus_bot.research.raw_log`
+  appends to `run_logs/`: each provider's RAW return before formatting (AskNews article
+  dicts per phase, native/Gemini raw responses + grounding, market contracts, resolution
+  fetches, gap-fill results). This is the durable raw evidence behind every forecast,
+  independent of published comments — it makes the AskNews summarizer relevance gate
+  auditable after the fact.
 - `backtests/telemetry_archive/` — run-log telemetry markers (`EXTRACTION_RUNG`,
   `GAP_FILL_V2`, `GHOST_FORECAST`, `OPEN_BOUND_PILING`, `CREDIT_*`) harvested from the
   same artifacts; feeds parser-drift watch, gap-fill v2 diagnostics, credit burn-rate,
@@ -36,6 +43,9 @@ for a missed week.
      bundle `run_logs/` inside `research-*`; test_bot uploads a separate `logs-*`),
      parses the run-log markers, and merges them into the telemetry archive
      (replace-by-run, idempotent);
+   - `sync_raw_research` — enumerates the same two artifact families, harvests the
+     `raw_research_<run_id>.jsonl` raw-payload logs from `run_logs/`, and writes one file
+     per run to `backtests/research_archive/raw/` (replace-by-run, idempotent);
 4. appends a dated logfile under `scripts/research_sync/logs/`.
 
 `sync_all` hits only the **read-only, free** GitHub + Metaculus APIs — no paid

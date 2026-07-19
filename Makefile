@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_all backfill_research download_research download_run_logs backfill_comments score_ghosts backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -203,13 +203,25 @@ sync_telemetry:
 	@echo ""
 	@echo "Telemetry archive ready at backtests/telemetry_archive/"
 
-# Pull EVERYTHING sync-shaped in one command: the research archive AND the telemetry
-# archive. Residual analyses should call this (never a single sync) so a future source
-# is never silently missed. Read-only + free. NOTE: bare ARGS is forwarded to BOTH
-# download scripts, so pass ARGS only when both accept the flag (e.g. --since-days).
-sync_all: sync_research sync_telemetry
+# Archive the raw research-provider payload logs (raw_research_<run_id>.jsonl) that
+# metaculus_bot.research.raw_log appends to run_logs/. Pulls both artifact families
+# (prod runs bundle run_logs/ inside research-*; test_bot uploads a separate logs-*),
+# harvests the raw JSONL, and writes one file per run to backtests/research_archive/raw/
+# (replace-by-run, idempotent). Read-only + free; safe on the weekly schedule.
+sync_raw_research:
+	@echo "=== Archiving raw research-provider payload logs from GHA artifacts ==="
+	uv run python scripts/download_raw_research.py $(ARGS)
 	@echo ""
-	@echo "=== sync_all complete: research + telemetry archives refreshed ==="
+	@echo "Raw-research archive ready at backtests/research_archive/raw/"
+
+# Pull EVERYTHING sync-shaped in one command: the research archive, the telemetry
+# archive, AND the raw research-provider payload archive. Residual analyses should call
+# this (never a single sync) so a future source is never silently missed. Read-only +
+# free. NOTE: bare ARGS is forwarded to ALL download scripts, so pass ARGS only when
+# they all accept the flag (e.g. --since-days).
+sync_all: sync_research sync_telemetry sync_raw_research
+	@echo ""
+	@echo "=== sync_all complete: research + telemetry + raw-research archives refreshed ==="
 
 # Score gap-fill v2 GHOST_FORECAST markers vs published forecasts on resolved questions
 # (paired log-score deltas — the retire-v1 gate). Read-only + free. Expects ~0
@@ -222,6 +234,11 @@ score_ghosts:
 # as sync_telemetry; kept as a named target for parity with download_research.
 download_run_logs:
 	uv run python scripts/download_run_logs.py $(ARGS)
+
+# Download artifacts + archive raw research-provider logs only (no other sync). Same
+# script as sync_raw_research; kept as a named target for parity with download_research.
+download_raw_research:
+	uv run python scripts/download_raw_research.py $(ARGS)
 
 # Backfill research from existing GitHub Actions logs (Nov 2025 onward).
 # Pass ARGS="--limit 100 --status completed" to customize.
