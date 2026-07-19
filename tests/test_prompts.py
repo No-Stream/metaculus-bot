@@ -266,28 +266,54 @@ class TestForecastingWindowAnchor:
 
 
 class TestTsAnchorClause:
-    """The numeric prompt surfaces the time-series-anchor guidance ONLY when the
+    """The numeric prompt surfaces the time-series-anchor pointer ONLY when the
     research actually carries the anchor section header. Binary/MC never mention
-    it (the anchor routes to numeric questions only in v1)."""
+    it (the anchor routes to numeric questions only in v1).
 
-    _MARKER = "CALIBRATED REFERENCE EVIDENCE"
+    The clause is deliberately NEUTRAL: it describes precisely what the section
+    contains and leaves the forecaster to decide how to use it. The old directive
+    framing ("CALIBRATED REFERENCE EVIDENCE", "keep your interval close", "do NOT
+    widen") was removed 2026-07-18 — the operator chose to state the facts and
+    trust the forecasters rather than prescribe usage on an untested feature."""
+
+    _MARKER = "## Time Series Anchor"
+    # Directive phrases that must NOT reappear in the neutral clause.
+    _BANNED = ("CALIBRATED", "keep your interval", "do not widen", "sharpen your distribution")
+
+    def _assert_no_directives(self, text: str) -> None:
+        lowered = text.lower()
+        for phrase in self._BANNED:
+            assert phrase.lower() not in lowered, f"directive phrase leaked back in: {phrase!r}"
 
     def test_clause_present_when_section_in_research(self) -> None:
         research = f"Some news.\n\n{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20\n- band ..."
         result = numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
+        # Neutral description present: it points at the section and says what the band IS,
+        # including the independent-window caveat, without telling the model how to weigh it.
         assert self._MARKER in result
-        assert "sharpen your distribution" in result.lower()
+        lowered = result.lower()
+        assert "empirical distribution of the series' own past changes" in lowered
+        assert "independent" in lowered
+        self._assert_no_directives(result)
 
     def test_clause_absent_when_section_missing(self) -> None:
         result = numeric_prompt(
             _numeric_q(), research="Just some news, no anchor.", lower_bound_message="lbm", upper_bound_message="ubm"
         )
-        assert self._MARKER not in result
+        # No anchor section -> neither the pointer nor any directive language appears.
+        assert "empirical distribution of the series' own past changes" not in result.lower()
+        self._assert_no_directives(result)
 
     def test_clause_not_in_binary_or_mc_even_with_section(self) -> None:
         research = f"{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20"
-        assert self._MARKER not in binary_prompt(_binary_q(), research=research)
-        assert self._MARKER not in multiple_choice_prompt(_mc_q(), research=research)
+        assert (
+            "empirical distribution of the series' own past changes"
+            not in binary_prompt(_binary_q(), research=research).lower()
+        )
+        assert (
+            "empirical distribution of the series' own past changes"
+            not in multiple_choice_prompt(_mc_q(), research=research).lower()
+        )
 
     def test_stacking_binary_injects_window(self) -> None:
         q = _binary_q(

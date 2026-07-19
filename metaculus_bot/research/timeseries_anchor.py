@@ -602,14 +602,34 @@ def _realized_vol_line(series: pd.Series) -> str | None:
     return f"- 30-day annualized realized volatility: {annualized:.1f}%"
 
 
+def _n_eff(n_obs: int, h: int) -> int:
+    """Rough count of statistically-INDEPENDENT h-step windows in ``n_obs`` observations.
+
+    Overlapping windows share observations, so the effective independent sample size is
+    ~``n_obs // h`` — far below the raw overlapping-window count at long horizons (a
+    1-year daily horizon over 15 years is ~15 independent windows, not thousands).
+    Floored at 1 (the band is only rendered when ``n_obs > h``, so this never bites in
+    practice, but it keeps the reported number honest for degenerate inputs)."""
+    return max(1, n_obs // h)
+
+
 def _band_line(
-    kind: str, freq: Freq, h: int, lookback_years: int, band: tuple[float, float, float], last: float
+    kind: str,
+    freq: Freq,
+    h: int,
+    lookback_years: int,
+    band: tuple[float, float, float],
+    last: float,
+    *,
+    n_windows: int,
+    n_eff: int,
 ) -> str:
     unit = _FREQ_UNIT[freq]
     p10, p50, p90 = band
     return (
-        f"- Horizon-matched empirical band (over all {h}-{unit} {kind} windows in the last "
-        f"~{lookback_years} years, applied to the latest value {_fmt(last)}):\n"
+        f"- Horizon-matched empirical band (empirical P10/P50/P90 of all {h}-{unit} {kind} windows "
+        f"in the last ~{lookback_years} years — {n_windows:,} overlapping windows, ~{n_eff:,} "
+        f"independent — applied to the latest value {_fmt(last)}):\n"
         f"  - P10 / P50 / P90 → {_fmt(p10)} / {_fmt(p50)} / {_fmt(p90)}"
     )
 
@@ -659,6 +679,7 @@ def _render_single(
         parts.append(_fifty_two_week_line(derived, ceiling, last))
 
     if route.model_target and y.size > h:
+        n_eff = _n_eff(int(y.size), h)
         if is_max:
             band = _empirical_max_band(y, h, use_log=use_log, last=last)
             floor = _realized_max_floor(derived, window_start, ceiling)
@@ -668,10 +689,34 @@ def _render_single(
                     f"- Realized max so far this window: {_fmt(floor)} — a HARD LOWER BOUND on the answer "
                     f"(the resolution window has already started; a forward max can only rise from here)."
                 )
-            parts.append(_band_line("forward-max", freq, h, TS_ANCHOR_LOOKBACK_YEARS, band, last))
+            # sliding_window_view yields y.size - h + 1 forward windows.
+            parts.append(
+                _band_line(
+                    "forward-max",
+                    freq,
+                    h,
+                    TS_ANCHOR_LOOKBACK_YEARS,
+                    band,
+                    last,
+                    n_windows=int(y.size) - h + 1,
+                    n_eff=n_eff,
+                )
+            )
         else:
             band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
-            parts.append(_band_line("change", freq, h, TS_ANCHOR_LOOKBACK_YEARS, band, last))
+            # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
+            parts.append(
+                _band_line(
+                    "change",
+                    freq,
+                    h,
+                    TS_ANCHOR_LOOKBACK_YEARS,
+                    band,
+                    last,
+                    n_windows=int(y.size) - h,
+                    n_eff=n_eff,
+                )
+            )
     elif route.model_target:
         parts.append(f"- (Horizon {h} exceeds available history; empirical band withheld.)")
 
@@ -714,9 +759,11 @@ def _render_spread(
     parts.append(_history_lines(series_a, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label} recent"))
     parts.append(_history_lines(series_b, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label_b} recent"))
     unit = _FREQ_UNIT[freq]
+    # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
     parts.append(
         f"- Forward {h}-{unit} relative-return band (pp, empirical over the last "
-        f"~{TS_ANCHOR_SPREAD_LOOKBACK_YEARS} years):\n"
+        f"~{TS_ANCHOR_SPREAD_LOOKBACK_YEARS} years — {int(y.size) - h:,} overlapping windows, "
+        f"~{_n_eff(int(y.size), h):,} independent):\n"
         f"  - P10 / P50 / P90 → {_fmt(band[0])} / {_fmt(band[1])} / {_fmt(band[2])}"
     )
     parts.append(

@@ -40,6 +40,7 @@ from metaculus_bot.research.timeseries_anchor import (
     _build_spread_series,
     _empirical_change_band,
     _empirical_max_band,
+    _n_eff,
     _realized_max_floor,
     _render_single,
     _render_spread,
@@ -454,6 +455,12 @@ class TestRenderSingle:
         assert "as of 2026-06-30" in first_line
         assert "P10 / P50 / P90 →" in out
         assert PROVENANCE_MARKER in out
+        # The band line reports both the raw overlapping-window count and the ~independent
+        # count (n_obs // h). A daily 14-day horizon -> h=10 trading days.
+        assert "overlapping windows" in out
+        assert "independent" in out
+        h = horizon_steps("daily", 14)
+        assert f"~{series.size // h:,} independent" in out
 
     def test_note_rendered_and_band_withheld_when_not_model_target(self):
         series = _daily_positive_series("PAYEMS")
@@ -494,6 +501,9 @@ class TestRenderSpread:
         assert "- ^GSPC recent:" in out
         assert "relative-return band" in out
         assert "P10 / P50 / P90 →" in out
+        # The spread band line also reports the overlapping + ~independent window counts.
+        assert "overlapping windows" in out
+        assert "independent" in out
         # §g: spread sections carry an explicit mean-zero-prior disclaimer.
         assert "mean-zero by construction" in out
         assert "not a directional signal" in out
@@ -550,6 +560,25 @@ class TestRealizedMaxFloor:
         s = pd.Series([10.0, 12.0, 11.0, 15.0, 13.0], index=idx)
         assert _realized_max_floor(s, window_start=date(2026, 1, 3), ceiling=date(2026, 1, 3)) is None
         assert _realized_max_floor(s, window_start=None, ceiling=date(2026, 1, 3)) is None
+
+
+class TestEffectiveWindowCount:
+    """n_eff ~= n_obs // h captures that overlapping windows share observations, so
+    the independent-sample count is far below the raw overlapping-window count at
+    long horizons. Floored at 1 for degenerate inputs."""
+
+    def test_long_horizon_collapses_to_few_independent_windows(self):
+        # 15 years of daily data, 1-year (h=252 trading-day) horizon -> ~15 independent.
+        assert _n_eff(15 * 252, 252) == 15
+
+    def test_short_horizon_keeps_many_independent_windows(self):
+        assert _n_eff(3780, 10) == 378
+
+    def test_floored_at_one(self):
+        # Fewer observations than the horizon (never happens where the band renders,
+        # but the count must stay honest rather than go to zero).
+        assert _n_eff(5, 10) == 1
+        assert _n_eff(0, 10) == 1
 
 
 class TestRenderDerived:

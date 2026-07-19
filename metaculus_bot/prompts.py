@@ -415,28 +415,24 @@ TS_ANCHOR_SECTION_HEADER = "## Time Series Anchor"
 
 
 def _ts_anchor_evidence_clause() -> str:
-    """Numeric-only clause telling the forecaster how to weigh the Time Series
-    Anchor section when it is present.
+    """Numeric-only clause that points the forecaster at the Time Series Anchor
+    section and describes precisely what it contains, without prescribing how to
+    weigh it — the forecaster decides.
 
-    The anchor is a purely-statistical extrapolation of the resolution series'
-    own history (blind to news/events/policy), so the empirical P10/P90 band is a
-    CALIBRATED reference for how much the quantity moves at this horizon. Its
-    reason for existing is to SHARPEN, not to license more widening: our published
-    low tails have been badly too wide (cov@10 ≈ 0.03 vs a 0.10 target), and the
-    anchor exists to pull those in. Kept to roughly the market clause's length.
+    The anchor is a purely-statistical extrapolation of the resolution series' own
+    history (blind to news/events/policy): the empirical distribution of the
+    series' own past changes over this horizon, applied to the latest value. The
+    rendered section reports both the raw overlapping-window count and the ~effective
+    independent-window count, since overlap at long horizons leaves far fewer
+    independent observations than raw windows.
     """
     return (
-        "When the research contains a `## Time Series Anchor` section, treat it as CALIBRATED "
-        "REFERENCE EVIDENCE, not decoration. It is a purely-statistical extrapolation of the "
-        "resolution series' own history — blind to news, events, and policy — so its empirical "
-        "P10/P50/P90 band is a well-grounded estimate of how much this quantity actually moves at "
-        "this horizon. Center your percentiles near the anchor's center and keep your interval "
-        "close to its band UNLESS the rest of the research names a concrete catalyst (a scheduled "
-        "event, a policy change, a regime break) that justifies departing. Do NOT widen beyond the "
-        "anchor's band without naming that driver: our published low tails have historically been "
-        "far too wide (only ~3% of outcomes fell below our P10 vs a 10% target), so the anchor is "
-        "here to SHARPEN your distribution, not to add another license to widen. It is rebuttable "
-        "evidence — weigh it against everything else, and say so when you override it."
+        "The research may include a `## Time Series Anchor` section. It is a purely-statistical "
+        "extrapolation of the resolution series' own history — blind to news, events, and policy. "
+        "Its P10/P50/P90 band is the empirical distribution of the series' own past changes over "
+        "this horizon applied to the latest value; the section reports both the number of overlapping "
+        "windows the band is computed from and roughly how many of those are statistically independent "
+        "(overlap at long horizons leaves far fewer independent observations than raw windows)."
     )
 
 
@@ -840,7 +836,7 @@ def numeric_prompt(
 
         (8) Calibration and distribution shaping
             - Think in ranges, not single points.
-            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution (see the hedge audit above), and not beyond a calibrated anchor's band when one is present.
+            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution (see the hedge audit above).
             - Ensure strictly increasing percentiles.
             - Avoid scientific notation.
             - For a closed bound, no percentile may cross it. For an open bound, the displayed edge is NOT a hard limit — place percentiles at or beyond it when your reasoning puts probability mass there (see the bound notes above).
