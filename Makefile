@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -229,6 +229,13 @@ sync_all: sync_research sync_telemetry sync_raw_research
 # read-only resolutions pull, or ARGS="--perf-json <path>" for a pre-built dataset.
 score_ghosts:
 	uv run python scripts/score_ghosts.py $(ARGS)
+
+# Weekly close-margin watch over the CLOSE_MARGIN telemetry archive: p50/p10/min of
+# window-remaining-at-submit per ISO week + questions under the 30% red line. Read-only
+# + free (reads backtests/telemetry_archive/close_margin.jsonl; run sync_telemetry first).
+# ARGS="--red-line 0.5" for a tighter line, ARGS="--output <path>" to dump the summary JSON.
+close_margin_watch:
+	uv run python scripts/close_margin_watch.py $(ARGS)
 
 # Download run-log artifacts + harvest telemetry only (no research sync). Same script
 # as sync_telemetry; kept as a named target for parity with download_research.
