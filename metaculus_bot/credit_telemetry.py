@@ -94,6 +94,17 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
         return None
     try:
         data = fetch_auth_key(api_key)
+        # Build the snapshot INSIDE the try: fetch_auth_key returns
+        # ``payload.get("data", payload)``, so a 200 whose body carries a
+        # non-mapping ``data`` (``{"data": null}`` / ``{"data": [...]}``) yields a
+        # non-dict here, and ``data.get(...)`` then raises AttributeError. Keeping
+        # the .get() calls under the try means that malformed-but-200 case degrades
+        # to a WARNING + None like any other fetch failure, never crashing the run.
+        return KeyBalanceSnapshot(
+            alias=alias,
+            remaining_usd=_as_float(data.get("limit_remaining")),
+            usage_usd=_as_float(data.get("usage")),
+        )
     except (httpx.HTTPError, ValueError, KeyError, AttributeError) as exc:
         logger.warning(
             "CREDIT_BALANCE: key=%s phase=%s fetch failed (%s); continuing without balance telemetry",
@@ -102,11 +113,6 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
             type(exc).__name__,
         )
         return None
-    return KeyBalanceSnapshot(
-        alias=alias,
-        remaining_usd=_as_float(data.get("limit_remaining")),
-        usage_usd=_as_float(data.get("usage")),
-    )
 
 
 class CreditTelemetry:

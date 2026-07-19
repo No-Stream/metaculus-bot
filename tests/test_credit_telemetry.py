@@ -22,7 +22,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from metaculus_bot.credit_telemetry import CreditTelemetry
+from metaculus_bot.credit_telemetry import CreditTelemetry, _fetch_snapshot
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"
 PERSONAL_KEY = "sk-or-v1-PERSONALsecretCD34"
@@ -257,3 +257,21 @@ class TestFetchFailureHandling:
         all_output = "\n".join(record.getMessage() for record in caplog.records)
         assert DONATED_KEY not in all_output
         assert PERSONAL_KEY not in all_output
+
+
+class TestMalformedButOkPayload:
+    """A 200 whose body carries a non-mapping ``data`` (``fetch_auth_key`` returns
+    ``payload.get("data", payload)``, so ``{"data": null}`` / ``{"data": [...]}``
+    surface a non-dict here). ``_fetch_snapshot`` must degrade to WARNING + None,
+    never AttributeError out and abort the run before forecasting."""
+
+    @pytest.mark.parametrize("bad_data", [None, [1, 2, 3], "unexpected", 42])
+    def test_non_dict_payload_warns_and_returns_none(self, monkeypatch, caplog, bad_data) -> None:
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [bad_data]}
+        with _patch_fetch(responses), caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            snapshot = _fetch_snapshot("donated", phase="start")
+
+        assert snapshot is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("key=donated phase=start fetch failed (AttributeError)" in msg for msg in warnings)

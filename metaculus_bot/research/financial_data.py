@@ -415,9 +415,17 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
         mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0
         parts.append(f"- Change from previous: {mom_change:+.4g} ({mom_pct:+.2f}%)")
 
-    # Year-over-year change (try ~12 periods back)
-    if len(data) >= 13:
-        yoy_value = data.iloc[-13]
+    # Year-over-year change via a DATE-based lookup, not a fixed observation
+    # offset: `data.iloc[-13]` is one year back only on a monthly series; on a
+    # daily FRED series (DGS10, DGS2, T10Y2Y, ...) 13 observations is ~2.5 weeks,
+    # which would be mislabeled "year-over-year" in a live forecaster prompt. Take
+    # the most recent observation at or before ~365 days ago (label slice is
+    # inclusive; data is sorted ascending). Omit the line entirely when no such
+    # observation exists (series shorter than a year).
+    year_ago = latest_date - pd.Timedelta(days=365)
+    prior = data.loc[:year_ago]
+    if not prior.empty:
+        yoy_value = prior.iloc[-1]
         yoy_change = latest_value - yoy_value
         yoy_pct = (yoy_change / abs(float(yoy_value))) * 100 if yoy_value != 0 else 0
         parts.append(f"- Year-over-year change: {yoy_change:+.4g} ({yoy_pct:+.2f}%)")

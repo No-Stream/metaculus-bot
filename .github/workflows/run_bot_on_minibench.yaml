@@ -123,8 +123,8 @@ jobs:
           # Validated via live test_bot run 2026-07-10.
           RESOLUTION_SOURCE_ENABLED: 'true'
           # Time-series anchor: deterministic empirical P10/P50/P90 band from a
-          # question's own resolution series (FRED/yfinance). OFF pending the paid
-          # validation ladder (see FUTURE.md "Time-series anchor").
+          # question's own resolution series (FRED/yfinance). Text anchor ON since
+          # 2026-07-17 (post smoke validation; see FUTURE.md "Time-series anchor").
           TS_ANCHOR_ENABLED: 'true'
           # TS anchor chart image side-channel (vision message to base models).
           # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").

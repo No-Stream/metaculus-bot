@@ -87,10 +87,11 @@ TS_ANCHOR_ENABLE = datetime(2026, 7, 17, tzinfo=timezone.utc)  # "sharpen, don't
 def default_eras() -> list[Era]:
     """The three width-relevant config eras, oldest first.
 
-    ``ts_anchor`` is a forward-looking bucket: the anchor clause only bites once
-    the timeseries-anchor research provider is enabled in prod, so this bucket
-    will be empty until then, by design (it exists so post-enable records land
-    in their own era instead of contaminating the ``widening_off`` baseline).
+    ``ts_anchor`` is the active era from 2026-07-17 onward: the timeseries-anchor
+    "sharpen, don't widen" clause is enabled in prod as of that date, so records
+    published on/after it land in this bucket instead of contaminating the
+    ``widening_off`` baseline. (It stays empty only for as long as no post-enable
+    question has resolved and been pulled.)
     """
     return [
         Era("widening_on (k_tail=1.25)", None, WIDENING_FLIP),
@@ -221,6 +222,7 @@ def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | 
 class EraWidthMetrics:
     label: str
     n_pit: int
+    n_eff: int
     n_width: int
     n_oob_low: int
     n_oob_high: int
@@ -237,6 +239,7 @@ class EraWidthMetrics:
         return {
             "label": self.label,
             "n_pit": self.n_pit,
+            "n_eff": self.n_eff,
             "n_width": self.n_width,
             "n_oob_low": self.n_oob_low,
             "n_oob_high": self.n_oob_high,
@@ -251,10 +254,26 @@ class EraWidthMetrics:
         }
 
 
+def _n_effective_clusters(post_ids: list[object]) -> int:
+    """Count distinct question families for the CI's effective sample size.
+
+    Records sharing a ``post_id`` are one correlated family (same series/window,
+    multiple sub-questions per post). A record with no ``post_id`` (``None``) is
+    treated as its own family — assigned a unique sentinel by position so it is
+    never merged with another None-post record — since we can't prove it shares
+    a family with anything else.
+    """
+    clusters: set[object] = set()
+    for i, pid in enumerate(post_ids):
+        clusters.add(pid if pid is not None else f"__no_post_{i}")
+    return len(clusters)
+
+
 def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | None:
     """Compute width/calibration metrics for one era's records. Returns None if
     no numeric/discrete records in the era yield a PIT."""
     pits: list[float] = []
+    pit_post_ids: list[object] = []
     widths: list[float] = []
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
@@ -262,6 +281,7 @@ def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | No
         pit = compute_pit(r)
         if pit is not None:
             pits.append(pit)
+            pit_post_ids.append(r.get("post_id"))
         w = relative_band_width(r)
         if w is not None:
             widths.append(w)
@@ -276,14 +296,27 @@ def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | No
     cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
     cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
 
+    # Coverage CIs use n_eff (distinct post_ids), not the raw question count:
+    # ~62% of records share a post (same series/window, multiple sub-questions
+    # per post) and are correlated, so a naive n=question-count Jeffreys CI runs
+    # ~26% too narrow. Cluster on post_id only — the one grouping key already on
+    # every record; a record missing a post_id counts as its own cluster (via a
+    # unique sentinel) so it is never merged with another. The point estimate is
+    # unchanged (cov_k / n); only the CI width widens to reflect n_eff clusters,
+    # via jeffreys_ci(round(cov_k * n_eff / n), n_eff).
+    n_eff = _n_effective_clusters(pit_post_ids)
+    cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
+    cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
+
     return EraWidthMetrics(
         label=label,
         n_pit=n,
+        n_eff=n_eff,
         n_width=len(widths),
         n_oob_low=n_oob_low,
         n_oob_high=n_oob_high,
-        cov80=jeffreys_ci(cov80_k, n),
-        cov50=jeffreys_ci(cov50_k, n),
+        cov80=cov80,
+        cov50=cov50,
         cov_at_10=float((arr <= 0.10).mean()),
         cov_at_50=float((arr <= 0.50).mean()),
         cov_at_90=float((arr <= 0.90).mean()),
@@ -332,20 +365,22 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "Calibrated targets: cov80=0.80, cov50=0.50, cov@10=0.10, cov@50=0.50, "
         f"cov@90=0.90, PIT std={UNIFORM_PIT_STD:.3f}. "
         "PIT std below target => too WIDE; above => too NARROW. "
-        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness)."
+        "cov@10 below 0.10 => low tail too wide; median rel width = (P90-P10)/|P50| (raw sharpness). "
+        "cov80/cov50 CIs are computed at n_eff (distinct post_ids), not n: questions cluster into "
+        "correlated families (multiple sub-questions per post), so a naive n-based CI is too narrow."
     )
     lines.append("")
     header = (
-        "| era | n | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
+        "| era | n | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
         "| PIT std | mean PIT | med rel width (n) | OOB lo/hi |"
     )
-    sep = "|" + "|".join(["---"] * 11) + "|"
+    sep = "|" + "|".join(["---"] * 12) + "|"
     lines.append(header)
     lines.append(sep)
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
         lines.append(
-            f"| {m.label} | {m.n_pit} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
+            f"| {m.label} | {m.n_pit} | {m.n_eff} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
             f"| {m.cov_at_10:.3f} | {m.cov_at_50:.3f} | {m.cov_at_90:.3f} "
             f"| {m.pit_std:.3f} | {m.mean_pit:.3f} | {rel} | {m.n_oob_low}/{m.n_oob_high} |"
         )

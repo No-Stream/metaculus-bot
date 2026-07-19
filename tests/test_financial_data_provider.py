@@ -239,6 +239,72 @@ class TestFetchFredData:
         assert result == ""
 
 
+class TestRenderFredSeriesYoY:
+    """The year-over-year line must use a DATE-based ~365-day lookup, not a fixed
+    13-observation offset (F8). On a daily series 13 observations is ~2.5 weeks, so
+    the old offset mislabeled a two-and-a-half-week move as year-over-year."""
+
+    @staticmethod
+    def _yoy_change_from(markdown: str) -> float:
+        """Pull the signed YoY change value out of the rendered markdown line."""
+        for line in markdown.splitlines():
+            if line.startswith("- Year-over-year change:"):
+                # "- Year-over-year change: +12.3 (+4.56%)" -> "+12.3"
+                return float(line.split(":", 1)[1].strip().split(" ")[0])
+        raise AssertionError(f"no year-over-year line in:\n{markdown}")
+
+    def test_daily_series_uses_365d_ago_value_not_obs_minus_13(self) -> None:
+        from metaculus_bot.research.financial_data import _render_fred_series
+
+        # 800 business days ending 2026-03-02. The value is a linear ramp from 0.0
+        # to 799.0 (one unit per observation), so the value at any date equals its
+        # integer offset from the start — making the two lookups trivially distinct.
+        dates = pd.bdate_range(end="2026-03-02", periods=800)
+        data = pd.Series(np.arange(800.0), index=dates, name="DGS10")
+
+        latest_value = float(data.iloc[-1])  # 799.0
+        # obs[-13] (the OLD, wrong behavior) is ~2.5 weeks back, not a year.
+        wrong_offset_value = float(data.iloc[-13])  # 787.0
+        # The date-based lookup: last observation at or before ~365 days ago.
+        year_ago = data.index[-1] - pd.Timedelta(days=365)
+        correct_value = float(data.loc[:year_ago].iloc[-1])
+
+        markdown = _render_fred_series("DGS10", data, "10Y Treasury rate")
+        rendered_yoy = self._yoy_change_from(markdown)
+
+        assert rendered_yoy == pytest.approx(latest_value - correct_value, abs=1e-6)
+        # And is materially different from the old fixed-offset result.
+        assert rendered_yoy != pytest.approx(latest_value - wrong_offset_value, abs=1e-6)
+
+    def test_monthly_series_still_correct(self) -> None:
+        from metaculus_bot.research.financial_data import _render_fred_series
+
+        # 60 monthly observations; the value ~12 months back is one year ago.
+        dates = pd.date_range(end="2026-03-01", periods=60, freq="MS")
+        data = pd.Series(np.arange(60.0), index=dates, name="UNRATE")
+
+        latest_value = float(data.iloc[-1])
+        year_ago = data.index[-1] - pd.Timedelta(days=365)
+        expected_prior = float(data.loc[:year_ago].iloc[-1])
+
+        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
+        rendered_yoy = self._yoy_change_from(markdown)
+
+        assert rendered_yoy == pytest.approx(latest_value - expected_prior, abs=1e-6)
+
+    def test_short_series_omits_yoy_line(self) -> None:
+        from metaculus_bot.research.financial_data import _render_fred_series
+
+        # Only ~3 months of monthly data: nothing is ~365 days back, so the YoY
+        # line is omitted rather than reaching for a nonexistent observation.
+        dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
+        data = pd.Series(np.arange(3.0), index=dates, name="UNRATE")
+
+        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
+
+        assert "Year-over-year change" not in markdown
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (full provider flow)
 # ---------------------------------------------------------------------------

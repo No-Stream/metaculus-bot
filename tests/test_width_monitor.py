@@ -154,6 +154,60 @@ class TestEraMetrics:
     def test_returns_none_without_numeric(self):
         assert compute_era_metrics("empty", [{"type": "binary"}]) is None
 
+    def test_no_post_id_makes_n_eff_equal_n(self):
+        # Synthetic records without post_id => each is its own cluster => n_eff == n,
+        # so the coverage CIs match the naive jeffreys_ci(cov_k, n) exactly.
+        recs = [_linear_cdf_record(resolution=r) for r in (5.0, 15.0, 50.0, 85.0, 95.0)]
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_eff == m.n_pit == 5
+        assert m.cov80 == pytest.approx(jeffreys_ci(3, 5))
+        assert m.cov50 == pytest.approx(jeffreys_ci(1, 5))
+
+
+class TestEraMetricsClustering:
+    """F3: coverage CIs use n_eff (distinct post_ids), not the raw question count.
+    Correlated question families (multiple sub-questions per post) otherwise make
+    the Jeffreys CI too narrow."""
+
+    def test_six_questions_two_posts_widen_ci_to_n_eff(self):
+        # 6 questions across 2 posts; all PITs land inside [0.10, 0.90] so cov80_k=6.
+        recs = []
+        for i, res in enumerate((20.0, 30.0, 40.0, 60.0, 70.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 1 if i < 3 else 2  # 3 sub-questions per post
+            recs.append(rec)
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == 6
+        assert m.n_eff == 2
+        # Point estimate uses round(cov_k * n_eff / n) over n_eff: round(6*2/6)=2 of 2.
+        assert m.cov80 == pytest.approx(jeffreys_ci(2, 2))
+        # The clustered CI is materially WIDER than the naive n=6 CI.
+        naive_lo, naive_hi = jeffreys_ci(6, 6)[1], jeffreys_ci(6, 6)[2]
+        _mean, clustered_lo, clustered_hi = m.cov80
+        assert (clustered_hi - clustered_lo) > (naive_hi - naive_lo)
+
+    def test_missing_post_id_counts_as_own_cluster(self):
+        # Two records share a post; one has no post_id => 2 clusters total.
+        recs = [_linear_cdf_record(resolution=50.0) for _ in range(3)]
+        recs[0]["post_id"] = 7
+        recs[1]["post_id"] = 7
+        # recs[2] intentionally has no post_id.
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == 3
+        assert m.n_eff == 2
+
+    def test_n_eff_rendered_in_markdown(self):
+        recs = []
+        for i, res in enumerate((20.0, 40.0, 60.0, 80.0)):
+            rec = _linear_cdf_record(resolution=res)
+            rec["post_id"] = 1 if i < 2 else 2
+            recs.append(rec)
+        md = render_markdown(compute_all_eras(recs))
+        assert "n_eff" in md
+
 
 class TestComputeAllEras:
     def test_buckets_by_era_and_emits_all_row(self):

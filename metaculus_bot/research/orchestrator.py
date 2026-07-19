@@ -40,7 +40,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.llm_retry import invoke_with_broad_retry
-from metaculus_bot.prompts import asknews_summarizer_prompt
+from metaculus_bot.prompts import TS_ANCHOR_SECTION_HEADER, asknews_summarizer_prompt
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
@@ -480,7 +480,7 @@ class ResearchOrchestrator:
             "native_search": "## Web Research (Native Search)",
             "gemini_search": "## Web Research (Google Search via Gemini)",
             "financial_data": "## Financial & Economic Data",
-            "timeseries_anchor": "## Time Series Anchor",
+            "timeseries_anchor": TS_ANCHOR_SECTION_HEADER,
             "prediction_market": "## Prediction Market Snapshot",
             "resolution_source": "## Resolution Source Snapshot",
             "exa": "## Web Research (Exa)",
