@@ -1,24 +1,27 @@
-"""Score gap-fill v2 GHOST_FORECAST markers against resolutions (paired vs published).
+"""Score gap-fill v2 ghost forecasts against resolutions (paired vs published).
 
 The agentic gap-fill loop (v2) logs an unpublished "ghost" forecast per question for
-telemetry (``GHOST_FORECAST: qtype=... summary=...``). Comparing those ghosts to the
-actually-published forecast on resolved questions is the NAMED GATE for retiring v1
-gap-fill: if the v2-driven ghost consistently out-scores the published forecast, v2 is
-carrying its weight.
+telemetry. Comparing those ghosts to the actually-published forecast on resolved
+questions is the NAMED GATE for retiring v1 gap-fill: if the v2-driven ghost
+consistently out-scores the published forecast, v2 is carrying its weight.
+
+Two marker sources, in preference order:
+
+* ``GHOST_FORECAST_JSON`` — the full-fidelity companion marker (a compact JSON blob:
+  binary posterior, complete MC option probs, or the complete percentile set + median
+  for numeric). Preferred when present — it makes numeric ghosts scoreable, not just
+  countable.
+* ``GHOST_FORECAST``      — the legacy lossy summary line. Falls back to this for the
+  pre-upgrade era (binary/MC scoreable from the summary; numeric exposes a median only,
+  so it stays unscoreable there).
+
+Both are harvested into ``backtests/telemetry_archive/`` by ``make sync_telemetry``.
+Resolved-question records come from a pre-built performance-analysis dataset JSON
+(``--perf-json``) or a live read-only pull (``--tournament``, free).
 
 This is scaffold quality by design. v2 shipped to prod 2026-07-17, so there are ~0
 resolved v2-era questions today; the scorer must run cleanly and report ``n=0, waiting
 on resolutions`` rather than error. It will be hardened once real deltas exist.
-
-INPUTS:
-* ghosts   — ``ghost_forecast.jsonl`` from ``backtests/telemetry_archive/`` (harvested
-             by ``make sync_telemetry``).
-* records  — resolved-question records: either a pre-built performance-analysis dataset
-             JSON (``--perf-json``) or a live read-only pull (``--tournament``, free).
-
-Only binary ghosts (full posterior) and MC ghosts (full option probs) are scoreable
-from the marker. Numeric ghosts expose only a median in the marker, so no numeric log
-score is computable from telemetry alone — they're counted, not scored.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-from metaculus_bot.scoring_common import binary_log_score, mc_log_score
+from metaculus_bot.scoring_common import binary_log_score, mc_log_score, numeric_log_score
 from scripts.telemetry.archive import load_marker_records
 
 logger = logging.getLogger(__name__)
@@ -43,7 +46,7 @@ _MC_PAIR_RE = re.compile(rf"(?P<name>[^=,]+)=(?P<prob>{_FLOAT})")
 
 
 def parse_ghost_summary(qtype: str, summary: str) -> float | dict[str, float] | None:
-    """Parse a GHOST_FORECAST ``summary=`` payload into a scoreable value.
+    """Parse a legacy ``GHOST_FORECAST`` ``summary=`` payload into a scoreable value.
 
     * binary          -> ``float`` posterior probability
     * multiple_choice -> ``{option_name: prob}``
@@ -83,14 +86,95 @@ def _latest_ghost_per_qid(ghosts: list[dict]) -> dict[int, dict]:
     return latest
 
 
+def _normalize_json_ghost(record: dict) -> dict | None:
+    """Turn a harvested ``ghost_forecast_json`` record into a normalized ghost, or None.
+
+    The ``forecast_json`` field is a raw JSON string (never coerced by the marker
+    parser). None if it is missing / malformed so the caller can fall back to any
+    legacy ghost for the same qid.
+    """
+    raw = record.get("forecast_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {"qid": record.get("qid"), "qtype": payload.get("qtype"), "source": "json", "payload": payload}
+
+
+def _select_ghost_per_qid(json_ghosts: list[dict], legacy_ghosts: list[dict]) -> dict[int, dict]:
+    """Pick one normalized ghost to score per qid: JSON-source preferred, legacy fallback.
+
+    JSON ghosts carry the full forecast (deterministically parsable); legacy ghosts
+    carry only the lossy summary string. Within each source we keep the latest per
+    qid; a (well-formed) JSON ghost always wins over a legacy one for the same qid.
+    """
+    selected: dict[int, dict] = {}
+    for qid, record in _latest_ghost_per_qid(legacy_ghosts).items():
+        selected[qid] = {
+            "qid": qid,
+            "qtype": record.get("qtype"),
+            "source": "legacy",
+            "summary": record.get("summary", ""),
+        }
+    for qid, record in _latest_ghost_per_qid(json_ghosts).items():
+        normalized = _normalize_json_ghost(record)
+        if normalized is not None:
+            selected[qid] = normalized
+    return selected
+
+
+def _binary_prob(ghost: dict) -> float | None:
+    """Ghost's posterior probability, from either source."""
+    if ghost["source"] == "json":
+        prob = ghost["payload"].get("prob")
+        return float(prob) if isinstance(prob, (int, float)) and not isinstance(prob, bool) else None
+    parsed = parse_ghost_summary("binary", ghost.get("summary", ""))
+    return parsed if isinstance(parsed, float) else None
+
+
+def _mc_probs(ghost: dict) -> dict[str, float] | None:
+    """Ghost's option->prob dict, from either source."""
+    if ghost["source"] == "json":
+        option_probs = ghost["payload"].get("option_probs")
+        if not isinstance(option_probs, dict) or not option_probs:
+            return None
+        try:
+            return {str(name): float(prob) for name, prob in option_probs.items()}
+        except (TypeError, ValueError):
+            return None
+    parsed = parse_ghost_summary("multiple_choice", ghost.get("summary", ""))
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _numeric_percentiles(ghost: dict) -> dict[float, float] | None:
+    """Ghost's full percentile->value map (fraction keys in [0, 1]), or None.
+
+    Only JSON-source ghosts carry the full percentile set; the legacy marker exposes
+    a median only and so can't be turned into a CDF.
+    """
+    if ghost["source"] != "json":
+        return None
+    declared = ghost["payload"].get("declared_percentiles")
+    if not isinstance(declared, dict) or len(declared) < 2:
+        return None
+    try:
+        return {float(pct): float(value) for pct, value in declared.items()}
+    except (TypeError, ValueError):
+        return None
+
+
 def _score_binary(ghost: dict, record: dict) -> dict | None:
     """Paired binary log-score row (ghost vs published), or None if not scoreable."""
     resolution = record.get("resolution_parsed")
     if not isinstance(resolution, bool):
         return None
-    ghost_p = parse_ghost_summary("binary", ghost.get("summary", ""))
+    ghost_p = _binary_prob(ghost)
     published_p = record.get("our_prob_yes")
-    if not isinstance(ghost_p, float) or published_p is None:
+    if ghost_p is None or published_p is None:
         return None
     ghost_ls = binary_log_score(ghost_p, resolution)
     published_ls = binary_log_score(float(published_p), resolution)
@@ -110,7 +194,7 @@ def _score_mc(ghost: dict, record: dict) -> dict | None:
     resolution = record.get("resolution_parsed")
     options = record.get("options") or []
     published_values = record.get("our_forecast_values")
-    ghost_probs = parse_ghost_summary("multiple_choice", ghost.get("summary", ""))
+    ghost_probs = _mc_probs(ghost)
     if not isinstance(resolution, str) or resolution not in options:
         return None
     if not isinstance(ghost_probs, dict) or not all(opt in ghost_probs for opt in options):
@@ -130,6 +214,81 @@ def _score_mc(ghost: dict, record: dict) -> dict | None:
     }
 
 
+def _score_numeric(ghost: dict, record: dict) -> dict:
+    """Attempt a paired numeric log-score (ghost vs published).
+
+    Builds the ghost's CDF from its declared percentiles with the production PCHIP
+    builder, on the SAME grid length as the published CDF, then scores both with the
+    same Metaculus PMF-bucket log score on identical bounds/scaling — so the delta is
+    a clean paired comparison. Always returns a dict with ``scoreable``; when False,
+    ``reason`` names the gap so the report can surface it instead of silently dropping.
+    """
+    qid = ghost["qid"]
+    percentiles = _numeric_percentiles(ghost)
+    if percentiles is None:
+        reason = "legacy_median_only" if ghost["source"] == "legacy" else "no_declared_percentiles"
+        return {"qid": qid, "scoreable": False, "reason": reason}
+
+    published_cdf = record.get("our_forecast_values")
+    if not published_cdf or len(published_cdf) < 2:
+        return {"qid": qid, "scoreable": False, "reason": "no_published_cdf"}
+
+    # Lazy imports: the PCHIP builder pulls numpy/scipy and the collector helper drags
+    # the collector's heavy import chain (requests, env loading). Keep the n=0 path
+    # dependency-light — numeric scoring only runs once real records join.
+    from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
+        generate_pchip_cdf,
+    )
+    from metaculus_bot.performance_analysis.collector import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
+        resolve_numeric_record_to_score_inputs,
+    )
+
+    score_inputs = resolve_numeric_record_to_score_inputs(record)
+    if score_inputs is None:
+        return {"qid": qid, "scoreable": False, "reason": "no_score_inputs"}
+    res_float, lower, upper, zero_point = score_inputs
+    open_lower = bool(record.get("open_lower_bound", False))
+    open_upper = bool(record.get("open_upper_bound", False))
+
+    # generate_pchip_cdf expects percentile keys in (0, 100); ghosts carry fraction
+    # keys in [0, 1]. Match the ghost grid to the published grid length so both score
+    # with identical PMF bucketing; min_step follows Metaculus' round(0.01 / N, 9).
+    pct_values = {frac * 100.0: value for frac, value in percentiles.items()}
+    num_points = len(published_cdf)
+    min_step = round(0.01 / (num_points - 1), 9)
+    try:
+        ghost_cdf, _ = generate_pchip_cdf(
+            pct_values,
+            open_upper,
+            open_lower,
+            upper,
+            lower,
+            zero_point,
+            min_step=min_step,
+            num_points=num_points,
+        )
+    except (ValueError, RuntimeError):
+        return {"qid": qid, "scoreable": False, "reason": "cdf_build_failed"}
+
+    try:
+        ghost_ls = numeric_log_score(ghost_cdf, res_float, lower, upper, open_lower, open_upper, zero_point)
+        published_ls = numeric_log_score(
+            list(published_cdf), res_float, lower, upper, open_lower, open_upper, zero_point
+        )
+    except (ValueError, ZeroDivisionError):
+        return {"qid": qid, "scoreable": False, "reason": "score_failed"}
+
+    return {
+        "qid": qid,
+        "scoreable": True,
+        "reason": None,
+        "resolution": res_float,
+        "ghost_log_score": ghost_ls,
+        "published_log_score": published_ls,
+        "delta": ghost_ls - published_ls,
+    }
+
+
 def _summarize_rows(rows: list[dict]) -> dict:
     return {
         "n": len(rows),
@@ -138,22 +297,29 @@ def _summarize_rows(rows: list[dict]) -> dict:
     }
 
 
-def join_and_score(ghosts: list[dict], records: list[dict]) -> dict:
-    """Join latest ghosts to resolved records and compute paired log-score deltas.
+def join_and_score(json_ghosts: list[dict], legacy_ghosts: list[dict], records: list[dict]) -> dict:
+    """Join the latest ghost per qid to resolved records and compute paired log-score deltas.
 
-    Returns a summary dict with per-qtype breakdowns. Everything is pure/in-memory so
-    the n=0 path (no resolved v2-era questions yet) is exercised in tests.
+    JSON-source ghosts (full forecast) are preferred over legacy summary-only ghosts
+    for the same qid. Binary, MC, and — new with the JSON marker — numeric ghosts are
+    all scoreable. Everything is pure/in-memory so the n=0 path (no resolved v2-era
+    questions yet) is exercised in tests.
     """
     records_by_qid = {r.get("question_id"): r for r in records}
-    latest = _latest_ghost_per_qid(ghosts)
+    selected = _select_ghost_per_qid(json_ghosts, legacy_ghosts)
+
+    source_counts: dict[str, int] = {"json": 0, "legacy": 0}
+    for ghost in selected.values():
+        source_counts[ghost["source"]] = source_counts.get(ghost["source"], 0) + 1
 
     binary_rows: list[dict] = []
     mc_rows: list[dict] = []
+    numeric_rows: list[dict] = []
+    numeric_unscoreable: dict[str, int] = {}
     numeric_joined = 0
-    numeric_unscoreable = 0
     n_joined = 0
 
-    for qid, ghost in latest.items():
+    for qid, ghost in selected.items():
         record = records_by_qid.get(qid)
         if record is None:
             continue
@@ -169,30 +335,43 @@ def join_and_score(ghosts: list[dict], records: list[dict]) -> dict:
                 mc_rows.append(row)
         elif qtype == "numeric":
             numeric_joined += 1
-            numeric_unscoreable += 1
+            outcome = _score_numeric(ghost, record)
+            if outcome["scoreable"]:
+                numeric_rows.append(outcome)
+            else:
+                reason = outcome["reason"]
+                numeric_unscoreable[reason] = numeric_unscoreable.get(reason, 0) + 1
 
     return {
-        "n_ghosts": len(latest),
+        "n_ghosts": len(selected),
         "n_joined": n_joined,
-        "n_scored": len(binary_rows) + len(mc_rows),
+        "n_scored": len(binary_rows) + len(mc_rows) + len(numeric_rows),
+        "source_counts": source_counts,
         "binary": _summarize_rows(binary_rows),
         "multiple_choice": _summarize_rows(mc_rows),
-        "numeric": {"n_joined": numeric_joined, "n_unscoreable": numeric_unscoreable},
+        "numeric": {
+            **_summarize_rows(numeric_rows),
+            "n_joined": numeric_joined,
+            "n_unscoreable": sum(numeric_unscoreable.values()),
+            "unscoreable_reasons": numeric_unscoreable,
+        },
     }
 
 
 def render_report(summary: dict) -> str:
     """Human-readable summary. A positive mean delta = ghost out-scores published."""
+    source_counts = summary["source_counts"]
     lines = [
         "=== Ghost-forecast scoring (gap-fill v2 ghost vs published) ===",
         f"Ghosts (latest per qid): {summary['n_ghosts']}",
+        f"  by source: json={source_counts.get('json', 0)} legacy={source_counts.get('legacy', 0)}",
         f"Joined to resolved-question dataset: {summary['n_joined']}",
     ]
     if summary["n_scored"] == 0:
         lines.append("Scored ghosts: n=0 — waiting on resolutions (v2 shipped 2026-07-17; expected today).")
     else:
         lines.append(f"Scored ghosts: {summary['n_scored']}")
-    for qtype in ("binary", "multiple_choice"):
+    for qtype in ("binary", "multiple_choice", "numeric"):
         block = summary[qtype]
         if block["n"]:
             delta = block["mean_delta"]
@@ -201,9 +380,11 @@ def render_report(summary: dict) -> str:
     numeric = summary["numeric"]
     if numeric["n_joined"]:
         lines.append(
-            f"  numeric: {numeric['n_joined']} joined, {numeric['n_unscoreable']} unscoreable "
-            "(marker exposes median only)"
+            f"  numeric coverage: {numeric['n_joined']} joined, "
+            f"{numeric['n']} scored, {numeric['n_unscoreable']} unscoreable"
         )
+        for reason, count in sorted(numeric["unscoreable_reasons"].items()):
+            lines.append(f"    - {reason}: {count}")
     return "\n".join(lines)
 
 
@@ -238,11 +419,15 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
-    ghosts = load_marker_records(Path(args.archive_dir), "ghost_forecast")
-    logger.info(f"Loaded {len(ghosts)} ghost_forecast record(s) from {args.archive_dir}")
+    json_ghosts = load_marker_records(Path(args.archive_dir), "ghost_forecast_json")
+    legacy_ghosts = load_marker_records(Path(args.archive_dir), "ghost_forecast")
+    logger.info(
+        f"Loaded {len(json_ghosts)} ghost_forecast_json + {len(legacy_ghosts)} legacy ghost_forecast "
+        f"record(s) from {args.archive_dir}"
+    )
 
     records = _load_records(args.perf_json, args.tournament)
-    summary = join_and_score(ghosts, records)
+    summary = join_and_score(json_ghosts, legacy_ghosts, records)
     print(render_report(summary))
 
     if args.output:

@@ -44,8 +44,9 @@ class ResearchPersistenceWriter:
         to None so older callers (and backfill paths) keep working.
 
         ``gap_fill_v2`` carries the agentic-loop trace (``transcript`` +
-        ``telemetry`` dicts) when the v2 loop ran; the key is written only in
-        that case so records stay compact when the flag is off.
+        ``telemetry`` + ``ghost`` dicts, the last nullable) when the v2 loop
+        ran; the key is written only in that case so records stay compact when
+        the flag is off.
 
         ``provider_diagnostics_block`` is the rendered ``## Provider Diagnostics``
         markdown. Since the diagnostics seam (2026-07) it is no longer embedded in

@@ -535,18 +535,32 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     )
 
 
-def _summarize_ghost(raw_text: str) -> tuple[str, str]:
+def _summarize_ghost(raw_text: str) -> tuple[str, str, dict[str, Any] | None]:
+    """Parse the ghost's structured block once into ``(qtype, legacy_summary, forecast)``.
+
+    ``legacy_summary`` is the lossy human-readable string kept for the
+    back-compat ``GHOST_FORECAST`` marker. ``forecast`` is the full,
+    deterministically-parsable payload for the ``GHOST_FORECAST_JSON`` marker:
+    the posterior probability (binary), the complete option->prob dict (MC), or
+    the complete percentile->value dict plus the median (numeric). ``None`` when
+    no block parses — the JSON marker line is then suppressed and only the
+    legacy ``unknown``/``""`` marker is emitted.
+    """
     for qtype in ("binary", "multiple_choice", "numeric"):
         block = parse_structured_block(raw_text, qtype)
         if isinstance(block, BinaryStructured):
-            return "binary", f"posterior_prob={float(block.posterior_prob):.4f}"
+            prob = float(block.posterior_prob)
+            return "binary", f"posterior_prob={prob:.4f}", {"qtype": "binary", "prob": prob}
         if isinstance(block, MultipleChoiceStructured):
-            probs = ", ".join(f"{name}={prob:.3f}" for name, prob in sorted(block.option_probs.items()))
-            return "multiple_choice", probs
+            option_probs = {name: float(prob) for name, prob in block.option_probs.items()}
+            summary = ", ".join(f"{name}={prob:.3f}" for name, prob in sorted(option_probs.items()))
+            return "multiple_choice", summary, {"qtype": "multiple_choice", "option_probs": option_probs}
         if isinstance(block, NumericStructured) and block.declared_percentiles:
-            median = block.declared_percentiles.get(0.5)
-            return "numeric", "" if median is None else f"median={median}"
-    return "unknown", ""
+            declared = {float(pct): float(value) for pct, value in block.declared_percentiles.items()}
+            median = declared.get(0.5)
+            summary = "" if median is None else f"median={median}"
+            return "numeric", summary, {"qtype": "numeric", "declared_percentiles": declared, "median": median}
+    return "unknown", "", None
 
 
 async def _run_ghost_phase(
@@ -569,9 +583,17 @@ async def _run_ghost_phase(
         return None
 
     raw_text = assistant_message["content"]
-    qtype, parsed_summary = _summarize_ghost(raw_text)
+    qtype, parsed_summary, forecast = _summarize_ghost(raw_text)
     ghost = GhostForecast(qtype=qtype, raw_text=raw_text, parsed_summary=parsed_summary)
     logger.info("%sGHOST_FORECAST: qtype=%s summary=%s", log_prefix, ghost.qtype, ghost.parsed_summary)
+    # Additive full-fidelity companion marker: the legacy line above stays
+    # byte-identical (harvested archive + other tests depend on it); this one
+    # carries the complete, deterministically-parsable forecast so numeric
+    # ghosts (not just their median) are scoreable. qid is carried the same way
+    # as GHOST_FORECAST — via ``log_prefix`` — so the harvester derives it
+    # identically. Suppressed when no block parsed (nothing to serialize).
+    if forecast is not None:
+        logger.info("%sGHOST_FORECAST_JSON: %s", log_prefix, json.dumps(forecast, separators=(",", ":")))
     return ghost
 
 

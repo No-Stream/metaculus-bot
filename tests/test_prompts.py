@@ -955,6 +955,15 @@ class TestAskNewsSummarizerPrompt:
         assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
         assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
 
+    def test_preserves_conditionality_rule(self) -> None:
+        """BTF-2 lesson: research found a crucial hedge and synthesis dropped the
+        conditionality. The summarizer must keep a condition attached to its
+        claim, never flattening 'X if Y' into an unconditional 'X'."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Preserve conditionality" in collapsed
+        assert "keep the condition attached to the claim" in collapsed
+        assert "never report a conditional statement as an unconditional one" in collapsed
+
     def test_supersession_and_deadline_arithmetic_rule(self) -> None:
         """2026-07-18 AskNews audit R2: newer facts govern, superseded ones are
         compressed, and deadline questions must surface the arithmetic inputs

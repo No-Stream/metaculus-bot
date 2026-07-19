@@ -441,7 +441,7 @@ GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
 GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
 # Parallel tool calls each count against the cap; steps are where latency
 # lives, so batching is encouraged rather than rationed.
-GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 14)
+GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 20)
 # Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
 # 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
 # no research-phase wall-clock. The loop is anytime: hitting the deadline

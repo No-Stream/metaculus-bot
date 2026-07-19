@@ -14,6 +14,8 @@ tests loudly instead of silently dropping records from the archive:
      in markers.py for why they rarely appear in run logs).
 """
 
+import json
+
 from scripts.telemetry.markers import (
     MARKER_SPECS,
     coerce_value,
@@ -37,6 +39,16 @@ GAP_FILL_V2_LINE = (
 GHOST_FORECAST_LINE = (
     "2026-07-17 14:25:11,000 - metaculus_bot.research.agentic.loop - INFO - "
     "question=https://www.metaculus.com/questions/38975/ GHOST_FORECAST: qtype=binary summary=posterior_prob=0.4200"
+)
+GHOST_FORECAST_JSON_LINE = (
+    "2026-07-17 14:25:11,001 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_FORECAST_JSON: "
+    '{"qtype":"binary","prob":0.42}'
+)
+GHOST_FORECAST_JSON_NUMERIC_LINE = (
+    "2026-07-17 14:25:11,002 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=12 GHOST_FORECAST_JSON: "
+    '{"qtype":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0},"median":20.5}'
 )
 OPEN_BOUND_PILING_LINE = (
     PFX_WARN + "OPEN_BOUND_PILING: question=51000 model=gemini-3.1-pro-preview bound=upper "
@@ -193,6 +205,34 @@ class TestGhostForecast:
         rec = _parse_one(line)
         assert rec["qtype"] == "numeric"
         assert rec["summary"] == "median=42.5"
+
+
+class TestGhostForecastJson:
+    def test_binary_payload_round_trips(self):
+        rec = _parse_one(GHOST_FORECAST_JSON_LINE)
+        assert rec["marker"] == "ghost_forecast_json"
+        # qid is carried via the log_prefix leading group, exactly like GHOST_FORECAST.
+        assert rec["qid"] == 38975
+        # forecast_json stays a raw string (never coerced) so the scorer can json.loads it.
+        assert json.loads(rec["forecast_json"]) == {"qtype": "binary", "prob": 0.42}
+
+    def test_numeric_payload_carries_full_percentiles(self):
+        rec = _parse_one(GHOST_FORECAST_JSON_NUMERIC_LINE)
+        assert rec["marker"] == "ghost_forecast_json"
+        assert rec["qid"] == 12
+        payload = json.loads(rec["forecast_json"])
+        assert payload == {
+            "qtype": "numeric",
+            "declared_percentiles": {"0.1": 10.0, "0.5": 20.5, "0.9": 30.0},
+            "median": 20.5,
+        }
+
+    def test_does_not_collide_with_legacy_ghost_forecast(self):
+        # A legacy GHOST_FORECAST line must NOT be mis-harvested as ghost_forecast_json,
+        # and a GHOST_FORECAST_JSON line must NOT match the legacy spec — the two tokens
+        # are mutually exclusive under the one-marker-per-line break.
+        assert _parse_one(GHOST_FORECAST_LINE)["marker"] == "ghost_forecast"
+        assert _parse_one(GHOST_FORECAST_JSON_LINE)["marker"] == "ghost_forecast_json"
 
 
 class TestOpenBoundPiling:

@@ -187,6 +187,42 @@ class TestRunGapFillV2Seam:
         ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
         assert roles[0] == "system"
         assert "tool" in roles
+        # The serialized ghost forecast is archived alongside transcript+telemetry
+        # (dict, not a GhostForecast) so the payload stays an opaque JSON blob.
+        ghost = payload["ghost"]
+        assert isinstance(ghost, dict)
+        assert ghost["qtype"] == "binary"
+        assert ghost["parsed_summary"] == "posterior_prob=0.1200"
+        assert _GHOST_BLOCK.split("\n", 1)[1].rsplit("\n", 1)[0] in ghost["raw_text"]
+
+    @pytest.mark.asyncio
+    async def test_archive_sink_ghost_none_when_ghost_phase_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No ghost turn (loop concludes without an explicit conclude call that
+        triggers the ghost phase) → payload carries ghost=None, not a missing key."""
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        captured: list[dict] = []
+        # Search, then two bare no-tool-call turns: the first triggers the
+        # single no-action nudge, the second stops the loop. conclude is never
+        # called, so state.explicit_conclude stays False and the ghost phase is
+        # skipped (ghost=None).
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("c1", "search_web", {"query": "q"})]),
+                _response(content="no more tool calls"),
+                _response(content="still nothing to do"),
+            ]
+        )
+        llm_patch, tools_patch = _patch_loop_internals(fake_llm)
+        with llm_patch, tools_patch:
+            await run_gap_fill_v2(
+                make_real_binary_question(),
+                BUNDLE,
+                is_benchmarking=False,
+                archive_sink=captured.append,
+            )
+        assert len(captured) == 1
+        assert "ghost" in captured[0]
+        assert captured[0]["ghost"] is None
 
 
 class TestDriverSystemPromptBaseRateTriage:
@@ -201,6 +237,45 @@ class TestDriverSystemPromptBaseRateTriage:
         assert "SKIP the lookup" in prompt
         assert "common knowledge" in prompt
         assert "real denominator and count" in prompt
+
+    def test_base_rate_bullet_carries_process_change_check(self) -> None:
+        """BTF-2 lesson: a rate from a changed regime (new gatekeeper, rule, or
+        coalition) is itself a finding — the bullet must prompt the process-still-
+        holds check, not just the denominator lookup."""
+        # Collapse whitespace so assertions don't depend on line-wrap positions.
+        collapsed = " ".join(build_system_prompt("2026-07-16").split())
+        assert "check whether the process that generated the class still holds" in collapsed
+        assert "same decision-maker, same rule or procedure, same coalition" in collapsed
+        assert "A rate drawn from a changed regime is itself a finding worth recording" in collapsed
+
+
+class TestDriverSystemPromptCatalyst:
+    """BTF-2 lesson: exact-entity search misses scheduled 'catalyst' events that
+    change what the deciding actor wants (their case: 17 searches about a bill,
+    never searched the summit that made the government want it passed). The
+    CATALYST bullet must push a calendar/agenda search, not an entity search,
+    and stay detached (no read on what an empty calendar implies)."""
+
+    def test_system_prompt_carries_catalyst_target(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-16").split())
+        assert "CATALYST targets" in collapsed
+        assert "spend 1-2 searches on the calendar around the question" in collapsed
+        assert "scheduled event, deadline, or process change inside the question window" in collapsed
+        assert "changes what the key actor wants" in collapsed
+        # Search the surrounding agenda, not the entity — the whole point.
+        assert "search the surrounding agenda, not the entity name" in collapsed
+        # An empty calendar is a recordable finding too.
+        assert 'a dated "no scheduled catalyst found inside the window" is a finding' in collapsed
+
+    def test_catalyst_bullet_stays_detached(self) -> None:
+        """The empty-calendar finding must be stated plainly with no read on the
+        outcome — consistent with the detachment lint (bans likely/suggests/
+        indicates in findings). The old draft's 'supports the status-quo lean'
+        would editorialize likelihood; the shipped text must not."""
+        collapsed = " ".join(build_system_prompt("2026-07-16").split())
+        assert "stated plainly with no read on what it means for the outcome" in collapsed
+        assert "supports the status-quo lean" not in collapsed
+        assert "supports the lean" not in collapsed
 
 
 @pytest.fixture

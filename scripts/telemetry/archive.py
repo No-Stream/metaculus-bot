@@ -5,8 +5,13 @@ Layout under ``backtests/telemetry_archive/`` (gitignored via the ``backtests/``
     extraction_rung.jsonl        # one record per harvested marker line
     gap_fill_v2.jsonl
     ghost_forecast.jsonl
+    ghost_forecast_json.jsonl    # full-fidelity companion to ghost_forecast
     ...
     runs.jsonl                   # manifest: one record per harvested run
+
+The per-marker file set is derived from ``MARKER_SPECS`` (via ``MARKER_NAMES``),
+so adding a marker spec automatically gives it its own JSONL here — no change
+to this module is needed.
 
 IDEMPOTENCY — REPLACE-BY-RUN: :func:`merge_and_write` drops every existing record
 whose ``run_id`` is present in the incoming harvest, then appends the freshly-parsed

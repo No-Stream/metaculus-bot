@@ -114,7 +114,7 @@ Both gap-fill passes run in prod as of 2026-07-17. Each soft-fails to an empty
 string on any error, and both are suppressed under `is_benchmarking=True`. v2's
 driver model and effort default to `gpt-5.6-terra` at `effort=low`
 (`GAP_FILL_V2_DRIVER_MODEL` / `GAP_FILL_V2_DRIVER_EFFORT`); its wall deadline is
-540s and it caps at 14 tool calls (`constants.py:405-444`).
+540s and it caps at 20 tool calls (`constants.py:405-444`).
 
 ### Stacking
 

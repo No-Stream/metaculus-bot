@@ -7,6 +7,9 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``EXTRACTION_RUNG``   — ``metaculus_bot/value_extraction.py`` ``_log_extraction``
 * ``GAP_FILL_V2``       — ``metaculus_bot/research/agentic/loop.py`` ``_log_completion``
 * ``GHOST_FORECAST``    — ``metaculus_bot/research/agentic/loop.py`` ``_run_ghost_phase``
+* ``GHOST_FORECAST_JSON`` — ``metaculus_bot/research/agentic/loop.py`` ``_run_ghost_phase``
+  (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
+  field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
@@ -34,8 +37,10 @@ import re
 from dataclasses import dataclass
 
 # Fields captured as free text / references — never numerically coerced. ``question``
-# is a raw ref (URL or bare id); ``summary`` is the ghost-forecast free-text summary.
-_RAW_FIELDS: frozenset[str] = frozenset({"question", "summary"})
+# is a raw ref (URL or bare id); ``summary`` is the ghost-forecast free-text summary;
+# ``forecast_json`` is the compact ghost-forecast JSON blob (kept verbatim for the
+# scorer to ``json.loads`` — coercion would mangle it).
+_RAW_FIELDS: frozenset[str] = frozenset({"question", "summary", "forecast_json"})
 
 # Values that mean "no data" in the marker formats (``_fmt`` renders ``None`` as
 # "n/a"; ``question_id`` renders as "None"; a stray "null" is defensive).
@@ -105,10 +110,11 @@ def _parse_line_ts(line: str) -> str | None:
 
 
 # --- Marker registry ---------------------------------------------------------
-# ``question=`` on GAP_FILL_V2 / GHOST_FORECAST comes from ``log_prefix`` (see
-# ``agentic_gap_fill.py``: ``f"question={ref} "``) and is prepended BEFORE the
-# marker token, so it's an optional leading group there. On EXTRACTION_RUNG /
-# OPEN_BOUND_PILING the ``question=`` is a normal field AFTER the token.
+# ``question=`` on GAP_FILL_V2 / GHOST_FORECAST / GHOST_FORECAST_JSON comes from
+# ``log_prefix`` (see ``agentic_gap_fill.py``: ``f"question={ref} "``) and is
+# prepended BEFORE the marker token, so it's an optional leading group there. On
+# EXTRACTION_RUNG / OPEN_BOUND_PILING the ``question=`` is a normal field AFTER
+# the token.
 MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "extraction_rung",
@@ -134,6 +140,17 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST:\s*qtype=(?P<qtype>\S+)\s+summary=(?P<summary>.*)$"
         ),
+    ),
+    # Additive full-fidelity companion to ``ghost_forecast``. ``question=`` comes
+    # from ``log_prefix`` (same leading-group mechanism as GAP_FILL_V2 /
+    # GHOST_FORECAST), and ``forecast_json`` greedily captures the compact
+    # single-line JSON payload to the final ``}``. The ``GHOST_FORECAST_JSON``
+    # token can't collide with ``GHOST_FORECAST:`` (the latter requires ``:``
+    # immediately after ``GHOST_FORECAST``), so the two specs stay mutually
+    # exclusive under the one-marker-per-line ``break``.
+    MarkerSpec(
+        "ghost_forecast_json",
+        re.compile(r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST_JSON:\s*(?P<forecast_json>\{.*\})\s*$"),
     ),
     MarkerSpec(
         "open_bound_piling",

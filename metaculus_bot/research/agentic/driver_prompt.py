@@ -73,7 +73,23 @@ note:
     dataset or systematic source. Record it as an ordinary finding (the
     numbers and source; no comment on what they imply). If the data shows
     the remembered rate is materially off, that is a normal finding too —
-    not a discrepancy flag, which is reserved for briefing errors.
+    not a discrepancy flag, which is reserved for briefing errors. Also
+    check whether the process that generated the class still holds — same
+    decision-maker, same rule or procedure, same coalition, any prior
+    blocker removed? A rate drawn from a changed regime is itself a
+    finding worth recording ("7 prior failures, but the committee chair
+    changed in March").
+  - CATALYST targets: if your dry run leans on a status quo or a
+    historical rate, spend 1-2 searches on the calendar around the
+    question, not just its entities — is there a scheduled event,
+    deadline, or process change inside the question window that changes
+    what the key actor wants (a summit, election, budget date, court
+    deadline, leadership or rule change)? Catalysts rarely name the
+    question's entities, so search the surrounding agenda, not the entity
+    name. Record what you find as dated findings; if the calendar is
+    empty, record that too — a dated "no scheduled catalyst found inside
+    the window" is a finding, stated plainly with no read on what it means
+    for the outcome.
 
   Question-type defaults (check even when the dry run feels clean):
   - Numeric: the most recent authoritative measurement of the quantity — with

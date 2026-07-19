@@ -307,6 +307,9 @@ def asknews_summarizer_prompt(
         - Single-source rule: when a claim rests on ONE source/outlet, label it "[SINGLE-SOURCE]" and carry
           the original hedges forward verbatim ("reportedly", "according to X"). NEVER promote a
           single-source claim to a confirmed or factual statement.
+        - Preserve conditionality: when a source states a claim conditionally ("X if Y", "unless",
+          "reserved the decision until the next meeting"), keep the condition attached to the claim —
+          never report a conditional statement as an unconditional one.
         - When a newer article supersedes an older one on the same fact (a withdrawal, an updated count,
           a final decision), state which version governs as of today and compress the superseded version
           to one line — do not give obsolete detail equal space. When the question turns on a deadline or

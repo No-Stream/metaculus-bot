@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -636,9 +637,73 @@ async def test_ghost_phase_runs_after_conclude_and_logs_marker(caplog: pytest.Lo
     assert any("GHOST_FORECAST:" in record.getMessage() for record in caplog.records)
 
 
+def _ghost_json_payload(caplog: pytest.LogCaptureFixture) -> dict:
+    """Extract and parse the single GHOST_FORECAST_JSON marker line from captured logs."""
+    lines = [record.getMessage() for record in caplog.records if "GHOST_FORECAST_JSON:" in record.getMessage()]
+    assert len(lines) == 1, f"expected exactly one GHOST_FORECAST_JSON line, got {lines}"
+    blob = lines[0].split("GHOST_FORECAST_JSON:", 1)[1].strip()
+    return json.loads(blob)
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_binary(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = 'analysis\n```json\n{"question_type":"binary","posterior_prob":0.42}\n```'
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    assert payload == {"qtype": "binary", "prob": 0.42}
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_mc(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = 'analysis\n```json\n{"question_type":"multiple_choice","option_probs":{"Blue":0.3,"Red":0.7}}\n```'
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    assert payload == {"qtype": "multiple_choice", "option_probs": {"Blue": 0.3, "Red": 0.7}}
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_numeric(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = (
+        'analysis\n```json\n{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}\n```'
+    )
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    # JSON serializes float keys as strings; the full percentile set survives round-trip.
+    assert payload == {
+        "qtype": "numeric",
+        "declared_percentiles": {"0.1": 10.0, "0.5": 20.5, "0.9": 30.0},
+        "median": 20.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_suppresses_json_marker_when_unparseable(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content="no block here")])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    # Legacy marker still fires (qtype=unknown); the JSON companion is suppressed.
+    assert any("GHOST_FORECAST:" in r.getMessage() for r in caplog.records)
+    assert not any("GHOST_FORECAST_JSON:" in r.getMessage() for r in caplog.records)
+
+
 class TestSummarizeGhost:
     """Branch coverage for _summarize_ghost (MC + numeric; binary is covered
-    by test_ghost_phase_runs_after_conclude_and_logs_marker above)."""
+    by test_ghost_phase_runs_after_conclude_and_logs_marker above). Also asserts
+    the third tuple element — the full-fidelity forecast payload."""
 
     def test_multiple_choice_formats_sorted_option_probs(self) -> None:
         raw = (
@@ -647,10 +712,11 @@ class TestSummarizeGhost:
             "\n```"
         )
 
-        qtype, summary = _summarize_ghost(raw)
+        qtype, summary, payload = _summarize_ghost(raw)
 
         assert qtype == "multiple_choice"
         assert summary == "Alpha=0.300, Mid=0.200, Zeta=0.500"
+        assert payload == {"qtype": "multiple_choice", "option_probs": {"Zeta": 0.5, "Alpha": 0.3, "Mid": 0.2}}
 
     def test_numeric_reports_median(self) -> None:
         raw = (
@@ -659,10 +725,15 @@ class TestSummarizeGhost:
             "\n```"
         )
 
-        qtype, summary = _summarize_ghost(raw)
+        qtype, summary, payload = _summarize_ghost(raw)
 
         assert qtype == "numeric"
         assert summary == "median=20.5"
+        assert payload == {
+            "qtype": "numeric",
+            "declared_percentiles": {0.1: 10.0, 0.5: 20.5, 0.9: 30.0},
+            "median": 20.5,
+        }
 
     def test_numeric_missing_median_yields_empty_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The median-None guard. Unreachable through a schema-valid parse
@@ -675,13 +746,16 @@ class TestSummarizeGhost:
 
         monkeypatch.setattr("metaculus_bot.research.agentic.loop.parse_structured_block", fake_parse)
 
-        qtype, summary = _summarize_ghost("whatever")
+        qtype, summary, payload = _summarize_ghost("whatever")
 
         assert qtype == "numeric"
         assert summary == ""
+        # Payload still carries the full (median-less) percentile set for scoring.
+        assert payload == {"qtype": "numeric", "declared_percentiles": {0.1: 10.0, 0.9: 30.0}, "median": None}
 
     def test_unparseable_text_reports_unknown(self) -> None:
-        qtype, summary = _summarize_ghost("no structured block here")
+        qtype, summary, payload = _summarize_ghost("no structured block here")
 
         assert qtype == "unknown"
         assert summary == ""
+        assert payload is None

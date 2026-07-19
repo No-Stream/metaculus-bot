@@ -64,9 +64,11 @@ async def run_gap_fill_v2(
     Returns ``""`` (and makes zero LLM calls) when the ``GAP_FILL_V2_ENABLED``
     flag is off, when benchmarking, or for question types the dry-run scaffold
     has no template for. Soft-fails to ``""`` on any error. When the loop ran,
-    ``archive_sink`` (if given) receives ``{"transcript": ..., "telemetry": ...}``
-    for research-archive persistence — including empty-findings runs, whose
-    telemetry is still worth keeping.
+    ``archive_sink`` (if given) receives
+    ``{"transcript": ..., "telemetry": ..., "ghost": ...}`` for research-archive
+    persistence — including empty-findings runs, whose telemetry is still worth
+    keeping. ``ghost`` is the serialized ghost forecast (or ``None`` when the
+    ghost phase did not run or failed).
     """
     if not env_flag_enabled(GAP_FILL_V2_ENABLED_ENV):
         return ""
@@ -109,6 +111,7 @@ async def run_gap_fill_v2(
                 {
                     "transcript": result.transcript,
                     "telemetry": dataclasses.asdict(result.telemetry),
+                    "ghost": result.ghost.model_dump() if result.ghost is not None else None,
                 }
             )
         return result.findings_markdown
