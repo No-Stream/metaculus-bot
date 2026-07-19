@@ -389,7 +389,10 @@ class TestFormatResolutionSections:
     def test_empty_results_returns_empty_string(self):
         assert format_resolution_sections([], datetime(2026, 7, 9, tzinfo=timezone.utc)) == ""
 
-    def test_no_success_results_returns_empty_string(self):
+    def test_all_failed_renders_unreachable_notice(self):
+        # URLs were attempted but every fetch failed — surface it instead of
+        # staying silent (the qid 44211 miss: the resolving CBP page 403'd and
+        # nobody in the pipeline learned it was unreachable).
         results = [
             FetchResult(
                 url="https://a.com/x",
@@ -406,7 +409,44 @@ class TestFormatResolutionSections:
                 content_type="text/html",
             ),
         ]
-        assert format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc)) == ""
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        assert out  # no longer empty
+        assert "2 resolution source(s) could not be fetched" in out
+        assert "a.com: blocked" in out
+        assert "b.com: js_wall" in out
+        assert "the resolving page was unreachable; weight other evidence accordingly" in out
+        # Body only — the orchestrator prepends the "## Resolution Source Snapshot" header.
+        assert "## Resolution Source Snapshot" not in out
+
+    def test_partial_success_appends_failure_note(self):
+        # Some sources fetched, some failed: keep the success content and append
+        # a terse note naming the unreachable ones.
+        results = [
+            FetchResult(
+                url="https://ok.com/data",
+                status="success",
+                text="the reading is 3.2%",
+                http_status=200,
+                content_type="text/html",
+            ),
+            FetchResult(
+                url="https://bad.com/y",
+                status="blocked",
+                text="",
+                http_status=403,
+                content_type=None,
+            ),
+        ]
+        out = format_resolution_sections(results, datetime(2026, 7, 9, tzinfo=timezone.utc))
+        # Success content still rendered.
+        assert "### https://ok.com/data" in out
+        assert "the reading is 3.2%" in out
+        assert "primary grading evidence" in out
+        # Terse note about the failed source appended.
+        assert "bad.com: blocked" in out
+        assert "could not be fetched" in out
+        # The success path must not carry the all-failed sentence.
+        assert "the resolving page was unreachable" not in out
 
     def test_success_rendering_includes_url_and_date(self):
         results = [
@@ -752,6 +792,29 @@ class TestResolutionSourceProvider:
         assert "### https://www.bls.gov/cpi/" in out
         assert "Bureau of Labor Statistics" in out
         assert session.closed is True
+
+    async def test_all_fetches_fail_surfaces_notice_end_to_end(self, monkeypatch):
+        # Non-benchmarking: a 403 on the sole resolution URL must surface the
+        # unreachable notice through the full provider path (feeds the header).
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession({"https://www.bls.gov/cpi/": FakeResponse(403, body=b"", content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        provider = resolution_source_provider(is_benchmarking=False)
+        out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
+        assert "www.bls.gov: blocked" in out
+        assert "the resolving page was unreachable; weight other evidence accordingly" in out
+
+    async def test_benchmarking_disables_even_when_all_fetches_fail(self, monkeypatch):
+        # The leakage guard fires before format_resolution_sections, so the new
+        # all-failed notice must NOT leak into a benchmarking run.
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession({"https://www.bls.gov/cpi/": FakeResponse(403, body=b"", content_type="text/html")})
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        provider = resolution_source_provider(is_benchmarking=True)
+        out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
+        assert out == ""
 
 
 # ---------------------------------------------------------------------------

@@ -367,20 +367,50 @@ def _truncate_with_marker(text: str, cap: int, url: str) -> str:
     return text[:body_budget].rstrip() + marker
 
 
-def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
-    """Render successful fetches as a markdown body block (orchestrator adds the ``##`` header).
+def _render_fetch_failures(failures: list[FetchResult]) -> str:
+    """Render failed fetches as a compact ``"domain: status, domain: status"`` list."""
+    parts: list[str] = []
+    for r in failures:
+        try:
+            domain = urlparse(r.url).netloc or r.url
+        except ValueError:
+            domain = r.url
+        parts.append(f"{domain}: {r.status}")
+    return ", ".join(parts)
 
-    Returns ``""`` if no results are successful. Enforces
-    ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across sections: later sections are
-    trimmed (or dropped) once the budget is spent. Per-URL truncation is the
-    caller's responsibility (already applied in ``_fetch_one``); this cap
-    covers the aggregate section length. When one or more sections are dropped
-    entirely (budget spent before them), a final line names the dropped count
-    so downstream readers can tell the snapshot is partial.
+
+def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
+    """Render fetch results as a markdown body block (orchestrator adds the ``##`` header).
+
+    Returns ``""`` only when no URLs were attempted (empty ``results``). When
+    URLs were attempted:
+
+    - ALL failed (403 / JS wall / error / etc.) → a one-line notice naming the
+      unreachable domains and their statuses, so forecasters learn the resolving
+      page was never seen instead of silently getting nothing (the qid 44211
+      failure: the CBP dashboard 403'd and no one in the pipeline knew).
+    - SOME succeeded → the success sections as before, plus a terse trailing
+      note about any that failed.
+
+    Enforces ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across success sections:
+    later sections are trimmed (or dropped) once the budget is spent. Per-URL
+    truncation is the caller's responsibility (already applied in
+    ``_fetch_one``); this cap covers the aggregate section length. When one or
+    more sections are dropped entirely (budget spent before them), a final line
+    names the dropped count so downstream readers can tell the snapshot is partial.
     """
-    successes = [r for r in results if r.status == "success"]
-    if not successes:
+    if not results:
         return ""
+
+    successes = [r for r in results if r.status == "success"]
+    failures = [r for r in results if r.status != "success"]
+
+    if not successes:
+        n = len(failures)
+        return (
+            f"[{n} resolution source(s) could not be fetched: {_render_fetch_failures(failures)}] — "
+            f"the resolving page was unreachable; weight other evidence accordingly."
+        )
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
     caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
@@ -407,6 +437,11 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     rendered = caveat + "\n\n" + "\n\n".join(sections)
     if dropped:
         rendered += f"\n\n[{dropped} additional source(s) omitted — section budget]"
+    if failures:
+        rendered += (
+            f"\n\n[Note: {len(failures)} other cited resolution source(s) could not be fetched: "
+            f"{_render_fetch_failures(failures)} — weight accordingly.]"
+        )
     return rendered
 
 
