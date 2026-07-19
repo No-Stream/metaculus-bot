@@ -61,6 +61,7 @@ from metaculus_bot.research.http_fetch import (
     read_body_capped,
 )
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.raw_log import record_raw_research
 
 
 def _make_filtering_resolver() -> FilteringResolver:
@@ -788,6 +789,11 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
                 f"resolution_source: {n_fail}/{len(results)} urls unfetched "
                 f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch)",
             )
+        record_raw_research(
+            qid=getattr(question, "id_of_question", None),
+            provider="resolution_source",
+            payload=results,
+        )
         return format_resolution_sections(results, datetime.now(timezone.utc))
 
     return _fetch

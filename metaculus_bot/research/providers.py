@@ -37,6 +37,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.raw_log import record_raw_research
 
 ResearchCallable = Callable[[MetaculusQuestion], Awaitable[str]]
 logger = logging.getLogger(__name__)
@@ -112,9 +113,12 @@ def _asknews_provider() -> ResearchCallable:
         # hang (connect stall, DNS hang, server not closing the stream) is
         # otherwise unbounded. This backstops that case so a stuck AskNews
         # call can't hold the whole research phase hostage.
-        return await asyncio.wait_for(_fetch_impl(question.question_text), timeout=ASKNEWS_WALL_TIMEOUT)
+        return await asyncio.wait_for(
+            _fetch_impl(question.question_text, qid=getattr(question, "id_of_question", None)),
+            timeout=ASKNEWS_WALL_TIMEOUT,
+        )
 
-    async def _fetch_impl(question_text: str) -> str:
+    async def _fetch_impl(question_text: str, *, qid: int | None = None) -> str:
         assert _ASKNEWS_GLOBAL_SEMAPHORE is not None
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)
@@ -160,6 +164,7 @@ def _asknews_provider() -> ResearchCallable:
                             strategy="latest news",
                         )
                         hot_articles = hot_response.as_dicts
+                        record_raw_research(qid=qid, provider="asknews", phase="hot", payload=hot_articles)
                         break
                     except Exception as e:
                         last_exc = e
@@ -197,6 +202,9 @@ def _asknews_provider() -> ResearchCallable:
                             strategy="news knowledge",
                         )
                         historical_articles = historical_response.as_dicts
+                        record_raw_research(
+                            qid=qid, provider="asknews", phase="historical", payload=historical_articles
+                        )
                         break
                     except Exception as e:
                         last_exc = e
@@ -431,6 +439,11 @@ def _native_search_provider(
             lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="native_search"
         )
         logger.info(f"NativeSearch: Got {len(result)} chars from {llm.model}")
+        record_raw_research(
+            qid=getattr(question, "id_of_question", None),
+            provider="native_search",
+            payload=result,
+        )
         return result
 
     return _fetch

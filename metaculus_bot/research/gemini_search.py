@@ -27,6 +27,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.prompts import web_research_prompt
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.raw_log import record_raw_research
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ async def invoke_gemini_grounded(
     *,
     model_slug: str | None = None,
     include_url_context: bool = True,
+    qid: int | None = None,
 ) -> str:
     """Invoke Gemini with Google Search grounding and return formatted text.
 
@@ -262,6 +264,10 @@ async def invoke_gemini_grounded(
     except asyncio.TimeoutError:
         logger.warning(f"GeminiSearch: {model} timed out after {GEMINI_SEARCH_TIMEOUT}s")
         raise
+
+    # Capture the raw SDK response (text + grounding metadata: the actual Google
+    # queries and sources) before formatting drops most of it.
+    record_raw_research(qid=qid, provider="gemini_search", payload=response)
 
     formatted = _format_grounded_response(response)
     n_chunks = 0
@@ -302,6 +308,8 @@ def gemini_search_provider(
             citation_style="auto_annotated",
             allow_resolution_source_reading=True,
         )
-        return await invoke_gemini_grounded(prompt, model_slug=model_slug)
+        return await invoke_gemini_grounded(
+            prompt, model_slug=model_slug, qid=getattr(question, "id_of_question", None)
+        )
 
     return _fetch

@@ -60,6 +60,7 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.research.http_fetch import build_session, read_body_capped
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.raw_log import record_raw_research
 
 logger = logging.getLogger(__name__)
 
@@ -1252,6 +1253,11 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
             as_of = datetime.now(timezone.utc)
 
         snapshot = await fetch_market_snapshot(question, as_of=as_of, timeout=PREDICTION_MARKET_TIMEOUT)
+        record_raw_research(
+            qid=getattr(question, "id_of_question", None),
+            provider="prediction_market",
+            payload=snapshot,
+        )
         return format_snapshot_for_research(snapshot)
 
     return _fetch
