@@ -37,8 +37,20 @@ _FETCH_LINK_CAP = 25
 _FETCH_MIN_CONTENT_CHARS = GAP_FILL_V2_MIN_CONTENT_CHARS
 _RENDERED_FETCH_TIMEOUT_MS = 35_000
 _READ_DOCUMENT_TIMEOUT_S = 60.0
+# Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
+# underlying socket is torn down before the loop's asyncio.wait_for fires — a
+# hung endpoint then frees its slot instead of pinning it to the wall deadline.
+_EXA_HTTP_TIMEOUT_S = 18.0  # search_web ToolSpec budget is 20s
+_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # read_document internal deadline is 60s (_READ_DOCUMENT_TIMEOUT_S)
 _EXA_RETRY_DELAYS_S = (1.0, 4.0)
 _EXA_GLOBAL_SEMAPHORE = asyncio.Semaphore(4)
+# Process-global cap on concurrent headless Chromium launches. Module-level, so
+# the bound spans all questions running under the orchestrator's Semaphore(6):
+# each Chromium is ~100-300MB, the driver's parallel_tool_calls can request many
+# fetches in one step, and an unbounded 6·N launch would OOM the runner (an
+# escape try/except cannot catch). Cap 2 covers real bursts of 1-3 rendered
+# pages while bounding worst-case memory.
+_RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 _FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
@@ -377,13 +389,20 @@ async def _call_asknews_search(query: str) -> list[Any]:
     return []
 
 
-def _run_exa_search_sync(query: str, end_published_date: str | None) -> Any:
-    from exa_py import Exa  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+async def _run_exa_search(query: str, end_published_date: str | None) -> Any:
+    import httpx  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+    from exa_py import AsyncExa  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
     api_key = os.getenv(EXA_API_KEY_ENV)
     if not api_key:
         raise ValueError(f"Missing Exa API key: {EXA_API_KEY_ENV}")
-    client = Exa(api_key=api_key)
+    client = AsyncExa(api_key=api_key)
+    # Inject a client-side-bounded httpx client (the SDK's default timeout is
+    # 600s): a hung Exa endpoint gives up at _EXA_HTTP_TIMEOUT_S instead of
+    # pinning the coroutine to the loop's wall deadline. The async client also
+    # means no worker thread to leak — the old to_thread path could strand a
+    # hung sync `requests` call in the shared ThreadPoolExecutor.
+    client._client = httpx.AsyncClient(base_url=client.base_url, headers=client.headers, timeout=_EXA_HTTP_TIMEOUT_S)
     kwargs: dict[str, Any] = {
         "query": query,
         "type": "auto",
@@ -392,14 +411,17 @@ def _run_exa_search_sync(query: str, end_published_date: str | None) -> Any:
     }
     if end_published_date is not None:
         kwargs["end_published_date"] = end_published_date
-    return client.search(**kwargs)
+    try:
+        return await client.search(**kwargs)
+    finally:
+        await client._client.aclose()
 
 
 async def _call_exa_search(query: str, end_published_date: str | None) -> list[Any]:
     async with _EXA_GLOBAL_SEMAPHORE:
         for attempt in range(len(_EXA_RETRY_DELAYS_S) + 1):
             try:
-                response = await asyncio.to_thread(_run_exa_search_sync, query, end_published_date)
+                response = await _run_exa_search(query, end_published_date)
                 results = _mapping_or_attrs_get(response, "results")
                 return list(results) if isinstance(results, list) else []
             except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
@@ -559,7 +581,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
         return None
 
     try:
-        async with _host_gate(url):
+        async with _host_gate(url), _RENDERED_FETCH_GLOBAL_SEMAPHORE:
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=True)
                 context = await browser.new_context(
@@ -636,7 +658,11 @@ def _run_document_read_sync(url: str, ask: str) -> str:
     api_key = os.getenv(GOOGLE_API_KEY_ENV)
     if not api_key:
         raise ValueError(f"Missing Google API key: {GOOGLE_API_KEY_ENV}")
-    client = genai.Client(api_key=api_key)
+    # Client-side timeout (ms) so a hung Gemini endpoint returns the thread —
+    # read_document runs this sync call under asyncio.to_thread, and wait_for
+    # cancels the coroutine but can't cancel the thread; without this ceiling a
+    # stuck endpoint leaks the worker into the shared ThreadPoolExecutor.
+    client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=_READ_DOCUMENT_HTTP_TIMEOUT_MS))
     tools: list[Any] = [{"url_context": {}}]
     config = genai_types.GenerateContentConfig(tools=tools)
     response = client.models.generate_content(

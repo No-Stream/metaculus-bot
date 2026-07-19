@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -53,6 +54,10 @@ def _reset_tool_state() -> None:
     agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
     agentic_tools._PLAYWRIGHT_WARNED = False
+    # Fresh module-global rendered-fetch semaphore per test: construction is
+    # loop-free in 3.12, so this prevents a contended acquire in one test's
+    # event loop from leaking a loop binding into a later test.
+    agentic_tools._RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 
 
 def test_tool_schemas_round_trip_for_public_tools() -> None:
@@ -93,6 +98,44 @@ async def test_search_web_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "- First highlight" in outcome.content_markdown
 
 
+class _FakeHttpxAsyncClient:
+    """httpx.AsyncClient double that records its constructor kwargs.
+
+    Lets the Exa tests assert the client-side timeout was applied without a
+    real socket. Instances append their kwargs to the shared ``captured`` list.
+    """
+
+    def __init__(self, captured: list[dict[str, Any]], **kwargs: Any) -> None:
+        captured.append(kwargs)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _patch_async_exa(monkeypatch: pytest.MonkeyPatch, searcher: MagicMock) -> list[dict[str, Any]]:
+    """Wire fake ``exa_py.AsyncExa`` + ``httpx`` for a ``search_web`` test.
+
+    ``searcher`` drives ``AsyncExa.search`` (call it to raise/return); the
+    returned list captures each ``httpx.AsyncClient(**kwargs)`` construction.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class FakeAsyncExa:
+        def __init__(self, api_key: str | None = None) -> None:
+            self.base_url = "https://api.exa.ai"
+            self.headers = {"x-api-key": api_key}
+            self._client: Any = None
+
+        async def search(self, **kwargs: Any) -> Any:
+            return searcher(**kwargs)
+
+    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(AsyncExa=FakeAsyncExa))
+    monkeypatch.setitem(
+        sys.modules, "httpx", SimpleNamespace(AsyncClient=lambda **kwargs: _FakeHttpxAsyncClient(captured, **kwargs))
+    )
+    return captured
+
+
 @pytest.mark.asyncio
 async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXA_API_KEY", "key")
@@ -103,12 +146,10 @@ async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) 
             SimpleNamespace(results=[SimpleNamespace(title="Recovered", url="https://example.com", highlights=[])]),
         ]
     )
-    exa_cls = MagicMock(return_value=SimpleNamespace(search=searcher))
     sleeps: list[float] = []
 
     monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=lambda delay: sleeps.append(delay)))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(Exa=exa_cls))
+    _patch_async_exa(monkeypatch, searcher)
 
     outcome = await agentic_tools.search_web("query")
 
@@ -122,17 +163,37 @@ async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) 
 async def test_search_web_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXA_API_KEY", "key")
     searcher = MagicMock(side_effect=RuntimeError("429 too many requests"))
-    exa_cls = MagicMock(return_value=SimpleNamespace(search=searcher))
 
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(Exa=exa_cls))
+    _patch_async_exa(monkeypatch, searcher)
 
     outcome = await agentic_tools.search_web("query")
 
     assert outcome.status == "error"
     assert "Exa search failed" in outcome.content_markdown
     assert searcher.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_search_web_exa_client_uses_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 2 (Exa half): the async Exa client is built with a client-side
+    timeout <= the search_web tool budget, so a hung endpoint tears the socket
+    down before the loop's wait_for fires — and there is no worker thread to
+    leak because the sync/to_thread path is gone."""
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    searcher = MagicMock(return_value=SimpleNamespace(results=[]))
+    captured = _patch_async_exa(monkeypatch, searcher)
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "ok"
+    tool_budget = next(
+        tool.timeout_s for tool in agentic_tools.build_gap_fill_tools("topic") if tool.name == "search_web"
+    )
+    assert len(captured) == 1
+    assert "timeout" in captured[0]
+    assert captured[0]["timeout"] is not None
+    assert captured[0]["timeout"] <= tool_budget
 
 
 @pytest.mark.asyncio
@@ -149,10 +210,7 @@ async def test_search_web_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_search_web_passes_end_published_date(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXA_API_KEY", "key")
     searcher = MagicMock(return_value=SimpleNamespace(results=[]))
-    exa_cls = MagicMock(return_value=SimpleNamespace(search=searcher))
-
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
-    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(Exa=exa_cls))
+    _patch_async_exa(monkeypatch, searcher)
 
     await agentic_tools.search_web("query", end_published_date="2026-01-01")
 
@@ -745,6 +803,100 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 1: concurrent headless-Chromium launches must never exceed the
+    module-global cap, even across questions (the semaphore is per-process).
+
+    Fires more concurrent _try_rendered_fetch calls than the cap — each to a
+    distinct host so the per-host gate never serializes them — and gates each
+    fake launch on a barrier so we can measure the true concurrent-launch peak.
+    The peak must equal the cap (proving contention was actually reached) and
+    never exceed it."""
+    cap = 2
+    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
+
+    live = 0
+    peak = 0
+    hold = asyncio.Event()
+    at_cap = asyncio.Event()
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            if live >= cap:
+                at_cap.set()
+            try:
+                await hold.wait()
+            finally:
+                live -= 1
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="rendered body")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    tasks = [
+        asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host{index}.example.com/page"))
+        for index in range(cap + 3)
+    ]
+
+    # Let the first wave saturate the semaphore, then confirm it plateaued at
+    # the cap while the launches are still parked on the barrier.
+    await asyncio.wait_for(at_cap.wait(), timeout=1.0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert live == cap
+    assert peak == cap
+
+    hold.set()
+    results = await asyncio.gather(*tasks)
+
+    assert all(result is not None and result.method == "rendered" for result in results)
+    assert peak == cap
+
+
+@pytest.mark.asyncio
 async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
     """The per-hop route guard must abort requests to non-public hosts.
 
@@ -845,6 +997,34 @@ async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None
     assert outcome.status == "ok"
     assert outcome.method == "document"
     assert outcome.content_markdown == "Quoted answer with dates."
+
+
+@pytest.mark.asyncio
+async def test_read_document_genai_client_uses_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 2 (genai half): the genai Client is built with a client-side timeout
+    (ms) <= the read_document internal deadline, so a hung endpoint returns the
+    to_thread worker instead of stranding it in the shared ThreadPoolExecutor.
+
+    Patches the real ``google.genai.Client`` attribute and uses the real
+    ``HttpOptions`` so the asserted timeout is the value that would ship."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "key")
+    captured: dict[str, Any] = {}
+
+    def fake_client(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        models = SimpleNamespace(generate_content=lambda **_: SimpleNamespace(text="Quoted answer."))
+        return SimpleNamespace(models=models)
+
+    monkeypatch.setattr("google.genai.Client", fake_client)
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
+
+    assert outcome.status == "ok"
+    http_options = captured["http_options"]
+    # HttpOptions.timeout is in milliseconds; the read_document internal deadline is in seconds.
+    assert http_options.timeout is not None
+    assert http_options.timeout <= agentic_tools._READ_DOCUMENT_TIMEOUT_S * 1000
 
 
 @pytest.mark.asyncio
