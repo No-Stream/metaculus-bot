@@ -386,24 +386,31 @@ def _strong_evidence_market_clause(
     extrapolate_target: str,
     projection: str,
 ) -> str:
-    """Shared "prediction markets are STRONG EVIDENCE" clause for the three forecaster prompts.
+    """Shared "prediction markets are strong evidence" clause for the three forecaster prompts.
 
     The framing is identical across binary / MC / numeric; only a few type-specific words differ
     (the signal noun, the anchor verb phrase, the extrapolation target, and the projection tail).
     Centralizing it keeps the strong-evidence framing AND the liquidity-weighting sentence in sync
     across all three prompts. Spliced into each prompt's ``clean_indents`` f-string; the embedded
     newlines are cosmetic (``clean_indents`` and the whitespace-collapsing tests both ignore them).
+
+    Why the strong push is earned (don't re-litigate this in future prompt audits): past misses
+    traced to forecasters ignoring prediction markets, and the evidence is that a liquid, closely
+    matched real-money market is hard to beat — treat one like a stock-market price, and this bot
+    is not assumed good enough to beat the stock market. Forecaster judgment operates in the
+    match/mismatch discounting (resolution criteria, resolution date, liquidity), not in waving the
+    market off. The all-caps shouting was dropped 2026-07-18 as decoration; the strong push stays.
     """
     return (
-        "Prediction markets are STRONG EVIDENCE — weight them heavily, not as a footnote. When the research "
+        "Prediction markets are strong evidence — weight them heavily, not as a footnote. When the research "
         f"includes a market on this {subject}, default to treating {signal_noun} as a serious signal: if the "
-        "market's resolution criteria, resolution date, and other material terms MATCH this question, it is "
-        f"extremely strong evidence and {anchor_tail}. If the resolution date or criteria DIFFER, discount it "
-        "proportionally to the SPECIFIC mismatch — name exactly which term differs and adjust accordingly. The "
+        "market's resolution criteria, resolution date, and other material terms match this question, it is "
+        f"extremely strong evidence and {anchor_tail}. If the resolution date or criteria differ, discount it "
+        "proportionally to the specific mismatch — name exactly which term differs and adjust accordingly. The "
         "burden is to justify any discount with a concrete criteria/date mismatch, not to wave the market off. "
-        "When the criteria are PRACTICALLY IDENTICAL and the ONLY material difference is the resolution DATE, do "
+        "When the criteria are practically identical and the only material difference is the resolution date, do "
         f"NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE {extrapolate_target} to our resolution date with a "
-        f"simple model and STATE the assumption. {projection} "
+        f"simple model and state the assumption. {projection} "
         f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE}"
     )
 
@@ -534,7 +541,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
             5b) Conjunctive criteria pricing (multi-part questions only — skip if you wrote "single-condition, decomposition skipped" in 0b)
                • NOW price the clauses you listed in 0b, informed by the evidence review and red-team above. Write a small table: one row per resolution clause (e.g. formal instrument? in-window? threshold met? listed by named source?) with its own probability, then the product of the rows.
-               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly two valid moves: revise the clause probabilities themselves and recompute, or name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect. Any override that is neither of these is not valid — all hedging and adjustment must operate through the clause probabilities or their dependence, not around them. If neither applies, stay at the product.
+               • Reconcile your final forecast against the product in one line. If you disagree with the product, you have exactly three valid moves: revise the clause probabilities themselves and recompute; name a specific dependence between clauses (e.g. "clauses A and B are positively correlated, so the independent product underestimates") and quantify its effect; or realize the decomposition itself was wrong — revise the clause decomposition from 0b, then re-derive the clause probabilities and the product. Any override that is none of these is not valid — all hedging and adjustment must operate through the clauses, their dependence, or a corrected decomposition, not around them. If none applies, stay at the product.
 
             6) Final rationale and calibration — integrate outside→inside view
                • Explicitly state: "My base rate was X%. After considering current evidence, I'm moving to Y% because..."
