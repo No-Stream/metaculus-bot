@@ -26,6 +26,22 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 >    `analysis_stacking_historical_treatment.md`). First measurable signal in the project's
 >    history; needs the marker fix for definitive measurement.
 
+> **Status as of 2026-07-18 (july15 branch — shipped state).** This branch flipped several
+> long-gestating items live in prod (all four workflow yamls). This block is just the index;
+> detailed status lives in the per-item entries below.
+>
+> - **Agentic gap-fill v2** is ON (`GAP_FILL_V2_ENABLED: 'true'`) since 2026-07-17, running
+>   concurrently with v1 during the overlap window.
+> - **Time-series anchor (text)** is ON (`TS_ANCHOR_ENABLED: 'true'`) since 2026-07-17; the
+>   chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`) stays OFF pending its A/B.
+> - **Summarizer, native-search, and crux-analyzer models migrated sol→terra** (native-search +
+>   crux 2026-07-17; summarizer 2026-07-18) — see the per-role entries below.
+> - **Supporting infrastructure landed**: raw pre-summarization AskNews text archived as
+>   `asknews_raw` in the research-persistence record (`research/persistence.py` +
+>   `research/orchestrator.py`), OpenRouter credit telemetry (`credit_telemetry.py`, wired in
+>   `cli.py`), and the era-bucketed numeric width monitor
+>   (`performance_analysis/width_monitor.py`).
+
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
 > Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting
@@ -305,7 +321,7 @@ data to re-measure the real treatment effect). Larger item to revisit, not a nea
 (Operator note: the stacker is what originally motivated joining the tournament; empirically it
 just hasn't worked yet.)
 
-### Time-series anchor for numeric questions — Phase A verdict IN, Phase B shipped env-gated OFF (2026-07-16/17): validate then flip
+### Time-series anchor for numeric questions — Phase A verdict IN; Phase B text anchor SHIPPED ON in prod (2026-07-17), chart still OFF
 
 For numeric questions that resolve on a fetchable series, render an empirical
 P10/P50/P90 quantile band built from the series' own history into the briefing — same shape
@@ -327,17 +343,20 @@ gate passed on 76% of questions but those picks beat naive out-of-sample only 43
 (worse than a coin flip) — the gate manufactures false wins, so we render the naive/empirical
 band directly (empirical h-step-change band for level/spread, empirical window-max for max).
 
-**Phase B shipped, env-gated OFF everywhere (commit ea889a6 + this commit).** The provider
+**Phase B text anchor SHIPPED ON in prod 2026-07-17 (`TS_ANCHOR_ENABLED: 'true'` in all four
+workflow yamls); chart side-channel stays OFF.** The provider
 (`metaculus_bot/research/timeseries_anchor.py` + `ts_fetch.py`, deterministic routing +
 point-in-time/ALFRED-vintage fetch + empirical bands, `TS_ANCHOR_ENABLED`), the numeric prompt
 clause (`_ts_anchor_evidence_clause`, gated on the section header being present), and a gated
-chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`, next entry). Both flags are `'false'` in
-all four workflow yamls. **Remaining validation ladder before the prod flip** (each gates the
-next): paid 3-arm smoke (bare / stats / stats+chart on a hard resolved question) → a
-`test_bot.yaml` prod-mode run to eyeball live rendered sections → `make backtest_medium` with
-`TS_ANCHOR_ENABLED` on (leakage-safe: the provider date-ceilings the fetch to `open_time` under
-`is_benchmarking`, so it's the FIRST research provider measurable in backtest) → prod flip. A
-handoff/seed doc is at `scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`.
+chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`, next entry) all live in the tree. The text
+anchor cleared its validation ladder (paid 3-arm smoke → `test_bot.yaml` prod-mode eyeball →
+`make backtest_medium` with `TS_ANCHOR_ENABLED` on, leakage-safe because the provider
+date-ceilings the fetch to `open_time` under `is_benchmarking`) and is now the FIRST research
+provider live in prod that is also measurable in backtest. **Still OFF:** `TS_ANCHOR_CHART_ENABLED`
+is `'false'` in all four yamls pending the text-vs-image A/B (next entry). The `TS_ANCHOR_ENABLE`
+config era (2026-07-17) is tracked by the numeric width monitor so post-enable numeric forecasts
+bucket separately from the widening-off baseline. Handoff/seed doc:
+`scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`.
 
 **Applicability gate RUN same-day (offline classification of all 231 numeric+discrete recovered
 questions; auditable per-question labels in `scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`):
@@ -367,7 +386,7 @@ representative of forward mix. **Applicability is no longer the question; design
 
 The applicability gate above (53% hit rate, recurring-template class A) is what promoted this
 to HIGH priority and motivated the Phase A replay; both are now done and the status is the
-Phase-B-shipped-gated-off block up top. Class B later-add (Mauna Loa CO2, Norwegian EV-share)
+Phase-B-text-anchor-shipped-ON block up top (chart still off). Class B later-add (Mauna Loa CO2, Norwegian EV-share)
 is still just an ingestion follow-on. Backtest measurement uses the gap-fill v2 eval-ladder
 pattern (artifact QA + era-bucketed residuals incl. calibration) for the prompt-visible effect.
 
@@ -463,8 +482,10 @@ research. Our architecture (multi-provider shared briefing + gap-fill + 6-model 
 median) already **is** BTF-2's winning recipe, at ~7 calls vs ~5N for full pipelines. The lever
 is **shared-research quality + a strong prompt**, not integration topology. So: make the shared
 research more agentic and higher-quality (the gap-fill v2 plan in
-`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`), do NOT rebuild into per-forecaster
-agents. If per-forecaster search is ever tried, give it only to the Opus-class slot. Calibration
+`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`, now SHIPPED and ON in prod since
+2026-07-17 — the "make shared research more agentic" half of this answer is done), do NOT
+rebuild into per-forecaster agents. If per-forecaster search is ever tried, give it only to the
+Opus-class slot. Calibration
 caveat (research-repos + papers-skeptic): all these agentic-research wins optimize pass@1
 accuracy, and edge-over-consensus has a *flat-to-negative* trend across a dozen model
 generations — "more search → more decisive" can trade calibration for sharpness, so track
@@ -473,7 +494,7 @@ See the deeper stub under "Longer-term → Agentic deep research" below (superse
 
 ## Near-term (worth exploring soon)
 
-### Agentic gap-fill v2: plan agreed, implementation starting (added 2026-07-16)
+### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-17 (added 2026-07-16)
 
 **FLAG STATUS (2026-07-17): `GAP_FILL_V2_ENABLED: 'true'` in all four workflow yamls** —
 flipped ON 2026-07-17 after the paid smoke, the blind driver eval (winner: gpt-5.6-terra
@@ -481,8 +502,9 @@ effort=low, now the prod default), and the Exa-alive confirmation replay
 (`scratch/driver_replay_2026-07-17/arm_terra_low_exa_alive/`). Remaining pending items:
 turn v1 gap-fill OFF after the overlap window (operator must remember — nothing does it
 automatically; **now explicitly gated on quality, not just time — see the 2026-07-18
-content-audit entry below**), the 3.5-flash researcher switch is undecided, and the
-sol→terra research-role audit is in flight.
+content-audit entry below**) and the 3.5-flash researcher switch is undecided. The
+sol→terra research-role audit has since LANDED (native-search + crux-analyzer 2026-07-17,
+summarizer 2026-07-18; see the per-role entries below).
 
 Full design in `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 4, self-contained —
 that doc is the source of truth; this entry is a pointer). Summary: a bounded agentic tool loop
@@ -811,7 +833,14 @@ Priority: HIGH (clean architecture + the user views the 0.15 disagreement bar as
 
 ### Re-run native-search model evaluation each quarter (added 2026-05-17)
 
-After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search models 2026-05-17, baseline data lives at `scratch/native_search_bench_2026-05-17/comparison_v3.md` (v3 supersedes the earlier v2 verdict; the final landing config is `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity=low` under a 360s cap). As cheaper / better OpenAI search models ship (gpt-5.6, mini variants), or if Anthropic/Google add native search to OpenRouter, re-run the harness:
+**Current model (2026-07-17): `openai/gpt-5.6-terra` at `effort=low` + `verbosity=low`, 360s**
+(`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` in `constants.py`).
+This slot migrated 2026-05-17 grok→gpt-5.5, then to `gpt-5.6-sol` (2026-07-09), then to
+`gpt-5.6-terra` (2026-07-17, per the blind research-role audit in
+`scratch/research_role_audit_2026-07-17/` — terra 1st, sol 2nd, luna 3rd; verdict "MARGINAL
+EDGE", terra at −42% cost); effort has been low since 2026-05-20 for latency.
+
+After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search models 2026-05-17, baseline data lives at `scratch/native_search_bench_2026-05-17/comparison_v3.md` (v3 supersedes the earlier v2 verdict; the original landing config was `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity=low` under a 360s cap — since superseded by the terra migration above). As cheaper / better OpenAI search models ship (gpt-5.6, mini variants), or if Anthropic/Google add native search to OpenRouter, re-run the harness:
 
 1. `python scratch/native_search_bench_2026-05-17/run.py --question-id <new open Q>` (or refactor into a make target if it gets reused).
 2. Update `metaculus_bot/constants.py:NATIVE_SEARCH_DEFAULT_MODEL` based on results.
@@ -1590,9 +1619,10 @@ issues (mini summarizer + missing no-forecast rule), not model tier. Terra: −4
 
 ### Agentic deep research (ReAct loop)
 
-> **In progress as of 2026-07-16**: the gap-fill v2 plan (near-term entry above;
+> **SHIPPED as of 2026-07-17**: the gap-fill v2 plan (near-term entry above;
 > `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) is exactly this — a bounded
-> tool-loop second pass. The cost blocker below is resolved by budget caps (~$0.50/q target)
+> tool-loop second pass, now ON in prod (`GAP_FILL_V2_ENABLED: 'true'` in all four yamls).
+> The cost blocker below is resolved by budget caps (~$0.50/q target)
 > and encouraged early-stop; selective activation happens via the template dry-run.
 >
 > **Direction confirmed by the 2026-07-16 lit survey (see the triage block near the top):**
