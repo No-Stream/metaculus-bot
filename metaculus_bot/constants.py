@@ -110,8 +110,19 @@ DEFAULT_MAX_CONCURRENT_RESEARCH: int = 6
 # Keep this modest to balance concurrency and rate limits.
 BENCHMARK_BATCH_SIZE: int = 4
 
-# Metaculus comment safety limits
-REPORT_SECTION_CHAR_LIMIT: int = 49_999
+# Metaculus comment safety limits. The published comment has three top-level
+# sections (# SUMMARY / # RESEARCH / # FORECASTS), each trimmed to its own
+# budget before assembly (see comment.trimming.trim_section). FORECASTS
+# (per-model rationales + fenced JSON forecast blocks) gets the largest share
+# because it carries the per-model attribution the residual pipeline parses;
+# RESEARCH is a lossy fallback-archive re-print; SUMMARY holds the
+# parser-critical bullets and is sized well above any realistic bullet block so
+# it never clips them. The three caps sum below COMMENT_CHAR_LIMIT; trim_comment
+# shrinks RESEARCH first (never bullets or rationales) if the assembled comment
+# plus framework overhead still overflows.
+FORECASTS_SECTION_CHAR_LIMIT: int = 89_999
+RESEARCH_SECTION_CHAR_LIMIT: int = 44_999
+SUMMARY_SECTION_CHAR_LIMIT: int = 13_999
 COMMENT_CHAR_LIMIT: int = 149_999
 
 # Optional environment variable to force research provider selection.

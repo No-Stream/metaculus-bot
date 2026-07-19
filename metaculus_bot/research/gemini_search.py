@@ -153,6 +153,25 @@ def _format_url_context_marker(reported: bool, entries: list[tuple[str, str]]) -
     return ""
 
 
+def _format_source_label(web: object) -> str:
+    """Render a grounding chunk's web source as ``title — domain`` (no redirect URL).
+
+    The SDK's ``chunk.web.uri`` is an opaque vertexaisearch grounding-api-redirect
+    blob (~250 chars) that a text-only forecaster cannot resolve. ``chunk.web.domain``
+    carries the real source domain (e.g. ``aljazeera.com``), so we render that plus
+    the title and drop the blob entirely. Falls back to the title alone when the
+    domain is absent (or vice versa); returns ``""`` when neither is present, so a
+    label-less chunk contributes no line rather than leaking the redirect URL.
+    """
+    if web is None:
+        return ""
+    domain = (getattr(web, "domain", None) or "").strip()
+    title = (getattr(web, "title", None) or "").strip()
+    if title and domain and title != domain:
+        return f"{title} — {domain}"
+    return title or domain
+
+
 def _format_grounded_response(response: genai_types.GenerateContentResponse) -> str:
     """Stitch response text with inline citations from grounding metadata.
 
@@ -160,8 +179,8 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
         <response text>
 
         ### Sources
-        [1] <title> — <uri>
-        [2] <title> — <uri>
+        [1] <title> — <domain>
+        [2] <title> — <domain>
         ...
 
     Inline citation markers are inserted per-segment using
@@ -216,15 +235,17 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
             logger.warning(f"GeminiSearch: could not splice inline citations ({type(exc).__name__}): {exc}")
             annotated = text
 
-    # Append a Sources section
+    # Append a Sources section rendering the real source domain, NOT the opaque
+    # vertexaisearch.cloud.google.com/grounding-api-redirect/<~250-char blob>
+    # URI. The domain carries all the signal a text-only forecaster can use, and
+    # the redirect blobs were ~5% of the whole research bundle. Entries stay 1:1
+    # with the grounding chunks so the inline [N] markers spliced above keep
+    # pointing at the right source (deduping would misalign them).
     sources_lines = ["", "", "### Sources"]
     for idx, chunk in enumerate(chunks, start=1):
-        web = chunk.web
-        if web and web.uri:
-            if web.title:
-                sources_lines.append(f"[{idx}] {web.title} — {web.uri}")
-            else:
-                sources_lines.append(f"[{idx}] {web.uri}")
+        label = _format_source_label(chunk.web)
+        if label:
+            sources_lines.append(f"[{idx}] {label}")
 
     return annotated + "\n".join(sources_lines) if len(sources_lines) > _SOURCES_HEADER_LEN else annotated
 

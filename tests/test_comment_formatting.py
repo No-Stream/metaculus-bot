@@ -64,12 +64,12 @@ class TestFormatResearchSummaryWithModels:
 
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_research_summary_with_models
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import SUMMARY_SECTION_CHAR_LIMIT
 
-        huge_text = "## Report 1 Summary\n" + ("X" * (REPORT_SECTION_CHAR_LIMIT + 5000))
+        huge_text = "## Report 1 Summary\n" + ("X" * (SUMMARY_SECTION_CHAR_LIMIT + 5000))
         predictions: list = []
         result = format_research_summary_with_models(huge_text, predictions, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= SUMMARY_SECTION_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +80,11 @@ class TestFormatResearchSummaryWithModels:
 class TestFormatMainResearchSection:
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_main_research_section
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import RESEARCH_SECTION_CHAR_LIMIT
 
-        huge_text = "## Research\n" + ("Y" * (REPORT_SECTION_CHAR_LIMIT + 3000))
+        huge_text = "## Research\n" + ("Y" * (RESEARCH_SECTION_CHAR_LIMIT + 3000))
         result = format_main_research_section(huge_text, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= RESEARCH_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
         from metaculus_bot.comment.formatting import format_main_research_section
@@ -102,11 +102,11 @@ class TestFormatMainResearchSection:
 class TestFormatForecasterRationalesSection:
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_forecaster_rationales_section
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT
 
-        huge_text = "## Rationale\n" + ("Z" * (REPORT_SECTION_CHAR_LIMIT + 2000))
+        huge_text = "## Rationale\n" + ("Z" * (FORECASTS_SECTION_CHAR_LIMIT + 2000))
         result = format_forecaster_rationales_section(huge_text, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= FORECASTS_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
         from metaculus_bot.comment.formatting import format_forecaster_rationales_section

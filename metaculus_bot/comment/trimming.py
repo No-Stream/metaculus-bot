@@ -5,7 +5,12 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
-from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.constants import (
+    COMMENT_CHAR_LIMIT,
+    FORECASTS_SECTION_CHAR_LIMIT,
+    RESEARCH_SECTION_CHAR_LIMIT,
+    SUMMARY_SECTION_CHAR_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +40,12 @@ _COMMENT_HEAD_BUDGET: Final[int] = 10_000
 @dataclass(frozen=True, slots=True)
 class TrimConfig:
     notice: str = TRIM_NOTICE
-    section_limit: int = REPORT_SECTION_CHAR_LIMIT
+    # Generic per-section fallback (unknown section names). Set to the most
+    # permissive section budget so a bare trim_section never over-trims.
+    section_limit: int = FORECASTS_SECTION_CHAR_LIMIT
+    summary_limit: int = SUMMARY_SECTION_CHAR_LIMIT
+    research_limit: int = RESEARCH_SECTION_CHAR_LIMIT
+    forecasts_limit: int = FORECASTS_SECTION_CHAR_LIMIT
     comment_limit: int = COMMENT_CHAR_LIMIT
     summary_end_marker: str = _SUMMARY_END_MARKER
     head_budget: int = _COMMENT_HEAD_BUDGET
@@ -80,9 +90,54 @@ def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bo
     return f"{notice}\n{tail}", True
 
 
+# A single forecaster's rationale header inside the FORECASTS section, e.g.
+# "## R1: Forecaster 3 Reasoning". report_number is always 1 in production
+# (single report), but \d+ keeps this robust to multi-report comments. The
+# block-aware trim splits the section on these so each forecaster keeps its own
+# attribution when the section overflows.
+_RATIONALE_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^##\s+R\d+:\s+Forecaster\s+\d+\s+Reasoning[ \t]*$")
+
+# The bot-injected "Model: openrouter/<provider>/<name>" attribution line that
+# opens each rationale body. Kept byte-stable because
+# performance_analysis/parsing.py (_R1_MODEL_RE, _REASONING_MODEL_PREFIX_RE)
+# keys per-model attribution on it — the exact line a naive header+tail trim
+# destroyed (measured: Forecaster 1's Model: line eaten in 29/29 July trims).
+_MODEL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^Model:[ \t]*[^\n]*$")
+
+# A fenced ```json STRUCTURED FORECAST block. Each rationale ends with one (the
+# block-last prompt requirement); it carries the per-model forecast values the
+# residual pipeline parses, so a within-block trim keeps it in the kept tail.
+_JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```json\b.*?```", re.DOTALL)
+
+
+def _section_budget(section_name: str, cfg: TrimConfig) -> tuple[int, bool]:
+    """Map a comment section name to its ``(char_limit, block_aware)`` policy.
+
+    The framework's unified comment is assembled from three sections whose
+    ``trim_section`` names end in ``_summary`` / ``_research`` / ``_rationales``
+    (see forecaster.py and comment.formatting). Each gets its own budget so the
+    parser-critical FORECASTS (rationales) section is not starved by a uniform
+    cap. The rationales section is additionally trimmed block-by-block
+    (``block_aware=True``) so per-forecaster ``Model:`` attribution and JSON
+    forecast blocks survive an overflow. Unknown names fall back to the generic
+    per-section default.
+    """
+    if section_name.endswith("_rationales"):
+        return cfg.forecasts_limit, True
+    if section_name.endswith("_research"):
+        return cfg.research_limit, False
+    if section_name.endswith("_summary"):
+        return cfg.summary_limit, False
+    return cfg.section_limit, False
+
+
 def trim_section(text: str, section_name: str, *, config: TrimConfig | None = None) -> str:
     cfg = config or TrimConfig()
-    trimmed, did_trim = _trim_with_notice(text, cfg.section_limit, cfg.notice, preserve_header=True)
+    limit, block_aware = _section_budget(section_name, cfg)
+    if block_aware:
+        trimmed, did_trim = _trim_rationales_within_blocks(text, limit, cfg.notice)
+    else:
+        trimmed, did_trim = _trim_with_notice(text, limit, cfg.notice, preserve_header=True)
     if did_trim:
         logger.warning(
             "Trimmed section '%s' from %s to %s characters",
@@ -91,6 +146,111 @@ def trim_section(text: str, section_name: str, *, config: TrimConfig | None = No
             len(trimmed),
         )
     return trimmed
+
+
+def _allocate_block_budgets(sizes: list[int], total: int) -> list[int]:
+    """Water-fill ``total`` chars across blocks by size.
+
+    Blocks that fit within the even share keep their full size; the freed budget
+    is redistributed to the larger blocks. This keeps small rationales whole
+    while trimming only the ones that actually overflow, and always sums exactly
+    to ``total`` (any rounding remainder lands on the first still-unfilled
+    block).
+    """
+    budgets = [0] * len(sizes)
+    remaining_total = total
+    remaining_idx = list(range(len(sizes)))
+    while remaining_idx:
+        share = remaining_total // len(remaining_idx)
+        fits = [i for i in remaining_idx if sizes[i] <= share]
+        if not fits:
+            for i in remaining_idx:
+                budgets[i] = share
+            budgets[remaining_idx[0]] += remaining_total - share * len(remaining_idx)
+            break
+        for i in fits:
+            budgets[i] = sizes[i]
+            remaining_total -= sizes[i]
+            remaining_idx.remove(i)
+    return budgets
+
+
+def _trim_block(block: str, budget: int, notice: str) -> str:
+    """Trim one rationale block to ``budget`` chars, preserving attribution.
+
+    Keeps (in order) the ``## R1: Forecaster N Reasoning`` header, the ``Model:``
+    line if it opens the body, a head of the reasoning prose, the trim notice,
+    and the trailing fenced ```json forecast block. So every kept block retains
+    the two things the residual pipeline parses — its model attribution and its
+    forecast values — even when the middle prose is sacrificed. The return value
+    never exceeds ``budget``.
+    """
+    if len(block) <= budget:
+        return block
+
+    header, separator, rest = block.partition("\n")
+    if not separator:
+        return block[:budget]
+
+    head = header
+    body = rest
+    lead = rest.lstrip("\n")
+    model_match = _MODEL_PREFIX_RE.match(lead)
+    if model_match:
+        head = f"{header}\n{model_match.group(0)}"
+        body = lead[model_match.end() :]
+
+    json_matches = list(_JSON_BLOCK_RE.finditer(body))
+    json_tail = json_matches[-1].group(0) if json_matches else ""
+    prose_before_json = body[: json_matches[-1].start()] if json_matches else body
+
+    # head + \n + prose + \n + notice + \n + json_tail  -> 3 joining newlines.
+    prose_budget = budget - len(head) - len(notice) - len(json_tail) - 3
+    if prose_budget > 0:
+        prose_head = prose_before_json[:prose_budget].rstrip("\n")
+        parts = [head, prose_head, notice, json_tail]
+        return "\n".join(p for p in parts if p)
+    if json_tail and len(head) + len(notice) + len(json_tail) + 2 <= budget:
+        return f"{head}\n{notice}\n{json_tail}"
+    if len(head) + len(notice) + 1 <= budget:
+        return f"{head}\n{notice}"
+    return head[:budget]
+
+
+def _trim_rationales_within_blocks(text: str, limit: int, notice: str) -> tuple[str, bool]:
+    """Trim the FORECASTS rationales section, block by block.
+
+    Splits the section into its ``## R1: Forecaster N Reasoning`` blocks and
+    shrinks each over-budget block from *within* (see ``_trim_block``), so every
+    forecaster keeps its ``Model:`` attribution line and JSON forecast block. A
+    plain header+tail trim (``_trim_with_notice``) drops the head of the first
+    block — including its ``Model:`` line — which the residual pipeline parses.
+
+    Falls back to the plain header-preserving trim when the section has no
+    recognizable rationale headers (or the budget is too small to seat them).
+    The returned text never exceeds ``limit``.
+    """
+    if len(text) <= limit:
+        return text, False
+
+    headers = list(_RATIONALE_HEADER_RE.finditer(text))
+    if not headers:
+        return _trim_with_notice(text, limit, notice, preserve_header=True)
+
+    preamble = text[: headers[0].start()]
+    blocks = [
+        text[h.start() : (headers[i + 1].start() if i + 1 < len(headers) else len(text))].rstrip()
+        for i, h in enumerate(headers)
+    ]
+
+    separator = "\n\n"
+    usable = limit - len(preamble) - len(separator) * (len(blocks) - 1)
+    if usable <= 0:
+        return _trim_with_notice(text, limit, notice, preserve_header=True)
+
+    budgets = _allocate_block_budgets([len(b) for b in blocks], usable)
+    trimmed_blocks = [_trim_block(block, budgets[i], notice) for i, block in enumerate(blocks)]
+    return preamble + separator.join(trimmed_blocks), True
 
 
 def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> tuple[str, bool]:

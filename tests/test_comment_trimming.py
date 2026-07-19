@@ -8,12 +8,18 @@ end-to-end coverage against realistic comment structure, and an explicit
 parser-compatibility check that runs the live parsing.py regexes.
 """
 
+import json
 import math
 
 import pytest
 
 from metaculus_bot.comment.trimming import TRIM_NOTICE, TrimConfig, trim_comment, trim_section
-from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.constants import (
+    COMMENT_CHAR_LIMIT,
+    FORECASTS_SECTION_CHAR_LIMIT,
+    RESEARCH_SECTION_CHAR_LIMIT,
+    SUMMARY_SECTION_CHAR_LIMIT,
+)
 
 # ---------------------------------------------------------------------------
 # Legacy section trim (unchanged behavior — keeps header, uses tail)
@@ -22,7 +28,9 @@ from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMI
 
 def test_trim_section_preserves_header_and_tail() -> None:
     header = "## Report 1 Summary"
-    body_length = REPORT_SECTION_CHAR_LIMIT + 512
+    # "unit-test-section" has no known suffix, so it routes to the generic
+    # section_limit default (FORECASTS_SECTION_CHAR_LIMIT).
+    body_length = FORECASTS_SECTION_CHAR_LIMIT + 512
     body = "A" * body_length
     original = f"{header}\n{body}"
 
@@ -30,9 +38,9 @@ def test_trim_section_preserves_header_and_tail() -> None:
 
     assert trimmed.splitlines()[0] == header
     assert TRIM_NOTICE in trimmed.splitlines()[1]
-    assert len(trimmed) == REPORT_SECTION_CHAR_LIMIT
+    assert len(trimmed) == FORECASTS_SECTION_CHAR_LIMIT
 
-    available = REPORT_SECTION_CHAR_LIMIT - len(header) - len(TRIM_NOTICE) - 2
+    available = FORECASTS_SECTION_CHAR_LIMIT - len(header) - len(TRIM_NOTICE) - 2
     assert available > 0
     expected_tail = body[-available:]
     assert trimmed.endswith(expected_tail)
@@ -608,3 +616,152 @@ class TestAgainstRealHistoricalData:
             checked += 1
 
         assert checked >= 50, f"expected to exercise dozens of real comments, only hit {checked}"
+
+
+# ---------------------------------------------------------------------------
+# Per-section budgets + block-aware FORECASTS trim (Model:-line preservation)
+#
+# The FORECASTS (rationales) section gets its own large budget and is trimmed
+# block-by-block, so a per-forecaster overflow no longer destroys the first
+# forecaster's ``Model:`` attribution line (measured 29/29 in July 2026) or its
+# JSON forecast block — both parsed by the residual pipeline.
+# ---------------------------------------------------------------------------
+
+
+_RATIONALE_MODELS: list[tuple[int, str]] = [
+    (1, "gpt-5.6-sol"),
+    (2, "gpt-5.5"),
+    (3, "claude-fable-5"),
+    (4, "claude-opus-4.8"),
+    (5, "gemini-3.1-pro-preview"),
+    (6, "grok-4.5"),
+]
+
+
+def _numeric_json_block(base: float) -> str:
+    """A schema-valid numeric STRUCTURED FORECAST block (the 3 required percentiles)."""
+    payload = {
+        "question_type": "numeric",
+        "declared_percentiles": {"0.1": base, "0.5": base + 10.0, "0.9": base + 20.0},
+    }
+    return "```json\n" + json.dumps(payload) + "\n```"
+
+
+def _rationale_block(idx: int, model: str, *, prose_tokens: int, base: float) -> str:
+    """One ``## R1: Forecaster N Reasoning`` block: header + Model line + prose + JSON block."""
+    return (
+        f"## R1: Forecaster {idx} Reasoning\n"
+        f"Model: openrouter/provider/{model}\n"
+        f"{'reasoning_token ' * prose_tokens}\n"
+        f"{_numeric_json_block(base)}"
+    )
+
+
+def _rationales_section(prose_tokens: int) -> str:
+    return "\n\n".join(_rationale_block(i, m, prose_tokens=prose_tokens, base=100.0 + i) for i, m in _RATIONALE_MODELS)
+
+
+class TestSectionBudgetRouting:
+    """trim_section picks the budget (and block-awareness) from the section name."""
+
+    def test_rationales_route_to_forecasts_budget(self) -> None:
+        rationales = _rationales_section(prose_tokens=1200)
+        assert len(rationales) > FORECASTS_SECTION_CHAR_LIMIT, "precondition: section must overflow"
+        trimmed = trim_section(rationales, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+
+    def test_research_routes_to_research_budget(self) -> None:
+        research = "## Report 1 Research\n" + ("research_token " * 6_000)
+        assert len(research) > RESEARCH_SECTION_CHAR_LIMIT
+        trimmed = trim_section(research, "report_1_research")
+        assert len(trimmed) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert TRIM_NOTICE in trimmed
+
+    def test_summary_routes_to_summary_budget(self) -> None:
+        summary = "## Report 1 Summary\n" + ("X" * (SUMMARY_SECTION_CHAR_LIMIT + 2_000))
+        trimmed = trim_section(summary, "report_1_summary")
+        assert len(trimmed) <= SUMMARY_SECTION_CHAR_LIMIT
+
+
+class TestRationaleBlockAwareTrim:
+    """An over-budget FORECASTS section keeps every block's Model: line + JSON block."""
+
+    def test_all_six_model_lines_and_blocks_survive(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_forecaster_model_map,
+            parse_per_model_numeric_percentiles,
+            parse_per_model_reasoning_text,
+        )
+
+        rationales = _rationales_section(prose_tokens=1500)  # ~145k, well over budget
+        assert len(rationales) > FORECASTS_SECTION_CHAR_LIMIT
+
+        trimmed = trim_section(rationales, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+        assert trimmed.startswith("## R1: Forecaster 1 Reasoning")
+        # The middle prose is sacrificed, so the trim notice fires.
+        assert TRIM_NOTICE in trimmed
+
+        # Wrap in the # FORECASTS header the R1 parsers expect.
+        comment = f"# FORECASTS\n{trimmed}\n"
+
+        model_map = parse_forecaster_model_map(comment)
+        assert len(model_map) == 6, f"expected all 6 Model: lines, got {model_map}"
+        for i, model in _RATIONALE_MODELS:
+            assert model_map[i] == model
+
+        percentiles = parse_per_model_numeric_percentiles(comment)
+        assert len(percentiles) == 6, f"expected all 6 JSON blocks recovered, got {sorted(percentiles)}"
+
+        bodies = parse_per_model_reasoning_text(comment)
+        assert len(bodies) == 6
+
+
+class TestFullCommentPreservesAttribution:
+    """End-to-end: a >150k raw comment trims to under the ceiling with attribution intact."""
+
+    def test_within_budgets_and_fully_parseable(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_forecaster_model_map,
+            parse_per_model_forecasts,
+            parse_per_model_numeric_percentiles,
+        )
+
+        bullets = "\n".join(f"*Forecaster {i} ({m})*: Median: {100 + i}" for i, m in _RATIONALE_MODELS)
+        raw_summary = f"## Report 1 Summary\n### Forecasts\n{bullets}\n\n### Research Summary\n_stub_"
+        raw_research = "## Report 1 Research\n" + ("research_token " * 6_000)
+        raw_rationales = _rationales_section(prose_tokens=1500)
+
+        raw_total = len(raw_summary) + len(raw_research) + len(raw_rationales)
+        assert raw_total > COMMENT_CHAR_LIMIT, "precondition: untrimmed comment must exceed the ceiling"
+
+        summary = trim_section(raw_summary, "report_1_summary")
+        research = trim_section(raw_research, "report_1_research")
+        rationales = trim_section(raw_rationales, "report_1_rationales")
+
+        assert len(summary) <= SUMMARY_SECTION_CHAR_LIMIT
+        assert len(research) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert len(rationales) <= FORECASTS_SECTION_CHAR_LIMIT
+
+        # Assemble like forecast_bot._create_unified_explanation, then apply the
+        # whole-comment trim as build_unified_explanation does.
+        assembled = (
+            "# SUMMARY\n*Question*: will X happen?\n\n"
+            f"{summary}\n\n"
+            f"# RESEARCH\n{research}\n\n"
+            f"# FORECASTS\n{rationales}\n"
+            "<!-- STACKED=false -->\n"
+        )
+        final = trim_comment(assembled)
+        assert len(final) <= COMMENT_CHAR_LIMIT
+
+        forecasts = parse_per_model_forecasts(final)
+        assert len(forecasts) == 6, f"lost summary bullets: {forecasts}"
+
+        model_map = parse_forecaster_model_map(final)
+        assert len(model_map) == 6, f"lost Model: lines: {model_map}"
+        for i, model in _RATIONALE_MODELS:
+            assert model_map[i] == model
+
+        percentiles = parse_per_model_numeric_percentiles(final)
+        assert len(percentiles) == 6, f"lost per-model JSON blocks: {sorted(percentiles)}"

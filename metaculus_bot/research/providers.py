@@ -14,6 +14,7 @@ defenses (see `prediction_market_provider.py`).
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -444,7 +445,9 @@ def _native_search_provider(
             provider="native_search",
             payload=result,
         )
-        return result
+        # Strip utm_source=openai from the forecaster-facing text; the raw log
+        # above keeps the untouched payload for archival fidelity.
+        return _strip_utm_source(result)
 
     return _fetch
 
@@ -527,6 +530,30 @@ def choose_provider_with_name(
 # ---------------------------------------------------------------------------
 # URL normalization and dedup helpers (simple, robust, testable)
 # ---------------------------------------------------------------------------
+
+
+# OpenAI native search tags every citation URL with `?utm_source=openai`; it is
+# pure tracking noise fanned into 6 forecaster prompts + the published comment.
+# Match the param wherever it sits in the query string, capturing the leading
+# separator and an optional trailing `&` so removal keeps the query well-formed.
+_UTM_SOURCE_OPENAI_RE = re.compile(r"([?&])utm_source=openai\b(&)?")
+
+
+def _strip_utm_source(text: str) -> str:
+    """Drop ``utm_source=openai`` tracking params from URLs in native-search text.
+
+    Handles the param as the sole query param (``?utm_source=openai`` -> ``), the
+    first of several (``?utm_source=openai&a=b`` -> ``?a=b``), or a later one
+    (``&utm_source=openai`` -> ``). Other query params are preserved. Operates on
+    the free-text research blob (the native-search LLM emits the URLs inline).
+    """
+
+    def _repl(match: re.Match[str]) -> str:
+        # Keep the leading separator only when another param follows, so the
+        # query string stays well-formed (`?a&utm&b` -> `?a&b`, not `?ab`).
+        return match.group(1) if match.group(2) else ""
+
+    return _UTM_SOURCE_OPENAI_RE.sub(_repl, text)
 
 
 def _normalize_url_for_dedup(url: str) -> str:

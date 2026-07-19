@@ -11,7 +11,7 @@ from forecasting_tools.data_models.numeric_report import Percentile as FTPercent
 
 from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
-from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT, RESEARCH_SECTION_CHAR_LIMIT
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.research import timeseries_anchor as ts_anchor
 from metaculus_bot.value_extraction import ExtractionOutcome
@@ -427,8 +427,8 @@ def test_format_methods_trim_long_outputs():
     }
     bot = TemplateForecaster(llms=llms_config)
 
-    long_research_body = "Line\n" + "A" * (REPORT_SECTION_CHAR_LIMIT + 500)
-    long_reasoning = "Reasoning\n" + "B" * (REPORT_SECTION_CHAR_LIMIT + 800)
+    long_research_body = "Line\n" + "A" * (RESEARCH_SECTION_CHAR_LIMIT + 500)
+    long_reasoning = "Reasoning\n" + "B" * (FORECASTS_SECTION_CHAR_LIMIT + 800)
     research_with_predictions = ResearchWithPredictions(
         research_report=f"# Deep Dive\n{long_research_body}",
         summary_report="Summary",
@@ -438,12 +438,12 @@ def test_format_methods_trim_long_outputs():
     formatted_research = bot._format_main_research(1, research_with_predictions)
     assert formatted_research.startswith("## Report 1 Research")
     assert TRIM_NOTICE in formatted_research
-    assert len(formatted_research) <= REPORT_SECTION_CHAR_LIMIT
+    assert len(formatted_research) <= RESEARCH_SECTION_CHAR_LIMIT
 
     formatted_rationales = bot._format_forecaster_rationales(1, research_with_predictions)
     assert formatted_rationales.startswith("## R1: Forecaster 1 Reasoning")
     assert TRIM_NOTICE in formatted_rationales
-    assert len(formatted_rationales) <= REPORT_SECTION_CHAR_LIMIT
+    assert len(formatted_rationales) <= FORECASTS_SECTION_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------

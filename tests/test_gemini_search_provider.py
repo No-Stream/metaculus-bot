@@ -27,8 +27,8 @@ def _make_q(text: str) -> MagicMock:
 
 
 class CannedWebChunk:
-    def __init__(self, uri: str, title: str | None) -> None:
-        self.web = SimpleNamespace(uri=uri, title=title)
+    def __init__(self, uri: str, title: str | None, domain: str | None = None) -> None:
+        self.web = SimpleNamespace(uri=uri, title=title, domain=domain)
 
 
 class CannedSegment:
@@ -248,12 +248,13 @@ async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_citations_appended_to_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Response with grounding chunks ends with a '### Sources' block listing both URIs/titles."""
+    """Response with grounding chunks ends with a '### Sources' block citing title + domain."""
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbC123"
     chunks = [
-        CannedWebChunk(uri="https://example.com/1", title="Example One"),
-        CannedWebChunk(uri="https://example.com/2", title="Example Two"),
+        CannedWebChunk(uri=blob, title="Example One", domain="example.com"),
+        CannedWebChunk(uri=blob, title="Example Two", domain="two.example.org"),
     ]
     response = _make_response("body text", chunks=chunks, supports=None)
     fake_client = _make_client_with_response(response)
@@ -264,12 +265,46 @@ async def test_citations_appended_to_response(monkeypatch: pytest.MonkeyPatch) -
         out = await invoke_gemini_grounded("prompt")
 
     assert "### Sources" in out
-    assert "https://example.com/1" in out
-    assert "Example One" in out
-    assert "https://example.com/2" in out
-    assert "Example Two" in out
+    assert "Example One — example.com" in out
+    assert "Example Two — two.example.org" in out
+    # The opaque vertexaisearch redirect blob must never reach the forecaster.
+    assert "vertexaisearch" not in out
+    assert "grounding-api-redirect" not in out
     # Sources comes after body text
     assert out.index("body text") < out.index("### Sources")
+
+
+@pytest.mark.asyncio
+async def test_sources_render_domain_not_redirect_blob(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sources cite title + domain, drop the redirect blob, and stay 1:1 with chunks.
+
+    Covers the title+domain case, the domain-only fallback (no title), the
+    title-only fallback (no domain), and a duplicate domain — which keeps its own
+    index so the inline [N] markers remain valid (we do not renumber/dedup).
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/" + ("X" * 200)
+    chunks = [
+        CannedWebChunk(uri=blob, title="Al Jazeera", domain="aljazeera.com"),
+        CannedWebChunk(uri=blob, title=None, domain="senate.gov"),  # no title -> domain only
+        CannedWebChunk(uri=blob, title="Reuters", domain=None),  # no domain -> title only
+        CannedWebChunk(uri=blob, title="Al Jazeera", domain="aljazeera.com"),  # duplicate keeps its index
+    ]
+    response = _make_response("body text", chunks=chunks, supports=None)
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt")
+
+    assert "vertexaisearch" not in out
+    assert "grounding-api-redirect" not in out
+    assert "[1] Al Jazeera — aljazeera.com" in out
+    assert "[2] senate.gov" in out
+    assert "[3] Reuters" in out
+    assert "[4] Al Jazeera — aljazeera.com" in out
 
 
 @pytest.mark.asyncio
@@ -284,9 +319,10 @@ async def test_inline_citation_markers_inserted(monkeypatch: pytest.MonkeyPatch)
     end_alpha = text.index("Alpha fact.") + len("Alpha fact.")
     end_beta = text.index("Beta fact.") + len("Beta fact.")
 
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/zzz"
     chunks = [
-        CannedWebChunk(uri="https://example.com/a", title="A"),
-        CannedWebChunk(uri="https://example.com/b", title="B"),
+        CannedWebChunk(uri=blob, title="A", domain="a.example.com"),
+        CannedWebChunk(uri=blob, title="B", domain="b.example.com"),
     ]
     supports = [
         CannedSupport(seg=CannedSegment(end_index=end_alpha, text="Alpha fact."), indices=[0]),
@@ -305,7 +341,8 @@ async def test_inline_citation_markers_inserted(monkeypatch: pytest.MonkeyPatch)
     # The sources block must also be appended whenever chunks are present — this is
     # the common production path (chunks + supports together), not chunks-only.
     assert "### Sources" in out
-    assert "https://example.com/a" in out
+    assert "a.example.com" in out
+    assert "vertexaisearch" not in out
 
 
 @pytest.mark.asyncio
