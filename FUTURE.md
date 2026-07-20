@@ -921,21 +921,13 @@ existing `stacking` module rather than the forecaster. Large-blast-radius (touch
 file in the pipeline), so it warrants its own PR **after the july15 branch merges** — tracked here
 so the file doesn't keep accreting in the meantime.
 
-### Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids (added 2026-07-20, MEDIUM)
+### ~~Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids~~ — DONE 2026-07-20 (added 2026-07-20)
 
-Status: deferred refactor from the 2026-07-20 forge review (finding F4); latent-only, provably
-neutralized today.
-
-The fallback CDF builder in `BoundSafeNumericDistribution.cdf`
-(`numeric/pchip_processing.py:~270`) calls `safe_cdf_bounds` with 201-grid defaults
-(`max_step=0.2`) even when `cdf_size < 201`. It's currently harmless because
-`numeric/pipeline.py` re-resamples with grid-scaled constraints (`grid_step_constraints(...)`,
-pipeline.py:93) whenever `cdf_size != 201` and discards this fallback CDF — so the coarse-grid path
-never ships this output. The fix is ~2 lines (compute `grid_step_constraints(len(base))` and pass
-the scaled min/max step into `safe_cdf_bounds`) plus a coarse-grid regression test. Fold into any
-future discrete-hardening pass (a discrete-pipeline audit is running 2026-07-20 and may produce
-one). Only becomes live if someone refactors the pipeline resample block that neutralizes it, or
-calls this fallback directly on a discrete grid.
+Landed with the 2026-07-20 discrete-hardening pass. `BoundSafeNumericDistribution.cdf`
+(`numeric/pchip_processing.py`) now computes `grid_step_constraints(len(base))` and threads the
+grid-scaled min/max step into `safe_cdf_bounds`, so the fallback matches the pipeline's resample
+path on a coarse discrete grid instead of clipping every bin to the 201-grid `max_step=0.2`.
+Regression test: `tests/test_thirteen_percentile_e2e.py::TestFallbackCdfRespectsOpenBounds::test_fallback_coarse_grid_uses_grid_scaled_constraints`.
 
 ### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
 

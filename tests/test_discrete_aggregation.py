@@ -167,6 +167,64 @@ def test_ensemble_discrete_resample_does_not_clip_concentrated_low_count():
     assert np.all(diffs >= 0.01 / (question.cdf_size - 1) - 1e-12)
 
 
+def test_ensemble_median_ramp_does_not_overflow_above_one():
+    """Regression: the continuous branch's min-step ramp must not push interior CDF > 1.0.
+
+    On a concentrated low-count discrete question the aggregated median CDF has
+    sub-min-step gaps near the top bins. The ramp (``p_vals + linspace(...)``) lifts
+    every point, and ``_pin_endpoints`` only fixes ``[0]`` and ``[-1]`` — so an interior
+    value could land above 1.0 (e.g. 1.0026) and crash ``Percentile`` validation
+    (``percentile <= 1``), dropping the whole question. The aggregated CDF must instead
+    be routed through ``safe_cdf_bounds`` and emerge as a valid submission.
+    """
+    for open_upper in (False, True):
+        question = _discrete_open_upper_question() if open_upper else _closed_discrete_question()
+        x = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
+        # Valid monotonic CDF in [0, 1] with sub-min-step gaps near the top bins that force
+        # the ramp branch (the exact shape the 2026-07-20 audit used to trigger the crash).
+        p = np.array([0.0, 0.6, 0.9, 0.97, 0.99, 0.994, 0.997, 0.9993, 1.0])
+        assert bool(np.all(np.diff(p) > 0)) and p.min() >= 0.0 and p.max() <= 1.0
+        assert float(np.diff(p).min()) < 0.01 / (question.cdf_size - 1), "test setup must trigger the ramp"
+
+        dist = _postprocess_ensemble_cdf(x, p.copy(), question, "median")
+        probs = np.array([pp.percentile for pp in dist.cdf], dtype=float)
+
+        assert len(probs) == question.cdf_size
+        assert probs.min() >= 0.0 and probs.max() <= 1.0 + 1e-12, f"interior overflow: max={probs.max()}"
+        diffs = np.diff(probs)
+        assert np.all(diffs > 0.0), "CDF must be strictly increasing"
+        min_step = 0.01 / (question.cdf_size - 1)
+        max_step = min(1.0, 0.2 * 200.0 / (question.cdf_size - 1))
+        assert np.all(diffs >= min_step - 1e-12), f"min-step violation: {diffs.min()}"
+        assert np.all(diffs <= max_step + 1e-9), f"max-step violation: {diffs.max()}"
+        if open_upper:
+            assert probs[-1] <= 0.999 + 1e-12
+        else:
+            assert abs(probs[-1] - 1.0) <= 1e-9
+        assert abs(probs[0] - 0.0) <= 1e-9
+
+
+def _closed_discrete_question() -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=38881,
+        id_of_post=38881,
+        page_url="https://example.com/q/38881",
+        question_text="Discrete low-count question (closed upper)",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=7.5,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=9,
+    )
+
+
 def test_ensemble_aligned_discrete_grid_preserves_shape():
     """When per-model CDFs already sit on the cdf_size grid, aggregation keeps the shape.
 

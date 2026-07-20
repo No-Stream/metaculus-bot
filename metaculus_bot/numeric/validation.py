@@ -8,7 +8,12 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import ValidationError
 
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.config import (
+    EXPECTED_PERCENTILE_COUNT,
+    MIN_BOUNDARY_DISTANCE,
+    STANDARD_PERCENTILES_CSV,
+    STRICT_ORDERING_EPSILON,
+)
 from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, percentile_key
 
 logger = logging.getLogger(__name__)
@@ -116,8 +121,25 @@ def detect_unit_mismatch(
         # Any of these triggers → mismatch
         if span_ratio < span_ratio_threshold:
             return True, f"tiny span vs range (span_ratio={span_ratio:.3e} < {span_ratio_threshold:.1e})"
-        if min_step_ratio < min_step_ratio_threshold:
+
+        # Near-duplicate (min adjacent step) rule, jitter-aware.
+        #
+        # ``sanitize_percentiles`` deliberately separates equal / clustered declarations
+        # (e.g. a low-count discrete question where a model declares P20=P40=P50=1) into a
+        # strictly-increasing set, using a jitter epsilon on the order of
+        # ``MIN_BOUNDARY_DISTANCE * range`` and, when adjacent clusters collide, compressing
+        # them no tighter than that epsilon spread across the percentile set
+        # (``epsilon / EXPECTED_PERCENTILE_COUNT``). Those sub-threshold gaps are an expected
+        # artifact of building a valid CDF, not a scale error, so a fixed relative threshold
+        # alone misfires on faithful concentrated forecasts and silently drops them. Require
+        # the gap to also be tighter than anything the pipeline can produce — i.e. values so
+        # collapsed it could not separate them (clamped onto a bound). Genuine
+        # order-of-magnitude unit errors still surface via the span/magnitude ratios, which
+        # this leaves untouched.
+        pipeline_min_gap = max(MIN_BOUNDARY_DISTANCE * rng, STRICT_ORDERING_EPSILON) / EXPECTED_PERCENTILE_COUNT
+        if min_step_ratio < min_step_ratio_threshold and min_step < 0.5 * pipeline_min_gap:
             return True, f"near-duplicate values (min_step_ratio={min_step_ratio:.3e} < {min_step_ratio_threshold:.1e})"
+
         if vmax_ratio < max_magnitude_ratio_threshold:
             return True, f"values tiny vs range (max_mag_ratio={vmax_ratio:.3e} < {max_magnitude_ratio_threshold:.1e})"
 

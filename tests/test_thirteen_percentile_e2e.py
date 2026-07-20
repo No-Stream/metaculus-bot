@@ -32,6 +32,7 @@ def _question(
     upper: float,
     open_lower: bool,
     open_upper: bool,
+    cdf_size: int = 201,
 ) -> NumericQuestion:
     return NumericQuestion(
         question_text="What will the value be?",
@@ -47,6 +48,7 @@ def _question(
         open_upper_bound=open_upper,
         zero_point=None,
         unit_of_measure="USD",
+        cdf_size=cdf_size,
     )
 
 
@@ -216,3 +218,29 @@ class TestFallbackCdfRespectsOpenBounds:
         steps = np.diff(probs)
         assert float(steps.min()) >= _MIN_STEP - 1e-10, f"min-step violation: {float(steps.min())}"
         assert probs[0] >= 0.001
+
+    def test_fallback_coarse_grid_uses_grid_scaled_constraints(self):
+        """F4 regression: on a coarse discrete grid (cdf_size < 201) the fallback must scale
+        its ``safe_cdf_bounds`` constraints to the grid, not use the 201-grid ``max_step=0.2``.
+
+        The native builder emits ``cdf_size`` points, so a concentrated open-bound
+        low-count forecast puts well over 0.2 of mass in one bin. With the 201-grid cap the
+        fallback would wrongly redistribute that bin down to 0.2; the grid-scaled cap
+        (``0.2 * 200 / (cdf_size - 1)``, vacuous at cdf_size=9) must let the peak stand while
+        still honouring the grid's min-step and open-bound endpoints."""
+        question = _question(lower=-0.5, upper=7.5, open_lower=False, open_upper=True, cdf_size=9)
+        declared = _declared([0.02, 0.03, 0.05, 0.08, 0.12, 0.2, 0.3, 0.45, 0.9, 1.5, 2.5, 4.0, 6.0])
+
+        distribution = create_fallback_numeric_distribution(declared, question, zero_point=None)
+        cdf = distribution.cdf
+
+        assert len(cdf) == question.cdf_size
+        probs = np.array([p.percentile for p in cdf], dtype=float)
+        steps = np.diff(probs)
+        grid_min_step = 0.01 / (question.cdf_size - 1)
+        grid_max_step = min(1.0, 0.2 * 200.0 / (question.cdf_size - 1))
+        assert float(steps.max()) > _MAX_STEP, "coarse-grid peak must exceed the old 201-grid 0.2 cap"
+        assert float(steps.min()) >= grid_min_step - 1e-10, f"grid min-step violation: {float(steps.min())}"
+        assert float(steps.max()) <= grid_max_step + 1e-9, f"grid max-step violation: {float(steps.max())}"
+        assert bool(np.all(steps > 0.0)), "fallback CDF must be strictly increasing"
+        assert probs[-1] <= 0.999 + 1e-12

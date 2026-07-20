@@ -18,7 +18,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_RAMP_K_FACTOR
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 __all__ = [
@@ -96,6 +96,20 @@ def _postprocess_ensemble_cdf(
                 min_delta_before,
                 min_delta_after,
             )
+
+        # The ramp (and even a raw concentrated median) can push interior CDF values above
+        # 1.0 and can leave bins above the grid-scaled max-step (binding once cdf_size >= 42).
+        # Route the aggregated CDF through the same bounds/monotonic/min-step/max-step
+        # enforcement the per-model ramp path (pchip_processing._apply_ramp_smoothing) and the
+        # discrete branch below already apply, so the result is a valid submission rather than
+        # a downstream Percentile validation crash (percentile <= 1) that drops the question.
+        p_vals = safe_cdf_bounds(
+            p_vals,
+            open_lower=question.open_lower_bound,
+            open_upper=question.open_upper_bound,
+            min_step=min_step_required,
+            max_step=max_step_required,
+        )
 
         declared_percentiles = [Percentile(percentile=float(p), value=float(v)) for v, p in zip(x_vals, p_vals)]
         return create_pchip_numeric_distribution(
