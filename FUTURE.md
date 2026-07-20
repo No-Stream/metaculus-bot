@@ -73,6 +73,60 @@ the 58:30 per-question wall clock; interaction with `WALL_CLOCK_STACKING_MIN_BUD
 subset; effects <0.02 Brier are undetectable at our n, so this is a big-lever ship-and-watch bet
 with era-bucketing.
 
+### Frozen-triple numeric watch: re-run the ensemble delta after a same-lineage era accrues (added 2026-07-20, HIGH)
+
+Status: shipped-and-watch. The 2026-07-20 drop to the latest-per-vendor triple
+(`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) ships accepting a fragile
+numeric lean toward the full 6-member roster. Two adversarially-verified analyses
+(`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`)
+found the triple non-inferior on binary (delta +0.01, P(loss>1pt/Q)=0.35) and MC (−0.14,
+0.26), but numeric leans full by **+3.24 log pts/Q, 95% CI [−2.5, +9.1], P(full better)=0.88,
+P(loss>1pt/Q)=0.80** — the interval spans zero, so not decisive, but it is the one type where
+the drop could cost score. Operator explicitly flagged this as "honestly a bit risky" — hence
+HIGH.
+
+**Why it's fragile, not merely uncertain.** The +3.24 lean rests on 2 questions: the top-2
+|delta| values are 51% of the summed numeric advantage, and jackknifing them halves the mean
+(+3.12 → +1.56 on raw deltas). Don't read +3.24 as a precise number; the mean-targeting Normal
+likelihood and the coverage-verified (over-covering) CI already handle the heavy tail.
+
+**Why waiting for more questions does NOT resolve it.** The numeric posterior SD is dominated
+by *between-era* variance (tau ≈ 3.85 over 5 eras), not within-era noise. That sets a hard
+floor of ±3.37 log pts/Q on the 95% half-width **no matter how many numeric questions
+resolve** — every operator precision target (±1/±2/±3 pt) sits below the floor and is
+unreachable by question accrual. The only lever that tightens numeric is more *independent
+roster-stable eras* (the tau/√n_era term), each of which is months of fixed-roster operation.
+This is a ship-and-watch bet decided on today's lean, not a measurement we can sharpen by
+collecting more questions.
+
+**Plan.**
+
+1. **FREEZE the triple** (gpt-5.6-sol / opus-4.8 / gemini-3.1-pro-preview). Roster churn
+   restarts the era clock and re-inflates the between-era variance floor that blocks any
+   numeric measurement — the current lineage has ~0 resolved questions, so the frozen triple
+   is the *first* modern-lineage era. This is the second roster change on 2026-07-20 (it
+   supersedes the morning fable-5 → opus-4.7 swap); do not swap members mid-window.
+2. After **~30–50 numeric questions resolve under the frozen triple** (~2–3 months at
+   ~15.8 numeric/mo), re-run `bash scratch/ensemble_power_model_2026-07-20/run_all.sh` with the
+   new era added. Its value is a **same-lineage read** — replacing the current lineage-transfer
+   caveat, since the analyzed eras used grok-4.1/4.3 plus predecessor slots — plus one more era
+   on the tau/√n_era term, NOT a narrower CI (the floor blocks that).
+3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
+   delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
+   top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
+   split is the config spaghetti the operator would rather avoid, and it only earns its cost
+   under that condition.
+
+**Cost context for the re-add decision.** The drop cut per-question reasoning spend from
+~$3.05 to ~$1.65 (three fewer xhigh forecasters), and removing grok also ends routine
+personal-key forecaster spend. Weigh that saving against the numeric lean when deciding whether
+to reintroduce members — a re-add must clear both the score bar above *and* justify the cost it
+brings back.
+
+Receipts: `scratch/ensemble_power_model_2026-07-20/synthesis.md` (composed-delta model, power
+floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthesis.md` (paired
+bootstrap audit). Era boundary: 2026-07-20 = the triple config.
+
 ### Score the archived gap-fill v2 ghost forecasts (added 2026-07-18, HIGH, cheap)
 
 Both approach reviews on this branch (`scratch/branch_review_july15/reviews/`) flagged the

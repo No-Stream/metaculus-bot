@@ -58,80 +58,58 @@ ACCEPTABLE_QUANTS = [
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
 FORECASTER_LLMS: list[GeneralLlm] = [
-    # 2026-07-09: OpenAI flagship (5.6 series, released today); replaces gpt-5.4.
-    # 2026-07-15: effort high -> xhigh (top OpenAI tier; forecaster quality is the
-    # product). Live-verified: OpenRouter's effort enum is
-    # max|xhigh|high|medium|low|minimal|none and all four bumped models accept
-    # xhigh (bogus values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling
-    # is xhigh and OpenAI rejects max upstream even though OpenRouter's enum
-    # validation admits it. (Dates anchor config eras for residual analysis.)
+    # 2026-07-20: forecaster roster dropped from 6 to a 3-member latest-per-vendor
+    # triple (1 OpenAI / 1 Anthropic / 1 Google). This is the SECOND roster change
+    # on 2026-07-20 and supersedes the morning fable-5 → opus-4.7 swap (7a76df6) as
+    # the config-era boundary for residual analysis. Removed: gpt-5.5,
+    # claude-opus-4.7, grok-4.5. Two adversarially-verified analyses
+    # (scratch/ensemble_3member_audit_2026-07-20/ +
+    # scratch/ensemble_power_model_2026-07-20/) found the triple non-inferior on
+    # binary/MC and only a fragile numeric lean toward the full roster (+3.24,
+    # 95% CI [-2.5, +9.1], P(loss>1pt/Q)=0.80, driven by 2 questions) — accepted as
+    # a ship-and-watch bet; see FUTURE.md "Frozen-triple numeric watch". Dropping
+    # grok (x-ai, 404s on the donated key) also ends routine personal-key forecaster
+    # spend: only the gemini-3.1-pro-preview personal-key PIN bills
+    # OPENROUTER_API_KEY now; the other two slots route via the donated key.
+    # (Dates anchor config eras for residual analysis.)
+    #
+    # OpenAI flagship (5.6 series). 2026-07-15: effort high -> xhigh (top OpenAI
+    # tier; forecaster quality is the product). Live-verified: OpenRouter's effort
+    # enum is max|xhigh|high|medium|low|minimal|none and this model accepts xhigh
+    # (bogus values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling is xhigh
+    # and OpenAI rejects max upstream even though OpenRouter's enum validation
+    # admits it.
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.6-sol",
         reasoning={"effort": "xhigh"},
         **_FORECASTER_CONFIG,
     ),
-    # Kept (not migrated to sol) to preserve intra-OpenAI generation diversity
-    # alongside gpt-5.6-sol in the ensemble. 2026-07-15: effort high -> xhigh.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.5",
-        reasoning={"effort": "xhigh"},
-        **_FORECASTER_CONFIG,
-    ),
-    # 2026-07-20: Fable-5 PULLED from the forecaster roster (roster change = new
-    # config era for residual analysis) after it returned message.content=None on
-    # 4/4 attempts for Q14333's numeric forecast + a truncated no-JSON-block output
-    # on Q578 in the 2026-07-19 test_bot run — suspected fable-5 content classifiers
-    # refusing certain question content (fast deterministic empty completions, not
-    # timeouts). opus-4.7 takes the slot: per operator it handles content the same
-    # as opus-4.8 and supports xhigh, so it MIRRORS the opus-4.8 slot config exactly
-    # (effort=xhigh + verbosity=high, same _FORECASTER_CONFIG). Reconsidering fable-5
-    # is a tracked high-prio follow-up (see FUTURE.md); its forecast quality was
-    # never the issue. Keeps n=6 and the 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI
-    # provider balance.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.7",
-        reasoning={"effort": "xhigh"},
-        extra_body={"verbosity": "high"},
-        **_FORECASTER_CONFIG,
-    ),
-    # 2026-07-15: enabled:True (provider-default adaptive thinking) -> explicit
-    # effort=xhigh. Anthropic also exposes "max" one tier above xhigh — held back
-    # deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; unbounded adaptive
-    # thinking caused silent 600s soft-deadline stalls on the retired opus-4.6
-    # slot, e.g. Q14333 on 2026-05-07).
+    # Anthropic slot. 2026-07-15: enabled:True (provider-default adaptive thinking)
+    # -> explicit effort=xhigh. Anthropic also exposes "max" one tier above xhigh —
+    # held back deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; unbounded
+    # adaptive thinking caused silent 600s soft-deadline stalls on the retired
+    # opus-4.6 slot, e.g. Q14333 on 2026-05-07).
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
         reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
     ),
-    # 2026-07-15: opus-4.6 retired from the roster (4.6 was the older Anthropic
-    # tier; its adaptive-thinking stall workaround — reasoning={"max_tokens":
-    # 32_000} instead of effort-based — went with it; see git history). The two
-    # Anthropic slots are now opus-4.7 + opus-4.8 (2026-07-20; see the slot-3
-    # comment above), keeping ensemble size at 6 and provider balance at
-    # 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI.
+    # Google slot. No explicit reasoning-effort kwarg — gemini-3.1-pro-preview has
+    # no xhigh tier and uses provider defaults. PINNED to the personal
+    # OPENROUTER_API_KEY via the DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist in
+    # fallback_openrouter (the donated key routes it through a free-tier Google
+    # AI Studio BYOK integration with quota 0, so it would 429 there); see the
+    # TODO(gemini-3.1-pro-donated) tag pending the Metaculus-side BYOK fix.
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3.1-pro-preview",
-        **_FORECASTER_CONFIG,
-    ),
-    # 2026-07-08: migrated from x-ai/grok-4.3 to x-ai/grok-4.5 (released today; xAI's
-    # newest frontier reasoning model, 500K context, $2/$6 per M input/output tokens).
-    # Prior hop 2026-05-18: x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI) → grok-4.3
-    # with explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
-    # (4.3 defaulted to low effort if unspecified, vs. 4.1-fast which had no effort flag).
-    # effort=high kept from the 4.3 config — 4.5's default-effort behavior isn't yet
-    # documented, so preserving the peer-parity setting rather than reverting to default.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.5",
-        reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
 ]
 
 
 def _forecaster_display_name(llm: GeneralLlm) -> str:
-    """Short label for a forecaster (e.g. 'claude-opus-4.7') — strips the 'openrouter/<provider>/' prefix.
+    """Short label for a forecaster (e.g. 'claude-opus-4.8') — strips the 'openrouter/<provider>/' prefix.
 
     Used by performance_analysis.parsing to map 'Forecaster N' labels in bot comments
     back to a model name without having to hand-maintain a parallel list.

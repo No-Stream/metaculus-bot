@@ -74,7 +74,7 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  4. MIN-FORECASTERS GUARD                        │
-        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (3) valid │
+        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (2) valid │
         │  → skip this question, keep the batch going.     │
         └────────────────────────────────────────────────┘
                                  │
@@ -150,10 +150,10 @@ bound/step constraints.
 
 ### 4. Min-forecasters guard
 
-If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 3, `constants.py:469`) forecasters
+If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 2, `constants.py:487`) forecasters
 returned a valid prediction, the ensemble is too degraded to trust. The question is
 skipped and a counter bumps for end-of-run alerting, but the rest of the batch and all
-other publications continue (`forecaster.py:613`).
+other publications continue (`forecaster.py:638`).
 
 ### 5. Aggregation: CONDITIONAL_STACKING
 

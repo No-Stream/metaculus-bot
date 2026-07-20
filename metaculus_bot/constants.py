@@ -475,9 +475,16 @@ FORECASTER_SOFT_DEADLINE: int = 600
 
 # Minimum number of successful base forecasters required to publish a question.
 # Below this, the question is skipped entirely rather than publishing a weak
-# ensemble. Chosen conservatively: median/stacker aggregation remains meaningful
-# with 3/6 inputs; below that we're closer to a single-model opinion.
-MIN_FORECASTERS_TO_PUBLISH: int = 3
+# ensemble.
+#
+# 2026-07-20: lowered 3 → 2 alongside the drop to a 3-member roster. At n=3,
+# min=3 would tolerate ZERO drops — a single transient model failure (e.g. the
+# 2026-07-19 fable-5 message.content=None drop) would withhold the question
+# entirely. Publishing the median of 2 surviving forecasters beats not
+# publishing at all, and exception-driven drops stay CI-visible (counted as
+# degradation since 687e113), so a systematically-failing model still surfaces
+# rather than silently thinning the ensemble.
+MIN_FORECASTERS_TO_PUBLISH: int = 2
 
 # Per-question wall-clock cutoff (58:30 of the 60-min Metaculus close window).
 # At deadline, in-flight forecasters are cancelled; we base-combine whatever
