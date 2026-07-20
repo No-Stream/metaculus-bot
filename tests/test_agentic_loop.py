@@ -389,6 +389,71 @@ async def test_record_findings_rejects_lint_and_banks_clean_findings() -> None:
     assert "findings[0] rejected" in _tool_messages(result)[0]["content"]
 
 
+_FINDING_UN = {
+    "claim": "The UN projects a population peak of ~10.3 billion in the mid-2080s.",
+    "source_url": "https://example.com/un",
+    "quote": "peak of around 10.3 billion people in the mid-2080s",
+    "date": "2024-07-11",
+    "retrieved_how": "fetch",
+    "topic": "demographics",
+}
+_FINDING_NASA = {
+    "claim": "NASA reports no known >140m asteroid with significant 100-year impact risk.",
+    "source_url": "https://example.com/nasa",
+    "quote": "no known asteroid larger than 140 meters",
+    "date": "2023-09-08",
+    "retrieved_how": "fetch",
+    "topic": "asteroids",
+}
+
+
+@pytest.mark.asyncio
+async def test_findings_recorded_then_relisted_in_conclude_are_not_duplicated() -> None:
+    """Regression (Q578): a driver that banks findings with record_findings and
+    then re-lists the SAME findings in conclude's final_findings must not double
+    them (observed: 8 findings rendered 16 times). Banking is idempotent by
+    full-field identity."""
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("rec1", "record_findings", {"findings": [_FINDING_UN, _FINDING_NASA]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude", {"final_findings": [_FINDING_UN, _FINDING_NASA]})]),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    md = result.findings_markdown
+    assert md.count("The UN projects a population peak") == 1
+    assert md.count("NASA reports no known") == 1
+    assert result.telemetry.findings_count == 2
+    conclude_message = _tool_messages(result)[-1]
+    assert "Skipped 2 final finding(s) already recorded earlier in this run." in conclude_message["content"]
+    assert "Concluded with 0 final finding(s)" in conclude_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_findings_sharing_source_but_distinct_claim_are_both_kept() -> None:
+    """Dedup must key on the WHOLE finding, not just source_url: two findings
+    from the same page with different claims/topics are genuinely distinct and
+    must both survive (the Q578 log had exactly this shape for the NASA page)."""
+    long_claim = {
+        **_FINDING_NASA,
+        "topic": "asteroids (with NEO Surveyor context)",
+        "claim": "NASA reports no known >140m asteroid impact risk and says NEO Surveyor will accelerate discovery.",
+    }
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("rec1", "record_findings", {"findings": [_FINDING_NASA, long_claim]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    assert result.telemetry.findings_count == 2
+    assert "NEO Surveyor" in result.findings_markdown
+
+
 @pytest.mark.asyncio
 async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
     async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
@@ -759,3 +824,42 @@ class TestSummarizeGhost:
         assert qtype == "unknown"
         assert summary == ""
         assert payload is None
+
+    @pytest.mark.parametrize(
+        ("qtype", "block"),
+        [
+            ("numeric", '{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}'),
+            ("multiple_choice", '{"question_type":"multiple_choice","option_probs":{"Blue":0.3,"Red":0.7}}'),
+            ("binary", '{"question_type":"binary","posterior_prob":0.42}'),
+        ],
+    )
+    def test_no_qtype_mismatch_warnings_on_declared_block(
+        self, caplog: pytest.LogCaptureFixture, qtype: str, block: str
+    ) -> None:
+        """Regression (BUG 2): the probe used to try all three qtypes, tripping
+        the shared parser's question_type-mismatch WARN for the non-matching
+        ones (5 spurious WARNs/run). Reading the declared type first parses only
+        the matching type — zero mismatch WARNs on the expected path."""
+        caplog.set_level(logging.WARNING, logger="metaculus_bot.structured_output_schema")
+
+        result_qtype, _summary, _payload = _summarize_ghost(f"analysis\n```json\n{block}\n```")
+
+        assert result_qtype == qtype
+        mismatch_warns = [r for r in caplog.records if "question_type mismatch" in r.getMessage()]
+        assert mismatch_warns == []
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pytest.LogCaptureFixture) -> None:
+    """End-to-end guard: a numeric ghost run through the full loop leaves no
+    question_type-mismatch WARN in the structured_output_schema logger."""
+    caplog.set_level(logging.WARNING, logger="metaculus_bot.structured_output_schema")
+    ghost_text = (
+        'analysis\n```json\n{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}\n```'
+    )
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    assert result.ghost is not None and result.ghost.qtype == "numeric"
+    assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []

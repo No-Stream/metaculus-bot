@@ -26,6 +26,7 @@ from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
     NumericStructured,
+    extract_json_block,
     parse_structured_block,
 )
 
@@ -45,6 +46,10 @@ class _LoopState:
     deadline_at_s: float
     telemetry: LoopTelemetry = field(default_factory=LoopTelemetry)
     findings: list[Finding] = field(default_factory=list)
+    # Full-field identities of already-banked findings, so re-recording the same
+    # finding (record_findings then a re-list in conclude's final_findings) is a
+    # no-op instead of a double-append. See _bank_findings.
+    seen_finding_keys: set[tuple[str, str, str, str, str, str, bool]] = field(default_factory=set)
     pending_leads: list[str] = field(default_factory=list)
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     nudged_for_no_action: bool = False
@@ -287,13 +292,50 @@ def _coerce_pending_leads(raw_pending_leads: Any) -> tuple[list[str], list[str]]
     return pending_leads, issues
 
 
+def _finding_key(finding: Finding) -> tuple[str, str, str, str, str, str, bool]:
+    return (
+        finding.claim,
+        finding.source_url,
+        finding.quote,
+        finding.date,
+        finding.retrieved_how,
+        finding.topic,
+        finding.discrepancy,
+    )
+
+
+def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int]:
+    """Append findings to ``state.findings``, skipping ones already banked this run.
+
+    Returns ``(banked, duplicates)``. Banking is idempotent by full-field
+    identity: a driver that records findings incrementally with
+    ``record_findings`` and then re-lists the same ones in ``conclude``'s
+    ``final_findings`` (observed on Q578 — 8 findings rendered 16 times) no
+    longer doubles the list. Using every field as the key keeps genuinely
+    distinct findings that happen to share a source/quote (a different ``claim``
+    or ``topic``) separate.
+    """
+    banked = 0
+    duplicates = 0
+    for finding in accepted:
+        key = _finding_key(finding)
+        if key in state.seen_finding_keys:
+            duplicates += 1
+            continue
+        state.seen_finding_keys.add(key)
+        state.findings.append(finding)
+        banked += 1
+    return banked, duplicates
+
+
 async def _record_findings_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOutcome:
     accepted, rejected, lint_rejections = _validate_findings_payload(arguments.get("findings"), label="findings")
-    if accepted:
-        state.findings.extend(accepted)
+    banked, duplicates = _bank_findings(state, accepted)
     state.telemetry.lint_rejections += lint_rejections
 
-    lines = [f"Recorded {len(accepted)} finding(s)."]
+    lines = [f"Recorded {banked} finding(s)."]
+    if duplicates:
+        lines.append(f"Skipped {duplicates} finding(s) already recorded earlier in this run.")
     if rejected:
         lines.append("Rejected:")
         lines.extend(f"- {item}" for item in rejected)
@@ -305,14 +347,15 @@ async def _conclude_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOu
         arguments.get("final_findings"), label="final_findings"
     )
     pending_leads, pending_errors = _coerce_pending_leads(arguments.get("pending_leads"))
-    if accepted:
-        state.findings.extend(accepted)
+    banked, duplicates = _bank_findings(state, accepted)
     state.pending_leads = pending_leads
     state.telemetry.lint_rejections += lint_rejections
     state.explicit_conclude = True
     state.stop_loop = True
 
-    lines = [f"Concluded with {len(accepted)} final finding(s) and {len(pending_leads)} pending lead(s)."]
+    lines = [f"Concluded with {banked} final finding(s) and {len(pending_leads)} pending lead(s)."]
+    if duplicates:
+        lines.append(f"Skipped {duplicates} final finding(s) already recorded earlier in this run.")
     if rejected or pending_errors:
         lines.append("Rejected:")
         lines.extend(f"- {item}" for item in [*rejected, *pending_errors])
@@ -535,6 +578,38 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     )
 
 
+_GHOST_QTYPES: tuple[Literal["binary", "multiple_choice", "numeric"], ...] = (
+    "binary",
+    "multiple_choice",
+    "numeric",
+)
+
+
+def _declared_qtype(raw_text: str) -> Literal["binary", "multiple_choice", "numeric"] | None:
+    """Peek the ghost block's self-declared ``question_type`` without parsing it.
+
+    The ghost emits exactly one structured block that names its own
+    ``question_type`` (the schema discriminator). Reading it lets
+    ``_summarize_ghost`` parse only the matching type instead of trying all
+    three — the two non-matching attempts would otherwise trip
+    ``parse_structured_payload``'s ``question_type`` mismatch guard, which WARNs
+    by construction (a numeric ghost logged 2 such WARNs, an MC ghost 1). Returns
+    ``None`` when no block is present, the JSON is malformed, or the declared
+    type is missing/unsupported, so the caller can fall back to trying every type.
+    """
+    raw = extract_json_block(raw_text)
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    declared = payload.get("question_type")
+    return declared if declared in _GHOST_QTYPES else None
+
+
 def _summarize_ghost(raw_text: str) -> tuple[str, str, dict[str, Any] | None]:
     """Parse the ghost's structured block once into ``(qtype, legacy_summary, forecast)``.
 
@@ -545,8 +620,14 @@ def _summarize_ghost(raw_text: str) -> tuple[str, str, dict[str, Any] | None]:
     the complete percentile->value dict plus the median (numeric). ``None`` when
     no block parses — the JSON marker line is then suppressed and only the
     legacy ``unknown``/``""`` marker is emitted.
+
+    Only the block's self-declared ``question_type`` is parsed (see
+    ``_declared_qtype``); the all-types fallback runs only when no type could be
+    read, keeping the mismatch-WARN path off the normal ghost flow.
     """
-    for qtype in ("binary", "multiple_choice", "numeric"):
+    declared = _declared_qtype(raw_text)
+    candidate_qtypes = (declared,) if declared is not None else _GHOST_QTYPES
+    for qtype in candidate_qtypes:
         block = parse_structured_block(raw_text, qtype)
         if isinstance(block, BinaryStructured):
             prob = float(block.posterior_prob)
