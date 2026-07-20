@@ -637,7 +637,7 @@ class TestAgainstRealHistoricalData:
 _RATIONALE_MODELS: list[tuple[int, str]] = [
     (1, "gpt-5.6-sol"),
     (2, "gpt-5.5"),
-    (3, "claude-fable-5"),
+    (3, "claude-opus-4.7"),
     (4, "claude-opus-4.8"),
     (5, "gemini-3.1-pro-preview"),
     (6, "grok-4.5"),

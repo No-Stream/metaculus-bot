@@ -77,15 +77,19 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         reasoning={"effort": "xhigh"},
         **_FORECASTER_CONFIG,
     ),
-    # 2026-07-15: Fable-5 joins the forecaster roster (roster change = new config
-    # era for residual analysis). Previously stacker-only — but stacking is
-    # disabled in prod (all workflow yamls pin *_STACKING_ENABLED=false), so our
-    # top Anthropic tier was idle in every prod run. Same effort=xhigh +
-    # verbosity=high config as its stacker slot; "max" held back for latency
-    # (FORECASTER_SOFT_DEADLINE=600s). Cost: $10/$50 per M in/out — 2x opus-4.8;
-    # donated-key eligible (Anthropic provider).
+    # 2026-07-20: Fable-5 PULLED from the forecaster roster (roster change = new
+    # config era for residual analysis) after it returned message.content=None on
+    # 4/4 attempts for Q14333's numeric forecast + a truncated no-JSON-block output
+    # on Q578 in the 2026-07-19 test_bot run — suspected fable-5 content classifiers
+    # refusing certain question content (fast deterministic empty completions, not
+    # timeouts). opus-4.7 takes the slot: per operator it handles content the same
+    # as opus-4.8 and supports xhigh, so it MIRRORS the opus-4.8 slot config exactly
+    # (effort=xhigh + verbosity=high, same _FORECASTER_CONFIG). Reconsidering fable-5
+    # is a tracked high-prio follow-up (see FUTURE.md); its forecast quality was
+    # never the issue. Keeps n=6 and the 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI
+    # provider balance.
     build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-fable-5",
+        model="openrouter/anthropic/claude-opus-4.7",
         reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
@@ -101,11 +105,12 @@ FORECASTER_LLMS: list[GeneralLlm] = [
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
     ),
-    # 2026-07-15: opus-4.6 retired from the roster — Fable-5 takes the second
-    # Anthropic slot, keeping ensemble size at 6 and provider balance at
-    # 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI. (4.6 was the older Anthropic
+    # 2026-07-15: opus-4.6 retired from the roster (4.6 was the older Anthropic
     # tier; its adaptive-thinking stall workaround — reasoning={"max_tokens":
-    # 32_000} instead of effort-based — goes with it. See git history.)
+    # 32_000} instead of effort-based — went with it; see git history). The two
+    # Anthropic slots are now opus-4.7 + opus-4.8 (2026-07-20; see the slot-3
+    # comment above), keeping ensemble size at 6 and provider balance at
+    # 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI.
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3.1-pro-preview",
         **_FORECASTER_CONFIG,
@@ -181,12 +186,15 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 # dice with the same distribution), and the budget is better spent on a
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/anthropic/claude-fable-5",
-    # Fable 5 uses effort-based adaptive thinking, not a max_tokens budget. Live-verified
-    # OpenRouter effort enum: none/minimal/low/medium/high/xhigh/max. 2026-07-15: effort
-    # high -> xhigh, matching the opus-4.8 forecaster slot. "max" (one tier above xhigh)
-    # is deliberately held back for latency — the stacker runs under STACKER_SOFT_DEADLINE
-    # (500s).
+    # 2026-07-20: fable-5 → opus-4.8 (fable-5 pulled from BOTH roles after
+    # content=None failures in the 2026-07-19 test_bot run — see the forecaster-slot
+    # comment above + FUTURE.md). Stacking is prod-disabled, so this is
+    # backtest/ablation-only exposure today. opus-4.8 uses effort-based adaptive
+    # thinking, not a max_tokens budget. Live-verified OpenRouter effort enum:
+    # none/minimal/low/medium/high/xhigh/max. effort=xhigh matches the opus-4.8
+    # forecaster slot; "max" (one tier above xhigh) is deliberately held back for
+    # latency — the stacker runs under STACKER_SOFT_DEADLINE (500s).
+    "openrouter/anthropic/claude-opus-4.8",
     reasoning={"effort": "xhigh"},
     extra_body={"verbosity": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},

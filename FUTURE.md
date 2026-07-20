@@ -116,6 +116,35 @@ pointing at mild HARM rather than neutrality, but on the retired lineage.
 n=5 and rebalance the provider mix; if it's neutral/positive, keep grok. Era-bucket the read (a
 roster swap starts a new era) — do NOT pool 4.3 and 4.5 evidence.
 
+### Reconsider claude-fable-5 for the forecaster slot (added 2026-07-20, HIGH)
+
+Status: pulled 2026-07-20; reconsideration tracked, do NOT re-add until the trigger below fires.
+
+Fable-5 held a forecaster slot from 2026-07-15 (when it replaced opus-4.6) until 2026-07-20, when
+it was pulled after returning `message.content=None` on 4/4 attempts for Q14333's numeric forecast
+(the question was dropped, published 5/6) and a truncated no-JSON-block output on Q578 that needed
+rung-3 LLM-parser salvage — both in the 2026-07-19 test_bot run (receipts:
+`scratch/gha_test_bot_2026_07_19.md`). Suspected cause: fable-5 content classifiers refusing certain
+question content, surfacing as fast deterministic empty completions (NOT timeouts). opus-4.7 took the
+slot (xhigh, mirroring opus-4.8). **Fable-5's forecast quality was never the issue** — this is a
+reliability/refusal problem, not a capability one.
+
+**Revisit when:** root cause is confirmed (e.g. replay fable-5 against the exact Q14333/Q578 prompts
+via a cheap manual call to see whether the empty completions reproduce and isolate the content
+trigger), or provider behavior changes. If the refusals turn out to be narrow/rare, fable-5 is the
+strongest available Anthropic tier and worth restoring.
+
+### Reconsider fable-5 as the stacker (currently opus-4.8) (added 2026-07-20, HIGH)
+
+Status: pulled 2026-07-20 alongside the forecaster slot; same trigger as the entry above.
+
+The primary stacker was `claude-fable-5` from 2026-07-07 to 2026-07-20; it moved to
+`claude-opus-4.8` in the same 2026-07-20 change (both roles pulled together after the content=None
+failures). Note stacking is **prod-disabled** (all workflow yamls pin `*_STACKING_ENABLED=false`), so
+this is backtest/ablation-only exposure today — lower urgency than the forecaster slot, but track it
+so both roles are reconsidered together when the root cause lands. The `gpt-5.6-sol` cross-provider
+fallback is unchanged.
+
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
 > Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting
