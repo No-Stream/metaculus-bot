@@ -908,6 +908,35 @@ small VM / fly.io cron firing `workflow_dispatch`. The new CLOSE_MARGIN watch
 (`make close_margin_watch`) is the instrument to confirm the problem persists and to measure any
 migration's effect.
 
+### Split `forecaster.py` (1066 LoC, past the ~1000 ceiling) (added 2026-07-20, MEDIUM)
+
+Status: deferred refactor from the 2026-07-20 forge review of the run-QA commits (finding F3);
+deliberately NOT fixed in the july15 branch.
+
+`metaculus_bot/forecaster.py` is 1066 lines, past our ~1000-LoC file ceiling, and keeps growing as
+research stages and post-processing accrete. Natural extraction seams: (1) the gather /
+wall-clock / soft-deadline concurrency machinery (`_forecaster_with_soft_deadline` and the
+parallel fan-out plumbing), and (2) the stacking-finalization helpers, which belong in the
+existing `stacking` module rather than the forecaster. Large-blast-radius (touches the hottest
+file in the pipeline), so it warrants its own PR **after the july15 branch merges** — tracked here
+so the file doesn't keep accreting in the meantime.
+
+### Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids (added 2026-07-20, MEDIUM)
+
+Status: deferred refactor from the 2026-07-20 forge review (finding F4); latent-only, provably
+neutralized today.
+
+The fallback CDF builder in `BoundSafeNumericDistribution.cdf`
+(`numeric/pchip_processing.py:~270`) calls `safe_cdf_bounds` with 201-grid defaults
+(`max_step=0.2`) even when `cdf_size < 201`. It's currently harmless because
+`numeric/pipeline.py` re-resamples with grid-scaled constraints (`grid_step_constraints(...)`,
+pipeline.py:93) whenever `cdf_size != 201` and discards this fallback CDF — so the coarse-grid path
+never ships this output. The fix is ~2 lines (compute `grid_step_constraints(len(base))` and pass
+the scaled min/max step into `safe_cdf_bounds`) plus a coarse-grid regression test. Fold into any
+future discrete-hardening pass (a discrete-pipeline audit is running 2026-07-20 and may produce
+one). Only becomes live if someone refactors the pipeline resample block that neutralizes it, or
+calls this fallback directly on a discrete grid.
+
 ### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
 
 Operator directive: no willy-nilly trimming; a Fable-judged per-section value/redundancy audit is the
