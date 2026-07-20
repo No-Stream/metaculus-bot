@@ -565,6 +565,111 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
 
 
 # ---------------------------------------------------------------------------
+# F5b: exception-dropped forecaster counts as degradation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exception_dropped_forecaster_counts_as_degradation(mock_binary_question, mock_general_llm):
+    """A forecaster that finishes by raising (not a timeout, not a cancel) must
+    bump _forecasters_dropped_count so cli.py's alertable exit fires.
+
+    Regression for the 2026-07-19 silent-degradation bug: a numeric forecaster
+    got message.content=None from OpenRouter, the AssertionError propagated, the
+    forecaster was dropped, and the question published on the surviving models —
+    but the drop was invisible to CI because only soft-deadline timeouts and
+    wall-clock cancels bumped the counter. min=1 keeps the survivor publishing
+    so the exception-drop counter is isolated from _questions_failed_to_publish.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+
+    # One forecaster succeeds; the other raises AssertionError mid-prediction
+    # (mirrors the real message.content=None -> AssertionError failure).
+    call_count = {"n": 0}
+
+    async def one_raises(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+        raise AssertionError("message.content was None")
+
+    bot._forecaster_with_soft_deadline = cast(Any, one_raises)
+
+    assert bot._forecasters_dropped_count == 0
+    assert bot.alertable_count == 0
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    # Survivor still publishes (1/2 >= min 1), so no question-failed bump.
+    assert len(result.predictions) == 1
+    assert bot._questions_failed_to_publish == 0
+    # The exception-dropped forecaster is now counted as degradation.
+    assert bot._forecasters_dropped_count == 1
+    assert bot.alertable_count == 1
+    # The error still flows to the errors list ("Minor Errors" reporting unchanged).
+    assert any("AssertionError" in e and "message.content was None" in e for e in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_soft_deadline_timeout_counted_once_through_gather(
+    mock_binary_question, mock_general_llm, monkeypatch: pytest.MonkeyPatch
+):
+    """A soft-deadline timeout must count exactly once end-to-end.
+
+    The timeout is bumped at its raise site in _forecaster_with_soft_deadline,
+    then the failed task also lands in the gather's done-loop. Pins the
+    no-double-count invariant: the done-loop excludes asyncio.TimeoutError so the
+    same drop isn't counted twice.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+
+    # Drive the REAL soft-deadline wrapper (don't patch it) so its timeout path
+    # runs; patch the inner _make_prediction: one fast, one past the deadline.
+    monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
+    call_count = {"n": 0}
+
+    async def make_pred(question, research, llm, chart_b64=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+        await asyncio.sleep(5)
+        return ReasonedPrediction(prediction_value=0.5, reasoning="never")
+
+    bot._make_prediction = AsyncMock(side_effect=make_pred)
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    assert len(result.predictions) == 1
+    # Counted once (at the raise site), not twice (raise site + done-loop).
+    assert bot._forecasters_dropped_count == 1
+    assert bot.alertable_count == 1
+
+
+# ---------------------------------------------------------------------------
 # F9a: alertable_count sum
 # ---------------------------------------------------------------------------
 

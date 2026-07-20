@@ -480,6 +480,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             else:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 exceptions.append(exc)
+                # A forecaster that finished by raising is a dropped ensemble
+                # member and must count as degradation (so cli.py's alertable
+                # exit fires). Soft-deadline TimeoutErrors were already counted
+                # at their raise site in _forecaster_with_soft_deadline, so
+                # exclude them here to avoid double-counting.
+                if not isinstance(exc, asyncio.TimeoutError):
+                    self._forecasters_dropped_count += 1
         exception_group: ExceptionGroup | None = (
             ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
         )
