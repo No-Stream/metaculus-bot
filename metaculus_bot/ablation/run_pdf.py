@@ -196,11 +196,12 @@ def _compute_numeric_prediction(
 
     ``cdf_size`` is the question's real grid length (see :func:`_resolve_numeric_cdf_size`):
     201 for continuous questions, smaller for discrete ones. The min/max per-bin step scale to
-    that length via ``_grid_step_constraints`` so a discrete grid satisfies the server's
+    that length via ``grid_step_constraints`` so a discrete grid satisfies the server's
     ``round(0.01 / N, 9)`` min-step and ``0.2 * 200 / N`` max-step rules, not just the
     201-point ones. At ``cdf_size == 201`` the constraints are exactly the historical
     constants, so that path is byte-identical to the pre-parameterization behavior.
     """
+    from metaculus_bot.numeric.config import grid_step_constraints  # noqa: PLC0415
     from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
     from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
         FitType,
@@ -208,7 +209,6 @@ def _compute_numeric_prediction(
         fit_normal_from_percentiles,
         fit_student_t_from_percentiles,
     )
-    from metaculus_bot.probabilistic_tools.pdf_pooling import _grid_step_constraints  # noqa: PLC0415
 
     percentiles = block.declared_percentiles
     if not percentiles or len(percentiles) < 2:
@@ -234,7 +234,7 @@ def _compute_numeric_prediction(
     open_lower = bool(question.open_lower_bound)
     open_upper = bool(question.open_upper_bound)
     num_points = cdf_size
-    min_step, max_step = _grid_step_constraints(num_points)
+    min_step, max_step = grid_step_constraints(num_points)
 
     grid = np.linspace(lower, upper, num_points)
     cdf_values = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)

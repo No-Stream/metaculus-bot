@@ -16,8 +16,8 @@ from forecasting_tools.data_models.numeric_report import (
 )
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
+from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_RAMP_K_FACTOR
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
@@ -76,7 +76,7 @@ def _postprocess_ensemble_cdf(
 
     target_cdf_size = int(getattr(question, "cdf_size", len(x_vals)) or len(x_vals))
     is_discrete = target_cdf_size != len(x_vals)
-    min_step_required = max(NUM_MIN_PROB_STEP, 0.01 / max(1, (target_cdf_size - 1)))
+    min_step_required, max_step_required = grid_step_constraints(target_cdf_size)
 
     if not is_discrete:
         diffs_before = np.diff(p_vals)
@@ -124,6 +124,7 @@ def _postprocess_ensemble_cdf(
         lower_bound=question.lower_bound,
         zero_point=question.zero_point,
         min_step=min_step_required,
+        max_step=max_step_required,
         num_points=target_cdf_size,
         question_id=getattr(question, "id_of_question", None),
         question_url=getattr(question, "page_url", None),

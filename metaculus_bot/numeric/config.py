@@ -47,6 +47,32 @@ MIN_CDF_PROB_STEP: float = 5e-5
 
 MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
+
+def grid_step_constraints(num_points: int) -> tuple[float, float]:
+    """Return ``(min_step, max_step)`` for an ``num_points``-point CDF grid.
+
+    Mirrors the Metaculus server's per-bin step rules, which scale with the bin
+    count ``inbound = num_points - 1``:
+
+    * min step ``round(0.01 / inbound, 9)`` — floored at ``MIN_CDF_PROB_STEP`` so
+      a fine grid never demands a step below the historical constant.
+    * max step ``0.2 * 200 / inbound`` — clamped at ``1.0`` (a probability step
+      can never exceed 1.0, so any larger bound is vacuous).
+
+    At the standard 201-point grid this returns exactly ``(MIN_CDF_PROB_STEP,
+    MAX_CDF_PROB_STEP)`` — i.e. ``(5e-5, 0.2)`` — so continuous questions are
+    unchanged. On a coarse discrete grid (``num_points < 201``) the max step
+    relaxes above 0.2 (e.g. 1.0 at ``num_points=9``), which is what lets a
+    small-count distribution keep its mass concentrated on the low integers
+    instead of being clipped to the 201-grid 0.2 cap. On a finer grid it
+    tightens below 0.2.
+    """
+    inbound = max(1, num_points - 1)
+    min_step = max(MIN_CDF_PROB_STEP, 0.01 / inbound)
+    max_step = min(1.0, 0.2 * 200.0 / inbound)
+    return min_step, max_step
+
+
 # Higher = more aggressive smoothing
 CDF_RAMP_K_FACTOR: float = 3.0
 

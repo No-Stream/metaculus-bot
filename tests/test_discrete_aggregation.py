@@ -2,7 +2,7 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.utils import aggregate_numeric
+from metaculus_bot.numeric.utils import _postprocess_ensemble_cdf, aggregate_numeric
 
 
 def test_discrete_mean_aggregation_cdf_size_and_min_step():
@@ -114,3 +114,82 @@ def test_discrete_median_aggregation_open_upper():
     assert probs[-1] <= 0.999 + 1e-12
     expected_values = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
     assert np.allclose(values, expected_values)
+
+
+def _discrete_open_upper_question() -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=38880,
+        id_of_post=38880,
+        page_url="https://example.com/q/38880",
+        question_text="Discrete low-count question",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=7.5,
+        open_lower_bound=False,
+        open_upper_bound=True,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=9,
+    )
+
+
+def test_ensemble_discrete_resample_does_not_clip_concentrated_low_count():
+    """Regression: the discrete-resample branch of _postprocess_ensemble_cdf must not clip P(0) to 0.2.
+
+    When the aggregated CDF arrives on a finer grid than the question's cdf_size
+    (``len(x_vals) != cdf_size``), the branch resamples via ``generate_pchip_cdf``.
+    On a 9-point grid the server's max-step is 0.2*200/8 = 5.0 (vacuous), so a
+    low-count consensus (most mass on 0) must keep P(0) well above the old
+    201-grid 0.2 cap this branch used to inherit.
+    """
+    question = _discrete_open_upper_question()
+
+    # Concentrated-low aggregated CDF on the 201-point grid (mismatched length ->
+    # is_discrete=True -> discrete-resample branch). ~32% of mass on 0.
+    x = np.linspace(question.lower_bound, question.upper_bound, 201)
+    below_one = np.minimum(1.0, np.maximum(0.0, (x + 0.5) / 1.0))
+    above_one = np.maximum(0.0, (x - 0.5) / 7.0)
+    p = np.maximum.accumulate(np.clip(0.32 * below_one + 0.66 * above_one, 0.0, 0.999))
+
+    dist = _postprocess_ensemble_cdf(x, p, question, "median")
+    probs = np.array([pp.percentile for pp in dist.cdf], dtype=float)
+
+    assert len(probs) == question.cdf_size
+    p_zero = probs[1] - probs[0]
+    assert p_zero > 0.25, f"P(0)={p_zero} clipped to the 0.2 cap"
+    diffs = np.diff(probs)
+    server_max_step = min(1.0, 0.2 * 200.0 / (question.cdf_size - 1))
+    assert np.all(diffs <= server_max_step + 1e-9)
+    assert np.all(diffs >= 0.01 / (question.cdf_size - 1) - 1e-12)
+
+
+def test_ensemble_aligned_discrete_grid_preserves_shape():
+    """When per-model CDFs already sit on the cdf_size grid, aggregation keeps the shape.
+
+    This is the branch that actually fires in prod (per-model CDFs are pre-resampled
+    to cdf_size by build_numeric_distribution), so len(x_vals) == cdf_size and the
+    continuous branch runs — it must not clip a concentrated low-count consensus.
+    """
+    question = _discrete_open_upper_question()
+    decls = [
+        [
+            Percentile(value=0.0, percentile=0.30),
+            Percentile(value=2.0, percentile=0.75),
+            Percentile(value=5.0, percentile=0.97),
+        ],
+        [
+            Percentile(value=0.0, percentile=0.28),
+            Percentile(value=2.0, percentile=0.72),
+            Percentile(value=5.0, percentile=0.96),
+        ],
+    ]
+    dists = [NumericDistribution(declared_percentiles=d, **question.model_dump()) for d in decls]
+
+    for method in ("mean", "median"):
+        agg = aggregate_numeric(dists, question, method)
+        probs = np.array([p.percentile for p in agg.cdf], dtype=float)
+        assert probs[1] - probs[0] > 0.25, f"{method}: P(0) unexpectedly clipped"

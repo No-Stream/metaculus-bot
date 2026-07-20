@@ -21,7 +21,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from scipy import optimize
 from scipy.stats import norm
 
-from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds
 
 
@@ -285,12 +285,16 @@ def percentiles_to_metaculus_cdf_via_mixture(
     # Ensure monotonic accumulation.
     cdf = np.maximum.accumulate(cdf)
 
+    # Grid-scale the per-bin step constraints so a non-201 grid uses the server's
+    # cdf_size-scaled min/max step (identical to the constants at 201).
+    min_step, max_step = grid_step_constraints(num_points)
+
     # Enforce min-step iteratively, with backward pass to handle CDFs that
     # saturate before the grid endpoint (forward+backward sweep).
-    cdf = enforce_min_steps(cdf, MIN_CDF_PROB_STEP, upper_cap=hi_cap, lower_cap=lo_cap)
+    cdf = enforce_min_steps(cdf, min_step, upper_cap=hi_cap, lower_cap=lo_cap)
 
     # Final monotonicity safety + apply boundary constraints + max-step redistribution.
     cdf = np.maximum.accumulate(cdf)
-    cdf = safe_cdf_bounds(cdf, open_lower, open_upper)
+    cdf = safe_cdf_bounds(cdf, open_lower, open_upper, min_step=min_step, max_step=max_step)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf[i])) for i in range(num_points)]

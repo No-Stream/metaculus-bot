@@ -219,6 +219,7 @@ def generate_pchip_cdf(
     zero_point: float | None = None,
     *,
     min_step: float = 5.0e-5,
+    max_step: float = NUM_MAX_STEP,
     num_points: int = 201,
     question_id: int | str | None = None,
     question_url: str | None = None,
@@ -230,6 +231,13 @@ def generate_pchip_cdf(
     maps percentiles in (0, 100) to values; ``zero_point`` enables non-linear grid scaling.
     Returns ``(cdf_values, aggressive_enforcement_used)`` where the second element flags whether
     aggressive step enforcement was required to satisfy the min-step constraint.
+
+    ``min_step`` / ``max_step`` default to the 201-point-grid constants. A caller building a CDF
+    on a non-201 grid (a discrete question with ``num_points != 201``) must pass the grid-scaled
+    values (see ``numeric.config.grid_step_constraints``) so the per-bin constraints match the
+    server's ``round(0.01 / N, 9)`` min-step and ``0.2 * 200 / N`` max-step, where
+    ``N = num_points - 1``. Passing the 201-grid ``max_step`` (0.2) on a coarse discrete grid
+    wrongly clips each bin to 20% and shoves the excess onto higher bins.
 
     Raises:
         ValueError: If input validation fails
@@ -371,8 +379,8 @@ def generate_pchip_cdf(
                             if cdf_y[j] > max_allowed:
                                 cdf_y[j] = max_allowed
 
-    # Apply boundary constraints and max jump rules
-    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound)
+    # Apply boundary constraints and max jump rules (grid-scaled on discrete grids)
+    cdf_y = safe_cdf_bounds(cdf_y, open_lower_bound, open_upper_bound, min_step=min_step, max_step=max_step)
 
     # Check if we have enough room for minimum steps
     required_range = (len(cdf_y) - 1) * min_step

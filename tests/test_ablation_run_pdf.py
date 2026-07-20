@@ -595,7 +595,7 @@ class TestNumericDiscreteGridLength:
         """At N=201 the parameterized path reproduces the pre-fix hard-coded-201 behavior exactly.
 
         The only change at N=201 is which step constants are passed to ``enforce_min_steps`` /
-        ``safe_cdf_bounds``. ``_grid_step_constraints(201)`` returns exactly the constants the
+        ``safe_cdf_bounds``. ``grid_step_constraints(201)`` returns exactly the constants the
         old code hard-coded (``MIN_CDF_PROB_STEP`` / ``MAX_CDF_PROB_STEP``, which equal
         ``safe_cdf_bounds``'s old defaults ``NUM_MIN_PROB_STEP`` / ``NUM_MAX_STEP``), so the new
         call is bit-for-bit the old call. We assert both that precondition AND that the emitted
@@ -605,18 +605,19 @@ class TestNumericDiscreteGridLength:
 
         from metaculus_bot.ablation.run_pdf import _compute_numeric_prediction  # noqa: PLC0415
         from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP  # noqa: PLC0415
-        from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, MIN_CDF_PROB_STEP  # noqa: PLC0415
+        from metaculus_bot.numeric.config import (  # noqa: PLC0415
+            MAX_CDF_PROB_STEP,
+            MIN_CDF_PROB_STEP,
+            grid_step_constraints,
+        )
         from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
         from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
             eval_cdf,
             fit_student_t_from_percentiles,
         )
-        from metaculus_bot.probabilistic_tools.pdf_pooling import _grid_step_constraints  # noqa: PLC0415
         from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block  # noqa: PLC0415
 
-        assert (
-            _grid_step_constraints(201) == (MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
-        )
+        assert grid_step_constraints(201) == (MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
 
         question = _make_numeric_q(qid=1, lower=0.0, upper=100.0, open_lower=True, open_upper=True, cdf_size=201)
         block = parse_structured_block(

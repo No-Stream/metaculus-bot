@@ -28,7 +28,7 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, MIN_CDF_PROB_STEP
+from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, enforce_min_steps, safe_cdf_bounds
 
 # Probability grid for inverting a CDF to a quantile function. Dense enough that linear
@@ -48,22 +48,6 @@ def _uniform_cdf_length(cdfs: list[list[Percentile]]) -> int:
     if len(lengths) != 1:
         raise ValueError(f"all input CDFs must share the same length; got lengths {sorted(lengths)}")
     return lengths.pop()
-
-
-def _grid_step_constraints(n_points: int) -> tuple[float, float]:
-    """(min_step, max_step) for an ``n_points``-point CDF, per the Metaculus per-bin rules.
-
-    Server constraints scale with the bin count ``inbound = n_points - 1``: min step
-    ``round(0.01 / inbound, 9)`` and max step ``0.2 * 200 / inbound``. We mirror
-    ``numeric.utils._postprocess_ensemble_cdf``: floor the min-step at ``MIN_CDF_PROB_STEP``
-    and cap the max-step at ``MAX_CDF_PROB_STEP`` (the 201-point-grid constants). For the
-    standard 201-point grid this returns exactly those constants (behaviour unchanged); it
-    only tightens the constraints on a coarser or finer grid.
-    """
-    inbound = max(1, n_points - 1)
-    min_step = max(MIN_CDF_PROB_STEP, 0.01 / inbound)
-    max_step = min(MAX_CDF_PROB_STEP, 0.2 * 200.0 / inbound)
-    return min_step, max_step
 
 
 def _question_grid(question: NumericQuestion, num_points: int) -> np.ndarray:
@@ -113,7 +97,7 @@ def _finalize_cdf(
     hi_cap = 0.999 if open_upper else 1.0
     lo_cap = 0.001 if open_lower else 0.0
 
-    min_step, max_step = _grid_step_constraints(len(grid))
+    min_step, max_step = grid_step_constraints(len(grid))
 
     cdf = np.clip(np.asarray(cdf, dtype=float), lo_cap, hi_cap)
     if not open_lower:
