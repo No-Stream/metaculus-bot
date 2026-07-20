@@ -599,12 +599,11 @@ signal: a model whose per-question percentile coverage drops to zero in a post-f
   (our `<2.0.0` cap is not binding), unreachable without bumping forecasting-tools.
 - **cryptography 45.0.4** — incl. one 9.8 (PYSEC-2026-36), transitive via asknews/google-auth/mcp.
 
-Resolved 2026-07-19: pillow and transformers came off the gated list via `[tool.uv]
-override-dependencies` in pyproject.toml (pillow forced past the never-importing forecasting-tools
-`<12` cap to 12.3.0; transformers — declared-but-unused, with an unreachable-fix critical RCE —
-excluded from resolution via a disjoint `python_version < '3.12'` marker), and pydantic-settings via
-an in-range bump to 2.14.2. Re-evaluate (and ideally delete) both overrides at the next
-forecasting-tools bump.
+Resolved 2026-07-19: pillow and transformers came off the gated list via `[tool.uv]` settings in
+pyproject.toml (pillow forced past the never-importing forecasting-tools `<12` cap to 12.3.0 via
+`override-dependencies`; transformers — declared-but-unused, with an unreachable-fix critical RCE —
+removed from resolution entirely via `exclude-dependencies`), and pydantic-settings via an in-range
+bump to 2.14.2. Re-evaluate (and ideally delete) both settings at the next forecasting-tools bump.
 
 Accepted consequence of freezing forecasting-tools. Revisit on the next forecasting-tools upgrade
 (re-run `make audit`); if a CVE becomes actively exploited first, evaluate a `[tool.uv]

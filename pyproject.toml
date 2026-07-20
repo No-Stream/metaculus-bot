@@ -59,12 +59,13 @@ override-dependencies = [
     # in the tree (streamlit <13, matplotlib >=9) accept 12.x. Forces the
     # 13-advisory pillow 11.3.0 CVE backlog onto the fixed 12.3.0 line.
     "pillow>=12.3.0",
+]
+exclude-dependencies = [
     # transformers is a declared-but-unused forecasting-tools dep (zero imports
     # there or in our code — verified 2026-07-19) carrying a critical RCE advisory
-    # (GHSA-fgcw-684q-jj6r) whose fix (5.5.0) sits above the <5.0.0 cap. The
-    # marker is disjoint from requires-python >=3.12, so uv drops transformers
-    # (and its safetensors subtree) from the lock entirely.
-    "transformers; python_version < '3.12'",
+    # (GHSA-fgcw-684q-jj6r) whose fix (5.5.0) sits above the <5.0.0 cap. Excluding
+    # it drops transformers (and its safetensors subtree) from the lock entirely.
+    "transformers",
 ]
 
 [build-system]

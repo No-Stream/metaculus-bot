@@ -6,10 +6,11 @@
 # upgrading forecasting-tools, which is deliberately frozen for behavioral
 # stability. See FUTURE.md "Dependency CVEs gated by the frozen forecasting-tools pin".
 #
-# pillow and transformers advisories were cleared 2026-07-19 via
-# `[tool.uv] override-dependencies` in pyproject.toml (pillow forced to >=12.3.0;
-# transformers excluded from resolution entirely as a declared-but-unused dep).
-# pydantic-settings was cleared by an in-range bump to 2.14.2.
+# pillow and transformers advisories were cleared 2026-07-19 in pyproject.toml:
+# pillow forced to >=12.3.0 via `[tool.uv] override-dependencies`; transformers
+# (a declared-but-unused dep) removed from resolution entirely via
+# `[tool.uv] exclude-dependencies`. pydantic-settings was cleared by an
+# in-range bump to 2.14.2.
 #
 # The scan stays LIVE for any NEW CVE not listed here — only these enumerated,
 # accepted advisories are suppressed. Re-evaluate this whole list whenever

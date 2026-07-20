@@ -7,14 +7,12 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-07-13T00:19:02.096708Z"
+exclude-newer = "2026-07-13T00:26:52.777828Z"
 exclude-newer-span = "P1W"
 
 [manifest]
-overrides = [
-    { name = "pillow", specifier = ">=12.3.0" },
-    { name = "transformers", marker = "python_full_version < '3.12'" },
-]
+overrides = [{ name = "pillow", specifier = ">=12.3.0" }]
+excludes = ["transformers"]
 
 [[package]]
 name = "aiofiles"
