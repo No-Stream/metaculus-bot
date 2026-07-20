@@ -570,6 +570,50 @@ class TestNumericDiscreteGridLength:
         steps = np.diff(np.asarray(cdf, dtype=float))
         assert float(steps.min()) >= self._discrete_min_step(self.DISCRETE_N) - 1e-12
 
+    def test_concentrated_discrete_question_retains_bin_above_020(self, tmp_path: Any) -> None:
+        """A concentrated low-count discrete question keeps one integer's bin > 0.2.
+
+        The broad-distribution test above passes under the old hard-coded 201-grid max-step
+        (0.2) too — no single bin exceeds it. This concentrated case is what actually
+        exercises the grid-scaled max-step (1.0 at cdf_size=17): the old cap would have
+        clipped the peaked integer to 20% and shoved the excess onto higher integers.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+
+        cache = AblationCache(str(tmp_path))
+        question = _make_numeric_q(
+            qid=42752,
+            lower=self.DISCRETE_LOWER,
+            upper=self.DISCRETE_UPPER,
+            open_lower=False,
+            open_upper=True,
+            cdf_size=self.DISCRETE_N,
+        )
+        # Tight cluster around integer 1 -> a student-t fit that concentrates >> 20% in the
+        # F(1.5) - F(0.5) bin on the [-0.5, 15.5] step-1 grid.
+        concentrated = {"0.1": 0.4, "0.25": 0.75, "0.5": 1.0, "0.75": 1.25, "0.9": 1.6}
+        reasoning = _numeric_percentile_reasoning(concentrated)
+        pv = _numeric_prediction_value(self.DISCRETE_N, lower=self.DISCRETE_LOWER, upper=self.DISCRETE_UPPER)
+        payloads = {
+            "model_a": _make_forecaster_payload(reasoning, prediction_value=pv),
+            "model_b": _make_forecaster_payload(reasoning, prediction_value=pv),
+        }
+        result = asyncio.run(
+            run_pdf_for_qid(
+                qid=42752, question=question, forecaster_payloads=payloads, cache=cache, force=True, min_forecasters=1
+            )
+        )
+        assert result["success"] is True
+        cdf = np.asarray(result["stacker_prediction"]["cdf_probabilities"], dtype=float)
+        assert len(cdf) == self.DISCRETE_N
+        steps = np.diff(cdf)
+        # The concentrated integer's bin survives above the old 0.2 cap.
+        assert float(steps.max()) > 0.2, f"peak bin {float(steps.max())} was clipped to the 0.2 cap"
+        # Server max-step for the coarse grid still holds (0.2 * 200 / 16 = 2.5, clamped to 1.0).
+        assert float(steps.max()) <= 1.0 + 1e-9
+
     def test_continuous_question_stays_201(self, tmp_path: Any) -> None:
         """A cdf_size=201 continuous question still yields a 201-point CDF."""
         from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415

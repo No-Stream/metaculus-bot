@@ -46,10 +46,10 @@ class _LoopState:
     deadline_at_s: float
     telemetry: LoopTelemetry = field(default_factory=LoopTelemetry)
     findings: list[Finding] = field(default_factory=list)
-    # Full-field identities of already-banked findings, so re-recording the same
+    # Canonical-JSON identities of already-banked findings, so re-recording the same
     # finding (record_findings then a re-list in conclude's final_findings) is a
     # no-op instead of a double-append. See _bank_findings.
-    seen_finding_keys: set[tuple[str, str, str, str, str, str, bool]] = field(default_factory=set)
+    seen_finding_keys: set[str] = field(default_factory=set)
     pending_leads: list[str] = field(default_factory=list)
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     nudged_for_no_action: bool = False
@@ -292,33 +292,22 @@ def _coerce_pending_leads(raw_pending_leads: Any) -> tuple[list[str], list[str]]
     return pending_leads, issues
 
 
-def _finding_key(finding: Finding) -> tuple[str, str, str, str, str, str, bool]:
-    return (
-        finding.claim,
-        finding.source_url,
-        finding.quote,
-        finding.date,
-        finding.retrieved_how,
-        finding.topic,
-        finding.discrepancy,
-    )
-
-
 def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int]:
     """Append findings to ``state.findings``, skipping ones already banked this run.
 
     Returns ``(banked, duplicates)``. Banking is idempotent by full-field
-    identity: a driver that records findings incrementally with
-    ``record_findings`` and then re-lists the same ones in ``conclude``'s
-    ``final_findings`` (observed on Q578 — 8 findings rendered 16 times) no
-    longer doubles the list. Using every field as the key keeps genuinely
-    distinct findings that happen to share a source/quote (a different ``claim``
-    or ``topic``) separate.
+    identity — the finding's canonical JSON serialization: a driver that records
+    findings incrementally with ``record_findings`` and then re-lists the same
+    ones in ``conclude``'s ``final_findings`` (observed on Q578 — 8 findings
+    rendered 16 times) no longer doubles the list. Serializing every field keeps
+    genuinely distinct findings that happen to share a source/quote (a different
+    ``claim`` or ``topic``) separate, and stays correct if ``Finding`` gains a
+    field.
     """
     banked = 0
     duplicates = 0
     for finding in accepted:
-        key = _finding_key(finding)
+        key = finding.model_dump_json()
         if key in state.seen_finding_keys:
             duplicates += 1
             continue

@@ -13,7 +13,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from scipy.stats import norm
 
-from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
+from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.probabilistic_tools.pdf_pooling import (
     _question_grid,
@@ -426,6 +426,30 @@ class TestNonStandardGridLength:
         out = np.asarray(apply_tail_floor(list(raw), question, floor_eps=1e-3), dtype=float)
         assert out.size == self.DISCRETE_N
         assert np.all(np.diff(out) >= self._discrete_min_step(self.DISCRETE_N) - 1e-10)
+
+    def test_concentrated_pool_retains_bin_above_020(self):
+        # Coverage gap: every coarse-grid test above uses broad distributions whose bins never
+        # exceed 0.2, so they'd pass even under the 201-grid 0.2 max-step cap. Two sharp,
+        # agreeing forecasters concentrated on integer 1 drive a single bin (F(1.5) - F(0.5))
+        # well above 0.2; _finalize_cdf must let it stand via the grid-scaled max-step
+        # (grid_step_constraints(17) -> 1.0), not clip it to the 201-grid 0.2 cap.
+        question = self._discrete_question()
+        grid = build_cdf_value_grid(self.DISCRETE_LOWER, self.DISCRETE_UPPER, None, self.DISCRETE_N)
+        sharp = [_normal_cdf_on_grid(grid, mean=1.0, sd=0.3) for _ in range(2)]
+
+        pooled = vincentize_cdfs(sharp, question, method="mean")
+
+        _assert_valid_cdf(
+            pooled,
+            question,
+            n_points=self.DISCRETE_N,
+            min_step=self._discrete_min_step(self.DISCRETE_N),
+            expected_grid=grid,
+        )
+        steps = np.diff(_probs(pooled))
+        _, max_step = grid_step_constraints(self.DISCRETE_N)
+        assert float(steps.max()) > 0.2, f"peak bin {float(steps.max())} was clipped to the 0.2 cap"
+        assert float(steps.max()) <= max_step + 1e-9  # scaled max-step (1.0), not the 0.2 cap
 
     def test_pooling_at_mid_range_length_101(self):
         # A coarser-than-201 grid that is not the real discrete size, to guard the general path.

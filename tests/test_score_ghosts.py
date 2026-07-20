@@ -11,6 +11,11 @@ shipped 2026-07-17), so the n=0 path is a first-class, tested outcome.
 import json
 import math
 
+import numpy as np
+import pytest
+
+import metaculus_bot.numeric.pchip_cdf as pchip_mod
+from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from scripts.score_ghosts import join_and_score, parse_ghost_summary, render_report
 
@@ -367,3 +372,78 @@ class TestNumericPairedScoring:
         assert math.isfinite(row["ghost_log_score"])
         assert math.isfinite(row["published_log_score"])
         assert math.isfinite(row["delta"])
+
+
+class TestGhostGridScaledMaxStep:
+    """F1 regression: the ghost CDF must be rebuilt with the grid-SCALED max-step.
+
+    On a native-discrete question the published CDF lives on a coarse grid
+    (cdf_size < 201) where the server's per-bin max step relaxes above 0.2 (e.g. 1.0
+    on a 9-point grid). The scorer rebuilds the ghost on that same grid; if it inherited
+    the 201-grid 0.2 cap it would clip a concentrated integer's mass while the published
+    side (built by the fixed prod path) stayed uncapped — an asymmetric paired log-score
+    biased against the ghost on concentrated discrete questions. The ghost build must pass
+    the grid-scaled (min_step, max_step) so a concentrated bin survives.
+    """
+
+    def test_concentrated_discrete_ghost_retains_bin_above_020(self, monkeypatch):
+        # grok's Q38880 concentrated low-count shape (~30% mass on integer 0), count 0-7,
+        # open upper. On a 9-point grid the P(0) bin (cdf[1]-cdf[0]) must stay above 0.25.
+        min_step, max_step = grid_step_constraints(9)
+        # Any valid 9-point published CDF fixes num_points=9; its shape only feeds the
+        # published log score, not the ghost CDF whose bins we assert on.
+        published_cdf, _ = generate_pchip_cdf(
+            {5: 1, 50: 3, 95: 6}, True, False, 7.5, -0.5, None, min_step=min_step, max_step=max_step, num_points=9
+        )
+        assert len(published_cdf) == 9
+
+        captured: dict = {}
+        real = pchip_mod.generate_pchip_cdf
+
+        def spy(*args, **kwargs):
+            cdf, flag = real(*args, **kwargs)
+            captured["cdf"] = cdf
+            captured["max_step"] = kwargs.get("max_step")
+            return cdf, flag
+
+        # _score_numeric imports generate_pchip_cdf lazily from this module, so patching
+        # the module attribute captures the ghost build (published_cdf was built above,
+        # before the patch, with the real function).
+        monkeypatch.setattr(pchip_mod, "generate_pchip_cdf", spy)
+
+        record = _numeric_record(1, 0.0, published_cdf, lower=-0.5, upper=7.5, open_upper=True)
+        record["type"] = "discrete"
+        concentrated = {0.2: 0.30, 0.4: 0.65, 0.5: 0.90, 0.8: 2.20, 0.9: 3.20, 0.99: 6.60}
+        json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": concentrated})]
+        summary = join_and_score(json_ghosts, [], [record])
+
+        assert summary["numeric"]["n"] == 1  # scoreable
+        # The ghost build received the grid-scaled max-step (1.0), not the 201-grid 0.2 cap.
+        assert captured["max_step"] == pytest.approx(max_step)
+        assert captured["max_step"] > 0.2
+        ghost_cdf = np.asarray(captured["cdf"], dtype=float)
+        assert ghost_cdf[0] == pytest.approx(0.0, abs=1e-9)  # closed lower
+        p_zero = ghost_cdf[1] - ghost_cdf[0]  # F(0.5) = P(0)
+        assert p_zero > 0.25, f"ghost P(0)={p_zero} was clipped by the 0.2 cap"
+
+    def test_paired_score_symmetric_on_concentrated_discrete_grid(self):
+        # Build the published CDF and the ghost from the SAME concentrated percentiles on
+        # the same coarse (9-point) grid. With the grid-scaled max-step the scorer rebuilds
+        # the ghost identically to the published side, so the paired delta is exactly 0.
+        # Under the bug the ghost was clipped at 0.2 while the published side was not — a
+        # spurious nonzero delta penalizing the concentrated ghost.
+        concentrated_pct = {20.0: 0.30, 40.0: 0.65, 50.0: 0.90, 80.0: 2.20, 90.0: 3.20, 99.0: 6.60}
+        min_step, max_step = grid_step_constraints(9)
+        published_cdf, _ = generate_pchip_cdf(
+            concentrated_pct, True, False, 7.5, -0.5, None, min_step=min_step, max_step=max_step, num_points=9
+        )
+        record = _numeric_record(1, 0.0, published_cdf, lower=-0.5, upper=7.5, open_upper=True)
+        record["type"] = "discrete"
+        ghost_declared = {p / 100.0: v for p, v in concentrated_pct.items()}
+        json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": ghost_declared})]
+        summary = join_and_score(json_ghosts, [], [record])
+
+        assert summary["numeric"]["n"] == 1
+        assert summary["numeric"]["n_unscoreable"] == 0
+        row = summary["numeric"]["rows"][0]
+        assert row["delta"] == pytest.approx(0.0, abs=1e-9)

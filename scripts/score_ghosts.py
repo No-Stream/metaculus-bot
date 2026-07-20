@@ -258,6 +258,9 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
     # Lazy imports: the PCHIP builder pulls numpy/scipy and the collector helper drags
     # the collector's heavy import chain (requests, env loading). Keep the n=0 path
     # dependency-light — numeric scoring only runs once real records join.
+    from metaculus_bot.numeric.config import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: pair the grid-step rule with the CDF builder it feeds
+        grid_step_constraints,
+    )
     from metaculus_bot.numeric.pchip_cdf import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the n=0 path free of numpy/scipy
         generate_pchip_cdf,
     )
@@ -274,10 +277,13 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
 
     # generate_pchip_cdf expects percentile keys in (0, 100); ghosts carry fraction
     # keys in [0, 1]. Match the ghost grid to the published grid length so both score
-    # with identical PMF bucketing; min_step follows Metaculus' round(0.01 / N, 9).
+    # with identical PMF bucketing; grid_step_constraints scales BOTH the min and max
+    # per-bin step to that length, so on a native-discrete grid (num_points < 201) the
+    # ghost isn't clipped by the 201-grid 0.2 max-step while the (prod-built) published
+    # side stays uncapped — that asymmetry biases the paired score against the ghost.
     pct_values = {frac * 100.0: value for frac, value in percentiles.items()}
     num_points = len(published_cdf)
-    min_step = round(0.01 / (num_points - 1), 9)
+    min_step, max_step = grid_step_constraints(num_points)
     try:
         ghost_cdf, _ = generate_pchip_cdf(
             pct_values,
@@ -287,6 +293,7 @@ def _score_numeric(ghost: dict, record: dict) -> dict:
             lower,
             zero_point,
             min_step=min_step,
+            max_step=max_step,
             num_points=num_points,
         )
     except (ValueError, RuntimeError):
