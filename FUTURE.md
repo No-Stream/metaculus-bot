@@ -152,23 +152,25 @@ via the existing CDF machinery, with a regex fallback for the pre-upgrade marker
 the legacy `GHOST_FORECAST` marker exposes only a numeric median, so numeric ghosts were
 countable but not scoreable — the operator wants gap-free ghost-vs-published analysis.
 
-### Re-evaluate the grok drop (6→5) once grok-4.5 has ~20-30 resolved questions (added 2026-07-19, HIGH)
+### Grok drop — RESOLVED 2026-07-20 (superseded by the latest-per-vendor triple) (added 2026-07-19, HIGH)
 
-Status: decision DEFERRED 2026-07-19 pending grok-4.5 evidence — do NOT act yet.
+Status: RESOLVED. Grok was removed entirely on 2026-07-20 as part of the drop to the 3-member
+latest-per-vendor triple — not the incremental 6→5 step this entry originally scoped. See the
+"Frozen-triple numeric watch" entry above and the ensemble analyses in
+`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`. The
+re-add question (should any dropped member, grok included, come back?) now lives in that
+frozen-triple watch. Evidence retained below for the record.
 
 A paired leave-one-out replay on 2026-07-19 found that dropping grok from the 6-model roster
-IMPROVES binary accuracy: Δlog-score **+1.83 [+0.74, +3.00]** favoring the drop (n=184). But
-that signal is entirely **grok-4.3-lineage** — grok-4.5 (the current slot) has too few resolved
-questions to score. Grok has long read as deadweight-but-harmless in the ensemble-composition
-screening (the 8-era LOO replay found no subset beats the full roster, grok the least
-load-bearing — see the "Ensemble composition screening 2026-07" memory); this is the first data
-pointing at mild HARM rather than neutrality, but on the retired lineage.
-
-**Gate:** re-run once grok-4.5 has ~20-30 resolved questions. The replay script
-`scratch/residual_2026-07-18/followups/grok_loo_replay.py` is parameterized and free to re-run
-(offline, no API). If grok-4.5 reproduces the drop-helps sign with a CI excluding zero, drop to
-n=5 and rebalance the provider mix; if it's neutral/positive, keep grok. Era-bucket the read (a
-roster swap starts a new era) — do NOT pool 4.3 and 4.5 evidence.
+IMPROVES binary accuracy: Δlog-score **+1.83 [+0.74, +3.00]** favoring the drop (n=184) — but
+that signal is entirely **grok-4.3-lineage** (grok-4.5, the slot at the time, had too few
+resolved questions to score). The 2026-07-20 power model corroborated the direction on the
+modern lineage's predecessors: grok read as a drag on binary (−2.4 log pts/Q) and MC (−1.3),
+and a help only on numeric (+2.0), with every CI spanning zero. Grok's numeric help is the one
+reason a re-add could be considered — and that is exactly the numeric lean the frozen-triple
+watch tracks. If grok is ever reconsidered, era-bucket the read (do NOT pool grok-4.3 and
+grok-4.5 evidence); the parameterized replay `scratch/residual_2026-07-18/followups/grok_loo_replay.py`
+is free to re-run (offline, no API).
 
 ### Reconsider claude-fable-5 for the forecaster slot (added 2026-07-20, HIGH)
 
