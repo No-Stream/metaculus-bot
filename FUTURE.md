@@ -921,6 +921,27 @@ existing `stacking` module rather than the forecaster. Large-blast-radius (touch
 file in the pipeline), so it warrants its own PR **after the july15 branch merges** — tracked here
 so the file doesn't keep accreting in the meantime.
 
+### Price the high→xhigh reasoning-effort premium via backtest A/B (added 2026-07-20, MEDIUM)
+
+Status: operator explicitly deferred 2026-07-20 — worth doing, but the backtest budget is
+contended; revisit when budget frees up or before the next major effort-config decision.
+
+**Motivation.** The 2026-07-20 reasoning-effort audit
+(`scratch/reasoning_effort_audit_2026-07-20/synthesis.md`, built from the AIB spring-2026 metac
+baseline-bot leaderboard) found default→high effort is clearly worth it: 8/8 within-model
+contrasts positive, sign test p=0.0078, median +2.9 spot-peer points/question, and thinking
+OFF→ON is the single largest knob (opus-4-5 flipped −1.9 → +2.9/Q). BUT the board has zero xhigh
+variants, so the high→xhigh premium — what we actually pay on 4 of 6 forecaster slots, ~64% of
+donated per-run spend per the 2026-07-19 credit audit — is unmeasured. The audit's
+diminishing-returns hint is a weak single-seed prior, not evidence.
+
+**Proposed test.** A paired A/B backtest, high vs xhigh arms on the same questions, on
+gpt-5.6-sol + gpt-5.5 (the two xhigh OpenAI slots); ~`backtest_medium` scale (2 arms × 32
+questions), rough cost $60-90 at recent per-question rates.
+
+**Decision rule when run.** If xhigh ≈ high within noise, drop those slots to high (saves a large
+fraction of the ~64%); if xhigh wins meaningfully, keep and consider extending xhigh to more slots.
+
 ### ~~Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids~~ — DONE 2026-07-20 (added 2026-07-20)
 
 Landed with the 2026-07-20 discrete-hardening pass. `BoundSafeNumericDistribution.cdf`
