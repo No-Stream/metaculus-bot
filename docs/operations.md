@@ -138,7 +138,7 @@ CRPS and is no better than median on binary.
 | `PERSIST_RESEARCH_ENABLED` | off | `true` (prod runs; off in test_bot) | Writes per-question research to JSONL for offline backtest replay |
 | `PLATT_CALIBRATION_ENABLED` | off | unset | Post-hoc logistic recalibration of the final published probability |
 | `GEMINI_USE_DONATED_OPENROUTER_KEY` | on | `true` | Route OpenRouter Gemini calls through the donated key with personal fallback |
-| `OPENROUTER_CREDIT_FLOOR_USD` | `50.0` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
+| `OPENROUTER_CREDIT_FLOOR_USD` | `1.0` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
 
 ## GitHub Actions workflows
 
@@ -208,8 +208,8 @@ stderr), so per-run spend is durably grep-able:
 - `CREDIT_BALANCE: key=<donated|personal> phase=<start|end> remaining=... usage=...`
 - `CREDIT_SPEND: key=... run_delta_usd=... remaining=...` at end of run.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
-  key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD` (default $50,
-  `constants.py:205`).
+  key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD` (default $1,
+  `constants.py:216`).
 
 A floor breach does not abort the run. Forecasting and publishing complete
 normally, then `cli.py` exits non-zero so the GitHub Actions check turns red as

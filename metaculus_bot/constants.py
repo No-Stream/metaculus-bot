@@ -213,7 +213,7 @@ ASKNEWS_WALL_TIMEOUT: int = 300
 # forecasting/publishing completes — a reminder-to-refill signal, not an abort.
 # The floor is meaningless for the personal key (no limit_remaining), so it is
 # only checked against the donated key. See metaculus_bot/credit_telemetry.py.
-OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 50.0)
+OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1.0)
 
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
