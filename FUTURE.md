@@ -518,6 +518,25 @@ affordable middle is more v2 rounds / parallelism, not a rebuild. The NO verdict
 
 ## Near-term (worth exploring soon)
 
+### TS-anchor follow-ups from the derivation-gating fix (added 2026-07-20)
+
+Context: commit `548ba88` closed the wrong-quantity routing bug (Codex P1 on b6edd2b) — CPI
+index-level/YoY/UK/Egypt questions were inheriting the US CPIAUCSL `mom_pct` band; PAYEMS and
+GASREGW had the same keyword overreach. The fix gates non-level derivations on quantity language
+and SKIPS when ambiguous. Two follow-ups deliberately left out of that commit:
+
+- **`yoy_pct` derivation to recover the YoY-CPI family.** The gate now skips YoY inflation
+  questions entirely (q41640-UK/q41634-Egypt-style, and US YoY variants). A `yoy_pct` derivation
+  gated on YoY language ("year-over-year", "12-month", "annual inflation") would give that
+  recurring family a correct-units anchor instead of none. Foreign-country questions need
+  country-specific series (ONS/ABS per `scratch/ts_anchor_gate_2026-07-16/MAPPING_AUDIT.md`) or
+  stay skipped — don't reuse CPIAUCSL. Same conservative registry pattern; the
+  `require_any_keywords` machinery from 548ba88 makes this a small add.
+- **Split `timeseries_anchor.py` (~1100 lines, over the monolithic ceiling).** Forge flagged;
+  deferred as its own PR. Natural seams: routing+registry vs estimators/render. Fold in the
+  duplicated 8-field `_Route` construction (`_single_url_route` vs `route_question`) via a
+  `_route_from_entry` helper when splitting.
+
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-17 (added 2026-07-16)
 
 **FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON 2026-07-17 after
