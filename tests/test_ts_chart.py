@@ -42,6 +42,10 @@ def _make_numeric_q(
     resolution_criteria: str = "rc",
     fine_print: str = "",
     scheduled_resolution_time: datetime | None = datetime(2027, 1, 1, tzinfo=UTC),
+    lower_bound: float = 0.0,
+    upper_bound: float = 1000.0,
+    open_lower_bound: bool = False,
+    open_upper_bound: bool = False,
 ) -> MagicMock:
     q = MagicMock(spec=NumericQuestion)
     q.id_of_question = qid
@@ -51,6 +55,15 @@ def _make_numeric_q(
     q.title = question_text
     q.open_time = datetime(2026, 3, 15, tzinfo=UTC)
     q.scheduled_resolution_time = scheduled_resolution_time
+    # build_anchor_section's bounds backstop reads these directly (they are required fields
+    # on a real NumericQuestion). The wide default range keeps the DGS10/VIX synthetic bands
+    # in-bounds so the section renders and the chart hook runs — this file tests the chart,
+    # not the backstop.
+    q.lower_bound = lower_bound
+    q.upper_bound = upper_bound
+    q.open_lower_bound = open_lower_bound
+    q.open_upper_bound = open_upper_bound
+    q.page_url = f"https://www.metaculus.com/questions/{qid}/"
     return q
 
 

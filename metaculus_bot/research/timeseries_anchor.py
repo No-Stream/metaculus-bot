@@ -122,10 +122,16 @@ class _TemplateEntry:
     # carried by the mom_diff branch, applied on top of scale).
     scale: float = 1.0
     # Extra keyword logic to disambiguate near-collisions under substring matching. An
-    # entry matches iff (any `keywords`) AND (all `require_keywords`) AND (no
-    # `exclude_keywords`). Used to keep US vs. Australian unemployment questions from
-    # both matching (they share "unemployment rate").
+    # entry matches iff (any `keywords`) AND (all `require_keywords`) AND (any
+    # `require_any_keywords`) AND (no `exclude_keywords`). `require_keywords` (all-of) keeps
+    # US vs. Australian unemployment questions from both matching (they share "unemployment
+    # rate"). `require_any_keywords` (any-of) is the DERIVATION gate: a non-"level" entry
+    # fits only when the question's own wording asks for the derived quantity (MoM change /
+    # MoM % / monthly average). Without it a question that merely NAMES the series but
+    # resolves on a different quantity — an index-LEVEL, year-over-year, or foreign-country
+    # CPI question, a payroll LEVEL question — gets an empirical band in the wrong units.
     require_keywords: tuple[str, ...] = ()
+    require_any_keywords: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
     model_target: bool = True
     note: str = ""
@@ -165,6 +171,13 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         "fred",
         "US regular gasoline price — monthly average ($/gal)",
         derivation="monthly_avg",
+        # Gate: fit the monthly-average band only on questions that ask for a value over a
+        # MONTH (the recurring "national average price ... for the month of X" family). Bare
+        # "average" would misfire — the GEOGRAPHIC "national average" descriptor is in every
+        # gasoline question, including spot/point-in-time ones, which must not inherit
+        # monthly_avg (and the bounds backstop can't catch it: both are ~$3/gal). The tokens
+        # here key on the monthly PERIOD framing instead.
+        require_any_keywords=("for the month", "monthly average", "during the month", "monthly"),
     ),
     _TemplateEntry(("brent",), "DCOILBRENTEU", "fred", "Brent crude spot ($/bbl)"),
     _TemplateEntry(("wti", "west texas intermediate"), "CL=F", "yfinance", "WTI crude front-month ($/bbl)"),
@@ -174,6 +187,26 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         "fred",
         "CPI-U all items — month-over-month % change (SA)",
         derivation="mom_pct",
+        # Gate: CPIAUCSL is US headline CPI, and this entry fits ONLY the recurring US
+        # month-over-month inflation family ("seasonally adjusted month over month headline
+        # CPI inflation ... in the United States", qids 39567/41681). Require MoM language
+        # so an index-LEVEL question, a year-over-year question, or a foreign-country CPI
+        # question (UK 12-month YoY, Egypt urban CPI — real tournament questions that route
+        # here today) does NOT get a US-MoM-% band in the wrong units / wrong country. The
+        # excludes are belt-and-suspenders for the YoY / level / foreign markers that lack
+        # MoM language anyway; " uk " uses both spaces so it never fires on "ukraine".
+        require_any_keywords=("month-over-month", "month over month", "mom "),
+        exclude_keywords=(
+            "year-over-year",
+            "year over year",
+            "yoy",
+            "12-month",
+            "annual",
+            "index level",
+            "united kingdom",
+            " uk ",
+            "egypt",
+        ),
     ),
     _TemplateEntry(
         ("unemployment rate",),
@@ -189,6 +222,11 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         "Nonfarm payrolls — month-over-month change (jobs added, persons)",
         derivation="mom_diff",
         scale=1000.0,  # PAYEMS is in thousands of persons; the question resolves in persons.
+        # Gate: the recurring family resolves on the CHANGE in payroll employment ("change
+        # in seasonally adjusted nonfarm payroll employment", qids 40100/40099/38829). A
+        # payroll LEVEL question (~160M persons) must not inherit the mom_diff band, whose
+        # ±hundreds-of-thousands scale is a different quantity entirely.
+        require_any_keywords=("change", "jobs added", "added", "gain", "gained"),
     ),
     _TemplateEntry(
         ("consumer sentiment", "michigan sentiment", "umich sentiment", "consumer confidence"),
@@ -297,15 +335,30 @@ def _wants_max(text: str) -> bool:
     return bool(_MAX_KEYWORD_RE.search(text))
 
 
+def _entry_quantity_ok(entry: _TemplateEntry, lowered: str) -> bool:
+    """The derivation gate, independent of title-keyword matching: at least one
+    ``require_any_keywords`` present (when any are declared) AND no ``exclude_keywords``.
+
+    Split out so the URL route can reuse it: a URL pins WHICH series resolves the question,
+    but a non-"level" derivation still only fits when the question actually asks for the
+    derived quantity — so a year-over-year / index-level / foreign-country CPI question
+    citing the US-MoM-CPI FRED URL is skipped rather than handed a wrong-units band."""
+    if entry.require_any_keywords and not any(kw in lowered for kw in entry.require_any_keywords):
+        return False
+    return not any(kw in lowered for kw in entry.exclude_keywords)
+
+
 def _entry_matches(entry: _TemplateEntry, lowered: str) -> bool:
     """An entry matches iff any of its keywords appear AND every require_keyword appears
-    AND no exclude_keyword appears (all case-folded). require/exclude disambiguate
-    substring collisions, e.g. US vs. Australian 'unemployment rate' questions."""
+    AND the derivation gate (``_entry_quantity_ok``) passes (all case-folded).
+    require/require_any/exclude disambiguate substring collisions (US vs. Australian
+    'unemployment rate') and keep a derived-quantity entry off a wrong-units question
+    (MoM vs. YoY/level CPI, payroll change vs. level)."""
     if not any(kw in lowered for kw in entry.keywords):
         return False
     if not all(kw in lowered for kw in entry.require_keywords):
         return False
-    return not any(kw in lowered for kw in entry.exclude_keywords)
+    return _entry_quantity_ok(entry, lowered)
 
 
 def _registry_entry_for_series(series_id: str, source: Literal["fred", "yfinance"]) -> _TemplateEntry | None:
@@ -332,15 +385,29 @@ def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str)
     return SeriesSpec(source="yfinance", series_id=series_id, column=column)
 
 
-def _single_url_route(series_id: str, source: Literal["fred", "yfinance"], text: str, *, is_max: bool) -> _Route:
+def _single_url_route(series_id: str, source: Literal["fred", "yfinance"], text: str, *, is_max: bool) -> _Route | None:
     """Route a single URL-cited series. The URL pins WHICH series; a matching registry
     entry still supplies HOW to derive/scale/label it (else a MoM-change or unit-scaled
     question renders a misleading raw-level band). Non-matching series keep dataclass
-    defaults (level, scale=1.0)."""
+    defaults (level, scale=1.0).
+
+    Returns None when the cited series has a NON-"level" registry derivation but the
+    question text fails that entry's quantity gate (``_entry_quantity_ok``): a MoM-%,
+    MoM-change, or monthly-average band on a question asking for a level / YoY / foreign
+    quantity is worse than no anchor, and we deliberately do NOT fall back to a raw-level
+    band (see ``_registry_entry_for_series`` on why that would be misleading)."""
     spec = _single_spec(series_id, source, text)
     entry = _registry_entry_for_series(series_id, source)
     if entry is None:
         return _Route(kind="single", spec=spec, label=series_id, is_max=is_max)
+    if entry.derivation != "level" and not _entry_quantity_ok(entry, text.lower()):
+        logger.info(
+            "ts_anchor: URL-cited %s carries registry derivation %r but the question text lacks the "
+            "matching quantity language (or hits an exclude) — skipping to avoid a wrong-units band",
+            series_id,
+            entry.derivation,
+        )
+        return None
     return _Route(
         kind="single",
         spec=spec,
@@ -677,7 +744,11 @@ def _render_single(
     ceiling: date,
     calendar_days: int,
     window_start: date | None = None,
-) -> str:
+) -> tuple[str, tuple[float, float, float] | None]:
+    """Return the rendered section text and the P10/P50/P90 band actually rendered (the
+    floor-lifted band for a max-window question), or ``None`` when no band was emitted
+    (not a model target, or the horizon exceeds available history). The caller uses the
+    band for the bounds-overlap backstop so it checks exactly what the forecaster sees."""
     # Everything downstream operates on the DERIVED quantity the question resolves on
     # (level×scale for plain/unit-converted levels; MoM change / MoM % / monthly average
     # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
@@ -714,6 +785,7 @@ def _render_single(
         parts.extend(_multi_res_history(derived, freq))
         parts.append(_fifty_two_week_line(derived, ceiling, last))
 
+    band: tuple[float, float, float] | None = None
     if route.model_target and y.size > h:
         n_eff = _n_eff(int(y.size), h)
         if is_max:
@@ -762,7 +834,7 @@ def _render_single(
             parts.append(vol_line)
 
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
-    return "\n".join(parts)
+    return "\n".join(parts), band
 
 
 def _render_spread(
@@ -869,7 +941,32 @@ def _maybe_stash_single_chart(
         logger.warning("ts_anchor: chart render failed for qid=%s (%s): %s", qid, type(exc).__name__, exc)
 
 
-def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
+def _finite_bound(v: float) -> bool:
+    """A displayed edge imposes a real constraint only when finite; some questions carry
+    ``±inf`` bounds, which mean "no constraint on this side"."""
+    return bool(np.isfinite(v))
+
+
+def _band_misses_bounds(question: NumericQuestion, band: tuple[float, float, float] | None) -> bool:
+    """Generic units/magnitude backstop: True when the rendered P10–P90 band lies ENTIRELY
+    outside the question's displayed range — a gross mismatch (level-vs-derived, or a
+    wrong-country CPI magnitude) meaning the anchor describes a different quantity than the
+    one that resolves. An OPEN or non-finite bound imposes no constraint on that side (the
+    outcome can settle beyond the displayed edge), so the check is one-sided or skipped
+    accordingly. Returns False when no band was rendered — nothing to check."""
+    if band is None:
+        return False
+    eff_lower = (
+        question.lower_bound if _finite_bound(question.lower_bound) and not question.open_lower_bound else -np.inf
+    )
+    eff_upper = (
+        question.upper_bound if _finite_bound(question.upper_bound) and not question.open_upper_bound else np.inf
+    )
+    p10, _p50, p90 = band
+    return p90 < eff_lower or p10 > eff_upper
+
+
+def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
     """Synchronous core: route, fetch point-in-time, render. Returns "" if unroutable.
 
     Runs in a worker thread (all HTTP is blocking). Raises FetchError/ValueError on
@@ -892,15 +989,38 @@ def build_anchor_section(question: MetaculusQuestion, as_of: datetime) -> str:
         return _truncate_section(_render_spread(series_a, series_b, route=route, calendar_days=calendar_days))
 
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)
-    _maybe_stash_single_chart(series, route=route, question=question, as_of=as_of, calendar_days=calendar_days)
     # For a forward-max question whose window has already opened, the max over the
     # elapsed portion is a hard lower bound. Approximate window_start by open_time; when
     # ceiling == open_time (benchmark path) there's no elapsed portion and no floor.
     open_time = getattr(question, "open_time", None)
     window_start = open_time.date() if isinstance(open_time, datetime) else None
-    return _truncate_section(
-        _render_single(series, route=route, ceiling=ceiling, calendar_days=calendar_days, window_start=window_start)
+    text, band = _render_single(
+        series, route=route, ceiling=ceiling, calendar_days=calendar_days, window_start=window_start
     )
+    if _band_misses_bounds(question, band):
+        assert band is not None  # _band_misses_bounds returns False for a None band
+        logger.warning(
+            "ts_anchor: empirical band P10/P90 %s/%s has zero overlap with question bounds "
+            "[%s, %s] (open_lower=%s open_upper=%s) — series=%s derivation=%s qid=%s url=%s; "
+            "skipping section (likely wrong units / country)",
+            _fmt(band[0]),
+            _fmt(band[2]),
+            question.lower_bound,
+            question.upper_bound,
+            question.open_lower_bound,
+            question.open_upper_bound,
+            route.spec.series_id,
+            route.derivation,
+            question.id_of_question,
+            question.page_url,
+        )
+        return ""
+    # Stash the chart only on the success path: a bounds-rejected section returns "" but a
+    # chart stashed here would still be pulled onto every base forecaster's vision message
+    # (forecaster.py `_pull_research_chart`), defeating the backstop. Success-only also
+    # skips a wasted matplotlib render on rejects.
+    _maybe_stash_single_chart(series, route=route, question=question, as_of=as_of, calendar_days=calendar_days)
+    return _truncate_section(text)
 
 
 # ---------------------------------------------------------------------------

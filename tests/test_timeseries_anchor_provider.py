@@ -37,6 +37,7 @@ from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
 from metaculus_bot.research.timeseries_anchor import (
     _apply_derivation,
+    _band_misses_bounds,
     _build_spread_series,
     _empirical_change_band,
     _empirical_max_band,
@@ -47,6 +48,7 @@ from metaculus_bot.research.timeseries_anchor import (
     _reset_session_caches,
     _Route,
     _truncate_section,
+    build_anchor_section,
     horizon_steps,
     route_question,
     timeseries_anchor_provider,
@@ -123,9 +125,16 @@ def _make_numeric_q(
     fine_print: str = "",
     open_time: datetime | None = None,
     scheduled_resolution_time: datetime | None = datetime(2027, 1, 1, tzinfo=UTC),
+    lower_bound: float = 0.0,
+    upper_bound: float = 1000.0,
+    open_lower_bound: bool = False,
+    open_upper_bound: bool = False,
 ) -> MagicMock:
     """A ``MagicMock(spec=NumericQuestion)`` with the fields the provider reads set to
-    real values (unset MagicMock attrs are truthy and would corrupt routing / isinstance)."""
+    real values (unset MagicMock attrs are truthy and would corrupt routing / isinstance,
+    and the bounds backstop needs real numeric bounds). The wide default range [0, 1000]
+    comfortably contains the synthetic-series bands, so the backstop is a no-op unless a
+    test opts into a mismatched range."""
     q = MagicMock(spec=NumericQuestion)
     q.id_of_question = qid
     q.question_text = question_text
@@ -134,6 +143,11 @@ def _make_numeric_q(
     q.title = question_text
     q.open_time = open_time if open_time is not None else datetime(2026, 3, 15, tzinfo=UTC)
     q.scheduled_resolution_time = scheduled_resolution_time
+    q.lower_bound = lower_bound
+    q.upper_bound = upper_bound
+    q.open_lower_bound = open_lower_bound
+    q.open_upper_bound = open_upper_bound
+    q.page_url = f"https://www.metaculus.com/questions/{qid}/"
     return q
 
 
@@ -152,10 +166,15 @@ class TestRouting:
         assert route.spec.revises is False  # DGS10 is in the non-revising allowlist
 
     def test_routes_via_fred_url_revising_series_uses_alfred_spec(self):
+        # The URL pins CPIAUCSL, but its mom_pct derivation is now gated: the question must
+        # ask for the MoM quantity, else the URL route skips (see the YoY-URL test below).
+        # A MoM CPI question citing the URL routes and, being a revising series, uses ALFRED.
+        qt = "What will month-over-month CPI inflation be in the United States for December 2026?"
         rc = "Resolves per https://fred.stlouisfed.org/series/CPIAUCSL."
-        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
         assert route is not None
         assert route.spec.series_id == "CPIAUCSL"
+        assert route.derivation == "mom_pct"  # registry derivation carried through the URL route
         assert route.spec.revises is True  # CPIAUCSL revises -> ALFRED vintage fetch
 
     def test_url_cited_unlisted_series_defaults_to_alfred_vintage(self):
@@ -169,18 +188,27 @@ class TestRouting:
         assert route.spec.revises is True  # unlisted -> fail-safe ALFRED vintage
 
     def test_url_cited_registry_series_carries_registry_derivation(self):
-        # F10: a question citing a FRED URL for a registry-derived series (PAYEMS resolves
-        # on the MoM jobs-added change, scaled x1000) must inherit the registry's
-        # derivation/scale/label, NOT render a raw unscaled level band. Before the fix the
-        # URL branch used dataclass defaults (derivation='level', scale=1.0), which is
-        # actively misleading — a level band for a change-quantity question.
+        # F10: a CHANGE-phrased question citing the PAYEMS FRED URL (resolves on the MoM
+        # jobs-added change, scaled x1000) inherits the registry's derivation/scale/label,
+        # NOT a raw unscaled level band. The mom_diff derivation is now gated on the URL
+        # route too (see the level-phrased-URL test below), so the question must ask for the
+        # change quantity for this to route.
+        qt = "What will the change in nonfarm payroll employment be for December 2026?"
         rc = "Resolves per https://fred.stlouisfed.org/series/PAYEMS on the release date."
-        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
         assert route is not None
         assert route.spec.series_id == "PAYEMS"
         assert route.derivation == "mom_diff"  # from the registry, not the 'level' default
         assert route.scale == 1000.0
         assert "payrolls" in route.label.lower()  # registry label, not the bare series_id
+
+    def test_url_cited_registry_series_skips_when_quantity_gate_fails(self):
+        # A PAYEMS FRED URL on a payroll-LEVEL question (no change language): the mom_diff
+        # derivation doesn't fit the level quantity, so the URL route skips entirely rather
+        # than fall back to a misleading raw-level band.
+        qt = "What will total nonfarm payroll employment (in thousands of persons) be?"
+        rc = "Resolves per https://fred.stlouisfed.org/series/PAYEMS on the release date."
+        assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
 
     def test_url_cited_registry_series_carries_unit_scale(self):
         # BOPGTB is a plain level but unit-scaled (millions -> billions). A cited URL must
@@ -238,8 +266,10 @@ class TestRouting:
         assert any("ambiguous URL routing" in r.message for r in caplog.records)
 
     def test_ambiguous_keyword_returns_none(self, caplog):
-        # Both the CPI and the treasury keyword registries match -> ambiguous.
-        q = _make_numeric_q(question_text="cpi versus the 10-year treasury spread index")
+        # Two ungated level entries both match (10-year treasury + high yield spread) ->
+        # ambiguous -> None. (The CPI entry, which used to serve this test, is now gated on
+        # MoM language, so it no longer matches a bare "cpi versus ..." string.)
+        q = _make_numeric_q(question_text="the 10-year treasury yield versus the high yield spread")
         with caplog.at_level(logging.INFO):
             assert route_question(q) is None
         assert any("ambiguous keyword routing" in r.message for r in caplog.records)
@@ -338,6 +368,93 @@ class TestRouting:
         assert route.spec.series_id == "BOPGTB"
         assert route.derivation == "level"
         assert route.scale == pytest.approx(0.001)  # millions of USD -> billions
+
+
+# Derivation gate: a NON-"level" registry entry (CPI mom_pct, PAYEMS mom_diff, gasoline
+# monthly_avg) must only fire when the question actually asks for that derived quantity.
+# The overreach it fixes: an index-LEVEL, year-over-year, or foreign-country CPI question
+# (real tournament questions — UK q41640, Egypt q41634) used to route to US CPIAUCSL
+# mom_pct and get an empirical band in the wrong units / wrong country. Phrasings below
+# mirror the real tournament questions (scratch/ts_anchor_gate_2026-07-16/ts_labeled.json).
+class TestDerivationGating:
+    def test_cpi_intended_mom_us_question_routes(self):
+        # qid 39567/41681 — the intended recurring US MoM headline-CPI family.
+        qt = (
+            "What will the seasonally adjusted month over month headline CPI inflation be in the "
+            "United States in the following months? (Sep-25)"
+        )
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert route.spec.series_id == "CPIAUCSL"
+        assert route.derivation == "mom_pct"
+
+    def test_cpi_index_level_question_skips(self):
+        qt = "What will the CPI-U index level (1982-84=100) be for December 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_cpi_yoy_question_skips(self):
+        qt = "What will the year-over-year CPI inflation rate be in the United States in December 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_uk_cpi_12_month_yoy_question_skips(self):
+        # qid 41640 — routes to US CPIAUCSL mom_pct today; wrong units AND wrong country.
+        qt = (
+            "What will be the UK Consumer Prices Index (CPI) 12-month rate (year-over-year percent change) "
+            "for March 2026, as reported by the UK Office for National Statistics (ONS)?"
+        )
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_egypt_urban_cpi_question_skips(self):
+        # qid 41634 — foreign CPI; must not inherit the US MoM-% band.
+        qt = (
+            "What is Egypt's annual inflation rate (year-over-year percent change) for the Urban "
+            "Consumer Price Index (Urban CPI) for March 2026?"
+        )
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_cpi_url_yoy_question_skips(self):
+        # A YoY question citing the CPIAUCSL FRED URL: the URL route is gated too, so it
+        # skips rather than hand back a US-MoM-% band for a year-over-year quantity.
+        qt = "What will the year-over-year CPI inflation rate be for December 2026?"
+        rc = "Resolves per https://fred.stlouisfed.org/series/CPIAUCSL on the release date."
+        assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+
+    def test_payrolls_change_intended_phrasing_routes(self):
+        # qid 40100/38829 — the intended recurring "change in nonfarm payroll employment" family.
+        qt = "What will be the change in seasonally adjusted nonfarm payroll employment in the following months? (Dec-25)"
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert route.spec.series_id == "PAYEMS"
+        assert route.derivation == "mom_diff"
+        assert route.scale == 1000.0
+
+    def test_payrolls_level_question_skips(self):
+        qt = "What will total nonfarm payroll employment (in thousands of persons) be in December 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_gasoline_point_in_time_question_skips(self):
+        # A spot gasoline-price question resolves on a point value, not a monthly mean, so
+        # the monthly_avg entry must not fire (no monthly-period language).
+        qt = "What will the price of regular gasoline be on December 31, 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_gasoline_for_the_month_intended_routes(self):
+        # qid 41795/41791/41785 — the intended "national average price ... for the month of X" family.
+        qt = (
+            "What will be the US national average price for regular gasoline (dollars per gallon) "
+            "for the month of April 2026?"
+        )
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == "monthly_avg"
+
+    def test_gasoline_national_average_spot_question_skips(self):
+        # The GEOGRAPHIC "national average" descriptor is in every gasoline question; on a
+        # point-in-time question it must NOT trigger monthly_avg (the bug F4 fixed — the old
+        # bare-"average" gate matched here, and the ~$3/gal band can't be caught by bounds).
+        qt = "What will the national average price of regular gasoline be on July 31, 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
 
 
 # Fetch layer (real fetch_series over a faked _http_get).
@@ -483,8 +600,9 @@ class TestRenderSingle:
         series = _daily_positive_series("^VIX")
         route = _Route(kind="single", spec=SeriesSpec(source="yfinance", series_id="^VIX"), label="CBOE VIX")
 
-        out = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
+        out, band = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=14)
 
+        assert band is not None  # a model-target series longer than the horizon renders a band
         first_line = out.splitlines()[0]
         assert first_line.startswith("**CBOE VIX** — latest ")
         assert "as of 2026-06-30" in first_line
@@ -507,8 +625,9 @@ class TestRenderSingle:
             note="This is the payrolls LEVEL series.",
         )
 
-        out = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=30)
+        out, band = _render_single(series, route=route, ceiling=date(2026, 6, 30), calendar_days=30)
 
+        assert band is None  # model_target=False -> no band computed, so nothing to return
         assert "- Note: This is the payrolls LEVEL series." in out
         # model_target=False -> no empirical band emitted at all.
         assert "P10 / P50 / P90" not in out
@@ -629,8 +748,9 @@ class TestRenderDerived:
             scale=1000.0,
         )
 
-        out = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
+        out, band = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
 
+        assert band is not None
         assert "latest derived value" in out
         assert "month-over-month change" in out
         assert "from raw level" in out  # the raw level is still surfaced for context
@@ -647,8 +767,9 @@ class TestRenderDerived:
             derivation="mom_pct",
         )
 
-        out = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
+        out, band = _render_single(series, route=route, ceiling=date(2026, 6, 1), calendar_days=30)
 
+        assert band is not None
         assert "month-over-month % change" in out
         assert "P10 / P50 / P90 →" in out
 
@@ -663,7 +784,7 @@ class TestRenderDerived:
             is_max=True,
         )
 
-        out = _render_single(
+        out, band = _render_single(
             series,
             route=route,
             ceiling=date(2026, 6, 30),
@@ -671,6 +792,7 @@ class TestRenderDerived:
             window_start=date(2026, 1, 1),  # window opened months before the ceiling
         )
 
+        assert band is not None
         assert "Realized max so far this window" in out
         assert "HARD LOWER BOUND" in out
         assert "forward-max" in out
@@ -684,13 +806,14 @@ class TestRenderDerived:
             is_max=True,
         )
         # Benchmark path: window_start == ceiling -> no elapsed portion, no floor line.
-        out = _render_single(
+        out, band = _render_single(
             series,
             route=route,
             ceiling=date(2026, 6, 30),
             calendar_days=14,
             window_start=date(2026, 6, 30),
         )
+        assert band is not None
         assert "Realized max so far this window" not in out
         assert "forward-max" in out
 
@@ -944,3 +1067,114 @@ class TestProviderFactory:
 
         assert await provider(q) == ""
         fetch_spy.assert_not_called()
+
+
+# Bounds-overlap backstop: a rendered P10-P90 band lying ENTIRELY outside the question's
+# displayed range is a gross units/magnitude mismatch (level-vs-derived, wrong country), so
+# build_anchor_section drops the section rather than feed a wrong-units anchor to the
+# forecasters. Open / non-finite bounds impose no constraint on that side.
+class TestBoundsBackstop:
+    def test_band_none_never_misses(self):
+        # No band rendered (not a model target, or horizon exceeds history) -> nothing to check.
+        assert _band_misses_bounds(_make_numeric_q(lower_bound=0.0, upper_bound=1.0), None) is False
+
+    def test_band_below_closed_bounds_misses(self):
+        # The canonical bug shape: a ~0.3 band (MoM-%) vs an index-level range [250, 350].
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0)
+        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is True
+
+    def test_band_above_closed_bounds_misses(self):
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0)
+        assert _band_misses_bounds(q, (400.0, 450.0, 500.0)) is True
+
+    def test_band_overlapping_bounds_does_not_miss(self):
+        q = _make_numeric_q(lower_bound=0.0, upper_bound=1.0)
+        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
+
+    def test_open_lower_bound_lifts_lower_constraint(self):
+        # Value can settle below an OPEN lower edge, so a low band is not a mismatch.
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0, open_lower_bound=True)
+        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
+
+    def test_open_upper_bound_lifts_upper_constraint(self):
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0, open_upper_bound=True)
+        assert _band_misses_bounds(q, (400.0, 450.0, 500.0)) is False
+
+    def test_non_finite_bounds_impose_no_constraint(self):
+        q = _make_numeric_q(lower_bound=float("-inf"), upper_bound=float("inf"))
+        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
+
+    def test_build_anchor_section_skips_on_bounds_mismatch(self, monkeypatch, caplog):
+        # End-to-end: a ~0.3-magnitude series routed onto a level question with an
+        # index-level range [250, 350] -> the section is dropped with a WARN.
+        flat = pd.Series(
+            np.full(400, 0.3, dtype="float64"),
+            index=pd.bdate_range("2024-01-01", periods=400),
+            name="DGS10",
+        )
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: flat)
+        q = _make_numeric_q(resolution_criteria=_DGS10_RC, lower_bound=250.0, upper_bound=350.0)
+
+        with caplog.at_level(logging.WARNING):
+            out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out == ""
+        assert any("zero overlap with question bounds" in r.message for r in caplog.records)
+
+    def test_build_anchor_section_renders_when_band_within_bounds(self, monkeypatch):
+        # Same series, but a range that contains the ~0.3 band -> the section renders.
+        flat = pd.Series(
+            np.full(400, 0.3, dtype="float64"),
+            index=pd.bdate_range("2024-01-01", periods=400),
+            name="DGS10",
+        )
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: flat)
+        q = _make_numeric_q(resolution_criteria=_DGS10_RC, lower_bound=0.0, upper_bound=1.0)
+
+        out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out  # non-empty; the band ~0.3 lies within [0, 1]
+        assert "P10 / P50 / P90 →" in out
+
+
+# Chart side-channel must respect the bounds backstop: build_anchor_section stashes the
+# chart only on the success path, so a bounds-rejected (wrong-units) section leaves nothing
+# for forecaster.py `_pull_research_chart` to attach to the base forecasters' vision message.
+class TestChartBackstop:
+    def _flat_series(self) -> pd.Series:
+        return pd.Series(
+            np.full(400, 0.3, dtype="float64"),
+            index=pd.bdate_range("2024-01-01", periods=400),
+            name="DGS10",
+        )
+
+    def test_chart_not_stashed_on_bounds_reject(self, monkeypatch):
+        # Chart flag ON + a band that misses the bounds -> section suppressed AND no chart
+        # stashed (the render is never even attempted on the reject path).
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: self._flat_series())
+        monkeypatch.setattr(
+            "metaculus_bot.research.ts_chart.render_anchor_chart",
+            MagicMock(side_effect=AssertionError("chart must not render on a bounds-rejected section")),
+        )
+        q = _make_numeric_q(resolution_criteria=_DGS10_RC, lower_bound=250.0, upper_bound=350.0)
+
+        out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out == ""
+        assert ts._session_charts == {}  # nothing stashed for _pull_research_chart to attach
+
+    def test_chart_stashed_on_success_path(self, monkeypatch):
+        # The move to the success path must still stash the chart when the band is in-bounds.
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: self._flat_series())
+        monkeypatch.setattr(
+            "metaculus_bot.research.ts_chart.render_anchor_chart",
+            lambda *_a, **_k: "FAKE_PNG_BASE64",
+        )
+        q = _make_numeric_q(qid=8123, resolution_criteria=_DGS10_RC, lower_bound=0.0, upper_bound=1.0)
+
+        out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out  # non-empty success path
+        assert ts._session_charts.get(8123) == "FAKE_PNG_BASE64"

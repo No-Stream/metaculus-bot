@@ -34,6 +34,7 @@ from collections.abc import Iterator
 from typing import Literal, TypeGuard
 
 from metaculus_bot.comment.markers import (
+    BASE_MODEL_SUBBLOCK_SPLIT_RE,
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
@@ -269,17 +270,6 @@ _PERCENTILE_LINE_RE: re.Pattern[str] = re.compile(
     re.MULTILINE,
 )
 
-# Matches a ``Model: openrouter/...`` line that starts a base-model sub-block
-# inside a stacker-combined body. Must anchor at the start of a line so it
-# doesn't match stray mentions inside prose; the value is captured for
-# attribution. The value is required to contain ``/`` so we don't accidentally
-# split on a narrative line like ``Model: previous version`` inside a base
-# reasoning's prose — the bot-injected prefix always uses a slash-delimited
-# OpenRouter path (e.g. ``Model: openrouter/openai/gpt-5.5``).
-_BASE_MODEL_SUBBLOCK_SPLIT_RE: re.Pattern[str] = re.compile(
-    r"(?m)^[ \t]*Model:[ \t]*([^\n]*/[^\n]*?)[ \t]*$",
-)
-
 
 def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None, str]]] | None:
     """Split a stacker-combined R1 body into (stacker_meta, base_sub_blocks).
@@ -315,7 +305,7 @@ def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None,
     # Each match starts a new sub-block; the body of a sub-block runs until
     # the next "Model:" line or end-of-portion.
     sub_blocks: list[tuple[str | None, str]] = []
-    matches = list(_BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
+    matches = list(BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
     for i, match in enumerate(matches):
         raw_model = match.group(1).strip()
         model_name: str | None

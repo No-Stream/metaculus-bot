@@ -12,7 +12,9 @@ import json
 import math
 
 import pytest
+from forecasting_tools import ReasonedPrediction
 
+from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER
 from metaculus_bot.comment.trimming import (
     TRIM_NOTICE,
     TrimConfig,
@@ -26,6 +28,7 @@ from metaculus_bot.constants import (
     RESEARCH_SECTION_CHAR_LIMIT,
     SUMMARY_SECTION_CHAR_LIMIT,
 )
+from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
 # ---------------------------------------------------------------------------
 # Legacy section trim (unchanged behavior — keeps header, uses tail)
@@ -721,6 +724,104 @@ class TestRationaleBlockAwareTrim:
 
         bodies = parse_per_model_reasoning_text(comment)
         assert len(bodies) == 6
+
+
+# ---------------------------------------------------------------------------
+# Stacker-combined FORECASTS trim (per-base-model attribution)
+#
+# When stacking fires, combine_stacker_and_base_reasoning folds the stacker's
+# meta-analysis and every base model's reasoning into ONE ``## R1: Forecaster 1
+# Reasoning`` block. The pre-fix single-body trim kept only the LAST json block
+# in the whole combined body and orphaned it from its ``Model:`` line, so
+# parsing._split_stacker_combined_body re-attributed that trailing model's
+# forecast values to the last surviving base model — silent misattribution in
+# residual analysis. Stacking is prod-disabled today, but the trim runs in
+# backtests/ablation and is armed for any stacking re-enable, so it must keep
+# each base model paired with its own line and forecast block.
+# ---------------------------------------------------------------------------
+
+
+class TestStackerCombinedBlockTrim:
+    """An over-budget stacker-combined R1 body keeps each base model's own
+    ``Model:`` line and json forecast block — no cross-model misattribution."""
+
+    _STACKER_META_BASE = 300.0
+    # Well-separated bases so a misattributed block is unmistakable in the
+    # recovered percentiles (a neighbor's values would be off by hundreds).
+    _BASE_MODELS: list[tuple[str, float]] = [
+        ("openrouter/openai/gpt-5.6-sol", 100.0),
+        ("openrouter/anthropic/claude-opus-4.8", 500.0),
+        ("openrouter/google/gemini-3.1-pro-preview", 900.0),
+    ]
+
+    def _combined_body(self, *, prose_tokens: int) -> str:
+        """A single ``## R1: Forecaster 1 Reasoning`` block for a stacked question.
+
+        Built exactly as production does: base predictions carry the bot-injected
+        ``Model:`` prefix, each with a DISTINCT numeric forecast block, folded via
+        combine_stacker_and_base_reasoning under the stacker meta-analysis.
+        """
+        prose = "reasoning_token " * prose_tokens
+        base_preds = [
+            ReasonedPrediction(
+                prediction_value=base,
+                reasoning=f"Model: {path}\n\n{prose}\n{_numeric_json_block(base)}",
+            )
+            for path, base in self._BASE_MODELS
+        ]
+        meta_text = f"stacker synthesis prose.\n{prose}\n{_numeric_json_block(self._STACKER_META_BASE)}"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        return f"## R1: Forecaster 1 Reasoning\n{combined}"
+
+    @staticmethod
+    def _expected(base: float) -> list[tuple[float, float]]:
+        # _numeric_json_block emits percentiles {0.1, 0.5, 0.9} → percent labels.
+        return [(10.0, base), (50.0, base + 10.0), (90.0, base + 20.0)]
+
+    def test_each_base_model_keeps_own_line_and_block_after_trim(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_per_model_numeric_percentiles,
+            parse_per_model_reasoning_text,
+        )
+
+        # ~130k across 4 sub-blocks — large enough that the pre-fix single-body
+        # trim would cut off a later base model's Model: line and orphan its
+        # json block onto a neighbor.
+        text = self._combined_body(prose_tokens=2000)
+        assert len(text) > FORECASTS_SECTION_CHAR_LIMIT, "precondition: must overflow"
+
+        trimmed = trim_section(text, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+        # Middle prose sacrificed → the notice fires.
+        assert TRIM_NOTICE in trimmed
+        # The R1 header and the stacker delimiter survive verbatim; the parser's
+        # stacker-body detection keys on the delimiter.
+        assert trimmed.startswith("## R1: Forecaster 1 Reasoning")
+        assert STACKED_BASE_REASONING_HEADER in trimmed
+        # Every base model keeps its Model: attribution line.
+        for path, _ in self._BASE_MODELS:
+            assert f"Model: {path}" in trimmed, f"lost Model: line for {path}"
+
+        # Value-equality per model is the assertion that catches misattribution:
+        # each base model must recover ITS OWN distinct percentiles.
+        comment = f"# FORECASTS\n{trimmed}\n"
+        percentiles = parse_per_model_numeric_percentiles(comment)
+        assert percentiles["gpt-5.6-sol"] == self._expected(100.0)
+        assert percentiles["claude-opus-4.8"] == self._expected(500.0)
+        assert percentiles["gemini-3.1-pro-preview"] == self._expected(900.0)
+        # The stacker portion has no Model: line, so its own block is recovered
+        # under the "Forecaster 1" fallback key.
+        assert percentiles["Forecaster 1"] == self._expected(self._STACKER_META_BASE)
+
+        # Per-base-model prose stays attributable for all three.
+        bodies = parse_per_model_reasoning_text(comment)
+        for name in ("gpt-5.6-sol", "claude-opus-4.8", "gemini-3.1-pro-preview"):
+            assert name in bodies, f"lost reasoning body for {name}"
+
+    def test_under_budget_stacked_body_untouched(self) -> None:
+        text = self._combined_body(prose_tokens=50)
+        assert len(text) < FORECASTS_SECTION_CHAR_LIMIT, "precondition: must fit under budget"
+        assert trim_section(text, "report_1_rationales") == text
 
 
 class TestFullCommentPreservesAttribution:

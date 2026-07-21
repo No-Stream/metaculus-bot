@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
+from metaculus_bot.comment.markers import BASE_MODEL_SUBBLOCK_SPLIT_RE, STACKED_BASE_REASONING_HEADER
 from metaculus_bot.constants import (
     COMMENT_CHAR_LIMIT,
     FORECASTS_SECTION_CHAR_LIMIT,
@@ -178,12 +179,32 @@ def _allocate_block_budgets(sizes: list[int], total: int) -> list[int]:
 def _trim_block(block: str, budget: int, notice: str) -> str:
     """Trim one rationale block to ``budget`` chars, preserving attribution.
 
-    Keeps (in order) the ``## R1: Forecaster N Reasoning`` header, the ``Model:``
-    line if it opens the body, a head of the reasoning prose, the trim notice,
-    and the trailing fenced ```json forecast block. So every kept block retains
-    the two things the residual pipeline parses — its model attribution and its
-    forecast values — even when the middle prose is sacrificed. The return value
-    never exceeds ``budget``.
+    Dispatches on block shape. A **stacker-combined** block (one that folds the
+    stacker meta-analysis and every base model's reasoning under
+    ``STACKED_BASE_REASONING_HEADER`` — the single-R1-block shape stacking
+    produces) is trimmed per-sub-block by ``_trim_stacker_combined_block`` so no
+    base model loses its ``Model:`` attribution or forecast block. Every other
+    block (the non-stacked prod case: one forecaster per R1 block) is trimmed as
+    a single body by ``_trim_single_body``. The return value never exceeds
+    ``budget``.
+    """
+    if len(block) <= budget:
+        return block
+    if STACKED_BASE_REASONING_HEADER in block:
+        return _trim_stacker_combined_block(block, budget, notice)
+    return _trim_single_body(block, budget, notice)
+
+
+def _trim_single_body(block: str, budget: int, notice: str) -> str:
+    """Trim one single-forecaster body to ``budget`` chars, preserving attribution.
+
+    Keeps (in order) the leading header line (the ``## R1: Forecaster N
+    Reasoning`` header for a full block, or the ``Model:`` line for a base
+    sub-block), the ``Model:`` line if it opens the body, a head of the
+    reasoning prose, the trim notice, and the trailing fenced ```json forecast
+    block. So every kept body retains the two things the residual pipeline
+    parses — its model attribution and its forecast values — even when the
+    middle prose is sacrificed. The return value never exceeds ``budget``.
     """
     if len(block) <= budget:
         return block
@@ -215,6 +236,65 @@ def _trim_block(block: str, budget: int, notice: str) -> str:
     if len(head) + len(notice) + 1 <= budget:
         return f"{head}\n{notice}"
     return head[:budget]
+
+
+def _trim_stacker_combined_block(block: str, budget: int, notice: str) -> str:
+    """Trim a stacker-combined R1 body, keeping every base model's attribution.
+
+    When stacking fires, ``combine_stacker_and_base_reasoning`` folds the
+    stacker's meta-analysis and all N base reasonings into a single
+    ``## R1: Forecaster 1 Reasoning`` block: a stacker portion (which itself
+    ends with the stacker's own json forecast block), the
+    ``STACKED_BASE_REASONING_HEADER`` delimiter, then one
+    ``Model: openrouter/...`` sub-block per base model, each ending with its own
+    fenced json forecast block.
+
+    Trimming this as a single body keeps only the LAST json block in the whole
+    combined body and orphans it from its ``Model:`` line — so
+    ``performance_analysis.parsing._split_stacker_combined_body`` re-attributes
+    that trailing model's forecast values to the last SURVIVING base model
+    (silent misattribution, not just loss). Instead we split on the same
+    delimiter + ``Model:`` regex the parser uses, water-fill ``budget`` across
+    the stacker portion and each base sub-block with ``_allocate_block_budgets``,
+    and trim each from within via ``_trim_single_body`` — so every base model
+    keeps its ``Model:`` line paired with its own json block, sacrificing only
+    per-sub-block prose. The delimiter is re-emitted verbatim so the parser's
+    stacker-body detection still fires. The return value never exceeds
+    ``budget``.
+    """
+    stacker_portion, base_portion = block.split(STACKED_BASE_REASONING_HEADER, 1)
+    matches = list(BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
+    if not matches:
+        # Delimiter present but no base ``Model:`` sub-blocks (e.g. a body
+        # already truncated inside the stacker portion). Nothing to attribute
+        # per base model, so fall back to the single-body trim — it still keeps
+        # the R1 header and a trailing json block.
+        return _trim_single_body(block, budget, notice)
+
+    stacker_unit = stacker_portion.rstrip()
+    base_units = [
+        base_portion[m.start() : (matches[i + 1].start() if i + 1 < len(matches) else len(base_portion))].rstrip()
+        for i, m in enumerate(matches)
+    ]
+    units = [stacker_unit, *base_units]
+
+    # Reassembly:
+    #   {stacker_unit}\n{DELIMITER}\n{base_0}\n\n{base_1}\n\n...
+    # Fixed overhead the per-unit budgets can't touch: the delimiter, the
+    # newline before it, the newline after it, and the blank line between
+    # consecutive base sub-blocks.
+    fixed = len(STACKED_BASE_REASONING_HEADER) + 2 + 2 * (len(base_units) - 1)
+    usable = budget - fixed
+    if usable <= 0:
+        # Budget too small to seat the delimiter + units. Does not occur in prod
+        # (the single stacked R1 block gets the whole FORECASTS section budget),
+        # but keep the block coherent rather than emit a headerless fragment.
+        return _trim_single_body(block, budget, notice)
+
+    budgets = _allocate_block_budgets([len(u) for u in units], usable)
+    stacker_trimmed = _trim_single_body(stacker_unit, budgets[0], notice)
+    base_trimmed = [_trim_single_body(unit, budgets[i + 1], notice) for i, unit in enumerate(base_units)]
+    return f"{stacker_trimmed}\n{STACKED_BASE_REASONING_HEADER}\n" + "\n\n".join(base_trimmed)
 
 
 def _trim_rationales_within_blocks(text: str, limit: int, notice: str) -> tuple[str, bool]:

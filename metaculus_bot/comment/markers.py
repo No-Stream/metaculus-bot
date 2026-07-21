@@ -140,6 +140,21 @@ def format_clause_divergence_marker(divergence_pp: float) -> str:
 STACKER_META_ANALYSIS_HEADER: str = "## Stacker Meta-Analysis"
 STACKED_BASE_REASONING_HEADER: str = "## Base Model Reasoning (inputs to stacker)"
 
+# Splits the base-model portion of a stacker-combined R1 body into per-model
+# sub-blocks, one per ``Model: openrouter/<provider>/<name>`` line the bot
+# injects ahead of each base reasoning. Shared by two consumers so they can
+# never drift: ``metaculus_bot.performance_analysis.parsing`` reads it to
+# recover per-base-model attribution, and ``metaculus_bot.comment.trimming``
+# uses the same split so a length-trim shrinks each base sub-block from within
+# — keeping every base model paired with its own ``Model:`` line and JSON
+# forecast block. The value is required to contain ``/`` so a narrative line
+# like ``Model: previous version`` inside a base reasoning's prose can't be
+# mistaken for a sub-block boundary — the bot-injected prefix is always a
+# slash-delimited OpenRouter path (e.g. ``Model: openrouter/openai/gpt-5.5``).
+BASE_MODEL_SUBBLOCK_SPLIT_RE: re.Pattern[str] = re.compile(
+    r"(?m)^[ \t]*Model:[ \t]*([^\n]*/[^\n]*?)[ \t]*$",
+)
+
 # Historical-header signature for stacked comments published before the
 # explicit STACKED= / STACKER_OUTCOME= markers existed. Three variants in the
 # wild (all stacker-only): ``## Stacker Meta-Analysis`` (current),
@@ -225,6 +240,7 @@ __all__ = [
     "STACKER_OUTCOME_RE",
     "STACKER_META_ANALYSIS_HEADER",
     "STACKED_BASE_REASONING_HEADER",
+    "BASE_MODEL_SUBBLOCK_SPLIT_RE",
     "HISTORICAL_STACKER_META_HEADER",
     "HISTORICAL_STACKER_SIGNATURE_RE",
     "TOOLS_USED_MARKER_TRUE",
