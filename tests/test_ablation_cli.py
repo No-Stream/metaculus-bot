@@ -6234,3 +6234,95 @@ class TestStageScoreArmCountRouting:
         assert "median-pdf_min1" not in text
         # Core 3-arm comparison present.
         assert "median-stack" in text
+
+
+class TestNumericCdfSizeShimRoundTrip:
+    """``cdf_size`` persists through the manifest so the rehydrated shim carries the real grid length.
+
+    Discrete numeric questions carry ``cdf_size != 201`` (e.g. 17 for an integer-count 0..15
+    question like the real qid 42752). The manifest writer now persists it and the shim reader
+    restores it, so the ARM_PDF structured-math arm builds its CDF on the right grid. Older
+    manifests (schema_version 1) that predate the field fall back to NumericQuestion's 201
+    default rather than crashing.
+    """
+
+    def _discrete_numeric_question(self, qid: int = 42752) -> NumericQuestion:
+        return NumericQuestion(
+            id_of_question=qid,
+            id_of_post=qid,
+            question_text="How many items?",
+            background_info="",
+            resolution_criteria="Integer count 0..15.",
+            fine_print="",
+            lower_bound=-0.5,
+            upper_bound=15.5,
+            open_lower_bound=False,
+            open_upper_bound=True,
+            zero_point=None,
+            unit_of_measure="Items",
+            page_url=f"https://example.com/q/{qid}",
+            open_time=_OPEN,
+            scheduled_resolution_time=_RESOLVE,
+            cdf_size=17,
+        )
+
+    def test_serialize_question_metadata_persists_cdf_size(self) -> None:
+        from metaculus_bot.ablation.cli import _serialize_question_metadata
+
+        metadata = _serialize_question_metadata(self._discrete_numeric_question())
+        assert metadata["cdf_size"] == 17
+
+    def test_serialize_question_metadata_persists_default_cdf_size_for_continuous(self) -> None:
+        from metaculus_bot.ablation.cli import _serialize_question_metadata
+
+        metadata = _serialize_question_metadata(_make_numeric_question(1))
+        assert metadata["cdf_size"] == 201
+
+    def test_shim_round_trips_discrete_cdf_size(self) -> None:
+        from metaculus_bot.ablation.cli import _build_manifest_entry, _build_question_shim_from_manifest_entry
+
+        question = self._discrete_numeric_question(qid=42752)
+        gt = GroundTruth(
+            question_id=42752,
+            question_type="numeric",
+            resolution=3.0,
+            resolution_string="3",
+            community_prediction=None,
+            actual_resolution_time=_RESOLVE,
+            question_text="How many items?",
+            page_url="https://example.com/q/42752",
+        )
+        entry = _build_manifest_entry(question, gt, "spring-aib-2026")
+        shim = _build_question_shim_from_manifest_entry(42752, entry)
+        assert isinstance(shim, NumericQuestion)
+        assert shim.cdf_size == 17
+
+    def test_shim_defaults_cdf_size_when_manifest_omits_it(self) -> None:
+        """An older manifest entry (no ``cdf_size`` key) rehydrates with the 201 default, not None."""
+        from metaculus_bot.ablation.cli import _build_question_shim_from_manifest_entry
+
+        entry = {
+            "type": "numeric",
+            "tournament": "spring-aib-2026",
+            "question_text": "What value?",
+            "page_url": "https://example.com/q/1",
+            "id_of_post": 1,
+            "ground_truth": {},
+            "resolution_criteria": "Resolves to a number.",
+            "fine_print": "",
+            "background_info": "",
+            "question_metadata": {
+                "open_time": "2026-01-01T00:00:00",
+                "scheduled_resolution_time": "2026-05-01T00:00:00",
+                "lower_bound": 0.0,
+                "upper_bound": 100.0,
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "zero_point": None,
+                "unit_of_measure": None,
+                # cdf_size deliberately absent — pre-fix schema_version 1 manifest.
+            },
+        }
+        shim = _build_question_shim_from_manifest_entry(1, entry)
+        assert isinstance(shim, NumericQuestion)
+        assert shim.cdf_size == 201

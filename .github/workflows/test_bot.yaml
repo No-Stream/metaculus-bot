@@ -13,6 +13,9 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    # Backstop only: normal runs finish far sooner. Without this, a wedged run
+    # holds the concurrency group for GitHub's 6h default.
+    timeout-minutes: 300
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -23,6 +26,17 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: uv sync --no-dev --frozen
+      # Chromium for gap-fill v2's rendered-fetch rung (playwright). --with-deps
+      # pulls the system libraries chromium needs on ubuntu runners. The loop
+      # degrades to plain fetch if the browser is missing, so this step is
+      # belt-and-suspenders rather than run-critical.
+      - name: Install Playwright Chromium
+        id: playwright_install
+        continue-on-error: true
+        run: uv run --frozen --no-dev playwright install --with-deps chromium
+      - name: Warn if Playwright install failed
+        if: steps.playwright_install.outcome == 'failure'
+        run: echo "::warning title=Playwright install failed::Chromium install failed — gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
       - name: Run bot
         shell: bash
         # Repo is public, so uploaded artifacts are effectively public. Log content
@@ -43,7 +57,10 @@ jobs:
           PYTHONUNBUFFERED: '1'
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          # Exa semantic search (gap-fill v2's search_web tool; also the legacy
+          # SmartSearcher fallback path). Secret name is lowercase exa_key
+          # (funded 2026-07-16).
+          EXA_API_KEY: ${{ secrets.exa_key }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OAI_ANTH_OPENROUTER_KEY: ${{ secrets.OAI_ANTH_OPENROUTER_KEY }}
@@ -59,7 +76,7 @@ jobs:
           # this default in metaculus_bot/__init__.py; pinned here for parity.
           DISABLE_AIOHTTP_TRANSPORT: 'true'
           # Native search runs in parallel with AskNews; model defaults to
-          # openai/gpt-5.6-sol (low effort, verbosity=low, 360s) per constants.py.
+          # openai/gpt-5.6-terra (low effort, verbosity=low, 360s) per constants.py.
           NATIVE_SEARCH_ENABLED: 'true'
           FINANCIAL_DATA_ENABLED: 'true'
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -81,6 +98,10 @@ jobs:
           # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
           # parallel grounded Gemini searches resolve each. Fails soft.
           GAP_FILL_ENABLED: 'true'
+          # Agentic gap-fill v2 (bounded research loop; runs concurrently with
+          # v1 when both are on). ON since 2026-07-17 after smoke + blind driver
+          # eval + Exa confirmation; v1 stays on for an overlap window.
+          GAP_FILL_V2_ENABLED: 'true'
           # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
           # Manual workflow_dispatch runs use this for end-to-end testing in prod
           # mode (is_benchmarking=False).
@@ -89,12 +110,25 @@ jobs:
           # in the resolution criteria (plain HTTP + trafilatura), no LLM calls.
           # test_bot only for now; prod workflows after eyeballing live output.
           RESOLUTION_SOURCE_ENABLED: 'true'
+          # Time-series anchor: deterministic empirical P10/P50/P90 band from a
+          # question's own resolution series (FRED/yfinance). Text anchor ON since
+          # 2026-07-17 (post smoke validation; see FUTURE.md "Time-series anchor").
+          TS_ANCHOR_ENABLED: 'true'
+          # TS anchor chart image side-channel (vision message to base models).
+          # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
+          TS_ANCHOR_CHART_ENABLED: 'false'
           # Stacking disabled on all types (ablation: stacker <= median on binary,
           # hurts numeric CRPS; stacker base model is a weak binary forecaster).
           NUMERIC_STACKING_ENABLED: 'false'
           BINARY_STACKING_ENABLED: 'false'
           MC_STACKING_ENABLED: 'false'
           OPENAI_AGENTS_DISABLE_TRACING: 'true'
+          # Raw research-provider payload log: each provider's RAW return (AskNews
+          # article dicts per phase, native/Gemini raw responses + grounding, market
+          # contracts, resolution-source fetches, gap-fill results) →
+          # run_logs/raw_research_<run_id>.jsonl, uploaded in the logs-* artifact
+          # below. make sync_raw_research archives it (pulls research-* + logs-*).
+          RAW_RESEARCH_LOG_ENABLED: 'true'
       # Durable capture of run logs (telemetry lives on stderr, tee'd to run_logs/).
       # Artifact name is logs-* (NOT research-*) so scripts/download_research.py's
       # research-* enumeration never picks up test runs.

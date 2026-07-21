@@ -31,10 +31,10 @@ async def test_asknews_rate_limiting_delay():
         return mock_response
 
     with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda key: {
+        mock_getenv.side_effect = lambda key, default=None: {
             "ASKNEWS_CLIENT_ID": "test_client_id",
             "ASKNEWS_SECRET": "test_secret",
-        }.get(key)
+        }.get(key, default)
 
         with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
             mock_sdk = AsyncMock()
@@ -66,10 +66,10 @@ async def test_asknews_calls_both_endpoints():
         return mock_response
 
     with patch("os.getenv") as mock_getenv:
-        mock_getenv.side_effect = lambda key: {
+        mock_getenv.side_effect = lambda key, default=None: {
             "ASKNEWS_CLIENT_ID": "test_client_id",
             "ASKNEWS_SECRET": "test_secret",
-        }.get(key)
+        }.get(key, default)
 
         with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
             mock_sdk = AsyncMock()

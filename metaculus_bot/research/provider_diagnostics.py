@@ -2,11 +2,14 @@
 
 A ``ProviderResult`` captures, for one research provider's call, what the
 orchestrator's ``_run_one`` chokepoint already sees: outcome status, output
-size, wall-clock latency, and any exception detail. The orchestrator both
-persists these to the durable research artifact (schema v2) and renders them
-into a compact, pipe-delimited block appended to the combined research string
-(which also becomes the Metaculus comment), so failures/empties/timing survive
-beyond the ephemeral GHA run-log.
+size, wall-clock latency, and any exception detail. The orchestrator persists
+these to the durable research artifact (schema v2) and renders them into a
+compact, pipe-delimited block that is logged at INFO, archived, and appended to
+the published Metaculus comment — but deliberately kept OUT of the
+forecaster-facing research text (the diagnostics seam in
+``ResearchOrchestrator.run_research`` / ``TemplateForecaster``), so
+failures/empties/timing survive beyond the ephemeral GHA run-log without
+distracting the forecasters.
 """
 
 from dataclasses import dataclass, field

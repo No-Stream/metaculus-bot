@@ -21,6 +21,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
+    STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
 )
@@ -90,6 +91,8 @@ def build_unified_explanation(
             outcome_marker, legacy_marker = STACKER_OUTCOME_FALLBACK_MEAN, STACKED_MARKER_FALSE
         case "skipped":
             outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED, STACKED_MARKER_FALSE
+        case "skipped_config_off":
+            outcome_marker, legacy_marker = STACKER_OUTCOME_SKIPPED_CONFIG_OFF, STACKED_MARKER_FALSE
         case other:
             raise ValueError(f"Unknown stacker outcome {other!r}")
 

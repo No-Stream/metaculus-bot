@@ -2,7 +2,7 @@
 
 Two marker families coexist on every stacked comment for one round of back-compat:
 
-* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|fallback_mean|skipped>``
+* ``STACKER_OUTCOME=<primary|fallback_llm|fallback_median|fallback_mean|skipped|skipped_config_off>``
   — the tri-state-plus marker. ``primary`` and ``fallback_llm`` mean a stacker
   LLM produced the value; ``fallback_median`` means both stacker LLMs failed
   and MEDIAN aggregation was used (CONDITIONAL_STACKING budget-skip path);
@@ -10,11 +10,18 @@ Two marker families coexist on every stacked comment for one round of back-compa
   skip path, where the base-combine re-entry uses MEAN rather than MEDIAN
   (F15 — keeps the marker truthful for residual analysis cuts that bucket on
   aggregation strategy); ``skipped`` means the conditional-stacking trigger
-  short-circuited the stacker entirely.
+  short-circuited the stacker because spread stayed at/below the threshold;
+  ``skipped_config_off`` means spread EXCEEDED the threshold but the per-type
+  ``<TYPE>_STACKING_ENABLED`` env gate was off, so the stacker was deliberately
+  bypassed (2026-07 residual round: 22 numeric "skipped" suppressions had to be
+  re-attributed to config-off via git archaeology — this value makes the reason
+  durable in the published record). Comments published before this value
+  shipped collapse both skip reasons into ``skipped``; disambiguating those
+  requires the workflow-yaml flag history.
 * ``STACKED=<true|false>`` — legacy binary marker derived from the new outcome
   (true ↔ outcome ∈ {primary, fallback_llm}, false ↔ outcome ∈ {skipped,
-  fallback_median, fallback_mean}). Kept around for one round so any external
-  parsers don't break the day this fix lands.
+  skipped_config_off, fallback_median, fallback_mean}). Kept around for one
+  round so any external parsers don't break the day this fix lands.
 
 Both are injected into each published Metaculus comment by the bot's
 ``_create_unified_explanation`` override (see ``main.py``), and parsed back out
@@ -56,9 +63,15 @@ STACKER_OUTCOME_FALLBACK_MEDIAN: str = "<!-- STACKER_OUTCOME=fallback_median -->
 # strategy from other signals.
 STACKER_OUTCOME_FALLBACK_MEAN: str = "<!-- STACKER_OUTCOME=fallback_mean -->"
 STACKER_OUTCOME_SKIPPED: str = "<!-- STACKER_OUTCOME=skipped -->"
+# Spread exceeded the threshold but the per-type <TYPE>_STACKING_ENABLED gate
+# was off — the stacker was config-suppressed, not spread-suppressed.
+STACKER_OUTCOME_SKIPPED_CONFIG_OFF: str = "<!-- STACKER_OUTCOME=skipped_config_off -->"
 
+# ``skipped_config_off`` precedes ``skipped`` in the alternation so the longer
+# literal wins on first match rather than relying on backtracking after the
+# ``skipped`` branch fails the trailing ``-->``.
 STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
-    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|fallback_mean|skipped)\s*-->",
+    r"<!--\s*STACKER_OUTCOME=(primary|fallback_llm|fallback_median|fallback_mean|skipped_config_off|skipped)\s*-->",
     re.IGNORECASE,
 )
 
@@ -81,14 +94,22 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 # flag to ``'false'``
 # (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
 # so these HTML-comment markers are currently DORMANT in published prod
-# comments. What DOES land in every prod R1 rationale — regardless of the
-# flag — is the raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
-# forecaster writes into its own STRUCTURED FORECAST block; residual-replay
-# tooling should key off that raw JSON today and can compute the same
-# overshoot / divergence numbers offline. The markers below become the
-# primary channel only if ``PROBABILISTIC_TOOLS_ENABLED`` is ever flipped on.
-# TELEMETRY ONLY either way: nothing in the pipeline reads these back to
-# clamp or mutate a forecast.
+# comments. NOTE: the ``base_rate_anchor`` / ``criteria_clauses`` fields are
+# live in the binary prompt (added ``30bca2f``, 2026-07-08) — they land
+# unconditionally in every prod binary comment's STRUCTURED FORECAST block.
+# The COMPUTED markers below (``ANCHOR_OVERSHOOT_PP`` /
+# ``CLAUSE_PRODUCT_DIVERGENCE_PP``) are dormant only because they emit from
+# ``tool_runner``, which is gated behind ``PROBABILISTIC_TOOLS_ENABLED`` (all
+# three prod workflows pin it to ``'false'``). While the flag is off, the
+# overshoot / divergence math is trivially replayable offline from the raw
+# JSON; the markers become the primary channel if it is ever flipped on.
+# (An earlier note here wrongly claimed the elicitation was retired in
+# Workstream C2 — that retirement covered the prior/base_rate/hazard/evidence/
+# scenario tier-2 fields; the anchor/clause fields shipped the next day as a
+# separate, still-live channel. The "0/2203 archived rows" reading was a
+# data-window artifact: the archive ended 2026-07-01, before ``30bca2f``.)
+# TELEMETRY ONLY either way: nothing in the pipeline reads these
+# back to clamp or mutate a forecast.
 ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"
 CLAUSE_DIVERGENCE_MARKER_PREFIX: str = "CLAUSE_PRODUCT_DIVERGENCE_PP"
 
@@ -118,6 +139,21 @@ def format_clause_divergence_marker(divergence_pp: float) -> str:
 # ``STACKED_BASE_REASONING_HEADER`` to recover per-base-model attribution.
 STACKER_META_ANALYSIS_HEADER: str = "## Stacker Meta-Analysis"
 STACKED_BASE_REASONING_HEADER: str = "## Base Model Reasoning (inputs to stacker)"
+
+# Splits the base-model portion of a stacker-combined R1 body into per-model
+# sub-blocks, one per ``Model: openrouter/<provider>/<name>`` line the bot
+# injects ahead of each base reasoning. Shared by two consumers so they can
+# never drift: ``metaculus_bot.performance_analysis.parsing`` reads it to
+# recover per-base-model attribution, and ``metaculus_bot.comment.trimming``
+# uses the same split so a length-trim shrinks each base sub-block from within
+# — keeping every base model paired with its own ``Model:`` line and JSON
+# forecast block. The value is required to contain ``/`` so a narrative line
+# like ``Model: previous version`` inside a base reasoning's prose can't be
+# mistaken for a sub-block boundary — the bot-injected prefix is always a
+# slash-delimited OpenRouter path (e.g. ``Model: openrouter/openai/gpt-5.5``).
+BASE_MODEL_SUBBLOCK_SPLIT_RE: re.Pattern[str] = re.compile(
+    r"(?m)^[ \t]*Model:[ \t]*([^\n]*/[^\n]*?)[ \t]*$",
+)
 
 # Historical-header signature for stacked comments published before the
 # explicit STACKED= / STACKER_OUTCOME= markers existed. Three variants in the
@@ -161,6 +197,17 @@ assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_FALLBACK_MEAN) is not None, (
 assert STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED) is not None, (
     f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED={STACKER_OUTCOME_SKIPPED!r}"
 )
+_skipped_config_off_match = STACKER_OUTCOME_RE.search(STACKER_OUTCOME_SKIPPED_CONFIG_OFF)
+assert _skipped_config_off_match is not None, (
+    f"STACKER_OUTCOME_RE does not match STACKER_OUTCOME_SKIPPED_CONFIG_OFF={STACKER_OUTCOME_SKIPPED_CONFIG_OFF!r}"
+)
+# Guard the alternation-order subtlety: the full literal must be captured, not
+# just its "skipped" prefix.
+assert _skipped_config_off_match.group(1) == "skipped_config_off", (
+    f"STACKER_OUTCOME_RE captured {_skipped_config_off_match.group(1)!r} from "
+    f"{STACKER_OUTCOME_SKIPPED_CONFIG_OFF!r}; expected 'skipped_config_off'"
+)
+del _skipped_config_off_match
 assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
     f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_TRUE={TOOLS_USED_MARKER_TRUE!r}"
 )
@@ -189,9 +236,11 @@ __all__ = [
     "STACKER_OUTCOME_FALLBACK_MEDIAN",
     "STACKER_OUTCOME_FALLBACK_MEAN",
     "STACKER_OUTCOME_SKIPPED",
+    "STACKER_OUTCOME_SKIPPED_CONFIG_OFF",
     "STACKER_OUTCOME_RE",
     "STACKER_META_ANALYSIS_HEADER",
     "STACKED_BASE_REASONING_HEADER",
+    "BASE_MODEL_SUBBLOCK_SPLIT_RE",
     "HISTORICAL_STACKER_META_HEADER",
     "HISTORICAL_STACKER_SIGNATURE_RE",
     "TOOLS_USED_MARKER_TRUE",

@@ -74,6 +74,12 @@ class TestHasStackerBodyMarker:
         record = {"comment_text": "text <!-- STACKER_OUTCOME=skipped --> end"}
         assert has_stacker_body_marker(record) is False
 
+    def test_stacker_outcome_skipped_config_off(self):
+        # config-suppressed skip (per-type gate off despite high spread) —
+        # the stacker did NOT fire, so this must classify as median.
+        record = {"comment_text": "text <!-- STACKER_OUTCOME=skipped_config_off --> end"}
+        assert has_stacker_body_marker(record) is False
+
     def test_stacker_outcome_fallback_median(self):
         # fallback_median means stacker failed, fell back to median — NOT stacker
         record = {"comment_text": "text <!-- STACKER_OUTCOME=fallback_median --> end"}
@@ -254,11 +260,13 @@ class TestExceededSpreadThreshold:
         assert exceeded_spread_threshold(record) is None
 
     def test_mc_high_spread(self):
+        # MC option vectors live in per_model_forecasts as {model: {option: prob}}
+        # (what collector._process_post emits via parse_per_model_mc_option_probs).
         record = {
             "type": "multiple_choice",
-            "per_model_mc_forecasts": {
-                "gpt-5.5": [{"option_name": "A", "probability": 0.8}, {"option_name": "B", "probability": 0.2}],
-                "claude-opus-4.7": [{"option_name": "A", "probability": 0.5}, {"option_name": "B", "probability": 0.5}],
+            "per_model_forecasts": {
+                "gpt-5.5": {"A": 0.8, "B": 0.2},
+                "claude-opus-4.7": {"A": 0.5, "B": 0.5},
             },
         }
         # max option spread: A = 0.8-0.5=0.3, B = 0.5-0.2=0.3. max=0.3 > 0.20
@@ -267,16 +275,43 @@ class TestExceededSpreadThreshold:
     def test_mc_low_spread(self):
         record = {
             "type": "multiple_choice",
-            "per_model_mc_forecasts": {
-                "gpt-5.5": [{"option_name": "A", "probability": 0.6}, {"option_name": "B", "probability": 0.4}],
-                "claude-opus-4.7": [
-                    {"option_name": "A", "probability": 0.65},
-                    {"option_name": "B", "probability": 0.35},
-                ],
+            "per_model_forecasts": {
+                "gpt-5.5": {"A": 0.6, "B": 0.4},
+                "claude-opus-4.7": {"A": 0.65, "B": 0.35},
             },
         }
         # max option spread: A = 0.65-0.6=0.05, B = 0.4-0.35=0.05. max=0.05 < 0.20
         assert exceeded_spread_threshold(record) is False
+
+    def test_mc_prefers_per_base_model_forecasts_on_stacked_records(self):
+        # On stacked records per_model_forecasts collapses to the stacker's
+        # single aggregate; per_base_model_forecasts carries the real base-model
+        # option vectors and must win (mirrors the binary branch).
+        record = {
+            "type": "multiple_choice",
+            "per_model_forecasts": {
+                "stacker": {"A": 0.65, "B": 0.35},
+            },
+            "per_base_model_forecasts": {
+                "gpt-5.5": {"A": 0.8, "B": 0.2},
+                "claude-opus-4.7": {"A": 0.5, "B": 0.5},
+            },
+        }
+        # base-model spread: A = 0.3 > 0.20; the collapsed per_model_forecasts
+        # alone would return None (only one model).
+        assert exceeded_spread_threshold(record) is True
+
+    def test_mc_string_forecasts_return_none(self):
+        # If the MC option parser found nothing, the collector falls back to
+        # single-string forecasts — no option vectors to compute a spread from.
+        record = {
+            "type": "multiple_choice",
+            "per_model_forecasts": {
+                "gpt-5.5": "A (60%)",
+                "claude-opus-4.7": "A (55%)",
+            },
+        }
+        assert exceeded_spread_threshold(record) is None
 
     def test_numeric_high_spread_closed_bounds(self):
         # Standard 11-percentile lists (raw 0-100 labels) on a [0, 100] range.

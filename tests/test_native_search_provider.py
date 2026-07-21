@@ -82,6 +82,59 @@ async def test_native_search_provider_uses_custom_model_slug(
     assert captured_model == "openrouter/openai/gpt-4o"
 
 
+class TestStripUtmSource:
+    """Unit coverage for _strip_utm_source (native-search citation cleanup)."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("See https://ex.com/a?utm_source=openai here", "See https://ex.com/a here"),
+            ("https://ex.com/a?utm_source=openai&page=2", "https://ex.com/a?page=2"),
+            ("https://ex.com/a?page=2&utm_source=openai", "https://ex.com/a?page=2"),
+            ("https://ex.com/a?x=1&utm_source=openai&y=2", "https://ex.com/a?x=1&y=2"),
+            ("https://ex.com/a?utm_source=other", "https://ex.com/a?utm_source=other"),
+            ("no urls here", "no urls here"),
+        ],
+    )
+    def test_strip_variants(self, raw: str, expected: str) -> None:
+        from metaculus_bot.research.providers import _strip_utm_source
+
+        assert _strip_utm_source(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_native_search_strips_utm_from_output_but_not_raw_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forecaster-facing text has utm_source=openai stripped; the raw log keeps the untouched payload."""
+    captured: dict = {}
+
+    def _capture(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+
+    class MockLlm:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.model = kwargs.get("model", "mock")
+
+        async def invoke(self, prompt: str) -> str:
+            return "Source: https://ex.com/x?utm_source=openai and https://ex.com/y?a=1&utm_source=openai"
+
+    with (
+        patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm),
+        patch("metaculus_bot.research.providers.record_raw_research", _capture),
+    ):
+        from metaculus_bot.research.providers import native_search_provider
+
+        provider = native_search_provider()
+        out = await provider(_make_q("Will X happen?"))
+
+    assert "utm_source" not in out
+    assert "https://ex.com/x" in out
+    assert "https://ex.com/y?a=1" in out
+    # The raw log receives the untouched payload for archival fidelity.
+    assert "utm_source=openai" in captured["payload"]
+
+
 @pytest.mark.asyncio
 async def test_native_search_provider_includes_prediction_markets_when_not_benchmarking(
     monkeypatch: pytest.MonkeyPatch,
@@ -332,7 +385,7 @@ class TestParallelExecution:
         provider2 = AsyncMock(return_value="Research from provider 2")
 
         providers = [(provider1, "asknews"), (provider2, "native_search")]
-        result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        result, _, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from provider 1" in result
         assert "Research from provider 2" in result
@@ -353,7 +406,7 @@ class TestParallelExecution:
         working_provider = AsyncMock(return_value="Research from working provider")
 
         providers = [(failing_provider, "failing"), (working_provider, "working")]
-        result, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
+        result, _, _ = await orch._run_providers_parallel(_make_q("Test question"), providers)
 
         assert "Research from working provider" in result
 
@@ -420,7 +473,7 @@ class TestAskNewsSubscriptionErrorHandling:
             raise ForbiddenError("403011 - subscription is not currently active")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.orchestrator"):
-            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
         assert orch.timeout_count == 0, "Off-season subscription-inactive must NOT count as an alertable failure."
@@ -449,7 +502,7 @@ class TestAskNewsSubscriptionErrorHandling:
         asknews_provider = AsyncMock(side_effect=RuntimeError("connection timeout"))
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.orchestrator"):
-            result, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
+            result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
         assert orch.timeout_count == 1

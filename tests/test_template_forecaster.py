@@ -11,8 +11,9 @@ from forecasting_tools.data_models.numeric_report import Percentile as FTPercent
 
 from main import TemplateForecaster
 from metaculus_bot.comment.trimming import TRIM_NOTICE
-from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT, RESEARCH_SECTION_CHAR_LIMIT
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.research import timeseries_anchor as ts_anchor
 from metaculus_bot.value_extraction import ExtractionOutcome
 
 
@@ -186,11 +187,46 @@ async def test_research_and_make_predictions_with_forecasters(mock_binary_questi
     # summarization pass. AskNews-only summarization lives in the orchestrator
     # (see test_research_orchestrator.py).
     assert bot._forecaster_with_soft_deadline.call_count == 2  # Called once for each forecaster
+    # Trailing chart_b64 is None here (TS_ANCHOR_CHART_ENABLED off in the test env).
     bot._forecaster_with_soft_deadline.assert_any_call(
-        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question
+        mock_binary_question, "mock research", mock_general_llm, mock_binary_question.id_of_question, None
     )
     assert isinstance(result, ResearchWithPredictions)
     assert len(result.predictions) == 2
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_seam_forecasters_clean_comment_carries_block(mock_general_llm, mock_binary_question):
+    """Diagnostics seam: forecaster prompts receive the clean research text while the
+    comment-bound research_report gets the provider-diagnostics block re-appended."""
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    diagnostics_block = "---\n\n## Provider Diagnostics\n\n- asknews: ok | 100 chars | 50 ms"
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="clean research")
+    bot._research.pop_provider_diagnostics = MagicMock(return_value=diagnostics_block)
+    bot._forecaster_with_soft_deadline = AsyncMock(
+        return_value=ReasonedPrediction(prediction_value=0.5, reasoning="test")
+    )
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    # Forecasters got the clean text (no diagnostics).
+    for call in bot._forecaster_with_soft_deadline.call_args_list:
+        assert call[0][1] == "clean research"
+    # The comment-bound research_report carries the block, appended after the research body.
+    assert "## Provider Diagnostics" in result.research_report
+    assert result.research_report.index("clean research") < result.research_report.index("## Provider Diagnostics")
+    bot._research.pop_provider_diagnostics.assert_called_once_with(mock_binary_question.id_of_question)
 
 
 @pytest.mark.asyncio
@@ -236,7 +272,8 @@ async def test_make_prediction_with_provided_llm(mock_binary_question, mock_gene
     result = await bot._make_prediction(mock_binary_question, "some research", mock_general_llm)
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
-    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_general_llm)
+    # Trailing chart_b64 is None (TS_ANCHOR_CHART_ENABLED off in the test env).
+    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_general_llm, None)
     assert result.prediction_value == 0.7
     assert "Model: mock_model" in result.reasoning
     assert "binary forecast" in result.reasoning
@@ -265,7 +302,8 @@ async def test_make_prediction_without_provided_llm(mock_binary_question):
 
     bot._get_notepad.assert_called_once_with(mock_binary_question)
     bot.get_llm.assert_called_once_with("default", "llm")
-    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_default_llm)
+    # Trailing chart_b64 is None (TS_ANCHOR_CHART_ENABLED off in the test env).
+    bot._run_forecast_on_binary.assert_called_once_with(mock_binary_question, "some research", mock_default_llm, None)
     assert result.prediction_value == 0.8
     assert "Model: default_mock_model" in result.reasoning
     assert "default binary forecast" in result.reasoning
@@ -389,8 +427,8 @@ def test_format_methods_trim_long_outputs():
     }
     bot = TemplateForecaster(llms=llms_config)
 
-    long_research_body = "Line\n" + "A" * (REPORT_SECTION_CHAR_LIMIT + 500)
-    long_reasoning = "Reasoning\n" + "B" * (REPORT_SECTION_CHAR_LIMIT + 800)
+    long_research_body = "Line\n" + "A" * (RESEARCH_SECTION_CHAR_LIMIT + 500)
+    long_reasoning = "Reasoning\n" + "B" * (FORECASTS_SECTION_CHAR_LIMIT + 800)
     research_with_predictions = ResearchWithPredictions(
         research_report=f"# Deep Dive\n{long_research_body}",
         summary_report="Summary",
@@ -400,12 +438,12 @@ def test_format_methods_trim_long_outputs():
     formatted_research = bot._format_main_research(1, research_with_predictions)
     assert formatted_research.startswith("## Report 1 Research")
     assert TRIM_NOTICE in formatted_research
-    assert len(formatted_research) <= REPORT_SECTION_CHAR_LIMIT
+    assert len(formatted_research) <= RESEARCH_SECTION_CHAR_LIMIT
 
     formatted_rationales = bot._format_forecaster_rationales(1, research_with_predictions)
     assert formatted_rationales.startswith("## R1: Forecaster 1 Reasoning")
     assert TRIM_NOTICE in formatted_rationales
-    assert len(formatted_rationales) <= REPORT_SECTION_CHAR_LIMIT
+    assert len(formatted_rationales) <= FORECASTS_SECTION_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +471,7 @@ async def test_forecaster_with_soft_deadline_times_out_and_bumps_counter(
     # Tighten the deadline to a fraction of a second so the test is fast.
     monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
 
-    async def slow_make_prediction(question, research, llm):
+    async def slow_make_prediction(question, research, llm, chart_b64=None):
         await asyncio.sleep(5)
         return ReasonedPrediction(prediction_value=0.5, reasoning="never returned")
 
@@ -527,6 +565,111 @@ async def test_min_forecasters_guard_reraises_exception_group_when_present(mock_
 
 
 # ---------------------------------------------------------------------------
+# F5b: exception-dropped forecaster counts as degradation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exception_dropped_forecaster_counts_as_degradation(mock_binary_question, mock_general_llm):
+    """A forecaster that finishes by raising (not a timeout, not a cancel) must
+    bump _forecasters_dropped_count so cli.py's alertable exit fires.
+
+    Regression for the 2026-07-19 silent-degradation bug: a numeric forecaster
+    got message.content=None from OpenRouter, the AssertionError propagated, the
+    forecaster was dropped, and the question published on the surviving models —
+    but the drop was invisible to CI because only soft-deadline timeouts and
+    wall-clock cancels bumped the counter. min=1 keeps the survivor publishing
+    so the exception-drop counter is isolated from _questions_failed_to_publish.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+
+    # One forecaster succeeds; the other raises AssertionError mid-prediction
+    # (mirrors the real message.content=None -> AssertionError failure).
+    call_count = {"n": 0}
+
+    async def one_raises(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+        raise AssertionError("message.content was None")
+
+    bot._forecaster_with_soft_deadline = cast(Any, one_raises)
+
+    assert bot._forecasters_dropped_count == 0
+    assert bot.alertable_count == 0
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    # Survivor still publishes (1/2 >= min 1), so no question-failed bump.
+    assert len(result.predictions) == 1
+    assert bot._questions_failed_to_publish == 0
+    # The exception-dropped forecaster is now counted as degradation.
+    assert bot._forecasters_dropped_count == 1
+    assert bot.alertable_count == 1
+    # The error still flows to the errors list ("Minor Errors" reporting unchanged).
+    assert any("AssertionError" in e and "message.content was None" in e for e in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_soft_deadline_timeout_counted_once_through_gather(
+    mock_binary_question, mock_general_llm, monkeypatch: pytest.MonkeyPatch
+):
+    """A soft-deadline timeout must count exactly once end-to-end.
+
+    The timeout is bumped at its raise site in _forecaster_with_soft_deadline,
+    then the failed task also lands in the gather's done-loop. Pins the
+    no-double-count invariant: the done-loop excludes asyncio.TimeoutError so the
+    same drop isn't counted twice.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+
+    # Drive the REAL soft-deadline wrapper (don't patch it) so its timeout path
+    # runs; patch the inner _make_prediction: one fast, one past the deadline.
+    monkeypatch.setattr("metaculus_bot.forecaster.FORECASTER_SOFT_DEADLINE", 0.05)
+    call_count = {"n": 0}
+
+    async def make_pred(question, research, llm, chart_b64=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ReasonedPrediction(prediction_value=0.5, reasoning="ok")
+        await asyncio.sleep(5)
+        return ReasonedPrediction(prediction_value=0.5, reasoning="never")
+
+    bot._make_prediction = AsyncMock(side_effect=make_pred)
+
+    result = await bot._research_and_make_predictions(mock_binary_question)
+
+    assert len(result.predictions) == 1
+    # Counted once (at the raise site), not twice (raise site + done-loop).
+    assert bot._forecasters_dropped_count == 1
+    assert bot.alertable_count == 1
+
+
+# ---------------------------------------------------------------------------
 # F9a: alertable_count sum
 # ---------------------------------------------------------------------------
 
@@ -567,3 +710,52 @@ def test_alertable_count_zero_by_default(mock_general_llm):
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     assert bot.alertable_count == 0
+
+
+def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:
+    llms_config: dict[str, Any] = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    return TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+
+class TestResearchChartSideChannel:
+    """_pull_research_chart pops the TS-anchor chart from the provider's per-session
+    cache and returns it — but only when the chart flag is on. Off (the prod default),
+    it never touches the provider module and leaves the cache intact."""
+
+    def test_pull_returns_chart_and_drains_cache_when_flag_on(self, mock_general_llm, monkeypatch):
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        ts_anchor._reset_session_caches()
+        ts_anchor._session_charts[777] = "Zm9v"  # a stashed chart for qid 777
+        try:
+            bot = _bot_with_one_forecaster(mock_general_llm)
+            chart = bot._pull_research_chart(777)
+
+            assert chart == "Zm9v"
+            assert 777 not in ts_anchor._session_charts  # popped exactly once, cache drained
+        finally:
+            ts_anchor._reset_session_caches()
+
+    def test_pull_returns_none_and_leaves_cache_when_flag_off(self, mock_general_llm, monkeypatch):
+        monkeypatch.delenv("TS_ANCHOR_CHART_ENABLED", raising=False)
+        ts_anchor._reset_session_caches()
+        ts_anchor._session_charts[778] = "Zm9v"  # present, but the flag gate must skip it
+        try:
+            bot = _bot_with_one_forecaster(mock_general_llm)
+            chart = bot._pull_research_chart(778)
+
+            assert chart is None
+            assert ts_anchor._session_charts[778] == "Zm9v"  # flag-off leaves the provider cache untouched
+        finally:
+            ts_anchor._reset_session_caches()
+
+    def test_pull_returns_none_when_no_chart_stashed(self, mock_general_llm, monkeypatch):
+        monkeypatch.setenv("TS_ANCHOR_CHART_ENABLED", "true")
+        ts_anchor._reset_session_caches()
+        bot = _bot_with_one_forecaster(mock_general_llm)
+        assert bot._pull_research_chart(779) is None

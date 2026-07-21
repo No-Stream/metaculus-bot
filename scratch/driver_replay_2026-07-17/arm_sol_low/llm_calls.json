@@ -1,0 +1,86 @@
+[
+  {
+    "wall_s": 4.98,
+    "n_messages": 2,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 17654,
+      "completion_tokens": 279,
+      "total_tokens": 17933,
+      "reasoning_tokens": 45
+    },
+    "response_id": "gen-1784324638-XrEFPVu2n1Rmuah9ymfr"
+  },
+  {
+    "wall_s": 6.31,
+    "n_messages": 7,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 20595,
+      "completion_tokens": 256,
+      "total_tokens": 20851,
+      "reasoning_tokens": 67
+    },
+    "response_id": "gen-1784324652-5zRQtc2RmzdIackFP841"
+  },
+  {
+    "wall_s": 16.2,
+    "n_messages": 12,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 21134,
+      "completion_tokens": 963,
+      "total_tokens": 22097,
+      "reasoning_tokens": 74
+    },
+    "response_id": "gen-1784324659-pmpMWZQgrOUux6YTU26z"
+  },
+  {
+    "wall_s": 5.53,
+    "n_messages": 14,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 22069,
+      "completion_tokens": 104,
+      "total_tokens": 22173,
+      "reasoning_tokens": 0
+    },
+    "response_id": "gen-1784324675-6uqXz9qoCCBXLh1gDIRG"
+  },
+  {
+    "wall_s": 4.72,
+    "n_messages": 16,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 22414,
+      "completion_tokens": 174,
+      "total_tokens": 22588,
+      "reasoning_tokens": 54
+    },
+    "response_id": "gen-1784324696-LJRg4EJavhSdrIfn8FcB"
+  },
+  {
+    "wall_s": 21.71,
+    "n_messages": 20,
+    "n_tools_offered": 6,
+    "usage": {
+      "prompt_tokens": 27077,
+      "completion_tokens": 1116,
+      "total_tokens": 28193,
+      "reasoning_tokens": 37
+    },
+    "response_id": "gen-1784324707-kvoR2zVxvAwUZziIgKuh"
+  },
+  {
+    "wall_s": 3.7,
+    "n_messages": 23,
+    "n_tools_offered": 0,
+    "usage": {
+      "prompt_tokens": 27537,
+      "completion_tokens": 180,
+      "total_tokens": 27717,
+      "reasoning_tokens": 0
+    },
+    "response_id": "gen-1784324729-1s2B23VLPqBTO8nwzs9p"
+  }
+]

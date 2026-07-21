@@ -58,56 +58,62 @@ ACCEPTABLE_QUANTS = [
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
 FORECASTER_LLMS: list[GeneralLlm] = [
-    # 2026-07-09: OpenAI flagship (5.6 series, released today); replaces gpt-5.4. High effort —
-    # forecaster quality is the product. (Date anchors the config era for residual analysis.)
+    # 2026-07-20: forecaster roster dropped from 6 to a 3-member latest-per-vendor
+    # triple (1 OpenAI / 1 Anthropic / 1 Google). This is the SECOND roster change
+    # on 2026-07-20 and supersedes the morning fable-5 → opus-4.7 swap (7a76df6) as
+    # the config-era boundary for residual analysis. Removed: gpt-5.5,
+    # claude-opus-4.7, grok-4.5. Two adversarially-verified analyses
+    # (scratch/ensemble_3member_audit_2026-07-20/ +
+    # scratch/ensemble_power_model_2026-07-20/) found the triple non-inferior on
+    # binary/MC and only a fragile numeric lean toward the full roster (+3.24,
+    # 95% CI [-2.5, +9.1], P(loss>1pt/Q)=0.80, driven by 2 questions) — accepted as
+    # a ship-and-watch bet; see FUTURE.md "Frozen-triple numeric watch". Dropping
+    # grok (x-ai, 404s on the donated key) also ends routine personal-key forecaster
+    # spend: only the gemini-3.1-pro-preview personal-key PIN bills
+    # OPENROUTER_API_KEY now; the other two slots route via the donated key.
+    # (Dates anchor config eras for residual analysis.)
+    #
+    # OpenAI flagship (5.6 series). 2026-07-20: effort xhigh -> high. The
+    # reasoning-effort audit (scratch/reasoning_effort_audit_2026-07-20/) found
+    # default->high clearly worth it but high->xhigh UNMEASURED; sol is ~70% of
+    # forecaster reasoning spend, so we stop paying the unmeasured premium on the
+    # dominant-cost slot. opus-4.8 keeps xhigh below as the remaining premium bet
+    # (FUTURE.md "Price the high->xhigh reasoning-effort premium"). (2026-07-15
+    # had bumped this high -> xhigh.) Live-verified: OpenRouter's effort enum is
+    # max|xhigh|high|medium|low|minimal|none and this model accepts high (bogus
+    # values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling is xhigh and
+    # OpenAI rejects max upstream even though OpenRouter's enum validation admits it.
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.6-sol",
         reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
-    # Kept (not migrated to sol) to preserve intra-OpenAI generation diversity
-    # alongside gpt-5.6-sol in the ensemble.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/openai/gpt-5.5",
-        reasoning={"effort": "high"},
-        **_FORECASTER_CONFIG,
-    ),
+    # Anthropic slot. 2026-07-15: enabled:True (provider-default adaptive thinking)
+    # -> explicit effort=xhigh. Anthropic also exposes "max" one tier above xhigh —
+    # held back deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; unbounded
+    # adaptive thinking caused silent 600s soft-deadline stalls on the retired
+    # opus-4.6 slot, e.g. Q14333 on 2026-05-07).
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
-        reasoning={"enabled": True},
+        reasoning={"effort": "xhigh"},
         extra_body={"verbosity": "high"},
         **_FORECASTER_CONFIG,
     ),
-    build_llm_with_openrouter_fallback(
-        model="openrouter/anthropic/claude-opus-4.6",
-        # Explicit max_tokens forces budget-based thinking. Without it, Opus 4.6 defaults to
-        # "adaptive thinking" (OpenRouter 4.6 migration guide) which is unbounded and has
-        # caused silent 600s soft-deadline stalls on hard questions (e.g. Q14333 on 2026-05-07).
-        reasoning={"max_tokens": 32_000},
-        extra_body={"verbosity": "high"},
-        **_FORECASTER_CONFIG,
-    ),
+    # Google slot. No explicit reasoning-effort kwarg — gemini-3.1-pro-preview has
+    # no xhigh tier and uses provider defaults. PINNED to the personal
+    # OPENROUTER_API_KEY via the DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist in
+    # fallback_openrouter (the donated key routes it through a free-tier Google
+    # AI Studio BYOK integration with quota 0, so it would 429 there); see the
+    # TODO(gemini-3.1-pro-donated) tag pending the Metaculus-side BYOK fix.
     build_llm_with_openrouter_fallback(
         model="openrouter/google/gemini-3.1-pro-preview",
-        **_FORECASTER_CONFIG,
-    ),
-    # 2026-07-08: migrated from x-ai/grok-4.3 to x-ai/grok-4.5 (released today; xAI's
-    # newest frontier reasoning model, 500K context, $2/$6 per M input/output tokens).
-    # Prior hop 2026-05-18: x-ai/grok-4.1-fast (deprecated 2026-05-15 by xAI) → grok-4.3
-    # with explicit reasoning effort=high to match the gpt-5.4/5.5 reasoning peers
-    # (4.3 defaulted to low effort if unspecified, vs. 4.1-fast which had no effort flag).
-    # effort=high kept from the 4.3 config — 4.5's default-effort behavior isn't yet
-    # documented, so preserving the peer-parity setting rather than reverting to default.
-    build_llm_with_openrouter_fallback(
-        model="openrouter/x-ai/grok-4.5",
-        reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
 ]
 
 
 def _forecaster_display_name(llm: GeneralLlm) -> str:
-    """Short label for a forecaster (e.g. 'claude-opus-4.7') — strips the 'openrouter/<provider>/' prefix.
+    """Short label for a forecaster (e.g. 'claude-opus-4.8') — strips the 'openrouter/<provider>/' prefix.
 
     Used by performance_analysis.parsing to map 'Forecaster N' labels in bot comments
     back to a model name without having to hand-maintain a parallel list.
@@ -118,16 +124,21 @@ def _forecaster_display_name(llm: GeneralLlm) -> str:
 FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FORECASTER_LLMS]
 
 # Summarizer: compresses raw AskNews article markdown into an analyst briefing
-# (AskNews-only; all other providers already emit LLM prose). NOT a saturated
-# task — it decides what is load-bearing and which sources to trust in the
-# briefing every forecaster reads, which rewards the top tier; low effort keeps
-# latency in check (sol-low ≈ terra-medium quality per the AA Pareto frontier).
+# (AskNews-only; all other providers already emit LLM prose). sol → terra
+# 2026-07-18 operator decision: AskNews is an auxiliary/augmenting source
+# (content audit: 16% unique content vs native-search 54% / gap-fill 59%), so
+# the absolute-frontier tier isn't warranted. The role audit
+# (scratch/research_role_audit_2026-07-17/) had sol 1st but verdict "MARGINAL
+# EDGE" with terra 2nd (one attribution blur, no fabrications), and 4/5 briefing
+# failures in the AskNews quality audit (scratch/asknews_quality_audit_2026-07-18/)
+# were prompt-era (mini summarizer + missing no-forecast rule), not model-tier.
+# Terra: −43% cost, ~50s vs ~118s wall. Effort stays low (latency).
 # allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
 # 30s-gated retry (orchestrator._summarize_asknews) to impose the universal
 # "no retry after 30s" deadline rule. Per-instance override so PARSER_LLM (which
 # also uses UTILITY_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.6-sol",
+    "openrouter/openai/gpt-5.6-terra",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )
@@ -157,10 +168,16 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 # dice with the same distribution), and the budget is better spent on a
 # different-provider fallback.
 STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/anthropic/claude-fable-5",
-    # Fable 5 uses effort-based adaptive thinking (none/low/medium/high/max), not a
-    # max_tokens budget. effort=high + verbosity=high matches the opus-4.8 forecaster slot.
-    reasoning={"effort": "high"},
+    # 2026-07-20: fable-5 → opus-4.8 (fable-5 pulled from BOTH roles after
+    # content=None failures in the 2026-07-19 test_bot run — see the forecaster-slot
+    # comment above + FUTURE.md). Stacking is prod-disabled, so this is
+    # backtest/ablation-only exposure today. opus-4.8 uses effort-based adaptive
+    # thinking, not a max_tokens budget. Live-verified OpenRouter effort enum:
+    # none/minimal/low/medium/high/xhigh/max. effort=xhigh matches the opus-4.8
+    # forecaster slot; "max" (one tier above xhigh) is deliberately held back for
+    # latency — the stacker runs under STACKER_SOFT_DEADLINE (500s).
+    "openrouter/anthropic/claude-opus-4.8",
+    reasoning={"effort": "xhigh"},
     extra_body={"verbosity": "high"},
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1},
 )
@@ -170,6 +187,8 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # deliberately cross-provider from the Anthropic Fable primary so an Anthropic
 # stall doesn't take both attempts down. Tighter timeout and single try since
 # we're already running late on the critical path by the time this fires.
+# Stays at high (not xhigh) for that same reason — the 2026-07-15 xhigh bump
+# covers the primary stacker and forecaster slots, not this 300s-budget path.
 STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "high"},
@@ -200,12 +219,14 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 # the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE (180s);
 # effort deliberately low since 2026-05-20 for latency — the tier was upgraded
 # instead (smarter-model-at-lower-effort beats more effort on a smaller model).
+# 2026-07-17: sol→terra per the role audit; terra 2nd (sol 3rd) at −49% cost;
+# the role fires rarely (stacking disabled in prod).
 # allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
 # 30s-gated retry (targeted.extract_disagreement_crux) to impose the universal
 # "no retry after 30s" deadline rule on the conditional-stacking critical path.
 # Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.6-sol",
+    "openrouter/openai/gpt-5.6-terra",
     reasoning={"effort": "low"},
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )

@@ -1081,7 +1081,7 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
         parser_llm=parser_llm,
     )
 
-    async def boom(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
+    async def boom(self, question, research, llm, chart_b64=None) -> ReasonedPrediction:  # type: ignore[no-untyped-def]  # noqa: ASYNC124
         raise RuntimeError("simulated forecaster failure")  # noqa: ASYNC910
 
     semaphore = asyncio.Semaphore(1)

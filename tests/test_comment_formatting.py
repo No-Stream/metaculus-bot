@@ -22,6 +22,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_FALLBACK_MEDIAN,
     STACKER_OUTCOME_PRIMARY,
     STACKER_OUTCOME_SKIPPED,
+    STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
 )
@@ -63,12 +64,12 @@ class TestFormatResearchSummaryWithModels:
 
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_research_summary_with_models
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import SUMMARY_SECTION_CHAR_LIMIT
 
-        huge_text = "## Report 1 Summary\n" + ("X" * (REPORT_SECTION_CHAR_LIMIT + 5000))
+        huge_text = "## Report 1 Summary\n" + ("X" * (SUMMARY_SECTION_CHAR_LIMIT + 5000))
         predictions: list = []
         result = format_research_summary_with_models(huge_text, predictions, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= SUMMARY_SECTION_CHAR_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +80,11 @@ class TestFormatResearchSummaryWithModels:
 class TestFormatMainResearchSection:
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_main_research_section
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import RESEARCH_SECTION_CHAR_LIMIT
 
-        huge_text = "## Research\n" + ("Y" * (REPORT_SECTION_CHAR_LIMIT + 3000))
+        huge_text = "## Research\n" + ("Y" * (RESEARCH_SECTION_CHAR_LIMIT + 3000))
         result = format_main_research_section(huge_text, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= RESEARCH_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
         from metaculus_bot.comment.formatting import format_main_research_section
@@ -101,11 +102,11 @@ class TestFormatMainResearchSection:
 class TestFormatForecasterRationalesSection:
     def test_trims_oversized_text(self):
         from metaculus_bot.comment.formatting import format_forecaster_rationales_section
-        from metaculus_bot.constants import REPORT_SECTION_CHAR_LIMIT
+        from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT
 
-        huge_text = "## Rationale\n" + ("Z" * (REPORT_SECTION_CHAR_LIMIT + 2000))
+        huge_text = "## Rationale\n" + ("Z" * (FORECASTS_SECTION_CHAR_LIMIT + 2000))
         result = format_forecaster_rationales_section(huge_text, report_number=1)
-        assert len(result) <= REPORT_SECTION_CHAR_LIMIT
+        assert len(result) <= FORECASTS_SECTION_CHAR_LIMIT
 
     def test_short_text_passes_through(self):
         from metaculus_bot.comment.formatting import format_forecaster_rationales_section
@@ -219,6 +220,23 @@ class TestBuildUnifiedExplanation:
             stacker_outcome="skipped",
         )
         assert STACKER_OUTCOME_SKIPPED in result
+        assert STACKED_MARKER_FALSE in result
+        assert STACKED_MARKER_TRUE not in result
+
+    def test_stacking_skipped_config_off_emits_correct_markers(self):
+        # skipped_config_off: spread exceeded the threshold but the per-type
+        # <TYPE>_STACKING_ENABLED gate was off. Distinguished from plain
+        # "skipped" (spread below threshold) so residual analysis doesn't need
+        # git archaeology to re-attribute config-off suppressions.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped_config_off",
+        )
+        assert STACKER_OUTCOME_SKIPPED_CONFIG_OFF in result
         assert STACKED_MARKER_FALSE in result
         assert STACKED_MARKER_TRUE not in result
 

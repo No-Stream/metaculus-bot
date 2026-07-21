@@ -229,12 +229,14 @@ async def _detect_leakage_structured(
 def _is_content_free_blob(research_blob: str) -> bool:
     """True iff the blob carries no leakable research content.
 
-    A fully-failed research run no longer returns ``""`` — it returns a
-    diagnostics-only blob (just the ``## Provider Diagnostics`` section appended
-    by the orchestrator: provider names, statuses, timings; nothing leakable). We
-    strip a trailing diagnostics section before the emptiness check so such a blob
-    short-circuits the detector just like the old empty-string case did, instead
-    of being needlessly screened.
+    Pre-2026-07 archived blobs from a fully-failed research run are
+    diagnostics-only (just the ``## Provider Diagnostics`` section the
+    orchestrator used to append: provider names, statuses, timings; nothing
+    leakable). We strip a trailing diagnostics section before the emptiness
+    check so such a blob short-circuits the detector just like the plain
+    empty-string case, instead of being needlessly screened. (Since the
+    diagnostics seam landed, live runs keep the block out of ``research_text``
+    entirely, so this mainly guards replays of older archives.)
     """
     header_idx = research_blob.find(PROVIDER_DIAGNOSTICS_HEADER)
     without_diagnostics = research_blob if header_idx == -1 else research_blob[:header_idx]

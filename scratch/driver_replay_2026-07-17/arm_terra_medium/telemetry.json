@@ -1,0 +1,20 @@
+{
+  "model": "openai/gpt-5.6-terra",
+  "steps": 5,
+  "tool_calls": 13,
+  "per_tool_counts": {
+    "fetch": 7,
+    "search_web": 1,
+    "record_findings": 2,
+    "search_news": 2,
+    "conclude": 1
+  },
+  "rendered_fetches": 0,
+  "dup_tool_calls": 0,
+  "deadline_hit": false,
+  "concluded_early": true,
+  "wall_s": 41.661038416903466,
+  "findings_count": 6,
+  "pending_leads_count": 3,
+  "lint_rejections": 0
+}

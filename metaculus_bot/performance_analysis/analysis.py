@@ -9,6 +9,7 @@ from scipy.stats import spearmanr
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.parsing import _parse_probability
+from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
 from metaculus_bot.spread_metrics import binary_prob_range_spread
 
@@ -153,14 +154,13 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
         elif resolution == "below_lower_bound":
             pit = 0.0
         elif isinstance(resolution, (int, float)):
-            zp_raw = scaling.get("zero_point")
             pit = _interpolate_pit(
                 float(resolution),
                 lower_bound,
                 upper_bound,
                 cdf_values,
                 value_grid=scaling.get("continuous_range"),
-                zero_point=None if zp_raw in (None, 0, 0.0) else float(zp_raw),
+                zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
             )
         else:
             continue

@@ -65,8 +65,10 @@ from metaculus_bot.ablation.cli import _build_question_shim_from_manifest_entry,
 from metaculus_bot.ablation.forecasters import deserialize_prediction_value
 from metaculus_bot.ablation.run_stacker import ABLATION_MIN_FORECASTERS, _surviving_forecasters
 from metaculus_bot.backtest.scoring import GroundTruth, _canonicalize_mc_option, numeric_crps
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.prob_math_utils import clamp_prob, logit
+from metaculus_bot.probabilistic_tools.aggregation import log_pool
 from metaculus_bot.probabilistic_tools.binary_pooling import (
     adaptive_weight,
     overconfidence_divergence,
@@ -88,6 +90,105 @@ logger: logging.Logger = logging.getLogger(__name__)
 QuestionType = Literal["binary", "multiple_choice", "numeric"]
 
 MEDIAN_BASELINE = "median_baseline"
+COHERENCE_SOFTWEIGHT = "coherence_softweight"
+
+
+# Weighted-quantile aggregation primitives (coherence-weighting offline study).
+#
+# One shared weighted operator so the scratch coherence re-aggregation harness
+# (comment-derived prod ensemble) and this ablation replay use the IDENTICAL
+# combine. Any arm's offset from the median baseline is then attributable to the
+# WEIGHTS, not to a different operator. We use the Hazen (midpoint) plotting
+# position ``p_i = S_i - w_i/2`` on the normalized cumulative weight ``S``: at
+# equal weights this is ``(i-0.5)/n`` for every n, which the ``q=0.5`` linear
+# interpolation reads off as EXACTLY ``np.median`` (odd n → the middle value;
+# even n → the two-middle average). It is symmetric in the weights (unlike the
+# type-7 ``S_{i-1}/(1-w_last)`` form, whose largest-value weight enters only via
+# the denominator, so up-weighting the top model would not move the median).
+# The combine is only ever taken at q=0.5 here. On even-M questions the median
+# reproduction is machine-precision, not literal bit-identity: ``np.median``
+# forms ``(a+b)/2`` while interpolation forms ``a + 0.5*(b-a)`` — a last-ULP
+# difference with zero score impact (verified <2e-15 in tests).
+
+
+def weighted_quantile(values: Any, weights: Any, q: float = 0.5) -> float:
+    """Hazen (midpoint) weighted quantile of ``values`` at level ``q``.
+
+    ``values`` / ``weights`` are 1-D, equal length; ``weights`` are non-negative
+    and not all zero. Sorted ascending by value, sorted point ``i`` is placed at
+    plotting position ``p_i = S_i - w_i/2`` (normalized cumulative-weight
+    midpoint). At equal weights ``p_i = (i-0.5)/n``, so ``q=0.5`` reduces to
+    ``np.median`` for every n. ``q`` outside ``[p_1, p_n]`` clamps to the nearest
+    extreme value (``np.interp`` behavior) — the sensible "all weight on one tail"
+    limit.
+    """
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    if v.shape != w.shape or v.ndim != 1:
+        raise ValueError(f"values/weights must be equal-length 1-D arrays, got {v.shape} / {w.shape}")
+    if np.any(w < 0):
+        raise ValueError("weights must be non-negative")
+    total = float(w.sum())
+    if total <= 0:
+        raise ValueError("weights must sum to a positive value")
+    order = np.argsort(v, kind="stable")
+    vs = v[order]
+    ws = w[order] / total
+    plotting = np.cumsum(ws) - ws / 2.0
+    return float(np.interp(q, plotting, vs))
+
+
+def weighted_cdf_median(prob_matrix: np.ndarray, weights: Any) -> list[float]:
+    """Weighted vertical median of a per-model CDF-probability matrix.
+
+    ``prob_matrix`` is ``(n_models, n_grid)`` — each row one model's CDF
+    probabilities on the SHARED question value grid. ``weights`` is ``(n_models,)``
+    (``None`` → equal). At each grid column the ``q=0.5`` weighted quantile of the
+    per-model probabilities is taken (fully vectorized: sort each column, apply the
+    per-column plotting positions, interpolate), then clipped to [0,1] and made
+    monotone via ``np.maximum.accumulate`` — the exact post-step of
+    ``_numeric_vertical`` so equal weights reproduce ``_numeric_median_baseline``.
+    """
+    mat = np.asarray(prob_matrix, dtype=float)
+    if mat.ndim != 2:
+        raise ValueError(f"prob_matrix must be 2-D (n_models, n_grid), got {mat.shape}")
+    n_models, n_grid = mat.shape
+    if weights is None:
+        w = np.full(n_models, 1.0 / n_models, dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape != (n_models,):
+            raise ValueError(f"weights shape {w.shape} must be ({n_models},)")
+        if np.any(w < 0):
+            raise ValueError("weights must be non-negative")
+        total = float(w.sum())
+        if total <= 0:
+            raise ValueError("weights must sum to a positive value")
+        w = w / total
+
+    order = np.argsort(mat, axis=0, kind="stable")  # (M, G)
+    vs = np.take_along_axis(mat, order, axis=0)  # sorted probs per column
+    ws = w[order]  # weights reordered per column (M, G); each column already sums to 1
+    plotting = np.cumsum(ws, axis=0) - ws / 2.0  # Hazen midpoint positions (M, G)
+
+    # Vectorized np.interp(0.5, plotting[:, g], vs[:, g]) per column g, with the same
+    # endpoint-clamp semantics as np.interp (q below p[0] -> vs[0]; above p[-1] -> vs[-1]).
+    cols = np.arange(n_grid)
+    idx_upper = (plotting >= 0.5).argmax(axis=0)  # first row reaching 0.5 (0 if none reach it)
+    none_reach = ~(plotting >= 0.5).any(axis=0)  # 0.5 above the whole column -> clamp to top
+    idx_lower = np.maximum(idx_upper - 1, 0)
+    p_lo = plotting[idx_lower, cols]
+    p_hi = plotting[idx_upper, cols]
+    v_lo = vs[idx_lower, cols]
+    v_hi = vs[idx_upper, cols]
+    span = p_hi - p_lo
+    t = np.where(span > 0, (0.5 - p_lo) / np.where(span > 0, span, 1.0), 0.0)
+    out = np.where(idx_upper == 0, vs[0, cols], v_lo + t * (v_hi - v_lo))  # q at/below first position
+    out = np.where(none_reach, vs[-1, cols], out)  # q above last position
+
+    out = np.clip(out, 0.0, 1.0)
+    out = np.maximum.accumulate(out)
+    return list(map(float, out))
 
 
 # Per-question replay records
@@ -102,6 +203,9 @@ class BinaryRecord:
     outcome: bool
     p_models: list[float]
     p_maths: list[float]  # reconstructed via reconstruct_p_math; may be empty if no blocks parse
+    # Per-forecaster model slug (``payload["model"]``, e.g. openrouter/anthropic/claude-opus-4.8),
+    # aligned index-for-index with ``p_models`` — the join key for per-(qid, model) coherence weights.
+    models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +217,8 @@ class MCRecord:
     option_order: list[str]
     correct_option_index: int
     option_vectors: list[dict[str, float]]
+    # Per-forecaster model slug, aligned index-for-index with ``option_vectors``.
+    models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +229,8 @@ class NumericRecord:
     question: NumericQuestion
     resolution_value: float  # OutOfBoundsResolution already mapped to slightly-out-of-bounds value
     cdfs: list[list[Percentile]]
+    # Per-forecaster model slug, aligned index-for-index with ``cdfs``.
+    models: tuple[str, ...] = ()
 
 
 @dataclass
@@ -267,14 +375,18 @@ def _build_binary_record(
         raise ValueError(f"qid {qid}: binary resolution must be bool, got {type(outcome).__name__}")
     p_models: list[float] = []
     p_maths: list[float] = []
+    models: list[str] = []
     for payload in surviving.values():
         p_models.append(float(deserialize_prediction_value(payload["prediction_value"], question)))
+        models.append(str(payload["model"]))
         block = parse_structured_block(payload.get("reasoning", ""), "binary")
         if isinstance(block, BinaryStructured):
             p_math = _reconstruct_p_math_from_block(block)
             if p_math is not None and np.isfinite(p_math):
                 p_maths.append(p_math)
-    return BinaryRecord(qid=qid, question=question, outcome=outcome, p_models=p_models, p_maths=p_maths)
+    return BinaryRecord(
+        qid=qid, question=question, outcome=outcome, p_models=p_models, p_maths=p_maths, models=tuple(models)
+    )
 
 
 def _build_mc_record(
@@ -288,6 +400,7 @@ def _build_mc_record(
         return None
 
     option_vectors: list[dict[str, float]] = []
+    models: list[str] = []
     for payload in surviving.values():
         predicted = deserialize_prediction_value(payload["prediction_value"], question)
         if not isinstance(predicted, PredictedOptionList):
@@ -297,12 +410,14 @@ def _build_mc_record(
             if opt.option_name in vec:
                 vec[opt.option_name] = float(opt.probability)
         option_vectors.append(vec)
+        models.append(str(payload["model"]))
     return MCRecord(
         qid=qid,
         question=question,
         option_order=option_order,
         correct_option_index=correct_index,
         option_vectors=option_vectors,
+        models=tuple(models),
     )
 
 
@@ -328,11 +443,13 @@ def _build_numeric_record(
 ) -> NumericRecord:
     resolution_value = _resolution_to_float(ground_truth.resolution, question)
     cdfs: list[list[Percentile]] = []
+    models: list[str] = []
     for payload in surviving.values():
         distribution = deserialize_prediction_value(payload["prediction_value"], question)
         # The PchipNumericDistribution exposes its constraint-enforced 201-point CDF via .cdf.
         cdfs.append(list(distribution.cdf))
-    return NumericRecord(qid=qid, question=question, resolution_value=resolution_value, cdfs=cdfs)
+        models.append(str(payload["model"]))
+    return NumericRecord(qid=qid, question=question, resolution_value=resolution_value, cdfs=cdfs, models=tuple(models))
 
 
 # Aggregation configs
@@ -382,6 +499,19 @@ def _binary_median_p_math(record: BinaryRecord) -> float | None:
     if not record.p_maths:
         return None
     return float(np.median(record.p_maths))
+
+
+def _binary_geo_odds(record: BinaryRecord) -> float:
+    """Geometric-mean-of-odds pool of the per-forecaster probs, clamped to [0.02, 0.98].
+
+    ``log_pool`` = ``sigmoid(mean(logit(p)))``, the normalized geometric-mean-of-odds for
+    binary. MEDIAN is invariant to the logit transform, so this is the only mean-type pool that
+    can differ from ``median_baseline``: it sharpens toward the tails when forecasters agree and
+    stays near the median when they don't. The clamp matches the incumbent's [0.02, 0.98] bounds
+    for a fair head-to-head — a no-op on the already-clamped cache, kept for parity with the live
+    per-model clamp. ``logit`` self-clamps at 1e-4, so log_pool is safe against 0/1 inputs.
+    """
+    return min(max(log_pool(record.p_models), BINARY_PROB_MIN), BINARY_PROB_MAX)
 
 
 def _make_binary_shrinkage_config(w: float) -> BinaryConfig:
@@ -440,15 +570,63 @@ def _clamp_config_suffix(low: float, high: float) -> str:
     return f"{round(low * 100):02d}_{round(high * 100):02d}"
 
 
-def build_binary_configs() -> dict[str, BinaryConfig]:
+# Per-(qid, model) coherence-weight lookup shared by all three type builders. The
+# VALUES are computed by the caller (the scratch coherence harness) under strict
+# era-blocking — hyperparameters come only from fall-aib-2025, never random folds
+# across eras — so this module stays a thin, hyperparameter-agnostic consumer of
+# externally-derived weights. ``model`` is the raw slug (``payload["model"]``,
+# e.g. openrouter/anthropic/claude-opus-4.8), matching ``Record.models``.
+WeightLookup = dict[tuple[int, str], float]
+
+
+def _record_weights(qid: int, models: tuple[str, ...], weights_by_qid_model: WeightLookup) -> list[float] | None:
+    """Weight vector aligned to ``models`` order, or ``None`` if any model is unmapped.
+
+    A ``None`` return signals the caller to fall back to equal weights (the median
+    baseline) for the whole question — so a missing weight never silently biases the
+    combine. With complete per-(qid, model) weights (z=0 imputed for models with no
+    coherence signal) this fallback is never hit in practice.
+    """
+    ws: list[float] = []
+    for m in models:
+        w = weights_by_qid_model.get((int(qid), m))
+        if w is None:
+            return None
+        ws.append(float(w))
+    return ws
+
+
+def _make_binary_coherence_config(weights_by_qid_model: WeightLookup) -> BinaryConfig:
+    """Weighted median of the per-forecaster probs; equal-weight fallback == median_baseline."""
+
+    def config(record: BinaryRecord) -> float:
+        ws = _record_weights(record.qid, record.models, weights_by_qid_model)
+        if ws is None:
+            return _binary_median_p_model(record)
+        return weighted_quantile(record.p_models, ws, 0.5)
+
+    return config
+
+
+def build_binary_configs(weights_by_qid_model: WeightLookup | None = None) -> dict[str, BinaryConfig]:
     """Binary candidate configs keyed by name. ``median_baseline`` is the incumbent.
 
     The cached per-forecaster probs are already [0.02, 0.98]-clamped at bench time, so
     ``median_baseline`` is effectively the ``clamp_02_98`` arm; the clamp configs below test
     whether a TIGHTER ceiling/floor (after-median primary, per-forecaster-before-median
     secondary) bounds the saturation tail enough to win on log score.
+
+    ``geo_odds`` is the geometric-mean-of-odds pool (``sigmoid(mean(logit(p)))``, clamped to
+    [0.02, 0.98]). MEDIAN is invariant to the logit transform, so this is the only mean-type
+    pool that can differ from ``median_baseline`` — it sharpens toward the tails when the
+    forecasters agree, tests whether that sharpening helps or hurts the ensemble log score.
+
+    When ``weights_by_qid_model`` is supplied, a ``coherence_softweight`` arm is added:
+    the weighted median of the per-forecaster probs (equal weights reproduce
+    ``median_baseline``). Weights are pre-computed by the caller under era-blocking.
     """
     configs: dict[str, BinaryConfig] = {MEDIAN_BASELINE: _binary_median_p_model}
+    configs["geo_odds"] = _binary_geo_odds
     for w in BINARY_SHRINKAGE_WEIGHTS:
         if w == 0.0:
             continue  # w=0 is identical to median_baseline; skip the redundant arm
@@ -458,6 +636,8 @@ def build_binary_configs() -> dict[str, BinaryConfig]:
         suffix = _clamp_config_suffix(low, high)
         configs[f"clamp_{suffix}"] = _make_binary_clamp_after_median_config(low, high)
         configs[f"clamp_{suffix}_premedian"] = _make_binary_clamp_before_median_config(low, high)
+    if weights_by_qid_model is not None:
+        configs[COHERENCE_SOFTWEIGHT] = _make_binary_coherence_config(weights_by_qid_model)
     return configs
 
 
@@ -500,14 +680,39 @@ def _make_mc_pool_config(concentration: float | None) -> MCConfig:
     return config
 
 
-def build_mc_configs() -> dict[str, MCConfig]:
-    """MC candidate configs keyed by name. ``median_baseline`` is the incumbent."""
+def _make_mc_coherence_config(weights_by_qid_model: WeightLookup) -> MCConfig:
+    """Per-option weighted median, renormalized; equal-weight fallback == median_baseline."""
+
+    def config(record: MCRecord) -> list[float]:
+        ws = _record_weights(record.qid, record.models, weights_by_qid_model)
+        if ws is None:
+            return _mc_median_baseline(record)
+        matrix = np.array(
+            [[vec[name] for name in record.option_order] for vec in record.option_vectors], dtype=float
+        )  # (M, K)
+        combined = np.array([weighted_quantile(matrix[:, k], ws, 0.5) for k in range(matrix.shape[1])], dtype=float)
+        total = float(combined.sum())
+        if total <= 0:
+            raise ValueError(f"qid {record.qid}: MC weighted median produced non-positive total {total}")
+        return list(combined / total)
+
+    return config
+
+
+def build_mc_configs(weights_by_qid_model: WeightLookup | None = None) -> dict[str, MCConfig]:
+    """MC candidate configs keyed by name. ``median_baseline`` is the incumbent.
+
+    When ``weights_by_qid_model`` is supplied, a ``coherence_softweight`` arm is added
+    (per-option weighted median + renormalize; equal weights reproduce ``median_baseline``).
+    """
     configs: dict[str, MCConfig] = {
         MEDIAN_BASELINE: _mc_median_baseline,
         "pool_mc": _make_mc_pool_config(None),
     }
     for c in MC_DIRICHLET_CONCENTRATIONS:
         configs[f"pool_mc_dir{c:g}"] = _make_mc_pool_config(c)
+    if weights_by_qid_model is not None:
+        configs[COHERENCE_SOFTWEIGHT] = _make_mc_coherence_config(weights_by_qid_model)
     return configs
 
 
@@ -559,8 +764,31 @@ def _make_tail_floor_config(floor_eps: float) -> NumericConfig:
     return config
 
 
-def build_numeric_configs() -> dict[str, NumericConfig]:
-    """Numeric candidate configs keyed by name. ``median_baseline`` is the incumbent."""
+def _make_numeric_coherence_config(weights_by_qid_model: WeightLookup) -> NumericConfig:
+    """Weighted vertical CDF median; equal-weight fallback == median_baseline.
+
+    Mirrors the incumbent vertical-median combine but weights the per-grid-point
+    quantile by the per-forecaster coherence weight — the drop-in for the current
+    groupby-median at ``numeric/utils.py``. All per-model CDFs share the question
+    value grid, so the vertical (pointwise) combine is well-defined.
+    """
+
+    def config(record: NumericRecord) -> list[float]:
+        ws = _record_weights(record.qid, record.models, weights_by_qid_model)
+        if ws is None:
+            return _numeric_vertical(record, "median")
+        prob_matrix = np.array([_cdf_probs(cdf) for cdf in record.cdfs], dtype=float)
+        return weighted_cdf_median(prob_matrix, ws)
+
+    return config
+
+
+def build_numeric_configs(weights_by_qid_model: WeightLookup | None = None) -> dict[str, NumericConfig]:
+    """Numeric candidate configs keyed by name. ``median_baseline`` is the incumbent.
+
+    When ``weights_by_qid_model`` is supplied, a ``coherence_softweight`` arm is added
+    (weighted vertical CDF median; equal weights reproduce ``median_baseline``).
+    """
     configs: dict[str, NumericConfig] = {
         MEDIAN_BASELINE: _numeric_median_baseline,
         "mean_baseline": _numeric_mean_baseline,
@@ -570,6 +798,8 @@ def build_numeric_configs() -> dict[str, NumericConfig]:
     }
     for floor in NUMERIC_TAIL_FLOORS:
         configs[f"mean_tailfloor{floor:g}"] = _make_tail_floor_config(floor)
+    if weights_by_qid_model is not None:
+        configs[COHERENCE_SOFTWEIGHT] = _make_numeric_coherence_config(weights_by_qid_model)
     return configs
 
 

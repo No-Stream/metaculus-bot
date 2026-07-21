@@ -1,0 +1,15 @@
+{
+  "arm": "arm_terra_medium",
+  "model": "openai/gpt-5.6-terra",
+  "reasoning_effort": "medium",
+  "outer_wall_s": 44.38,
+  "loop_wall_s": 41.661038416903466,
+  "est_cost_usd": 0.404,
+  "pricing_per_token": {
+    "prompt": 2.5e-06,
+    "completion": 1.5e-05
+  },
+  "prompt_tokens_total": 146460,
+  "completion_tokens_total": 2522,
+  "n_llm_calls": 6
+}

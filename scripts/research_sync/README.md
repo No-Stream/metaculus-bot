@@ -1,18 +1,33 @@
-# Scheduled research-archive sync (launchd)
+# Scheduled archive sync (launchd)
 
-Keeps `backtests/research_archive/` fresh by running `make sync_research` on a
-weekly schedule.
+Keeps `backtests/research_archive/` (incl. `raw/`) AND `backtests/telemetry_archive/`
+fresh by running `make sync_all` on a weekly schedule.
 
 ## Why this exists
 
-Every bot run uploads its `research_outputs/` artifact to GitHub Actions with
-`retention-days: 90` (see `.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`).
-**After 90 days GitHub deletes the artifact forever.** The local archive at
-`backtests/research_archive/` (gitignored) is the only durable copy and feeds the
-backtest replay (`make backtest_with_cache`) and residual / per-provider research
-attribution. The puller is manual (`make sync_research`), so without a scheduler the
-archive silently goes stale and old research is lost. This launchd job runs the pull
-weekly — well inside the 90-day window, with margin for a missed week.
+Every bot run uploads its `research_outputs/` AND `run_logs/` to GitHub Actions with
+`retention-days: 90` (see `.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`
+and `test_bot.yaml`). **After 90 days GitHub deletes the artifacts forever.** Two local
+archives (both gitignored) are the only durable copies:
+
+- `backtests/research_archive/` — per-question research text; feeds the backtest replay
+  (`make backtest_with_cache`) and residual / per-provider research attribution.
+- `backtests/research_archive/raw/` — the raw research-provider payloads
+  (`raw_research_<run_id>.jsonl`, one file per run) that `metaculus_bot.research.raw_log`
+  appends to `run_logs/`: each provider's RAW return before formatting (AskNews article
+  dicts per phase, native/Gemini raw responses + grounding, market contracts, resolution
+  fetches, gap-fill results). This is the durable raw evidence behind every forecast,
+  independent of published comments — it makes the AskNews summarizer relevance gate
+  auditable after the fact.
+- `backtests/telemetry_archive/` — run-log telemetry markers (`EXTRACTION_RUNG`,
+  `GAP_FILL_V2`, `GHOST_FORECAST`, `OPEN_BOUND_PILING`, `CREDIT_*`) harvested from the
+  same artifacts; feeds parser-drift watch, gap-fill v2 diagnostics, credit burn-rate,
+  and the ghost-vs-published scoring gate.
+
+The pullers are manual (`make sync_research` / `make sync_telemetry`, both wrapped by
+`make sync_all`), so without a scheduler the archives silently go stale and old data is
+lost. This launchd job runs the pull weekly — well inside the 90-day window, with margin
+for a missed week.
 
 ## What it does
 
@@ -20,12 +35,29 @@ weekly — well inside the 90-day window, with margin for a missed week.
 
 1. `cd`s to the repo,
 2. prepends the dirs holding `uv` and `gh` to `PATH` (launchd jobs get a minimal PATH),
-3. runs `make sync_research` (enumerates EVERY `research-*` artifact via the complete,
-   paginated artifacts REST endpoint — no 1000-result `gh run list` cap, so nothing in
-   the 90-day window is missed — backfills from Metaculus comments, rebuilds the archive),
+3. runs `make sync_all`, which:
+   - backfills from Metaculus comments (`backfill_research_from_comments.py`) FIRST — it
+     hits Metaculus, not GHA, and writes `comments_backfill.jsonl` for the research build
+     to load;
+   - then runs the **single-pass** driver `scripts/sync_all.py`, which enumerates EVERY
+     `research-*` AND `logs-*` artifact ONCE via the complete, paginated artifacts REST
+     endpoint (no 1000-result `gh run list` cap, so nothing in the 90-day window is
+     missed), downloads each unique artifact ONCE into a shared temp dir, and runs all
+     three harvests over the same downloaded run dirs:
+     - research JSONL (research-* dirs only) → rebuilds the research archive (download
+       records + comment backfill, dedup, build);
+     - run-log telemetry markers → merged into the telemetry archive (replace-by-run);
+     - `raw_research_<run_id>.jsonl` raw-payload logs → one file per run under
+       `backtests/research_archive/raw/` (replace-by-run);
 4. appends a dated logfile under `scripts/research_sync/logs/`.
 
-`sync_research` hits only the **read-only, free** GitHub + Metaculus APIs — no paid
+Running the driver in one pass avoids the three-pass waste of the old chain (each of the
+three standalone `sync_*` targets re-enumerated every artifact and re-downloaded the
+overlapping `research-*`/`logs-*` families into its own temp dir). The three standalone
+targets (`sync_research` / `sync_telemetry` / `sync_raw_research`) still exist for a
+single-archive refresh.
+
+`sync_all` hits only the **read-only, free** GitHub + Metaculus APIs — no paid
 LLM/research calls and no publishing.
 
 ## Install
@@ -101,7 +133,7 @@ artifact. Read-only and free (GitHub API only).
 
 ## Logs
 
-- `scripts/research_sync/logs/sync_<YYYY-MM-DD>.log` — full `make sync_research` output, one file per run-day.
+- `scripts/research_sync/logs/sync_<YYYY-MM-DD>.log` — full `make sync_all` output, one file per run-day.
 - `scripts/research_sync/logs/launchd.out.log` / `launchd.err.log` — launchd's own capture (job-start issues).
 
 The `logs/` directory is created on first run.

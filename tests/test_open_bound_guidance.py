@@ -169,14 +169,32 @@ class TestNumericPromptDisplaysNominalBounds:
 
     def test_numeric_prompt_carries_replacement_open_bound_guidance(self):
         """Positive assertions on the NEW guidance (not just absence of the old): the
-        closed/open replacement sentence, the displayed-units note, and the open-aware IQR line."""
+        closed/open replacement sentence and the displayed-units note."""
         q = _discrete_question()
         upper_msg, lower_msg = bound_messages(q)
         prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
         assert "the displayed edge is NOT a hard limit" in prompt
         assert "For a closed bound, no percentile may cross it." in prompt
         assert "displayed range is suggestive of units" in prompt
-        assert "IQR should span a large fraction of the displayed range (or beyond where a bound is open)" in prompt
+
+    def test_numeric_prompt_forecastability_guidance_is_even_handed(self):
+        """The Step-9b forecastability block keeps its HIGH/MEDIUM/LOW classification and its
+        ``FORECASTABILITY:`` output line (the checklist echo depends on it), but the directional
+        IQR prescriptions authored in the retired k_tail=1.25 wide era are gone (2026-07-18 width
+        audit, Option B). What remains is a single even-handed self-check line."""
+        q = _discrete_question()
+        upper_msg, lower_msg = bound_messages(q)
+        prompt = numeric_prompt(q, research="r", lower_bound_message=lower_msg, upper_bound_message=upper_msg)
+        # Classification + machine-readable output line survive (the checklist echoes FORECASTABILITY).
+        assert "FORECASTABILITY: HIGH" in prompt
+        assert "FORECASTABILITY: LOW" in prompt
+        # The new even-handed self-check line replaces the two directional prescriptions.
+        assert "your interval width should match how predictable the quantity actually is on this horizon" in prompt
+        # The removed directional pushes must not resurface (Step-9b widening + Step-7 narrowing).
+        assert "large fraction of the displayed range" not in prompt
+        assert "as narrow as the historical data justifies" not in prompt
+        assert "you are losing points" not in prompt
+        assert "hedge audit" not in prompt.lower()
 
     def test_stacking_numeric_prompt_carries_replacement_open_bound_guidance(self):
         q = _discrete_question()

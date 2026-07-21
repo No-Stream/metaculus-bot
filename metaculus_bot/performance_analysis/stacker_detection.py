@@ -17,6 +17,7 @@ Signal hierarchy (strongest first):
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 from typing import Literal
 
@@ -45,8 +46,12 @@ DetectorVerdict = Literal[
 # Stacker outcomes that indicate the stacker LLM actually produced a value
 _STACKER_FIRED_OUTCOMES: frozenset[str] = frozenset({"primary", "fallback_llm"})
 
-# Stacker outcomes that indicate the stacker did NOT produce a value
-_STACKER_MEDIAN_OUTCOMES: frozenset[str] = frozenset({"skipped", "fallback_median", "fallback_mean"})
+# Stacker outcomes that indicate the stacker did NOT produce a value.
+# "skipped" = spread at/below threshold; "skipped_config_off" = spread exceeded
+# the threshold but the per-type <TYPE>_STACKING_ENABLED gate was off.
+_STACKER_MEDIAN_OUTCOMES: frozenset[str] = frozenset(
+    {"skipped", "skipped_config_off", "fallback_median", "fallback_mean"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,26 +170,31 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
         return spread > CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD
 
     if question_type == "multiple_choice":
-        # TODO: MC likely has the same collapse-on-stacking issue as binary — once
-        # per_base_model_forecasts is populated for MC records, prefer it here too.
-        per_model_mc = record.get("per_model_mc_forecasts") or {}
-        if len(per_model_mc) < 2:
+        # The collector emits MC option vectors as {model: {option: prob}} in
+        # per_model_forecasts (collector._process_post), and per-base-model
+        # vectors in per_base_model_forecasts for stacked records (where
+        # per_model_forecasts collapses to the stacker's single aggregate) —
+        # prefer the base-model field, mirroring the binary branch.
+        per_base_model = record.get("per_base_model_forecasts") or {}
+        per_model_mc = per_base_model if per_base_model else (record.get("per_model_forecasts") or {})
+        # Non-dict values mean the MC option parser found nothing and the
+        # collector fell back to single-string forecasts — no option vectors.
+        model_option_dicts = [v for v in per_model_mc.values() if isinstance(v, dict)]
+        if len(model_option_dicts) < 2:
             return None
 
         # Collect per-option probabilities across models
         option_probs: dict[str, list[float]] = {}
-        for model_options in per_model_mc.values():
-            for opt in model_options:
-                name = opt.get("option_name", "")
-                prob = opt.get("probability")
+        for model_options in model_option_dicts:
+            for name, prob in model_options.items():
                 if prob is not None:
                     option_probs.setdefault(name, []).append(float(prob))
 
-        if not option_probs:
+        spreads = [max(probs) - min(probs) for probs in option_probs.values() if len(probs) >= 2]
+        if not spreads:
             return None
 
-        max_spread = max((max(probs) - min(probs)) for probs in option_probs.values() if len(probs) >= 2)
-        return max_spread > CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD
+        return max(spreads) > CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD
 
     if question_type in ("numeric", "discrete"):
         # Reuse the normalized percentile spread approach from the residual script
@@ -208,8 +218,6 @@ def exceeded_spread_threshold(record: dict) -> bool | None:
                 model_maps.append(label_to_value)
         if len(model_maps) < 2:
             return None
-
-        import math
 
         scaling = record.get("scaling") or {}
         open_lower = record.get("open_lower_bound", scaling.get("open_lower_bound", False))

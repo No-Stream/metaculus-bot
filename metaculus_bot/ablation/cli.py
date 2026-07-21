@@ -567,6 +567,14 @@ def _serialize_question_metadata(question: Any) -> dict:
         # ``unit_of_measure`` is read by ``stacking_numeric_prompt`` and ``numeric_prompt``;
         # legitimately Optional (None when the question doesn't specify a unit).
         metadata["unit_of_measure"] = question.unit_of_measure
+        # ``cdf_size`` (``inbound_outcome_count + 1``) is 201 for continuous questions and
+        # smaller for discrete ones (e.g. 17 for an integer-count 0..15 question). Persist it so
+        # the rehydrated shim carries the real grid length instead of NumericQuestion's 201
+        # default — the ARM_PDF structured-math arm builds its CDF on this grid, and a wrong
+        # length silently mis-scores discrete questions. Older manifests (schema_version 1)
+        # predate this field; the shim reader treats it as optional and the ablation arms
+        # recover it from the cached per-forecaster CDF for those entries.
+        metadata["cdf_size"] = int(question.cdf_size) if question.cdf_size is not None else None
     if isinstance(question, MultipleChoiceQuestion):
         metadata["options"] = list(question.options)
     return metadata
@@ -672,17 +680,23 @@ def _build_question_shim_from_manifest_entry(qid: int, entry: dict) -> Any:
     if qtype == "numeric":
         # ``lower_bound`` / ``upper_bound`` / ``open_*_bound`` always written by
         # ``_serialize_question_metadata`` for numerics; missing → drift.
-        return NumericQuestion(
-            lower_bound=metadata["lower_bound"],
-            upper_bound=metadata["upper_bound"],
-            open_lower_bound=metadata["open_lower_bound"],
-            open_upper_bound=metadata["open_upper_bound"],
+        numeric_kwargs: dict[str, Any] = {
+            "lower_bound": metadata["lower_bound"],
+            "upper_bound": metadata["upper_bound"],
+            "open_lower_bound": metadata["open_lower_bound"],
+            "open_upper_bound": metadata["open_upper_bound"],
             # ``zero_point`` is None for linear-scale numerics; legitimately optional.
-            zero_point=metadata.get("zero_point"),
+            "zero_point": metadata.get("zero_point"),
             # ``unit_of_measure`` is None when the question doesn't specify a unit.
-            unit_of_measure=metadata.get("unit_of_measure"),
-            **common_kwargs,
-        )
+            "unit_of_measure": metadata.get("unit_of_measure"),
+        }
+        # ``cdf_size`` distinguishes a discrete grid (e.g. 17) from the 201-point continuous
+        # default. Older manifests (schema_version 1) omit it — pass it only when present so
+        # NumericQuestion keeps its 201 default for those entries (it rejects ``cdf_size=None``).
+        cdf_size = metadata.get("cdf_size")
+        if cdf_size is not None:
+            numeric_kwargs["cdf_size"] = int(cdf_size)
+        return NumericQuestion(**numeric_kwargs, **common_kwargs)
     raise ValueError(f"Unknown question type {qtype} in manifest entry for qid {qid}")
 
 

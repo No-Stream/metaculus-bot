@@ -2,214 +2,735 @@
 
 Ideas for improving the forecasting bot, roughly ordered by expected impact and feasibility.
 
-> **Status as of 2026-05-10** (closing residual analysis on spring-aib-2026, n=189). See
-> `scratch/analysis_2026-05/analysis_synthesis.md` for full per-rec discussion,
-> `scratch/analysis_2026-05/extended_hits_misses_postmortem.md` for deeper per-question
-> diagnostic, and `scratch/analysis_2026-05/NEXT_SESSION_QUEUE.md` for the prioritized
-> implementation backlog. Per-rec status notes are inlined below; some recs were retired
-> this round, and the priority order shifted materially based on the deeper post-mortem
-> read of 102 per-question audit files.
+> **Status as of 2026-05-10** (closing residual on spring-aib-2026, n=189; receipts
+> `scratch/analysis_2026-05/{analysis_synthesis,extended_hits_misses_postmortem,NEXT_SESSION_QUEUE}.md`).
+> Two findings then reshaped priorities: (1) 17/20 worst misses were high-spread (>0.15) with a base
+> model closer than the ensemble — models disagree on reference class and median pulls away from the
+> closer minority (though "right model" attribution is post-hoc); (2) stacking treatment effect
+> directionally measurable at +89.8% bootstrap (n=8, `analysis_stacking_historical_treatment.md`).
+> Both are now largely superseded — stacking was later rejected/disabled, and the 2026-07-18 residual
+> found the modal worst-miss has moved to consensus-with-zero-dissenters (see the top High-priority entry).
+
+> **Status as of 2026-07-18 (july15 branch — shipped state).** This branch flipped several
+> long-gestating items live in prod (all four workflow yamls). This block is just the index;
+> detailed status lives in the per-item entries below.
 >
-> **Two findings reshaped the priority list:**
->
-> 1. **17/20 worst misses are high-spread** (>0.15 disagreement) — at least one base model was
->    closer to truth than the ensemble. The post-mortem labeled this as "good input wrongly
->    weighted" in 14/20, but reading those misses critically, calling the closer model "right
->    for the right reason" and the others "wrongly weighted" is post-hoc — the closer model
->    often just made a different reasonable reference-class choice that happened to win.
->    What's robustly true: models genuinely disagree on which reference class to weight, and
->    the ensemble's averaging often pulls away from the closer-to-truth minority. Whether the
->    stacker can systematically pick the better minority is what the n=8 treatment-effect
->    signal hints at, but at n=8 it's a hint, not proof.
-> 2. Stacking treatment effect is now **directionally measurable** at +89.8% bootstrap
->    confidence (n=8 stacker-ran vs n=57 triggered-counterfactual on May binary;
->    `analysis_stacking_historical_treatment.md`). First measurable signal in the project's
->    history; needs the marker fix for definitive measurement.
+> - **Agentic gap-fill v2** is ON (`GAP_FILL_V2_ENABLED: 'true'`) since 2026-07-17, running
+>   concurrently with v1 during the overlap window.
+> - **Time-series anchor (text)** is ON (`TS_ANCHOR_ENABLED: 'true'`) since 2026-07-17; the
+>   chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`) stays OFF pending its A/B.
+> - **Summarizer, native-search, and crux-analyzer models migrated sol→terra** (native-search +
+>   crux 2026-07-17; summarizer 2026-07-18) — see the per-role entries below.
+> - **Supporting infrastructure landed**: raw pre-summarization AskNews text archived as
+>   `asknews_raw` in the research-persistence record (`research/persistence.py` +
+>   `research/orchestrator.py`), OpenRouter credit telemetry (`credit_telemetry.py`, wired in
+>   `cli.py`), and the era-bucketed numeric width monitor
+>   (`performance_analysis/width_monitor.py`).
+
+## High-priority
+
+### Spread-triggered second forecast round (re-forecast, NOT stacker) — top-priority design item (added 2026-07-19)
+
+Status: design sketch only. Operator decision 2026-07-19 — this is the top-priority design
+item, but explicitly NOT for right now.
+
+**Honest caveat (load-bearing, read first).** Per the 2026-07-18 residual refresh, the modal
+worst-miss has MOVED to consensus-with-zero-dissenters under a shared briefing — spread-gating is
+structurally blind to that mode. This lever addresses the *disagreement* subset only; do not
+expect it to fix the current worst misses. The consensus-miss counters are separate items
+(gap-fill v2 verify / DISCREPANCY channel; cross-question coherence / resolution-metric
+verification / publish-vs-own-anchor checks from the residual round).
+
+**What.** On questions where forecaster spread exceeds the existing CONDITIONAL_STACKING
+thresholds (~30% of questions per the one recorded estimate): run the EXISTING crux extractor →
+EXISTING targeted search → append `## Targeted Research` to the bundle → re-fan-out all 6 base
+forecasters → MEDIAN over round-2. The stacker stays off entirely — this is a re-forecast, not a
+judge.
+
+**Evidence.** BTF-2 (arXiv:2604.26106): 8 independent Opus rollouts straddle 50% on 38% of 200
+difficult questions (mean per-q σ=0.08), and the strongest research agent (Opus-class) scored
+*worse* on fixed evidence than on its own research (0.131 → 0.153; the effect was model-dependent,
+with Gemini slightly *better* on fixed shared research at 0.143 → 0.141) — so the mechanism is
+disagreement-triggered EXTRA
+RESEARCH, not a smarter judge. AIA Forecaster (arXiv:2511.07678) independently found
+disagreement → targeted-search its biggest aggregation lever. Crucially: ALL of this repo's
+stacking rejections (n=88 ablation, stack_aug arms, trio-50q) tested "stacker LLM rewrites the
+forecast"; a targeted-research-fed SECOND BASE-MODEL ROUND was never built or tested here, so the
+rejection evidence does not apply to it.
+
+**Wiring sketch.** `compute_spread` already runs on every prod question (`forecaster.py:676`);
+the crux extractor + targeted search are importable functions currently welded to the stacker
+path only by code arrangement (`forecaster.py:698-775`); reuse the fan-out helper
+(`forecaster.py:593-604`) for round 2; re-aggregate via the existing `_base_combine` MEDIAN.
+Flag-gated (e.g. `SECOND_ROUND_ENABLED`) + a telemetry marker. Open design decisions:
+round-2-only vs pooled (round-1+round-2) median; a tighter round-2 soft deadline (~5 min) to fit
+the 58:30 per-question wall clock; interaction with `WALL_CLOCK_STACKING_MIN_BUDGET`.
+
+**Cost.** ~8-14 extra LLM calls (1 crux + 1 targeted search + 6 re-forecasts + parsers) on the
+~30% triggered subset → roughly +30-40% forecaster spend.
+
+**Eval.** Ablation harness `--stages forecast` on frozen research, paired on the triggered
+subset; effects <0.02 Brier are undetectable at our n, so this is a big-lever ship-and-watch bet
+with era-bucketing.
+
+### Frozen-triple numeric watch: re-run the ensemble delta after a same-lineage era accrues (added 2026-07-20, HIGH)
+
+Status: shipped-and-watch. The 2026-07-20 drop to the latest-per-vendor triple
+(`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) ships accepting a fragile
+numeric lean toward the full 6-member roster. Two adversarially-verified analyses
+(`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`)
+found the triple non-inferior on binary (delta +0.01, P(loss>1pt/Q)=0.35) and MC (−0.14,
+0.26), but numeric leans full by **+3.24 log pts/Q, 95% CI [−2.5, +9.1], P(full better)=0.88,
+P(loss>1pt/Q)=0.80** — the interval spans zero, so not decisive, but it is the one type where
+the drop could cost score. Operator explicitly flagged this as "honestly a bit risky" — hence
+HIGH.
+
+**Why it's fragile, not merely uncertain.** The +3.24 lean rests on 2 questions: the top-2
+|delta| values are 51% of the summed numeric advantage, and jackknifing them halves the mean
+(+3.12 → +1.56 on raw deltas). Don't read +3.24 as a precise number; the mean-targeting Normal
+likelihood and the coverage-verified (over-covering) CI already handle the heavy tail.
+
+**Why waiting for more questions does NOT resolve it.** The numeric posterior SD is dominated
+by *between-era* variance (tau ≈ 3.85 over 5 eras), not within-era noise. That sets a hard
+floor of ±3.37 log pts/Q on the 95% half-width **no matter how many numeric questions
+resolve** — every operator precision target (±1/±2/±3 pt) sits below the floor and is
+unreachable by question accrual. The only lever that tightens numeric is more *independent
+roster-stable eras* (the tau/√n_era term), each of which is months of fixed-roster operation.
+This is a ship-and-watch bet decided on today's lean, not a measurement we can sharpen by
+collecting more questions.
+
+**Plan.**
+
+1. **FREEZE the triple** (gpt-5.6-sol / opus-4.8 / gemini-3.1-pro-preview). Roster churn
+   restarts the era clock and re-inflates the between-era variance floor that blocks any
+   numeric measurement — the current lineage has ~0 resolved questions, so the frozen triple
+   is the *first* modern-lineage era. This is the second roster change on 2026-07-20 (it
+   supersedes the morning fable-5 → opus-4.7 swap); do not swap members mid-window.
+2. After **~30–50 numeric questions resolve under the frozen triple** (~2–3 months at
+   ~15.8 numeric/mo), re-run `bash scratch/ensemble_power_model_2026-07-20/run_all.sh` with the
+   new era added. Its value is a **same-lineage read** — replacing the current lineage-transfer
+   caveat, since the analyzed eras used grok-4.1/4.3 plus predecessor slots — plus one more era
+   on the tau/√n_era term, NOT a narrower CI (the floor blocks that).
+3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
+   delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
+   top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
+   split is the config spaghetti the operator would rather avoid, and it only earns its cost
+   under that condition.
+
+**Cost context for the re-add decision.** The drop cut per-question reasoning spend from
+~$3.05 to ~$1.65 (three fewer xhigh forecasters), and removing grok also ends routine
+personal-key forecaster spend. Weigh that saving against the numeric lean when deciding whether
+to reintroduce members — a re-add must clear both the score bar above *and* justify the cost it
+brings back.
+
+Receipts: `scratch/ensemble_power_model_2026-07-20/synthesis.md` (composed-delta model, power
+floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthesis.md` (paired
+bootstrap audit). Era boundary: 2026-07-20 = the triple config.
+
+### Score the archived gap-fill v2 ghost forecasts (added 2026-07-18, HIGH, cheap)
+
+Both approach reviews on this branch (`scratch/branch_review_july15/reviews/`) flagged the
+gap-fill v2 ghost forecast as a latent asset that nothing scores. The loop already privately
+dry-runs a forecast per question and archives it — the transcript + telemetry go through
+`archive_sink=_capture_gap_fill_v2` (`research/orchestrator.py`) and a `GHOST_FORECAST` marker
+lands in the run logs — but it is only ever logged for telemetry, never scored against
+resolution. Build an offline harness that CRPS/log-scores three things per resolved question:
+ghost-with-findings, resolution, and the panel's published forecast. **Interpretation guardrail:**
+the ghost is a same-model (terra-low driver) counterfactual, NOT a panel proxy — it measures
+whether the v2 findings alone, forecast by one cheap model, land near truth, not whether v2 would
+improve the 6-model ensemble. This is the most decision-relevant single number for the
+gap-fill-v1-retirement call (v1-retirement gate in the "Bundle content-audit findings" entry):
+v1 currently carries the decisive single-source fact in most sampled questions, and a ghost score
+is the cheapest read on whether v2 findings stand on their own before v1 goes off.
+
+**Addendum 2026-07-19 (promoted to HIGH; scoreability work started).** (a) Shipped same day: the
+archive payload now carries the full structured ghost (`gap_fill_v2.ghost`, pydantic
+`model_dump`) alongside the transcript + telemetry. (b) In flight: a `GHOST_FORECAST_JSON`
+single-line structured marker (full 13 numeric percentiles + full MC option probs) + a
+telemetry-archive harvest + a `score_ghosts.py` upgrade to prefer JSON records and score numerics
+via the existing CDF machinery, with a regex fallback for the pre-upgrade marker era. Rationale:
+the legacy `GHOST_FORECAST` marker exposes only a numeric median, so numeric ghosts were
+countable but not scoreable — the operator wants gap-free ghost-vs-published analysis.
+
+### Grok drop — RESOLVED 2026-07-20 (superseded by the latest-per-vendor triple) (added 2026-07-19, HIGH)
+
+Status: RESOLVED. Grok was removed entirely on 2026-07-20 as part of the drop to the 3-member
+latest-per-vendor triple — not the incremental 6→5 step this entry originally scoped. See the
+"Frozen-triple numeric watch" entry above and the ensemble analyses in
+`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`. The
+re-add question (should any dropped member, grok included, come back?) now lives in that
+frozen-triple watch. Evidence retained below for the record.
+
+A paired leave-one-out replay on 2026-07-19 found that dropping grok from the 6-model roster
+IMPROVES binary accuracy: Δlog-score **+1.83 [+0.74, +3.00]** favoring the drop (n=184) — but
+that signal is entirely **grok-4.3-lineage** (grok-4.5, the slot at the time, had too few
+resolved questions to score). The 2026-07-20 power model corroborated the direction on the
+modern lineage's predecessors: grok read as a drag on binary (−2.4 log pts/Q) and MC (−1.3),
+and a help only on numeric (+2.0), with every CI spanning zero. Grok's numeric help is the one
+reason a re-add could be considered — and that is exactly the numeric lean the frozen-triple
+watch tracks. If grok is ever reconsidered, era-bucket the read (do NOT pool grok-4.3 and
+grok-4.5 evidence); the parameterized replay `scratch/residual_2026-07-18/followups/grok_loo_replay.py`
+is free to re-run (offline, no API).
+
+### Reconsider claude-fable-5 for the forecaster slot (added 2026-07-20, HIGH)
+
+Status: pulled 2026-07-20; reconsideration tracked, do NOT re-add until the trigger below fires.
+
+Fable-5 held a forecaster slot from 2026-07-15 (when it replaced opus-4.6) until 2026-07-20, when
+it was pulled after returning `message.content=None` on 4/4 attempts for Q14333's numeric forecast
+(the question was dropped, published 5/6) and a truncated no-JSON-block output on Q578 that needed
+rung-3 LLM-parser salvage — both in the 2026-07-19 test_bot run (receipts:
+`scratch/gha_test_bot_2026_07_19.md`). Suspected cause: fable-5 content classifiers refusing certain
+question content, surfacing as fast deterministic empty completions (NOT timeouts). opus-4.7 took the
+slot (xhigh, mirroring opus-4.8). **Fable-5's forecast quality was never the issue** — this is a
+reliability/refusal problem, not a capability one.
+
+**Revisit when:** root cause is confirmed (e.g. replay fable-5 against the exact Q14333/Q578 prompts
+via a cheap manual call to see whether the empty completions reproduce and isolate the content
+trigger), or provider behavior changes. If the refusals turn out to be narrow/rare, fable-5 is the
+strongest available Anthropic tier and worth restoring.
+
+### Reconsider fable-5 as the stacker (currently opus-4.8) (added 2026-07-20, HIGH)
+
+Status: pulled 2026-07-20 alongside the forecaster slot; same trigger as the entry above.
+
+The primary stacker was `claude-fable-5` from 2026-07-07 to 2026-07-20; it moved to
+`claude-opus-4.8` in the same 2026-07-20 change (both roles pulled together after the content=None
+failures). Note stacking is **prod-disabled** (all workflow yamls pin `*_STACKING_ENABLED=false`), so
+this is backtest/ablation-only exposure today — lower urgency than the forecaster slot, but track it
+so both roles are reconsidered together when the root cause lands. The `gpt-5.6-sol` cross-provider
+fallback is unchanged.
+
+## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
+
+> Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting
+> literature (evaluation pitfalls, prompting, ensembling, calibration, research harnesses,
+> market-lifecycle) and the open-source forecasting-agent repos (Gnosis, MiroFlow,
+> predictionprophet, vox, TimeCopilot, ForecastBench, futuresim, Bench-to-the-Future),
+> plus two codebase verifications and a rigorous era-bucketed calibration audit. Entries
+> below are grouped by priority within this block; thread them into the topical sections
+> above if they survive discussion. Every "why it helps" from a repo is a mechanism argument
+> unless a paper number is cited. The killed items are logged at the bottom so they aren't
+> re-litigated.
+
+### Calibration is probably NOT a realistic improvement lever for us (added 2026-07-16, decision) — but promote the audit to a monitoring module
+
+Rigorous era-bucketed Bayesian calibration audit (2026-07-16; scripts
+`scratch/calibration_audit_2026-07-16/`, data `scratch/coherence_2026-07-15/perf_all_tagged.json`,
+694 records). **Conclusions:**
+
+- **Not cleanly over- or under-confident — it flips by era.** Bayesian logistic slope:
+  fall-aib-2025 **1.70 [1.28, 2.20]** (under-confident), spring-aib-2026 **0.83 [0.58, 1.10]**
+  (over-confident), summer n=15 uninformative. Opposite-signed eras cancel to a ~calibrated pooled
+  slope (1.17) — why past pooled reads were contradictory. Even within spring the early/late split
+  flips 0.64 → 1.25 (roster churn inside one tournament).
+- **"More NO right than YES right" is a base-rate artifact, NOT directional miscalibration.**
+  YES-rate 24%/33%/60% by era; the decisive per-side test (observed vs expected-if-calibrated,
+  Beta-Binomial CIs) is consistent with calibration on both sides in every era. Puzzle resolved.
+- **The killed spring YES-overconfidence finding reproduces as spring-local** (intercept −0.40
+  [−0.80, 0.00], P(a>0)=0.017) and is untestable on the current post-flip roster (n=15); fall shows
+  the opposite sign. Nothing to fit.
+- **Chronically data-starved for the miscalibrations a fitted layer would target.** Power sim:
+  detecting mild overconfidence (slope 0.85) has power ~0.25 even at N=400; a roster era yields only
+  ~150–210 resolved binaries before it churns. We catch only *large* miscalibrations, and any fit
+  spans opposite-signed eras — a drift bomb by construction.
+
+**Decision (operator, 2026-07-16): calibration is not a realistic source of improvement given our
+budget. Prefer SOTA forecasters over fitted calibration.** Do NOT ship isotonic / Platt /
+directional-shrink layers (see the killed-calibration entries; the Beta-Bernoulli "calibrator"
+from arXiv 2605.27668 degrades OOD in its own tables — cite it as anti-adoption evidence).
+
+**DO promote the audit to a standing monitoring module (free, zero scar risk).** Complementary to
+`performance_analysis/analysis.py` (point-estimate buckets, a single `bias_pp` scalar, PIT
+coverage): the audit adds multi-era comparison, Beta-Binomial CIs per bucket, the slope/intercept
+decomposition (separates confidence from directional bias, which `bias_pp` conflates), the YES/NO
+base-rate-artifact test, the power sim, and partial pooling. Reuse the existing `_interpolate_pit`
+(log-grid fix) + bucket plumbing. Cadence: on each roster change print era-bucketed slope/intercept
+CIs + reliability table + base-rate check; **act only if a CI excludes the null AND reproduces
+across ≥2 eras** — "inconclusive" is the honest default.
+
+### ~~Geometric-mean-of-odds base-combine vs MEDIAN~~ — RUN 2026-07-16, DECISIVE NULL (keep MEDIAN)
+
+The one open aggregation variant the prior rejection never covered (binary geo-mean-of-odds as
+the scored base-combine; MEDIAN is logit-invariant so only a mean-type pool can differ). Offline
+replay, zero API (`scratch/geo_odds_2026-07-16/`, `geo_odds` arm + 5 tests in
+`ablation/offline_replay.py`): NULL everywhere — no era's bootstrap CI excludes zero on log-score
+or Brier (fall +0.32 [−1.34, +2.04]; spring +2.14 [−0.52, +5.34], Wilcoxon p=0.16; pooled +1.07
+[−0.40, +2.68]), Brier opposite-signed to log-score (wash tell), and on the full-ensemble n≥5
+filter fall FLIPS negative — confirming the documented "sharpening pools wash out on the diffuse
+6-model ensemble" headwind. **Verdict: keep MEDIAN; geo-odds joins the settled dead paths (with
+mean, stacking-as-default, coherence-weighting). Do NOT re-run** absent a materially different
+ensemble regime (a confident small-N roster) or post-flip data with a different disagreement
+structure. Arm + tests stay in the harness for cheap re-runs.
+
+### Backtest statistical hardening + leak-aware replay (added 2026-07-16)
+
+Two independent findings (papers-skeptic + eval-repos) plus a codebase check converge here.
+
+**(a) Statistical rigor — AUDITED 2026-07-16, now a scoped consolidation program.** A methodology
+audit found the recent scratch analyses strong-to-gold-standard (coherence phase2: two-way FE +
+cluster-robust SEs; `ensemble_screen`: paired deltas + era-bucketing; calibration audit: Bayesian
+posteriors + power sim) but the **standing pipeline is the thinnest machinery in the repo**, weak
+in the two ways the house rubric names mandatory (pairing, era-bucketing). **Operator directive:
+promote the scratch machinery into the standing pipeline.** Ranked gaps:
+
+1. **`backtest.py` never pairs** (highest leverage): runs multiple bots on identical questions,
+   persists per-qid scores (`backtest/analysis.py:205`), then reports pooled means + population SD
+   with zero inferential content (`analysis.py:43-58,104-118`). Fix: join arms on qid, per-qid
+   deltas, import the in-repo primitives `ablation/scoring.py`
+   `bootstrap_mean_ci`/`bootstrap_median_ci`/`sign_test`/`wilcoxon_signed_rank`.
+2. **`performance_analysis/analysis.py` emits pooled, CI-free, era-blind calibration — the
+   actively-misleading item** (the pooled numbers that flipped three times). Fix: Beta-Binomial CIs
+   on every bucket (`calibration_audit/binary_calibration.py:53-56`, a 4-line drop-in) + a
+   first-class era key. This is where the calibration-monitor promotion lands.
+3. **Per-model comparisons unpaired** in both standing surfaces — same fix as (1).
+4. **Percentile bootstrap under-covers on heavy-tailed log-score deltas** — `ensemble_screen` needs
+   the median/robust (or Bayesian) hedge ablation Path A already has.
+5. **No clustering/effective-N outside coherence phase2** — mirror phase2's `cluster_bootstrap_mean`
+   where a cheap cluster key exists.
+6. **No multiplicity correction** in ablation (~15) or ensemble_screen (~48) — BH q-values or
+   partial-pooling. Low priority.
+
+**Explicitly NOT broken (don't make work):** `backtest/scoring.py` CRPS/log-score (correct),
+`audit.py` (non-inferential by design), ablation Path B fold-std (stability diagnostic), plain
+means on large-n bounded proportions. The problem is never "a mean was used" — it's "used as the
+*comparison* with no pairing, CI, or era split." Reusable-machinery map: primitives
+`ablation/scoring.py`; era-bucketing `ensemble_screen.py:109-140`; Bayesian CI drop-in
+`calibration_audit/binary_calibration.py:53-56`; cluster-robust
+`coherence_2026-07-15/phase2_lib.py:176-345`.
+
+**(b) Leak-aware replay — plumbing exists, archive quality is the gap.** Default
+`backtest_{smoke,small,medium,large}` targets **re-run live research at replay time**
+(leakage-exposed; the leakage detector is a filter, not a fix). Frozen-replay already exists
+(`--research-dir` → `make backtest_with_cache` → orchestrator skips providers), so code distance
+to leak-free ≈ zero. The gap is archive quality: of 921 records in
+`backtests/research_archive/latest/`, only **19 are genuine GHA-captured payloads; 902 are
+reconstructed from published comments** (trimmed, empty `providers_used`), and uncached qids
+silently fall back to live fetch. So: (1) flip default targets to `--research-dir`, (2) grow
+genuine GHA-captured coverage from prod runs. Cheap near-term RetroSearch (below).
+
+**Framing takeaway (papers-skeptic, arXiv 2506.00723 + Vaticinus preprint):** the re-run backtest
+is an optimistic **upper bound**; calibration-on-own-published-forecasts (elicited at forecast
+time, leak-free) is the trustworthy axis. And **stop treating "community Brier − our Brier" as
+edge-over-market** — it's an affine shift of Brier on a balanced panel (ρ=1.000 across 25 rounds),
+zero edge.
+
+### Forecaster-prompt audit — verified clean, no action (added 2026-07-16)
+
+The preregistered Schoenegger/Tetlock result (arXiv 2506.01578) found two prompt scaffolds
+reliably *hurt* accuracy via over-decisiveness: step-by-step "Bayesian reasoning" and
+"propose-evaluate-select". Audit of `prompts.py`: **neither harmful form present** — the closest
+(binary:394 anchor-and-adjust) is the benign outside-view move the study carves out. The three
+base prompts (~11.7k/7.8k/12.8k chars) are focused, not bloated. **No action.** Follow-up
+**RESOLVED 2026-07-16:** the `base_rate_anchor` / `criteria_clauses` binary-schema fields are NOT
+dead — live-elicited since `30bca2f` (2026-07-08); the "0/2203 rows" finding was a data-window
+artifact (archive ended 2026-07-01). Wrong-mechanism claims in `comment/markers.py` +
+`scratch/coherence_2026-07-15/synthesis.md` fixed same-day.
+
+### Market-deference: time-to-close term MEASURED DEAD; liquidity fixes survive, downsized (updated 2026-07-16)
+
+Applicability gate (offline archive mining) killed the headline half:
+
+- **Time-to-close term: structural null — drop to bottom-of-low.** Of 285 matches with real close
+  dates (n=64 questions, ~July 2026), **0.0% within 30 days of close** (median 185d), liquid∧near-close
+  intersection **zero**. Structural, not small-n: a near-identical market closes ≈ when the question
+  resolves, we forecast near open (`skip_previously_forecasted_questions=True`, `cli.py:119-148`), and
+  the `as_of` filter drops markets closing before resolution. Revisit only if we add late re-forecasting.
+- **Surviving — three small liquidity/matching fixes (top-of-low / bottom-of-medium):** (1)
+  **Fallback-chain bug**: 39 real-money matches render `no-liquidity-data` because volume/OI fields are
+  dropped — fix the `total_volume`/`open_interest` fallback (`prediction_market.py:498-506`). (2)
+  **Fuzzy floor (40) so loose "match" ≈ topical-adjacent**: 100% "match" but confidence never exceeds
+  0.77; ≥0.7-confidence (the defer trigger) is only ~8% of questions, ≥decent-liquidity ~12% — raise
+  the floor or add a confidence tier. (3) Optional mild deference nudge for deep+high-confidence matches
+  (plumbing already exists; prompt/render-level).
+- Mechanics: `## Prediction Market Snapshot` header renders only on ≥1 match (`orchestrator.py:401-403`),
+  so header-absence ≠ provider-off — use `providers_attempted`; close dates captured for
+  Polymarket/Kalshi/Manifold (PredictIt lacks them).
+
+**Rides along (low-value, operator 2026-07-16):** a bias-corrected **∆LL-over-matched-market diagnostic**
+on the ~8% near-identical subset — do we add signal beyond the price or defer harder. NOT worth building
+against the Metaculus CP (bot-only questions, CP is mostly-poor bots + null-hidden for our account).
+Small subset → accumulates signal slowly.
+
+### ~~JS-divergence diversity lens on ensemble screening~~ — BUILT 2026-07-16, verdict: NOT a selection signal (paper's heuristic INVERTS under median)
+
+The "Diversity is the Strength of the AI Crowd" paper (arXiv 2606.29661) argues decorrelation
+matters more than solo accuracy for roster decisions. Prototyped a JS-divergence metric on top of
+`ensemble_screen`'s loaders (`scratch/js_divergence_2026-07-16/`, JS over
+Bernoulli/option-simplex/202-bin PMFs). Findings: the metric is internally valid (Spearman(JS,
+per-question score-corr) pooled −0.67, p≈1e-9 — high-JS pairs make independent errors), **but under
+MEDIAN, decorrelation is INVERSELY related to marginal contribution** — Spearman(decorr,
+removal-drop) = **+0.83** in the only rankable era (fall_6m): the most-decorrelated members (kimi,
+grok) are the *least* load-bearing. Grok's independence is *incompetent* (off in a different
+direction, not right-when-others-wrong) and MEDIAN discards outliers rather than harvesting them
+(the paper's combiner was learned). **Verdict: do NOT promote JS as a roster-selection signal; the
+marginal-contribution benchmark stays the decision instrument.** Keep the scratch code for two
+uses: redundancy/near-clone detection (spring `opus-4.5|opus-4.6=0.017`, summer
+`gpt-5.4|gpt-5.5=0.018` bits) and the error-complementarity Spearman as a validity check. Caveat:
+the inversion is median-specific — a learned combiner/stacker could exploit decorrelation (relevant
+only if the stacker-revisit lands).
+
+### Revisit the conditional stacker with the AIA supervisor evidence (added 2026-07-16) — SUPERSEDED 2026-07-19
+
+Folded into the top-priority entry "Spread-triggered second forecast round (re-forecast, NOT
+stacker)" at the top of this file, which reframes the AIA (arXiv:2511.07678, supervisor 0.1125 vs
+no-supervisor 0.1199 ≈ 0.0074 Brier) + BTF-2 evidence as motivating a targeted-research-fed
+second BASE-MODEL round rather than a stacker revisit. The stacker-as-judge rejection still stands
+(disabled in prod; our own benchmark found it counterproductive on the current ensemble).
+
+### Time-series anchor for numeric questions — Phase A verdict IN; Phase B text anchor SHIPPED ON in prod (2026-07-17), chart still OFF
+
+For numeric questions resolving on a fetchable series, render an empirical P10/P50/P90 band from
+the series' own history into the briefing — **TS-as-anchor, not TS-as-answer**; a principled
+version of the "status-quo / last-print anchor" finding. The shipped provider is deterministic
+naive/empirical (no statsforecast dependency, no model selection).
+
+**Phase A offline-replay verdict** (`scratch/ts_anchor_replay_2026-07-16/synthesis.md`). On 105
+mapped class-A resolved numerics the empirical band beats our published CDF: paired relative skill
+−1.17 (sign-flip permutation p=0.005 over 22 clusters; conservative CR2-t p=0.15 — cluster-fragile
+but directionally robust). Decisive result is **coverage**: our published low tail is badly
+miscalibrated (~3% below published P10 vs 10% target) while the anchor's P10 coverage is 0.18 and
+P90 on target — sharper AND better-tail-calibrated. **CV model selection rejected**: the
+must-beat-naive gate passed 76% but those picks beat naive OOS only 43% (worse than a coin flip),
+so we render the naive/empirical band directly.
+
+**Phase B text anchor SHIPPED ON 2026-07-17** (`TS_ANCHOR_ENABLED: 'true'` in all four yamls; chart
+side-channel `TS_ANCHOR_CHART_ENABLED` stays OFF, next entry). Provider
+`research/timeseries_anchor.py` + `ts_fetch.py` (deterministic routing + point-in-time/ALFRED-vintage
+fetch + empirical bands); prompt clause `_ts_anchor_evidence_clause` (gated on section header).
+Cleared its validation ladder (paid 3-arm smoke → `test_bot.yaml` eyeball → `make backtest_medium`,
+leakage-safe because the provider date-ceilings the fetch to `open_time` under `is_benchmarking`) —
+the FIRST prod research provider also measurable in backtest. The `TS_ANCHOR_ENABLE` config era
+(2026-07-17) is tracked by the width monitor. Seed doc:
+`scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`.
+
+**Applicability gate** (`scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`): **53.2% (123/231) map to
+a standard fetchable series** (fall 57% / spring 41% / summer 75%; strictest level-only reading 27%)
+vs the ~10% skip bar. Class A is recurring templates (10Y yield, HY OAS, VIX, index/commodity returns,
+gasoline, unemployment, CPI, payrolls, poll averages, TSA volume). Design notes:
+
+- **Strong-value core = 63 level anchors** (macro prints, rates, spreads, poll averages, TSA).
+  Spot-check: q43611/q43591 (poll averages) off in exactly the direction a live anchor corrects;
+  q43647 (HY OAS) center-correct, would sharpen. (n=3, anecdotal.)
+- **47 relative-return spread questions need the anchor fit on the SPREAD series** (center≈0 +
+  historical-vol band), not a naive level forecast. The 13 max-functional questions (VIX/commodity
+  highs) need window logic.
+- **Net-new vs `financial_data`:** its allowlist misses HY OAS, gasoline, Brent, VIX, poll averages,
+  TSA (4/5 spot-checked FRED series absent), and emits a raw last-6-obs table, not a fitted band.
+- **Class B later-add:** Mauna Loa CO2 + Norwegian EV-share (held out of A on ingestion only; fold in
+  once statsforecast wiring exists). Backtest measurement uses the gap-fill v2 eval-ladder pattern.
+
+### TS anchor chart image — enable + A/B (HIGH, added 2026-07-17)
+
+Beyond the text anchor's prose band, the chart side-channel passes each base model a rendered
+800×400 PNG of the series + projected band as a vision message. **Skeleton shipped env-gated OFF**
+(`TS_ANCHOR_CHART_ENABLED`, `'false'` in all four yamls): `research/ts_chart.py`
+(`render_anchor_chart`, deterministic base64 PNG), a provider hook stashing the chart per-qid for
+single LEVEL questions only (max-window/spread deferred), and forecaster plumbing threading the b64
+→ `self._research_images[qid]` → the three runners via
+`VisionMessageData(..., image_resolution="low")`. All 6 roster models are vision-capable via
+OpenRouter (verified); stacker/summarizer/gap-fill/parser never see the image.
+
+**Cost:** ~$0.02/question at low resolution — cheap enough to A/B but not free, hence gated
+separately so the validated text anchor ships first.
+
+**A/B needs:** arms bare / stats (text) / stats+chart on numeric-anchored questions, real read is
+era-bucketed residuals on the level/spread cohort. **Prerequisite for archived-replay: research-sink
+schema v3** — the archive stores only the text bundle; to replay chart arms offline the sink must
+persist the chart b64 (or the band + series slice to re-render deterministically). Until v3, chart-arm
+measurement is live-only. **Cheapest first signal — 3-arm smoke:** one hard resolved level-series
+question, run a cheap model 3× (bare / stats / stats+chart), eyeball whether the image moves the
+distribution beyond the text. Paid — gate behind operator sign-off.
+
+### Necessary-condition / scenario decomposition scaffold (added 2026-07-16, bottom-of-medium)
+
+Gnosis ThinkThoroughly (gnosis-repos): generate ~3 necessary preconditions + ~5 hypothetical
+scenarios (incl. the negation) as sub-questions, research/score each, synthesize. Highest
+ceiling of the "experiment" bucket, weakest evidence (no in-repo ablation; the PROPHET benchmark
+found agentic-RAG scaffolding gave only marginal Brier improvement and naive RAG sometimes
+*hurt*). Overlaps gap-fill v2's private dry-run (a lighter cousin). **Operator prior:** prompting
+tricks mostly don't work — bots check the boxes you give them then put down what they want. File
+it; gate hard on beating a flat forecaster in our own backtest before shipping.
+
+### Lower-priority / logged (added 2026-07-16)
+
+- **Embedding-NN market matcher + LLM resolution-equivalence check (low).** Replace/augment our
+  fuzzy-string market matching (rapidfuzz) with embedding nearest-neighbor + similarity
+  threshold (Gnosis pattern), plus an LLM "is this really the same resolution criterion" gate on
+  top — catches paraphrase matches we miss, serves defer-to-market. Low-risk recall win, but low
+  priority.
+- **Consistency-check as an offline diagnostic (bottom of low).** The 0.85 consistency↔Brier
+  correlation (arXiv 2412.18544) is a cheap no-resolutions-needed roster-health signal — probe
+  members with negation/paraphrase variants, flag incoherent ones. **Diagnostic only** — the
+  paper's own experiments show enforcing consistency does NOT reliably improve accuracy, and we
+  killed coherence-*weighting* on 2026-07-15. Never in the prediction path.
+- **Deterministic coherence projection (bottom of low).** KL/Brier projection onto monotone
+  deadline/threshold ladders + MC-sum-to-1. Survives the era-test trivially (it's algebra, not a
+  fit) but **rarely binds** — most AIB questions are standalone; sibling A/¬A/A⇒B ladders are
+  rare (unlike a market book). We already enforce the two that apply (MC renormalize, CDF
+  monotonicity). Low-yield; build a lightweight same-tournament ladder detector only if the
+  ladder frequency turns out non-trivial.
+- **ForecastBench external submission (bottom of low).** MIT code, open submission,
+  contamination-free scoreboard vs superforecasters + other bots (arXiv 2409.19839). Genuinely
+  useful for knowing where we stand leak-free — but **not free to forecast** (spends API on the
+  submission question set), so it sits at the bottom.
+
+### Study-only / longer-term (added 2026-07-16)
+
+- **RetroSearch-style frozen point-in-time corpus** (FutureSearch, Bench-to-the-Future): live
+  Google for ranking quality, filtered so the agent only ever receives pages already in a frozen,
+  date-bounded per-question snapshot ("no tool returns a document from after the simulated now").
+  The rigorous fix for backtest leakage. **Reproduce the design only** — RetroSearch code+corpus
+  are proprietary; futuresim (openforecaster.github.io/futuresim) has NO license (study, don't
+  copy). Cheaper reproducible variant: date-gated CommonCrawl News + LanceDB with query
+  date-range control (both open). The near-term substitute is the frozen-artifact-replay in the
+  backtest-hardening entry above — do that first.
+- **Longitudinal trajectory scoring** (futuresim: sum of Brier-skill-score over timesteps;
+  rewards correctness + calibration + timeliness). Suggestive that *timing* matters (TimeSeek),
+  but no paper shows re-forecasting the same question over calendar time improves a bot's score,
+  and it's an uncertain fit for single-shot Metaculus tournament scoring. Longer-term R&D.
+
+### Answer to "should we go end-to-end agentic research?" — NO (shared, not integrated) (added 2026-07-16)
+
+The strongest evidence (BTF-2, arXiv 2604.26106) argues against per-forecaster integrated
+research+forecast pipelines: the single most accurate forecast was a **strong prompt on good
+shared/fixed research** (0.129 Brier), edging the best self-directed integrated agent (0.131), and
+integrated-vs-shared was **model-dependent** (only the Opus-class model clearly benefited from its
+own search; Gemini was slightly *better* on fixed shared research). Our architecture (multi-provider
+shared briefing + gap-fill + 6-model ensemble + median) already **is** BTF-2's winning recipe, at ~7
+calls vs ~5N. The lever is **shared-research quality + a strong prompt**, not integration topology.
+So: make the shared research more agentic (gap-fill v2,
+`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`, SHIPPED + ON since 2026-07-17 — that half is
+done); do NOT rebuild into per-forecaster agents; if ever tried, give it only to the Opus-class slot.
+Calibration caveat: these agentic-research wins optimize pass@1, and edge-over-consensus has a
+*flat-to-negative* trend across model generations — "more search → more decisive" trades calibration
+for sharpness, so track era-bucketed calibration alongside Brier. See "Longer-term → Agentic deep
+research" below (superseded by this).
+
+**Addendum 2026-07-19 (BTF-2 re-read).** BTF-2 (arXiv:2604.26106) strengthens the case that
+per-predictor research is the literal ideal for the strongest research agent (Opus-class), which
+scored worse on fixed evidence than on its own research (0.131 → 0.153; the effect was
+model-dependent, with Gemini slightly better on fixed shared research at 0.143 → 0.141). But at
+~$3-10/question for 6 frontier agents each running
+live search, it stays not-planned. Read the design as a continuum — shared bundle → shared bundle
++ one agentic researcher (gap-fill v2, current) → per-predictor research loops — where the
+affordable middle is more v2 rounds / parallelism, not a rebuild. The NO verdict stands.
 
 ## Near-term (worth exploring soon)
+
+### TS-anchor follow-ups from the derivation-gating fix (added 2026-07-20)
+
+Context: commit `548ba88` closed the wrong-quantity routing bug (Codex P1 on b6edd2b) — CPI
+index-level/YoY/UK/Egypt questions were inheriting the US CPIAUCSL `mom_pct` band; PAYEMS and
+GASREGW had the same keyword overreach. The fix gates non-level derivations on quantity language
+and SKIPS when ambiguous. Two follow-ups deliberately left out of that commit:
+
+- **`yoy_pct` derivation to recover the YoY-CPI family.** The gate now skips YoY inflation
+  questions entirely (q41640-UK/q41634-Egypt-style, and US YoY variants). A `yoy_pct` derivation
+  gated on YoY language ("year-over-year", "12-month", "annual inflation") would give that
+  recurring family a correct-units anchor instead of none. Foreign-country questions need
+  country-specific series (ONS/ABS per `scratch/ts_anchor_gate_2026-07-16/MAPPING_AUDIT.md`) or
+  stay skipped — don't reuse CPIAUCSL. Same conservative registry pattern; the
+  `require_any_keywords` machinery from 548ba88 makes this a small add.
+- **Split `timeseries_anchor.py` (~1100 lines, over the monolithic ceiling).** Forge flagged;
+  deferred as its own PR. Natural seams: routing+registry vs estimators/render. Fold in the
+  duplicated 8-field `_Route` construction (`_single_url_route` vs `route_question`) via a
+  `_route_from_entry` helper when splitting.
+
+### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-17 (added 2026-07-16)
+
+**FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON 2026-07-17 after
+the paid smoke, the blind driver eval (winner: gpt-5.6-terra effort=low, now the prod default),
+and the Exa-alive confirmation replay (`scratch/driver_replay_2026-07-17/arm_terra_low_exa_alive/`).
+Pending: turn v1 gap-fill OFF after the overlap window (operator must remember — **now gated on
+quality, not just time, per the 2026-07-18 content-audit entry**); the 3.5-flash researcher switch
+is undecided. Full design (source of truth): `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`
+(rev 4).
+
+Summary: a bounded agentic tool loop is the second-pass research stage — a driver LLM briefed with
+the forecaster prompt template privately dry-runs the forecast to find fill/verify targets, then
+iterates over four tools: `search_news` (AskNews rate-limit machinery), `search_web` (Exa direct,
+key `~/.keys/exa_key` / GHA secret `exa_key`), `fetch` (ladder plain → headless Chromium → Gemini
+url_context), `read_document` (Gemini flash url_context). Output: a detached citation-only findings
+artifact appended to the bundle; a ghost forecast logged for telemetry only. DIY litellm-direct,
+append-only message array for prompt-cache discipline.
+
+**Rollout: BOTH v1 and v2 run in prod during an overlap window** (independent flags
+`GAP_FILL_ENABLED` / `GAP_FILL_V2_ENABLED`, distinct headers); artifact diffs + resolution scoring
+harvested from the both-on era. Turning v1 OFF is a deliberate pending step — nothing does it
+automatically.
+
+Evidence base (plan doc §7): Metaculus Fall 2025 bot survey — research breadth ~ accuracy r=0.42;
+FutureSearch #1 with agentic research ~$1/question; Bridgewater ablation agrees; date-filtered live
+search leaks resolution info on 41–55% of resolved questions, so **`make backtest_*` is
+uninterpretable for research-stage changes** — eval is test_bot QA then early prod flip.
+
+Post-review (plan rev 4): dup-query semantic stuck-detector deferred (v1 ships only a per-run
+`dup_tool_calls` counter); traditional-researcher tier-tagging is a follow-up to ride the same era
+boundary; era-bucketed calibration is in the v2 eval ladder.
+
+**DeepNews (AskNews's agentic research product; we call only basic HOT+HISTORICAL today).** Two
+options vs the v2 driver: (a) expose as an optional heavy tool `search_news_deep(query, max_depth)`
+the driver escalates to when basic search comes up thin; (b) upgrade the `search_news` backend to
+DeepNews with a depth param. **Blocked on operator checking DeepNews limits/pricing** (separate
+quota pool, possibly subsidized for tournament participants — if cheap, solid case for (a)).
+
+### Bundle content-audit findings: v1 retirement gate, AskNews reform, market header (added 2026-07-18)
+
+Three findings from the 2026-07-18 bundle content audit
+(`scratch/bundle_content_audit_2026-07-17/RESULTS.md`, Fable-judged per-section value/redundancy).
+
+1. **Gap-fill v1 retirement risk — do NOT flip v1 off on the calendar alone.** v1 is the MOST
+   load-bearing section per token (59% unique content; carried the decisive single-source fact in
+   the majority of sampled questions). The ~$190/quarter retirement savings holds only if quality
+   is preserved. **Gate:** compare v1 vs v2 findings on the first ~20 prod questions where both are
+   present; flip only if v2 consistently surfaces the same decisive facts.
+2. **AskNews reform — shipped 2026-07-18.** Audit: 44% of the bundle by tokens, 57% padding, AND
+   stale/directionally-wrong in 5/10 sampled questions while smaller sections had the right answer.
+   "Longer is better" nudge removed (`5cfb6cd`); quality audit
+   `scratch/asknews_quality_audit_2026-07-18/RESULTS.md` (R1-R5 + per-failure prevention matrix).
+   Shipped in `asknews_summarizer_prompt`: **R1** recency-first ordering, **R2** supersession +
+   quote-the-deadline-inputs arithmetic transparency, **R3** hard per-article relevance gate
+   (off-topic DROPPED to a screened-out list), **R4** evidence-age disclosure opening the briefing,
+   and an operator **proportionality rule** (length tracks decision-relevant content). The
+   `asknews_raw` archiving hygiene rec is a separate in-flight change (orchestrator + persistence).
+   R5 (fetch query enrichment) remains optional. Do NOT blindly halve the section — prioritization
+   change + eyeball, not a cap.
+3. **Prediction-market header revision (low effort, medium impact).** The `STRONG EVIDENCE -- weight
+   these markets heavily` header fires unconditionally (`research/prediction_market.py:1184`) even at
+   low fuzzy-match relevance — ~56% of sampled questions had off-topic/loosely-matched markets and
+   forecasters anchor on them. Fix: qualify the research-side header by match confidence; the
+   forecaster-prompt clause (`prompts.py:372`) already discounts on mismatch — the problem is the
+   research-side header priming the model first. **Caution:** the `[PRE-WINDOW]` apparatus in the
+   summarizer output is load-bearing (prevents pre-open events read as resolutions — has saved
+   multiple questions); do NOT remove, at most abbreviate after first occurrence.
 
 ### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
 
 The 2026-06-28 research-quality audit found **zero positive evidence** that Gemini's `url_context`
-tool (purpose-built to directly read resolution-source URLs named in question fine print) ever fires
-in production. Across all 17 post-2026-05-17 Period-B research records, every Gemini section cites only
-`vertexaisearch.cloud.google.com/grounding-api-redirect/` links — 0/17 contain a direct
-`.gov`/`fred`/`cboe` resolution URL. In every observed tracker case the live resolving value was
-surfaced by the **gap-fill OpenAI native-search pass** or the **financial-data API**, NOT by
-url_context. Most damning single data point: on q43650 Gemini's grounded snippet was *wrong*
-(4.44–4.46%) while gap-fill returned the exact 4.48% that resolved. The fetch gap is *masked by
-gap-fill*, not *closed by url_context*. (Inference from research text only — at audit time there was
-no telemetry.)
+tool (built to directly read criteria-named resolution URLs) ever fires in prod: across 17 Period-B
+records every Gemini section cites only `grounding-api-redirect/` links — 0/17 a direct
+`.gov`/`fred`/`cboe` URL. Live resolving values came from the **gap-fill native-search pass** or the
+**financial-data API**, not url_context (damning case q43650: Gemini's snippet was wrong 4.44–4.46%
+while gap-fill returned the exact 4.48% that resolved). The fetch gap is *masked by gap-fill*, not
+*closed by url_context*.
 
-**Telemetry was added 2026-06-28** (`gemini_search.py` `_extract_url_context_telemetry`): each
-grounded call now logs `N/M url_context fetches` and writes a greppable marker into the persisted
-research blob — `### URL Context Fetches` (successful reads, with the retrieved URLs) or
-`_url_context: none_` (tool fired but fetched nothing). So this is now *observable for free* on the
-next scheduled tournament/backtest run.
+**Telemetry added 2026-06-28** (`gemini_search.py` `_extract_url_context_telemetry`): each grounded
+call logs `N/M url_context fetches` and writes a greppable marker — `### URL Context Fetches` (reads +
+URLs) or `_url_context: none_`. **Action (free):** after the next prod run, grep
+`backtests/research_archive/latest/*.json` for those markers to settle whether url_context fires and
+reads the named URL. If it reliably direct-reads named sources, the deterministic-fetch question
+dissolves; if never, that justifies the narrow named-URL fetcher.
 
-**Action (free, rides an already-scheduled run):** after the next prod run with Gemini enabled, grep
-`backtests/research_archive/latest/*.json` for `### URL Context Fetches` vs `_url_context: none_` vs
-absence, to settle definitively whether url_context fires and, if so, whether it reads the
-criteria-named resolution URL. If it reliably direct-reads named sources, the deterministic-fetch
-question (below) largely dissolves. If it never fires or never reads the *named* URL, that's the
-evidence that would justify the narrow deterministic named-URL fetcher.
+**Related (deferred, needs a small paid re-bench — clear cost):** the audit could NOT test the gap's
+worst case — obscure non-API official counters/registries/dashboards (state policy trackers, CBP
+tables, WHO-style dashboards, mesonet tables). Period B had zero; the only two clean research-side
+fetch failures in the 40-tracker corpus (q43046 WHO extranet, q43139 IEM mesonet) were both this type,
+both pre-current-stack. A ~10–15-question adversarial re-bench enriched for that archetype is the
+highest-leverage missing evidence. Narrow design (parse criteria for a resolver URL → force-fetch, or
+make the gap-fill analyzer treat a criteria-named URL as mandatory) sketched in
+`scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. FRED/Yahoo URL-extraction (shipped 2026-06-28)
+already covers the API-backed financial subset.
 
-**Related (deferred, needs a small paid re-bench — clear cost first):** the audit could NOT test the
-gap's worst case — obscure, low-news, *non-API* official counters/registries/dashboards (state policy
-trackers, CBP encounters tables, WHO-style dashboards, mesonet data tables, "infants enrolled"
-homepage counters). Period B contained zero of that archetype; the only two clean research-side
-fetch failures in the entire 40-tracker corpus (q43046 WHO extranet dashboard, q43139 IEM mesonet
-precip table) were both this type and both pre-current-stack. A deliberately adversarial ~10–15-question
-re-bench enriched for that archetype is the single highest-leverage missing evidence — it either kills
-the deterministic-fetcher project or scopes it precisely. The narrow design (parse criteria for a
-resolver URL → force-fetch+parse; or make the gap-fill analyzer treat a criteria-named URL as a
-*mandatory* gap) is sketched in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §4. The FRED/Yahoo
-URL-extraction shipped 2026-06-28 already covers the API-backed financial subset of this class.
+### Resolution-source fetcher: Tier-2 LLM fetch + oversized-source summarization (added 2026-07-09)
 
-### Resolution-source fetcher: flip prod workflows + Tier-2 LLM fetch (added 2026-07-09)
+Tier-1 deterministic fetcher shipped `66e31c0` (`research/resolution_source.py` +
+`research/http_fetch.py`, `RESOLUTION_SOURCE_ENABLED`). Smoke-validated on 40 cached questions
+(`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 (60%) get a non-empty snapshot vs
+the 62.5% Tier-1 target, 30/45 URL success, 0 SSRF false positives, first-cited URL was the primary
+grading source in all 12 multi-URL questions; remaining misses are known Tier-2 hosts (JS walls /
+fingerprinting). **Flipped ON in all three prod yamls 2026-07-10** after a `test_bot.yaml` eyeball
+(same commit added the per-URL truncation marker + dropped-section note).
 
-The Tier-1 deterministic resolution-source fetcher shipped in `66e31c0`
-(`research/resolution_source.py` + shared `research/http_fetch.py`, gated by
-`RESOLUTION_SOURCE_ENABLED`, currently ON in `test_bot.yaml` only). Smoke-validated on 40 cached
-real questions (`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 questions (60%)
-get a non-empty `## Resolution Source Snapshot` vs the probe's 62.5% Tier-1 target, 30/45 URL
-success, 0 SSRF false positives, and the first-cited URL was the primary grading source in all
-12 multi-URL questions. Remaining misses are all known Tier-2 hosts (JS walls / bot
-fingerprinting).
-
-**Truncation-cap distribution study (2026-07-09, don't re-derive):** uncapped re-fetch of the
-29 real successful URLs from the smoke run, full trafilatura extraction: p25=697 / p50=2,201 /
-p75=5,206 / p90=67,041 / max=438,049 chars. Elbow at 6,000 chars/URL — a 3,000 cap truncates
-14/29 URLs (48%), 6,000 truncates 6/29 (21%), and past 6,000 only whale pages (67k+) remain,
-which need summarization, not bigger caps. Mean prompt cost across all 40 smoke questions:
-380→578 tokens/question at 6k. **Shipped:** `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` 3,000→6,000
-and `RESOLUTION_SOURCE_TOTAL_MAX_CHARS` 12,000→18,000 (headroom so the per-URL cap is the
-binding constraint; max observed section simulates to ~11.1k at 6k/URL).
+**Truncation-cap study (2026-07-09, don't re-derive):** uncapped re-fetch of the 29 smoke URLs:
+p25=697 / p50=2,201 / p75=5,206 / p90=67,041 / max=438,049 chars. Elbow at 6,000/URL (3,000 cap
+truncates 48%, 6,000 truncates 21%, past 6,000 only whales that need summarization). **Shipped:**
+`RESOLUTION_SOURCE_PER_URL_MAX_CHARS` 3,000→6,000, `RESOLUTION_SOURCE_TOTAL_MAX_CHARS` 12,000→18,000.
 
 Follow-ups:
 
-1. **Flip prod workflows — DONE 2026-07-10.** Live `test_bot.yaml` run confirmed real rubric/fact
-   content, visible forecaster uptake, and clean diagnostics; `RESOLUTION_SOURCE_ENABLED=true`
-   now set in all three `run_bot_on_*.yaml` prod workflows (tournament / metaculus_cup / minibench).
-   Same commit added a per-URL truncation marker (`[truncated at N chars — full source at URL]`)
-   and a dropped-section note so forecasters can tell when the snapshot is partial.
-2. **MEDIUM — Conditional summarization for oversized sources.** The first-cited URL's content
-   stays verbatim (provenance for the primary grading source); URLs 2+ and/or whale pages
-   (full extraction ≥ ~10k chars; p90 of the real distribution is 67k) go through the existing
-   cheap summarizer path (`gpt-5.4-mini`, temp 0, ~$0.01/call). Rationale: the distribution
-   study found ~5 whale sources per 40 questions that no reasonable cap captures; raising caps
-   past 6k has near-zero marginal rescue.
-3. **MEDIUM — Expand fetching for other site types (Tier-2 LLM fetch)** for the
-   js_wall/blocked slice (~15% of questions; e.g. Masters.com, childmortality.org, UNICEF,
-   Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked / js_wall retained
-   deliberately) is the seam — a follow-on pass feeds those URLs to an LLM-mediated reader
-   (Gemini `url_context` or OpenAI native-search URL-read).
-   **Precondition:** the "Confirm Gemini `url_context` actually fires in prod" probe above
-   (added 2026-06-28) — no point building on url_context until we know it fires.
-4. **LOW — minor follow-up from review, explicitly deferred:** module split of
-   `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
+1. **MEDIUM — conditional summarization for oversized sources.** First-cited URL stays verbatim
+   (provenance); URLs 2+ / whales (≥~10k chars) go through the cheap summarizer (`gpt-5.4-mini`, temp
+   0, ~$0.01/call). ~5 whale sources per 40 questions no cap captures.
+2. **MEDIUM — Tier-2 LLM fetch** for the js_wall/blocked slice (~15%; Masters.com, childmortality.org,
+   UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked/js_wall) is the seam.
+   **Precondition:** the Gemini `url_context` probe above. *Note 2026-07-16:* the gap-fill v2 fetch
+   ladder gives the driver this capability inside the loop, so the js_wall slice may get covered
+   agentically first — re-assess after the v2 overlap window.
+3. **LOW (deferred):** module split of `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
 
 ### Parser hardening + forecasting-tools upgrade path (added 2026-07-07)
 
-Full plan in `scratch_docs_and_planning/parser_hardening_and_ft_upgrade_plan.md` (written
-after an 8-agent structured-outputs exploration). Decisions: do NOT migrate forecaster calls
-to native `response_format` structured outputs (OpenRouter silent-degradation footguns,
-load-bearing rationale channel, zero competitive precedent — no upstream layer uses it
-either). Instead:
+Full plan `scratch_docs_and_planning/parser_hardening_and_ft_upgrade_plan.md`. Decision: do NOT
+migrate forecaster calls to native `response_format` structured outputs (OpenRouter
+silent-degradation footguns, load-bearing rationale channel, zero competitive precedent).
 
-- **Workstream A — DONE and superseded.** Shadow divergence logging shipped, served its
-  purpose, and was deleted 2026-07-10 when the block became authoritative (see the DONE
-  entry below; `EXTRACTION_RUNG` telemetry replaced it). The strict json_schema on the
-  *parser call* via `GeneralLlm(response_format=...)` also shipped (`structured_parse.py`,
-  constrained primary + framework `structure_output` fallback) and now serves as the
-  ladder's rung-3 salvage parser.
-- **Workstream B (between rounds, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 →
-  0.2.92+. Two verified breaks: our PCHIP subclasses override `.cdf` but HEAD internals moved
-  to `get_cdf()` (silent bypass of our CDF machinery); `fetch_hardening` patch target moved
-  to the new `MetaculusClient` (silent no-op). Plus a validator audit — HEAD's new
-  `_check_too_far_from_bounds` (25% wiggle) may conflict with our beyond-range open-bound
-  percentile design. Unlocks the litellm/cryptography CVE fixes below.
-- **DONE (2026-07-10): JSON-block-as-authoritative for ALL question types
-  (binary, MC, numeric) AND the stacker.** Value extraction runs through the
-  deterministic four-rung ladder in `metaculus_bot/value_extraction.py`:
-  fenced ```json block parse → json-repair salvage → LLM-parser salvage
-  (`parse_structured`) → `ValueExtractionError`. The old Workstream A trigger
-  ("wait for ~50 questions of shadow-divergence agreement data") was
-  **consciously waived by the operator** in favor of two lighter-weight
-  verification channels: (a) the `EXTRACTION_RUNG` INFO telemetry emitted on
-  every extraction — `rung=llm` salvages and `block_present=false` are the
-  drift signals to watch in prod logs; and (b) a user-gated live `test_bot`
-  rerun that eyeballs those rungs before the first tournament run. The
-  shadow-divergence logging module and its tests were deleted (superseded
-  by rung telemetry); the F5 block-lift fallback was absorbed into rung 1
-  of the numeric ladder.
+- **Workstream A — DONE (superseded).** Shadow-divergence logging shipped, served its purpose,
+  deleted 2026-07-10 when the block became authoritative (`EXTRACTION_RUNG` telemetry replaced it).
+  Strict json_schema on the *parser call* (`structured_parse.py`) shipped and is now the ladder's
+  rung-3 salvage.
+- **JSON-block-as-authoritative for ALL question types + stacker — DONE 2026-07-10.** Value
+  extraction runs the deterministic four-rung ladder in `value_extraction.py` (block parse →
+  json-repair → LLM-parser salvage → `ValueExtractionError`). The old "wait for ~50 questions of
+  shadow-divergence data" trigger was operator-waived for `EXTRACTION_RUNG` telemetry + a gated
+  `test_bot` eyeball.
+- **Workstream B (active, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 → 0.2.92+. Two
+  verified breaks: our PCHIP subclasses override `.cdf` but HEAD moved internals to `get_cdf()`
+  (silent bypass of our CDF machinery); `fetch_hardening` patch target moved to `MetaculusClient`
+  (silent no-op). Plus a validator audit — HEAD's `_check_too_far_from_bounds` (25% wiggle) may
+  conflict with our beyond-range open-bound design. Unlocks the litellm/cryptography CVE fixes below.
+
+### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
+
+A numeric STRUCTURED FORECAST block whose `declared_percentiles` keys are percent-form ("2.5" …
+"97.5") not fraction-form (0.025 …) is dropped by BOTH recovery rungs in
+`performance_analysis/parsing.py` (strict `parse_structured_block` rejects the schema; the tolerant
+salvage rung drops the keys on its `0 < pct < 1` guard). Historically harmless (prose "Percentile
+2.5: X" lines rescued these, e.g. qid 43684 / grok-4.3), but post-2026-07 block-last-no-prose prompts
+leave no fallback — that model's percentiles vanish silently from residual analysis. Fix: teach the
+tolerant rung to detect a canonical-set×100 key match and rescale (validator + canonical sets already
+exist: `_validate_percentile_labels`, `_CANONICAL_PERCENT_LABEL_SETS`, parsing.py:600-650). Watch
+signal: a model whose per-question percentile coverage drops to zero in a post-flip pull while its
+`EXTRACTION_RUNG` prod telemetry stays healthy.
 
 ### Dependency CVEs gated by the frozen `forecasting-tools` pin
 
-`make audit` (osv-scanner over `uv.lock`, added in the 2026-06 uv migration)
-flags known CVEs we currently can't patch because the fixed versions are
-unreachable while `forecasting-tools==0.2.54` is frozen. As of 2026-06:
+`make audit` (osv-scanner over `uv.lock`) flags CVEs we can't patch while
+`forecasting-tools==0.2.54` is frozen. As of 2026-07-19 the gated set is down to two packages:
 
-- **litellm 1.80.0** — four high-severity CVEs (GHSA-4xpc-pv4p-pm3w 9.5,
-  GHSA-jjhc-v7c2-5hh6 9.4, GHSA-53mr/69x8 8.6–8.7), fixed in 1.83.x–1.84.0.
-  `forecasting-tools 0.2.54` resolves litellm to exactly 1.80.0; our own
-  `<2.0.0` cap is not the binding constraint. `uv tree --invert` confirms the
-  pin chain. Unreachable without bumping forecasting-tools.
-- **cryptography 45.0.4** — incl. one 9.8 (PYSEC-2026-36), pulled transitively
-  via asknews / google-auth / mcp, all ultimately under forecasting-tools.
-- **pillow 11.3.0, pydantic-settings 2.14.1, transformers 4.57.6** — lower
-  severity, also transitive.
+- **litellm 1.80.0** — four high-severity CVEs (GHSA-4xpc-pv4p-pm3w 9.5, GHSA-jjhc-v7c2-5hh6 9.4,
+  GHSA-53mr/69x8 8.6–8.7), fixed in 1.83.x–1.84.0; forecasting-tools pins litellm to exactly 1.80.0
+  (our `<2.0.0` cap is not binding), unreachable without bumping forecasting-tools.
+- **cryptography 45.0.4** — incl. one 9.8 (PYSEC-2026-36), transitive via asknews/google-auth/mcp.
 
-These are an accepted consequence of freezing forecasting-tools for behavioral
-stability. Revisit when forecasting-tools is next upgraded (re-run `make audit`
-after any bump); if a litellm/cryptography CVE becomes actively exploited before
-then, evaluate an out-of-tree override (`[tool.uv] override-dependencies`) and
-re-validate the numeric/stacking pipeline against the bumped litellm. CI runs
-the same scan via `google/osv-scanner-action`, so new CVEs surface on every PR.
+Resolved 2026-07-19: pillow and transformers came off the gated list via `[tool.uv]` settings in
+pyproject.toml (pillow forced past the never-importing forecasting-tools `<12` cap to 12.3.0 via
+`override-dependencies`; transformers — declared-but-unused, with an unreachable-fix critical RCE —
+removed from resolution entirely via `exclude-dependencies`), and pydantic-settings via an in-range
+bump to 2.14.2. Re-evaluate (and ideally delete) both settings at the next forecasting-tools bump.
+
+Accepted consequence of freezing forecasting-tools. Revisit on the next forecasting-tools upgrade
+(re-run `make audit`); if a CVE becomes actively exploited first, evaluate a `[tool.uv]
+override-dependencies` + re-validate the numeric/stacking pipeline. CI runs the same scan on every PR.
 
 ### Promote the core pipeline to `basedpyright` strict
 
-The 2026-06 Poetry→uv migration wired `basedpyright` at **standard** mode across
-the whole repo and drove it to zero errors. The original intent was **strict on
-the core forecasting pipeline** (`forecaster.py`, `aggregation_pipeline.py`,
-`stacking.py`, `numeric/`, `research/`, `probabilistic_tools/`); that was
-deferred because, against an unclean base, strict surfaced ~900 findings of which
-~450 were low-value "type is partially unknown" noise at the untyped
-`forecasting-tools` boundary, and the cleaner standard-everywhere target caught
-every real type bug with no suppression hacks.
+The 2026-06 uv migration wired `basedpyright` at **standard** mode repo-wide, zero errors. The
+intent was **strict on the core pipeline**; deferred because against an unclean base strict surfaced
+~900 findings (~450 low-value "partially unknown" noise at the untyped `forecasting-tools` boundary).
+Now the base is clean the promotion is much smaller. Spec:
 
-Now that the base is clean, the strict promotion is much smaller. Spec:
-
-1. Add the `strict` path list back to `[tool.basedpyright]` in `pyproject.toml`:
-   ```toml
-   strict = [
-       "metaculus_bot/numeric",
-       "metaculus_bot/research",
-       "metaculus_bot/probabilistic_tools",
-       "metaculus_bot/forecaster.py",
-       "metaculus_bot/aggregation_pipeline.py",
-       "metaculus_bot/stacking.py",
-   ]
-   ```
-2. Resolve the resulting `reportUnknown*` findings (~447 last measured) by
-   **annotating our own functions** — attribution showed ~95% of the unknowns are
-   our own under-typed signatures/locals, not the library boundary. This is the
-   real "make it pretty" work and should add genuine type coverage.
-3. `forecasting-tools` is frozen and ships **no `py.typed`** marker despite having
-   inline annotations, so strict re-raises `reportMissingTypeStubs` for it.
-   `basedpyright --createstub forecasting_tools` is NOT a clean fix — it drops the
-   Pydantic-generated attributes and made things worse (892→1011). Options, in
-   order of preference: (a) hand-maintain a thin `typings/forecasting_tools/` stub
-   covering only the symbols we import; (b) a one-line `reportMissingTypeStubs`
-   override scoped to the strict execution environments (note: the global
-   `reportMissingTypeStubs = false` does not survive the `strict` promotion —
-   needs an `executionEnvironments` entry or per-file directive); (c) request a
-   `py.typed` marker upstream.
-4. Re-add the local `basedpyright` pre-commit hook in `.pre-commit-config.yaml`
-   (removed during the migration so commits weren't blocked while the codebase was
-   still dirty) and gate CI on it (the `typecheck` step already runs `basedpyright`).
-5. Do this as a heavily-parallel workflow (one agent per core module), same shape
-   as the standard-mode cleanup.
+1. Add the `strict` path list to `[tool.basedpyright]`: `metaculus_bot/{numeric, research,
+   probabilistic_tools, forecaster.py, aggregation_pipeline.py, stacking.py}`.
+2. Resolve the resulting `reportUnknown*` findings (~447 last measured) by **annotating our own
+   functions** — ~95% of the unknowns are our own under-typed signatures/locals, not the library.
+3. `forecasting-tools` ships **no `py.typed`** despite inline annotations, so strict re-raises
+   `reportMissingTypeStubs`. `--createstub` is NOT a clean fix (drops Pydantic attrs, 892→1011).
+   Options: (a) thin hand-maintained `typings/forecasting_tools/` stub for imported symbols only;
+   (b) a `reportMissingTypeStubs` override scoped to the strict execution environments (the global
+   `= false` does not survive the strict promotion); (c) request `py.typed` upstream.
+4. Re-add the local `basedpyright` pre-commit hook (removed during migration) + gate CI.
+5. Do as a heavily-parallel workflow (one agent per core module).
 
 ### ~~Supervisor agent for high-disagreement questions~~ DONE
 
@@ -219,280 +740,122 @@ Implemented as conditional stacking (`AggregationStrategy.CONDITIONAL_STACKING`)
 
 Implemented as `financial_data_provider.py`.
 
-### Run crux extraction on every question + always-on stacker (added 2026-05-17)
+### Run crux extraction on every question + always-on stacker (added 2026-05-17) — largely superseded
 
-Today crux-extract + targeted-search + stacker only fire on the ~30% high-spread subset (CONDITIONAL_STACKING + `spread > threshold`). User raised whether the pipeline would be cleaner if it always ran: forecaster fan-out → crux extract → targeted re-research → final stacker.
-
-**Cost** at gpt-5.5 high effort, ~250 Qs/tournament:
-
-- Crux extract: 250 × $0.055 ≈ $14
-- Targeted search (gpt-5.4-mini): 250 × $0.076 ≈ $19
-- Stacker (claude-opus-4.5): 250 × $0.30 ≈ $75
-- Total uplift vs disagreement-only: ~$80/tournament
-
-**Open question**: do cruxes on uncontroversial questions actually move predictions, or just add latency + cost? User's framing — "cruxes only make sense if we stack all the time, otherwise the crux research is wasted on a one-pass prediction." So this is paired: either both flip on together, or neither.
-
-**Test before flipping**: pick 50 historical resolved Qs from past tournaments where base models AGREED, run both pipelines offline, compare Brier / log-loss. ~Half-day of eng work, but the math win is ambiguous, hence test before flip.
-
-Priority: HIGH (clean architecture + the user views the 0.15 disagreement bar as somewhat arbitrary).
+Original idea: always run forecaster fan-out → crux extract → targeted re-research → stacker (vs the
+current ~30% high-spread trigger). **Cost** at gpt-5.5 high effort, ~250 Qs/tournament: crux $14 +
+targeted search $19 + stacker $75 ≈ **+$80/tournament** vs disagreement-only. Open question: do cruxes
+move predictions on uncontroversial questions, or just add latency? Paired — the always-on stacker half
+is now benchmark-rejected (stacker disabled in prod). The live version of "spend the crux research on a
+real re-forecast" is the top-priority "Spread-triggered second forecast round" entry, which keeps the
+trigger and drops the stacker.
 
 ### Re-run native-search model evaluation each quarter (added 2026-05-17)
 
-After migrating from `x-ai/grok-4.1-fast` (deprecated) to OpenAI's native-search models 2026-05-17, baseline data lives at `scratch/native_search_bench_2026-05-17/comparison_v3.md` (v3 supersedes the earlier v2 verdict; the final landing config is `gpt-5.5` with `reasoning={"effort":"medium"}` + `verbosity=low` under a 360s cap). As cheaper / better OpenAI search models ship (gpt-5.6, mini variants), or if Anthropic/Google add native search to OpenRouter, re-run the harness:
-
-1. `python scratch/native_search_bench_2026-05-17/run.py --question-id <new open Q>` (or refactor into a make target if it gets reused).
-2. Update `metaculus_bot/constants.py:NATIVE_SEARCH_DEFAULT_MODEL` based on results.
-
-Bake into the quarterly review cadence.
+**Current model (2026-07-17): `openai/gpt-5.6-terra` at `effort=low` + `verbosity=low`, 360s**
+(`NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` in `constants.py`). Slot
+history: grok→gpt-5.5 (2026-05-17) → gpt-5.6-sol (2026-07-09) → gpt-5.6-terra (2026-07-17, blind
+research-role audit `scratch/research_role_audit_2026-07-17/` — terra 1st, "MARGINAL EDGE", −42%
+cost); effort low since 2026-05-20 for latency. Baseline
+`scratch/native_search_bench_2026-05-17/comparison_v3.md`. As cheaper/better OpenAI search models
+ship (or Anthropic/Google add native search to OpenRouter), re-run `python
+scratch/native_search_bench_2026-05-17/run.py --question-id <new open Q>` and update
+`NATIVE_SEARCH_DEFAULT_MODEL`. Bake into the quarterly review cadence.
 
 ### Gemini on the donated OpenRouter key: pro-preview still blocked by free-tier BYOK (updated 2026-06-16)
 
-**Update (2026-06-16, fresh live calls):** Metaculus raised the Google rate limits (per Ben's Discord announcement). The donated OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) now serves **most** Gemini models — verified by live call:
+The donated key (`OAI_ANTH_OPENROUTER_KEY`) now serves most Gemini (verified live:
+`gemini-3.5-flash`, `gemini-3.1-flash-lite` both SUCCEED). **Remaining blocker —
+`gemini-3.1-pro-preview` only (our forecaster slot):** routed through a free-tier Google AI Studio
+**BYOK** key on the donated account (`is_byok:true`), and Pro-preview has no Google free tier, so
+quota is structurally 0 — every donated call 429s `RESOURCE_EXHAUSTED`.
 
-- `openrouter/google/gemini-3.5-flash` → **SUCCESS** on the donated key.
-- `openrouter/google/gemini-3.1-flash-lite` → **SUCCESS** on the donated key.
+**Resolution — SURGICAL pin:** `GEMINI_USE_DONATED_OPENROUTER_KEY=true` in all four yamls (flash uses
+donated), but `gemini-3.1-pro-preview` is **pinned to the personal key** via
+`DONATED_KEY_BLOCKED_GOOGLE_MODELS` in `fallback_openrouter.py` (`should_route_via_donated_key` →
+`False`; no donated attempt, no 429, no fallback-counter bump). Without the pin, each donated→429→personal
+fallback bumps the counter → `cli` `sys.exit(1)` → **red CI every run**. OpenAI/Anthropic on the donated
+key are unaffected.
 
-**Remaining blocker — `gemini-3.1-pro-preview` only (our forecaster slot):** that specific model is still routed through the free-tier Google AI Studio **BYOK** key on the donated account (`is_byok:true`), and Pro-preview has no Google free tier, so the BYOK quota is structurally 0. Every donated-key `gemini-3.1-pro-preview` call still 429s with `RESOURCE_EXHAUSTED` (`is_byok:true` + free-tier `limit: 0`) and `FallbackOpenRouterLlm` gracefully falls back to the personal `OPENROUTER_API_KEY`.
-
-**Resolution (this session) — SURGICAL pin, not all-or-nothing:** default flipped back to `GEMINI_USE_DONATED_OPENROUTER_KEY=true` and all four prod YAMLs (`run_bot_on_{tournament,metaculus_cup,minibench}.yaml`, `test_bot.yaml`) flipped on, so flash Gemini models (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) use the donated key. But `gemini-3.1-pro-preview` is **pinned to the personal key** via the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist in `metaculus_bot/fallback_openrouter.py` — `should_route_via_donated_key` returns `False` for it, so `build_llm_with_openrouter_fallback` builds a plain `GeneralLlm` on the personal key. No donated attempt, no 429, no fallback-counter bump.
-
-This avoids the **CI-red-every-run** problem: `gemini-3.1-pro-preview` is a core forecaster on every question; without the pin, each donated→429→personal fallback bumps the personal-key-fallback counter → `cli` `sys.exit(1)` → red CI on every prod run. The surgical pin removes the donated attempt entirely for Pro while keeping the donated subsidy for the flash models that actually work on it.
-
-**⚠️ TEMPORARY WORKAROUND — remove the pin once Metaculus fixes the BYOK routing.** `gemini-3.1-pro` *should* work on the donated key; the **only** blocker is Metaculus's free-tier Google BYOK routing. The pin is tagged in code as `TODO(gemini-3.1-pro-donated)` on the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` constant — delete the matching entry there (the doc-and-code source of truth for the workaround) once any one of the Metaculus-side fixes below lands, then re-verify with one live call.
-
-OpenAI / Anthropic on the donated key are **unaffected**: there's no broken BYOK key for those providers, so they route on the donated subsidy normally.
-
-**Fix (Metaculus-account-side, for pro-preview specifically, pick one):**
-
-1. Enable Cloud billing on the BYOK key's GCP project so it reaches Tier 1 (gemini-3.x-pro-preview gets a non-zero quota).
-2. Remove the Google AI Studio BYOK integration so `google/*` uses native OpenRouter Google credits instead of the BYOK key.
-3. Disable "Always use for this provider" on that BYOK key.
-
-**Does NOT help:** raising OpenRouter-side native limits — the pro-preview 429 is Google-side on the BYOK key, not an OpenRouter throttle.
-
-**Action:** pinged Ben. Once Metaculus applies one of the fixes above, re-verify pro-preview with one live `openrouter/google/gemini-3.1-pro-preview` call and confirm the error no longer carries `is_byok:true` + free-tier `limit: 0`; then remove the `gemini-3.1-pro` entry from `DONATED_KEY_BLOCKED_GOOGLE_MODELS` (see `TODO(gemini-3.1-pro-donated)` in `metaculus_bot/fallback_openrouter.py`) so Pro rejoins the donated subsidy.
+**⚠️ TEMPORARY WORKAROUND, tagged `TODO(gemini-3.1-pro-donated)`.** Remove the blocklist entry once
+Metaculus fixes the BYOK routing (pick one, account-side): (1) enable Cloud billing on the BYOK GCP
+project → Tier 1 quota; (2) remove the Google AI Studio BYOK integration so `google/*` uses native
+OpenRouter Google credits; (3) disable "Always use for this provider" on that BYOK key. Does NOT help:
+raising OpenRouter-side native limits (the 429 is Google-side). Pinged Ben; after a fix, re-verify with
+one live call and delete the entry.
 
 ### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
 
-Metaculus enabled OpenAI on the donated key. `build_native_search_llm` now routes through
-`build_llm_with_openrouter_fallback` (donated key primary, personal key fallback). Verified
-end-to-end on `openai/gpt-5-mini`: grounded result returned, donated-key 404 fallback count = 0,
-i.e. the call succeeded on the donated subsidy. The guardrail/data-policy fallback matcher stays
-in place as a safety net. Original note retained below for context.
-
-When migrating native search from `x-ai/grok-4.1-fast` (deprecated) to OpenAI native search on 2026-05-17 (final landing config: `openai/gpt-5.5` medium-effort + verbosity=low, see W-C v2), the donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) returned a 404 with:
-
-> No endpoints available matching your guardrail restrictions and data policy.
-> Configure: <https://openrouter.ai/settings/privacy>
-
-This means OpenAI native-search calls fall back to the personal `OPENROUTER_API_KEY` instead of the donated subsidy. At ~$0.15/call × 250 Qs/tournament that's ~$40/tournament (size grew vs the original mini-only estimate of ~$3-5 because we landed on gpt-5.5 medium-effort, not mini) — still small enough to defer, but worth reclaiming.
-
-**Investigation paths**:
-
-1. **Email Metaculus** (<ben@metaculus.com>) — ask whether the data-policy guardrail on the shared OpenRouter account can be relaxed for OpenAI native search, or whether they need to whitelist a specific endpoint.
-2. **OpenRouter request preferences** — try `provider: {data_collection: "deny"}` or `provider: {require_parameters: true}` in the chat completions request to see if a compliant OpenAI endpoint is available; OpenRouter's privacy doc at <https://openrouter.ai/docs/features/privacy> describes the routing knobs. The metaculus-bot's `build_native_search_llm` already uses `extra_body` for plugins, so adding `provider` is one line.
-3. **Accept personal-key spend** — if (1) and (2) both fail, the migration still solved the Grok deprecation; the cost is small enough to live with.
-
-Today's status: code falls back automatically via `FallbackOpenRouterLlm` (added pattern matcher for "guardrail" / "data policy" in `fallback_openrouter.py`). No incidents expected.
-
-Priority: HIGH — it's free money to reclaim, and the same guardrail may bite us when the next OpenAI/Anthropic/Google migration comes up.
+Metaculus enabled OpenAI on the donated key. `build_native_search_llm` routes through
+`build_llm_with_openrouter_fallback` (donated primary, personal fallback); verified end-to-end on
+`openai/gpt-5-mini` (grounded result, 404 fallback count = 0). The original block was a 404 "no
+endpoints matching your guardrail restrictions and data policy"; the guardrail/data-policy fallback
+matcher in `fallback_openrouter.py` stays as a safety net for the next provider migration.
 
 ### Second-pass web search + scrape pipeline
 
-Our first-pass research (AskNews API dump, Grok native search) is a black box — we can't
-control what gets fetched, can't parse PDFs or JS-heavy pages, and can't follow up on gaps.
-A second pass with full-control scraping would address this.
-
-**Three use cases for the second pass:**
-
-1. **Gap-filling**: After initial research + forecasting, identify information gaps or
-   unanswered questions from the first pass and run targeted searches to fill them.
-2. **Resolution source reading**: Many questions include specific resolution source URLs
-   in the fine print. Directly scraping the authoritative source (e.g., a government
-   dataset, a specific report) gives ground-truth current state instead of secondhand
-   summaries.
-3. **Reopening inaccessible sources**: The first-pass research often surfaces URLs that
-   the bot can't open (PDFs, paywalled content, JS-rendered pages). The forecasting
-   prompt should instruct models to flag interesting sources they couldn't access, so
-   the second pass can scrape them with more sophisticated tools.
-
-**Tool candidates**: Olostep (cheaper, PAYG) or Firecrawl (pricier but the industry norm).
-Both handle PDFs, JS rendering, and give full control over what gets fetched.
-
-**Architecture**: Runs after the initial research phase, before (or as input to) forecasting.
-Could also feed into the stacking pass for high-disagreement questions. Moderate effort.
+**SUPERSEDED 2026-07-16** by the agentic gap-fill v2 plan
+(`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`). The three use cases (gap-filling,
+resolution-source reading, reopening inaccessible PDF/JS/paywalled sources) are covered by the v2
+tool loop; Firecrawl/Olostep were rejected in favor of a DIY fetch ladder (plain → headless
+Chromium → Gemini url_context).
 
 ### Separate outside/inside view stages
 
-Currently both phases happen in a single prompt. Making them separate LLM calls means the
-inside view genuinely adjusts FROM an explicit base rate rather than constructing both
-together. This could help with the arithmetic-override problem (models computing correct
-probabilities then ignoring them).
+Split the single-prompt outside+inside view into separate LLM calls so the inside view genuinely
+adjusts FROM an explicit base rate — could help the arithmetic-override problem (models computing
+correct probabilities then ignoring them). Smingers does this with cross-pollination (outside view
+from Model A → inside view for Model B, adding diversity). Prototype: first pass produces base rate +
+reference class, fed explicitly to the second. Moderate-to-high effort.
 
-Smingers uses this architecture with cross-pollination: outside view from Model A feeds
-into inside view for Model B, introducing diversity.
+### ~~Post-hoc isotonic calibration on binary predictions~~ — DROPPED 2026-05-10
 
-We could prototype this by having a first pass produce only a base rate + reference class,
-then feeding that explicitly to the second pass. Moderate-to-high effort.
+The May closing analysis (n=109 binary) did NOT replicate the [0.20,0.30]-band NO-bias concentration
+that the April-new n=27 cohort showed — the April finding was a small-N artifact, and the 20 worst May
+misses span many failure modes. The original proposal: fit `sklearn.isotonic.IsotonicRegression` on
+`(our_prob_yes, resolution)` behind a `USE_BINARY_CALIBRATION` flag, refit quarterly, log
+raw+calibrated. **Killed**, and independently re-confirmed dead by the 2026-07-16 calibration audit
+(don't ship isotonic/Platt/directional-shrink — see the top calibration entry). Defer any global
+isotonic until a >50pp residual is observed in a predicted-prob band on N≥50.
 
-### Post-hoc isotonic calibration on binary predictions
+### Probabilistic tooling for base forecasters — DORMANT / on the settled dead-paths list
 
-> **Status 2026-05-10: NOT REPLICATED at the larger N — DROP.** The May closing
-> analysis (n=109 binary, full cohort) showed the [0.20, 0.30] band did not show
-> the 5/6-of-worst-misses concentration that April-new (n=27) did. The April
-> finding was small-N artifact. The 20 worst May misses span a much wider range of
-> failure modes (high-spread contested questions like 42243 Christie's, 42923
-> Senate, 42926 CDC). Defer global isotonic until a >50pp residual is observed in
-> any predicted-prob band on N≥50. — Section preserved below for historical context.
+Infra built (`probabilistic_tools/`, `tool_runner.py`, `structured_output_schema.py` — Beta-binomial
+updaters, survival/hazard, log-pooling + Satopää, distribution fits with out-of-bounds mass,
+Dirichlet-with-Other, NegBinom/Beta-binomial-ceiling for counts, consistency checks), 261 tests green,
+gated behind `PROBABILISTIC_TOOLS_ENABLED`. **Currently DISABLED in prod** (all prod yamls `'false'`;
+tier-2 scaffold removed from prompts via Workstream C2) and on the settled dead-paths list (benchmarked
++ rejected — don't re-recommend without new evidence). Activation guide (exact edits, parser-ordering
+gotcha, A/B sequence): `scratch_docs_and_planning/probabilistic_tools_activation.md`. Original motivation
+was two numeric representation failures the percentile elicitation can't express: NM1 (DOJ antitrust —
+model wrote "~92%" of 0 in prose but only ~55% mass at-or-below 0; needs Beta-binomial-ceiling/NegBinom)
+and NM3 (MSFT EPS — knew the GAAP-vs-adjusted tail risk, couldn't widen enough, resolved past P97.5;
+needs out-of-bounds mass reporting).
 
-Our performance analyses (2026-Q1 and 2026-Q2) have repeatedly found systematic
-NO-bias in the 10–30% predicted-probability band: Q1 showed −7.3pp overall bias;
-Q2's new cohort showed −22.7pp overall and −59pp in the 0.10–0.30 bucket. Six of
-the eight worst binary misses in Q2 sat in that band. The top 3 worst
-spot_peer misses (post_ids 43131, 41835, 42116) are all failures of this same
-pattern plus correlated LLM priors — ensembling doesn't help when every model
-shares the prior.
+### Status-quo / last-print anchor for slow-moving numeric trackers (added 2026-06-28, NEEDS BACKTEST) — partly shipped as TS anchor
 
-Calibration is the statistical fix where prompting is least likely to work,
-because the failure pattern is statistically real across N≥100 questions, not
-vibes from N=3.
+**Finding (2026-06-28 period-split audit, Period-B n=17, ~5 numeric trackers — directional only):** on
+numeric/discrete questions resolving on a slow-moving/mean-reverting tracker, research surfaces the exact
+current value and the ensemble then *degrades* it with directional drift or asymmetric widening. The three
+worst Period-B trackers all had the resolving value in research (all scored positively — "left points on
+the table," not lost):
 
-**Proposal**: fit a monotonic (isotonic) regression on the combined Q1+Q2
-resolved-binary dataset, mapping the ensemble's aggregate `prob_yes` to a
-calibrated output. Apply the mapping to binary predictions before
-submission.
+- **q43647 HY-OAS** (peer +52.4): research handed over 2.71; medians skewed UP to 2.73–2.80; truth below p40.
+- **q43611 generic ballot** (peer +31.8): research surfaced Silver +6.8 + a mean-reversion base rate; ensemble
+  extrapolated to ~6.7–7.2; reverted to 6.4.
+- **q43591 Trump approval** (peer +14.3): research surfaced 38.5; ensemble drifted down to 37.8; ticked up to 38.6.
 
-**Why isotonic and not shrink-toward-50%** (which is the existing bullet in
-"Aggregation strategy improvements"): shrinkage is a single-parameter global
-pull that costs correctly-confident predictions to fix overconfident ones.
-Isotonic is non-parametric and monotonic — it pulls 25% → 40% if that's
-what the data says while leaving 5% and 95% largely alone if those buckets
-are well-calibrated. Much less risk of overcorrection.
+**Proposed change (prompt-only):** in `numeric_prompt`/discrete handling, when research surfaces a current
+authoritative value for a slow-moving/mean-reverting tracker, default p50 + the bulk of mass to that last
+print and require an EXPLICIT named justification before applying drift — a *rebuttable* default, not a hard
+constraint. **Note:** the shipped TS anchor (see the TS-anchor entry) covers the fetchable-series subset of
+this with an empirical band; this prompt lever is the broader, non-fetchable version.
 
-**Implementation sketch**:
-
-- Use `sklearn.isotonic.IsotonicRegression` fit on
-  `(our_prob_yes, resolution_as_float)` pairs from
-  `scratch/analysis_2026-04/performance_data.json`.
-- Hold out 20% as validation, report pre/post Brier + log score + PIT
-  calibration.
-- Wrap as a pure transform: `calibrated = iso.transform([raw_prob])[0]`.
-- Store the fitted model in `metaculus_bot/calibration/binary_isotonic.pkl`
-  with a training-date stamp; refit quarterly.
-- Ship behind a feature flag (e.g. `USE_BINARY_CALIBRATION = True` in
-  `metaculus_bot/constants.py`) so we can A/B via the bench runner.
-
-**Risks**:
-
-- **Overfitting to historical cohort**. Isotonic with N=100-200 is noisy;
-  use 5-fold CV to pick breakpoints. If CV Brier is not robustly better
-  than raw, don't ship.
-- **Distribution shift**: next round's question mix may differ. Mitigate
-  by refitting each round, keeping the training set rolling.
-- **Trust erosion**: if the calibration ever silently flips a confident
-  prediction, it'll look like a bug. Log raw + calibrated side-by-side
-  in the bot comment for the first cohort.
-
-**Out of scope**: numeric/MC calibration. Binary only — other question
-types don't have enough resolved data to fit a reliable mapping yet.
-
-Easy-to-moderate effort. The biggest risk is shipping it without proper
-held-out CV.
-
-### Probabilistic tooling for base forecasters (DORMANT — activation guide written)
-
-> **Status 2026-05-10: PROMOTED — activate after instrumentation bugs ship.** The
-> strongest case is two numeric misses where the failure is in *representation*,
-> not reasoning, and prompt edits demonstrably didn't help even when the model
-> knew it should:
->
-> - **NM1 (DOJ antitrust=0):** model wrote *"Probability: ~92%"* of 0 in prose
->   but its 11-percentile output represented only ~55% mass at-or-below 0. The
->   percentile elicitation can't represent a point mass at a discrete endpoint;
->   `Beta-binomial-ceiling` / `NegBinom` utilities fix this directly.
-> - **NM3 (MSFT EPS):** model identified the GAAP-vs-adjusted risk and wrote
->   *"I deliberately widen the 90-95% interval relative to the analyst range"*
->   — and still couldn't widen enough; resolution at $5.16 was past P97.5.
->   Prompt-driven tail-widening failed against a known risk; structural
->   `out-of-bounds mass reporting` handles this case explicitly.
->
-> A softer secondary case: 9/15 binary hits' load-bearing reasoning is explicit
-> Poisson math; the survival/hazard calculator would standardize this across
-> base LLMs. Less defensible because we can't tell whether the math caused the
-> wins or just marks questions that fit a clean reference class.
->
-> Infrastructure is built, 261 tests green, gated behind `PROBABILISTIC_TOOLS_ENABLED`
-> — A/B-able immediately. Backtest gate: improvement on numeric (especially
-> count-distribution and discrete-mode questions) with no regression on simple
-> binary cohort.
-
-Base-forecaster failure mode identified in Q2 2026 analysis: models state
-base rates, percentiles, and priors in prose but don't compute on them
-("arithmetic override"). Ships `metaculus_bot/probabilistic_tools/`,
-`metaculus_bot/structured_output_schema.py`, and
-`metaculus_bot/tool_runner.py` — pure-function Beta-binomial updaters,
-survival / hazard calculators, log-pooling + Satopää extremization,
-distribution fitting (normal / lognormal / Student-t) with out-of-bounds
-mass reporting, Dirichlet-with-Other for MC, NegBinom / Beta-binomial-ceiling
-for counts, and prior-posterior + percentile-family consistency checks.
-
-**Status:** tools + tool_runner + 261 unit/E2E tests all green. NOT wired
-into prompts, `_make_prediction`, or the stacker. Activation is a
-single-session prompt + main.py + stacking.py edit behind a
-`PROBABILISTIC_TOOLS_ENABLED` env flag.
-
-**Activation plan:** `scratch_docs_and_planning/probabilistic_tools_activation.md`
-— exact file-and-line edits, parser-ordering gotcha (JSON block before
-`Probability: ZZ%`), A/B backtest verification sequence, known landmines.
-A fresh session can flip it live with minimal context loss.
-
-### Status-quo / last-print anchor for slow-moving numeric trackers (added 2026-06-28, NEEDS BACKTEST before acting)
-
-**Finding (2026-06-28 period-split research audit, current-stack "Period B" cohort, n=17, of which
-~5 numeric trackers — small sample, directional only):** on numeric/discrete questions that resolve on
-a slow-moving / mean-reverting tracker series, the research pipeline now reliably surfaces the **exact
-current value**, and then the forecaster ensemble *degrades* it by layering directional drift or
-asymmetric-widening tails on top. The three worst Period-B numeric trackers all had the resolving value
-sitting in the research:
-
-- **q43647 HY-OAS spread** (peer +52.4): research handed over 2.71 exactly; per-model medians skewed UP
-  to 2.73–2.80 anticipating widening that never came over a calm ~two-week window; truth landed below p40.
-- **q43611 generic ballot** (peer +31.8): research surfaced Silver net +6.8 *plus* an explicit
-  mean-reversion base rate; ensemble extrapolated the late-May uptrend to ~6.7–7.2; series reverted to 6.4.
-- **q43591 Trump approval** (peer +14.3): research surfaced 38.5; ensemble applied a damped *downtrend* to
-  37.8; the tracker ticked *up* to 38.6.
-
-NOTE these three scored **positively** — the bot did fine; the finding is "left points on the table by
-over-reasoning on a value research already nailed," not "lost." A flat "status-quo = last surfaced print"
-central anchor would have materially improved all three. This is a forecaster-**reasoning** lever, fully
-independent of the research/fetch work shipped 2026-06-28.
-
-**Proposed change (prompt-only, numeric + discrete paths):** add a conditional step to
-`numeric_prompt` / discrete handling: *when the research surfaces a current authoritative value for a
-slow-moving or mean-reverting tracker (rates, spreads, approval/poll averages, index levels), default the
-central estimate (p50, and the bulk of the mass) to that last print, and require an EXPLICIT,
-named justification before applying directional drift.* Frame it as a rebuttable default, not a hard
-constraint — the model must still be free to move when it has a concrete catalyst (a scheduled release,
-a structural break, a genuine trend with a stated mechanism). Likely lives alongside the existing
-conditional-hazard step in the numeric prompt; reuse that "compute the number, then state the assumption"
-pattern.
-
-**Why this is NOT shipped yet (the trap to avoid):**
-
-1. **n=3.** A real pattern but a thin sample; could be noise dressed as signal.
-2. **Over-correction risk.** A blanket anti-drift instruction will *hurt* genuinely-trending or
-   event-driven numerics (a series mid-breakout, a count accumulating toward a deadline). The rebuttable
-   framing mitigates this but doesn't eliminate it — the model has to correctly classify "slow/mean-
-   reverting" vs "trending," which is itself a judgment call the prompt is now asking it to make.
-3. **Prompt-behavior changes can only be validated on a real run** — unlike the observability/routing
-   work this session (all unit-testable offline), this one's value is unprovable without a paid backtest.
-
-**Backtest gate (clear cost with the operator first):** A/B on a **numeric/discrete-heavy slice** —
-improvement (or no regression) on slow-moving-tracker questions (rates/spreads/poll-averages/index-levels)
-AND, critically, **no regression on trending/event-driven numerics and count-toward-deadline questions**
-(the over-correction failure mode). A `make backtest_small`/`medium` seeded with both archetypes is the
-cheapest discriminating test. Do NOT ship on the strength of the n=3 hits alone. Full per-question
-evidence in `scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §3.
+**Why NOT shipped:** n=3; over-correction risk on genuinely-trending / count-toward-deadline numerics (the
+model must classify slow/mean-reverting vs trending); prompt-behavior value is unprovable without a paid
+backtest. **Backtest gate (clear cost first):** A/B on a numeric/discrete-heavy slice — improvement on
+tracker questions AND no regression on trending/event-driven ones. Full evidence
+`scratch/research_audit_2026-06-27/SYNTHESIS_62.md` §3.
 
 ### LLM-based forecast self-evaluation
 
@@ -503,198 +866,198 @@ Flag potential issues before submission.
 Smingers found this invaluable for catching date confusion, hallucinated sources, and
 reasoning failures. Implementation: easy (structured eval prompt + cheap model call).
 
-### Hits-side reasoning prompt-test ideas (added 2026-05-10)
+### Hits-side reasoning prompt-test ideas (added 2026-05-10) — LOW PRIORITY, defer
 
-> **Status 2026-05-10: LOW PRIORITY — defer pending `probabilistic_tools` backtest.**
-> The dormant `probabilistic_tools` infrastructure provides a stronger version
-> of what these prompt edits try to elicit informally — #1's Poisson math via the
-> survival/hazard calculator, #2's pace arithmetic via Beta-binomial updaters.
-> Backtesting both classes of intervention in parallel would confound A/B
-> attribution, so activate `probabilistic_tools` first; revisit these ideas only
-> if the dormant tools don't move the needle on similar question shapes.
->
-> Additionally, prompt-test #2's evidentiary base is smaller than implied — the
-> Wikipedia hit/miss N=2 pair is actually N=1: miss 42238 *did* apply the
-> required-vs-observed math correctly and just landed in a 16% tail by chance.
-> Only hit 42235 fits "qualitative-hedging-overrides-arithmetic". Defer #2.
+Three prompt edits from the May analysis (`scratch/analysis_2026-05/analysis_hits_reasoning_patterns.md`),
+hypothesis-generating not shipping recs (need N≥30 prompt-vs-prompt backtest):
 
-Three prompt edits identified by the May closing analysis (`scratch/analysis_2026-05/analysis_hits_reasoning_patterns.md`)
-from reasoning shapes that preceded the top-10 binary hits. **Hypothesis-generating, not
-shipping recs** — needs N≥30 prompt-vs-prompt backtest before any change ships.
+1. **"State your Poisson lambda explicitly"** — 5/10 top hits used `P(≥1)=1−exp(−λT)` with stated λ, T.
+2. **"Required-vs-observed pace section"** — 3/10 top hits used threshold-by-deadline arithmetic. Its
+   Wikipedia hit/miss base is N=1 not N=2 (miss 42238 applied the math correctly, landed in a 16% tail).
+3. **"Distrust briefing claims that contradict the question's open status"** — inverse of the April
+   Klimt-sale hallucination (miss 42243, 4/5 models pulled by a fake datapoint). N=1, weakest.
 
-1. **"State your Poisson lambda explicitly when applicable"** — 5/10 top hits used
-   `P(≥1) = 1 - exp(-λ·T)` arithmetic with stated λ and T. Misses-side reasoning
-   often skipped this. Add ~3 lines to binary system prompt.
-2. **"Required-vs-observed pace section"** — 3/10 top hits used arithmetic on
-   threshold-by-deadline questions ("539/day observed vs 636/day required").
-   **Note:** the Wikipedia hit/miss pair is N=1, not N=2 (see status above).
-3. **"Distrust briefing claims that contradict the question's open status"** — the
-   April Klimt-sale hallucination (miss 42243, 4/5 models pulled by a fake research
-   datapoint) is the inverse failure mode. Explicit prompt clause: "If a fact in the
-   briefing would, if true, definitively resolve the question YES or NO, but the
-   question is still open, treat that fact as suspect rather than authoritative."
-   **N=1 in May binary cohort; weakest of the three.**
-
-Risk: prompt-length growth degrades simple-question performance. Backtest gate is
-"mean Brier improves with no per-cell regression on the easy/middle tier."
+Deferred: #1/#2 overlap the (now-dormant) probabilistic_tools Poisson/pace math — don't A/B in parallel.
+Risk: prompt-length growth degrades simple questions; gate is "mean Brier improves, no per-cell regression
+on easy/middle tier."
 
 ### Stacker prompt: tell it which models are reliable dissenters (added 2026-05-10)
 
-May C5+C7 analysis showed gpt-5.2 is a **contrarian signal source** (8/20 best on
-worst-misses, 0/20 best on hits, mid-pack full-cohort Brier 0.150) — exactly the
-high-disagreement signal source the conditional stacker is supposed to up-weight.
-claude-4.6-opus has the inverse profile (best on the random-middle cohort, worst
-on hard questions). The current stacker prompt strips model IDs (LLM-as-judge
-self-agreement bias) but the *historical pattern* of "this model is a reliable
-dissenter on high-spread questions" is signal we're throwing away.
-
-Hypothesis: a stacker prompt that includes a small "historical dissenter quality"
-hint (e.g. "Forecaster X has historically been the closest model on high-disagreement
-questions Y% of the time") could produce better stacked outputs on the high-spread
-cohort.
-
-Blocked on: STACKER_OUTCOME marker fix (Priority 1A in NEXT_SESSION_QUEUE.md), then
-≥30 stacked records under the new marker, before this can be tested. Defer.
+May C5+C7 analysis: gpt-5.2 is a **contrarian signal source** (8/20 best on worst-misses, 0/20 on hits,
+mid-pack Brier 0.150) — the high-disagreement signal the conditional stacker should up-weight;
+claude-4.6-opus has the inverse profile. The stacker prompt strips model IDs (self-agreement bias) but
+the *historical* "reliable dissenter on high-spread questions" pattern is signal we throw away.
+Hypothesis: a small "historical dissenter quality" hint could improve stacked outputs on the high-spread
+cohort. Blocked on: STACKER_OUTCOME marker fix + ≥30 stacked records under it (and the stacker is
+disabled in prod). Defer.
 
 ### Per-forecaster critic/revision pass (added 2026-07-08, medium priority)
 
 An unconditional adversarial critic reviews each forecaster's draft against a resolution-criteria
-checklist BEFORE aggregation — window discipline (does the resolution window actually cover the
-event?), already-resolved-events-don't-count (an event before the window opened cannot resolve
-the question), listing/instrument bar (does the specific instrument or ticker named in the
-question exist and clear the criteria?), blind-spot pricing (did the model implicitly assume
-a fact it should have priced). The forecaster then answers the critic point-by-point and
-re-issues its forecast, with the revision capped at ±20% from the original draft to prevent
-over-swing on a single critic pass.
+checklist BEFORE aggregation (window discipline, already-resolved-events-don't-count, listing/instrument
+bar, blind-spot pricing); the forecaster answers point-by-point and re-issues, revision capped ±20%.
+**Evidence:** Laertes (summer futureeval-2026 #4) runs this on all forecasters — qid 42024: its Forecaster
+1 drafted 97% (our published number) and the critic reversed it to 4% after flagging the "resolving" event
+fell outside the open window. GreeneiBot2 (spring #1) runs capped critique rounds. Two top bots converging
+is a notable signal.
 
-**Evidence.** Laertes (summer futureeval-2026 #4 slot) runs this critic pass on all forecasters.
-The most striking single data point is qid 42024: Laertes's Forecaster 1 initially drafted 97%
-(the exact number we published) and the critic reversed it to 4% pre-publication after flagging
-that the "resolving" event fell outside the question's open window. GreeneiBot2 (spring-aib-2026
-#1 slot) runs capped critique rounds with similar structure. Two independent top bots
-converging on this pattern is a notable signal.
+**Caveat:** the demonstrated evidence is on **degenerate** failures (pre-open-window traps, criteria
+misreads); generalizing to non-degenerate misses is unproven. Cost ~1 extra LLM call/forecaster/question.
+**Distinct from the stacker** (benchmarked + rejected): this is per-member BEFORE aggregation with a bounded
+±20% revision, not a post-hoc aggregate rewrite. **Gate:** `make backtest_medium` mixed cohort, primary peer
+score — (a) improvement/no-regression on the degenerate subset, (b) no regression on non-degenerate. If (a)
+lands but (b) regresses, ship as a **conditional** critic (fires only on pre-open-event/listing-bar/mismatch
+flags).
 
-**Caveat (explicit).** The demonstrated evidence is on **degenerate** failures — pre-open-window
-event traps and similar resolution-criteria misreads where a critic pass mechanically catches a
-model applying the wrong reference class. Generalizing to non-degenerate misses (routine
-mid-range calibration errors, close-call disagreements) is **unproven** and would require a
-proper paid backtest (`make backtest_medium`-class ablation of critic-on vs. critic-off on a
-mixed cohort) before shipping. Cost is ~1 extra LLM call per forecaster per question, so at
-6 forecasters × ~250 Qs/tournament this is a non-trivial but not-huge line item.
-
-**Distinct from the stacker (which was benchmarked and rejected).** The stacker is a *post-hoc
-aggregate rewrite* — one meta-model looks at the N base forecasts and produces a single
-consolidated number, which the ablation showed ties MEDIAN on binary and loses on numeric. The
-critic pass here acts **per-member BEFORE aggregation** with a **bounded revision** (±20%),
-which is a structurally different lever — it hardens each base forecast against a checklist of
-known reasoning traps rather than trying to arbitrate a disagreement after the fact.
-
-**Gate before shipping:** `make backtest_medium` on a mixed-question cohort, primary metric peer
-score, secondary metric Brier / CRPS. Look for: (a) improvement or no regression on the
-"degenerate-failure" subset (window-trap, listing-bar, already-resolved cases — the demonstrated
-class); (b) no regression on non-degenerate misses (the unproven-generalization class). If (a)
-lands but (b) shows regression, ship it as a **conditional** critic (fires only when the
-question exhibits pre-open-event / listing-bar / criteria-mismatch flags) rather than
-unconditionally.
-
-**Update 2026-07-08 (pt2 acid test):** down-scoped. On the two non-degenerate consensus misses
-(41800 / 42855), advisory critique captured ~0 points even when it diagnosed the exact defect;
-only BINDING corrections moved numbers. If built, the critic must emit a bounded numeric
-adjustment / floor / cap that is mechanically applied in aggregation — not prose. Sequence AFTER
-the free offline counterfactuals of the deterministic guards (anchor-floor, no-market cap,
-signed haircut), which capture most of the demonstrated value at zero cost. Honest ceiling:
-~30–60 spot-peer points of damage limitation on consensus misses, no flips. See
-`scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3.
-
-**Update 2026-07-08 (guard counterfactuals):** the sequencing premise is falsified — all
-three deterministic guards buried on offline replay (era sign-flips / top-5 concentration /
-fall-hostile fire rates; see `scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`
-and the three guard entries in the "Killed by July 2026-07-08" section below). The critic
-pass now carries the full burden of demonstrating era-stable conditional firing on its own
-paid backtest; there is no free deterministic fallback capturing the same value. Its gate
-must include a fall-like era-stability check, not just capture of the spring miss cluster —
-the guards showed that harvesting that cluster is exactly what damages the largest and
-best-calibrated era.
+**Update 2026-07-08 (acid test + guard counterfactuals):** down-scoped. On the two non-degenerate consensus
+misses (41800 / 42855), advisory critique captured ~0 points even when it diagnosed the exact defect — only
+BINDING corrections (bounded numeric adjustment / floor / cap, mechanically applied) moved numbers. The
+"sequence after free deterministic guards" premise is falsified: all three guards were buried on offline
+replay (era sign-flips / top-5 concentration / fall-hostile fire rates — see the three guard entries in the
+"Killed by July 2026-07-08" section). So the critic carries the full burden on its own paid backtest, and
+its gate must include a fall-like era-stability check (harvesting the spring miss cluster is exactly what
+damages the largest, best-calibrated era). Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md` §3,
+`scratch/residual_2026-07-08/experiments/GUARDS_SYNTHESIS.md`.
 
 ### Telemetry-first guard revival program (added 2026-07-08, passive)
 
-The shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` and `criteria_clauses` on
-`BinaryStructured`) plus `PREDICTION_MARKETS_ENABLED: 'true'` across all four prod workflows
-make future guard replays exact rather than parser-based — Arm A's regex parser at 84.9% text
-coverage is now a structured field, and the market snapshot section starts populating the
-archive going forward. No code is on the roadmap here; the whole program is passive.
+Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses` on `BinaryStructured`)
+plus `PREDICTION_MARKETS_ENABLED: 'true'` make future guard replays exact rather than parser-based. No
+code on the roadmap; passive. Note: the computed `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP`
+markers emit only from `tool_runner` (gated behind `PROBABILISTIC_TOOLS_ENABLED`, off in prod) so they're
+DORMANT; the raw `base_rate_anchor` / `criteria_clauses` JSON lands unconditionally and the
+overshoot/divergence math is trivially replayable offline from it.
 
-Important gating note on the telemetry channel: the computed
-`ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers emit only from
-`tool_runner.run_tools_for_forecaster`, which is gated behind `PROBABILISTIC_TOOLS_ENABLED`
-(all three prod workflows pin it to `'false'`), so those computed markers are currently
-DORMANT in published prod comments. What DOES land unconditionally in every prod R1
-rationale is the raw `base_rate_anchor` and `criteria_clauses` JSON the forecaster writes
-into its own STRUCTURED FORECAST block — the primary telemetry channel today. The computed
-markers become the primary channel only if the flag is flipped on; until then the
-overshoot / divergence math (which lives in `tool_runner`) is trivially replayable offline
-from the raw JSON.
+Two free checks next residual session: (1) **structured-JSON presence rate per forecaster** — grep the
+archive for the raw JSON keys, confirm every slot emits them; (2) **does the spring overshoot pattern
+reproduce on the current roster?** — if the confident-overshoot cluster (42024 / 42304 / 41800 analogues)
+doesn't appear post-`30bca2f`, the prompt fixes sufficed and all three guard-revival conditions become
+moot. `clause_product_divergence_pp` (published vs the model's own priced clause product) is the first
+trigger keying on divergence-from-own-math — the conditionality the three tested guards failed to achieve.
+Watch, don't act.
 
-First checks in the next residual session, both free:
+Also watch (MC, 2026-07-09): whether the low-bucket over-payment closes under the merged MC calibration
+bullet (`ceab2df`). Baseline: [0-5%) options assigned mean 2.4%, resolve at 1.0% (n=96, both eras —
+"courtesy mass" on named-dead longshots; MC_CONFIDENCE_FINDINGS.md). If the gap persists, add one prompt
+line: price clearly-dead NAMED options near the 1% floor (residual/"Other" keep honest mass). The 1% floor
+stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs parser/clamp regression risk — not worth it).
 
-1. **Structured-JSON presence rate per forecaster** in published comments — the whole replay
-   program depends on the telemetry actually landing. Grep the archive for the raw
-   `base_rate_anchor` and `criteria_clauses` JSON keys inside each forecaster's STRUCTURED
-   FORECAST block and confirm every slot is emitting them. If `PROBABILISTIC_TOOLS_ENABLED`
-   is ever flipped on, additionally grep for the computed `ANCHOR_OVERSHOOT_PP` /
-   `CLAUSE_PRODUCT_DIVERGENCE_PP` HTML-comment markers as a cross-check; today those markers
-   are absent and their absence carries no signal.
-2. **Does the spring overshoot pattern reproduce on the current roster at all?** If the
-   confident-overshoot cluster (analogues of 42024 / 42304 / 41800) does not appear in
-   post-`30bca2f` resolutions, the prompt fixes were sufficient and all three guard revival
-   conditions (Guard 1 anchors, Guard 2 markets, Guard 3 confidence deadzone) become moot.
-   Compute overshoot / divergence offline from the raw JSON (same math as `tool_runner`)
-   until the flag lands.
+### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
 
-One novel candidate trigger becomes analyzable for free once current-roster binaries
-resolve: `clause_product_divergence_pp` (published forecast vs. the model's own priced
-clause product). It is the first trigger that keys on divergence-from-own-math rather than
-confidence, anchor band, or market presence — the exact conditionality the three tested
-guards failed to achieve. Watch, don't act.
+Structure findings from the branch-review forge + structure reviewers
+(`scratch/branch_review_july15/reviews/`). Each is a clean behavior-neutral refactor — keep
+them OUT of feature work, land as their own PRs.
 
-Also watch (MC, added 2026-07-09): whether the low-bucket over-payment closes under the new
-merged MC calibration bullet (`ceab2df`). Baseline: [0-5%) options assigned mean 2.4%,
-resolve at 1.0% (n=96 pairs, both eras — "courtesy mass" on named-dead longshots leaking
-from under-committed favorites; see MC_CONFIDENCE_FINDINGS.md). If the gap persists at the
-next residual pull, add one prompt line: price clearly-dead NAMED options at/near the 1%
-floor (residual/"Other" options keep honest mass — asymmetric by option type). The 1% floor
-itself stays (operator decision 2026-07-09: sub-1% headroom is ~+0.01 nats/question ideal
-case vs. parser/clamp regression risk — not worth it).
+- **Three files over the monolith threshold** (measured 2026-07-18):
+  `research/timeseries_anchor.py` (986 LoC — split the routing registry out into
+  `ts_routing.py` per the structure reviews), `research/agentic/tools.py` (784 — split the
+  search vs fetch subsystems), `tests/test_agentic_tools.py` (1055 after this branch's added
+  tests).
+- **Promote the shared SSRF/fetch primitives into `http_fetch.py`.** `agentic/tools.py`
+  currently reaches into `resolution_source.py`'s private functions — it calls
+  `resolution_source._get_session`, `_sem_for_host`, and `_extract_main_text` directly
+  (`agentic/tools.py:217,448,529,625`). That private-function coupling across modules is the
+  smell; hoist those three into the shared `research/http_fetch.py` as public primitives and
+  have both call sites use them.
+- **Give the anchor-chart `_session_charts` global a public accessor.** It's a module-level
+  dict in `research/timeseries_anchor.py:919` mutated/read by qid; expose a small
+  get/set/clear surface instead of touching the global directly.
 
 ## Medium-term (requires more exploration)
 
+### Consider migrating scheduled runs off GitHub Actions cron (added 2026-07-19, MEDIUM)
+
+The 2026-07-18 latency/completeness audit
+(`scratch/residual_2026-07-18/followups/latency_completeness.md`) traced ~80% of the
+submission-latency p90 creep (24 → 58 min) to GitHub Actions cron STARVATION: the scheduled
+workflows fire ~36 times/day against a nominal 72 (GHA silently drops scheduled runs under
+load). Queue-delay p90 is already 82 min against 90-minute question windows, so worst-case
+queue (82) + pipeline (12 p90) breaches the close deadline — and a missed close forfeits the
+whole spot score. Gap-fill v2 (up to 540s wall) stacks more pipeline time on top once the
+july15 branch merges.
+
+Time-sensitive because the failure mode is a hard forfeit, not a soft regression. No clean easy
+migration exists (hence MEDIUM, not HIGH) — alternatives to scope: a self-hosted GHA runner
+(kills queue starvation, adds ops burden), EventBridge Scheduler → `workflow_dispatch`, or a
+small VM / fly.io cron firing `workflow_dispatch`. The new CLOSE_MARGIN watch
+(`make close_margin_watch`) is the instrument to confirm the problem persists and to measure any
+migration's effect.
+
+### Split `forecaster.py` (1066 LoC, past the ~1000 ceiling) (added 2026-07-20, MEDIUM)
+
+Status: deferred refactor from the 2026-07-20 forge review of the run-QA commits (finding F3);
+deliberately NOT fixed in the july15 branch.
+
+`metaculus_bot/forecaster.py` is 1066 lines, past our ~1000-LoC file ceiling, and keeps growing as
+research stages and post-processing accrete. Natural extraction seams: (1) the gather /
+wall-clock / soft-deadline concurrency machinery (`_forecaster_with_soft_deadline` and the
+parallel fan-out plumbing), and (2) the stacking-finalization helpers, which belong in the
+existing `stacking` module rather than the forecaster. Large-blast-radius (touches the hottest
+file in the pipeline), so it warrants its own PR **after the july15 branch merges** — tracked here
+so the file doesn't keep accreting in the meantime.
+
+### Price the high→xhigh reasoning-effort premium via backtest A/B (added 2026-07-20, MEDIUM/low urgency)
+
+**Update 2026-07-20 (evening): the A/B as originally scoped is largely moot.** Two same-day changes
+gutted the stakes: the roster dropped to the 3-member triple (gpt-5.5 left), and the operator then
+dropped the gpt-5.6-sol forecaster xhigh→high — sol was ~70% of forecaster reasoning spend, so
+paying an unmeasured premium on the dominant-cost slot wasn't justified. The only xhigh slot left
+in the forecaster path is opus-4.8 (~$0.40/q), so the live question is now narrowly "does opus-4.8
+xhigh beat high?" — lower stakes, MEDIUM/low urgency. (The opus-4.8 stacker also runs xhigh but is
+prod-disabled, so that's backtest-only exposure.)
+
+Status: operator explicitly deferred 2026-07-20 — worth doing, but the backtest budget is
+contended; revisit when budget frees up or before the next major effort-config decision.
+
+**Motivation.** The 2026-07-20 reasoning-effort audit
+(`scratch/reasoning_effort_audit_2026-07-20/synthesis.md`, built from the AIB spring-2026 metac
+baseline-bot leaderboard) found default→high effort is clearly worth it: 8/8 within-model
+contrasts positive, sign test p=0.0078, median +2.9 spot-peer points/question, and thinking
+OFF→ON is the single largest knob (opus-4-5 flipped −1.9 → +2.9/Q). BUT the board has zero xhigh
+variants, so the high→xhigh premium — which, at the 6-model roster this entry was written against,
+we paid on 4 of 6 forecaster slots, ~64% of donated per-run spend per the 2026-07-19 credit audit
+(now just the opus-4.8 forecaster after the evening sol drop) — is unmeasured. The audit's
+diminishing-returns hint is a weak single-seed prior, not evidence.
+
+**Proposed test (rescoped 2026-07-20 evening).** A paired A/B backtest, high vs xhigh arms on the
+same questions, on the one remaining xhigh forecaster slot — opus-4.8 (originally scoped as
+gpt-5.6-sol + gpt-5.5, both since dropped from the xhigh forecaster set); ~`backtest_medium` scale
+(2 arms × 32 questions), rough cost $60-90 at recent per-question rates.
+
+**Decision rule when run.** If xhigh ≈ high within noise, drop opus-4.8 to high too; if xhigh wins
+meaningfully, keep it and reconsider re-raising the other slots.
+
+### ~~Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids~~ — DONE 2026-07-20 (added 2026-07-20)
+
+Landed with the 2026-07-20 discrete-hardening pass. `BoundSafeNumericDistribution.cdf`
+(`numeric/pchip_processing.py`) now computes `grid_step_constraints(len(base))` and threads the
+grid-scaled min/max step into `safe_cdf_bounds`, so the fallback matches the pipeline's resample
+path on a coarse discrete grid instead of clipping every bin to the 201-grid `max_step=0.2`.
+Regression test: `tests/test_thirteen_percentile_e2e.py::TestFallbackCdfRespectsOpenBounds::test_fallback_coarse_grid_uses_grid_scaled_constraints`.
+
+### ~~Bundle section-content audit before any content cuts~~ — DONE 2026-07-18 (added 2026-07-17)
+
+Operator directive: no willy-nilly trimming; a Fable-judged per-section value/redundancy audit is the
+prerequisite for any cut. Token measurements `scratch/bundle_token_audit_2026-07-17/`; audit ran
+`scratch/bundle_content_audit_2026-07-17/RESULTS.md`. Findings + follow-ups in the Near-term entry
+"Bundle content-audit findings" (v1 retirement gate, AskNews reform, market header).
+
 ### Research-output audit: temporal/provenance error sweep (added 2026-07-08, low priority)
 
-Motivated by the qid 42304 INES miss: the then-native-search provider (`x-ai/grok-4.1-fast`,
-since retired) cited a real but undated-URL NucNet archive article from 1 Feb 1999 (the
-1998–99 Istanbul INES-3 accident) and presented it as a "February 2026" Turkish event with a
-fabricated "reported March 1, 2026" date — likely cross-contaminated from an adjacent 2026
-search result. All five forecasters anchored on it (81% published; resolved NO; peer −115.9).
-The same phantom claim independently reached at least two top-competitor research stacks, so
-this is a field-wide hazard of undated archive URLs, not a one-off provider quirk.
+Motivated by the qid 42304 INES miss: the then-native-search provider (`x-ai/grok-4.1-fast`, retired)
+cited an undated NucNet archive article from 1 Feb 1999 (the 1998–99 Istanbul INES-3 accident) as a
+"February 2026" Turkish event with a fabricated "reported March 1, 2026" date. All five forecasters
+anchored on it (81% published; resolved NO; peer −115.9); the same phantom reached ≥2 top-competitor
+stacks — a field-wide hazard of undated archive URLs, not a one-off. Idea: a free offline audit over
+`backtests/research_archive/latest/` — sample research per provider, spot-check high-leverage claims
+(dates, event existence, numbers) against cited URLs, classify error modes (temporal displacement,
+fabricated dates, summarizer certainty inflation). Low priority (offending provider gone; prompt-side
+date-stamping + single-source flagging are the nearer lever) but worth doing before any new provider swap.
 
-Idea: a free, offline audit pass over `backtests/research_archive/latest/` — sample research
-texts per provider, spot-check high-leverage factual claims (dates, event existence, numbers)
-against their cited URLs, and classify error modes (temporal displacement, fabricated dates,
-certainty inflation by the summarizer). Output: per-provider error-rate estimates + a list of
-recurring hazard patterns to feed prompt/summarizer hardening. Low priority — the offending
-provider is gone and prompt-side mitigations (date-stamping relative to question open date,
-single-source claim flagging) are the nearer-term lever — but worth doing before trusting any
-new research provider swap.
-
-Deferred from the 2026-06-01 desloppify code-health pass (which did only behavior-neutral pyproject hygiene: dropped unused `python-decouple`, removed the unused `litellm[proxy]` extra, declared the directly-imported `scipy`/`pandas`/`pydantic` that were previously only transitive via `forecasting-tools`).
-
-Two follow-ups intentionally left for a separate, gated PR:
-
-1. **Raise version floors to current-installed** (e.g. `litellm ^1.80` vs the current `^1.59.1` floor, `openai` to latest, and evaluate moving `forecasting-tools` off the hard-pinned `0.2.54`). This is **forecast-affecting**: a litellm/openai/forecasting-tools behavior change can subtly shift model outputs and therefore predictions. **Gate:** run a medium backtest (`make backtest_medium`) before and after the bump and confirm scores don't regress before shipping. Do NOT bump blind.
-2. **Migrate dependency management from poetry to `uv`.** Larger refactor (pyproject `[tool.poetry]` → PEP 621 `[project]`, regenerate lockfile, update Makefile `install`/`run`/`test` targets and CI). An orphaned 136-byte `uv.lock` stub + `[tool.uv]` block (declaring a contradictory `requires-python >=3.12`) were removed in the 2026-06-01 pass so the repo has one source of truth (poetry); a real uv migration would regenerate the lockfile from scratch. Worth doing for speed + the team's broader uv standardization — poetry is dated and the team is standardizing on uv, so this is the intended direction; it's pure tooling churn with no forecast impact, so schedule when there's appetite for a no-functional-change infra PR.
-
-   **Update 2026-06-16:** the contentless `uv.lock` stub re-appeared (an incidental `uv` invocation in this environment keeps regenerating it). Rather than delete-and-forget again, added `uv.lock` to `.gitignore` so it can't sneak back into a commit before the real migration lands. When the migration happens, remove that gitignore line and check in the real resolved lockfile.
+Related dependency follow-up (from the 2026-06-01 desloppify pass): **raise version floors to
+current-installed** (`litellm ^1.80` vs `^1.59.1`, `openai` to latest, evaluate moving `forecasting-tools`
+off the pinned `0.2.54`). Forecast-affecting — **gate on a `make backtest_medium` before/after, don't bump
+blind**. (The poetry→uv migration follow-up shipped 2026-06.)
 
 ### Gemini grounding via OpenRouter — currently NOT supported (added 2026-05-17)
 
@@ -706,248 +1069,230 @@ Goal would be: route Gemini Google-Search-grounded calls (currently in `metaculu
 
 ### Update analysis-CLI defaults to summer-futureeval-2026 (added 2026-05-17)
 
-Tournament rolled over from `spring-aib-2026` to `summer-futureeval-2026` on 2026-05-17. The bot's live tournament target (`metaculus_bot/constants.py:TOURNAMENT_ID`) updated immediately, but **three CLI default constants stayed pinned to spring** intentionally:
+Tournament rolled spring→summer 2026-05-17; live `TOURNAMENT_ID` updated but **three CLI defaults stay
+pinned to spring** intentionally (`ablation/cli.py:95`, `performance_analysis/collector.py:30`,
+`performance_analysis/cli.py:17`) so analysis defaults to the resolved dataset, not the freshly-opened one.
+**Flip when** summer has ~30+ resolved Qs (mid-July 2026); also update the stale slug example in
+`tests/test_tournament_dates.py:127,131`.
 
-- `metaculus_bot/ablation/cli.py:95` — `DEFAULT_TOURNAMENTS = ["spring-aib-2026"]`
-- `metaculus_bot/performance_analysis/collector.py:30` — `DEFAULT_TOURNAMENT = "spring-aib-2026"`
-- `metaculus_bot/performance_analysis/cli.py:17` — same constant
+### Mixture model parameterization for numeric questions — largely rejected
 
-**Rationale for not updating yet**: ablation + perf-analysis are run against *resolved* questions. Summer just opened (zero resolved Qs); spring just closed (n=189, ongoing residual analysis). Updating the defaults now would force `--tournament spring-aib-2026` on every analysis command for what's still the active dataset.
-
-**Flip when**: summer accumulates ~30+ resolved Qs (probably 6-8 weeks in, mid-July 2026), enough to ablate against. At that point also update the slug example in `tests/test_tournament_dates.py:127,131` (currently still references spring as the example slug in error-path messaging — harmless but stale).
-
-### Mixture model parameterization for numeric questions
-
-Instead of asking LLMs for 11 percentiles (which they find unnatural), ask them to
-parameterize a mixture of distributions: specify 2-3 components with means, stds, and
-weights. This naturally produces smoother, better-shaped CDFs.
-
-Mantic uses this approach and reports good results. The LLM selects components capturing
-different scenarios, and the final prediction is a weighted combination.
-
-Would require changes to the numeric prompt, parsing, and CDF construction pipeline.
+Ask LLMs to parameterize a mixture (2-3 components: mean, std, weight) instead of percentiles, for
+smoother CDFs (Mantic reports good results). **Note:** a mixture path
+(`NumericStructured.mixture_components` + router branch) was built and REMOVED 2026-07-08 after zero
+prod fires — percentiles+PCHIP beat it in every benchmark (`mixtures.py` library preserved but dormant).
+Re-proposing the LLM-parameterized-mixture form has to clear that bar.
 
 ### Aggregation strategy improvements
 
-> **Status 2026-05-29: STACKER NOW DISABLED ON ALL TYPES (default off in code).** Numeric was
-> already off (ablation: median > stack CRPS, p=0.042). Binary + MC now off too — the ablation
-> binary result was a *tie* (p=0.496), so this is a low-risk default (tie-at-best + compute cost),
-> NOT a measured harm; the binary/MC treatment effect is unmeasured on the current stack. The
-> code default flipped to `default=False` so the stacker only runs on explicit opt-in. **Revisit
-> when post-2026-04-27 (marker-era) resolved questions exist** to measure the real treatment effect.
->
-> **Status 2026-05-10:** Spread-aware aggregation (item 3) is **SHIPPED** as
-> CONDITIONAL_STACKING (April 2026); the prob-range trigger metric is durably
-> justified by May ρ=0.616 disagreement-error. Post-aggregation shrinkage toward
-> 50% (item 2) is **explicitly killed** — costs correctly-confident predictions to
-> fix overconfident ones, and the May data did not replicate the NO-bias at the
-> larger N. Per-type weighting (item 4) is **LOW-PRIORITY, deferred to Q3+** —
-> May data showed gemini-3.1-pro's binary-vs-numeric asymmetry, but only one
-> model fits the pattern, infra doesn't exist, and the next-tournament roster
-> will likely refresh this model anyway; revisit only when ≥2 active models show
-> the asymmetry on ≥100 binary AND ≥30 numeric records each. Trimmed mean (item
->
-> 1) remains untested — keep on backlog.
+**Status 2026-05-29: STACKER DISABLED ON ALL TYPES (default off in code).** Numeric was already off
+(ablation median > stack CRPS, p=0.042); binary + MC now off too (binary was a *tie*, p=0.496 — low-risk
+default given compute cost, not a measured harm; binary/MC treatment effect unmeasured on the current
+stack). Revisit when post-2026-04-27 marker-era resolved questions exist.
 
-Ideas from analysis (lower priority since prompt changes address the bigger issues):
+Item status (from analysis; prompt changes address the bigger issues):
 
-- Trimmed mean (drop highest + lowest, mean of middle): robustness of median with
-  better signal preservation. With 6 models, could drop top and bottom, mean of 4.
-- ~~Post-aggregation shrinkage toward 50% (~15-20%)~~ — **KILLED 2026-05-10.** May
-  data did not replicate the NO-bias finding at n=109. Shrinkage costs well-
-  calibrated extremes to fix a problem that didn't recur.
-- Spread-aware aggregation: widen uncertainty when models disagree rather than just
-  picking the middle. **SHIPPED as CONDITIONAL_STACKING.**
-- Weighted aggregation by historical model performance (per question type).
-  **Deferred — see status note above.**
-
-Need more data (more resolved questions) to confidently evaluate these.
+- **Trimmed mean** (drop hi+lo, mean of middle 4 of 6) — untested, on backlog.
+- ~~Post-aggregation shrinkage toward 50%~~ — **KILLED 2026-05-10** (May data didn't replicate the NO-bias
+  at n=109; shrinkage costs well-calibrated extremes).
+- **Spread-aware aggregation** — **SHIPPED as CONDITIONAL_STACKING** (April 2026; prob-range trigger
+  justified by May ρ=0.616 disagreement-error).
+- **Per-type weighting by historical performance** — LOW-PRIORITY, deferred to Q3+ (only gemini-3.1-pro fit
+  the binary-vs-numeric asymmetry; revisit only when ≥2 active models show it on ≥100 binary AND ≥30 numeric).
 
 ### Per-model peer ranking: GPT-strong / Claude-weak on binary (2026-05-29, NEEDS BENCHMARK before acting)
 
-> A peer-score recompute (`scratch/residual_2026-05-29/dim_peer_recompute.md`, method validated
-> exact against `spot_baseline_score`; reviewed in `review_peer_analysis.md`) ranked base models on
-> **peer-equivalent** (the metric that matters), not Brier. On binary (spring-aib-2026, n≈150):
+Peer-equivalent recompute (`scratch/residual_2026-05-29/dim_peer_recompute.md`, validated exact vs
+`spot_baseline_score`), binary spring-aib-2026 n≈150:
 
-- **GPT models carry the binary ensemble** (gpt-5.1 +19, gpt-5.2 +17 peer; CIs exclude 0). The
-  **Claude pair is the binary drag** (claude-opus-4.6 −9, claude-opus-4.5 +2.2). The confound was
-  checked and runs the *wrong way* (Claude saw slightly easier questions), so the drag is genuine.
-- **The story INVERTS on numeric** — Claude is *strong* there (opus-4.6 +24), gpt-5.1 weakest. So
-  this is a binary-specific effect, NOT "Claude is bad." A blanket roster cut would hurt numeric.
-- **Counterfactual ensembles (paired, in-sample):** dropping the Claude pair → **+5.94 binary peer
-  [+1.0, +11.7]**; dropping claude-opus-4.6 alone → +3.66 (survives jackknife, the most robust
-  sub-claim). GPT-only → +10.6 but that point estimate hinges on 1-2 questions — don't quote it clean.
-- Corrected an earlier wrong claim: gpt-5.2 is **not** high-variance (lowest binary sd); the
-  wildcards are gemini-3.1-pro (sd 96) and claude-opus-4.6 (sd 80).
+- **GPT carries the binary ensemble** (gpt-5.1 +19, gpt-5.2 +17 peer, CIs exclude 0); the **Claude pair
+  is the binary drag** (opus-4.6 −9, opus-4.5 +2.2; confound runs the wrong way, so genuine).
+- **INVERTS on numeric** — Claude strong (opus-4.6 +24), gpt-5.1 weakest — so binary-specific, not
+  "Claude is bad"; a blanket cut hurts numeric.
+- Counterfactuals (paired, in-sample): drop Claude pair → +5.94 binary peer [+1.0, +11.7]; drop opus-4.6
+  alone → +3.66 (survives jackknife, most robust). GPT-only +10.6 hinges on 1-2 questions — don't quote clean.
+- gpt-5.2 is NOT high-variance (lowest binary sd); wildcards are gemini-3.1-pro (sd 96), opus-4.6 (sd 80).
 
-> **Do NOT act on this without an intense out-of-sample benchmark.** It's in-sample (n=62 paired),
-> multiple-comparisons exposed, epoch-confounded, and the roster has already rotated (current Claude
-> slot is opus-4.5 + opus-4.6; new gpt-5.4 / grok-4.1-fast have n=3-12, uninformative). The credible
-> reading is narrow: *on binary, the Claude pair is a measurable drag and the GPTs carry the
-> ensemble.* The natural next step is a **prospective per-type model-inclusion benchmark** (GPT-heavy
-> on binary, retain Claude for numeric), gated on out-of-sample peer — not a reweight off this slice.
-> Relatedly: the stacker's own model (claude-opus-4.5) being a weak base binary forecaster is part of
-> why disabling the binary stacker is low-risk (see Aggregation status above).
+**Do NOT act without an intense OOS benchmark** — in-sample (n=62 paired), multiple-comparisons exposed,
+epoch-confounded, roster already rotated. Credible reading: on binary the Claude pair is a measurable drag
+and GPTs carry the ensemble. Next step: a prospective per-type model-inclusion benchmark (GPT-heavy binary,
+retain Claude numeric), gated on OOS peer. (The stacker's own model opus-4.5 being a weak base binary
+forecaster is part of why disabling the binary stacker is low-risk.)
 
 ### Domain-aware CDF spread tuning
 
-> **Status 2026-05-29: HOLD — measured on a STALE pipeline; re-measure on current version before ANY narrowing.**
-> The residual analysis (`scratch/residual_2026-05-29/dim_numericpit.md`, `numeric_width_version_confound.md`)
-> re-confirmed across two independent rosters that the *analyzed* CDFs are too wide (PIT std 0.24–0.26 vs ideal
-> 0.289; 90% coverage 92–98%), and a uniform contraction k≈1.2–1.3 toward the median would hit the ideal. **BUT all
-> analyzed forecasts (≤ 2026-04-13) ran with tail-widening ON at full strength (k_tail=1.25).** Prod flipped to
-> k_tail=1.0 (identity) on **2026-05-12 (`b8d730f`)**, *after* the data — plus the mixture-distribution router went
-> live and numeric stacking was disabled. So current prod is **already narrower** than what we measured; the bot's
-> own calibration study showed widening-off moved PIT std 0.238 → 0.245. **Applying k≈1.3 on top of the current
-> pipeline would overcorrect** — the over-width is in the *body* while deep tails are *already too thin* (1.5–6% mass
-> vs 10% ideal), and the widening-off flip thinned tails further.
->
-> **Before doing anything here:** (1) ship the PIT log-grid measurement-bug fix in `analysis.py::_interpolate_pit`
-> (it mis-scores log-scaled / `zero_point` questions by up to 0.86 PIT — version-independent, do regardless);
-> (2) add PIT std as a first-class `backtest.py` metric (it emits CRPS/log but not PIT, and doesn't persist the CDF);
-> (3) run `make backtest_large` to get a **current-version** PIT measurement on fresh predictions; (4) only then,
-> if still over-wide, choose a (smaller) narrowing factor with a per-side tail-mass floor. The *direction* (mild body
-> over-width) may survive; the *magnitude* k=1.3 will not.
->
-> Also note the 2026 finance carve-out **inverts** the old advice: financial questions were the *most* over-wide
-> (cov90=100%), not the least — so the old "exclude finance/markets" guidance is wrong on current data.
->
-> Reconciled along the way: the long-standing "PIT std 0.143" figure was just the April **n=11** subsample under the
-> same metric (a ~2nd-percentile draw) — retire it; population is ~0.24–0.26.
+**Status 2026-05-29: HOLD — measured on a STALE pipeline; re-measure on current version before ANY narrowing.**
+Residual analysis (`scratch/residual_2026-05-29/dim_numericpit.md`, `numeric_width_version_confound.md`)
+re-confirmed across two rosters that the *analyzed* CDFs are too wide (PIT std 0.24–0.26 vs ideal 0.289; 90%
+coverage 92–98%) and a uniform k≈1.2–1.3 contraction would hit the ideal. BUT all analyzed forecasts (≤2026-04-13)
+ran tail-widening at full strength (k_tail=1.25); prod flipped to k_tail=1.0 on 2026-05-12 (`b8d730f`) *after* the
+data, so current prod is already narrower. **Applying k≈1.3 now would overcorrect** — over-width is in the *body*
+while deep tails are already too thin (1.5–6% mass vs 10% ideal).
 
-Older (2026-05-10) framing, now superseded by the version-confound note above: PIT analysis found CDFs too wide; the
-pipeline could use the forecastability classification (output by the prompt) to apply different tail-widening
-parameters, or use the FORECASTABILITY tag to adjust smoothing / tail-mass allocation / post-hoc CDF scaling.
+Before anything here: (1) PIT log-grid measurement-bug fix in `analysis.py::_interpolate_pit` (mis-scores
+log/`zero_point` questions by up to 0.86 PIT) — since shipped; (2) add PIT std as a first-class `backtest.py`
+metric; (3) `make backtest_large` for a current-version PIT measurement; (4) only then, if still over-wide, a
+smaller narrowing factor with a per-side tail-mass floor. Direction (mild body over-width) may survive; magnitude
+k=1.3 won't. Note: the 2026 finance carve-out **inverts** the old advice — financial questions were the *most*
+over-wide (cov90=100%), so "exclude finance/markets" is wrong on current data. (Retire the old "PIT std 0.143"
+figure — it was the April n=11 ~2nd-percentile draw; population ~0.24–0.26.) The older forecastability-conditional
+framing is superseded by this version-confound note.
+
+### Numeric-width history — receipts + ongoing monitor (added 2026-07-17)
+
+Consolidated, git-verified history of numeric-width config, so future sessions never re-litigate from memory.
+Short version: tails deliberately widened 2025-09 → 2026-05, turned off 2026-05-12, and the 2026-07-17 TS-anchor
+clause now pushes back toward sharpening.
+
+| Date | Change | Value before → after | Commit | Source |
+|---|---|---|---|---|
+| 2025-08-21 | Numeric prompt: earliest "widen" language added | (none) → "aim to produce somewhat wider and less confident predictions" | `4bd8685` | `prompts.py` |
+| 2025-09-06 | Numeric prompt: widen language strengthened | "somewhat wider" → "wider and less confident … penalties for narrow intervals are severe" | `0437f3e` | `prompts.py` |
+| 2025-09-07 | **Tail-widening machinery introduced** — `widen_declared_percentiles` + constants born | function default `k_tail=1.25`, `span_floor_gamma=1.0`; `TAIL_WIDEN_K_TAIL=1.25`, `TAIL_WIDEN_SPAN_FLOOR_GAMMA=1.0` | `4c6481b` | `tail_widening.py` + `numeric_config.py` |
+| 2026-03-30 | Numeric prompt: blanket-widen replaced by forecastability-conditional wording | "aim to produce wider … penalties for narrow intervals severe" → "produce wide, diffuse [for volatile] … anchor tightly [for stable] … penalties for overly wide intervals on predictable quantities also accumulate" | `3217aab` | `prompts.py` |
+| 2026-04-27 | Numeric prompt: added "Hedge audit" anti-over-widening clause | (none) → "Only widen tails when you can name specific evidence creating that uncertainty, not because it feels safer" | `95c4fff` | `prompts.py` |
+| **2026-05-12** | **`k_tail` 1.25 → 1.0 and `span_floor_gamma` 1.0 → 0.0** (function defaults AND both constants), plus `ValueError` guard on `k_tail<1` / negative params | `k_tail: 1.25 → 1.0`; `span_floor_gamma: 1.0 → 0.0` | `b8d730f` | `tail_widening.py` + `numeric_config.py` + `constants.py` |
+| 2026-06-01 | Subpackage move (no value change): `tail_widening.py`/`numeric_config.py` → `numeric/` | rename only | `78c5182` | subpackage extraction |
+| 2026-07-09 | Numeric prompt de-overfit prune; **kept** hedge-audit | large prune | `5c6640a` | `prompts.py` |
+| 2026-07-17 | Numeric prompt: **TS-anchor clause** reframes widening as the failure mode ("SHARPEN, not another license to widen"; "cov@10 ≈ 0.03 vs 0.10 target") | (none) → anchor clause | `3a7ba7d` | `prompts.py` |
+| 2026-07-17 | Numeric prompt: fixed the surviving blanket-widen contradiction — Phase-8 "keep tails far apart for unknown unknowns" scoped to *nameable* unknowns, not padded from generic caution or beyond a calibrated anchor's band | unconditional → conditional | (this branch) | `prompts.py` |
+
+Notes on the story:
+
+- **`k_tail`/`span_floor_gamma` have a two-point history, no intermediate values**: born 1.25/1.0 (`4c6481b`,
+  2025-09-07), flipped 1.0/0.0 (`b8d730f`, 2026-05-12); function default and constant always changed together.
+  Current: `tail_widening.py` 1.0/0.0, `numeric/config.py` `TAIL_WIDEN_K_TAIL=1.0`, `TAIL_WIDEN_SPAN_FLOOR_GAMMA=0.0`.
+- **No constant literally named "PIT."** The "PIT widening 1.25 → 1.0" memory = the `TAIL_WIDEN_K_TAIL` flip; PIT is
+  the calibration metric (`performance_analysis/analysis.py`) that drove it, not a separate knob.
+- **The 2026-05-12 study** (`scratch_docs_and_planning/tail_widening_empirical_calibration.md` +
+  `scratch/tail_widening_calibration_2026-05-12/`, 43 resolved numerics Feb–May): drop `k_tail` to 1.0 (every
+  segment minimized |PIT std − 0.289| there; 1.25 moved PIT *away* from ideal); `span_floor_gamma` a no-op (→0.0);
+  no per-category `k_tail` (CIs overlap); narrowing (`k_tail<1`) is a silent no-op (motivated the `ValueError`
+  guard). Caveat: "revisit after ~150 resolved numerics."
+- Prompt-language and `k_tail`-code changes are **decoupled** (separate commits).
+
+**Ongoing monitor: `metaculus_bot/performance_analysis/width_monitor.py`** (read-only, free — not cost-gated).
+Run: `uv run python -m metaculus_bot.performance_analysis.width_monitor --cached scratch/coherence_2026-07-15/perf_all_tagged.json`
+(or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist). Per config era it reports
+central-80% / central-50% coverage with Jeffreys CIs, cov@10/50/90, PIT std (uniform ideal 0.289 — below ⇒ too
+wide, above ⇒ too narrow), and median relative band width `(P90−P10)/|P50|` as the raw sharpness metric. Eras are
+the two width-relevant flips: `WIDENING_FLIP` (2026-05-12, k_tail 1.25→1.0) and `TS_ANCHOR_ENABLE` (2026-07-17); the
+`ts_anchor` bucket is intentionally empty until the anchor provider is flipped on in prod, so post-enable records
+land in their own era instead of contaminating the widening-off baseline.
+
+**Measured 2026-07-17 on the 231 recovered numeric+discrete questions** (`scratch/coherence_2026-07-15/perf_all_tagged.json`):
+
+| era | n | cov80 [95% CI] | cov50 | cov@10 | PIT std | med rel width |
+|---|---|---|---|---|---|---|
+| widening_on (k_tail=1.25) | 197 | 0.851 [0.798, 0.897] | 0.558 | 0.096 | 0.267 | 0.674 |
+| widening_off (k_tail=1.0) | 24 | 0.740 [0.555, 0.888] | 0.580 | 0.083 | 0.286 | 0.561 |
+| all | 231 | 0.847 [0.798, 0.890] | 0.567 | 0.091 | 0.267 | 0.647 |
+
+Reading: widening-off moved PIT std 0.267 → 0.286 (toward the 0.289 ideal), cov80 0.851 → 0.740, median rel width
+0.674 → 0.561 — consistent with the 2026-05-12 study; no longer over-wide in the body. `widening_off` n is only 24
+(loose CIs); baseline to watch as the TS-anchor clause lands (forward risk is over-sharpening). `cov@10` gap: even
+widening-off, only ~8% of resolutions fall below published P10 (vs 10% target), so the low tail runs slightly wide —
+what the anchor's better-calibrated P10 pulls in.
+
+### Width post-ship watch + monitor attribution tagging (added 2026-07-18, medium)
+
+Two follow-ups from the 2026-07-18 full-branch width audit (`scratch/width_audit_2026-07-18/synthesis.md`).
+The audit found no era-stable width bias and motivated Option B, shipped `f4f7984`: delete the Step-7
+hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the numeric prompt.
+
+1. **Post-ship over-sharpening watch (load-bearing gate).** Option B removed a one-directional narrowing
+   instruction, so forward risk flips over-wide → over-sharp. Over the next ~15 numeric resolutions on the
+   `width_monitor`: if `cov80` climbs back toward ~0.88+ WITH PIT std below ~0.25 (the pre-flip over-wide
+   signature), re-add the hedge audit — but as a SYMMETRIC clause ("match width to reasoning; don't pad OR
+   sharpen from disposition"), never the one-directional form just cut. Standing gate: n≥25 with theme
+   diversity before fitting any width knob (the "~150 numerics" caveat governs a fitted change). Do NOT cite
+   `cov@10 ≈ 0.03` as a too-wide signal here — that's a pooling artifact; the current-era value is 0.107 (on
+   target). The ~0.03 the TS-anchor prompt clause quotes is the live-prod low tail, a different cohort.
+2. **Tag monitor records with `anchor_present` / `gap_fill_v2_present` (low effort).** The `ts_anchor` era
+   bucket is confounded (TS anchor + gap-fill v2 + native-search/crux terra swaps all flipped 2026-07-17) AND
+   pools treated with untreated (only ~53% of numerics route to a fetchable series). Fix: at collection time
+   grep research text for the `## Time Series Anchor` and `## Agentic Research Findings` headers, thread the
+   booleans into the record, split era rows by presence. Cheap; unblocks any real anchor-effect read.
 
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
-Source: a systematic dissection of 12 high-scoring forecast outputs from three competitor bots
-(GreeneiBot2, Preseen-Atlas, SynapseSeer) captured in `/Users/flatljan/Documents/prompts/metac-examples-strong-bots-june-2026.md`,
-analyzed via an ultracode workflow on 2026-06-26. Full report + grounding-critic verdict at
-`scratch/competitor_analysis_2026-06-26/REPORT.md`. **Important caveat for all of these: the corpus
-has NO resolution outcomes**, so every "why it helps" is a *mechanism* argument, never an
-outcome-validated one — none of these is evidence that the competitor scores better. The one
-genuinely shipped this session was the source-provenance trust ladder (prompt edit, in
-`prompts.py:_SOURCE_PROVENANCE_LADDER`); everything below was deliberately deferred as
-higher-risk-than-this-session and is gated on a benchmark before acting.
+Source: dissection of 12 high-scoring outputs from GreeneiBot2 / Preseen-Atlas / SynapseSeer
+(`/Users/flatljan/Documents/prompts/metac-examples-strong-bots-june-2026.md`; report + grounding-critic
+verdict `scratch/competitor_analysis_2026-06-26/REPORT.md`). **Caveat: the corpus has NO resolution
+outcomes**, so every "why it helps" is a mechanism argument, not outcome-validated. Only the
+source-provenance trust ladder shipped (`prompts.py:_SOURCE_PROVENANCE_LADDER`); the rest is gated on a
+benchmark.
 
-**1. Stacker deviation cap from the base-model median (experiment; needs benchmark).**
-Bound the stacker's output to within K of the base-forecaster median — binary in probability
-points, numeric as a percentile/location shift — mirroring the existing Platt deviation-cap
-pattern, with K a new constant near the `CONDITIONAL_STACKING_*_THRESHOLD`s. Land it in
-`aggregation_pipeline.py::_stacking_aggregate` (clamp just before `_apply_platt_calibration`),
-new caps in `constants.py`.
-*Grounding:* GreeneiBot2's fact-checker layer caps any consolidated update to ±20% of the
-forecaster panel average (source line 1352: "any consolidated forecast should remain between
-roughly 42% and 62%"). *Why it could matter for us:* our own ablation disabled the numeric
-stacker because MEDIAN beat it (CRPS p=0.042, see Aggregation status above) — a reviewer
-drifting too far from a well-calibrated central statistic is exactly the failure a cap prevents,
-so a cap might let us safely re-enable numeric stacking. *Cautions:* (a) the whole point of
-conditional stacking is to let the reviewer MOVE the number when one model is right — a cap that
-is too tight defeats it, so ablate before shipping, do not assume benefit; (b) their "±20% of the
-average" is multiplicative and unstable near 0/1 — use an ABSOLUTE points cap for binary, not a
-percentage. **Gate:** `make backtest_medium` (or large) ablation of capped-stacker vs current
-MEDIAN-default before shipping.
+**1. Stacker deviation cap from the base-model median (experiment; needs benchmark).** Bound stacker
+output to within K of the base median (binary in prob points — ABSOLUTE, not their unstable-near-0/1
+multiplicative "±20% of average"; numeric as a percentile/location shift), in
+`aggregation_pipeline.py::_stacking_aggregate` just before `_apply_platt_calibration`, new caps in
+`constants.py`. *Grounding:* GreeneiBot2 caps consolidated updates to ±20% of the panel average (line 1352).
+*Why:* a cap might let us safely re-enable the numeric stacker MEDIAN beat (CRPS p=0.042). *Caution:* too
+tight defeats the point of stacking — ablate, don't assume. **Gate:** `make backtest_medium` capped-stacker
+vs MEDIAN-default.
 
-**2. Shared-reliance / consensus-fragility audit (experiment; higher-risk, needs benchmark).**
-The hole: our spread-gate (`spread_metrics.compute_spread`) takes MEDIAN whenever the N
-forecasters agree and **never asks WHY they agree**. If all 6 agree because they swallowed the
-same unverified fact from shared research, that consensus is falsely confident and invisible to a
-pure numeric-spread metric. This is the missing *mirror* of our existing disagreement branch
-(`spread > threshold` → crux → targeted search → stack); the agreement branch has no counterpart.
-Three operationalizations, cheap→expensive:
-  - (A) **Prompt-only self-report** — add a `load_bearing_claims: [{claim, verified, source}]`
-    field to the structured JSON each forecaster already emits (consumed by `tool_runner`); each
-    forecaster names the 1-3 facts its forecast most depends on and whether it could verify them.
-    Surfaces shared reliance, improves rationales, zero aggregation change. Cheapest; could be done
-    in a future prompt session without the benchmark gate (strict rationale-quality improvement).
-  - (B) **Deterministic cross-forecaster flag** — if one unverified load-bearing claim appears in
-    ≥K of N forecasters' self-reports, mark consensus fragile and FORCE the stacker/crux path to
-    fire even at low spread. Reuses existing machinery; the stacker prompt already has the right
-    language (`prompts.py:725`: "hedged consensus can reflect shared priors more than shared
-    evidence") — it just never runs on agreement today. Hard part: clustering free-text claims
-    across models is fuzzy (may itself need an LLM).
-  - (C) **Dedicated consensus-auditor LLM** — one cheap pass over the N rationales on the
-    low-spread branch: "do they agree from independent reasoning or shared reliance on claim X? is
-    X verified?" Symmetric to the disagreement-crux extractor.
-*Grounding (honest provenance):* this is **OUR idea, seeded by — not copied from — the competitors.**
-Their fact-checkers do two things SEPARATELY that this fuses: (a) discount agreement as
-non-independent when rationales overlap (SpaceX-stock line 2028: "their agreement should not be
-treated as two independent signals because the rationales and inputs are highly overlapping";
-Iran line 1330: "their rationales are very similar, so I would not treat them as fully
-independent evidence"), and (b) notice both forecasters leaned on the same unverified figure
-(Metaculus-predictions lines 36, 43: "both lean somewhat on an unverified GPT search count") —
-but they respond to (b) by downweighting+widening, NEVER by gating aggregation. No competitor
-passage fuses "shared reliance on one unverified fact" with "therefore discount the consensus."
-*Caution:* (B)/(C) add cost to the COMMON cheap MEDIAN path (most questions agree), inverting our
-"cheap path for agreement, expensive only for disagreement" design — that per-question cost bump
-is the main reason it's deferred. **Gate:** benchmark (B)/(C) before shipping; (A) is the
-low-risk starting point.
+**2. Shared-reliance / consensus-fragility audit (experiment; higher-risk, needs benchmark).** The hole:
+`compute_spread` takes MEDIAN when the N agree and never asks WHY — if all 6 swallowed the same unverified
+shared-research fact, that consensus is falsely confident and invisible to spread. The missing *mirror* of
+the disagreement branch. Three operationalizations, cheap→expensive: (A) **prompt-only self-report** — add a
+`load_bearing_claims: [{claim, verified, source}]` field to the structured JSON; surfaces shared reliance,
+zero aggregation change, low-risk (could ship in a prompt session); (B) **deterministic cross-forecaster
+flag** — one unverified claim in ≥K of N → mark fragile, FORCE the crux/stacker path even at low spread (the
+stacker prompt `prompts.py:725` already has the language, just never runs on agreement; hard part is
+clustering free-text claims); (C) **dedicated consensus-auditor LLM** on the low-spread branch. *Grounding:*
+OUR idea, seeded not copied — competitors discount overlapping-rationale agreement (SpaceX line 2028, Iran
+line 1330) and notice shared unverified figures (Metaculus-predictions lines 36/43) but respond by
+downweighting+widening, NEVER by gating aggregation. *Caution:* (B)/(C) add cost to the COMMON cheap MEDIAN
+path — the main reason they're deferred. **Gate:** benchmark (B)/(C); (A) is the low-risk start.
 
-**3. Numeric "unverified-conflict → variance" rider (low priority; tension with our calibration).**
-When the source-provenance ladder genuinely CANNOT adjudicate between two candidate values for a
-load-bearing quantity, place mass across both rather than committing to one (widen the relevant
-percentiles), with a materiality gate so it only fires when the gap exceeds plausible
-measurement/timing noise.
-*Grounding:* the Metaculus-predictions fact-checkers, facing a background count (3,856,697) vs an
-unverified live count (3,895,701), widened rather than picking: "this discrepancy should widen
-uncertainty and slightly reduce confidence … not secure enough to fully adopt" (line 36); "treat
-the current count as uncertain, centered between these values but with extra variance … sigma
-95000 to cover the current-count discrepancy" (line 43); and a quantified materiality test ("a
-39004 same-day discrepancy is too large to dismiss as normal intraday growth").
-*Why deferred / tension:* our verified PIT analysis says our numeric CDFs are ALREADY too wide
-(why `TAIL_WIDEN_K_TAIL=1.0`, see Domain-aware CDF entry above), and our hedge-audit deliberately
-*penalizes* widening-out-of-caution. The narrow defense is that this widens for a NAMED, specific,
-quantified reason — which satisfies the hedge-audit's own "name specific evidence to widen"
-carve-out rather than violating it — but it risks an LLM over-applying it (every question has
-*some* source tension). Decided in design discussion (2026-06-26) NOT to ship as a standalone
-widening license; the trust ladder + the existing gap-fill tiebreaker-search already adjudicate
-most conflicts by authority. Revisit only as a tightly-scoped numeric-only A/B, never blanket;
-**gate** on P10/P90 coverage of resolved numerics not regressing.
+**3. Numeric "unverified-conflict → variance" rider (low priority; tension with our calibration).** When
+the trust ladder can't adjudicate two candidate values for a load-bearing quantity, place mass across both
+(widen the relevant percentiles) with a materiality gate. *Grounding:* Metaculus-predictions fact-checkers
+facing 3,856,697 vs 3,895,701 widened rather than picked ("sigma 95000 to cover the discrepancy", lines
+36/43). *Tension:* our CDFs are ALREADY too wide (`TAIL_WIDEN_K_TAIL=1.0`) and the hedge-audit penalizes
+caution-widening; the defense is this widens for a NAMED, quantified reason (satisfies the hedge-audit
+carve-out) but risks over-application. Decided 2026-06-26 NOT to ship standalone. Revisit only as a
+tightly-scoped numeric-only A/B; **gate** on P10/P90 coverage not regressing.
 
-**Also observed but NOT pursued (logged so future sessions don't re-litigate):** binary-complement
-coherence guard ("state implied No; confirm Yes+No=100%", cheap defect protection — candidate for a
-future prompt session, see report rec #4); interrogate-the-resolution-source-quality prompt clause
-(Preseen-Atlas "Nasdaq calendar dates are 'not official'", line 2679 — partially covered by our
-trust ladder now placing "the question's own named resolution source" in tier A); numeric
-partial-resolution incorporation ("fix the realized portion, put variance only on the remainder")
-and reporting-vs-outcome-uncertainty clauses (report rec #5). **Explicitly rejected as conflicting
-with verified data** (do NOT re-recommend): GreeneiBot2's one-sided anti-overprediction shave
-`X=min(10−certainty, 0.2×estimate)` (our binary calibration slope flips 0.83→1.66 across rounds, so
-a fixed shave helps one round and hurts the next); blanket sigma-widening (CDFs already too wide);
-switching numeric to parametric mean/sigma representation (our percentile→PCHIP→CDF-space pipeline
-strictly subsumes a single normal and additionally supports mixtures via OPTION B); the open-tail
-"spike" grid-compliance trick (we solve grid validity deterministically in `pchip_cdf.py` and our
-prompt already tells forecasters spiky tricks don't pay).
+**Also observed, NOT pursued (don't re-litigate):** binary-complement coherence guard (Yes+No=100%,
+candidate for a future prompt session, report rec #4); interrogate-resolution-source-quality clause
+(Preseen-Atlas line 2679 — partly covered by the trust ladder); numeric partial-resolution incorporation +
+reporting-vs-outcome-uncertainty (report rec #5). **Explicitly rejected as conflicting with verified data
+(do NOT re-recommend):** GreeneiBot2's one-sided anti-overprediction shave (our binary slope flips 0.83→1.66
+across rounds, so a fixed shave helps one and hurts the next); blanket sigma-widening (CDFs already too
+wide); parametric mean/sigma numeric representation (our percentile→PCHIP→CDF-space pipeline subsumes it);
+the open-tail "spike" grid-compliance trick (we solve grid validity deterministically in `pchip_cdf.py`).
+
+### ~~Summarizer model: bench sol-low vs terra-low~~ — DECIDED 2026-07-18 (switched to terra-low)
+
+The 2026-07-17 role audit kept sol (best synthesis/provenance, terra 2nd with one attribution blur, gap
+"MARGINAL EDGE"), but an operator value-call 2026-07-18 **switched to terra-low**: AskNews is auxiliary
+(16% unique content vs native-search 54% / gap-fill 59%) so the frontier tier isn't warranted, and the
+AskNews quality audit (`scratch/asknews_quality_audit_2026-07-18/`) blamed 4/5 briefing failures on
+prompt-era issues not model tier. Terra: −43% cost, ~50s vs ~118s. Packets:
+`scratch/research_role_audit_2026-07-17/`.
 
 ## Longer-term (significant R&D)
 
-### Agentic deep research (ReAct loop)
+### Agentic deep research (ReAct loop) — SHIPPED 2026-07-17
 
-Move from one-shot research to an iterative research agent that can: execute search queries,
-evaluate results, identify gaps, execute follow-up queries, run code for analysis, and
-synthesize findings. Smingers is moving this direction.
+The gap-fill v2 plan (near-term entry; `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) IS this —
+a bounded tool-loop second pass, ON in prod (`GAP_FILL_V2_ENABLED: 'true'`). The old cost blocker is
+resolved by budget caps (~$0.50/q) + early-stop; selective activation via the template dry-run. Direction
+confirmed by the 2026-07-16 lit survey: keep it a **shared** stage (one loop → detached artifact all
+forecasters read), NOT per-forecaster integrated pipelines (BTF-2 arXiv 2604.26106 — strong prompt on
+shared research edged the best integrated agent; integrated benefit was Opus-class-only). Watch
+era-bucketed calibration alongside Brier (agentic research trades calibration for over-decisiveness).
 
-Main blocker: API costs. The canned Grok native search works adequately for most questions.
-Agentic research would be most valuable for complex questions where a single search
-doesn't surface the right information.
+### Prediction market integration — SHIPPED (strong evidence, criteria/date-matched)
 
-Could prototype with selective activation (only for questions where initial research
-scores poorly on a relevance check).
-
-### Prediction market integration (strong evidence, criteria/date-matched)
-
-Direct API access to Polymarket, Kalshi, Metaculus community predictions (where available)
-as one research input. Currently markets show up in web search results inconsistently.
-Structured access would be more reliable.
-
-Framing: markets are STRONG EVIDENCE, not a footnote. The forecaster prompts now instruct
-models to anchor on a market whose resolution criteria and date MATCH the question, discount
-proportionally to any specific mismatch, and — when the only difference is the resolution
-DATE — explicitly extrapolate the market's probability to our date with a simple model
-(constant-hazard / base-rate-over-time) rather than applying a vague haircut. Superseded the
-old "not beholden to them" language after a referendum miss where a market sat at the correct
-answer and the bot dismissed it.
+Structured Polymarket/Kalshi/Manifold/PredictIt access shipped as the prediction-market snapshot
+(`PREDICTION_MARKETS_ENABLED: 'true'` in prod). Framing: markets are STRONG EVIDENCE, not a footnote. The
+forecaster prompts anchor on a market whose criteria + date MATCH, discount proportionally to a specific
+mismatch, and when only the DATE differs, extrapolate the market's probability to our date with a simple
+model (constant-hazard / base-rate-over-time) rather than a vague haircut. Superseded the old "not beholden
+to them" language after a referendum miss where the bot dismissed a market sitting at the correct answer.
 
 ## Killed by May 2026-05 closing analysis
 
@@ -974,179 +1319,96 @@ here so future sessions don't re-recommend them without new data.
 
 ## Killed by July 2026-07-08 residual + competitor analysis
 
-- **YES-side shrink / any fitted directional calibration layer** — the P6 YES-overconfidence
-  finding is real on pooled data but era-local (spring-2026 only; fall confident-YES buckets
-  are ~100% accurate). All three pre-registered stability criteria failed; a fit-on-two-eras
-  layer degraded held-out fall performance (+4.3e-3 mean Brier). Receipts:
-  `scratch/residual_2026-07-08/experiments/ARM_B_FINDINGS.md`. One sub-finding survives as a
-  hard rule: symmetric shrink was strictly worse in every era — never touch the NO side.
-- **Anchor-guard as a clamp/gate** — models publish outside their own stated base-rate anchor
-  on ~88% of forecasts (that is the normal outside → inside update, not a bug); precision on
-  a binary "flag it" gate is ≤29% and the sign of the effect flips across eras. Surviving
-  fragment: overshoot MAGNITUDE >15pp degrades Brier monotonically in both well-powered eras,
-  so ship it as telemetry plus a prompt nudge only (telemetry shipped 2026-07-08). Receipts:
-  `scratch/residual_2026-07-08/experiments/ARM_A_FINDINGS.md`.
-- **Advisory (non-binding) critic passes** — pt2 natural experiment: GreeneiBot2's critique
-  diagnosed our exact 41800 defect verbatim and the number never moved; laertes's correct
-  42855 reference-class recomputation was half-overridden by its own forecasters. Corrections
-  that BIND (formula/floor/structural) captured 30–130 spot-peer points; advisory captured
-  ~0. Receipts: `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md`. The critic-pass Near-term
-  entry stays, but in binding-output form only.
-- **Fixed-direction haircuts** — GreeneiBot2's always-downward haircut was best-of-group on
-  42855 AND actively harmful on 41800 (it extremized a 12 down to 10 on a YES resolution).
-  Any damping mechanism must push toward 0.5, not in a fixed direction. Consistent with the
-  already-killed one-sided anti-overprediction shave.
-- **"Median drowns the correct dissenter"** (re-confirmed dead) — the 7/9 washouts framing is
-  survivorship bias; median remains at the non-oracle frontier per dim_peer-calibration across
-  two additional pulls; and even laertes's 41800 "win" discarded its own best member and was
-  saved by its floor, not by aggregation.
-- **Anchor-floor guard on cheap tails** — the deterministic follow-up to the Arm A anchor-guard
-  kill. The median-band variant sign-flips across eras (fall +1.68 / spring −2.19 total Brier
-  at the 10pp margin) because 76% of parsed anchor bands are degenerate points, collapsing the
-  clamp back into Arm A's buried point-anchor clamp. The union-band variant is sign-consistent
-  but 100% top-5-concentrated (1–2 questions per era) and catches only 1/5 of the known misses.
-  Decomposing fires shows same-side tail clamping — the mechanism the guard is named for —
-  hurts BOTH well-powered eras. Revival condition: ≥50 current-roster binaries carrying the
-  new structured `base_rate_anchor` telemetry (shipped 30bca2f) AND an era-stable,
-  non-concentrated (top-5 < 50% of gross) replay. Receipts:
-  `scratch/residual_2026-07-08/experiments/GUARD1_FINDINGS.md`.
-- **No-market-no-extremize cap** — feasibility kill: the market-presence signal exists in
-  essentially one era (fall is 89% NO_SIGNAL because the prediction-market provider was
-  benchmark-suppressed; the canonical `## Prediction Market Snapshot` header appears in
-  exactly 1 archived binary), so era-stability is un-testable for the market-conditioned form.
-  Marketless fallback form = Arm A's point-anchor clamp drift bomb; strict form's gain is 3
-  spring questions (74–98% of gross improvement) and the market gate itself adds ~nothing
-  (with-cond vs. no-cond within ~0.2 Brier on spring). Revival condition: ≥~50 resolved
-  binaries per era carrying the structured `## Prediction Market Snapshot` AND the market
-  gate itself earning the delta the marketless form does not. Receipts:
-  `scratch/residual_2026-07-08/experiments/GUARD2_FINDINGS.md`.
-- **Signed deadzone haircut toward 0.5** (question closed permanently) — extends the Arm B
-  symmetric-shrink kill to all thresholded / high-t forms. 0 of 24 (λ, t) grid cells help or
-  are neutral in both well-powered eras; fall has no improving cell anywhere. Fire rate ≥30%
-  at even the loosest deadzone (t=0.4) because the bot is a confident forecaster
-  (median |p−0.5| ≈ 0.32–0.38) so confidence-keyed deadzones fire on the bulk, not a tail.
-  LOTO fit on spring+summer degrades held-out fall +1.12 total Brier. Keeper: the
-  signed-toward-0.5 direction constraint stands as a design rule (mirrors the fixed-direction
-  haircut kill above). Revival condition: the ensemble's calibration profile qualitatively
-  changes (a fall-like era where confident calls are wrong at scale) AND leave-one-era-out
-  passes on every held-out era; do not re-grid λ/t on new data absent that. Receipts:
-  `scratch/residual_2026-07-08/experiments/GUARD3_FINDINGS.md`.
-- **Cross-cutting** — at mid-grid configs all three guards fire on the same spring miss
-  cluster (42024 / 42304 / 41800 in particular; often 42018 / 42577 / 42855 / 41644 too), so
-  they are one lever measured three ways rather than three independent findings. The shipped
-  `30bca2f` prompt changes (status-quo derivation, conjunctive clause pricing, anchor/clause
-  telemetry) target that exact cluster, so any future guard replay on post-`30bca2f` data
-  must never fit on pre-`30bca2f` eras — that is the roster-drift bomb with a prompt-change
-  fuse. Config-era bucketing (keyed on submission time) already handles this; the new prompt
-  era starts at `30bca2f`.
+- **YES-side shrink / any fitted directional calibration layer** — the YES-overconfidence finding is
+  real but era-local (spring-only; fall confident-YES ~100% accurate). All three stability criteria failed;
+  a two-era fit degraded held-out fall +4.3e-3 Brier. Surviving hard rule: symmetric shrink was strictly
+  worse in every era — never touch the NO side. `scratch/residual_2026-07-08/experiments/ARM_B_FINDINGS.md`.
+- **Anchor-guard as a clamp/gate** — models publish outside their own base-rate anchor on ~88% of forecasts
+  (normal outside→inside update); "flag it" gate precision ≤29% and sign flips across eras. Surviving
+  fragment: overshoot MAGNITUDE >15pp degrades Brier monotonically in both well-powered eras → ship as
+  telemetry + prompt nudge only (telemetry shipped 2026-07-08). `.../ARM_A_FINDINGS.md`.
+- **Advisory (non-binding) critic passes** — GreeneiBot2's critique diagnosed our exact 41800 defect and the
+  number never moved; laertes's correct 42855 recomputation was half-overridden. BINDING corrections
+  (formula/floor/structural) captured 30–130 spot-peer points, advisory ~0. The critic-pass entry stays but
+  binding-output only. `scratch/residual_2026-07-08/ACID_TEST_VERDICT.md`.
+- **Fixed-direction haircuts** — GreeneiBot2's always-downward haircut helped 42855 but harmed 41800
+  (extremized 12→10 on a YES). Any damping must push toward 0.5, not a fixed direction (mirrors the killed
+  one-sided anti-overprediction shave).
+- **"Median drowns the correct dissenter"** (re-confirmed dead) — 7/9 washouts framing is survivorship bias;
+  median stays at the non-oracle frontier across two more pulls; even laertes's 41800 "win" discarded its own
+  best member and was saved by its floor, not aggregation.
+- **Anchor-floor guard on cheap tails** — median-band variant sign-flips (fall +1.68 / spring −2.19 total
+  Brier at 10pp) because 76% of parsed anchor bands are degenerate points; union-band variant is
+  sign-consistent but 100% top-5-concentrated (1–2 Qs/era) and catches 1/5 of known misses; same-side tail
+  clamping hurts both well-powered eras. Revival: ≥50 current-roster binaries with `base_rate_anchor`
+  telemetry (30bca2f) AND an era-stable, top-5<50% replay. `.../GUARD1_FINDINGS.md`.
+- **No-market-no-extremize cap** — feasibility kill: market-presence signal exists in ~one era (fall 89%
+  NO_SIGNAL, `## Prediction Market Snapshot` in exactly 1 archived binary), so era-stability un-testable;
+  marketless fallback = Arm A's point-anchor drift bomb; strict form's gain is 3 spring questions and the
+  gate itself adds ~nothing. Revival: ≥~50 binaries/era carrying the structured snapshot AND the market gate
+  earning the delta. `.../GUARD2_FINDINGS.md`.
+- **Signed deadzone haircut toward 0.5** (closed permanently) — extends the Arm B symmetric-shrink kill to
+  thresholded/high-t forms: 0 of 24 (λ,t) cells help in both well-powered eras; fire rate ≥30% even at t=0.4
+  (confident bot, median |p−0.5|≈0.32–0.38); LOTO on spring+summer degrades fall +1.12 Brier. Keeper: the
+  signed-toward-0.5 direction constraint is a design rule. Revival: calibration profile qualitatively changes
+  AND leave-one-era-out passes everywhere; don't re-grid λ/t absent that. `.../GUARD3_FINDINGS.md`.
+- **Cross-cutting** — at mid-grid all three guards fire on the same spring miss cluster (42024 / 42304 /
+  41800; often 42018 / 42577 / 42855 / 41644) — one lever measured three ways. The shipped `30bca2f` prompt
+  changes target that cluster, so any future guard replay must never fit on pre-`30bca2f` eras (the
+  roster-drift bomb with a prompt-change fuse; config-era bucketing already handles this).
 
 ## Killed / evaluated 2026-07-11 (blind-forecaster review + crowd-signal audit)
 
-Context: blind (model-IDs-stripped) judge pass over the 2026-07-11 `test_bot` run
-(`scratch/test_bot_july_11_2026 .md`), plus a live-API audit of surfacing crowd-signal
-informativeness (forecaster counts / market liquidity) in research packets.
+Context: blind judge pass over the 2026-07-11 `test_bot` run (`scratch/test_bot_july_11_2026 .md`) + a
+live-API audit of surfacing crowd-signal informativeness in research packets.
 
-- **Metaculus `similar-posts` endpoint as a research provider** — KILLED. Audited live
-  across 23 source posts / 160 related rows (`GET /api/posts/{id}/similar-posts/`). Two
-  dealbreakers, both confirmed at scale: (1) the community-prediction VALUE is `null` for our
-  bot account on 160/160 rows (`aggregations.recency_weighted.latest`), and (2) it returns
-  ONLY open questions — 160/160 unresolved, even when the source has obvious resolved
-  monthly/weekly siblings (probed TSA-weekly, cabinet-departure, WatchCharts) — so the
-  base-rate payload we wanted is absent. What remains is title + `nr_forecasters` +
-  un-followable link = decorative (tells a forecaster a related question *exists*, not what
-  the crowd thinks). Match quality is also sharply bimodal: good for AI-frontier / US-politics
-  / geopolitics / broad-finance, garbage for weather / sports / non-US elections / niche
-  product events (a Boston-Marathon source returned the "2026 World Bog Snorkelling
-  Championships" and a Zambian election), and the endpoint pads to exactly 8 with no relevance
-  score so a provider couldn't filter the junk. Also rate-limits at ~10 rapid calls → 429.
-  NOTE: exact-match Metaculus community-prediction surfacing is separately pointless in prod —
-  tournament questions are bot-specific so there's no meaningful CP, on top of the bot-account
-  API hiding (which itself is Metaculus defending against systematic CP scraping).
-
-- **Resolved-sibling base-rate lookup** (`GET /api/posts/?search=<kw>&statuses=resolved`) —
-  general version KILLED; a narrow self-history salvage is a LOW-PRIORITY optional experiment.
-  Audited live 2026-07-11 (~110 calls). The hypothesis — "full-text search over resolved
-  Metaculus questions = a leakage-safe base-rate library (past Fed cycles, Bitcoin, ACX
-  classics)" — is dead on a dealbreaker: **Metaculus null-outs `question.resolution` (plus
-  description/resolution_criteria/fine_print/CP) on every post this bot account did NOT itself
-  forecast** (view-level, presumably AIB anti-cheating; verified ~15 detail fetches, zero
-  counterexamples, no bypass via `with_cp`/`minimize`/`include_descriptions`). So the
-  Metaculus-wide resolved corpus is unreadable to our token. Endpoint mechanics all work
-  (`statuses=` plural; `resolution` null on list rows, populated on detail for
-  bot-forecast posts; formats: binary `yes`/`no`, MC option string, numeric stringified-float
-  or `above_upper_bound`/`below_lower_bound`, plus `annulled` rows to filter; server-side
-  `scheduled_resolve_time__lt` / `open_time__lt` work, `actual_resolve_time__lt` and
-  `order_by=-scheduled_resolve_time` are silently broken).
-  **Salvage (optional, low priority):** a `forecaster_id=275109&statuses=resolved` self-history
-  lookup over the bot's own ~770 resolved posts (~9mo of fall-aib + spring-aib + cup). AIB
-  recycles templates heavily, so sibling quality is excellent for recurring indicators (TSA
-  weekly volume, Fed funds bound, ISM PMIs) and repeated event-window binaries (cabinet
-  departures, city-rain, AI-benchmark thresholds); naive title-as-query works (no LLM keyword
-  step). Backtest-MEASURABLE (unlike prediction_market) via a `actual_resolve_time < question.
-  open_time` date-filter rather than a hard `is_benchmarking` disable. Design if pursued:
-  title-as-query, self-history filter, K=5, resolve-date guard, drop `annulled`. Ranked below
-  recent pipeline work on impact/complexity — the indicator series it surfaces are already
-  pulled by the resolution-source fetcher + financial-data provider (FRED/TSA.gov); its only
-  UNIQUE value is structured prior-outcomes for repeated event-window binaries not otherwise
-  in the briefing.
-
-- **Crowd-signal informativeness surfacing (forecaster count + market liquidity)** — WORTH
-  DOING, plan pending. Findings: `nr_forecasters` is already on the fetched question object
-  (forecasting-tools `MetaculusQuestion.num_forecasters`, populated from the post payload the
-  bot already fetches — zero extra HTTP). Market fetchers (`research/prediction_market.py`)
-  already RECEIVE but DISCARD total volume / open-interest / liquidity / `uniqueBettorCount`,
-  and the one liquidity number they DO print (`vol` = 24h volume) is ~always ≈0 for the
-  long-horizon questions we forecast — systematically misleading. Proposed labels (raw shown
-  alongside): Metaculus <30 thin / 30–49 decent / 50–99 good / ≥100 high-confidence;
-  real-money <$5k thin / $5k–50k decent / >$50k deep (sub-$10k is bot-dominated, may raise the
-  thin cutoff); Manifold on `uniqueBettorCount` <20/20–100/>100. Aggregators evaluated and
-  SKIPPED: Metaforecast is shut down (offline July 2026, repo archived, search API erroring);
-  Adjacent News covers only Kalshi+Polymarket (redundant) with unpriced API. PredictIt is an
-  optional cheap politics-only add (free/no-auth, but price-only, no volume/liquidity). PMXT
-  ("CCXT for prediction markets") is the thing to evaluate only if venue breadth becomes a
-  binding constraint.
-
-- **Open-bound tail-cramming on discrete/open-upper numeric** — FIX IN PROGRESS (see the
-  dedicated review). gpt-5.6-sol and gpt-5.5 crammed ~20% / ~12.6% of probability mass onto
-  the top displayed bin of Q38195 (open upper bound) instead of placing percentiles above the
-  ceiling, because a prompt line ("Allowed range … Respect the explicit bounds") is read by
-  literal-minded models as a hard cap that overrides the open-bound carve-out. Fix = prompt
-  clarification (pending redundancy check vs the existing open-bound guidance series) + a
-  WARN-only boundary-piling detector routed into GHA artifacts (EXTRACTION_RUNG-style
-  telemetry). Model-family split was clean: both OpenAI models failed, all of
-  Claude/Gemini/Grok handled it correctly.
+- **Metaculus `similar-posts` endpoint as a research provider** — KILLED. Live audit, 23 source posts / 160
+  rows (`GET /api/posts/{id}/similar-posts/`). Two dealbreakers: (1) community-prediction VALUE is `null` for
+  our bot account on 160/160 rows; (2) returns ONLY open questions (160/160 unresolved) so the base-rate
+  payload is absent. What remains (title + `nr_forecasters` + un-followable link) is decorative; match quality
+  bimodal (good AI/US-politics/geo, garbage weather/sports/non-US — a Boston-Marathon source returned "World
+  Bog Snorkelling" + a Zambian election), pads to 8 with no relevance score, rate-limits ~10 calls → 429.
+- **Resolved-sibling base-rate lookup** (`?search=<kw>&statuses=resolved`) — general version KILLED (~110-call
+  audit): **Metaculus null-outs `question.resolution` (+ description/criteria/CP) on every post this bot didn't
+  itself forecast** (view-level AIB anti-cheating; no bypass via `with_cp`/`minimize`), so the Metaculus-wide
+  resolved corpus is unreadable to our token. Endpoint mechanics work (`statuses=` plural; `actual_resolve_time__lt`
+  + `order_by=-scheduled_resolve_time` silently broken). **Salvage (optional, LOW):** a
+  `forecaster_id=275109&statuses=resolved` self-history lookup over the bot's own ~770 resolved posts —
+  AIB recycles templates so sibling quality is excellent for recurring indicators / event-window binaries,
+  naive title-as-query works, and it's backtest-MEASURABLE (date-filter `actual_resolve_time < open_time`, not
+  a hard `is_benchmarking` disable). Ranked low — the indicator series are already pulled by the
+  resolution-source + financial-data providers; unique value is structured prior-outcomes for repeated
+  event-window binaries.
+- **Crowd-signal informativeness surfacing** — WORTH DOING; market-liquidity half SHIPPED (snapshot now
+  renders thin/decent/deep labels from total volume / OI / `uniqueBettorCount`, which the fetchers previously
+  discarded — the old `vol`=24h-volume number was ~always ≈0 for long-horizon questions, misleading).
+  `nr_forecasters` is free on the fetched object (`MetaculusQuestion.num_forecasters`, zero extra HTTP).
+  Proposed labels: Metaculus <30 thin / 30–49 decent / 50–99 good / ≥100 high; real-money <$5k / $5k–50k /
+  >$50k; Manifold bettors <20/20–100/>100. Aggregators SKIPPED: Metaforecast shut down; Adjacent News
+  redundant (Kalshi+Polymarket only); PredictIt an optional politics-only price-only add; PMXT only if venue
+  breadth becomes binding.
+- **Open-bound tail-cramming on discrete/open-upper numeric** — FIXED (see the `OPEN_BOUND_PILING` telemetry
+  + nominal-bounds prompt render, CLAUDE.md). gpt-5.6-sol / gpt-5.5 crammed ~20% / ~12.6% of mass onto the top
+  displayed bin of Q38195 because "Respect the explicit bounds" read as a hard cap; both OpenAI models failed,
+  Claude/Gemini/Grok handled it. Fix: prompt clarification + a WARN-only boundary-piling detector into GHA
+  artifacts.
 
 ## Instrumentation bugs
 
-> **All three identified in May 2026 closing analysis are FIXED.** See commits in
-> the working tree as of 2026-05-10. Verification: 1187 tests pass, lint clean.
+**All three from the May 2026 closing analysis are FIXED (2026-05-10; 1187 tests pass).**
 
-1. ~~STACKER_OUTCOME tri-state marker~~ **FIXED 2026-05-10.** Producer now sets
-   `_stacker_outcome[qid] = "primary" | "fallback_llm" | "fallback_median" | "skipped"`
-   at the END of each path (after success), not at entry. `_create_unified_explanation`
-   emits both the new tri-state `STACKER_OUTCOME=...` marker AND the legacy
-   `STACKED=true|false` marker for one round of back-compat. Median-fallback path
-   (which previously silently emitted `STACKED=true`) now correctly emits
-   `STACKER_OUTCOME=fallback_median` + `STACKED=false`.
-2. ~~Targeted-research header missing from comments~~ **FIXED 2026-05-10.** Root
-   cause: `main.py:839` returned `research_report=research` instead of
-   `research_report=combined_research` on the conditional-stacking-triggered branch.
-   The `## Targeted Research (addressing model disagreement)` header lives in
-   `combined_research` but never reached the published comment. One-line fix.
-3. ~~`audit.py::emit_synthesis` KeyError on numeric-mixed cohorts~~ **FIXED 2026-05-10.**
-   Type-aware skip for non-binary entries in the spread section (the previous code
-   assumed all `ranked` entries had a `prob` key, which numeric ranking via
-   `_rank_numeric` doesn't produce).
+1. ~~STACKER_OUTCOME tri-state marker~~ FIXED — producer sets `_stacker_outcome[qid]` (primary /
+   fallback_llm / fallback_median / skipped) at the END of each path; `_create_unified_explanation` emits
+   the tri-state `STACKER_OUTCOME=` + legacy `STACKED=` markers (median-fallback previously silently emitted
+   `STACKED=true`).
+2. ~~Targeted-research header missing from comments~~ FIXED — `main.py:839` returned
+   `research_report=research` not `combined_research` on the conditional-stacking branch; one-line fix.
+3. ~~`audit.py::emit_synthesis` KeyError on numeric-mixed cohorts~~ FIXED — type-aware skip for non-binary
+   entries in the spread section (`_rank_numeric` produces no `prob` key).
 
-### New parser feature shipped this session — historical-header-aware detection
+### New parser feature shipped — historical-header-aware detection
 
-Three older code variants emitted recoverable stacker-output body signatures
-that earlier residual analyses missed: `## Stacker Meta-Analysis` (current),
-`## Meta-Analysis` (April-2 stacker ship era), and `# Meta-Analysis and
-Synthesis` (earliest H1 variant). The new
-`metaculus_bot.performance_analysis.parsing.parse_inferred_stacker_outcome`
-detects all three plus the new tri-state marker plus the legacy marker.
-This unlocked the May 2026 stacker treatment-effect estimate
-(`analysis_stacking_historical_treatment.md`) — first measurable signal in
-the project's history (n=8 stacker-ran, point estimate −0.090 Brier vs
-counterfactual, P(stacker helped) = 89.8%).
+`parse_inferred_stacker_outcome` detects three older stacker-output body signatures (`## Stacker
+Meta-Analysis`, `## Meta-Analysis`, `# Meta-Analysis and Synthesis`) plus the tri-state + legacy markers.
+Unlocked the May 2026 stacker treatment-effect estimate (`analysis_stacking_historical_treatment.md`) —
+first measurable signal (n=8 stacker-ran, −0.090 Brier vs counterfactual, P(helped)=89.8%).

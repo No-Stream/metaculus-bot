@@ -49,11 +49,12 @@ def _format_usd(value: Any) -> str:
         return str(value)
 
 
-def _fetch_auth_key(api_key: str) -> dict[str, Any]:
+def fetch_auth_key(api_key: str) -> dict[str, Any]:
     """Hit /api/v1/auth/key and return the parsed ``data`` payload.
 
     Raises ``httpx.HTTPStatusError`` on non-2xx responses so the caller can
-    surface a friendly message.
+    surface a friendly message. Shared with ``metaculus_bot.credit_telemetry``
+    (the per-run balance logging in cli.main) — one endpoint, one parser.
     """
     response = httpx.get(
         OPENROUTER_AUTH_KEY_URL,
@@ -91,7 +92,7 @@ def check_key(alias: str) -> bool:
         return False
 
     try:
-        data = _fetch_auth_key(api_key)
+        data = fetch_auth_key(api_key)
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         if status == 401:

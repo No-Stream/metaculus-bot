@@ -59,7 +59,15 @@ def _make_mc_q(qid: int = 2) -> MultipleChoiceQuestion:
     return q
 
 
-def _make_numeric_q(qid: int = 3) -> NumericQuestion:
+def _make_numeric_q(
+    qid: int = 3,
+    *,
+    lower: float = 0.0,
+    upper: float = 100.0,
+    open_lower: bool = True,
+    open_upper: bool = True,
+    cdf_size: int = 201,
+) -> NumericQuestion:
     q = MagicMock(spec=NumericQuestion)
     q.id_of_question = qid
     q.question_text = "What will X be?"
@@ -69,12 +77,35 @@ def _make_numeric_q(qid: int = 3) -> NumericQuestion:
     q.page_url = f"https://example.com/q/{qid}"
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
-    q.lower_bound = 0.0
-    q.upper_bound = 100.0
-    q.open_lower_bound = True
-    q.open_upper_bound = True
+    q.lower_bound = lower
+    q.upper_bound = upper
+    q.open_lower_bound = open_lower
+    q.open_upper_bound = open_upper
     q.zero_point = None
+    q.cdf_size = cdf_size
     return q
+
+
+def _numeric_prediction_value(cdf_size: int, *, lower: float = 0.0, upper: float = 100.0) -> dict:
+    """A cached-numeric ``prediction_value`` carrying an explicit ``cdf_size`` and a same-length CDF.
+
+    Mirrors ``serialize_prediction_value``'s numeric shape: ``cdf_size`` plus a monotone
+    ``cdf_probabilities`` list of that length. ARM_PDF reads this length to size the grid it
+    builds from each forecaster's declared percentiles (see ``_resolve_numeric_cdf_size``).
+    """
+    step = 0.998 / (cdf_size - 1)
+    cdf = [0.001 + step * i for i in range(cdf_size)]
+    return {
+        "type": "numeric",
+        "cdf_size": cdf_size,
+        "cdf_probabilities": cdf,
+        "declared_percentiles": [],
+        "lower_bound": lower,
+        "upper_bound": upper,
+        "open_lower_bound": False,
+        "open_upper_bound": True,
+        "zero_point": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +506,270 @@ class TestMultipleChoice:
         )
         assert result["success"] is True
         assert result["n_forecasters_used"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Numeric — discrete grid length (cdf_size != 201)
+# ---------------------------------------------------------------------------
+
+
+class TestNumericDiscreteGridLength:
+    """ARM_PDF must build its per-model CDF on the question's real ``cdf_size`` grid.
+
+    Discrete questions carry ``cdf_size = inbound_outcome_count + 1 != 201`` (e.g. the real
+    qid 42752 — integer counts 0..15 on [-0.5, 15.5], open upper — has cdf_size 17). Before
+    the fix ``_compute_numeric_prediction`` hard-coded 201 points, so a discrete question got
+    a 201-point CDF that was silently mis-scored against the wrong bucket count. The grid
+    length now follows the surviving forecasters' cached CDFs (their real cdf_size), mirroring
+    ``pdf_pooling`` deriving the length from the INPUT CDFs. N=201 stays byte-identical.
+    """
+
+    # Mirrors the real discrete question qid 42752.
+    DISCRETE_N = 17
+    DISCRETE_LOWER = -0.5
+    DISCRETE_UPPER = 15.5
+
+    def _discrete_min_step(self, n: int) -> float:
+        # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
+        from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP  # noqa: PLC0415
+
+        return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
+
+    def _discrete_numeric_reasoning(self) -> str:
+        # Percentiles inside the [0, 15] integer range so the student-t fit is well-posed.
+        return _numeric_percentile_reasoning({"0.1": 2.0, "0.25": 4.0, "0.5": 6.0, "0.75": 8.0, "0.9": 11.0})
+
+    def test_discrete_question_produces_cdf_size_length(self, tmp_path: Any) -> None:
+        """A cdf_size=17 discrete question yields a 17-point CDF with the scaled min-step."""
+        import numpy as np  # noqa: PLC0415
+
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+
+        cache = AblationCache(str(tmp_path))
+        question = _make_numeric_q(
+            qid=42752,
+            lower=self.DISCRETE_LOWER,
+            upper=self.DISCRETE_UPPER,
+            open_lower=False,
+            open_upper=True,
+            cdf_size=self.DISCRETE_N,
+        )
+        pv = _numeric_prediction_value(self.DISCRETE_N, lower=self.DISCRETE_LOWER, upper=self.DISCRETE_UPPER)
+        payloads = {
+            "model_a": _make_forecaster_payload(self._discrete_numeric_reasoning(), prediction_value=pv),
+            "model_b": _make_forecaster_payload(self._discrete_numeric_reasoning(), prediction_value=pv),
+        }
+        result = asyncio.run(
+            run_pdf_for_qid(
+                qid=42752, question=question, forecaster_payloads=payloads, cache=cache, force=True, min_forecasters=1
+            )
+        )
+        assert result["success"] is True
+        cdf = result["stacker_prediction"]["cdf_probabilities"]
+        assert len(cdf) == self.DISCRETE_N
+        steps = np.diff(np.asarray(cdf, dtype=float))
+        assert float(steps.min()) >= self._discrete_min_step(self.DISCRETE_N) - 1e-12
+
+    def test_concentrated_discrete_question_retains_bin_above_020(self, tmp_path: Any) -> None:
+        """A concentrated low-count discrete question keeps one integer's bin > 0.2.
+
+        The broad-distribution test above passes under the old hard-coded 201-grid max-step
+        (0.2) too — no single bin exceeds it. This concentrated case is what actually
+        exercises the grid-scaled max-step (1.0 at cdf_size=17): the old cap would have
+        clipped the peaked integer to 20% and shoved the excess onto higher integers.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+
+        cache = AblationCache(str(tmp_path))
+        question = _make_numeric_q(
+            qid=42752,
+            lower=self.DISCRETE_LOWER,
+            upper=self.DISCRETE_UPPER,
+            open_lower=False,
+            open_upper=True,
+            cdf_size=self.DISCRETE_N,
+        )
+        # Tight cluster around integer 1 -> a student-t fit that concentrates >> 20% in the
+        # F(1.5) - F(0.5) bin on the [-0.5, 15.5] step-1 grid.
+        concentrated = {"0.1": 0.4, "0.25": 0.75, "0.5": 1.0, "0.75": 1.25, "0.9": 1.6}
+        reasoning = _numeric_percentile_reasoning(concentrated)
+        pv = _numeric_prediction_value(self.DISCRETE_N, lower=self.DISCRETE_LOWER, upper=self.DISCRETE_UPPER)
+        payloads = {
+            "model_a": _make_forecaster_payload(reasoning, prediction_value=pv),
+            "model_b": _make_forecaster_payload(reasoning, prediction_value=pv),
+        }
+        result = asyncio.run(
+            run_pdf_for_qid(
+                qid=42752, question=question, forecaster_payloads=payloads, cache=cache, force=True, min_forecasters=1
+            )
+        )
+        assert result["success"] is True
+        cdf = np.asarray(result["stacker_prediction"]["cdf_probabilities"], dtype=float)
+        assert len(cdf) == self.DISCRETE_N
+        steps = np.diff(cdf)
+        # The concentrated integer's bin survives above the old 0.2 cap.
+        assert float(steps.max()) > 0.2, f"peak bin {float(steps.max())} was clipped to the 0.2 cap"
+        # Server max-step for the coarse grid still holds (0.2 * 200 / 16 = 2.5, clamped to 1.0).
+        assert float(steps.max()) <= 1.0 + 1e-9
+
+    def test_continuous_question_stays_201(self, tmp_path: Any) -> None:
+        """A cdf_size=201 continuous question still yields a 201-point CDF."""
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+
+        cache = AblationCache(str(tmp_path))
+        question = _make_numeric_q(qid=770, cdf_size=201)
+        pv = _numeric_prediction_value(201)
+        payloads = {
+            "model_a": _make_forecaster_payload(
+                _numeric_percentile_reasoning({"0.1": 30.0, "0.5": 50.0, "0.9": 70.0}), prediction_value=pv
+            ),
+            "model_b": _make_forecaster_payload(
+                _numeric_percentile_reasoning({"0.1": 25.0, "0.5": 48.0, "0.9": 75.0}), prediction_value=pv
+            ),
+        }
+        result = asyncio.run(
+            run_pdf_for_qid(qid=770, question=question, forecaster_payloads=payloads, cache=cache, force=True)
+        )
+        assert result["success"] is True
+        assert len(result["stacker_prediction"]["cdf_probabilities"]) == 201
+
+    def test_n201_output_byte_identical_to_legacy_constants(self) -> None:
+        """At N=201 the parameterized path reproduces the pre-fix hard-coded-201 behavior exactly.
+
+        The only change at N=201 is which step constants are passed to ``enforce_min_steps`` /
+        ``safe_cdf_bounds``. ``grid_step_constraints(201)`` returns exactly the constants the
+        old code hard-coded (``MIN_CDF_PROB_STEP`` / ``MAX_CDF_PROB_STEP``, which equal
+        ``safe_cdf_bounds``'s old defaults ``NUM_MIN_PROB_STEP`` / ``NUM_MAX_STEP``), so the new
+        call is bit-for-bit the old call. We assert both that precondition AND that the emitted
+        201-point CDF equals a verbatim replay of the legacy body.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        from metaculus_bot.ablation.run_pdf import _compute_numeric_prediction  # noqa: PLC0415
+        from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP  # noqa: PLC0415
+        from metaculus_bot.numeric.config import (  # noqa: PLC0415
+            MAX_CDF_PROB_STEP,
+            MIN_CDF_PROB_STEP,
+            grid_step_constraints,
+        )
+        from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
+        from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
+            eval_cdf,
+            fit_student_t_from_percentiles,
+        )
+        from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block  # noqa: PLC0415
+
+        assert grid_step_constraints(201) == (MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP) == (NUM_MIN_PROB_STEP, NUM_MAX_STEP)
+
+        question = _make_numeric_q(qid=1, lower=0.0, upper=100.0, open_lower=True, open_upper=True, cdf_size=201)
+        block = parse_structured_block(
+            _numeric_percentile_reasoning({"0.1": 30.0, "0.25": 42.0, "0.5": 50.0, "0.75": 58.0, "0.9": 70.0}),
+            "numeric",
+        )
+        assert isinstance(block, NumericStructured)
+        assert block.declared_percentiles is not None
+
+        new = _compute_numeric_prediction(block, question, cdf_size=201)
+        assert new is not None and len(new) == 201
+        new_probs = np.array([p.percentile for p in new], dtype=float)
+
+        # Verbatim replay of the pre-parameterization body (hard-coded 201, MIN_CDF_PROB_STEP,
+        # default-arg safe_cdf_bounds). Same fit call → same distribution → same CDF.
+        fit = fit_student_t_from_percentiles(block.declared_percentiles, df=5.0)
+        grid = np.linspace(0.0, 100.0, 201)
+        legacy = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
+        legacy = np.clip(legacy, 0.001, 0.999)
+        legacy = np.maximum.accumulate(legacy)
+        legacy = enforce_min_steps(legacy, MIN_CDF_PROB_STEP, upper_cap=0.999, lower_cap=0.001)
+        legacy = np.maximum.accumulate(legacy)
+        legacy = safe_cdf_bounds(legacy, True, True)
+        assert np.array_equal(new_probs, legacy)
+
+    def test_resolve_cdf_size_prefers_payload_cdf_size(self) -> None:
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+
+        question = _make_numeric_q(cdf_size=201)  # shim default; payload is authoritative
+        surviving = {"a": _make_forecaster_payload("r", prediction_value=_numeric_prediction_value(17))}
+        assert _resolve_numeric_cdf_size(surviving, question) == 17
+
+    def test_resolve_cdf_size_uses_cdf_probabilities_len_when_no_size_key(self) -> None:
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+
+        question = _make_numeric_q(cdf_size=201)
+        pv = _numeric_prediction_value(17)
+        del pv["cdf_size"]  # older cached payload without the explicit key
+        surviving = {"a": _make_forecaster_payload("r", prediction_value=pv)}
+        assert _resolve_numeric_cdf_size(surviving, question) == 17
+
+    def test_resolve_cdf_size_falls_back_to_question_when_no_numeric_payload(self) -> None:
+        from metaculus_bot.ablation.run_pdf import _resolve_numeric_cdf_size  # noqa: PLC0415
+
+        question = _make_numeric_q(cdf_size=17)
+        surviving = {"a": _make_forecaster_payload("r", prediction_value={"type": "binary", "prob": 0.5})}
+        assert _resolve_numeric_cdf_size(surviving, question) == 17
+
+    def test_seeded_cache_discrete_end_to_end_under_no_network(self, tmp_path: Any) -> None:
+        """qid-42752-shaped discrete question through ARM_PDF from a seeded cache, zero network.
+
+        Committable stand-in for the real backtests/ablation cache (gitignored): write numeric
+        forecaster payloads carrying cdf_size=17 to a tmp AblationCache, read them back, and run
+        the arm under ``no_network`` (the offline-replay zero-API guard). Output must be 17 points
+        with the scaled min-step — the arm now scores against the right bucket count.
+        """
+        import numpy as np  # noqa: PLC0415
+        from forecasting_tools import NumericQuestion  # noqa: PLC0415
+
+        from metaculus_bot.ablation.offline_replay import no_network  # noqa: PLC0415
+        from metaculus_bot.ablation.run_pdf import run_pdf_for_qid  # noqa: PLC0415
+
+        qid = 42752
+        question = NumericQuestion(
+            id_of_question=qid,
+            id_of_post=qid,
+            question_text="How many items?",
+            background_info="",
+            resolution_criteria="Integer count 0..15.",
+            fine_print="",
+            lower_bound=self.DISCRETE_LOWER,
+            upper_bound=self.DISCRETE_UPPER,
+            open_lower_bound=False,
+            open_upper_bound=True,
+            zero_point=None,
+            unit_of_measure="Items",
+            page_url=f"https://example.com/q/{qid}",
+            open_time=_OPEN,
+            scheduled_resolution_time=_RESOLVE,
+            cdf_size=self.DISCRETE_N,
+        )
+        cache = AblationCache(str(tmp_path))
+        pv = _numeric_prediction_value(self.DISCRETE_N, lower=self.DISCRETE_LOWER, upper=self.DISCRETE_UPPER)
+        for slug in ("model_a", "model_b"):
+            cache.write_forecaster_output(
+                qid=qid,
+                model_slug=slug,
+                payload=_make_forecaster_payload(self._discrete_numeric_reasoning(), prediction_value=pv),
+            )
+        payloads = cache.list_forecaster_outputs(qid)
+
+        with no_network():
+            result = asyncio.run(
+                run_pdf_for_qid(
+                    qid=qid,
+                    question=question,
+                    forecaster_payloads=payloads,
+                    cache=cache,
+                    force=True,
+                    min_forecasters=1,
+                )
+            )
+
+        assert result["success"] is True
+        cdf = result["stacker_prediction"]["cdf_probabilities"]
+        assert len(cdf) == self.DISCRETE_N
+        steps = np.diff(np.asarray(cdf, dtype=float))
+        assert float(steps.min()) >= self._discrete_min_step(self.DISCRETE_N) - 1e-12
 
 
 # ---------------------------------------------------------------------------

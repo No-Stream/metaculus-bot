@@ -76,7 +76,8 @@ ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metac
 
 # Default stacker intentionally uses claude-opus-4.5 as primary for local
 # donated-key compatibility (see the History note below), independent of the
-# current prod ``STACKER_LLM`` primary (claude-fable-5 in ``llm_configs.py``).
+# current prod ``STACKER_LLM`` primary (claude-opus-4.8 in ``llm_configs.py``
+# since 2026-07-20, when fable-5 was pulled from both roles).
 # gpt-5.6-sol as fallback matches prod STACKER_FALLBACK_LLM (different provider
 # so an Anthropic stall doesn't take both attempts down). Both are routed through
 # ``build_llm_with_openrouter_fallback`` for the donated→paid key fallback the
@@ -178,11 +179,12 @@ __all__ = [
     "run_stacker_for_arm",
 ]
 
-# Minimum forecasters required to run the stacker for an ablation arm. The
-# production path enforces ``MIN_FORECASTERS_TO_PUBLISH=3``; we relax to 2
-# here because the alternative is dropping the question for both arms (which
-# defeats the paired-comparison design when one arm could still produce a
-# valid stacker output).
+# Minimum forecasters required to run the stacker for an ablation arm. Tracks
+# the production ``MIN_FORECASTERS_TO_PUBLISH`` (lowered 3 → 2 on 2026-07-20
+# with the drop to a 3-member roster; historical eras replayed here ran at 3).
+# We hold at 2 regardless of the current prod value because the alternative is
+# dropping the question for both arms, which defeats the paired-comparison
+# design when one arm could still produce a valid stacker output.
 ABLATION_MIN_FORECASTERS = 2
 
 # Approximate per-prompt character ceiling for stacker calls. ~4 chars/token
@@ -347,8 +349,8 @@ async def _dispatch_stacker(
             build_numeric_distribution,
             sanitize_percentiles,
         )
-        from metaculus_bot.numeric.validation import (  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
-            detect_unit_mismatch,  # noqa: PLC0415  # function-scoped: see AGENTS.md
+        from metaculus_bot.numeric.validation import (  # noqa: PLC0415  # function-scoped: see AGENTS.md  # noqa: HARNESS-SCAN-EXEMPT-function-level-import
+            detect_unit_mismatch,
         )
 
         upper_msg, lower_msg = bound_messages(question)

@@ -1,0 +1,6 @@
+2026-07-17 14:45:36,441 - driver_replay - INFO - ARM START: arm_sonnet5_medium model=anthropic/claude-sonnet-5 effort=medium
+2026-07-17 14:46:44,105 - metaculus_bot.structured_output_schema - WARNING - question_type mismatch: arg=binary, payload=numeric. Refusing to parse.
+2026-07-17 14:46:44,106 - metaculus_bot.structured_output_schema - WARNING - question_type mismatch: arg=multiple_choice, payload=numeric. Refusing to parse.
+2026-07-17 14:46:44,106 - metaculus_bot.research.agentic.loop - INFO - arm=arm_sonnet5_medium GHOST_FORECAST: qtype=numeric summary=median=60.0
+2026-07-17 14:46:44,106 - metaculus_bot.research.agentic.loop - INFO - arm=arm_sonnet5_medium GAP_FILL_V2: model=anthropic/claude-sonnet-5 steps=6 tool_calls=7 searches=2 fetches=3 rendered=0 reads=0 dup_tool_calls=0 deadline_hit=False concluded_early=True wall_s=58.08 findings=9 pending_leads=4 lint_rejections=0
+2026-07-17 14:46:44,164 - driver_replay - INFO - ARM DONE: arm_sonnet5_medium wall_s=67.7 est_cost=0.52772 findings=9

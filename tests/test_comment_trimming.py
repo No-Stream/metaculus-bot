@@ -8,12 +8,27 @@ end-to-end coverage against realistic comment structure, and an explicit
 parser-compatibility check that runs the live parsing.py regexes.
 """
 
+import json
 import math
 
 import pytest
+from forecasting_tools import ReasonedPrediction
 
-from metaculus_bot.comment.trimming import TRIM_NOTICE, TrimConfig, trim_comment, trim_section
-from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMIT
+from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER
+from metaculus_bot.comment.trimming import (
+    TRIM_NOTICE,
+    TrimConfig,
+    _allocate_block_budgets,
+    trim_comment,
+    trim_section,
+)
+from metaculus_bot.constants import (
+    COMMENT_CHAR_LIMIT,
+    FORECASTS_SECTION_CHAR_LIMIT,
+    RESEARCH_SECTION_CHAR_LIMIT,
+    SUMMARY_SECTION_CHAR_LIMIT,
+)
+from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
 # ---------------------------------------------------------------------------
 # Legacy section trim (unchanged behavior — keeps header, uses tail)
@@ -22,7 +37,9 @@ from metaculus_bot.constants import COMMENT_CHAR_LIMIT, REPORT_SECTION_CHAR_LIMI
 
 def test_trim_section_preserves_header_and_tail() -> None:
     header = "## Report 1 Summary"
-    body_length = REPORT_SECTION_CHAR_LIMIT + 512
+    # "unit-test-section" has no known suffix, so it routes to the generic
+    # section_limit default (FORECASTS_SECTION_CHAR_LIMIT).
+    body_length = FORECASTS_SECTION_CHAR_LIMIT + 512
     body = "A" * body_length
     original = f"{header}\n{body}"
 
@@ -30,9 +47,9 @@ def test_trim_section_preserves_header_and_tail() -> None:
 
     assert trimmed.splitlines()[0] == header
     assert TRIM_NOTICE in trimmed.splitlines()[1]
-    assert len(trimmed) == REPORT_SECTION_CHAR_LIMIT
+    assert len(trimmed) == FORECASTS_SECTION_CHAR_LIMIT
 
-    available = REPORT_SECTION_CHAR_LIMIT - len(header) - len(TRIM_NOTICE) - 2
+    available = FORECASTS_SECTION_CHAR_LIMIT - len(header) - len(TRIM_NOTICE) - 2
     assert available > 0
     expected_tail = body[-available:]
     assert trimmed.endswith(expected_tail)
@@ -608,3 +625,319 @@ class TestAgainstRealHistoricalData:
             checked += 1
 
         assert checked >= 50, f"expected to exercise dozens of real comments, only hit {checked}"
+
+
+# ---------------------------------------------------------------------------
+# Per-section budgets + block-aware FORECASTS trim (Model:-line preservation)
+#
+# The FORECASTS (rationales) section gets its own large budget and is trimmed
+# block-by-block, so a per-forecaster overflow no longer destroys the first
+# forecaster's ``Model:`` attribution line (measured 29/29 in July 2026) or its
+# JSON forecast block — both parsed by the residual pipeline.
+# ---------------------------------------------------------------------------
+
+
+_RATIONALE_MODELS: list[tuple[int, str]] = [
+    (1, "gpt-5.6-sol"),
+    (2, "gpt-5.5"),
+    (3, "claude-opus-4.7"),
+    (4, "claude-opus-4.8"),
+    (5, "gemini-3.1-pro-preview"),
+    (6, "grok-4.5"),
+]
+
+
+def _numeric_json_block(base: float) -> str:
+    """A schema-valid numeric STRUCTURED FORECAST block (the 3 required percentiles)."""
+    payload = {
+        "question_type": "numeric",
+        "declared_percentiles": {"0.1": base, "0.5": base + 10.0, "0.9": base + 20.0},
+    }
+    return "```json\n" + json.dumps(payload) + "\n```"
+
+
+def _rationale_block(idx: int, model: str, *, prose_tokens: int, base: float) -> str:
+    """One ``## R1: Forecaster N Reasoning`` block: header + Model line + prose + JSON block."""
+    return (
+        f"## R1: Forecaster {idx} Reasoning\n"
+        f"Model: openrouter/provider/{model}\n"
+        f"{'reasoning_token ' * prose_tokens}\n"
+        f"{_numeric_json_block(base)}"
+    )
+
+
+def _rationales_section(prose_tokens: int) -> str:
+    return "\n\n".join(_rationale_block(i, m, prose_tokens=prose_tokens, base=100.0 + i) for i, m in _RATIONALE_MODELS)
+
+
+class TestSectionBudgetRouting:
+    """trim_section picks the budget (and block-awareness) from the section name."""
+
+    def test_rationales_route_to_forecasts_budget(self) -> None:
+        rationales = _rationales_section(prose_tokens=1200)
+        assert len(rationales) > FORECASTS_SECTION_CHAR_LIMIT, "precondition: section must overflow"
+        trimmed = trim_section(rationales, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+
+    def test_research_routes_to_research_budget(self) -> None:
+        research = "## Report 1 Research\n" + ("research_token " * 6_000)
+        assert len(research) > RESEARCH_SECTION_CHAR_LIMIT
+        trimmed = trim_section(research, "report_1_research")
+        assert len(trimmed) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert TRIM_NOTICE in trimmed
+
+    def test_summary_routes_to_summary_budget(self) -> None:
+        summary = "## Report 1 Summary\n" + ("X" * (SUMMARY_SECTION_CHAR_LIMIT + 2_000))
+        trimmed = trim_section(summary, "report_1_summary")
+        assert len(trimmed) <= SUMMARY_SECTION_CHAR_LIMIT
+
+
+class TestRationaleBlockAwareTrim:
+    """An over-budget FORECASTS section keeps every block's Model: line + JSON block."""
+
+    def test_all_six_model_lines_and_blocks_survive(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_forecaster_model_map,
+            parse_per_model_numeric_percentiles,
+            parse_per_model_reasoning_text,
+        )
+
+        rationales = _rationales_section(prose_tokens=1500)  # ~145k, well over budget
+        assert len(rationales) > FORECASTS_SECTION_CHAR_LIMIT
+
+        trimmed = trim_section(rationales, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+        assert trimmed.startswith("## R1: Forecaster 1 Reasoning")
+        # The middle prose is sacrificed, so the trim notice fires.
+        assert TRIM_NOTICE in trimmed
+
+        # Wrap in the # FORECASTS header the R1 parsers expect.
+        comment = f"# FORECASTS\n{trimmed}\n"
+
+        model_map = parse_forecaster_model_map(comment)
+        assert len(model_map) == 6, f"expected all 6 Model: lines, got {model_map}"
+        for i, model in _RATIONALE_MODELS:
+            assert model_map[i] == model
+
+        percentiles = parse_per_model_numeric_percentiles(comment)
+        assert len(percentiles) == 6, f"expected all 6 JSON blocks recovered, got {sorted(percentiles)}"
+
+        bodies = parse_per_model_reasoning_text(comment)
+        assert len(bodies) == 6
+
+
+# ---------------------------------------------------------------------------
+# Stacker-combined FORECASTS trim (per-base-model attribution)
+#
+# When stacking fires, combine_stacker_and_base_reasoning folds the stacker's
+# meta-analysis and every base model's reasoning into ONE ``## R1: Forecaster 1
+# Reasoning`` block. The pre-fix single-body trim kept only the LAST json block
+# in the whole combined body and orphaned it from its ``Model:`` line, so
+# parsing._split_stacker_combined_body re-attributed that trailing model's
+# forecast values to the last surviving base model — silent misattribution in
+# residual analysis. Stacking is prod-disabled today, but the trim runs in
+# backtests/ablation and is armed for any stacking re-enable, so it must keep
+# each base model paired with its own line and forecast block.
+# ---------------------------------------------------------------------------
+
+
+class TestStackerCombinedBlockTrim:
+    """An over-budget stacker-combined R1 body keeps each base model's own
+    ``Model:`` line and json forecast block — no cross-model misattribution."""
+
+    _STACKER_META_BASE = 300.0
+    # Well-separated bases so a misattributed block is unmistakable in the
+    # recovered percentiles (a neighbor's values would be off by hundreds).
+    _BASE_MODELS: list[tuple[str, float]] = [
+        ("openrouter/openai/gpt-5.6-sol", 100.0),
+        ("openrouter/anthropic/claude-opus-4.8", 500.0),
+        ("openrouter/google/gemini-3.1-pro-preview", 900.0),
+    ]
+
+    def _combined_body(self, *, prose_tokens: int) -> str:
+        """A single ``## R1: Forecaster 1 Reasoning`` block for a stacked question.
+
+        Built exactly as production does: base predictions carry the bot-injected
+        ``Model:`` prefix, each with a DISTINCT numeric forecast block, folded via
+        combine_stacker_and_base_reasoning under the stacker meta-analysis.
+        """
+        prose = "reasoning_token " * prose_tokens
+        base_preds = [
+            ReasonedPrediction(
+                prediction_value=base,
+                reasoning=f"Model: {path}\n\n{prose}\n{_numeric_json_block(base)}",
+            )
+            for path, base in self._BASE_MODELS
+        ]
+        meta_text = f"stacker synthesis prose.\n{prose}\n{_numeric_json_block(self._STACKER_META_BASE)}"
+        combined = combine_stacker_and_base_reasoning(meta_text, base_preds)
+        return f"## R1: Forecaster 1 Reasoning\n{combined}"
+
+    @staticmethod
+    def _expected(base: float) -> list[tuple[float, float]]:
+        # _numeric_json_block emits percentiles {0.1, 0.5, 0.9} → percent labels.
+        return [(10.0, base), (50.0, base + 10.0), (90.0, base + 20.0)]
+
+    def test_each_base_model_keeps_own_line_and_block_after_trim(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_per_model_numeric_percentiles,
+            parse_per_model_reasoning_text,
+        )
+
+        # ~130k across 4 sub-blocks — large enough that the pre-fix single-body
+        # trim would cut off a later base model's Model: line and orphan its
+        # json block onto a neighbor.
+        text = self._combined_body(prose_tokens=2000)
+        assert len(text) > FORECASTS_SECTION_CHAR_LIMIT, "precondition: must overflow"
+
+        trimmed = trim_section(text, "report_1_rationales")
+        assert len(trimmed) <= FORECASTS_SECTION_CHAR_LIMIT
+        # Middle prose sacrificed → the notice fires.
+        assert TRIM_NOTICE in trimmed
+        # The R1 header and the stacker delimiter survive verbatim; the parser's
+        # stacker-body detection keys on the delimiter.
+        assert trimmed.startswith("## R1: Forecaster 1 Reasoning")
+        assert STACKED_BASE_REASONING_HEADER in trimmed
+        # Every base model keeps its Model: attribution line.
+        for path, _ in self._BASE_MODELS:
+            assert f"Model: {path}" in trimmed, f"lost Model: line for {path}"
+
+        # Value-equality per model is the assertion that catches misattribution:
+        # each base model must recover ITS OWN distinct percentiles.
+        comment = f"# FORECASTS\n{trimmed}\n"
+        percentiles = parse_per_model_numeric_percentiles(comment)
+        assert percentiles["gpt-5.6-sol"] == self._expected(100.0)
+        assert percentiles["claude-opus-4.8"] == self._expected(500.0)
+        assert percentiles["gemini-3.1-pro-preview"] == self._expected(900.0)
+        # The stacker portion has no Model: line, so its own block is recovered
+        # under the "Forecaster 1" fallback key.
+        assert percentiles["Forecaster 1"] == self._expected(self._STACKER_META_BASE)
+
+        # Per-base-model prose stays attributable for all three.
+        bodies = parse_per_model_reasoning_text(comment)
+        for name in ("gpt-5.6-sol", "claude-opus-4.8", "gemini-3.1-pro-preview"):
+            assert name in bodies, f"lost reasoning body for {name}"
+
+    def test_under_budget_stacked_body_untouched(self) -> None:
+        text = self._combined_body(prose_tokens=50)
+        assert len(text) < FORECASTS_SECTION_CHAR_LIMIT, "precondition: must fit under budget"
+        assert trim_section(text, "report_1_rationales") == text
+
+
+class TestFullCommentPreservesAttribution:
+    """End-to-end: a >150k raw comment trims to under the ceiling with attribution intact."""
+
+    def test_within_budgets_and_fully_parseable(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_forecaster_model_map,
+            parse_per_model_forecasts,
+            parse_per_model_numeric_percentiles,
+        )
+
+        bullets = "\n".join(f"*Forecaster {i} ({m})*: Median: {100 + i}" for i, m in _RATIONALE_MODELS)
+        raw_summary = f"## Report 1 Summary\n### Forecasts\n{bullets}\n\n### Research Summary\n_stub_"
+        raw_research = "## Report 1 Research\n" + ("research_token " * 6_000)
+        raw_rationales = _rationales_section(prose_tokens=1500)
+
+        raw_total = len(raw_summary) + len(raw_research) + len(raw_rationales)
+        assert raw_total > COMMENT_CHAR_LIMIT, "precondition: untrimmed comment must exceed the ceiling"
+
+        summary = trim_section(raw_summary, "report_1_summary")
+        research = trim_section(raw_research, "report_1_research")
+        rationales = trim_section(raw_rationales, "report_1_rationales")
+
+        assert len(summary) <= SUMMARY_SECTION_CHAR_LIMIT
+        assert len(research) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert len(rationales) <= FORECASTS_SECTION_CHAR_LIMIT
+
+        # Assemble like forecast_bot._create_unified_explanation, then apply the
+        # whole-comment trim as build_unified_explanation does.
+        assembled = (
+            "# SUMMARY\n*Question*: will X happen?\n\n"
+            f"{summary}\n\n"
+            f"# RESEARCH\n{research}\n\n"
+            f"# FORECASTS\n{rationales}\n"
+            "<!-- STACKED=false -->\n"
+        )
+        final = trim_comment(assembled)
+        assert len(final) <= COMMENT_CHAR_LIMIT
+
+        forecasts = parse_per_model_forecasts(final)
+        assert len(forecasts) == 6, f"lost summary bullets: {forecasts}"
+
+        model_map = parse_forecaster_model_map(final)
+        assert len(model_map) == 6, f"lost Model: lines: {model_map}"
+        for i, model in _RATIONALE_MODELS:
+            assert model_map[i] == model
+
+        percentiles = parse_per_model_numeric_percentiles(final)
+        assert len(percentiles) == 6, f"lost per-model JSON blocks: {sorted(percentiles)}"
+
+
+# ---------------------------------------------------------------------------
+# Water-fill allocator (_allocate_block_budgets)
+#
+# The block-aware FORECASTS trim splits its budget across per-forecaster blocks
+# via this allocator. The tests above build near-equal blocks, so ``fits`` is
+# always empty and the allocator degenerates to a flat ``total // n`` split —
+# the redistribution branch (keep small blocks whole, hand the freed budget to
+# the large ones) is never exercised there. These tests hit it directly. The
+# load-bearing invariant: under a shortfall the budgets sum to EXACTLY ``total``
+# — a reclaim/remainder accounting bug that overshot would push the assembled
+# comment past COMMENT_CHAR_LIMIT and Metaculus would reject the submission.
+# ---------------------------------------------------------------------------
+
+
+class TestAllocateBlockBudgets:
+    def test_tiny_block_kept_whole_freed_budget_redistributed(self) -> None:
+        # One tiny block beside several large ones, with a budget well below
+        # their combined size — the common prod case (a soft-deadline-truncated
+        # rationale next to full-length ones).
+        sizes = [100, 40_000, 40_000, 40_000]
+        total = 60_000
+        assert total < sum(sizes), "precondition: shortfall — exercises the redistribution branch"
+
+        budgets = _allocate_block_budgets(sizes, total)
+
+        # (a) whole budget consumed exactly — nothing lost or invented.
+        assert sum(budgets) == total
+        # (b) the tiny block is kept whole (redistribution didn't trim it).
+        assert budgets[0] == 100
+        # (c) each large block gets strictly more than the flat even split,
+        # because the tiny block's unused share was handed back to them.
+        flat_share = total // len(sizes)
+        for i in (1, 2, 3):
+            assert budgets[i] > flat_share
+        # No block is ever budgeted above its own size.
+        for size, budget in zip(sizes, budgets, strict=True):
+            assert budget <= size
+
+    def test_multi_round_water_fill_keeps_unequal_small_blocks_whole(self) -> None:
+        # Genuinely multi-round: block 1 (25k) does NOT fit the round-1 share of
+        # 20k (= 60k // 3), but once block 0's budget is reclaimed the round-2
+        # share rises to ~29.5k (= 59k // 2) and block 1 then fits. Both small
+        # blocks must survive whole; only the largest is trimmed.
+        sizes = [1_000, 25_000, 40_000]
+        total = 60_000
+        assert total < sum(sizes)
+
+        budgets = _allocate_block_budgets(sizes, total)
+
+        assert sum(budgets) == total
+        assert budgets[0] == 1_000  # round-1 fit, kept whole
+        assert budgets[1] == 25_000  # round-2 fit, kept whole
+        assert budgets[2] < 40_000  # the only genuinely overflowing block is trimmed
+        assert budgets[2] > total // len(sizes)  # ...and gets more than the flat share
+
+    def test_budget_at_least_sum_keeps_every_block_whole(self) -> None:
+        # Surplus budget: everything fits, so each block keeps its full size and
+        # the total is deliberately NOT fully allocated.
+        sizes = [100, 200, 300]
+        budgets = _allocate_block_budgets(sizes, total=10_000)
+        assert budgets == sizes
+
+    def test_single_block_trimmed_to_total(self) -> None:
+        assert _allocate_block_budgets([5_000], total=3_000) == [3_000]
+
+    def test_single_block_kept_whole_when_it_fits(self) -> None:
+        assert _allocate_block_budgets([5_000], total=8_000) == [5_000]

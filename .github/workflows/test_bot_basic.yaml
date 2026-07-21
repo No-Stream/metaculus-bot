@@ -1,0 +1,159 @@
+name: Test Bot Basic (1 numeric Q smoke)
+
+# Minimal smoke variant of test_bot.yaml that forecasts EXACTLY ONE question —
+# a plain-continuous numeric (Q14333 "Age of Oldest Human as of 2100"), chosen
+# because numeric has the deepest type-specific pipeline and is the most likely
+# to break. Every research flag matches test_bot.yaml so this exercises the
+# whole pipeline (AskNews + native search + Gemini grounded + financial data +
+# gap-fill v1/v2 + prediction markets + resolution source + TS anchor) end-to-end
+# on one question, in prod mode (is_benchmarking=False → publishes to Metaculus).
+#
+# COST: ~$2.60/question at current config — a single run spends real OpenRouter /
+# research API credits AND publishes a comment to Metaculus.
+#
+# NOTE: workflow_dispatch workflows are only dispatchable once the workflow file
+# exists on the DEFAULT branch (GitHub limitation) — this file will not appear in
+# the Actions "Run workflow" UI until it is merged to main.
+
+on:
+  workflow_dispatch:
+
+# Own concurrency group (workflow name differs from Test Bot), so a basic smoke
+# run never contends with the full Test Bot run.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    # Backstop only: a single-question run finishes far sooner. Without this, a
+    # wedged run holds the concurrency group for GitHub's 6h default.
+    timeout-minutes: 60
+    steps: # sets up the steps that will be run in order
+      # setup repository with all necessary dependencies - keep as is
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --no-dev --frozen
+      # Chromium for gap-fill v2's rendered-fetch rung (playwright). --with-deps
+      # pulls the system libraries chromium needs on ubuntu runners. The loop
+      # degrades to plain fetch if the browser is missing, so this step is
+      # belt-and-suspenders rather than run-critical.
+      - name: Install Playwright Chromium
+        id: playwright_install
+        continue-on-error: true
+        run: uv run --frozen --no-dev playwright install --with-deps chromium
+      - name: Warn if Playwright install failed
+        if: steps.playwright_install.outcome == 'failure'
+        run: echo "::warning title=Playwright install failed::Chromium install failed — gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
+      - name: Run bot
+        shell: bash
+        # Repo is public, so uploaded artifacts are effectively public. Log content
+        # (question URLs, predictions, degradation counters) is already public via
+        # Metaculus — acceptable, no redaction. A secret-leakage audit passed: no
+        # logger emits credentials; keys travel only in request headers.
+        # shell: bash yields `set -eo pipefail`, so the `python | tee` pipeline
+        # preserves the intentional sys.exit(1) degradation alert (cli.py ~L186);
+        # a bare `run:` (bash -e, no pipefail) would swallow it as tee's exit 0.
+        run: |
+          mkdir -p run_logs
+          uv run --frozen --no-dev python main.py --mode test_questions 2>&1 | tee "run_logs/run_${GITHUB_RUN_ID}_$(date -u +%Y%m%dT%H%M%SZ).log"
+        # this reads the environment variables from the github repository.
+        # Store under Settings --> Secrets and variables --> Actions
+        env:
+          # Single-question override consumed by cli.py's test_questions path:
+          # Q14333 "Age of Oldest Human as of 2100" (plain-continuous numeric).
+          # Unset, main.py would run the full evergreen EXAMPLE_QUESTIONS set.
+          TEST_QUESTIONS_OVERRIDE: 'https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/'
+          # Unbuffered stdout/stderr so log lines stream in real time and nothing
+          # is lost if the run crashes before a buffer flush.
+          PYTHONUNBUFFERED: '1'
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          # Exa semantic search (gap-fill v2's search_web tool; also the legacy
+          # SmartSearcher fallback path). Secret name is lowercase exa_key
+          # (funded 2026-07-16).
+          EXA_API_KEY: ${{ secrets.exa_key }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OAI_ANTH_OPENROUTER_KEY: ${{ secrets.OAI_ANTH_OPENROUTER_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_MAX_CONCURRENCY: '1'
+          ASKNEWS_MAX_RPS: '0.2'
+          # Disable litellm's aiohttp transport (default since v1.71.x): under
+          # concurrent async bursts it raises near-instant connection failures
+          # litellm re-wraps as a 1ms Timeout (litellm #14895; see
+          # scratch_docs_and_planning/transient_retry_fix.md). Code already sets
+          # this default in metaculus_bot/__init__.py; pinned here for parity.
+          DISABLE_AIOHTTP_TRANSPORT: 'true'
+          # Native search runs in parallel with AskNews; model defaults to
+          # openai/gpt-5.6-terra (low effort, verbosity=low, 360s) per constants.py.
+          NATIVE_SEARCH_ENABLED: 'true'
+          FINANCIAL_DATA_ENABLED: 'true'
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source.
+          # GOOGLE_API_KEY is the operator's personal Google AI Studio key (stored
+          # in CI as secrets.GEMINI_API_KEY). The grounded-search side has no
+          # donated/shared path — Google AI Studio doesn't offer one.
+          GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_SEARCH_ENABLED: 'true'
+          # OpenRouter Gemini routing (forecaster, stacker, summarizer when the
+          # ensemble includes a Google model). When 'true' (default since
+          # 2026-06-16), Gemini OpenRouter calls prefer the Metaculus-donated
+          # OAI_ANTH_OPENROUTER_KEY wrapper with personal-key fallback. On because
+          # Metaculus raised the Google rate limits — the donated key serves most
+          # Gemini now; gemini-3.1-pro-preview is pinned to the personal key
+          # (DONATED_KEY_BLOCKED_GOOGLE_MODELS blocklist; no donated attempt, no
+          # 429) pending the Metaculus BYOK fix.
+          GEMINI_USE_DONATED_OPENROUTER_KEY: 'true'
+          # Second-pass gap-fill: analyzer identifies gaps in first-pass research,
+          # parallel grounded Gemini searches resolve each. Fails soft.
+          GAP_FILL_ENABLED: 'true'
+          # Agentic gap-fill v2 (bounded research loop; runs concurrently with
+          # v1 when both are on). ON since 2026-07-17 after smoke + blind driver
+          # eval + Exa confirmation; v1 stays on for an overlap window.
+          GAP_FILL_V2_ENABLED: 'true'
+          # Prediction-market snapshot provider: Polymarket + Kalshi + Manifold.
+          # Manual workflow_dispatch runs use this for end-to-end testing in prod
+          # mode (is_benchmarking=False).
+          PREDICTION_MARKETS_ENABLED: 'true'
+          # Tier-1 resolution-source fetcher: deterministically fetches URLs cited
+          # in the resolution criteria (plain HTTP + trafilatura), no LLM calls.
+          RESOLUTION_SOURCE_ENABLED: 'true'
+          # Time-series anchor: deterministic empirical P10/P50/P90 band from a
+          # question's own resolution series (FRED/yfinance). Text anchor ON since
+          # 2026-07-17 (post smoke validation; see FUTURE.md "Time-series anchor").
+          TS_ANCHOR_ENABLED: 'true'
+          # TS anchor chart image side-channel (vision message to base models).
+          # OFF pending the text-vs-image A/B (see FUTURE.md "TS anchor chart image").
+          TS_ANCHOR_CHART_ENABLED: 'false'
+          # Stacking disabled on all types (ablation: stacker <= median on binary,
+          # hurts numeric CRPS; stacker base model is a weak binary forecaster).
+          NUMERIC_STACKING_ENABLED: 'false'
+          BINARY_STACKING_ENABLED: 'false'
+          MC_STACKING_ENABLED: 'false'
+          OPENAI_AGENTS_DISABLE_TRACING: 'true'
+          # Raw research-provider payload log: each provider's RAW return (AskNews
+          # article dicts per phase, native/Gemini raw responses + grounding, market
+          # contracts, resolution-source fetches, gap-fill results) →
+          # run_logs/raw_research_<run_id>.jsonl, uploaded in the logs-* artifact
+          # below. make sync_raw_research archives it (pulls research-* + logs-*).
+          RAW_RESEARCH_LOG_ENABLED: 'true'
+      # Durable capture of run logs (telemetry lives on stderr, tee'd to run_logs/).
+      # Artifact name is logs-* (NOT research-*) so scripts/download_research.py's
+      # research-* enumeration never picks up test runs.
+      - name: Upload run logs
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-${{ github.run_id }}
+          path: run_logs/
+          retention-days: 90
+          if-no-files-found: ignore

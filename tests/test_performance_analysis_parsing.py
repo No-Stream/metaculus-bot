@@ -26,6 +26,7 @@ from metaculus_bot.performance_analysis.parsing import (
     _iter_per_model_blocks,
     _parse_probability,
     _summary_section_for_bullets,
+    _validate_percentile_labels,
     annotate_forecaster_bullets_with_models,
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
@@ -83,6 +84,13 @@ class TestParseStackerOutcomeMarker:
 
     def test_skipped_marker(self):
         assert parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=skipped -->\n") == "skipped"
+
+    def test_skipped_config_off_marker(self):
+        # The alternation-order case: "skipped" must not shadow the longer
+        # "skipped_config_off" literal (config-suppressed vs below-threshold).
+        assert (
+            parse_stacker_outcome_marker("...\n<!-- STACKER_OUTCOME=skipped_config_off -->\n") == "skipped_config_off"
+        )
 
     def test_absent_marker_returns_none(self):
         assert parse_stacker_outcome_marker("# SUMMARY\nNo marker here\n") is None
@@ -855,7 +863,7 @@ class TestRealDataRegression:
                 trimmed_bad.append(rec["post_id"])
             else:
                 parser_bad.append((rec["post_id"], bad_keys))
-        assert not parser_bad, f"Non-trim-related parse failures: {parser_bad[:10]}"
+        assert not parser_bad, f"Non-trim-related parse failures: {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
         assert fully_parsed / total >= 0.90, (
             f"Only {fully_parsed}/{total} records parsed cleanly ({len(trimmed_bad)} due to comment trimming)"
         )
@@ -1935,3 +1943,276 @@ class TestMcSummaryBulletsStayProseOnly:
         result = parse_per_model_mc_option_probs(comment)
         # Summary bullets (the bot's rendered values), NOT the R1 body's block.
         assert result == {"gpt-5.5": {"Option A": 0.40, "Option B": 0.60}}
+
+
+# ---------------------------------------------------------------------------
+# Tolerant raw-JSON salvage rung (strict block > prose > tolerant).
+#
+# Historical 2026-05/06-era blocks carry retired tier-2 scaffold fields
+# (mixture_components, tails, distribution_family_hint) or values the current
+# strict schemas reject (concentration=0.0). parse_structured_block's
+# extra="forbid" schemas return None for the whole block, and block-only
+# rationales (gemini-3.1-pro in that era) have no prose value lines either —
+# so those models silently vanished from recovered per-model data. That parse
+# loss produced the false "gemini missed 5 of 45 summer questions" finding in
+# the 2026-07-15 ensemble screening (4 of the 5 were recovery artifacts; only
+# qid 44136 was a real soft-deadline drop). The payload shapes below are taken
+# verbatim from the affected comments (qids 43652/43746/43656).
+# ---------------------------------------------------------------------------
+
+
+class TestTolerantBlockSalvage:
+    def test_numeric_block_with_retired_tier2_fields_salvaged(self):
+        # Gemini's actual Q43652-era block shape: strict-invalid (retired
+        # fields + only 3 declared percentiles), and NO prose value lines.
+        block = _fenced_json_block(
+            {
+                "question_type": "numeric",
+                "declared_percentiles": {"0.1": -15.5, "0.5": -0.2, "0.9": 16.5},
+                "distribution_family_hint": "normal",
+                "tails": {"below_min_expected": 0.05, "above_max_expected": 0.06},
+                "mixture_components": [{"weight": 1.0, "mean": -0.5, "sd": 9.0}],
+            }
+        )
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/google/gemini-3.1-pro-preview\n\n"
+            f"block-only rationale, no prose lines.\n\n{block}\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gemini-3.1-pro-preview": [(10.0, -15.5), (50.0, -0.2), (90.0, 16.5)]}
+
+    def test_numeric_prose_still_wins_over_tolerant_salvage(self):
+        # Transition-era: strict-invalid block AND prose lines. Prose keeps
+        # precedence (tolerant is strictly the LAST rung).
+        block = _fenced_json_block(
+            {
+                "question_type": "numeric",
+                "declared_percentiles": {"0.1": 999.0, "0.5": 1000.0, "0.9": 1001.0},
+                "mixture_components": [],
+            }
+        )
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            f"{block}\n\n"
+            "Percentile 10: 120.0\n"
+            "Percentile 50: 150.0\n"
+            "Percentile 90: 180.0\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(10.0, 120.0), (50.0, 150.0), (90.0, 180.0)]}
+
+    def test_numeric_garbage_keys_and_nonfinite_values_skipped(self):
+        block = _fenced_json_block(
+            {
+                "question_type": "numeric",
+                "declared_percentiles": {"0.5": 150.0, "not-a-pct": 1.0, "1.5": 2.0},
+                "tails": {},
+            }
+        )
+        comment = f"## R1: Forecaster 1 Reasoning\nModel: openrouter/openai/gpt-5.5\n\n{block}\n"
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(50.0, 150.0)]}
+
+    def test_mc_block_with_zero_concentration_salvaged(self):
+        # Gemini's actual Q43656-era MC block: concentration=0.0 fails the
+        # strict >0 validator and the trailing prose lines lack the "- "
+        # bullet prefix the regex fallback needs.
+        block = _fenced_json_block(
+            {
+                "question_type": "multiple_choice",
+                "option_probs": {"Option A": 0.6, "Option B": 0.4},
+                "other_mass": 0.0,
+                "concentration": 0.0,
+            }
+        )
+        base_preds = [
+            _build_base_pred(
+                "openrouter/google/gemini-3.1-pro-preview",
+                f"block-only rationale.\n\n{block}\n\nOption A: 60%\nOption B: 40%",
+            ),
+        ]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "multiple_choice")
+        assert result == {"gemini-3.1-pro-preview": {"Option A": 0.6, "Option B": 0.4}}
+
+    def test_binary_block_with_retired_scenario_shape_salvaged(self):
+        # Old scenarios shape (description/conditional_yes instead of
+        # name/probability) fails extra="forbid"; posterior_prob is salvaged.
+        block = _fenced_json_block(
+            {
+                "question_type": "binary",
+                "posterior_prob": 0.62,
+                "scenarios": [{"description": "conviction upheld", "conditional_yes": 0.98}],
+            }
+        )
+        base_preds = [
+            _build_base_pred("openrouter/google/gemini-3.1-pro-preview", f"block-only rationale.\n\n{block}"),
+        ]
+        combined = combine_stacker_and_base_reasoning("stacker meta", base_preds)
+        comment = _build_stacked_comment(combined)
+        result = parse_per_base_model_forecasts(comment, "binary")
+        assert result == {"gemini-3.1-pro-preview": "62.0%"}
+
+    def test_conflicting_question_type_not_salvaged(self):
+        # A binary-typed block in a numeric parse context must not be salvaged.
+        block = _fenced_json_block({"question_type": "binary", "posterior_prob": 0.5})
+        comment = f"## R1: Forecaster 1 Reasoning\nModel: openrouter/openai/gpt-5.5\n\n{block}\n"
+        assert parse_per_model_numeric_percentiles(comment) == {}
+
+    def test_malformed_json_not_salvaged(self):
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            '```json\n{"question_type": "numeric", "declared_percentiles": {"0.5": \n```\n'
+        )
+        assert parse_per_model_numeric_percentiles(comment) == {}
+
+
+# ---------------------------------------------------------------------------
+# Double-scaled percentile-label guard (_validate_percentile_labels).
+#
+# parse_per_model_numeric_percentiles emits labels in the PERCENT convention
+# (2.5, 5, ..., 97.5, 99) — always strictly inside (0, 100). A forecaster that
+# writes its block keys in percent form (2.5, 5, ...) instead of the decimal
+# convention (0.025, 0.05, ...) has them multiplied by 100 by the block readers,
+# producing double-scaled labels (250, 500, ..., 9750). That was the qid=43684
+# grok-4.3 record the 2026-07-15 coherence study had to hand-drop. The guard
+# passes clean labels through, deterministically rescales an exact
+# canonical-set*100 double-scaling, and rejects any other out-of-range set.
+# ---------------------------------------------------------------------------
+
+# Canonical percent-form label sets (mirrors STANDARD_PERCENTILES * 100).
+_CANONICAL_LABELS_11 = [2.5, 5.0, 10.0, 20.0, 40.0, 50.0, 60.0, 80.0, 90.0, 95.0, 97.5]
+_CANONICAL_LABELS_13 = [1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 50.0, 60.0, 80.0, 90.0, 95.0, 97.5, 99.0]
+
+
+def _pairs(labels: list[float]) -> list[tuple[float, float]]:
+    """Build (label, value) pairs with monotone-increasing dummy values."""
+    return [(label, float(i)) for i, label in enumerate(labels)]
+
+
+def _prose_percentile_lines(labels: list[float], values: list[float]) -> str:
+    """Render ``Percentile L: V`` prose lines (labels emitted without trailing .0)."""
+    return "\n".join(f"Percentile {label:g}: {value}" for label, value in zip(labels, values, strict=True))
+
+
+class TestValidatePercentileLabels:
+    """Unit coverage for the three branches of the label guard."""
+
+    def test_valid_11_point_set_passes_through_unchanged(self):
+        pairs = _pairs(_CANONICAL_LABELS_11)
+        assert _validate_percentile_labels(pairs, model="gpt-5.5") == pairs
+
+    def test_valid_13_point_set_passes_through_unchanged(self):
+        pairs = _pairs(_CANONICAL_LABELS_13)
+        assert _validate_percentile_labels(pairs, model="gpt-5.5") == pairs
+
+    def test_exact_11_point_x100_is_rescaled(self):
+        double_scaled = _pairs([label * 100.0 for label in _CANONICAL_LABELS_11])
+        result = _validate_percentile_labels(double_scaled, model="grok-4.3", question_id=43684)
+        assert result == _pairs(_CANONICAL_LABELS_11)
+
+    def test_exact_13_point_x100_is_rescaled(self):
+        double_scaled = _pairs([label * 100.0 for label in _CANONICAL_LABELS_13])
+        result = _validate_percentile_labels(double_scaled, model="gpt-5.5")
+        assert result == _pairs(_CANONICAL_LABELS_13)
+
+    def test_out_of_range_non_canonical_set_rejected(self):
+        # Labels out of (0, 100) whose /100 is not a canonical set → drop.
+        garbage = [(250.0, 1.0), (777.0, 2.0), (9999.0, 3.0)]
+        assert _validate_percentile_labels(garbage, model="gpt-5.5") is None
+
+    def test_label_at_zero_boundary_rejected(self):
+        # 0 is not strictly inside (0, 100); /100 = {0.0, ...} is not canonical.
+        with_zero = [(0.0, 1.0), (50.0, 2.0), (97.5, 3.0)]
+        assert _validate_percentile_labels(with_zero, model="gpt-5.5") is None
+
+    def test_label_at_hundred_boundary_rejected(self):
+        with_hundred = [(2.5, 1.0), (50.0, 2.0), (100.0, 3.0)]
+        assert _validate_percentile_labels(with_hundred, model="gpt-5.5") is None
+
+    def test_partial_double_scaling_rejected_not_rescaled(self):
+        # A mix of correct (2.5) and double-scaled (500) labels does not /100 to
+        # a canonical set, so it must be rejected rather than silently rescaled.
+        mixed = [(2.5, 1.0), (500.0, 2.0), (97.5, 3.0)]
+        assert _validate_percentile_labels(mixed, model="gpt-5.5") is None
+
+    def test_rescale_emits_warning_naming_model_and_labels(self, caplog):
+        double_scaled = _pairs([label * 100.0 for label in _CANONICAL_LABELS_11])
+        with caplog.at_level(logging.WARNING):
+            _validate_percentile_labels(double_scaled, model="grok-4.3", question_id=43684)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Rescaling" in m and "grok-4.3" in m and "43684" in m for m in messages)
+
+    def test_reject_emits_warning_naming_model_and_labels(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _validate_percentile_labels([(250.0, 1.0), (777.0, 2.0)], model="gpt-5.5")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Rejecting" in m and "gpt-5.5" in m and "250.0" in m for m in messages)
+
+
+class TestParsePerModelNumericPercentilesLabelGuard:
+    """End-to-end: the label guard fires inside parse_per_model_numeric_percentiles."""
+
+    def test_qid_43684_real_shape_passes_through_via_prose(self):
+        # Faithful reproduction of the qid=43684 grok-4.3 comment_archive record:
+        # a numeric block whose keys are in PERCENT form (2.5, 5, ...) plus the
+        # matching prose value lines. The strict schema rejects the block (keys
+        # > 1, missing 0.1/0.5/0.9, retired fields) AND the tolerant salvage rung
+        # drops it (its keys fail the 0<pct<1 guard), so the prose lines win and
+        # yield clean in-range labels — the PASSTHROUGH branch, NOT rescale. The
+        # 250..9750 double-scaling only ever arose in the coherence study's own
+        # guard-less raw-JSON reader, never in this production parser.
+        labels = _CANONICAL_LABELS_11
+        values = [-10.0, -8.0, -6.0, -3.5, -0.5, 1.0, 2.5, 5.5, 8.0, 10.0, 12.0]
+        block = _fenced_json_block(
+            {
+                "question_type": "numeric",
+                # Percent-form keys, exactly as grok-4.3 emitted them.
+                "declared_percentiles": {f"{label:g}": value for label, value in zip(labels, values, strict=True)},
+                "distribution_family_hint": "normal",
+                "tails": {"below_min_expected": 0.03, "above_max_expected": 0.03},
+                "mixture_components": None,
+            }
+        )
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/x-ai/grok-4.3\n\n"
+            f"analysis prose.\n\n{block}\n\n{_prose_percentile_lines(labels, values)}\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment, question_id=43684)
+        assert result == {"grok-4.3": list(zip(labels, values, strict=True))}
+
+    def test_double_scaled_prose_labels_are_rescaled(self):
+        # If the double-scaled labels DO reach extraction (a model emitting
+        # ``Percentile 250: V`` prose), the guard rescales the exact 11-point
+        # canonical-set*100 back to canonical.
+        canonical_values = [-10.0, -8.0, -6.0, -3.5, -0.5, 1.0, 2.5, 5.5, 8.0, 10.0, 12.0]
+        double_scaled_labels = [label * 100.0 for label in _CANONICAL_LABELS_11]
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/x-ai/grok-4.3\n\n"
+            f"analysis.\n\n{_prose_percentile_lines(double_scaled_labels, canonical_values)}\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment, question_id=43684)
+        assert result == {"grok-4.3": list(zip(_CANONICAL_LABELS_11, canonical_values, strict=True))}
+
+    def test_genuine_garbage_labels_drop_the_model(self):
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "Percentile 250: 1\nPercentile 777: 2\nPercentile 9999: 3\n"
+        )
+        assert parse_per_model_numeric_percentiles(comment) == {}
+
+    def test_clean_prose_unaffected_by_guard(self):
+        comment = (
+            "## R1: Forecaster 1 Reasoning\n"
+            "Model: openrouter/openai/gpt-5.5\n\n"
+            "Percentile 2.5: 100.0\nPercentile 50: 150.0\nPercentile 97.5: 200.0\n"
+        )
+        result = parse_per_model_numeric_percentiles(comment)
+        assert result == {"gpt-5.5": [(2.5, 100.0), (50.0, 150.0), (97.5, 200.0)]}

@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,8 @@ from forecasting_tools.data_models.questions import MetaculusQuestion
 from rapidfuzz import fuzz
 
 from metaculus_bot.constants import (
+    MARKET_RELEVANCE_CONF_MIN,
+    MARKET_RELEVANCE_OVERLAP_MIN,
     PREDICTION_MARKET_KEYWORD_STRATEGY_ENV,
     PREDICTION_MARKET_KEYWORD_STRATEGY_VALID,
     PREDICTION_MARKET_TIMEOUT,
@@ -60,6 +63,7 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.research.http_fetch import build_session, read_body_capped
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.raw_log import record_raw_research
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,11 @@ logger = logging.getLogger(__name__)
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 MANIFOLD_SEARCH_URL = "https://api.manifold.markets/v0/search-markets"
 KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
+# Kalshi has no full-text search endpoint; the series list is the sanctioned
+# entity->ticker index (one unpaginated call, returns ticker/title/category/tags).
+# We match salient question entities against series titles locally, then fetch that
+# series' open events by `series_ticker`. Verified against docs.kalshi.com 2026-07-19.
+KALSHI_SERIES_URL = "https://api.elections.kalshi.com/trade-api/v2/series"
 PREDICTIT_URL = "https://www.predictit.org/api/marketdata/all/"
 
 # Bounded retry-with-backoff for transient 403/429/5xx. The s4_s5_union strategy
@@ -80,6 +89,17 @@ HTTP_RETRY_BACKOFF_SECS = 0.5
 
 # Client-side Kalshi fuzzy-match threshold below which we drop candidates.
 KALSHI_MIN_FUZZY_SCORE = 40.0
+
+# Entity-based Kalshi retrieval (closes the recall hole where the exact-title
+# market is absent from / drowned in the capped prefetch dump). Salient entities
+# extracted from the question title are matched against the Kalshi series list;
+# a series clears at KALSHI_ENTITY_SERIES_MIN_SCORE (higher than the general
+# fuzzy floor because short entity strings score near-100 against the right
+# series title). We fetch at most KALSHI_ENTITY_MAX_SERIES series' open events
+# from at most KALSHI_ENTITY_MAX_ENTITIES entities to bound the HTTP fan-out.
+KALSHI_ENTITY_SERIES_MIN_SCORE = 80.0
+KALSHI_ENTITY_MAX_ENTITIES = 4
+KALSHI_ENTITY_MAX_SERIES = 4
 
 # Client-side PredictIt fuzzy-match threshold (mirrors Kalshi; PredictIt has no
 # keyword-search endpoint, so we prefetch the full market dump and fuzzy-match).
@@ -833,6 +853,187 @@ def _kalshi_search_local(
 
 
 # ---------------------------------------------------------------------------
+# Kalshi entity-based series retrieval (recall fix on top of fuzzy-over-prefetch)
+# ---------------------------------------------------------------------------
+
+# Capitalized tokens that are sentence scaffolding, not entities — dropped when they
+# lead or stand alone in a proper-noun run (matched case-insensitively).
+_ENTITY_STOPWORDS: frozenset[str] = frozenset(
+    """will who what when where why how which whose is are was were do does did can could should
+    would may might must shall the a an of in on at to for by with and or if then than as from into
+    over under before after during between year years month months day days week weeks
+    january february march april june july august september october november december
+    """.split()
+)
+
+# Quoted spans (film / song / work titles) and word tokens for proper-noun runs.
+_QUOTED_RE = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{2,60})[\"“”'‘’]")
+_ENTITY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'&.\-]*")
+
+
+def _extract_title_entities(question: Any) -> list[str]:
+    """Deterministically extract salient entities from a question title — no LLM.
+
+    Runs of consecutive proper tokens (Capitalized words or ALL-CAPS acronyms) collapse into
+    one entity phrase ("Donald Trump", "BET Awards", "Best Male Athlete"); scaffolding words
+    (Will/Who/The/months/...) break runs and are dropped. Quoted spans are captured verbatim.
+    Ordered most-specific (longest) first, deduped case-insensitively, capped at
+    KALSHI_ENTITY_MAX_ENTITIES.
+    """
+    title = getattr(question, "title", None) or getattr(question, "question_text", "") or ""
+    entities: list[str] = []
+
+    for m in _QUOTED_RE.finditer(title):
+        span = m.group(1).strip()
+        if span:
+            entities.append(span)
+
+    run: list[str] = []
+    for tok in _ENTITY_TOKEN_RE.findall(title):
+        is_proper = (tok[0].isupper() and any(c.isalpha() for c in tok)) or (tok.isupper() and tok.isalpha())
+        if is_proper and tok.lower() not in _ENTITY_STOPWORDS:
+            run.append(tok)
+            continue
+        if run:
+            entities.append(" ".join(run))
+            run = []
+    if run:
+        entities.append(" ".join(run))
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for e in sorted(entities, key=lambda phrase: len(phrase), reverse=True):
+        key = e.lower()
+        if len(e) >= 3 and key not in seen:
+            seen.add(key)
+            out.append(e)
+    return out[:KALSHI_ENTITY_MAX_ENTITIES]
+
+
+def _match_entities_to_series(
+    entities: list[str], series: list[dict], *, min_score: float = KALSHI_ENTITY_SERIES_MIN_SCORE
+) -> list[str]:
+    """Fuzzy-match entities against series titles/tags; return distinct series tickers,
+    most-confident first, capped at KALSHI_ENTITY_MAX_SERIES.
+
+    token_set_ratio scores a full subset (the entity's tokens all present in the title)
+    at ~100, so a short entity like "ESPY" cleanly matches its series title.
+    """
+    scored: dict[str, float] = {}
+    for s in series:
+        if not isinstance(s, dict):
+            continue
+        ticker = s.get("ticker") or ""
+        title = (s.get("title") or "").lower()
+        if not ticker or not title:
+            continue
+        tags = s.get("tags") or []
+        tags_text = " ".join(str(t) for t in tags).lower() if isinstance(tags, list) else ""
+        best = 0.0
+        for e in entities:
+            el = e.lower()
+            score = float(fuzz.token_set_ratio(el, title))
+            if tags_text:
+                score = max(score, float(fuzz.token_set_ratio(el, tags_text)))
+            best = max(best, score)
+        if best >= min_score:
+            scored[ticker] = max(scored.get(ticker, 0.0), best)
+    return [t for t, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)][:KALSHI_ENTITY_MAX_SERIES]
+
+
+async def _kalshi_prefetch_series(session: Any) -> list[dict]:
+    """Fetch the Kalshi series list once (ticker/title/category/tags), cache ~6h.
+
+    Kalshi exposes no full-text search; the series list is the sanctioned entity->ticker
+    index (one unpaginated call). Soft-fails to [] — entity retrieval is best-effort on top
+    of the fuzzy-over-prefetch path.
+    """
+    cached = _KALSHI_CACHE.get("series")
+    if cached is not None:
+        ts, series = cached
+        if (time.monotonic() - ts) < KALSHI_CACHE_TTL_S:
+            return series  # noqa: ASYNC910
+
+    payload = await _http_get_with_backoff(session, KALSHI_SERIES_URL, {}, max_attempts=2, label="Kalshi series")
+    if not isinstance(payload, dict):
+        if payload is not None:
+            logger.warning("Kalshi series returned non-dict payload")
+        return []  # noqa: ASYNC910
+    series = payload.get("series")
+    if not isinstance(series, list):
+        return []  # noqa: ASYNC910
+    series = [s for s in series if isinstance(s, dict)]
+    _KALSHI_CACHE["series"] = (time.monotonic(), series)
+    return series  # noqa: ASYNC910
+
+
+async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[dict]:
+    """Fetch a single series' open events (with nested markets), cached ~6h per ticker.
+
+    Returns the same event-dict shape `_kalshi_search_local` already parses.
+    """
+    cache_key = f"events:{series_ticker}"
+    cached = _KALSHI_CACHE.get(cache_key)
+    if cached is not None:
+        ts, events = cached
+        if (time.monotonic() - ts) < KALSHI_CACHE_TTL_S:
+            return events  # noqa: ASYNC910
+
+    payload = await _http_get_with_backoff(
+        session,
+        KALSHI_EVENTS_URL,
+        {"series_ticker": series_ticker, "status": "open", "with_nested_markets": "true", "limit": "200"},
+        max_attempts=2,
+        label=f"Kalshi events series={series_ticker}",
+    )
+    if not isinstance(payload, dict):
+        return []  # noqa: ASYNC910
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return []  # noqa: ASYNC910
+    events = [ev for ev in events if isinstance(ev, dict)]
+    _KALSHI_CACHE[cache_key] = (time.monotonic(), events)
+    return events  # noqa: ASYNC910
+
+
+async def _kalshi_entity_matches(session: Any, question: Any, queries: list[str], *, top_k: int) -> list[MarketMatch]:
+    """Entity-targeted Kalshi retrieval, additive to the fuzzy-over-prefetch pass.
+
+    Extracts salient title entities, matches them against the series list, fetches those
+    series' open events, and fuzzy-scores them against the queries AND the entities (so a
+    market retrieved because its series matched an entity survives even when the LLM query
+    text does not). Closes the recall hole where the exact-title market is absent from / drowned
+    in the capped prefetch dump. Soft-fails to [] at every boundary.
+    """
+    entities = _extract_title_entities(question)
+    if not entities:
+        return []
+    series = await _kalshi_prefetch_series(session)
+    if not series:
+        return []
+    tickers = _match_entities_to_series(entities, series)
+    if not tickers:
+        return []
+
+    event_lists = await asyncio.gather(
+        *[_kalshi_events_for_series(session, t) for t in tickers], return_exceptions=True
+    )
+    events: list[dict] = []
+    for r in event_lists:
+        if isinstance(r, list):
+            events.extend(r)
+        elif isinstance(r, Exception):
+            logger.warning(f"Kalshi entity events fetch raised: {r}")
+    if not events:
+        return []
+
+    matches: list[MarketMatch] = []
+    for q in list(queries) + entities:
+        matches.extend(_kalshi_search_local(events, q, top_k=top_k))
+    return matches
+
+
+# ---------------------------------------------------------------------------
 # PredictIt (prefetch full market dump + client-side fuzzy match)
 # ---------------------------------------------------------------------------
 
@@ -1090,6 +1291,10 @@ async def _fetch_market_snapshot_impl(
         merged: list[MarketMatch] = []
         for q in queries:
             merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
+        # Entity-targeted retrieval on top of fuzzy-over-prefetch: pulls the series/events
+        # matching salient title entities (e.g. an exact ESPY / BET-Awards market) that the
+        # capped prefetch dump misses. Additive; soft-fails to [] internally.
+        merged.extend(await _kalshi_entity_matches(session, question, queries, top_k=max_matches_per_platform + 2))
         return merged
 
     async def _predictit_for_all_queries() -> list[MarketMatch]:
@@ -1165,40 +1370,110 @@ def _flatten_results(results: list[Any], platform: str) -> list[MarketMatch]:
 
 
 # ---------------------------------------------------------------------------
-# Formatter
+# Formatter — relevance gate (content-word overlap + matcher conf)
 # ---------------------------------------------------------------------------
 
+# Content-word stopwords for the relevance gate. Kept byte-identical to the tuning script
+# (scratch/new_analyses_2026-07-18/market_match_precision.py `_overlap`) so the shipped labels
+# match the 403-contract grading the thresholds were chosen on.
+_RELEVANCE_STOPWORDS: frozenset[str] = frozenset(
+    """a an the of in on at to for by with will be is are was were before after during between
+    and or not no yes if then than as from into over under above below more less most least
+    what which who whom whose when where why how this that these those there here it its
+    do does did done have has had having get gets got question market resolve resolves resolved
+    resolution against per any all each both other another same different new old first last
+    2025 2026 2027 january february march april may june july august september october november december
+    """.split()
+)
 
-def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
+
+def _relevance_content_words(text: str | None) -> set[str]:
+    words = re.findall(r"[a-z0-9']+", (text or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in _RELEVANCE_STOPWORDS}
+
+
+def _market_relevance_overlap(question_words: set[str], match: MarketMatch) -> int:
+    match_words = _relevance_content_words(match.market_title) | _relevance_content_words(match.raw_rules)
+    return len(question_words & match_words)
+
+
+def _is_likely_relevant(overlap: int, confidence: float) -> bool:
+    return overlap >= MARKET_RELEVANCE_OVERLAP_MIN and confidence >= MARKET_RELEVANCE_CONF_MIN
+
+
+# Shared trailing legend (the table's signal + relevance columns are present in both branches).
+_MARKET_SIGNAL_LEGEND = (
+    "The `signal` column labels each market's liquidity/participation "
+    "(thin/decent/deep or thin/decent/high); the raw total volume and open interest are shown alongside. Treat "
+    "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy. "
+    "The `relevance` column flags whether the fuzzy match cleared a content-overlap + confidence bar for THIS "
+    "question (`likely-relevant`) or did not (`verify-carefully`)."
+)
+
+# Strong-evidence framing — used ONLY when >=1 contract is likely-relevant to THIS question.
+_MARKET_PREAMBLE_STRONG = (
+    "The following prediction markets MAY be relevant — the match below is fuzzy, so verify each market's "
+    "resolution criteria, resolution date, and topic against THIS question before weighting. A market whose "
+    "criteria and date match this question is extremely strong evidence — anchor on its price. A market on a "
+    "related but different event, different date, or different criteria carries proportionally less weight — "
+    "name the specific mismatch and discount accordingly; a poorly-matched market may be worth little or "
+    "nothing. "
+)
+
+# Neutral framing — used when NO contract clears the relevance bar (matches are likely all off-topic).
+_MARKET_PREAMBLE_NEUTRAL = (
+    "The following prediction markets were fuzzy-matched to this question and may all be off-topic — none "
+    "cleared the relevance bar for THIS question, so treat them as leads to verify, not as evidence. Weight a "
+    "market only after you confirm its resolution criteria, date, and topic match this question; otherwise "
+    "disregard it. "
+)
+
+
+def format_snapshot_for_research(
+    snapshot: MarketSnapshot,
+    *,
+    question_title: str | None = None,
+    resolution_criteria: str | None = None,
+) -> str:
     """Compact markdown block for the research prompt.
 
-    Emits a table + raw-rules section + a strong-evidence caveat: markets are
-    weighted heavily when their resolution criteria and date match the
-    question, and discounted proportionally to any specific mismatch.
+    Emits a table + raw-rules section. Each row carries a `relevance` label
+    (`likely-relevant` / `verify-carefully`) from a content-word overlap + matcher-confidence
+    bar against THIS question, and NOTHING is dropped. The strong-evidence preamble is used only
+    when >=1 contract clears the bar; otherwise a neutral "these are leads to verify, not
+    evidence" preamble is used, so an authoritative header never sits on an all-off-topic table.
+
+    Without question context (``question_title`` / ``resolution_criteria`` unset), overlap can't
+    be computed, so every row is `verify-carefully` and the neutral preamble is used — the
+    conservative default. The production caller always passes question context.
     """
     if not snapshot.matches:
         return ""
 
+    question_words = _relevance_content_words(question_title) | _relevance_content_words(resolution_criteria)
+    relevances = [
+        _is_likely_relevant(_market_relevance_overlap(question_words, m), m.match_confidence) for m in snapshot.matches
+    ]
+    any_relevant = any(relevances)
+
     lines: list[str] = []
-    lines.append(
-        "STRONG EVIDENCE -- weight these markets heavily. Verify each market's resolution criteria AND "
-        "resolution date against the question: if they match, anchor on the price; if they differ, discount "
-        "proportionally to the specific mismatch. The `signal` column labels each market's liquidity/participation "
-        "(thin/decent/deep or thin/decent/high); the raw total volume and open interest are shown alongside. Treat "
-        "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy."
-    )
+    preamble = _MARKET_PREAMBLE_STRONG if any_relevant else _MARKET_PREAMBLE_NEUTRAL
+    lines.append(preamble + _MARKET_SIGNAL_LEGEND)
     lines.append("")
-    lines.append("| platform | title | prob | total_vol | OI | signal | close | conf |")
-    lines.append("|---|---|---|---|---|---|---|---|")
-    for m in snapshot.matches:
+    lines.append("| platform | title | prob | total_vol | OI | signal | close | conf | relevance |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for m, is_rel in zip(snapshot.matches, relevances):
         prob = f"{m.implied_prob_yes:.2f}" if m.implied_prob_yes is not None else "-"
         total_vol = f"{m.total_volume:.0f}" if m.total_volume is not None else "-"
         oi = f"{m.open_interest:.0f}" if m.open_interest is not None else "-"
         signal = _liquidity_label(m)
         close = m.close_time.strftime("%Y-%m-%d") if m.close_time else "-"
         conf = f"{m.match_confidence:.2f}"
+        relevance = "likely-relevant" if is_rel else "verify-carefully"
         safe_title = (m.market_title or "")[:80].replace("|", "/")
-        lines.append(f"| {m.platform} | {safe_title} | {prob} | {total_vol} | {oi} | {signal} | {close} | {conf} |")
+        lines.append(
+            f"| {m.platform} | {safe_title} | {prob} | {total_vol} | {oi} | {signal} | {close} | {conf} | {relevance} |"
+        )
 
     lines.append("")
     lines.append("### Resolution criteria / rules")
@@ -1247,7 +1522,16 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
             as_of = datetime.now(timezone.utc)
 
         snapshot = await fetch_market_snapshot(question, as_of=as_of, timeout=PREDICTION_MARKET_TIMEOUT)
-        return format_snapshot_for_research(snapshot)
+        record_raw_research(
+            qid=getattr(question, "id_of_question", None),
+            provider="prediction_market",
+            payload=snapshot,
+        )
+        return format_snapshot_for_research(
+            snapshot,
+            question_title=getattr(question, "title", None) or getattr(question, "question_text", None),
+            resolution_criteria=getattr(question, "resolution_criteria", None),
+        )
 
     return _fetch
 

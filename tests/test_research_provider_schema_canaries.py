@@ -41,14 +41,14 @@ from pydantic import AnyUrl
 
 def _make_real_grounding_response(
     text: str,
-    chunks: list[tuple[str, str | None]] | None = None,
+    chunks: list[tuple[str, str | None, str | None]] | None = None,
     supports: list[tuple[int, list[int]]] | None = None,
     *,
     response_text_override: str | None = None,
 ) -> genai_types.GenerateContentResponse:
     """Build an actual GenerateContentResponse with grounding metadata.
 
-    chunks: list of (uri, title) — `web.uri` and `web.title` populated.
+    chunks: list of (uri, title, domain) — `web.uri`, `web.title`, `web.domain` populated.
     supports: list of (segment_end_index, [chunk_indices]) for inline citations.
 
     Uses real types so a pydantic schema break in google-genai surfaces here.
@@ -56,7 +56,8 @@ def _make_real_grounding_response(
     grounding_chunks: list[genai_types.GroundingChunk] | None = None
     if chunks is not None:
         grounding_chunks = [
-            genai_types.GroundingChunk(web=genai_types.GroundingChunkWeb(uri=uri, title=title)) for uri, title in chunks
+            genai_types.GroundingChunk(web=genai_types.GroundingChunkWeb(uri=uri, title=title, domain=domain))
+            for uri, title, domain in chunks
         ]
 
     grounding_supports: list[genai_types.GroundingSupport] | None = None
@@ -169,11 +170,14 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         end_apple = text.index("Apple announced new product.") + len("Apple announced new product.")
         end_tesla = text.index("Tesla recalled vehicles.") + len("Tesla recalled vehicles.")
 
+        # Real Gemini web.uri is an opaque vertexaisearch redirect; web.domain carries
+        # the real source domain, which is what the formatter must render.
+        blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
         response = _make_real_grounding_response(
             text=text,
             chunks=[
-                ("https://reuters.com/apple-news", "Apple announces new product — Reuters"),
-                ("https://reuters.com/tesla-recall", "Tesla recall — Reuters"),
+                (blob + "apple", "Apple announces new product", "reuters.com"),
+                (blob + "tesla", "Tesla recall", "reuters.com"),
             ],
             supports=[(end_apple, [0]), (end_tesla, [1])],
         )
@@ -189,12 +193,12 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         assert "Apple announced new product.[1]" in out
         assert "Tesla recalled vehicles.[2]" in out
 
-        # Sources block appended.
+        # Sources block cites title + domain, never the redirect blob.
         assert "### Sources" in out
-        assert "https://reuters.com/apple-news" in out
-        assert "https://reuters.com/tesla-recall" in out
-        assert "Apple announces new product — Reuters" in out
-        assert "Tesla recall — Reuters" in out
+        assert "Apple announces new product — reuters.com" in out
+        assert "Tesla recall — reuters.com" in out
+        assert "vertexaisearch" not in out
+        assert "grounding-api-redirect" not in out
 
     @pytest.mark.asyncio
     async def test_real_response_with_chunks_but_no_supports(
@@ -204,9 +208,10 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         """Chunks present, supports None — sources block appended, no inline markers."""
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
+        blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
         response = _make_real_grounding_response(
             text="Some research finding without explicit segment mapping.",
-            chunks=[("https://example.com/a", "Source A"), ("https://example.com/b", None)],
+            chunks=[(blob + "a", "Source A", "example.com"), (blob + "b", None, "b.example.com")],
             supports=None,
         )
         client = _make_async_client(response)
@@ -218,12 +223,12 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
 
         # No inline markers were inserted because supports was None.
         assert "[1]" not in out.split("### Sources")[0]
-        # But the Sources section is still appended for both chunks.
+        # But the Sources section is still appended for both chunks (title + domain).
         assert "### Sources" in out
-        assert "https://example.com/a" in out
-        assert "Source A" in out
-        # When title is None, the formatter falls back to URI-only line.
-        assert "https://example.com/b" in out
+        assert "Source A — example.com" in out
+        # When title is None, the formatter falls back to a domain-only line.
+        assert "b.example.com" in out
+        assert "vertexaisearch" not in out
 
     @pytest.mark.asyncio
     async def test_real_response_with_empty_chunks_list(

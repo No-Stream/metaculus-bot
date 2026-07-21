@@ -12,6 +12,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
 from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
+    grid_step_constraints,
 )
 from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 
@@ -267,7 +268,18 @@ def create_fallback_numeric_distribution(
             if not (self.open_lower_bound or self.open_upper_bound):
                 return base
             probs = np.array([p.percentile for p in base], dtype=float)
-            safe = safe_cdf_bounds(probs, self.open_lower_bound, self.open_upper_bound)
+            # Scale the min/max-step constraints to the actual grid length. On a coarse
+            # discrete grid (cdf_size < 201) the 201-grid defaults (max_step=0.2) would
+            # wrongly clip each bin to 20%; grid_step_constraints mirrors the server's
+            # per-bin rules so the fallback matches the pipeline's resample path.
+            min_step, max_step = grid_step_constraints(len(base))
+            safe = safe_cdf_bounds(
+                probs,
+                self.open_lower_bound,
+                self.open_upper_bound,
+                min_step=min_step,
+                max_step=max_step,
+            )
             return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base)]
 
     return BoundSafeNumericDistribution(

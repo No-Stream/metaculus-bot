@@ -1,6 +1,7 @@
 """Tests for the research persistence write path."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from metaculus_bot.research.persistence import RESEARCH_SCHEMA_VERSION, ResearchPersistenceWriter
@@ -118,8 +119,6 @@ class TestResearchPersistenceWriter:
 
     def test_timestamp_is_iso_format(self, tmp_path: Path) -> None:
         """Verify timestamp is valid ISO 8601 UTC."""
-        from datetime import datetime, timezone
-
         writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
@@ -202,6 +201,56 @@ class TestResearchPersistenceWriter:
         assert record["provider_results"] == []
         assert record["providers_attempted"] == []
         assert record["providers_succeeded"] == []
+
+    def test_asknews_raw_persisted_when_provided(self, tmp_path: Path) -> None:
+        """The raw pre-summarization AskNews text is archived as its own field
+        (2026-07-18 audit hygiene) so summarizer replays and FETCH-vs-SUMMARIZE
+        attribution don't require fresh paid pulls."""
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        raw_articles = "**Article 1: Something happened (2026-07-14)**\nRaw article body."
+        writer.record(
+            qid=7,
+            page_url="https://example.com/q/7/",
+            question_text="Test?",
+            research_text="Analyst briefing (post-summarization).",
+            providers_used=["asknews"],
+            gap_fill_used=False,
+            asknews_raw=raw_articles,
+        )
+
+        result = writer.flush(output_dir=str(tmp_path))
+        assert result is not None
+        record = json.loads(result.read_text().strip())
+        assert record["asknews_raw"] == raw_articles
+        # Additive field: no schema-version bump (passthrough readers).
+        assert record["schema_version"] == RESEARCH_SCHEMA_VERSION
+
+    def test_asknews_raw_omitted_when_empty_or_absent(self, tmp_path: Path) -> None:
+        """Empty raw text (AskNews didn't run / errored / prose fallback) must not
+        add a key — records stay compact, matching provider_diagnostics_block."""
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer.record(
+            qid=1,
+            page_url="https://example.com/q/1/",
+            question_text="Q?",
+            research_text="R",
+            providers_used=[],
+            gap_fill_used=False,
+            asknews_raw="",
+        )
+        writer.record(
+            qid=2,
+            page_url="https://example.com/q/2/",
+            question_text="Q?",
+            research_text="R",
+            providers_used=[],
+            gap_fill_used=False,
+        )
+
+        result = writer.flush(output_dir=str(tmp_path))
+        assert result is not None
+        records = [json.loads(line) for line in result.read_text().strip().splitlines()]
+        assert all("asknews_raw" not in r for r in records)
 
     def test_unicode_content_preserved(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")

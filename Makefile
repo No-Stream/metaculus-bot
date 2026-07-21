@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research backfill_research download_research backfill_comments backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -190,6 +190,74 @@ sync_research:
 	uv run python scripts/download_research.py $(ARGS)
 	@echo ""
 	@echo "Archive ready at backtests/research_archive/latest/"
+
+# Harvest run-log telemetry markers (EXTRACTION_RUNG, GAP_FILL_V2, GHOST_FORECAST,
+# OPEN_BOUND_PILING, CREDIT_*) from GHA artifacts into the durable local archive
+# (backtests/telemetry_archive/). Prod runs bundle run_logs/ inside research-* and
+# test_bot uploads a separate logs-* artifact, so the downloader pulls both families.
+# Read-only + free (GitHub API only) and idempotent (replace-by-run), so it's safe on
+# the weekly schedule. Pass ARGS="--since-days N" to scope the pull.
+sync_telemetry:
+	@echo "=== Harvesting run-log telemetry from GHA artifacts ==="
+	uv run python scripts/download_run_logs.py $(ARGS)
+	@echo ""
+	@echo "Telemetry archive ready at backtests/telemetry_archive/"
+
+# Archive the raw research-provider payload logs (raw_research_<run_id>.jsonl) that
+# metaculus_bot.research.raw_log appends to run_logs/. Pulls both artifact families
+# (prod runs bundle run_logs/ inside research-*; test_bot uploads a separate logs-*),
+# harvests the raw JSONL, and writes one file per run to backtests/research_archive/raw/
+# (replace-by-run, idempotent). Read-only + free; safe on the weekly schedule.
+sync_raw_research:
+	@echo "=== Archiving raw research-provider payload logs from GHA artifacts ==="
+	uv run python scripts/download_raw_research.py $(ARGS)
+	@echo ""
+	@echo "Raw-research archive ready at backtests/research_archive/raw/"
+
+# Pull EVERYTHING sync-shaped in one command: the research archive, the telemetry
+# archive, AND the raw research-provider payload archive. Residual analyses should call
+# this (never a single sync) so a future source is never silently missed. Read-only + free.
+#
+# SINGLE-PASS: unlike running the three sync_* targets in sequence (which each
+# re-enumerate every artifact and re-download the overlapping research-*/logs-* families
+# into their own temp dir — ~300 downloads for ~100 artifacts), scripts/sync_all.py
+# enumerates ONCE over the union family and downloads each artifact ONCE, then runs all
+# three harvests over the shared run dirs. The Metaculus-comment backfill runs FIRST
+# (it hits Metaculus, not GHA) so its comments_backfill.jsonl is on disk when the
+# driver's research build loads it. NOTE: ARGS is forwarded only to sync_all.py, which
+# accepts --repo / --since-days (and the per-archive --*-dir overrides).
+sync_all:
+	@echo "=== Backfilling from Metaculus comments (historical) ==="
+	uv run python scripts/backfill_research_from_comments.py
+	@echo ""
+	@echo "=== Single-pass GHA sync: research + telemetry + raw-research (one download pass) ==="
+	uv run python scripts/sync_all.py $(ARGS)
+	@echo ""
+	@echo "=== sync_all complete: research + telemetry + raw-research archives refreshed ==="
+
+# Score gap-fill v2 GHOST_FORECAST markers vs published forecasts on resolved questions
+# (paired log-score deltas — the retire-v1 gate). Read-only + free. Expects ~0
+# scoreable today (v2 shipped 2026-07-17); pass ARGS="--tournament <slug>" for a live
+# read-only resolutions pull, or ARGS="--perf-json <path>" for a pre-built dataset.
+score_ghosts:
+	uv run python scripts/score_ghosts.py $(ARGS)
+
+# Weekly close-margin watch over the CLOSE_MARGIN telemetry archive: p50/p10/min of
+# window-remaining-at-submit per ISO week + questions under the 30% red line. Read-only
+# + free (reads backtests/telemetry_archive/close_margin.jsonl; run sync_telemetry first).
+# ARGS="--red-line 0.5" for a tighter line, ARGS="--output <path>" to dump the summary JSON.
+close_margin_watch:
+	uv run python scripts/close_margin_watch.py $(ARGS)
+
+# Download run-log artifacts + harvest telemetry only (no research sync). Same script
+# as sync_telemetry; kept as a named target for parity with download_research.
+download_run_logs:
+	uv run python scripts/download_run_logs.py $(ARGS)
+
+# Download artifacts + archive raw research-provider logs only (no other sync). Same
+# script as sync_raw_research; kept as a named target for parity with download_research.
+download_raw_research:
+	uv run python scripts/download_raw_research.py $(ARGS)
 
 # Backfill research from existing GitHub Actions logs (Nov 2025 onward).
 # Pass ARGS="--limit 100 --status completed" to customize.

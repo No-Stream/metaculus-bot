@@ -8,7 +8,6 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.bounds_clamping import (
     calculate_bounds_buffer,
     clamp_values_to_bounds,
@@ -29,6 +28,7 @@ from metaculus_bot.numeric.config import (
     TAIL_WIDEN_SPAN_FLOOR_GAMMA,
     TAIL_WIDEN_TAIL_START,
     TAIL_WIDENING_ENABLE,
+    grid_step_constraints,
 )
 from metaculus_bot.numeric.diagnostics import log_pchip_fallback, validate_cdf_construction
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, percentiles_to_pchip_format
@@ -90,7 +90,7 @@ def build_numeric_distribution(
 
     target_cdf_size = getattr(question, "cdf_size", None)
     if target_cdf_size is not None and target_cdf_size != PCHIP_CDF_POINTS:
-        min_step = max(NUM_MIN_PROB_STEP, 0.01 / max(1, target_cdf_size - 1))
+        min_step, max_step = grid_step_constraints(target_cdf_size)
         pchip_percentiles = percentiles_to_pchip_format(percentile_list)
         resampled_cdf, _ = generate_pchip_cdf(
             percentile_values=pchip_percentiles,
@@ -100,6 +100,7 @@ def build_numeric_distribution(
             lower_bound=question.lower_bound,
             zero_point=zero_point,
             min_step=min_step,
+            max_step=max_step,
             num_points=target_cdf_size,
             question_id=getattr(question, "id_of_question", None),
             question_url=getattr(question, "page_url", None),

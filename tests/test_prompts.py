@@ -15,6 +15,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaculus_bot.prompts import (
+    _SOURCE_TIER_TAG_INSTRUCTION,
+    TS_ANCHOR_SECTION_HEADER,
+    asknews_summarizer_prompt,
     binary_prompt,
     gap_fill_analyzer_prompt,
     gap_fill_search_prompt,
@@ -26,9 +29,7 @@ from metaculus_bot.prompts import (
     web_research_prompt,
 )
 
-# ---------------------------------------------------------------------------
 # gap_fill_analyzer_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestGapFillAnalyzerPrompt:
@@ -98,9 +99,7 @@ class TestGapFillAnalyzerPrompt:
         assert "(none provided)" in result
 
 
-# ---------------------------------------------------------------------------
 # gap_fill_search_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestGapFillSearchPrompt:
@@ -151,9 +150,7 @@ class TestGapFillSearchPrompt:
         assert "Will the treaty be in force by 2027?" in result
 
 
-# ---------------------------------------------------------------------------
 # Forecasting-window anchor (binary / MC / numeric + stacking variants)
-# ---------------------------------------------------------------------------
 
 
 def _binary_q(
@@ -267,6 +264,57 @@ class TestForecastingWindowAnchor:
 
     # -- stacking variants -------------------------------------------------
 
+
+class TestTsAnchorClause:
+    """The numeric prompt surfaces the time-series-anchor pointer ONLY when the
+    research actually carries the anchor section header. Binary/MC never mention
+    it (the anchor routes to numeric questions only in v1).
+
+    The clause is deliberately NEUTRAL: it describes precisely what the section
+    contains and leaves the forecaster to decide how to use it. The old directive
+    framing ("CALIBRATED REFERENCE EVIDENCE", "keep your interval close", "do NOT
+    widen") was removed 2026-07-18 — the operator chose to state the facts and
+    trust the forecasters rather than prescribe usage on an untested feature."""
+
+    _MARKER = "## Time Series Anchor"
+    # Directive phrases that must NOT reappear in the neutral clause.
+    _BANNED = ("CALIBRATED", "keep your interval", "do not widen", "sharpen your distribution")
+
+    def _assert_no_directives(self, text: str) -> None:
+        lowered = text.lower()
+        for phrase in self._BANNED:
+            assert phrase.lower() not in lowered, f"directive phrase leaked back in: {phrase!r}"
+
+    def test_clause_present_when_section_in_research(self) -> None:
+        research = f"Some news.\n\n{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20\n- band ..."
+        result = numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
+        # Neutral description present: it points at the section and says what the band IS,
+        # including the independent-window caveat, without telling the model how to weigh it.
+        assert self._MARKER in result
+        lowered = result.lower()
+        assert "empirical distribution of the series' own past changes" in lowered
+        assert "independent" in lowered
+        self._assert_no_directives(result)
+
+    def test_clause_absent_when_section_missing(self) -> None:
+        result = numeric_prompt(
+            _numeric_q(), research="Just some news, no anchor.", lower_bound_message="lbm", upper_bound_message="ubm"
+        )
+        # No anchor section -> neither the pointer nor any directive language appears.
+        assert "empirical distribution of the series' own past changes" not in result.lower()
+        self._assert_no_directives(result)
+
+    def test_clause_not_in_binary_or_mc_even_with_section(self) -> None:
+        research = f"{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20"
+        assert (
+            "empirical distribution of the series' own past changes"
+            not in binary_prompt(_binary_q(), research=research).lower()
+        )
+        assert (
+            "empirical distribution of the series' own past changes"
+            not in multiple_choice_prompt(_mc_q(), research=research).lower()
+        )
+
     def test_stacking_binary_injects_window(self) -> None:
         q = _binary_q(
             open_time=datetime(2026, 2, 2),
@@ -310,9 +358,7 @@ class TestForecastingWindowAnchor:
             stacking_binary_prompt(q, research="r", base_predictions=["a"])
 
 
-# ---------------------------------------------------------------------------
 # web_research_prompt
-# ---------------------------------------------------------------------------
 
 
 class TestMcPromptInterpolatesRealOptionNames:
@@ -449,10 +495,19 @@ class TestWebResearchPromptPrimarySources:
         assert "Prediction market odds" in non_bench
         assert "Prediction market odds" not in bench
 
+    def test_reference_class_frequency_instruction_present(self) -> None:
+        """The prompt must ask for historical frequencies (with source and
+        denominator) on reference-class questions — prioritizing niche,
+        regional, or conditional rates and skipping common knowledge."""
+        for is_benchmarking in (False, True):
+            result = web_research_prompt("Will X happen?", is_benchmarking=is_benchmarking)
+            assert "reference-class reasoning" in result
+            assert "historical frequency with its source and denominator" in result
+            assert "niche, regional, or conditional" in result
+            assert "common knowledge" in result
 
-# ---------------------------------------------------------------------------
+
 # Prediction-market framing (strong-evidence, criteria/date-matched weighting)
-# ---------------------------------------------------------------------------
 
 
 class TestPredictionMarketFraming:
@@ -536,9 +591,7 @@ class TestPredictionMarketFraming:
         assert "Prediction market" not in bench
 
 
-# ---------------------------------------------------------------------------
 # Source-provenance / motivation trust ladder
-# ---------------------------------------------------------------------------
 
 
 class TestSourceProvenanceLadder:
@@ -664,19 +717,112 @@ class TestConjunctiveCriteriaPricing:
         """pgodzinai 42855 failure mode: a computed clause product coexisting
         with free-form narrative adjustment gets nullified (82% computed →
         87% via 'season-specific upward adjustment'). Any deviation from the
-        product must operate through the clause probabilities themselves or a
-        named clause dependence; overrides that route around the clauses are
-        explicitly forbidden."""
+        product must operate through the clause probabilities themselves, a
+        named clause dependence, or a corrected clause decomposition; overrides
+        that route around the clauses are explicitly forbidden."""
         prompt = binary_prompt(_binary_q(), research="r")
         lowered = " ".join(prompt.lower().split())
-        assert "you have exactly two valid moves" in lowered
+        assert "you have exactly three valid moves" in lowered
         assert "revise the clause probabilities themselves and recompute" in lowered
         assert "name a specific dependence between clauses" in lowered
+        # The third sanctioned move: the decomposition itself was wrong.
+        assert "revise the clause decomposition from 0b" in lowered
         assert (
-            "all hedging and adjustment must operate through the clause probabilities or their dependence, "
-            "not around them" in lowered
+            "all hedging and adjustment must operate through the clauses, their dependence, or a corrected "
+            "decomposition, not around them" in lowered
         )
-        assert "if neither applies, stay at the product" in lowered
+        assert "if none applies, stay at the product" in lowered
+
+
+class TestResolutionMetricEcho:
+    """PHASE 0 resolution-metric echo: when the resolution criteria name an
+    official statistical series, force the forecaster to name the exact
+    resolving series and enumerate its variants (component vs total, etc.)
+    before forecasting. Motivated by qid 44211 — all six models priced the
+    USBP-apprehensions *component* of a series that resolves on the *total*,
+    even though the research carried the wedge, the historical conversion, and
+    an explicit provider warning. Scoped to the numeric prompt (which also
+    serves discrete-integer questions — outcome_type is decided in the block,
+    there is no separate discrete prompt) and the binary prompt. MC and the
+    prod-disabled stacking prompts are deliberately untouched."""
+
+    _HEADER = "resolution-metric echo (named-series questions only)"
+    _INERT = "no named series, metric echo skipped"
+
+    @staticmethod
+    def _collapsed(prompt: str) -> str:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        return " ".join(prompt.lower().split())
+
+    def _assert_core_block(self, prompt: str) -> None:
+        c = self._collapsed(prompt)
+        assert self._HEADER in c
+        assert "name the exact series that resolves this question" in c
+        assert "enumerate the plausible variants" in c
+        assert "component vs total" in c
+        # Inert escape: questions with no named series skip the step.
+        assert self._INERT in c
+        # Don't-discard-on-one-implausible-estimate: the gemini-31k poisoning lesson.
+        assert "do not discard a candidate variant" in c
+        assert "recompute the candidate from its components" in c
+
+    def test_numeric_prompt_has_metric_echo(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        self._assert_core_block(prompt)
+        c = self._collapsed(prompt)
+        # Numeric reconciles against the displayed range — but NOT as an oracle
+        # (the 44211 trap: the true total was the bounds midpoint).
+        assert "reconcile each candidate against the displayed range" in c
+        assert 'do not read "inside the range" as confirming' in c
+        # Points at both numeric-available research sections (synergy, not duplication).
+        assert "## Resolution Source Snapshot" in prompt
+        assert "## Time Series Anchor" in prompt
+
+    def test_binary_prompt_has_metric_echo(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        self._assert_core_block(prompt)
+        c = self._collapsed(prompt)
+        # Binary reconciles against the criteria's threshold/comparison (no displayed range).
+        assert "reconcile each candidate against the threshold or comparison" in c
+        # Points at the resolution-source snapshot only — the TS anchor is numeric-only.
+        assert "## Resolution Source Snapshot" in prompt
+        assert "## Time Series Anchor" not in prompt
+
+    def test_binary_metric_echo_after_decomposition_before_phase1(self) -> None:
+        prompt = binary_prompt(_binary_q(), research="r")
+        idx_decomp = prompt.find("Resolution decomposition")
+        idx_echo = prompt.find("Resolution-metric echo")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert 0 <= idx_decomp < idx_echo < idx_phase1
+
+    def test_numeric_metric_echo_after_status_quo_before_phase1(self) -> None:
+        prompt = numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm")
+        idx_sq = prompt.find("Status-quo derivation")
+        idx_echo = prompt.find("Resolution-metric echo")
+        idx_phase1 = prompt.find("PHASE 1")
+        assert 0 <= idx_sq < idx_echo < idx_phase1
+
+    def test_mc_prompt_omits_metric_echo(self) -> None:
+        # MC questions resolve to an enumerated option, not a value read off a
+        # named statistical series, so the component-vs-total ambiguity does not
+        # arise. The measured miss family (44211 numeric, 42018/41801 binary)
+        # contains zero MC cases — scoping decision locked here.
+        prompt = multiple_choice_prompt(_mc_q(), research="r")
+        assert "Resolution-metric echo" not in prompt
+
+    def test_stacking_prompts_omit_metric_echo(self) -> None:
+        # Stacking is prod-disabled; those prompts are left untouched.
+        binary = stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"])
+        mc = stacking_multiple_choice_prompt(_mc_q(), research="r", base_predictions=["a1", "a2"])
+        numeric = stacking_numeric_prompt(
+            _numeric_q(),
+            research="r",
+            base_predictions=["a1", "a2"],
+            lower_bound_message="lbm",
+            upper_bound_message="ubm",
+        )
+        for p in (binary, mc, numeric):
+            assert "Resolution-metric echo" not in p
 
 
 class TestNumericPromptThirteenPercentiles:
@@ -805,3 +951,169 @@ class TestOptionProbsExampleJsonValidity:
         probs = list(parsed["option_probs"].values())
         assert sum(probs) == pytest.approx(1.0, abs=0.02)
         assert all(0.0 < p < 1.0 for p in probs)
+
+
+def _summarizer_prompt(**overrides) -> str:
+    """Build the AskNews summarizer prompt with representative defaults."""
+    kwargs = dict(
+        question_text="Will X happen by 2027?",
+        resolution_criteria="Resolves YES if X happens",
+        fine_print="fp",
+        open_date="2026-03-15",
+        research="raw asknews articles",
+    )
+    kwargs.update(overrides)
+    return asknews_summarizer_prompt(**kwargs)
+
+
+class TestSourceTierTagging:
+    """Both TRADITIONAL research prompts (web research + AskNews summarizer)
+    must instruct the model to tag factual claims with the A-D source-tier
+    vocabulary — otherwise a C-tier aggregator claim arrives in the briefing
+    looking identical to a B-tier wire fact and the forecaster prompts'
+    provenance ladder has nothing left to weight."""
+
+    def _assert_tier_tag_instruction(self, prompt: str) -> None:
+        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        collapsed = " ".join(prompt.split())
+        assert "SOURCE TIER TAGS" in collapsed
+        # Inline tag examples using the shared vocabulary.
+        for example in ('"[A: official]"', '"[B: Reuters]"', '"[C: aggregator]"', '"[D: social]"'):
+            assert example in collapsed, f"missing tag example {example}"
+        # The condensed A-D definitions mirror the forecaster ladder's vocabulary.
+        lowered = collapsed.lower()
+        assert "official / primary" in lowered
+        assert "wire services and papers of record" in lowered
+        assert "aggregators, advocacy or partisan outlets" in lowered
+        assert "anonymous, social, rumor" in lowered
+        # Tag only when clear; never drop a low-tier fact.
+        assert "tag only when the tier is reasonably clear" in lowered
+        assert "never discard a fact because its tier is low" in lowered
+
+    def test_web_research_prompt_carries_tier_tag_instruction(self) -> None:
+        self._assert_tier_tag_instruction(web_research_prompt("Will X happen?", is_benchmarking=False))
+
+    def test_web_research_prompt_carries_tier_tag_instruction_when_benchmarking(self) -> None:
+        """The tier-tag steer is orthogonal to the benchmarking carve-out."""
+        self._assert_tier_tag_instruction(web_research_prompt("Will X happen?", is_benchmarking=True))
+
+    def test_summarizer_prompt_carries_tier_tag_instruction(self) -> None:
+        self._assert_tier_tag_instruction(_summarizer_prompt())
+
+    def test_instruction_is_shared_constant_verbatim(self) -> None:
+        """Both prompts must interpolate the SAME module-level constant — a
+        drift between the two vocabularies would let the summarizer emit tags
+        the forecaster ladder doesn't recognize."""
+        collapsed_instruction = " ".join(_SOURCE_TIER_TAG_INSTRUCTION.split())
+        for prompt in (
+            web_research_prompt("Q?", is_benchmarking=False),
+            _summarizer_prompt(),
+        ):
+            assert collapsed_instruction in " ".join(prompt.split())
+
+
+class TestAskNewsSummarizerPrompt:
+    """The summarizer prompt moved from ResearchOrchestrator._summarize_asknews
+    to prompts.py (2026-07). These lock the load-bearing content that
+    tests/test_research_orchestrator.py asserts through the orchestrator, plus
+    argument threading now that the text is a standalone function."""
+
+    def test_threads_all_arguments(self) -> None:
+        prompt = _summarizer_prompt(
+            question_text="Will the treaty be in force by 2027?",
+            resolution_criteria="Resolves YES if in force.",
+            fine_print="Per the depositary's records.",
+            open_date="2026-01-02",
+            research="ARTICLE BODY HERE",
+        )
+        assert "Will the treaty be in force by 2027?" in prompt
+        assert "Resolves YES if in force." in prompt
+        assert "Per the depositary's records." in prompt
+        assert "opened on 2026-01-02" in " ".join(prompt.split())
+        assert "<research>\nARTICLE BODY HERE\n</research>" in prompt
+
+    def test_retains_window_stamping_and_no_forecast_rules(self) -> None:
+        """Regression: the move + tier-tag insertion must not displace the
+        summarizer's existing critical rules."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Date every fact precisely" in collapsed
+        # First occurrence carries the full tag; repeats use the short tag (display
+        # compression only — the pre-window warning semantics must stay intact).
+        assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
+        assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
+        assert "[SINGLE-SOURCE]" in collapsed
+        assert "NEVER promote a single-source claim to a confirmed or factual statement" in collapsed
+        assert "NEVER include your own forecast, probability estimate, or probability distribution" in collapsed
+
+    def test_preserves_conditionality_rule(self) -> None:
+        """BTF-2 lesson: research found a crucial hedge and synthesis dropped the
+        conditionality. The summarizer must keep a condition attached to its
+        claim, never flattening 'X if Y' into an unconditional 'X'."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Preserve conditionality" in collapsed
+        assert "keep the condition attached to the claim" in collapsed
+        assert "never report a conditional statement as an unconditional one" in collapsed
+
+    def test_supersession_and_deadline_arithmetic_rule(self) -> None:
+        """2026-07-18 AskNews audit R2: newer facts govern, superseded ones are
+        compressed, and deadline questions must surface the arithmetic inputs
+        rather than an unsupported conclusion (the q44255 failure — briefing
+        had every input to 'Jun 29 + 10 non-Sundays > Jul 4', did no math, and
+        asserted Yes anyway)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "state which version governs" in collapsed
+        assert "compress the superseded version to one line" in collapsed
+        assert "QUOTE the relevant inputs explicitly" in collapsed
+        assert "verify the arithmetic" in collapsed
+        assert "do not assert a deadline conclusion without showing the facts it rests on" in collapsed
+
+    def test_evidence_age_disclosure_opens_briefing(self) -> None:
+        """2026-07-18 AskNews audit R4: the briefing must open with the age of
+        the newest directly-relevant evidence, or say no article directly
+        reports the resolution quantity (the q44219 failure — a 67-day-old
+        leaderboard read as current)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Newest directly-relevant article" in collapsed
+        assert "DIRECTLY bears on the resolution" in collapsed
+        assert "background rather than signal" in collapsed
+        # The disclosure is requirement #1, ahead of the extraction bullets.
+        assert collapsed.index("Newest directly-relevant article") < collapsed.index("Extracts ALL facts")
+
+    def test_proportionality_rule_scopes_comprehensiveness(self) -> None:
+        """2026-07-18 AskNews audit (operator-designed proportionality rule):
+        length tracks decision-relevant content; tangential-only article sets
+        yield a short briefing with a screened-out list, and the
+        comprehensiveness mandate is scoped to decision-relevant material so
+        the two rules can't be read as contradicting."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "Length must track decision-relevant content, not article count" in collapsed
+        assert "Screened out as not decision-relevant" in collapsed
+        assert "do not pad with tangential material to appear thorough" in collapsed
+        # Comprehensiveness survives, but scoped to decision-relevant material.
+        assert "Be COMPREHENSIVE about DECISION-RELEVANT material" in collapsed
+        assert "Be COMPREHENSIVE — do not omit relevant details" not in collapsed
+
+    def test_hard_relevance_gate_drops_offtopic_articles(self) -> None:
+        """2026-07-18 AskNews audit R3: a hard per-article screen against the
+        resolution criteria (the semantic-drift padding class — Microsoft
+        surveys and crypto incidents extracted in full for unrelated
+        questions). Off-topic articles are DROPPED to a one-line list, not
+        summarized 'briefly'."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "screen each article for relevance to the resolution criteria" in collapsed
+        assert "NO direct bearing on how this question resolves" in collapsed
+        assert "must be DROPPED entirely" in collapsed
+        assert "plausibly affect a forecaster's reasoning on THIS question" in collapsed
+
+    def test_recency_first_ordering_replaces_input_mirroring(self) -> None:
+        """2026-07-18 AskNews audit R1: the briefing leads with the newest,
+        most resolution-relevant facts instead of mirroring AskNews's
+        Historical/Recent input structure (the q44555 failure — obsolete
+        chronology buried the live matchup)."""
+        collapsed = " ".join(_summarizer_prompt().split())
+        assert "lead with the most recent and most resolution-relevant facts" in collapsed
+        assert "Do not mirror the raw input's section structure" in collapsed
+        assert "organize by recency and relevance to the question" in collapsed
+        # The old input-mirroring instruction it replaced must be gone.
+        assert "Maintains the section structure" not in collapsed

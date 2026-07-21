@@ -75,7 +75,11 @@ async def _process_single_question(
     qid = _question_id(question)
     try:
         async with semaphore:
-            research_text = await research_provider(question.question_text)
+            # ResearchCallable expects the MetaculusQuestion object, not its text —
+            # providers do isinstance checks and attribute access (e.g. the ts-anchor
+            # provider reads question.open_time / scheduled_resolution_time), which
+            # silently no-op on a bare string.
+            research_text = await research_provider(question)
     except Exception:
         logger.warning(f"Research failed for Q{qid}, keeping question without cached research")
         return (qid, None, False)

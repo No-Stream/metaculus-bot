@@ -1,0 +1,865 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+import pytest
+
+from metaculus_bot.research.agentic.loop import _summarize_ghost, run_agentic_loop
+from metaculus_bot.research.agentic.types import LoopConfig, ToolOutcome, ToolSpec
+from metaculus_bot.structured_output_schema import NumericStructured
+from tests.agentic_fakes import FakeLlm
+from tests.agentic_fakes import response as _response
+from tests.agentic_fakes import tool_call as _tool_call
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, delta: float) -> None:
+        self.value += delta
+
+
+def _tool_spec(
+    name: str,
+    handler: Any,
+    *,
+    timeout_s: float = 0.1,
+) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=f"{name} description",
+        parameters={"type": "object", "properties": {}, "additionalProperties": True},
+        handler=handler,
+        timeout_s=timeout_s,
+    )
+
+
+def _config(
+    *,
+    model: str = "openai/gpt-5.4-mini",
+    reasoning_effort: str = "medium",
+    max_tool_calls: int = 14,
+    wall_deadline_s: float = 1.0,
+    conclude_threshold_s: float = 0.1,
+    max_result_chars: int = 8000,
+    max_steps: int = 5,
+) -> LoopConfig:
+    return LoopConfig(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        max_tool_calls=max_tool_calls,
+        wall_deadline_s=wall_deadline_s,
+        conclude_threshold_s=conclude_threshold_s,
+        max_result_chars=max_result_chars,
+        max_steps=max_steps,
+    )
+
+
+def _tool_messages(result: Any) -> list[dict[str, Any]]:
+    return [message for message in result.transcript if message["role"] == "tool"]
+
+
+def _tool_names(tools_json: list[dict[str, Any]] | None) -> list[str]:
+    return [] if tools_json is None else [tool["function"]["name"] for tool in tools_json]
+
+
+@pytest.mark.asyncio
+async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(  # noqa: ASYNC910
+            content_markdown="Authoritative page text.", links=["https://example.com"], method="search"
+        )
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("search1", "search_web", {"query": "report"})]),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "record1",
+                        "record_findings",
+                        {
+                            "findings": [
+                                {
+                                    "claim": "The report was published on July 1.",
+                                    "source_url": "https://example.com",
+                                    "quote": "Published on July 1, 2026.",
+                                    "date": "2026-07-01",
+                                    "retrieved_how": "search_web",
+                                    "topic": "timeline",
+                                }
+                            ]
+                        },
+                    )
+                ]
+            ),
+            _response(tool_calls=[_tool_call("done1", "conclude", {"pending_leads": ["Check the appendix."]})]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    assert "## Agentic Research Findings" in result.findings_markdown
+    assert "The report was published on July 1." in result.findings_markdown
+    assert result.telemetry.model == "openai/gpt-5.4-mini"
+    assert result.telemetry.steps == 3
+    assert result.telemetry.tool_calls == 3
+    assert result.telemetry.per_tool_counts == {"search_web": 1, "record_findings": 1, "conclude": 1}
+    assert result.telemetry.rendered_fetches == 0
+    assert result.telemetry.dup_tool_calls == 0
+    assert result.telemetry.findings_count == 1
+    assert result.telemetry.pending_leads_count == 1
+    assert result.telemetry.concluded_early is True
+    marker_lines = [record.getMessage() for record in caplog.records if "GAP_FILL_V2:" in record.getMessage()]
+    assert len(marker_lines) == 1
+    # Plan-§6 marker shape: model + per-surface counters, grep-able in run_logs.
+    marker = marker_lines[0]
+    assert "model=openai/gpt-5.4-mini" in marker
+    assert "searches=1" in marker
+    assert "fetches=0" in marker
+    assert "rendered=0" in marker
+    assert "reads=0" in marker
+    assert "dup_tool_calls=0" in marker
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCaptureFixture) -> None:
+    """Exact-duplicate (tool, normalized-args) repeats bump dup_tool_calls and
+    append a gentle warning to the duplicate's tool result — no enforcement."""
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+
+    # Same args with shuffled key order still count as the same call.
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report", "extra": 1})]),
+            _response(tool_calls=[_tool_call("s2", "search_web", {"extra": 1, "query": "report"})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    assert result.telemetry.dup_tool_calls == 1
+    tool_messages = _tool_messages(result)
+    first, second = tool_messages[0], tool_messages[1]
+    assert "already made earlier in this run" not in first["content"]
+    assert "already made earlier in this run" in second["content"]
+    # The duplicate still executed — counter + warning only, no enforcement.
+    assert "done" in second["content"]
+    marker = next(record.getMessage() for record in caplog.records if "GAP_FILL_V2:" in record.getMessage())
+    assert "dup_tool_calls=1" in marker
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_outcomes_counted_in_telemetry() -> None:
+    async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown="rendered body", method="rendered")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://example.com"})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("fetch", fetch)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    assert result.telemetry.per_tool_counts["fetch"] == 1
+    assert result.telemetry.rendered_fetches == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line() -> None:
+    started: list[str] = []
+    finished: list[str] = []
+    release = asyncio.Event()
+
+    def _parallel_handler(name: str) -> Any:
+        async def _handler(**_: Any) -> ToolOutcome:
+            started.append(name)
+            if len(started) == 3:
+                release.set()
+            await release.wait()
+            finished.append(name)
+            return ToolOutcome(content_markdown=f"{name} done", method="plain")
+
+        return _handler
+
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call("a", "alpha"),
+                    _tool_call("b", "beta"),
+                    _tool_call("c", "gamma"),
+                ]
+            ),
+            _response(tool_calls=[_tool_call("done", "conclude")]),
+        ]
+    )
+
+    result = await asyncio.wait_for(
+        run_agentic_loop(
+            "system",
+            "user",
+            [
+                _tool_spec("alpha", _parallel_handler("alpha")),
+                _tool_spec("beta", _parallel_handler("beta")),
+                _tool_spec("gamma", _parallel_handler("gamma")),
+            ],
+            _config(),
+            llm_call=fake_llm,
+        ),
+        timeout=0.5,
+    )
+
+    assert started == ["alpha", "beta", "gamma"]
+    assert set(finished) == {"alpha", "beta", "gamma"}
+    tool_messages = _tool_messages(result)[:3]
+    assert [message["name"] for message in tool_messages] == ["alpha", "beta", "gamma"]
+    budget_lines = [message["content"].splitlines()[-1] for message in tool_messages]
+    assert len(set(budget_lines)) == 1
+    assert budget_lines[0].startswith("[budget: ")
+    assert budget_lines[0].endswith("3/14 tool calls used]")
+
+
+@pytest.mark.asyncio
+async def test_budget_threshold_switches_to_conclude_mode_and_shrinks_tools() -> None:
+    clock = FakeClock()
+
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        clock.advance(95.0)
+        return ToolOutcome(content_markdown="late result", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("search1", "search_web")]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(wall_deadline_s=100.0, conclude_threshold_s=10.0),
+        llm_call=fake_llm,
+        now=clock,
+    )
+
+    assert "[budget: 5s remaining — you must conclude now]" in _tool_messages(result)[0]["content"]
+    assert _tool_names(fake_llm.calls[1]["tools"]) == ["record_findings", "conclude"]
+
+
+@pytest.mark.asyncio
+async def test_deadline_mid_tool_still_returns_banked_findings() -> None:
+    async def slow_tool(**_: Any) -> ToolOutcome:
+        await asyncio.sleep(0.2)
+        return ToolOutcome(content_markdown="too slow", method="plain")
+
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "record1",
+                        "record_findings",
+                        {
+                            "findings": [
+                                {
+                                    "claim": "The statute took effect in 2025.",
+                                    "source_url": "https://example.com/statute",
+                                    "quote": "This act takes effect in 2025.",
+                                    "topic": "law",
+                                }
+                            ]
+                        },
+                    ),
+                    _tool_call("slow1", "slow_tool"),
+                ]
+            )
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("slow_tool", slow_tool, timeout_s=1.0)],
+        _config(wall_deadline_s=0.05, max_steps=2),
+        llm_call=fake_llm,
+    )
+
+    assert "The statute took effect in 2025." in result.findings_markdown
+    assert result.telemetry.deadline_hit is True
+    assert result.ghost is None
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_is_reported_and_loop_continues() -> None:
+    async def slow_tool(**_: Any) -> ToolOutcome:
+        await asyncio.sleep(0.05)
+        return ToolOutcome(content_markdown="never seen", method="plain")
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("slow1", "slow_tool")]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("slow_tool", slow_tool, timeout_s=0.01)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    assert "status: timeout" in _tool_messages(result)[0]["content"]
+    assert result.telemetry.steps == 2
+
+
+@pytest.mark.asyncio
+async def test_record_findings_rejects_lint_and_banks_clean_findings() -> None:
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "record1",
+                        "record_findings",
+                        {
+                            "findings": [
+                                {
+                                    "claim": "This likely resolves soon.",
+                                    "source_url": "https://example.com/bad",
+                                    "quote": "Likely to resolve soon.",
+                                    "topic": "general",
+                                },
+                                {
+                                    "claim": "The board published the minutes.",
+                                    "source_url": "https://example.com/good",
+                                    "quote": "Minutes were published on Tuesday.",
+                                    "topic": "minutes",
+                                },
+                            ]
+                        },
+                    )
+                ]
+            ),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    assert "The board published the minutes." in result.findings_markdown
+    assert "This likely resolves soon." not in result.findings_markdown
+    assert result.telemetry.lint_rejections == 1
+    assert "findings[0] rejected" in _tool_messages(result)[0]["content"]
+
+
+_FINDING_UN = {
+    "claim": "The UN projects a population peak of ~10.3 billion in the mid-2080s.",
+    "source_url": "https://example.com/un",
+    "quote": "peak of around 10.3 billion people in the mid-2080s",
+    "date": "2024-07-11",
+    "retrieved_how": "fetch",
+    "topic": "demographics",
+}
+_FINDING_NASA = {
+    "claim": "NASA reports no known >140m asteroid with significant 100-year impact risk.",
+    "source_url": "https://example.com/nasa",
+    "quote": "no known asteroid larger than 140 meters",
+    "date": "2023-09-08",
+    "retrieved_how": "fetch",
+    "topic": "asteroids",
+}
+
+
+@pytest.mark.asyncio
+async def test_findings_recorded_then_relisted_in_conclude_are_not_duplicated() -> None:
+    """Regression (Q578): a driver that banks findings with record_findings and
+    then re-lists the SAME findings in conclude's final_findings must not double
+    them (observed: 8 findings rendered 16 times). Banking is idempotent by
+    full-field identity."""
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("rec1", "record_findings", {"findings": [_FINDING_UN, _FINDING_NASA]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude", {"final_findings": [_FINDING_UN, _FINDING_NASA]})]),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    md = result.findings_markdown
+    assert md.count("The UN projects a population peak") == 1
+    assert md.count("NASA reports no known") == 1
+    assert result.telemetry.findings_count == 2
+    conclude_message = _tool_messages(result)[-1]
+    assert "Skipped 2 final finding(s) already recorded earlier in this run." in conclude_message["content"]
+    assert "Concluded with 0 final finding(s)" in conclude_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_findings_sharing_source_but_distinct_claim_are_both_kept() -> None:
+    """Dedup must key on the WHOLE finding, not just source_url: two findings
+    from the same page with different claims/topics are genuinely distinct and
+    must both survive (the Q578 log had exactly this shape for the NASA page)."""
+    long_claim = {
+        **_FINDING_NASA,
+        "topic": "asteroids (with NEO Surveyor context)",
+        "claim": "NASA reports no known >140m asteroid impact risk and says NEO Surveyor will accelerate discovery.",
+    }
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("rec1", "record_findings", {"findings": [_FINDING_NASA, long_claim]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    assert result.telemetry.findings_count == 2
+    assert "NEO Surveyor" in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("search1", "search_web")]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(max_tool_calls=1),
+        llm_call=fake_llm,
+    )
+
+    assert _tool_names(fake_llm.calls[1]["tools"]) == ["record_findings", "conclude"]
+    assert result.telemetry.tool_calls == 2
+
+
+_CLEAN_FINDING = {
+    "claim": "The report was published on July 1.",
+    "source_url": "https://example.com",
+    "quote": "Published on July 1, 2026.",
+    "topic": "timeline",
+}
+
+
+@pytest.mark.asyncio
+async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continues() -> None:
+    """An LLM-emitted extra kwarg makes spec.handler(**arguments) raise TypeError
+    at bind time (async-def binds eagerly). It must surface as a status=error
+    tool result inside the per-tool boundary, not crash the batch gather and
+    abort the whole pass. The loop keeps running and banked findings survive."""
+    invoked: list[str] = []
+
+    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("bad1", "strict_tool", {"query": "x", "unexpected": 1})]),
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+    )
+
+    assert result.telemetry.steps == 3  # loop ran all three turns — no abort
+    bad_message = _tool_messages(result)[0]
+    assert bad_message["tool_call_id"] == "bad1"
+    assert "status: error" in bad_message["content"]
+    assert "TypeError" in bad_message["content"]
+    assert invoked == []  # handler body never ran; failure was at bind time
+    assert "The report was published on July 1." in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_continues() -> None:
+    """A missing required kwarg raises TypeError at bind time too; same contract:
+    error tool result, loop continues, banked findings survive."""
+    invoked: list[str] = []
+
+    async def strict_tool(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("bad1", "strict_tool", {})]),  # no `query`
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+    )
+
+    assert result.telemetry.steps == 3
+    bad_message = _tool_messages(result)[0]
+    assert bad_message["tool_call_id"] == "bad1"
+    assert "status: error" in bad_message["content"]
+    assert "TypeError" in bad_message["content"]
+    assert invoked == []
+    assert "The report was published on July 1." in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls() -> None:
+    """A single turn can emit more calls than budget allows (parallel_tool_calls).
+    The batch is clamped to the remaining external-call slots: in-budget calls run,
+    overflow external calls are rejected with a synthetic budget-exhausted error,
+    every tool_call_id still gets exactly one response, and internal tools
+    (record_findings) keep working past the ceiling."""
+    invoked: list[str] = []
+
+    async def search_web(*, query: str) -> ToolOutcome:  # noqa: ASYNC124 - concrete signature, no **kwargs
+        invoked.append(query)
+        return ToolOutcome(content_markdown=f"result {query}", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call("c1", "search_web", {"query": "q1"}),
+                    _tool_call("c2", "search_web", {"query": "q2"}),
+                    _tool_call("c3", "search_web", {"query": "q3"}),
+                ]
+            ),
+            _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(max_tool_calls=2),
+        llm_call=fake_llm,
+    )
+
+    # Only the two in-budget external calls executed; the third never bound.
+    assert set(invoked) == {"q1", "q2"}
+    assert len(invoked) == 2
+    assert result.telemetry.per_tool_counts["search_web"] == 2
+
+    # Every tool_call_id in the batch got exactly one response, in order.
+    batch_messages = _tool_messages(result)[:3]
+    assert [message["tool_call_id"] for message in batch_messages] == ["c1", "c2", "c3"]
+
+    rejected_message = next(message for message in batch_messages if message["tool_call_id"] == "c3")
+    assert "status: error" in rejected_message["content"]
+    assert "budget is exhausted" in rejected_message["content"]
+    accepted_messages = [message for message in batch_messages if message["tool_call_id"] in {"c1", "c2"}]
+    assert all("budget is exhausted" not in message["content"] for message in accepted_messages)
+
+    # record_findings ran past the ceiling — internal tools are not budget-gated.
+    assert "The report was published on July 1." in result.findings_markdown
+
+
+@pytest.mark.asyncio
+async def test_append_only_message_history_is_preserved_across_steps() -> None:
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("search1", "search_web")]),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    for earlier, later in zip(fake_llm.calls, fake_llm.calls[1:]):
+        assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
+
+
+@pytest.mark.asyncio
+async def test_soft_fail_preserves_banked_findings_on_broken_llm_response() -> None:
+    fake_llm = FakeLlm(
+        [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "record1",
+                        "record_findings",
+                        {
+                            "findings": [
+                                {
+                                    "claim": "The agency released the bulletin.",
+                                    "source_url": "https://example.com/bulletin",
+                                    "quote": "Bulletin released Friday.",
+                                    "topic": "bulletin",
+                                }
+                            ]
+                        },
+                    )
+                ]
+            ),
+            object(),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+    assert "The agency released the bulletin." in result.findings_markdown
+    assert result.ghost is None
+
+
+@pytest.mark.asyncio
+async def test_soft_fail_returns_empty_result_on_injected_loop_bug(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
+
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("search1", "search_web")])])
+    monkeypatch.setattr(
+        "metaculus_bot.research.agentic.loop._tool_schemas",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    result = await run_agentic_loop(
+        "system",
+        "user",
+        [_tool_spec("search_web", search_web)],
+        _config(),
+        llm_call=fake_llm,
+    )
+
+    assert result.findings_markdown == ""
+    assert result.ghost is None
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_runs_after_conclude_and_logs_marker(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = 'analysis\n```json\n{"question_type":"binary","posterior_prob":0.42}\n```'
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+            _response(content=ghost_text),
+        ]
+    )
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    assert result.ghost is not None
+    assert result.ghost.qtype == "binary"
+    assert result.ghost.parsed_summary == "posterior_prob=0.4200"
+    assert any("GHOST_FORECAST:" in record.getMessage() for record in caplog.records)
+
+
+def _ghost_json_payload(caplog: pytest.LogCaptureFixture) -> dict:
+    """Extract and parse the single GHOST_FORECAST_JSON marker line from captured logs."""
+    lines = [record.getMessage() for record in caplog.records if "GHOST_FORECAST_JSON:" in record.getMessage()]
+    assert len(lines) == 1, f"expected exactly one GHOST_FORECAST_JSON line, got {lines}"
+    blob = lines[0].split("GHOST_FORECAST_JSON:", 1)[1].strip()
+    return json.loads(blob)
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_binary(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = 'analysis\n```json\n{"question_type":"binary","posterior_prob":0.42}\n```'
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    assert payload == {"qtype": "binary", "prob": 0.42}
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_mc(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = 'analysis\n```json\n{"question_type":"multiple_choice","option_probs":{"Blue":0.3,"Red":0.7}}\n```'
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    assert payload == {"qtype": "multiple_choice", "option_probs": {"Blue": 0.3, "Red": 0.7}}
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_emits_full_fidelity_json_marker_numeric(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    ghost_text = (
+        'analysis\n```json\n{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}\n```'
+    )
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    payload = _ghost_json_payload(caplog)
+    # JSON serializes float keys as strings; the full percentile set survives round-trip.
+    assert payload == {
+        "qtype": "numeric",
+        "declared_percentiles": {"0.1": 10.0, "0.5": 20.5, "0.9": 30.0},
+        "median": 20.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_suppresses_json_marker_when_unparseable(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content="no block here")])
+
+    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    # Legacy marker still fires (qtype=unknown); the JSON companion is suppressed.
+    assert any("GHOST_FORECAST:" in r.getMessage() for r in caplog.records)
+    assert not any("GHOST_FORECAST_JSON:" in r.getMessage() for r in caplog.records)
+
+
+class TestSummarizeGhost:
+    """Branch coverage for _summarize_ghost (MC + numeric; binary is covered
+    by test_ghost_phase_runs_after_conclude_and_logs_marker above). Also asserts
+    the third tuple element — the full-fidelity forecast payload."""
+
+    def test_multiple_choice_formats_sorted_option_probs(self) -> None:
+        raw = (
+            "analysis\n```json\n"
+            '{"question_type": "multiple_choice", "option_probs": {"Zeta": 0.5, "Alpha": 0.3, "Mid": 0.2}}'
+            "\n```"
+        )
+
+        qtype, summary, payload = _summarize_ghost(raw)
+
+        assert qtype == "multiple_choice"
+        assert summary == "Alpha=0.300, Mid=0.200, Zeta=0.500"
+        assert payload == {"qtype": "multiple_choice", "option_probs": {"Zeta": 0.5, "Alpha": 0.3, "Mid": 0.2}}
+
+    def test_numeric_reports_median(self) -> None:
+        raw = (
+            "analysis\n```json\n"
+            '{"question_type": "numeric", "declared_percentiles": {"0.1": 10.0, "0.5": 20.5, "0.9": 30.0}}'
+            "\n```"
+        )
+
+        qtype, summary, payload = _summarize_ghost(raw)
+
+        assert qtype == "numeric"
+        assert summary == "median=20.5"
+        assert payload == {
+            "qtype": "numeric",
+            "declared_percentiles": {0.1: 10.0, 0.5: 20.5, 0.9: 30.0},
+            "median": 20.5,
+        }
+
+    def test_numeric_missing_median_yields_empty_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The median-None guard. Unreachable through a schema-valid parse
+        (NumericStructured requires percentile 0.5), so build the block via
+        model_construct and stub the parse to return it."""
+        block = NumericStructured.model_construct(question_type="numeric", declared_percentiles={0.1: 10.0, 0.9: 30.0})
+
+        def fake_parse(_raw_text: str, qtype: str) -> Any:
+            return block if qtype == "numeric" else None
+
+        monkeypatch.setattr("metaculus_bot.research.agentic.loop.parse_structured_block", fake_parse)
+
+        qtype, summary, payload = _summarize_ghost("whatever")
+
+        assert qtype == "numeric"
+        assert summary == ""
+        # Payload still carries the full (median-less) percentile set for scoring.
+        assert payload == {"qtype": "numeric", "declared_percentiles": {0.1: 10.0, 0.9: 30.0}, "median": None}
+
+    def test_unparseable_text_reports_unknown(self) -> None:
+        qtype, summary, payload = _summarize_ghost("no structured block here")
+
+        assert qtype == "unknown"
+        assert summary == ""
+        assert payload is None
+
+    @pytest.mark.parametrize(
+        ("qtype", "block"),
+        [
+            ("numeric", '{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}'),
+            ("multiple_choice", '{"question_type":"multiple_choice","option_probs":{"Blue":0.3,"Red":0.7}}'),
+            ("binary", '{"question_type":"binary","posterior_prob":0.42}'),
+        ],
+    )
+    def test_no_qtype_mismatch_warnings_on_declared_block(
+        self, caplog: pytest.LogCaptureFixture, qtype: str, block: str
+    ) -> None:
+        """Regression (BUG 2): the probe used to try all three qtypes, tripping
+        the shared parser's question_type-mismatch WARN for the non-matching
+        ones (5 spurious WARNs/run). Reading the declared type first parses only
+        the matching type — zero mismatch WARNs on the expected path."""
+        caplog.set_level(logging.WARNING, logger="metaculus_bot.structured_output_schema")
+
+        result_qtype, _summary, _payload = _summarize_ghost(f"analysis\n```json\n{block}\n```")
+
+        assert result_qtype == qtype
+        mismatch_warns = [r for r in caplog.records if "question_type mismatch" in r.getMessage()]
+        assert mismatch_warns == []
+
+
+@pytest.mark.asyncio
+async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pytest.LogCaptureFixture) -> None:
+    """End-to-end guard: a numeric ghost run through the full loop leaves no
+    question_type-mismatch WARN in the structured_output_schema logger."""
+    caplog.set_level(logging.WARNING, logger="metaculus_bot.structured_output_schema")
+    ghost_text = (
+        'analysis\n```json\n{"question_type":"numeric","declared_percentiles":{"0.1":10.0,"0.5":20.5,"0.9":30.0}}\n```'
+    )
+    fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
+
+    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+
+    assert result.ghost is not None and result.ghost.qtype == "numeric"
+    assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []

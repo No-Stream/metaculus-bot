@@ -22,6 +22,7 @@ from forecasting_tools import (
     ReasonedPrediction,
     clean_indents,
 )
+from forecasting_tools.ai_models.ai_utils.openai_utils import VisionMessageData
 from pydantic import ValidationError
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
@@ -54,6 +55,22 @@ END LLM OUTPUT | {model_name}
 \n\n
 """
     )
+
+
+def _forecaster_input(prompt: str, chart_b64: str | None) -> str | VisionMessageData:
+    """Return the invoke input for a forecaster: the bare prompt, or a
+    ``VisionMessageData`` carrying the prompt + the time-series-anchor chart PNG.
+
+    When ``chart_b64`` is provided (TS_ANCHOR_CHART_ENABLED on), the base model
+    sees the chart alongside the prompt at low resolution — enough to read the
+    band/level, cheap on tokens. All roster models are vision-capable via
+    OpenRouter. The downstream parser/extraction path only ever consumes the
+    model's reasoning TEXT, so it is untouched by this. Only the base forecaster
+    generation sees the image — never the stacker, summarizer, or gap-fill.
+    """
+    if chart_b64 is None:
+        return prompt
+    return VisionMessageData(prompt=prompt, b64_image=chart_b64, image_resolution="low")
 
 
 def build_parse_notes(question: NumericQuestion) -> str:
@@ -104,14 +121,18 @@ async def run_binary_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    chart_b64: str | None = None,
 ) -> ReasonedPrediction[float]:
     prompt = binary_prompt(question, research)
+    forecaster_input = _forecaster_input(prompt, chart_b64)
     # Broad, 30s-gated retry (forecaster instances are allowed_tries=1 in
     # llm_configs.py): recovers a fast blip / empty-response while obeying the
     # universal "no retry after 30s" deadline rule. wall_timeout mirrors the outer
     # FORECASTER_SOFT_DEADLINE that _forecaster_with_soft_deadline already enforces.
     reasoning = await invoke_with_broad_retry(
-        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_binary"
+        lambda: forecaster_llm.invoke(forecaster_input),
+        wall_timeout=FORECASTER_SOFT_DEADLINE,
+        label="forecaster_binary",
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
@@ -139,11 +160,13 @@ async def run_mc_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    chart_b64: str | None = None,
 ) -> ReasonedPrediction[PredictedOptionList]:
     prompt = multiple_choice_prompt(question, research)
+    forecaster_input = _forecaster_input(prompt, chart_b64)
     # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
     reasoning = await invoke_with_broad_retry(
-        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_mc"
+        lambda: forecaster_llm.invoke(forecaster_input), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_mc"
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
@@ -180,6 +203,7 @@ async def run_numeric_forecast(
     research: str,
     forecaster_llm: GeneralLlm,
     parser_llm: GeneralLlm,
+    chart_b64: str | None = None,
 ) -> tuple[ReasonedPrediction[NumericDistribution], bool | None]:
     """Run a numeric forecast and return (prediction, discrete_vote).
 
@@ -188,9 +212,12 @@ async def run_numeric_forecast(
     """
     upper_bound_message, lower_bound_message = bound_messages(question)
     prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
+    forecaster_input = _forecaster_input(prompt, chart_b64)
     # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
     reasoning = await invoke_with_broad_retry(
-        lambda: forecaster_llm.invoke(prompt), wall_timeout=FORECASTER_SOFT_DEADLINE, label="forecaster_numeric"
+        lambda: forecaster_llm.invoke(forecaster_input),
+        wall_timeout=FORECASTER_SOFT_DEADLINE,
+        label="forecaster_numeric",
     )
 
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)

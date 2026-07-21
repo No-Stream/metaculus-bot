@@ -26,17 +26,22 @@ attribution for each base model; the summary bullets only show the stacker's
 aggregate, so per-base-model values are only recoverable from reasoning prose.
 """
 
+import json
 import logging
+import math
 import re
 from collections.abc import Iterator
-from typing import Literal
+from typing import Literal, TypeGuard
 
 from metaculus_bot.comment.markers import (
+    BASE_MODEL_SUBBLOCK_SPLIT_RE,
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
     STACKER_OUTCOME_RE,
 )
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.percentile_set import PERCENTILE_KEY_DECIMALS
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
@@ -51,8 +56,11 @@ def parse_stacker_outcome_marker(comment_text: str) -> str | None:
     """Return the STACKER_OUTCOME literal in ``comment_text``, else None.
 
     Returns one of ``"primary"``, ``"fallback_llm"``, ``"fallback_median"``,
-    ``"skipped"`` (always lower-cased), or ``None`` if no marker is present.
-    Older comments predating the tri-state marker return ``None``.
+    ``"fallback_mean"``, ``"skipped"``, ``"skipped_config_off"`` (always
+    lower-cased), or ``None`` if no marker is present. Older comments
+    predating the tri-state marker return ``None``; comments published before
+    ``skipped_config_off`` shipped (2026-07-19) collapse both skip reasons
+    into ``"skipped"``.
     """
     match = STACKER_OUTCOME_RE.search(comment_text)
     if match is None:
@@ -262,17 +270,6 @@ _PERCENTILE_LINE_RE: re.Pattern[str] = re.compile(
     re.MULTILINE,
 )
 
-# Matches a ``Model: openrouter/...`` line that starts a base-model sub-block
-# inside a stacker-combined body. Must anchor at the start of a line so it
-# doesn't match stray mentions inside prose; the value is captured for
-# attribution. The value is required to contain ``/`` so we don't accidentally
-# split on a narrative line like ``Model: previous version`` inside a base
-# reasoning's prose — the bot-injected prefix always uses a slash-delimited
-# OpenRouter path (e.g. ``Model: openrouter/openai/gpt-5.5``).
-_BASE_MODEL_SUBBLOCK_SPLIT_RE: re.Pattern[str] = re.compile(
-    r"(?m)^[ \t]*Model:[ \t]*([^\n]*/[^\n]*?)[ \t]*$",
-)
-
 
 def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None, str]]] | None:
     """Split a stacker-combined R1 body into (stacker_meta, base_sub_blocks).
@@ -308,7 +305,7 @@ def _split_stacker_combined_body(body: str) -> tuple[str, list[tuple[str | None,
     # Each match starts a new sub-block; the body of a sub-block runs until
     # the next "Model:" line or end-of-portion.
     sub_blocks: list[tuple[str | None, str]] = []
-    matches = list(_BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
+    matches = list(BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
     for i, match in enumerate(matches):
         raw_model = match.group(1).strip()
         model_name: str | None
@@ -460,9 +457,203 @@ def _mc_option_probs_from_block(body_text: str) -> dict[str, float] | None:
     return dict(block.option_probs)
 
 
+# ---------------------------------------------------------------------------
+# Tolerant raw-JSON salvage (last rung, after strict block AND prose regex)
+#
+# Historical blocks (pre-2026-07-08 prompt era) carry retired tier-2 scaffold
+# fields (``mixture_components``, ``tails``, ``distribution_family_hint``, the
+# old ``scenarios`` shape) or values the current strict schemas reject
+# (``concentration: 0.0``). ``parse_structured_block`` uses extra="forbid"
+# schemas, so it returns None for the ENTIRE block even though the declared
+# forecast values inside are fine. Models that emitted block-only rationales
+# with no prose value lines (gemini-3.1-pro in the 2026-05/06 era) then vanish
+# from recovered per-model data entirely — the 2026-07-15 ensemble screening's
+# false "gemini missed 5 of 45 summer questions" finding was exactly this
+# (4 of the 5 were parse losses, verified against GHA run logs; only 1 was a
+# real soft-deadline drop). The salvage below reads just the value field from
+# the raw JSON, faithful to what the model emitted, mirroring the tolerant
+# read pinned in scratch/coherence_2026-07-15/schema_README.md.
+#
+# Precedence is deliberately strict-block > prose > tolerant: transition-era
+# comments where a sparse/invalid block coexists with full prose value lines
+# keep resolving from prose exactly as before.
+# ---------------------------------------------------------------------------
+
+_KNOWN_BLOCK_QUESTION_TYPES: frozenset[str] = frozenset({"binary", "numeric", "multiple_choice"})
+
+
+def _tolerant_block_payload(
+    body_text: str,
+    question_type: Literal["binary", "numeric", "multiple_choice"],
+) -> dict | None:
+    """Raw ``json.loads`` of the body's fenced block, bypassing schema validation.
+
+    Returns the payload dict, or None when there is no block, the JSON is
+    malformed, or the block declares a *conflicting* known question_type
+    (an unknown/absent question_type passes — field extraction filters it).
+    """
+    raw = extract_json_block(body_text)
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    declared_type = payload.get("question_type")
+    if declared_type in _KNOWN_BLOCK_QUESTION_TYPES and declared_type != question_type:
+        return None
+    return payload
+
+
+def _is_finite_number(value: object) -> TypeGuard[float]:
+    """True for real int/float values (bool excluded, NaN/inf excluded)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _numeric_percentiles_from_block_tolerant(body_text: str) -> list[tuple[float, float]] | None:
+    """Salvage (percentile, value) pairs from a strict-invalid numeric block.
+
+    Same decimal→raw-percent label conversion as the strict reader. Keys must
+    coerce to float in (0, 1); values must be finite numbers. Returns None when
+    nothing usable survives.
+    """
+    payload = _tolerant_block_payload(body_text, "numeric")
+    if payload is None:
+        return None
+    declared = payload.get("declared_percentiles")
+    if not isinstance(declared, dict):
+        return None
+    pairs: list[tuple[float, float]] = []
+    for key, value in declared.items():
+        try:
+            pct = float(key)
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 < pct < 1.0) or not _is_finite_number(value):
+            continue
+        pairs.append((round(pct * 100.0, 6), float(value)))
+    return sorted(pairs) if pairs else None
+
+
+def _binary_prob_from_block_tolerant(body_text: str) -> float | None:
+    """Salvage the posterior probability from a strict-invalid binary block."""
+    payload = _tolerant_block_payload(body_text, "binary")
+    if payload is None:
+        return None
+    prob = payload.get("posterior_prob")
+    if not _is_finite_number(prob) or not (0.0 <= prob <= 1.0):
+        return None
+    return float(prob)
+
+
+def _mc_option_probs_from_block_tolerant(body_text: str) -> dict[str, float] | None:
+    """Salvage {option_name: probability} from a strict-invalid MC block.
+
+    Per-value bounds are enforced but the strict sum≈1 check is NOT — the
+    downstream consumers (option-set match + renormalization) handle scale.
+    """
+    payload = _tolerant_block_payload(body_text, "multiple_choice")
+    if payload is None:
+        return None
+    raw_options = payload.get("option_probs")
+    if not isinstance(raw_options, dict):
+        return None
+    options: dict[str, float] = {}
+    for key, value in raw_options.items():
+        if not isinstance(key, str) or not key.strip():
+            return None
+        if not _is_finite_number(value) or not (0.0 <= value <= 1.0):
+            return None
+        options[key] = float(value)
+    if not options or sum(options.values()) <= 0.0:
+        return None
+    return options
+
+
+# ---------------------------------------------------------------------------
+# Percentile-label validation (guard against double-scaled labels)
+#
+# ``parse_per_model_numeric_percentiles`` emits labels in the PERCENT convention
+# (2.5, 5, ..., 97.5, 99) — every legitimate label is strictly inside (0, 100).
+# A forecaster that writes its block keys in percent form (2.5, 5, ...) instead
+# of the decimal convention (0.025, 0.05, ...) has them multiplied by 100 by the
+# block readers, producing double-scaled labels (250, 500, ..., 9750). That was
+# the qid=43684 grok-4.3 record the 2026-07-15 coherence study had to hand-drop
+# (drop_reason=malformed_percentile_labels_out_of_range). The guard below runs
+# after extraction and either passes clean labels through, deterministically
+# rescales an exact canonical-set*100 match, or rejects the model's percentiles.
+# ---------------------------------------------------------------------------
+
+# Canonical label sets in the percent convention (STANDARD_PERCENTILES * 100).
+# The 13-point set is the current standard; the 11-point subset (P1/P99 dropped)
+# is the pre-2026-07-07 archive-era shape. Both are derived from the decimal-form
+# single source of truth so a percentile-set change stays in lockstep.
+_CANONICAL_PERCENT_LABELS_13: frozenset[float] = frozenset(
+    round(p * 100.0, PERCENTILE_KEY_DECIMALS) for p in STANDARD_PERCENTILES
+)
+# P1 (0.01) and P99 (0.99) are the finer tail anchors added when the set grew 11->13.
+_CANONICAL_PERCENT_LABELS_11: frozenset[float] = _CANONICAL_PERCENT_LABELS_13 - {
+    round(0.01 * 100.0, PERCENTILE_KEY_DECIMALS),
+    round(0.99 * 100.0, PERCENTILE_KEY_DECIMALS),
+}
+_CANONICAL_PERCENT_LABEL_SETS: tuple[frozenset[float], ...] = (
+    _CANONICAL_PERCENT_LABELS_13,
+    _CANONICAL_PERCENT_LABELS_11,
+)
+
+
+def _validate_percentile_labels(
+    percentiles: list[tuple[float, float]],
+    *,
+    model: str,
+    question_id: int | str | None = None,
+) -> list[tuple[float, float]] | None:
+    """Guard extracted percentile labels against the double-scaled failure mode.
+
+    Runs after label extraction/normalization (block, prose, or tolerant rung).
+    The percent-label convention puts every legitimate label strictly inside
+    ``(0, 100)`` (P1..P99). This guard:
+
+    * returns the list unchanged when every label is in ``(0, 100)``;
+    * deterministically divides every label by 100 (with a WARNING) when the set
+      is EXACTLY a canonical label set * 100 (11- or 13-point) — a safe,
+      reversible correction of percent-vs-decimal double scaling, not a guess;
+    * otherwise returns ``None`` (with a WARNING naming the model and offending
+      labels) so the caller drops the model rather than emit out-of-range labels
+      into downstream calibration.
+
+    ``question_id`` is optional log context; callers that lack a qid pass None.
+    """
+    labels = [label for label, _ in percentiles]
+    if all(0.0 < label < 100.0 for label in labels):
+        return percentiles
+
+    rescaled_label_set = frozenset(round(label / 100.0, PERCENTILE_KEY_DECIMALS) for label in labels)
+    if rescaled_label_set in _CANONICAL_PERCENT_LABEL_SETS:
+        logger.warning(
+            "Rescaling double-scaled percentile labels (label/100 == canonical set): "
+            "question=%s model=%s offending_labels=%s",
+            question_id,
+            model,
+            sorted(labels),
+        )
+        return [(round(label / 100.0, PERCENTILE_KEY_DECIMALS), value) for label, value in percentiles]
+
+    logger.warning(
+        "Rejecting numeric percentiles with out-of-range labels: question=%s model=%s offending_labels=%s",
+        question_id,
+        model,
+        sorted(labels),
+    )
+    return None
+
+
 def parse_per_model_numeric_percentiles(
     comment_text: str,
     model_names: list[str] | None = None,
+    question_id: int | str | None = None,
 ) -> dict[str, list[tuple[float, float]]]:
     """Extract per-forecaster percentile lists from a numeric/discrete comment.
 
@@ -478,6 +669,12 @@ def parse_per_model_numeric_percentiles(
 
     Empty dict if no sections match. Sections without percentile lines are
     skipped (stacker meta-blocks that only reason, no distribution).
+
+    Every extracted percentile set is run through ``_validate_percentile_labels``
+    before it is returned: labels outside ``(0, 100)`` are either deterministically
+    rescaled (when the set is an exact canonical-set*100 double-scaling) or the
+    model is dropped, so downstream calibration never sees out-of-range labels.
+    ``question_id`` is optional context threaded into that guard's WARNING logs.
 
     Stacked blocks
     --------------
@@ -497,8 +694,16 @@ def parse_per_model_numeric_percentiles(
         if percentiles is None:
             percentiles = [(float(m.group(1)), float(m.group(2))) for m in _PERCENTILE_LINE_RE.finditer(body_text)]
         if not percentiles:
+            # Tolerant salvage: historical blocks with retired tier-2 fields
+            # fail the strict schema, and block-only rationales have no prose
+            # lines — without this rung those models vanish from recovery.
+            percentiles = _numeric_percentiles_from_block_tolerant(body_text) or []
+        if not percentiles:
             continue
-        result[key] = percentiles
+        validated = _validate_percentile_labels(percentiles, model=key, question_id=question_id)
+        if validated is None:
+            continue
+        result[key] = validated
     return result
 
 
@@ -772,6 +977,10 @@ def parse_per_base_model_forecasts(
             prob = _binary_prob_from_block(body_text)
             if prob is None:
                 prob = _extract_last_probability_from_body(body_text)
+            if prob is None:
+                # Tolerant salvage for historical strict-invalid blocks with
+                # no prose value lines (see the salvage-rung comment above).
+                prob = _binary_prob_from_block_tolerant(body_text)
             if prob is not None:
                 result[model_name] = f"{prob * 100:.1f}%"
 
@@ -783,6 +992,10 @@ def parse_per_base_model_forecasts(
                     option_name = opt_match.group(1).strip()
                     prob_pct = float(opt_match.group(2))
                     options[option_name] = prob_pct / 100.0
+            if not options:
+                # Tolerant salvage, e.g. blocks with concentration=0.0 that
+                # the strict validator rejects wholesale.
+                options = _mc_option_probs_from_block_tolerant(body_text) or {}
             if options:
                 result[model_name] = options
 

@@ -37,10 +37,13 @@ from metaculus_bot.research import prediction_market as pmp
 from metaculus_bot.research.prediction_market import (
     MarketMatch,
     MarketSnapshot,
+    _extract_title_entities,
+    _kalshi_entity_matches,
     _kalshi_prefetch_events,
     _kalshi_search_local,
     _liquidity_label,
     _manifold_search,
+    _match_entities_to_series,
     _parse_manifold_matches,
     _parse_polymarket_matches,
     _polymarket_search,
@@ -781,6 +784,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, predictit_payload),
         }
 
@@ -838,6 +842,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, {"events": [], "markets": []}),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, []),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, late_close_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
@@ -884,6 +889,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, {"events": [], "markets": []}),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, []),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, closed_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
         # Fresh cache
@@ -958,6 +964,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
@@ -993,6 +1000,7 @@ class TestFetchMarketSnapshot:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
@@ -1089,6 +1097,7 @@ class TestProviderFactory:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
@@ -1132,6 +1141,7 @@ class TestProviderFactory:
             "https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload),
             "https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload),
             "https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, {"series": []}),
             "https://www.predictit.org/api/marketdata/all/": FakeResponse(200, {"markets": []}),
         }
 
@@ -1151,13 +1161,94 @@ class TestProviderFactory:
             out = await provider(mock_question)
 
         assert isinstance(out, str)
-        assert "STRONG EVIDENCE" in out
+        assert "MAY be relevant" in out
         assert "polymarket" in out.lower() or "manifold" in out.lower() or "kalshi" in out.lower()
 
 
 # ---------------------------------------------------------------------------
 # Formatter
 # ---------------------------------------------------------------------------
+
+
+def _fmt_match(title: str, rules: str, confidence: float, *, platform: str = "polymarket") -> MarketMatch:
+    """Minimal MarketMatch for formatter/relevance tests."""
+    return MarketMatch(
+        platform=platform,  # type: ignore[arg-type]
+        market_title=title,
+        market_url=f"https://example.com/{platform}",
+        implied_prob_yes=0.5,
+        bid=None,
+        ask=None,
+        spread=None,
+        volume_24h=None,
+        close_time=datetime(2026, 12, 31, tzinfo=timezone.utc),
+        is_resolved=False,
+        match_confidence=confidence,
+        raw_rules=rules,
+        total_volume=100_000.0,
+        open_interest=50_000.0,
+    )
+
+
+class TestRelevanceGate:
+    """Piece 1: per-row relevance labels + conditional strong/neutral preamble."""
+
+    _SPACEX_Q = "Will SpaceX Starship reach orbit in 2026?"
+    _SPACEX_RC = "Resolves Yes if a SpaceX Starship reaches orbital velocity in 2026."
+
+    def test_all_junk_gets_neutral_preamble_and_verify_labels(self):
+        # Off-topic contract (zero content-word overlap, low conf) against a Fed-rates question.
+        snap = MarketSnapshot(matches=[_fmt_match("Carnival Cruise lower berth days", "berth-day count", 0.42)])
+        out = format_snapshot_for_research(
+            snap,
+            question_title="Will the Federal Reserve cut interest rates in September 2026?",
+            resolution_criteria="Resolves Yes if the FOMC lowers the target range at its September meeting.",
+        )
+        # Neutral framing, NOT the strong-evidence framing.
+        assert "may all be off-topic" in out.lower()
+        assert "leads to verify, not as evidence" in out.lower()
+        assert "extremely strong evidence" not in out.lower()
+        assert "anchor on its price" not in out.lower()
+        # Contract still rendered, labelled verify-carefully. (Check the pipe-delimited table
+        # cell, not the whole string — the legend text names both labels.)
+        assert "Carnival Cruise lower berth days" in out
+        assert "| verify-carefully |" in out
+        assert "| likely-relevant |" not in out
+
+    def test_relevant_contract_fires_strong_preamble_with_per_row_labels(self):
+        # One strongly-overlapping contract (clears the bar) + one off-topic contract (does not).
+        snap = MarketSnapshot(
+            matches=[
+                _fmt_match(self._SPACEX_Q, "Starship reaches orbital velocity in 2026.", 0.88),
+                _fmt_match("Carnival Cruise lower berth days", "berth-day count", 0.40, platform="kalshi"),
+            ]
+        )
+        out = format_snapshot_for_research(snap, question_title=self._SPACEX_Q, resolution_criteria=self._SPACEX_RC)
+        # >=1 clears -> strong preamble.
+        assert "extremely strong evidence" in out.lower()
+        assert "anchor on its price" in out.lower()
+        # Both contracts rendered; per-row labels differ (pipe-delimited cells).
+        assert "| likely-relevant |" in out
+        assert "| verify-carefully |" in out
+        assert "Carnival Cruise lower berth days" in out
+
+    def test_high_overlap_but_low_conf_stays_verify_carefully(self):
+        # Overlap clears but conf < MARKET_RELEVANCE_CONF_MIN -> not likely-relevant -> neutral.
+        snap = MarketSnapshot(matches=[_fmt_match(self._SPACEX_Q, "Starship orbital velocity 2026.", 0.30)])
+        out = format_snapshot_for_research(snap, question_title=self._SPACEX_Q, resolution_criteria=self._SPACEX_RC)
+        assert "| verify-carefully |" in out
+        assert "| likely-relevant |" not in out
+        assert "may all be off-topic" in out.lower()
+
+    def test_no_question_context_defaults_to_verify_carefully(self):
+        # Without question context overlap can't be computed -> conservative default (neutral + verify).
+        snap = MarketSnapshot(matches=[_fmt_match(self._SPACEX_Q, "Starship orbital velocity 2026.", 0.99)])
+        out = format_snapshot_for_research(snap)
+        assert "| verify-carefully |" in out
+        assert "| likely-relevant |" not in out
+        assert "may all be off-topic" in out.lower()
+        # Contract still rendered.
+        assert self._SPACEX_Q in out
 
 
 class TestFormatter:
@@ -1184,20 +1275,34 @@ class TestFormatter:
             ]
         )
 
-        formatted = format_snapshot_for_research(snap)
+        # Question context that strongly overlaps the match (spacex/starship/orbit/orbital/velocity)
+        # so the contract clears the relevance bar and the STRONG-evidence preamble fires.
+        formatted = format_snapshot_for_research(
+            snap,
+            question_title="Will SpaceX Starship reach orbit in 2026?",
+            resolution_criteria="Resolves Yes if a SpaceX Starship reaches orbital velocity in 2026.",
+        )
 
-        # The strong-evidence caveat is the load-bearing framing for the forecaster prompt:
-        # markets are weighted heavily, discounted only on a specific resolution mismatch.
-        assert "STRONG EVIDENCE" in formatted
-        assert "weight these markets heavily" in formatted.lower()
-        assert "verify" in formatted.lower()
+        # The strong-evidence header is the load-bearing framing when >=1 contract clears the bar:
+        # the fuzzy match may be off-topic, so relevance must be verified before weighting — a
+        # criteria+date match is extremely strong evidence, a mismatch is discounted proportionally.
+        assert "MAY be relevant" in formatted
+        assert "verify each market's resolution criteria" in formatted.lower()
+        assert "extremely strong evidence" in formatted.lower()
+        assert "anchor on its price" in formatted.lower()
         assert "resolution date" in formatted.lower()
-        assert "discount" in formatted.lower()
-        # New columns per the plan: total_vol + OI + signal replace the misleading 24h vol column.
+        assert "name the specific mismatch and discount accordingly" in formatted.lower()
+        assert "worth little or nothing" in formatted.lower()
+        # The old unconditional header must be gone.
+        assert "weight these markets heavily" not in formatted.lower()
+        # New columns per the plan: total_vol + OI + signal replace the misleading 24h vol column,
+        # plus the per-row relevance label.
         assert "platform" in formatted.lower()
         assert "total_vol" in formatted.lower()
         assert "| oi |" in formatted.lower()
         assert "signal" in formatted.lower()
+        assert "| relevance |" in formatted.lower()
+        assert "likely-relevant" in formatted
         assert "polymarket" in formatted.lower()
         assert "0.74" in formatted
         # total_volume=987654 rendered (not the 12500 24h vol), open_interest=60000, deep signal.
@@ -1303,7 +1408,117 @@ class TestFormatter:
         # total_vol and OI render as "-" for an all-None row.
         row = [ln for ln in formatted.splitlines() if ln.startswith("| predictit")][0]
         cells = [c.strip() for c in row.split("|")]
-        # cells: ['', platform, title, prob, total_vol, OI, signal, close, conf, '']
+        # cells: ['', platform, title, prob, total_vol, OI, signal, close, conf, relevance, '']
         assert cells[4] == "-"  # total_vol
         assert cells[5] == "-"  # OI
         assert cells[6] == "no-liquidity-data"  # signal
+        assert cells[9] == "verify-carefully"  # relevance (no question context -> conservative default)
+
+
+# ---------------------------------------------------------------------------
+# Kalshi entity-based series retrieval (Piece 2)
+# ---------------------------------------------------------------------------
+
+
+class TestKalshiEntityRetrieval:
+    def test_extract_title_entities_captures_awards_and_names(self):
+        q = MagicMock()
+        q.title = "Will an athlete win the ESPY for Best Male Athlete in 2026?"
+        q.question_text = q.title
+        entities = _extract_title_entities(q)
+        # Acronym + proper-noun phrase captured; scaffolding (Will/the/for/in/month) dropped.
+        assert "ESPY" in entities
+        assert "Best Male Athlete" in entities
+        assert "Will" not in entities
+
+    def test_extract_title_entities_quoted_span_and_dedup(self):
+        q = MagicMock()
+        q.title = 'Will the film "Toy Story 5" gross over $200M and win a BET Award?'
+        q.question_text = q.title
+        entities = _extract_title_entities(q)
+        assert "Toy Story 5" in entities
+        assert "BET Award" in entities
+
+    def test_match_entities_to_series_matches_by_title(self):
+        series = [
+            {"ticker": "KXESPYS", "title": "ESPY Awards Best Male Athlete", "tags": ["espy", "awards"]},
+            {"ticker": "KXHIGHNY", "title": "Weekly high temperature in NYC", "tags": []},
+        ]
+        tickers = _match_entities_to_series(["Best Male Athlete", "ESPY"], series)
+        assert tickers == ["KXESPYS"]
+
+    @pytest.mark.asyncio
+    async def test_entity_retrieval_finds_series_pure_fuzzy_missed(self):
+        """ESPY-style title: the exact ESPY event is ABSENT from the prefetch dump (only junk
+        there), so pure fuzzy-over-prefetch misses it. Entity retrieval matches the series and
+        fetches the event by series_ticker, surfacing the exact market."""
+        q = MagicMock()
+        q.title = "Will an athlete win the ESPY for Best Male Athlete in 2026?"
+        q.question_text = q.title
+
+        # Prefetch dump: only an off-topic event a pure fuzzy match would surface.
+        prefetch_events = [
+            {
+                "event_ticker": "KXCRUISE",
+                "title": "Carnival Cruise lower berth days",
+                "markets": [{"ticker": "KXCRUISE-Y", "title": "berth days", "rules_primary": "berth-day count"}],
+            }
+        ]
+        espy_event = {
+            "event_ticker": "KXESPYS-26-BMA",
+            "title": "ESPY Award: Best Male Athlete 2026",
+            "markets": [
+                {
+                    "ticker": "KXESPYS-26-BMA-Y",
+                    "title": "ESPY Best Male Athlete 2026",
+                    "rules_primary": "Resolves to the athlete who wins the 2026 ESPY for Best Male Athlete.",
+                    "yes_bid_dollars": "0.30",
+                    "yes_ask_dollars": "0.34",
+                    "close_time": "2026-12-31T23:59:59Z",
+                }
+            ],
+        }
+        series_payload = {
+            "series": [
+                {"ticker": "KXESPYS", "title": "ESPY Awards Best Male Athlete", "tags": ["espy"]},
+                {"ticker": "KXHIGHNY", "title": "Weekly high temperature in NYC", "tags": []},
+            ]
+        }
+
+        def _events_handler(params: dict[str, Any]) -> FakeResponse:
+            if params.get("series_ticker") == "KXESPYS":
+                return FakeResponse(200, {"events": [espy_event], "cursor": ""})
+            return FakeResponse(200, {"events": prefetch_events, "cursor": ""})
+
+        handlers = {
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(200, series_payload),
+            "https://api.elections.kalshi.com/trade-api/v2/events": _events_handler,
+        }
+        session = FakeSession(handlers)
+
+        # A generic query that would NOT fuzzy-match the ESPY event over the prefetch dump.
+        query = "athlete nominee 2026"
+
+        # Pure fuzzy over the prefetch dump surfaces nothing about the ESPY market.
+        fuzzy_only = _kalshi_search_local(prefetch_events, query, top_k=5, min_score=40.0)
+        assert not any("espy" in m.market_title.lower() for m in fuzzy_only)
+
+        # Entity retrieval surfaces the exact ESPY market via /series -> /events?series_ticker.
+        entity_matches = await _kalshi_entity_matches(session, q, [query], top_k=5)
+        assert any("espy" in m.market_title.lower() for m in entity_matches)
+        assert all(m.platform == "kalshi" for m in entity_matches)
+
+    @pytest.mark.asyncio
+    async def test_entity_retrieval_soft_fails_when_no_series_match(self):
+        """No series matches the entities -> no /events call, empty result (no raise)."""
+        q = MagicMock()
+        q.title = "Will an athlete win the ESPY for Best Male Athlete in 2026?"
+        q.question_text = q.title
+        handlers = {
+            "https://api.elections.kalshi.com/trade-api/v2/series": FakeResponse(
+                200, {"series": [{"ticker": "KXHIGHNY", "title": "Weekly high temperature in NYC", "tags": []}]}
+            ),
+        }
+        session = FakeSession(handlers)
+        matches = await _kalshi_entity_matches(session, q, ["athlete"], top_k=5)
+        assert matches == []

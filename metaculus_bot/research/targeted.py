@@ -34,6 +34,7 @@ from metaculus_bot.prompts import (
     targeted_search_prompt,
 )
 from metaculus_bot.research.providers import build_native_search_llm
+from metaculus_bot.research.raw_log import record_raw_research
 from metaculus_bot.structured_output_schema import extract_first_balanced_braces, extract_json_block
 
 __all__ = [
@@ -300,6 +301,14 @@ async def run_gap_fill_pass(
     # return_exceptions=True captures per-gap failures so one SDK error
     # doesn't take the whole addendum down.
     results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    # Raw per-gap search results (exceptions serialize to their str via the
+    # logger's encoder) alongside the analyzer's declared gaps.
+    record_raw_research(
+        qid=getattr(question, "id_of_question", None),
+        provider="gap_fill",
+        payload={"gaps": gaps, "results": results},
+    )
 
     sections: list[str] = []
     for idx, (gap, res) in enumerate(zip(gaps, results), start=1):

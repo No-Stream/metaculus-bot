@@ -10,6 +10,7 @@ Verifies that the orchestrator:
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -169,9 +170,12 @@ class TestAskNewsSummarization:
         assert "opened on 2026-03-15" in collapsed
         # (b) Lighter window-stamping: precise dating, targeted PRE-WINDOW label
         #     only for facts that could look like they satisfy the criteria; no
-        #     blanket IN-WINDOW stamps.
+        #     blanket IN-WINDOW stamps. Full tag on first occurrence, short
+        #     "[PRE-WINDOW]" tag on repeats (display compression only).
         assert "Date every fact precisely" in collapsed
         assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
+        assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
+        assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
         assert "[IN-WINDOW]" not in collapsed
         assert "base-rate" in collapsed
         # (c) Single-source rule: label + carry hedges + no promotion to confirmed.
@@ -546,7 +550,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="some research prose")
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert len(results) == 1
         assert results[0].name == "native_search"
@@ -563,7 +567,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="   ")
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert results[0].status == "empty"
         assert results[0].chars == 0
@@ -573,7 +577,7 @@ class TestProviderDiagnosticsCapture:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(side_effect=RuntimeError("boom"))
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "native_search")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
 
         assert results[0].status == "errored"
         assert results[0].chars == 0
@@ -591,7 +595,7 @@ class TestProviderDiagnosticsCapture:
 
         provider = AsyncMock(side_effect=ForbiddenError("403011 - subscription is not currently active"))
 
-        _, results = await orch._run_providers_parallel(question, [(provider, "asknews")])
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "asknews")])
 
         assert results[0].status == "inactive"
         assert results[0].chars == 0
@@ -611,7 +615,7 @@ class TestProviderDiagnosticsCapture:
             new_callable=AsyncMock,
             return_value="perplexity fallback prose",
         ):
-            text, results = await orch._run_providers_parallel(question, [(asknews, "asknews")])
+            text, results, _ = await orch._run_providers_parallel(question, [(asknews, "asknews")])
 
         assert results[0].status == "fallback"
         assert results[0].name == "asknews"
@@ -624,33 +628,56 @@ class TestProviderDiagnosticsCapture:
         ok = AsyncMock(return_value="native prose")
         failing = AsyncMock(side_effect=RuntimeError("timeout"))
 
-        _, results = await orch._run_providers_parallel(question, [(ok, "native_search"), (failing, "gemini_search")])
+        _, results, _ = await orch._run_providers_parallel(
+            question, [(ok, "native_search"), (failing, "gemini_search")]
+        )
 
         by_name = {r.name: r for r in results}
         assert by_name["native_search"].status == "ok"
         assert by_name["gemini_search"].status == "errored"
 
     @pytest.mark.asyncio
-    async def test_diagnostics_block_appended_to_research(self, mock_llm, question):
+    async def test_diagnostics_block_withheld_from_research_but_logged_and_poppable(self, mock_llm, question, caplog):
+        """Diagnostics seam: run_research output (the forecaster-facing text) must NOT
+        carry the block, but it must still be (a) logged at INFO and (b) stashed for the
+        comment path via pop_provider_diagnostics."""
+
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         ok = AsyncMock(return_value="native prose")
         failing = AsyncMock(side_effect=RuntimeError("timeout"))
 
-        with patch.object(
-            orch,
-            "_select_research_providers",
-            return_value=[(ok, "native_search"), (failing, "gemini_search")],
+        with (
+            patch.object(
+                orch,
+                "_select_research_providers",
+                return_value=[(ok, "native_search"), (failing, "gemini_search")],
+            ),
+            caplog.at_level(logging.INFO),
         ):
             research = await orch.run_research(question)
 
-        assert "## Provider Diagnostics" in research
-        diag_lines = [line for line in research.splitlines() if line.startswith("- ")]
+        # Forecaster-facing research is clean.
+        assert "## Provider Diagnostics" not in research
+        assert "native prose" in research
+
+        # Logged at INFO for run-log triage.
+        diag_log = next(rec.message for rec in caplog.records if "Provider diagnostics for URL" in rec.message)
+        assert "## Provider Diagnostics" in diag_log
+
+        # Stashed for the comment path, keyed by qid.
+        block = orch.pop_provider_diagnostics(question.id_of_question)
+        assert "## Provider Diagnostics" in block
+        diag_lines = [line for line in block.splitlines() if line.startswith("- ")]
         assert any(line.startswith("- native_search: ok |") for line in diag_lines)
         errored_line = next(line for line in diag_lines if line.startswith("- gemini_search: errored |"))
         assert "RuntimeError" in errored_line
 
+        # Pop semantics: a second pop returns empty (stash must not grow across a batch).
+        assert orch.pop_provider_diagnostics(question.id_of_question) == ""
+        assert orch.pop_provider_diagnostics(None) == ""
+
     @pytest.mark.asyncio
-    async def test_diagnostics_block_after_gap_fill(self, mock_llm, question, monkeypatch):
+    async def test_gap_fill_research_stays_clean_of_diagnostics(self, mock_llm, question, monkeypatch):
         monkeypatch.setenv("GAP_FILL_ENABLED", "true")
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="A" * 200)
@@ -665,8 +692,10 @@ class TestProviderDiagnosticsCapture:
         ):
             research = await orch.run_research(question)
 
-        # Ordering: providers -> gap-fill -> provider diagnostics.
-        assert research.index("Targeted Gap-Fill") < research.index("## Provider Diagnostics")
+        # Gap-fill addendum lands in the forecaster-facing text; diagnostics do not.
+        assert "Targeted Gap-Fill" in research
+        assert "## Provider Diagnostics" not in research
+        assert "## Provider Diagnostics" in orch.pop_provider_diagnostics(question.id_of_question)
 
     @pytest.mark.asyncio
     async def test_sink_receives_attempted_and_succeeded_excluding_failures(self, mock_llm, question, monkeypatch):
@@ -758,6 +787,53 @@ class TestProviderDiagnosticsCapture:
         assert captured["providers_attempted"] == ["asknews"]
         assert captured["providers_succeeded"] == ["asknews"]  # fallback status counts as succeeded
         assert captured["provider_results"][0]["status"] == "fallback"
+        # Fallback prose is not AskNews articles — no raw capture (empty string,
+        # which the persistence writer omits from the record).
+        assert captured["asknews_raw"] == ""
+
+    @pytest.mark.asyncio
+    async def test_sink_receives_raw_asknews_text_pre_summarization(self, mock_llm, question, monkeypatch):
+        """2026-07-18 audit hygiene: the archive stores only the post-summarization
+        briefing, so the sink must also receive the raw pre-summarization AskNews
+        article text — otherwise FETCH-vs-SUMMARIZE attribution and summarizer
+        replays require fresh paid pulls."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+
+        captured: dict = {}
+
+        def sink(**kwargs) -> None:  # noqa: ANN003
+            captured.update(kwargs)
+
+        orch = ResearchOrchestrator(
+            default_llm=mock_llm,
+            summarizer_llm=mock_llm,
+            allow_research_fallback=False,
+            research_sink=sink,
+        )
+        asknews = AsyncMock(return_value="raw asknews articles")
+        native = AsyncMock(return_value="native search prose")
+
+        with (
+            patch.object(
+                orch,
+                "_select_research_providers",
+                return_value=[(asknews, "asknews"), (native, "native_search")],
+            ),
+            patch.object(
+                orch._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value="ASKNEWS BRIEFING",
+            ),
+        ):
+            research = await orch.run_research(question)
+
+        # Forecaster-facing text carries the briefing; the sink carries the raw.
+        assert "ASKNEWS BRIEFING" in research
+        assert "raw asknews articles" not in research
+        assert captured["asknews_raw"] == "raw asknews articles"
+        # The raw is a sibling field, never folded into research_text.
+        assert "raw asknews articles" not in captured["research_text"]
 
 
 class TestDemoteInnerHeadings:

@@ -1,0 +1,708 @@
+# Crux-analyzer inputs: the six forecaster rationales (model tags stripped)
+
+## Forecaster 1 Analysis
+
+PHASE 0: PRELIMINARY CHECK
+
+(0) Status-quo derivation: This question is open and unresolved as of 2026-07-17; the election has not occurred (August 13, 2026) and no official ECZ result exists. The status-quo anchor is therefore not an existing measurement but a projection from the best available leading indicators: the incumbent's 2021 first-round result (59.02%), the ZEREN 2025 survey (55% headline / 56% among likely voters), and the structural setup (split opposition, Lungu barred, favorable macro). No qualifying event has yet occurred inside the window; the in-window trigger is the August 13 vote itself, results declared ~August 17.
+
+PHASE 1: OUTSIDE VIEW
+
+(1) Source analysis
+- (A) ECZ 2021 official: Hichilema won first round with 59.02%.
+- (A) ZEREN Round 1 survey (n=1,497, weighted): 55% HH / 13% opposition / 32% undecided; 56% among registered likely voters. Caveat: fieldwork June–Nov 2025, predates Mundubile's emergence, huge undecided share.
+- (B) Reuters/Fitch/Oxford/EIU: consistent "incumbent victory" base case, opposition fragmentation making 50%+1 first-round win likely.
+- (C) Polymarket ~85% to win — but winner-only (includes possible runoff), not first-round share; useful directional signal, not a share estimate.
+- Opinion figures (Mwale 75%, Kasune 6M, Chanda "no one gets 70-80%") are partisan/single-source, weakly informative bounds.
+
+Most recent authoritative measurement of the quantity: none (no result yet); best proxies are ZEREN 55-56% and 2021's 59%.
+
+(2) Outside view
+- Reference class: Zambian incumbent presidents seeking re-election with improving macro and fragmented opposition. Recent HH range 47.6% (2016 loss) to 59.0% (2021 win).
+- Anchoring: As incumbent with debt restructuring, falling inflation (6.5%), and a fragmented 14-candidate field (Lungu barred, PF split between Mundubile/Sampa/others), a first-round majority is the modal outcome. But economic discontent (41% say worse off) and civic-space criticism cap the upside below 2021's landslide. Central estimate ~56-57%.
+
+(3) Timeframe & dynamics
+- 31 days to resolution. Status quo persistence implies mid-to-high 50s. Trend: incumbency + split opposition supports ≥50%; economic squeeze pulls modestly down from 2021.
+
+(4) Market/expert priors: Multiple houses forecast first-round win; Polymarket 85% overall win. These support a distribution centered comfortably above 50% but with a real (~10-15%) runoff risk.
+
+PHASE 2: INSIDE VIEW
+
+(5) Evidence weighting
+- Strong: opposition fragmentation, Lungu barred, incumbency, improved macro → supports ≥50%.
+- Moderate: ZEREN 55-56% (dated); expert consensus for incumbent win.
+- Weak: partisan predictions (75%, 6M votes), thin winner-only market.
+- Counter: economic perceptions split, cost-of-living grievance, Mundubile consolidating chunk of PF base → downside risk toward runoff.
+
+(6) Tail scenarios
+- Low: undecided/PF vote consolidates behind Mundubile, differential turnout, cost-of-living backlash → HH falls below 50%, forcing a runoff (share ~45-49%).
+- High: opposition stays fragmented, strong incumbent turnout machine, sympathy/mobilization effects → 62-68%, approaching 2021 landslide.
+
+(7) Red team & rationale
+My base rate (from ZEREN 56% and 2021 59%, adjusted down for economic discontent and up for split opposition) is ~57%. After weighing current evidence I center at ~57%, with meaningful downside toward runoff and modest upside toward low 60s. +/-10% on percentiles still fits. Status quo = P50 near 57. I keep tails wide enough to cover polling error and undecided-voter break, but not padded.
+
+(8) Calibration: continuous percentage, MEDIUM forecastability. IQR roughly 53-61.
+
+(9) Outcome type: continuous.
+
+(9b) FORECASTABILITY: MEDIUM
+
+(10) Checklist
+- Units: percent of first-round presidential vote.
+- Resolution: HH's official ECZ first-round vote share, published before Sept 1, 2026.
+- Bait-and-switch: yes, first-round share (not win probability, not runoff).
+- Outside baseline: ZEREN 55-56% + 2021 59% → ~57%.
+- Consistency: P50 ≈ status-quo projection (57%).
+- Top evidence: 2021=59% (A); ZEREN 55-56% (A); expert consensus for incumbent first-round win (B/C); split opposition/Lungu barred (B); economic discontent (A).
+- Blind spot: sudden opposition consolidation or turnout surge → fattens lower tail (runoff).
+- Width matches MEDIUM.
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 42.0, "0.025": 45.0, "0.05": 47.5, "0.1": 49.5, "0.2": 52.5, "0.4": 55.5, "0.5": 57.0,
+    "0.6": 58.5, "0.8": 61.0, "0.9": 63.5, "0.95": 66.0, "0.975": 68.0, "0.99": 71.0
+  },
+  "outcome_type": "continuous"
+}
+```
+
+## Forecaster 2 Analysis
+
+# Zambia 2026: Hichilema First-Round Vote Share
+
+## PHASE 0: PRELIMINARY CHECK
+
+**(0) Status-quo derivation.** This question is open and unresolved as of 2026-07-17. The election is on 2026-08-13; ECZ declares results 2026-08-17 (comfortably before the 2026-09-01 annulment cutoff). There is no realized value yet. The status-quo anchor is a synthesis of: Hichilema's most recent actual result (**59.02% in 2021**), the ZEREN survey (**55%** headline support, 56% among likely voters, with 32% DK/refuse), and Polymarket's **~85% win probability**. No qualifying event has occurred inside the window; the qualifying event (the vote itself) is a concretely expected in-window trigger on Aug 13.
+
+## PHASE 1: OUTSIDE VIEW
+
+**(1) Sources and anchor.**
+- **Tier A:** ZEREN/UCT survey (n=1,497, phone, Jun–Nov 2025, weighted): 55% HH / 13% opposition / 32% DK-refuse; likely voters 56/12/6/26. Authors note refusals likely resemble PF supporters — DK block is probably opposition-tilted, so 55% is closer to a ceiling than a floor from this instrument.
+- **Tier A:** 2021 official result: HH 59.02%, Lungu 38.71%; 2016: HH 47.63%.
+- **Tier B (Reuters):** HH "favored"; economy improving on headline indicators (6.5% inflation, 4.3% IMF growth) but 41% say personally worse off; opposition consolidated late behind Mundubile (NRPUP), with Lungu barred and deceased-era PF fractured (Sampa faction endorses HH).
+- **Tier C (discount):** Mwale's 75% (partisan), Kasune's 6 million votes (implies ~85%+ of registered voters — implausible), online/Facebook polls (self-selected garbage), Oct 2025 "60%" poll (no methodology).
+- **Prediction market:** Polymarket **85%** HH win / 11% Mundubile, ~$72k volume (thin-to-decent). Criteria mismatch: it prices *winning* (including a runoff), not first-round share. Rough mapping: if P(win)=0.85 and a runoff (first round <50%) gives HH ~50–60% conditional win odds, then P(first round >50%) ≈ 0.78–0.82. This constrains my distribution: ~18–22% mass below 50%.
+
+**(2) Outside view.** Reference class: African incumbent seeking re-election with improving macro but cost-of-living discontent, fragmented-but-consolidating opposition, and the former ruling party's base (38.7% in 2021) split between challenger factions. Zambian incumbents can lose (2011, 2021), but those losses followed visible opposition consolidation behind a single strong challenger with intact party machinery — Mundubile's NRPUP is a hastily assembled vehicle with only PF fragments plus micro-parties (~0.7% combined 2021 share). Outside-view range: **48–63%**, center ~55%.
+
+**(3) Timeframe/dynamics.** 27 days to the poll. Campaign dynamics (Mundubile's rally momentum, late opposition energy) could shave a few points; incumbent resource advantages, state media, and alleged restrictions on opposition campaigning cut the other way. Status quo trajectory: HH wins first round in the mid-50s.
+
+**(4) Expert/market priors.** Fitch, EIU, Oxford Economics all base-case an incumbent victory, citing opposition fragmentation as making 50%+1 hard for challengers. Amos Chanda's ceiling argument ("no one gets 70–80%") is a reasonable structural check. Polymarket 85% win prob as above.
+
+## PHASE 2: INSIDE VIEW UPDATE
+
+**(5) Evidence weighting.**
+- **Strong:** ZEREN 55–56% among likely voters; 2021 baseline 59%; Polymarket implied ~80% P(>50%).
+- **Moderate:** Opposition consolidation behind Mundubile (Zulu merger, 29 PF MPs, Lusambo, Chungu withdrawal) — real but the PF machine is split, with Sampa's faction backing HH; economic-perception split (41% worse vs 38% better) suggests HH cannot replicate 2021's anti-incumbent wave in his favor.
+- **Weak:** Partisan projections (75%, 6M votes), online polls, rally-size anecdotes.
+
+**(6) Tails.**
+- **Low (<47%):** Late opposition surge; Bemba-belt regions (Northern, Luapula, Muchinga, Copperbelt — ~45% of the electorate) swing hard to Mundubile with high turnout; cost-of-living referendum dominates; DK/refusals break heavily against incumbent. Values in the low-to-mid 40s are plausible (2016 analogue: near-even race). A forced runoff scenario means resolution still occurs on first-round share.
+- **High (>65%):** Opposition vote fragments across 13–14 candidates; state advantages, low opposition-region turnout, and possible tilted playing field (cyber law, police disruptions) inflate HH's share toward 65–70%. Above 70% seems unlikely given regional polarization (Chanda's point).
+
+**(7) Red team.** My base rate was ~55% (ZEREN likely-voter figure, discounted 2021 result). Risks to that anchor: (a) ZEREN predates Mundubile's emergence and had huge DK/refusal — likely opposition-leaning, so 55% may overstate; (b) but consolidation behind Mundubile is incomplete, and incumbency advantages plus 1.76M new registered voters in a machine-favored environment could push HH back toward or above his 2021 59%. These roughly offset. I keep the median at **~55%**, with asymmetry checked against Polymarket: ~19% below 50% fits. ±3 points on the median would still fit the evidence — hence a fairly wide IQR (~50.5–60). Not over-hedged: elections with one dated poll deserve wide intervals.
+
+**(8) Distribution.** Median 55, IQR ≈ 51–60, P10 ≈ 47.5, P90 ≈ 63, tails to ~40 and ~71.
+
+**(9) Outcome type:** continuous (percentage).
+
+**(9b)** FORECASTABILITY: MEDIUM
+
+**(10) Checklist.**
+- **Units:** percent of first-round valid votes for HH per ECZ.
+- **Resolution:** HH's official first-round % from ECZ, results due Aug 17; annulled if unavailable by Sep 1 or HH exits.
+- **Bait-and-switch:** yes — forecasting first-round *share*, not win probability; Polymarket adjusted for that mismatch explicitly.
+- **Outside view baseline:** ZEREN 55–56% + 2021's 59% + incumbent reference class → 48–63.
+- **Consistency:** status quo/trend ≈ P50 at 55%; ~19% mass below the 50% runoff threshold matches Polymarket's implied ~80% first-round-win probability.
+- **Top evidence:** ZEREN 55% (A); 2021 result 59.02% (A); Polymarket 85% win (thin market, criteria mismatch); PF split with Sampa backing HH; economic-perception split.
+- **Blind spot:** an unpublished credible recent poll showing a much tighter race, or vote manipulation inflating HH's total — both covered by tails.
+- **Width check:** IQR ~9 points on a 40-point display range — appropriate for MEDIUM forecastability with stale polling.
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 40.0,
+    "0.025": 43.0,
+    "0.05": 45.0,
+    "0.1": 47.5,
+    "0.2": 50.5,
+    "0.4": 53.5,
+    "0.5": 55.0,
+    "0.6": 56.5,
+    "0.8": 60.0,
+    "0.9": 63.0,
+    "0.95": 65.5,
+    "0.975": 68.0,
+    "0.99": 71.0
+  },
+  "outcome_type": "continuous"
+}
+```
+
+## Forecaster 3 Analysis
+
+-- Analysis Template ──
+
+PHASE 0: PRELIMINARY CHECK
+
+(0) Status-quo derivation 
+This question is open and unresolved as of 2026-07-17. If nothing changed between now and resolution, what value would it resolve at? It would resolve as the final vote percentage published by the Electoral Commission of Zambia (ECZ). As the election has not yet occurred (scheduled for August 13, 2026), there is no official measurement. The closest status-quo anchor is the 2021 election, where Hichilema received 59.02% of the first-round vote, and the late-2025/early-2026 polls showing him explicitly at ~55-60%. I will anchor on 58.2% as the continuation of current political conditions.
+
+PHASE 1: OUTSIDE VIEW 
+
+(1) Source analysis and data anchor
+- **A: Official/Primary**: In 2021, ECZ results gave Hichilema 59.02% against incumbent Edgar Lungu. Hichilema is now the incumbent. ZEREN (Zambia Election Research Network) Round 1 survey (June-Nov 2025) found 56% for Hichilema among registered/likely voters with a 26% "don't know/refused" segment. 
+- **A: Relevant Contextual Polling**: An unlinked but specifically cited October 2025 poll gave him 60%.
+- **B: Media Extrapolations and Economics**: Macroeconomic indicators have improved—June 2026 inflation was 6.5%, and growth is forecast at 4.3% by the IMF. However, individual voters cite personal dissatisfaction regarding the high cost of living.
+- **C: Prediction Markets**: A Polymarket contract indicates an 85% probability that Hichilema will win the election. While it is low-volume ($72K), it indicates high confidence that he ultimately surpasses the 50%+1 threshold, largely neutralizing the threat of a fragmented opposition or runoff upset.
+
+The most recent authoritative measurements for his vote share are his 59.02% in 2021 and recent polls clustering between 55% and 60%.
+
+(2) Outside view and quantitative modeling
+Reference classes for incumbent African presidents in multi-party systems who won their initial mandates in convincing margins show that first-term reelection tallies typically align closely with their initial victory margins, slightly diluted by anti-incumbency fatigue unless the opposition collapses completely. Hichilema obtained ~59% in a two-horse race; in 2026, the opposition is highly fragmented (13 opponents on the ECZ list), but Brian Mundubile has consolidated some distinct factions. Given partial opposition consolidation but a baseline fractured Lungu base (PF), projecting a slight drop or stagnation is most empirically sound. 
+
+(3) Timeframe and dynamics
+The election is less than a month away (August 13, 2026). Given this tight timeframe, shifts to macro conditions or brand new candidates are not possible. Voting preferences at this stage are usually crystallized, only varying via late turnout swings. 
+
+(4) Expert and market priors
+Analysts explicitly categorize an incumbent victory as their base case (Fitch Solutions, Oxford Economics, EIU). 
+
+PHASE 2: INSIDE VIEW UPDATE
+
+(5) Evidence weighting for inside view adjustments 
+- **Strong**: Fragmentation of the former main rival party (PF) into multiple factions, some of which actually endorsed Hichilema while others backed Mundubile. This naturally protects Hichilema's share.
+- **Moderate**: High proportion of ZEREN survey respondents expressing continued economic hardship (41%). This prevents Hichilema from running away with an unprecedented 70%+ landslide, capping his vote near his 2021 floor.
+
+(6) Tail scenarios
+- Low result (40-48%): Turnout collapses largely among UPND bases displeased with the perceived failure of macroeconomics to translate to poverty reduction, while Mundubile effectively monopolizes the old Lungu constituencies without leakage.
+- High result (65-72%): The deeply fragmented and financially disorganized opposition sees its voters stay home. Hichilema supporters mobilize vigorously on rhetoric of stability, and he eclipses his 2021 performance significantly.
+
+(7) Red team and final rationale 
+My base rate was 59.0% matching the 2021 result. After considering current evidence (specifically the combination of polling at 56-60% and somewhat painful household economics despite debt restructuring), I'm moving my median slightly down to 58.2%. The 26% undecidability in the ZEREN survey is typically a mixture of silent opposition and non-voters. Assuming silent opposition takes an outsized chunk, his total first-round share stays comfortably between 54–62%, safely clearing the 50% majority required without hitting unrealistic thresholds. My percentiles accommodate the mathematical reality that, if he were to clear 50% simply by avoiding a runoff 85% of the time, roughly 5-10% of probability mass should belong below the 50% mark.
+
+(8) Calibration and distribution shaping
+The interval maintains an inner core strictly around the 55-61% polling/historical boundaries. The tails extend gracefully to ~43% to account for polling error/youth turnout shocks and ~71% for an opposition collapse scenario. 
+
+(9) Outcome type classification
+This resolves as a raw percentage, making it continuous.
+outcome_type = "continuous"
+
+(9b) Forecastability classification
+FORECASTABILITY: MEDIUM
+
+(10) Brief checklist
+- Units are raw percentage (%).
+- Bounds handled properly (tails extend beyond the lower floor). 
+- Bait-and-switch avoided: the forecast focuses strictly on first-round vote share.
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 43.5,
+    "0.025": 46.5,
+    "0.05": 49.0,
+    "0.1": 51.5,
+    "0.2": 54.0,
+    "0.4": 57.0,
+    "0.5": 58.2,
+    "0.6": 59.5,
+    "0.8": 62.2,
+    "0.9": 64.8,
+    "0.95": 66.8,
+    "0.975": 68.8,
+    "0.99": 71.5
+  },
+  "outcome_type": "continuous"
+}
+```
+
+## Forecaster 4 Analysis
+
+-- Analysis Template ──
+
+PHASE 0: PRELIMINARY CHECK
+
+(0) Status-quo derivation
+This question is open and unresolved as of 2026-07-17. If nothing changed between now and resolution, what value would it resolve at? There is no realized first-round vote share yet; the resolution criteria require official Electoral Commission of Zambia (ECZ) results from the 13 August 2026 first-round balloting (declaration targeted for 17 August). Platform state therefore supplies no numerical status-quo figure. The nearest authoritative historical measurements are the 2021 ECZ result (Hichilema 59.02 %) and the most recent documented nationwide survey (Zambia Election Research Network / ZEREN June–November 2025: 55 % intent, 56 % among registered likely voters). No qualifying event that produces an official vote percentage has yet occurred inside the open window (question opened 30 June 2026); the relevant in-window trigger remains the 13 August election itself.
+
+PHASE 1: OUTSIDE VIEW (anchor on historical context above)
+
+(1) Source analysis and data anchor
+Key A-tier / primary sources: (i) official 2021 ECZ / AU EOM results (Hichilema 2 852 348 votes = 59.02 %, Lungu 38.71 %, turnout 70.61 %); (ii) ECZ 2026 registration total 8 786 300 and official timetable confirming 13 August first ballot; (iii) University of Cape Town / SAIPAR ZEREN Round 1 paper (telephone survey N = 1 497, June–November 2025, weighted by sex/region/urban-rural): 55 % for Hichilema / UPND, 13 % any opposition party, 32 % don’t-know/refuse; among registered & likely voters the figures shift to 56 % / 12 % / 26 %. B-tier: Reuters (9 July 2026) reporting macro improvements (June inflation 6.5 %, IMF 4.3 % 2026 growth) and describing Hichilema as “favored”; AP confirmation that Constitutional Court barred former President Lungu. C-tier local press (News Diggers!, Zambia Monitor, Lusaka Times) supply candidate lists, campaign anecdotes and partisan point estimates (e.g., 75 % predictions) that must be heavily discounted.  
+No transparent nationwide probability sample has been published after the May 2026 nominations; circulating July “polls” lack sample design, weighting or margins of error and are treated as non-evidence. Most recent quantitative anchors therefore remain the 2021 59 % result and the late-2025 55–56 % survey. Both are imperfect (Hichilema was then a challenger; the survey predates Mundubile’s consolidation and still contains a large undecided bloc).
+
+(2) Outside view and quantitative modeling
+Reference classes: (a) Zambian presidential results 2016–2021 (winner shares 50.35 %–59.02 %, second-place 38–48 %); (b) African multi-candidate races requiring 50 %+1 with fragmented opposition (incumbent / front-runner shares typically 48–65 % when they clear the first-round hurdle). Historical mean for Zambian winners ≈ 55 %; standard deviation of the two most recent contests ≈ 6 pp. Simple extrapolation = 0.6 × 2021 result + 0.4 × ZEREN likely-voter figure ≈ 57.8 % rounded to 57–58 % as the outside-view centre. Variance is inflated relative to a well-polled race because of the stale survey and large undecided share; a ±6–8 pp inter-quartile range is therefore the minimum historically justified width.
+
+(3) Timeframe and dynamics
+≈ 27 days remain until election day / ≈ 31 days until scheduled declaration; halving the horizon would tighten the distribution only modestly (campaign effects already largely priced into late-2025 data), while doubling it would add volatility from economic shocks or alliance breakdowns. Status-quo trajectory (current macro improvement + incomplete opposition consolidation + incumbency) projects a first-round share modestly below 2021 but still clear of 50 %. Trend continuation from the 11.4 pp jump 2016→2021 is uninformative once Hichilema became incumbent; the rational extrapolation is therefore a mild mean-reversion toward the 50–55 % band unless new information arrives.
+
+(4) Expert and market priors
+Fitch, Oxford Economics and EIU base cases are “Hichilema re-election.” Amos Chanda (former State House aide) publicly rejected 70–80 % scenarios as unrealistic. Polymarket (thin, ≈ $72 k volume) prices Hichilema ≈ 85 % win probability; because the contract resolves on overall victory (including possible second round) it supplies only a lower-bound signal that P(share > 50 %) is high, not a mean vote-share estimate. No liquid market exists on first-round percentage itself.
+
+PHASE 2: INSIDE VIEW UPDATE
+
+(5) Evidence weighting
+Strong: 2021 official result; ZEREN methods paper; ECZ registration and timetable; Constitutional Court bar on Lungu.  
+Moderate: Reuters macro series; partial PF/Tonse/WOZA endorsements for Mundubile versus Miles Sampa PF faction endorsement of Hichilema (opposition fragmentation partially intact); inflation / growth numbers.  
+Weak: partisan 75 % or 6-million-vote claims; un-sampled online polls; single-source violence anecdotes; bishops’ peace appeals.
+
+(6) Tail scenarios
+Low tail (< 48 %): cost-of-living dissatisfaction (ZEREN 41 % “worse”) drives a sharp youth/undecided swing, full PF reunification behind Mundubile, or large urban protest vote; first-round share falls into the mid-40s and forces a competitive runoff.  
+High tail (> 66 %): extreme opposition fragmentation persists, copper-price windfall and patronage mobilization produce a late rally, and minor candidates siphon protest votes; share approaches or modestly exceeds the 2021 mark.
+
+(7) Red team and final rationale
+Base rate (simple blend of 2021 result and ZEREN) was ≈ 58 %. After re-weighting stale survey + incomplete consolidation + mixed micro-economic perceptions I move the median to 56 %. Key assumptions that could be wrong: (i) refusals are more PF-leaning than already implied by the paper’s own caveat, (ii) new registrants (≈ 1.76 m) vote differently from the 2021 electorate, (iii) campaign-period repression or violence alters turnout differentially. ±10 % on the median still remains inside the historically plausible 50–62 % band, so the shift is modest.  
+Trajectory: status-quo does not mean “freeze at 55 %”; it means “continue present economic and coalition dynamics through ballot day,” which already embeds mild mean-reversion from the 2021 high-water mark. Log-score discipline argues against further widening beyond the named uncertainties (stale poll, fragmentation residual).
+
+(8) Calibration and distribution shaping
+Distribution is mildly right-skewed (higher ceiling than floor for an incumbent who is already “favored”) yet centred near the data anchors. Extreme percentiles cover the named tail pathways without generic hedge inflation. All values strictly increasing; open bounds permit mass below 40 or above 80 if the data justify it (they do not).
+
+(9) Outcome type classification
+Resolution is a percentage that can (and historically does) carry two decimal places; therefore continuous.
+
+(9b) Forecastability classification
+FORECASTABILITY: MEDIUM
+
+(10) Brief checklist
+- Units: percentage points of valid first-round presidential votes (as published by ECZ).  
+- Resolution criteria paraphrase: official ECZ first-round percentage for Hichilema on/after 13 August (annul if unavailable by 1 September or if he exits the race).  
+- Bait-and-switch check: forecast is first-round share only, not win probability or second-round share.  
+- Outside-view baseline: blend of 2021 59 % and ZEREN 56 % → ≈ 57–58 %.  
+- Consistency: P50 tracks the updated outside-view centre after mild downward revision.  
+- Top evidence: (1) 2021 59.02 %, (2) ZEREN 55–56 %, (3) incomplete opposition consolidation, (4) divided household economic perceptions, (5) thin Polymarket win price only as lower-bound signal. All are A/B-tier or primary.  
+- Blind-spot: late undecided swing or differential new-voter turnout; widens both tails by ≈ 2–3 pp.  
+- Interval width matches MEDIUM forecastability (IQR ≈ 8–9 pp).
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 41.0,
+    "0.025": 43.5,
+    "0.05": 45.5,
+    "0.1": 48.0,
+    "0.2": 51.0,
+    "0.4": 54.0,
+    "0.5": 56.0,
+    "0.6": 58.0,
+    "0.8": 62.0,
+    "0.9": 65.5,
+    "0.95": 68.0,
+    "0.975": 70.5,
+    "0.99": 74.0
+  },
+  "outcome_type": "continuous"
+}
+```
+
+## Forecaster 5 Analysis
+
+PHASE 0: PRELIMINARY CHECK
+
+(0) Status-quo derivation  
+This question is open and unresolved as of 2026-07-17. If literally nothing changed between now and resolution—no August 13 poll, no ECZ first-round result published before September 1—there would be no numeric value and the question would be annulled rather than resolving to a vote share.
+
+For a conditional numeric forecast, the closest authoritative anchor is not a current 2026 result, because none exists. The most recent official comparable measurement is Hichilema’s 2021 first-round result, about 59.02%. The most recent transparent voting-intention measurement is the ZEREN survey, fielded June–November 2025 and published in March 2026, showing 55% overall and 56% among registered/likely voters for the president, with a large undecided/refusal share.
+
+No qualifying event has yet occurred inside the window. The expected in-window trigger is the August 13, 2026 first ballot, followed by ECZ publication of official results.
+
+PHASE 1: OUTSIDE VIEW
+
+(1) Source analysis and data anchor  
+
+Key sources, ranked by evidentiary value:
+
+- A / official-primary:
+  - ECZ timetable: first ballot August 13; declaration/publication expected August 17–24.
+  - 2021 official/observer-reproduced result: Hichilema 59.02%.
+  - ZEREN/UCT primary survey: 55% planned to vote for the president, 13% for opposition parties, 32% don’t know/refused; among registered/likely voters, 56% UPND, 12% PF, 6% other, 26% DK/refused.
+  - Constitutional Court / AP reporting: Edgar Lungu barred from contesting, a major structural difference from 2021.
+- B / wire and international reporting:
+  - Reuters-derived reporting: Hichilema favored; election framed as referendum on economic record; inflation down to 6.5%; IMF growth projection 4.3%; cost of living remains salient.
+- C / local or partisan-adjacent:
+  - Candidate/endorsement reporting, opposition alliances, withdrawals, and campaign claims.
+  - Partisan forecasts such as 75% or “six million votes” are not polling and receive little weight.
+- D / self-selected online polls:
+  - Very weak; not useful as national-vote-share measures.
+
+Most recent authoritative measurement for this quantity: there is no 2026 ECZ measurement yet. The best direct polling anchor is ZEREN’s 56% among registered/likely voters, but it is old and has a large DK/refusal bloc. The best official historical anchor is 2021’s 59.02%.
+
+(2) Outside view and quantitative modeling  
+
+Reference classes:
+
+- Zambia’s recent presidential elections: Hichilema was 47.63% in 2016 and 59.02% in 2021. The 2021 result is highly relevant but not clean, because he was then an opposition challenger, whereas he is now the incumbent.
+- Incumbent reelection in competitive African multiparty systems: incumbency and state capacity matter, but economic disappointment can produce sharp erosion.
+- Polling with high refusal/undecided shares: the raw support number is not automatically the final vote share; refusals may hide opposition support.
+
+A rough weighted anchor:
+
+- ZEREN registered/likely voter raw support: 56%, weight 50%.
+- 2021 official result: 59.02%, weight 25%.
+- October 2025 reported poll around 60%, weight 10%, discounted for weaker methodology.
+- Prediction-market-constrained share anchor around 55%, weight 15%.
+
+Calculation:  
+0.50 × 56 + 0.25 × 59.02 + 0.10 × 60 + 0.15 × 55  
+= 28.0 + 14.755 + 6.0 + 8.25  
+= 57.005%.
+
+Outside-view baseline: about 57%.
+
+(3) Timeframe and dynamics  
+
+There are about four weeks to the election and one month to expected official results. That is enough time for campaign shocks, legal disputes, turnout effects, and alliance coordination, but not enough for the fundamental political economy to transform.
+
+If the timeline were halved, I would narrow the interval modestly because fewer campaign shocks could occur. If it were doubled, I would widen both tails by roughly 1–2 percentage points due to more time for opposition consolidation or government-favorable macro/news developments.
+
+Status-quo trajectory: current conditions persisting implies Hichilema remains favored and probably above 50%, but not with landslide certainty. The natural-trend central value is mid-to-high 50s.
+
+(4) Expert and market priors  
+
+Prediction markets: the supplied market snapshot contains unrelated Turkish, Brazilian, and US markets; those receive zero weight because the country and resolution criteria do not match.
+
+The relevant market found in research is Polymarket pricing Hichilema to win the Zambian presidential election at about 85%, with about $72,400 volume. This is important but not a direct vote-share market. The mismatch is specific: it resolves on the eventual winner, not Hichilema’s first-round vote percentage, and it can include a second-round path.
+
+A simple mapping: let p = probability Hichilema exceeds 50% in round one, and q = probability he still wins if he falls below 50%. Then:
+
+0.85 = p + (1 − p)q.
+
+If q = 0.2, p = (0.85 − 0.2) / 0.8 = 0.8125.  
+If q = 0.4, p = (0.85 − 0.4) / 0.6 = 0.75.
+
+So the market is consistent with roughly a 75%–82% chance of clearing 50% in the first round, assuming plausible runoff chances. My final distribution gives about an 80%+ chance above 50%, so I am using the market as a real constraint, not ignoring it.
+
+PHASE 2: INSIDE VIEW UPDATE
+
+(5) Evidence weighting for inside view adjustments  
+
+Strong:
+- ZEREN primary polling: direct but old; high DK/refusal limits precision.
+- 2021 official result: strong historical anchor.
+- Lungu barred: major structural fact; weakens direct 2021 PF rematch logic.
+
+Moderate:
+- Polymarket 85% win probability: meaningful but criterion mismatch and modest liquidity.
+- Reuters macro/cost-of-living reporting: macro improvement helps Hichilema, but household pain limits upside.
+- Opposition consolidation around Mundubile: relevant, but PF remains divided and some candidates remain outside his camp.
+
+Weak:
+- Partisan predictions of 75% or six million votes.
+- Self-selected online polls.
+- Rally size anecdotes, single-source campaign claims, and violence anecdotes without quantified electoral effect.
+
+(6) Tail scenarios  
+
+Low-result pathway: Mundubile consolidates most Lungu/PF-aligned voters; ZEREN’s DK/refusal bloc proves heavily anti-Hichilema; cost-of-living dissatisfaction outweighs macro stabilization; UPND turnout underperforms among new voters. This gets Hichilema into the mid/high 40s, possibly missing the first-round threshold.
+
+Very low tail: below 40% would require a severe anti-incumbent wave or massive opposition coordination plus UPND demobilization. I assign this less than 1%.
+
+High-result pathway: opposition remains split; Lungu’s exclusion demobilizes or fragments PF voters; Mundubile fails to inherit the full Lungu vote; inflation and debt restructuring strengthen the incumbent narrative; UPND turnout machine performs well. This can produce low/mid 60s.
+
+Very high tail: above 70% would require near-collapse of the opposition or official results reflecting extreme incumbent dominance. Possible but uncommon for modern competitive Zambia, so it is only in the far tail.
+
+(7) Red team and final rationale  
+
+My base rate was 57.0%. After considering current evidence, I’m moving to about 56.6% because the favorable incumbency/macro/Lungu-barred factors are partly offset by cost-of-living dissatisfaction, the large hidden-opposition/refusal group in ZEREN, and Mundubile’s partial consolidation of the opposition.
+
+Red-team concerns:
+- The ZEREN survey may overstate Hichilema due to social desirability, phone sampling, and the long field period.
+- Conversely, taking the 55–56% raw poll as the final share may understate him if undecided voters split normally or if opposition turnout is weak.
+- The prediction market is not a first-round-share market and cannot directly determine the median.
+- Zambia has a history of real alternation, so “incumbent favored” should not be read as “safe landslide.”
+
+Small delta check: a median 10 percentage points lower, around 46–47%, would imply the market and ZEREN are badly wrong and Hichilema likely loses; possible but not my central read. A median 10 points higher, around 66–67%, requires opposition collapse not shown in strong evidence. A ±4–6 point shift is plausible and is covered in the central distribution.
+
+Trajectory check: “status quo” does not mean an existing numeric result; it means the current electoral trajectory reaches the August vote. That trajectory points to Hichilema winning or narrowly clearing 50% more often than not, not to either a landslide or a collapse.
+
+Hedge audit: this is a medium-forecastability election result with weak current polling and significant political uncertainty. I am using a fairly wide interval, but not so wide as to ignore the direct 55–56% polling anchor and 2021 result.
+
+(8) Calibration and distribution shaping  
+
+The median is near the ZEREN likely-voter result and modestly below the 2021 official result. I put the 2021 value near the upper-middle of the distribution, not at the center, because incumbency backlash and household economic dissatisfaction plausibly reduce his share. The lower tail is wider than for a well-polled US/European election because of polling gaps, candidate-field uncertainty, and hidden opposition/refusals.
+
+(9) Outcome type classification  
+
+The resolution is a percentage vote share, which can be fractional.  
+outcome_type: continuous
+
+(9b) Forecastability classification  
+
+FORECASTABILITY: MEDIUM
+
+(10) Brief checklist  
+
+- Units: percent of first-round presidential votes, as officially reported by ECZ.
+- Resolution paraphrase: ECZ official first-round vote percentage for Hakainde Hichilema in Zambia’s August 2026 presidential election.
+- Bait-and-switch check: this forecasts first-round vote share, not merely whether Hichilema wins.
+- Outside-view baseline: about 57%, from ZEREN, 2021 result, weaker 60% poll, and market-implied win constraint.
+- Consistency line: ZEREN’s 56% is near my median; 2021’s 59.02% is around the upper-middle; missing 50% is a meaningful but minority outcome.
+- Top evidence:
+  1. ZEREN 55/56% support — strong direct source, but old with high DK/refusal.
+  2. 2021 result 59.02% — official historical anchor.
+  3. Polymarket 85% win — useful but criterion mismatch.
+  4. Lungu barred and PF split — materially helps Hichilema but does not eliminate opposition.
+  5. Macro improvement vs cost-of-living pain — mixed incumbent evaluation.
+- Blind spot: a late, credible nationwide poll or major court/ballot decision could move the forecast several points.
+- Forecastability check: medium; interval is wider than a well-polled stable indicator but anchored to the strongest available data.
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 40.8,
+    "0.025": 43.3,
+    "0.05": 45.4,
+    "0.1": 48.0,
+    "0.2": 51.1,
+    "0.4": 54.9,
+    "0.5": 56.6,
+    "0.6": 58.2,
+    "0.8": 62.0,
+    "0.9": 65.2,
+    "0.95": 68.0,
+    "0.975": 70.5,
+    "0.99": 73.4
+  },
+  "outcome_type": "continuous"
+}
+```
+
+## Forecaster 6 Analysis
+
+## PHASE 0: PRELIMINARY CHECK
+
+### (0) Status-quo derivation
+
+This question is open and unresolved as of 2026-07-17. Strictly, if nothing changed—meaning no election or official result appeared—it would be annulled rather than resolve numerically. The platform currently contains no latent 2026 result.
+
+For a numeric status-quo anchor, the most recent authoritative measurement of the same quantity is Hichilema’s **59.02% first-round share in 2021**. Thus, a simple “repeat the last official result” counterfactual gives **59.02%**.
+
+**No qualifying event has yet occurred inside the window.** The concretely expected in-window trigger is the August 13 first ballot, followed by ECZ declaration beginning around August 17. Post-opening information—including Reuters’ reporting on Mundubile’s opposition consolidation and the June inflation release—makes an exact 2021 repeat less likely, so my median is slightly below 59.02%.
+
+## PHASE 1: OUTSIDE VIEW
+
+### (1) Source analysis and data anchor
+
+**Tier A — official or primary**
+
+- The ECZ timetable schedules the first ballot for **August 13, 2026** and result declaration from August 17.
+- The reproduced official 2021 result gives Hichilema **59.02%**, the latest authoritative observation of this exact quantity.
+- ECZ reports **8,786,300 registered voters**, up from 7,023,499 in 2021. The enlarged electorate creates some additional turnout and composition uncertainty.
+- The UCT/Zambia Election Research Network survey is the best primary polling evidence: 1,497 telephone respondents, weighted by gender, region, and urban/rural residence, fielded June–November 2025. It found:
+  - all respondents: 55% Hichilema, 13% opposition, 32% don’t know/refused;
+  - registered likely voters: 56% Hichilema, 18% opposition, 26% don’t know/refused.
+
+The survey is well above the quality of online polls, but it is old, spans five months, predates the finalized candidate field, and combines undecideds with potentially opposition-leaning refusals.
+
+**Tier B — Reuters/AP and institutional reporting**
+
+- Reuters describes Hichilema as favored but reports that living costs remain a major vulnerability.
+- Annual inflation reached **6.5% in June 2026**, while the IMF projects **4.3% growth**. These are credible facts, although their electoral effect is indirect.
+- AP confirms Edgar Lungu is constitutionally barred from running. His former 38.71% bloc is now divided rather than transferred automatically to one successor.
+
+**Tier C — local, partisan, or methodologically opaque evidence**
+
+- The reported 60% October 2025 poll lacks enough accessible methodological detail for substantial weight.
+- The 75% prediction from a politician campaigning for Hichilema is advocacy, not polling.
+- The claim that Hichilema will receive six million votes has no turnout denominator. Six million is 68.3% of all registered voters and would imply an implausibly high vote share at turnout near 2021 levels.
+- Online, Facebook, and call-in polls are self-selected and unsuitable as national estimates.
+- Reports conflict between 12 and 14 candidates, with withdrawals and a pending court issue. The nomination-stage 14-candidate list is better established than any definitive post-withdrawal final list.
+
+**Most recent authoritative measurement:** 59.02% in 2021.  
+**Most recent credible direct indicator:** 56% stated support among registered likely voters in the 2025 ZEREN survey, with 26% undecided/refusing.
+
+### (2) Outside view and quantitative modeling
+
+Hichilema received:
+
+- **47.63% in 2016**
+- **59.02% in 2021**
+
+The candidate-specific mean is:
+
+\[
+(47.63 + 59.02)/2 = 53.325
+\]
+
+However, 2016 is a weak analogue because Hichilema was an opposition challenger, while he is now an incumbent with greater institutional and coalition advantages.
+
+For a conservative transformation of the ZEREN likely-voter poll, allocate only 10% of the combined undecided/refusal group to Hichilema:
+
+\[
+56 + 0.10(26) = 58.6
+\]
+
+This deliberately assumes almost all reluctant respondents ultimately favor the opposition, consistent with the survey authors’ warning about hidden PF support.
+
+I combine:
+
+- 50% weight on the latest official result, 59.02;
+- 15% on Hichilema’s two-election historical mean, 53.325;
+- 35% on the conservative ZEREN-derived anchor, 58.6.
+
+\[
+0.50(59.02)+0.15(53.325)+0.35(58.6)=58.02
+\]
+
+That gives an **outside-view center of approximately 58.0%**. The raw historical and polling evidence supports a central range around 55%–62%, with wider downside uncertainty from hidden opposition support and differential turnout.
+
+### (3) Timeframe and dynamics
+
+There are 27 days until voting and about 31 days until expected resolution.
+
+- **Status quo:** Continued macroeconomic improvement, no campaign shock, and incomplete opposition consolidation imply roughly 58%–59%.
+- **Trend continuation:** Inflation and growth trends mildly favor Hichilema, but household economic perceptions remain mixed. I do not extrapolate a large late swing.
+- **Halving the horizon:** With two weeks remaining, I would narrow the P10–P90 interval by roughly 1–2 percentage points, but old-poll and response-bias uncertainty would remain.
+- **Doubling the horizon:** Two months would widen each main tail by approximately 1–2 points because alliances, turnout intentions, and economic perceptions could change further.
+
+The natural trajectory is the election occurring as scheduled, not literal stasis.
+
+### (4) Expert and market priors
+
+Analyst forecasts from Reuters, Fitch Solutions, Oxford Economics, and the EIU broadly favor Hichilema, but they forecast the winner rather than his exact first-round percentage.
+
+The relevant Polymarket contract priced Hichilema at approximately **85% to win**, on about **$72,400 volume**. This is meaningful but only modest-liquidity evidence.
+
+Its criteria differ materially:
+
+- the market asks whether Hichilema eventually wins, potentially after a runoff;
+- this question asks for his percentage on the August 13 first ballot and requires timely ECZ results.
+
+Let \(p\) be his probability of exceeding 50% in round one and \(r\) his probability of eventually winning conditional on failing to exceed 50%. Then:
+
+\[
+0.85=p+(1-p)r
+\]
+
+For \(r=0.20\):
+
+\[
+p=(0.85-0.20)/(1-0.20)=0.8125
+\]
+
+For \(r=0.35\):
+
+\[
+p=(0.85-0.35)/(1-0.35)=0.7692
+\]
+
+A broader \(r=0.50\) assumption gives \(p=0.70\). Thus, the market suggests approximately a **70%–81% probability of a first-round majority**, depending on runoff assumptions. My distribution gives about **81%**, at the upper end because the direct survey and 2021 result both indicate majority-level support.
+
+The unrelated Kalshi and PredictIt contracts in the supplied snapshot concern Turkey, Brazil, or US elections and have no evidentiary value for this question.
+
+## PHASE 2: INSIDE VIEW UPDATE
+
+### (5) Evidence weighting for inside-view adjustments
+
+**Strong for measurement**
+
+- Official 2021 result of 59.02%.
+- Primary ZEREN survey showing 55% overall and 56% among registered likely voters.
+- The prediction market is strong evidence for its own winner criterion, though only moderately precise for first-round vote share after the explicit criterion conversion above.
+
+**Moderate**
+
+- June inflation of 6.5% and IMF growth of 4.3% mildly favor the incumbent.
+- Reuters’ reporting that the opposition organized late favors Hichilema.
+- Mundubile’s consolidation of substantial PF-aligned figures works in the opposite direction.
+- The voter-register increase of 1.76 million could change regional and age composition, but its direction is unknown.
+- Lungu’s exclusion and the presence of many candidates promote fragmentation, although the main anti-UPND vote may still coordinate informally.
+
+**Weak**
+
+- Rally size, campaign promises, individual endorsements, and reported crowd enthusiasm.
+- The 75% and six-million-vote partisan predictions.
+- Self-selected online and call-in polls.
+- Single-source campaign-violence anecdotes without enough evidence to estimate a national vote effect.
+
+The positive macroeconomic news and opposition consolidation approximately offset one another in the central case.
+
+### (6) Tail scenarios
+
+**Unusually low result**
+
+Mundubile inherits most of Lungu’s former electorate, reluctant ZEREN respondents prove overwhelmingly opposition-aligned, household dissatisfaction dominates headline economic improvement, and UPND turnout underperforms. Hichilema could then fall into the low-to-mid 40s; a more severe backlash could put him near 38%–40%.
+
+**Unusually high result**
+
+The opposition alliance fractures operationally, smaller candidates retain meaningful anti-government votes, inflation improvement becomes salient, and incumbency produces superior turnout and organization. That could lift Hichilema into the upper 60s or low 70s. Shares above 75% remain very unlikely absent extraordinary opposition collapse or serious electoral-integrity concerns.
+
+Candidate death or withdrawal would annul the question and therefore is not represented as a numerical tail.
+
+### (7) Red team and final rationale
+
+The main red-team concern is that ZEREN’s apparent 55% hard support may be distorted by social-desirability bias, telephone coverage, or reluctance among opposition voters. Conversely, mechanically treating all 32% undecided/refusing respondents as opposition would also be excessive. The five-month field period and absence of a transparent post-nomination poll prevent a narrow forecast.
+
+**My base rate was 58.0%. After considering current evidence, I’m moving to 57.8% because opposition consolidation and the market-translated majority probability slightly thicken the downside tail, while improving inflation and candidate fragmentation offset most of that adjustment.**
+
+A ±10-point shift in the median would not fit the evidence: 47.8% is an adverse scenario, while 67.8% is a landslide scenario. Both belong in the tails rather than near the center.
+
+The 59.02% repeat-of-2021 status quo lies close to P60. The final median remains close to the explicit 58.02% quantitative anchor rather than being moved by campaign anecdotes.
+
+The interval is intentionally asymmetric, with a thicker downside tail. That reflects specific uncertainty about hidden opposition support, turnout, and alliance consolidation—not generic caution.
+
+### (8) Calibration and distribution shaping
+
+I use the following conceptual mixture:
+
+- 25% adverse scenario centered near 47%, standard deviation about 5 points;
+- 67% central scenario centered near 59%, standard deviation about 3.8 points;
+- 8% landslide scenario centered near 68%, standard deviation about 4 points.
+
+This produces:
+
+- P10–P90: **45.7%–65.0%**
+- P2.5–P97.5: **40.6%–70.2%**
+- approximately 81% probability of exceeding 50%.
+
+The central P40–P60 interval is only 2.9 points wide, preserving sharpness around the polling and historical anchor, while named downside scenarios justify the wider lower tail.
+
+### (9) Outcome type classification
+
+The result can include decimal fractions of a percentage point, so the outcome type is **continuous**.
+
+### (9b) Forecastability classification
+
+FORECASTABILITY: MEDIUM
+
+An election result one month away is moderately predictable, but the absence of recent transparent polling and the unusually large undecided/refusal group prevent high forecastability.
+
+### (10) Brief checklist
+
+- **Units:** Percentage points of Hichilema’s official first-round vote share.
+- **Resolution paraphrase:** ECZ-reported percentage of Hichilema’s votes on Zambia’s August 13, 2026 first presidential ballot.
+- **Bait-and-switch:** The forecast concerns first-round percentage, not merely whether Hichilema eventually wins.
+- **Outside-view baseline:** 58.02%, combining 2021, Hichilema’s two-election history, and a conservative ZEREN transformation.
+- **Status-quo consistency:** The 59.02% repeat anchor is near P60.
+- **Top evidence:** Official 2021 result; primary ZEREN poll; 85% winner market after criterion conversion; official voter-register growth; Reuters/IMF macroeconomic evidence.
+- **Validity check:** No credible post-nomination national poll exists; partisan projections and online polls receive negligible weight.
+- **Blind spot:** A hidden high-quality poll, major opposition coordination, or electoral-administration shock could move the result sharply, primarily affecting the lower or upper tails.
+- **Forecastability check:** The approximately 19-point P10–P90 span is appropriate for a medium-forecastability election with weak current polling.
+
+```json
+{
+  "question_type": "numeric",
+  "declared_percentiles": {
+    "0.01": 38.3,
+    "0.025": 40.6,
+    "0.05": 42.8,
+    "0.1": 45.7,
+    "0.2": 50.6,
+    "0.4": 56.3,
+    "0.5": 57.8,
+    "0.6": 59.2,
+    "0.8": 62.4,
+    "0.9": 65.0,
+    "0.95": 67.7,
+    "0.975": 70.2,
+    "0.99": 72.6
+  },
+  "outcome_type": "continuous"
+}
+```

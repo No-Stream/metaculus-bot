@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
@@ -23,6 +24,7 @@ from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
     AggregationStrategy,
 )
+from metaculus_bot.close_margin import format_close_margin_marker
 from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
@@ -38,6 +40,7 @@ from metaculus_bot.constants import (
     NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     STACKER_SOFT_DEADLINE,
+    TS_ANCHOR_CHART_ENABLED_ENV,
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
@@ -477,6 +480,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             else:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 exceptions.append(exc)
+                # A forecaster that finished by raising is a dropped ensemble
+                # member and must count as degradation (so cli.py's alertable
+                # exit fires). Soft-deadline TimeoutErrors were already counted
+                # at their raise site in _forecaster_with_soft_deadline, so
+                # exclude them here to avoid double-counting.
+                if not isinstance(exc, asyncio.TimeoutError):
+                    self._forecasters_dropped_count += 1
         exception_group: ExceptionGroup | None = (
             ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
         )
@@ -544,6 +554,22 @@ class TemplateForecaster(CompactLoggingForecastBot):
             predictions=[aggregated_prediction],
         )
 
+    async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
+        """Run the base per-question pipeline, then log the close-margin marker on submit.
+
+        The base method publishes the report to Metaculus at its tail (when
+        ``publish_reports_to_metaculus`` is set), so the moment it returns is the
+        submission time. We gate the marker on that flag: backtests/benchmarks don't
+        submit and run resolved (past-close) questions, so a margin there would be a
+        meaningless negative — the marker is a *submission*-latency watch signal.
+        """
+        report = await super()._run_individual_question(question)
+        if self.publish_reports_to_metaculus:
+            marker = format_close_margin_marker(question, datetime.now(timezone.utc))
+            if marker is not None:
+                logger.info(marker)
+        return report
+
     async def _research_and_make_predictions(
         self,
         question: MetaculusQuestion,
@@ -563,6 +589,23 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question)
 
+        # Diagnostics seam: run_research returns forecaster-clean text (the
+        # provider-diagnostics block is withheld so it never reaches forecaster
+        # prompts, the stacker, or the gap-fill v2 driver brief). It must still
+        # reach the published comment, so re-append it to the comment-bound
+        # research_report strings only.
+        diagnostics_block = self._research.pop_provider_diagnostics(question.id_of_question)
+
+        def _with_diagnostics(text: str) -> str:
+            return f"{text}\n\n{diagnostics_block}" if diagnostics_block else text
+
+        # Pull the time-series-anchor chart image (if the chart flag rendered one
+        # this question) out of the provider's per-session cache so the base
+        # forecasters can attach it as a vision message. No-op unless
+        # TS_ANCHOR_CHART_ENABLED is on. The stacker path never receives chart_b64,
+        # so the image reaches base models only.
+        chart_b64 = self._pull_research_chart(question.id_of_question)
+
         # A stub, not the full corpus: the framework embeds summary_report under
         # "### Research Summary" and research_report under "# RESEARCH", so
         # setting both to `research` duplicated it and bloated the comment past
@@ -575,7 +618,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
             [
-                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log)
+                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log, chart_b64)
                 for llm_instance in self._forecaster_llms
             ],
         )
@@ -602,6 +645,35 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if exception_group is not None:
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
+
+        # Single-forecaster short-circuit. With MIN_FORECASTERS_TO_PUBLISH=1 a
+        # question can survive on one forecaster, but the spread metrics
+        # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
+        # >=2 predictions and raise otherwise, and stacking a lone base model is
+        # meaningless. So when only one forecaster survived we skip spread +
+        # stacking entirely and hand the single prediction to the parent
+        # aggregator, whose _base_combine returns it as-is (snap-to-integers
+        # applied for discrete numerics). Placed before the budget gate and the
+        # per-strategy branches so it short-circuits every stacking path. The
+        # _stacker_outcome marker is "skipped" (stacking was skipped, non-stacked
+        # aggregation); the distinct log line records the single-forecaster reason.
+        if n_valid == 1 and self.aggregation_strategy in (
+            AggregationStrategy.STACKING,
+            AggregationStrategy.CONDITIONAL_STACKING,
+        ):
+            logger.info(
+                "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
+                "skipping spread + stacking, aggregating the lone prediction",
+                qid_for_log,
+            )
+            self._register_expected_base_combine(question)
+            self._stacker_outcome[question.id_of_question] = "skipped"
+            return ResearchWithPredictions(
+                research_report=_with_diagnostics(research),
+                summary_report=summary_report,
+                errors=errors,
+                predictions=valid_predictions,
+            )
         # Stacking budget gate. If we've burned through the per-Q wall-clock
         # budget (e.g. research stalled, fan-out used most of the budget),
         # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
@@ -648,7 +720,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 question,
                 valid_predictions,
                 research_for_stacking=research_to_use,
-                research_report=research,
+                research_report=_with_diagnostics(research),
                 summary_report=summary_report,
                 errors=errors,
                 default_meta_reasoning="Stacked prediction aggregated from multiple models",
@@ -748,7 +820,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     question,
                     valid_predictions,
                     research_for_stacking=combined_research,
-                    research_report=combined_research,
+                    research_report=_with_diagnostics(combined_research),
                     summary_report=summary_report,
                     errors=errors,
                     default_meta_reasoning=(
@@ -773,9 +845,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
                         question.id_of_question,
                     )
                 self._register_expected_base_combine(question)
-                self._stacker_outcome[question.id_of_question] = "skipped"
+                # "skipped_config_off" (spread exceeded the threshold but the
+                # per-type gate was off) vs plain "skipped" (spread at/below
+                # threshold) — keeps the suppression reason durable in the
+                # published marker instead of requiring git archaeology over
+                # workflow-yaml flag history.
+                self._stacker_outcome[question.id_of_question] = (
+                    "skipped_config_off" if type_stacking_disabled else "skipped"
+                )
                 return ResearchWithPredictions(
-                    research_report=research,
+                    research_report=_with_diagnostics(research),
                     summary_report=summary_report,
                     errors=errors,
                     predictions=valid_predictions,
@@ -787,7 +866,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # them. For the skip case, _stacker_outcome was already set to
         # "fallback_median" upstream so the comment-marker reflects reality.
         return ResearchWithPredictions(
-            research_report=research,
+            research_report=_with_diagnostics(research),
             summary_report=summary_report,
             errors=errors,
             predictions=valid_predictions,
@@ -854,6 +933,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research: str,
         llm: GeneralLlm,
         qid: int | None,
+        chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         """Run a single forecaster with FORECASTER_SOFT_DEADLINE.
 
@@ -866,11 +946,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         caller's _gather_results_and_exceptions treats it like any other failed
         forecaster (dropped from the ensemble; the other models in the ensemble
         carry the question).
+
+        ``chart_b64`` is the optional time-series-anchor chart image forwarded to
+        the base runners; None (the default) when the chart flag is off.
         """
         start = time.monotonic()
         try:
             return await asyncio.wait_for(
-                self._make_prediction(question, research, llm),
+                self._make_prediction(question, research, llm, chart_b64),
                 timeout=FORECASTER_SOFT_DEADLINE,
             )
         except asyncio.TimeoutError:
@@ -890,6 +973,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         question: MetaculusQuestion,
         research: str,
         llm_to_use: GeneralLlm | None = None,
+        chart_b64: str | None = None,
     ) -> ReasonedPrediction[PredictionTypes]:
         notepad = await self._get_notepad(question)
         notepad.total_predictions_attempted += 1
@@ -898,11 +982,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         forecast_function: Callable[..., Coroutine[Any, Any, ReasonedPrediction[Any]]]
         if isinstance(question, BinaryQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_binary(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_binary(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, MultipleChoiceQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, NumericQuestion):
-            forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm)  # noqa: E731
+            forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, DateQuestion):
             raise NotImplementedError("Date questions not supported yet")
         else:
@@ -948,27 +1032,46 @@ class TemplateForecaster(CompactLoggingForecastBot):
             predictions, question, research, reasoned_predictions, aggregated_tool_output
         )
 
-    async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm
+    def _pull_research_chart(self, qid: int | None) -> str | None:
+        """Pop the time-series-anchor chart image for this qid from the provider's
+        per-session cache and return the base64 PNG (or None).
+
+        Popping keeps the provider cache from growing across a batch; the returned
+        value is handed straight down the fan-out. Gated on the chart flag so the
+        provider (and matplotlib) stays off the cold path when the feature is
+        disabled — the default in prod.
+        """
+        if qid is None or not env_flag_enabled(TS_ANCHOR_CHART_ENABLED_ENV):
+            return None
+        from metaculus_bot.research.timeseries_anchor import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # optional provider; matplotlib off the cold path
+            _session_charts,
+        )
+
+        return _session_charts.pop(qid, None)
+
+    async def _run_forecast_on_binary(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: BinaryQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[float]:
         from metaculus_bot.forecaster_runners import run_binary_forecast
 
-        return await run_binary_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
+        return await run_binary_forecast(
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
+        )
 
-    async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm
+    async def _run_forecast_on_multiple_choice(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: MultipleChoiceQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[PredictedOptionList]:
         from metaculus_bot.forecaster_runners import run_mc_forecast
 
-        return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"))
+        return await run_mc_forecast(question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64)
 
-    async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra llm_to_use param: ensemble fan-out passes a specific LLM per call
-        self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm
+    async def _run_forecast_on_numeric(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: NumericQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[NumericDistribution]:
         from metaculus_bot.forecaster_runners import run_numeric_forecast
 
         prediction, discrete_vote = await run_numeric_forecast(
-            question, research, llm_to_use, self.get_llm("parser", "llm")
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )
         qid = question.id_of_question
         if qid is not None and discrete_vote is not None:

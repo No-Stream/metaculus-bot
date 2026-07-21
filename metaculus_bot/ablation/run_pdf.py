@@ -159,9 +159,49 @@ def _compute_binary_prediction(block: BinaryStructured) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _compute_numeric_prediction(block: NumericStructured, question: NumericQuestion) -> list[Percentile] | None:
-    """Numeric: fit parametric family to declared percentiles, build CDF on grid. None = drop."""
-    from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS  # noqa: PLC0415
+def _resolve_numeric_cdf_size(surviving: dict[str, dict], question: NumericQuestion) -> int:
+    """Grid length (== the question's ``cdf_size``) for the per-model CDFs this arm builds.
+
+    Authoritative source is the per-forecaster cached CDF: every surviving forecaster for a
+    numeric question stored its prediction on the question's own grid, so ``cdf_size`` (or
+    ``len(cdf_probabilities)``) is the real bucket count — 201 for continuous questions,
+    smaller for discrete ones (e.g. 17 for an integer-count 0..15 question). This mirrors
+    ``pdf_pooling`` deriving the grid length from the INPUT CDFs rather than a hard-coded 201:
+    the offline question shim rehydrated from an older manifest defaults ``cdf_size`` to 201,
+    so trusting ``question.cdf_size`` alone would silently emit a 201-point CDF for a discrete
+    question and mis-score it against the wrong bucket count. Falls back to ``question.cdf_size``
+    (correct for manifests that persist it) only when no surviving numeric prediction carries a
+    CDF — unreachable for a real numeric question, where every survivor is a numeric prediction.
+    """
+    from metaculus_bot.numeric.config import PCHIP_CDF_POINTS  # noqa: PLC0415
+
+    for payload in surviving.values():
+        pv = payload.get("prediction_value")
+        if not isinstance(pv, dict) or pv.get("type") != "numeric":
+            continue
+        size = pv.get("cdf_size")
+        if size is not None:
+            return int(size)
+        cdf = pv.get("cdf_probabilities")
+        if cdf:
+            return len(cdf)
+    fallback = getattr(question, "cdf_size", None)
+    return fallback if isinstance(fallback, int) else PCHIP_CDF_POINTS
+
+
+def _compute_numeric_prediction(
+    block: NumericStructured, question: NumericQuestion, *, cdf_size: int
+) -> list[Percentile] | None:
+    """Numeric: fit parametric family to declared percentiles, build CDF on grid. None = drop.
+
+    ``cdf_size`` is the question's real grid length (see :func:`_resolve_numeric_cdf_size`):
+    201 for continuous questions, smaller for discrete ones. The min/max per-bin step scale to
+    that length via ``grid_step_constraints`` so a discrete grid satisfies the server's
+    ``round(0.01 / N, 9)`` min-step and ``0.2 * 200 / N`` max-step rules, not just the
+    201-point ones. At ``cdf_size == 201`` the constraints are exactly the historical
+    constants, so that path is byte-identical to the pre-parameterization behavior.
+    """
+    from metaculus_bot.numeric.config import grid_step_constraints  # noqa: PLC0415
     from metaculus_bot.numeric.pchip_cdf import enforce_min_steps, safe_cdf_bounds  # noqa: PLC0415
     from metaculus_bot.probabilistic_tools.distributions import (  # noqa: PLC0415
         FitType,
@@ -193,7 +233,8 @@ def _compute_numeric_prediction(block: NumericStructured, question: NumericQuest
     upper = float(question.upper_bound)
     open_lower = bool(question.open_lower_bound)
     open_upper = bool(question.open_upper_bound)
-    num_points = PCHIP_CDF_POINTS
+    num_points = cdf_size
+    min_step, max_step = grid_step_constraints(num_points)
 
     grid = np.linspace(lower, upper, num_points)
     cdf_values = np.array([eval_cdf(fit, float(x)) for x in grid], dtype=float)
@@ -208,9 +249,9 @@ def _compute_numeric_prediction(block: NumericStructured, question: NumericQuest
         cdf_values[-1] = 1.0
 
     cdf_values = np.maximum.accumulate(cdf_values)
-    cdf_values = enforce_min_steps(cdf_values, MIN_CDF_PROB_STEP, upper_cap=hi_cap, lower_cap=lo_cap)
+    cdf_values = enforce_min_steps(cdf_values, min_step, upper_cap=hi_cap, lower_cap=lo_cap)
     cdf_values = np.maximum.accumulate(cdf_values)
-    cdf_values = safe_cdf_bounds(cdf_values, open_lower, open_upper)
+    cdf_values = safe_cdf_bounds(cdf_values, open_lower, open_upper, min_step=min_step, max_step=max_step)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf_values[i])) for i in range(num_points)]
 
@@ -286,6 +327,13 @@ async def run_pdf_for_qid(
 
     structured_predictions: list[Any] = []
 
+    # The numeric CDF grid length follows the question's real cdf_size (201 for continuous,
+    # smaller for discrete). Resolve it once from the surviving forecasters' cached CDFs so a
+    # discrete question doesn't silently get a 201-point CDF from the shim's default cdf_size.
+    numeric_cdf_size: int | None = None
+    if isinstance(question, NumericQuestion):
+        numeric_cdf_size = _resolve_numeric_cdf_size(surviving, question)
+
     for slug, payload in surviving.items():
         reasoning = payload.get("reasoning", "")
         block = parse_structured_block(reasoning, qtype_label)
@@ -298,7 +346,8 @@ async def run_pdf_for_qid(
                 structured_predictions.append(pred)
 
         elif isinstance(block, NumericStructured) and isinstance(question, NumericQuestion):
-            pred = _compute_numeric_prediction(block, question)
+            assert numeric_cdf_size is not None  # set above whenever question is a NumericQuestion
+            pred = _compute_numeric_prediction(block, question, cdf_size=numeric_cdf_size)
             if pred is not None:
                 structured_predictions.append(pred)
 
@@ -362,12 +411,15 @@ async def _aggregate_numeric_predictions(
     question: NumericQuestion,
     aggregation: Literal["mean", "median"] = "median",
 ) -> Any:
-    """Pointwise central tendency of per-forecaster 201-point CDFs.
+    """Pointwise central tendency of the per-forecaster CDFs.
 
+    All inputs share one grid length — the question's ``cdf_size`` (201 for continuous
+    questions, smaller for discrete ones) — since :func:`_compute_numeric_prediction`
+    builds every per-model CDF on that grid; ``n_points`` follows the inputs.
     Operates directly on the probability arrays rather than wrapping in
     NumericDistribution objects (which enforce strict-monotonicity on
-    declared_percentiles — a constraint our 201-point CDFs can violate
-    at the tails). Takes the pointwise median or mean, then wraps the result.
+    declared_percentiles — a constraint these CDFs can violate at the tails).
+    Takes the pointwise median or mean, then wraps the result.
     """
     await asyncio.sleep(0)  # cooperative yield for flake8-async ASYNC910
     from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution  # noqa: PLC0415

@@ -18,6 +18,7 @@ from metaculus_bot.performance_analysis.analysis import (
     numeric_pit_analysis,
     stacking_effectiveness,
 )
+from metaculus_bot.performance_analysis.collector import resolve_numeric_record_to_score_inputs
 
 
 def _old_interpolate_pit(resolution: float, lower_bound: float, upper_bound: float, cdf_values: list[float]) -> float:
@@ -363,6 +364,14 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome"] == "skipped"
         assert rec["stacker_outcome_source"] == "marker_outcome"
 
+    def test_outcome_marker_skipped_config_off(self):
+        # Config-suppressed skip (per-type gate off despite high spread) must
+        # survive the collector round-trip distinct from plain "skipped" — this
+        # is the field the 0/22-numeric-suppression re-attribution needed.
+        rec = self._run(3, 33, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped_config_off -->\n")
+        assert rec["stacker_outcome"] == "skipped_config_off"
+        assert rec["stacker_outcome_source"] == "marker_outcome"
+
     def test_legacy_marker_only_maps_to_primary(self):
         rec = self._run(4, 44, "*Forecaster 1*: 70%\n<!-- STACKED=true -->\n")
         assert rec["stacker_outcome"] == "primary"
@@ -531,3 +540,55 @@ class TestNumericPitAnalysisValueGrid:
         assert result["pit_values"][1] == pytest.approx(0.5, abs=0.02)
         # Both PITs land in the central coverage band.
         assert result["coverage_50"] == pytest.approx(1.0)
+
+    def test_zero_point_zero_without_continuous_range_reconstructs_geometric(self):
+        # Regression for the zero_point sentinel bug on the analysis fallback path:
+        # a log-scale record serializes zero_point==0 with range_min>0 but carries
+        # NO continuous_range (old archive / schema drift). numeric_pit_analysis
+        # must reconstruct the GEOMETRIC grid (via grid_zero_point), not a linear
+        # one. On [1, 1000] the geometric midpoint (~31.6) is PIT ~0.5; the buggy
+        # linear-grid reconstruction would call it near-zero.
+        cdf = list(np.linspace(0.0, 1.0, 201))
+        log_rec = self._record(1, cdf, 31.6, 1.0, 1000.0, 0, None)
+        result = numeric_pit_analysis([log_rec])
+        assert result["count"] == 1
+        assert result["pit_values"][0] == pytest.approx(0.5, abs=0.02)
+
+
+class TestResolveNumericScoreInputsZeroPoint:
+    """Regression for the zero_point sentinel bug in the record-scoring coercion:
+    ``resolve_numeric_record_to_score_inputs`` must keep a serialized
+    ``zero_point == 0`` (with a positive ``range_min``) as a genuine log-scale
+    value, not collapse it to the linear ``None`` sentinel."""
+
+    def _record(self, zero_point: float | int | None, range_min: float, range_max: float) -> dict:
+        return {
+            "type": "numeric",
+            "resolution_parsed": (range_min + range_max) / 2.0,
+            "scaling": {"range_min": range_min, "range_max": range_max, "zero_point": zero_point},
+        }
+
+    def test_zero_point_zero_stays_log_when_range_min_positive(self):
+        # This is the sibling of the width_monitor fix: a log-scale question with a
+        # positive floor carries zero_point==0, which must survive as 0.0 so
+        # numeric_log_score buckets on the geometric grid.
+        inputs = resolve_numeric_record_to_score_inputs(self._record(0, 1.0, 1000.0))
+        assert inputs is not None
+        _res, _lo, _hi, zero_point = inputs
+        assert zero_point == 0.0
+
+    def test_zero_point_zero_dropped_when_range_min_nonpositive(self):
+        # A non-positive floor rules out a log transform -> linear (None).
+        inputs = resolve_numeric_record_to_score_inputs(self._record(0, 0.0, 100.0))
+        assert inputs is not None
+        assert inputs[3] is None
+
+    def test_absent_zero_point_is_linear(self):
+        inputs = resolve_numeric_record_to_score_inputs(self._record(None, 0.0, 100.0))
+        assert inputs is not None
+        assert inputs[3] is None
+
+    def test_nonzero_zero_point_passthrough(self):
+        inputs = resolve_numeric_record_to_score_inputs(self._record(50, 0.0, 100.0))
+        assert inputs is not None
+        assert inputs[3] == 50.0

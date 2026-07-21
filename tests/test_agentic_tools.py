@@ -1,0 +1,1055 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from metaculus_bot.research.agentic import tools as agentic_tools
+from metaculus_bot.research.agentic.loop import _tool_schemas
+
+
+class _FakeResponse:
+    def __init__(self, *, status: int, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self.headers = headers or {}
+
+    async def __aenter__(self) -> "_FakeResponse":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _FakeSession:
+    """Serves a queued sequence of responses; the last response repeats.
+
+    Single-response construction keeps the original fixed-response behavior;
+    multi-response construction lets redirect tests script a chain of hops.
+    """
+
+    def __init__(self, *responses: _FakeResponse) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, bool]] = []
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def get(self, url: str, *, allow_redirects: bool = False) -> _FakeResponse:
+        self.calls.append((url, allow_redirects))
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
+
+
+@pytest.fixture(autouse=True)
+def _reset_tool_state() -> None:
+    agentic_tools._FETCH_TEXT_CACHE.clear()
+    agentic_tools._FETCH_LINKS_CACHE.clear()
+    agentic_tools._FETCH_HOST_SEMAPHORES.clear()
+    agentic_tools._PLAYWRIGHT_WARNED = False
+    # Fresh module-global rendered-fetch semaphore per test: construction is
+    # loop-free in 3.12, so this prevents a contended acquire in one test's
+    # event loop from leaking a loop binding into a later test.
+    agentic_tools._RENDERED_FETCH_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
+
+
+def test_tool_schemas_round_trip_for_public_tools() -> None:
+    tools = agentic_tools.build_gap_fill_tools("topic")
+    schemas = _tool_schemas(tools, must_conclude=False)
+
+    by_name = {entry["function"]["name"]: entry["function"] for entry in schemas}
+    assert by_name["search_news"]["parameters"]["required"] == ["query"]
+    assert by_name["search_web"]["parameters"]["properties"]["end_published_date"]["type"] == ["string", "null"]
+    assert by_name["fetch"]["parameters"]["properties"]["start_char"]["minimum"] == 0
+    assert by_name["read_document"]["parameters"]["required"] == ["url", "ask"]
+
+
+@pytest.mark.asyncio
+async def test_search_web_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    monkeypatch.setattr(
+        agentic_tools,
+        "_call_exa_search",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    title="Result title",
+                    url="https://example.com/a",
+                    published_date="2026-07-15",
+                    highlights=["First highlight", "Second highlight"],
+                )
+            ]
+        ),
+    )
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "search"
+    assert "Result title" in outcome.content_markdown
+    assert "https://example.com/a" in outcome.content_markdown
+    assert "- First highlight" in outcome.content_markdown
+
+
+class _FakeHttpxAsyncClient:
+    """httpx.AsyncClient double that records its constructor kwargs.
+
+    Lets the Exa tests assert the client-side timeout was applied without a
+    real socket. Instances append their kwargs to the shared ``captured`` list.
+    """
+
+    def __init__(self, captured: list[dict[str, Any]], **kwargs: Any) -> None:
+        captured.append(kwargs)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _patch_async_exa(monkeypatch: pytest.MonkeyPatch, searcher: MagicMock) -> list[dict[str, Any]]:
+    """Wire fake ``exa_py.AsyncExa`` + ``httpx`` for a ``search_web`` test.
+
+    ``searcher`` drives ``AsyncExa.search`` (call it to raise/return); the
+    returned list captures each ``httpx.AsyncClient(**kwargs)`` construction.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class FakeAsyncExa:
+        def __init__(self, api_key: str | None = None) -> None:
+            self.base_url = "https://api.exa.ai"
+            self.headers = {"x-api-key": api_key}
+            self._client: Any = None
+
+        async def search(self, **kwargs: Any) -> Any:
+            return searcher(**kwargs)
+
+    monkeypatch.setitem(sys.modules, "exa_py", SimpleNamespace(AsyncExa=FakeAsyncExa))
+    monkeypatch.setitem(
+        sys.modules, "httpx", SimpleNamespace(AsyncClient=lambda **kwargs: _FakeHttpxAsyncClient(captured, **kwargs))
+    )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_search_web_retries_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    searcher = MagicMock(
+        side_effect=[
+            RuntimeError("429 too many requests"),
+            RuntimeError("rate limit"),
+            SimpleNamespace(results=[SimpleNamespace(title="Recovered", url="https://example.com", highlights=[])]),
+        ]
+    )
+    sleeps: list[float] = []
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=lambda delay: sleeps.append(delay)))
+    _patch_async_exa(monkeypatch, searcher)
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "ok"
+    assert "Recovered" in outcome.content_markdown
+    assert sleeps == [1.0, 4.0]
+    assert searcher.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_search_web_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    searcher = MagicMock(side_effect=RuntimeError("429 too many requests"))
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    _patch_async_exa(monkeypatch, searcher)
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "error"
+    assert "Exa search failed" in outcome.content_markdown
+    assert searcher.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_search_web_exa_client_uses_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 2 (Exa half): the async Exa client is built with a client-side
+    timeout <= the search_web tool budget, so a hung endpoint tears the socket
+    down before the loop's wait_for fires — and there is no worker thread to
+    leak because the sync/to_thread path is gone."""
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    searcher = MagicMock(return_value=SimpleNamespace(results=[]))
+    captured = _patch_async_exa(monkeypatch, searcher)
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "ok"
+    tool_budget = next(
+        tool.timeout_s for tool in agentic_tools.build_gap_fill_tools("topic") if tool.name == "search_web"
+    )
+    assert len(captured) == 1
+    assert "timeout" in captured[0]
+    assert captured[0]["timeout"] is not None
+    assert captured[0]["timeout"] <= tool_budget
+
+
+@pytest.mark.asyncio
+async def test_search_web_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+
+    outcome = await agentic_tools.search_web("query")
+
+    assert outcome.status == "error"
+    assert "EXA_API_KEY" in outcome.content_markdown
+
+
+@pytest.mark.asyncio
+async def test_search_web_passes_end_published_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "key")
+    searcher = MagicMock(return_value=SimpleNamespace(results=[]))
+    _patch_async_exa(monkeypatch, searcher)
+
+    await agentic_tools.search_web("query", end_published_date="2026-01-01")
+
+    assert searcher.call_args.kwargs["end_published_date"] == "2026-01-01"
+
+
+@pytest.mark.asyncio
+async def test_search_news_happy_path_uses_gate_and_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+    monkeypatch.setenv("ASKNEWS_SECRET", "secret")
+    gate = AsyncMock()
+    semaphore_entered = False
+
+    class RecordingSemaphore:
+        async def __aenter__(self) -> None:
+            nonlocal semaphore_entered
+            semaphore_entered = True
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakeSdk:
+        async def __aenter__(self) -> "FakeSdk":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        news = SimpleNamespace(
+            search_news=AsyncMock(
+                return_value=SimpleNamespace(
+                    as_dicts=[
+                        {
+                            "eng_title": "Article title",
+                            "pub_date": "2026-07-16",
+                            "source_id": "reuters",
+                            "article_url": "https://example.com/story",
+                            "summary": "Short summary.",
+                        }
+                    ]
+                )
+            )
+        )
+
+    monkeypatch.setattr("metaculus_bot.research.providers._ASKNEWS_GLOBAL_SEMAPHORE", RecordingSemaphore())
+    monkeypatch.setattr("metaculus_bot.research.providers._asknews_rate_gate", gate)
+    monkeypatch.setitem(sys.modules, "asknews_sdk", SimpleNamespace(AsyncAskNewsSDK=lambda **_: FakeSdk()))
+
+    outcome = await agentic_tools.search_news("query")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "news"
+    assert semaphore_entered is True
+    gate.assert_awaited_once()
+    assert "Article title" in outcome.content_markdown
+
+
+class _FakeAskNewsSdk:
+    """Async-context AskNews SDK double with a scripted search_news."""
+
+    def __init__(self, search_news_mock: AsyncMock) -> None:
+        self.news = SimpleNamespace(search_news=search_news_mock)
+
+    async def __aenter__(self) -> "_FakeAskNewsSdk":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def _patch_asknews_env(monkeypatch: pytest.MonkeyPatch, search_news_mock: AsyncMock) -> AsyncMock:
+    """Wire creds + SDK + rate gate for a _call_asknews_search test; returns the sleep recorder."""
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "id")
+    monkeypatch.setenv("ASKNEWS_SECRET", "secret")
+    monkeypatch.setattr("metaculus_bot.research.providers._asknews_rate_gate", AsyncMock())
+    monkeypatch.setitem(
+        sys.modules, "asknews_sdk", SimpleNamespace(AsyncAskNewsSDK=lambda **_: _FakeAskNewsSdk(search_news_mock))
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", sleep_mock)
+    return sleep_mock
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_retries_rate_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(
+        side_effect=[
+            RuntimeError("429 too many requests"),
+            SimpleNamespace(as_dicts=[{"eng_title": "Recovered article"}]),
+        ]
+    )
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    articles = await agentic_tools._call_asknews_search("query")
+
+    assert len(articles) == 1
+    assert search_news.await_count == 2
+    # One backoff between the two attempts, on the provider's schedule.
+    expected_backoff = agentic_tools.ASKNEWS_BACKOFF_SECS * (10 + 3**1)
+    assert [call.args[0] for call in sleep_mock.await_args_list] == [expected_backoff]
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_retries_concurrency_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(
+        side_effect=[
+            RuntimeError("concurrency limit exceeded for plan"),
+            SimpleNamespace(as_dicts=[{"eng_title": "Recovered article"}]),
+        ]
+    )
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    articles = await agentic_tools._call_asknews_search("query")
+
+    assert len(articles) == 1
+    assert search_news.await_count == 2
+    assert sleep_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_non_retryable_error_raises_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    search_news = AsyncMock(side_effect=RuntimeError("invalid credentials"))
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    with pytest.raises(RuntimeError, match="invalid credentials"):
+        await agentic_tools._call_asknews_search("query")
+
+    assert search_news.await_count == 1
+    assert sleep_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_rate_limit_exhausts_retries_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    tries = max(1, int(agentic_tools.ASKNEWS_MAX_TRIES))
+    search_news = AsyncMock(side_effect=RuntimeError("429 too many requests"))
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    with pytest.raises(RuntimeError, match="429"):
+        await agentic_tools._call_asknews_search("query")
+
+    assert search_news.await_count == tries
+    assert sleep_mock.await_count == tries - 1
+
+
+@pytest.mark.asyncio
+async def test_search_news_missing_creds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASKNEWS_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ASKNEWS_SECRET", raising=False)
+
+    outcome = await agentic_tools.search_news("query")
+
+    assert outcome.status == "error"
+    assert "ASKNEWS_CLIENT_ID" in outcome.content_markdown
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_success_path_reuses_fetch_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(
+        agentic_tools,
+        "_read_response_body",
+        AsyncMock(return_value=b'<html><body><a href="/a">A</a><p>Long body</p></body></html>'),
+    )
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="Rendered plain body " * 40),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "plain"
+    assert outcome.links == ["https://example.com/a"]
+    assert "Rendered plain body" in outcome.content_markdown
+    assert session.calls == [("https://example.com/page", False)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_js_wall_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok",
+                method="plain",
+                text="too short",
+                links=["https://example.com/plain"],
+                url="https://example.com/page",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agentic_tools,
+        "_try_rendered_fetch",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok",
+                method="rendered",
+                text="rendered body",
+                links=["https://example.com/rendered"],
+                url="https://example.com/page",
+            )
+        ),
+    )
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.method == "rendered"
+    assert outcome.links == ["https://example.com/rendered"]
+    assert outcome.content_markdown == "rendered body"
+
+
+@pytest.mark.asyncio
+async def test_fetch_thin_content_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok",
+                method="plain",
+                text="x" * 100,
+                links=[],
+                url="https://example.com/page",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agentic_tools,
+        "_try_rendered_fetch",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok", method="rendered", text="x" * 600, links=[], url="https://example.com/page"
+            )
+        ),
+    )
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.method == "rendered"
+    assert outcome.content_markdown == "x" * 600
+
+
+@pytest.mark.asyncio
+async def test_fetch_pdf_content_type_auto_escalates_to_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    read_document = AsyncMock(
+        return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
+    )
+    monkeypatch.setattr(agentic_tools, "read_document", read_document)
+
+    outcome = await agentic_tools.fetch("https://example.com/file.pdf")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "document"
+    assert outcome.content_markdown == "Extracted PDF content."
+    read_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_document_escalation_generic_ask_contains_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    read_document = AsyncMock(
+        return_value=agentic_tools.ToolOutcome(content_markdown="Extracted PDF content.", method="document")
+    )
+    monkeypatch.setattr(agentic_tools, "read_document", read_document)
+
+    tools = agentic_tools.build_gap_fill_tools("Will Nauru ratify the treaty?")
+    fetch_handler = next(tool.handler for tool in tools if tool.name == "fetch")
+
+    outcome = await fetch_handler(url="https://example.com/file.pdf")
+
+    assert outcome.method == "document"
+    read_document.assert_awaited_once_with(
+        "https://example.com/file.pdf",
+        "Extract the main content relevant to: Will Nauru ratify the treaty?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    fetch_plain = AsyncMock(
+        return_value=SimpleNamespace(
+            status="ok",
+            method="plain",
+            text="A" * (agentic_tools._FETCH_WINDOW_CHARS + 5),
+            links=["https://example.com/a"],
+            url="https://example.com/page",
+            escalate_rendered=False,
+        )
+    )
+    monkeypatch.setattr(agentic_tools, "_fetch_plain", fetch_plain)
+
+    first = await agentic_tools.fetch("https://example.com/page")
+    second = await agentic_tools.fetch("https://example.com/page", start_char=agentic_tools._FETCH_WINDOW_CHARS)
+
+    assert first.truncated is True
+    assert "[truncated at 8000 of 8005 chars — call again with start_char=8000]" in first.content_markdown
+    assert second.method == "cache"
+    assert second.content_markdown == "A" * 5
+    assert fetch_plain.await_count == 1
+
+
+def test_extract_links_caps_at_twenty_five() -> None:
+    html = "".join(f'<a href="/{index}">link{index}</a>' for index in range(30))
+
+    links = agentic_tools._extract_links_from_html(html, "https://example.com/root")
+
+    assert len(links) == 25
+    assert links[0] == "https://example.com/0"
+    assert links[-1] == "https://example.com/24"
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
+        _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(
+        agentic_tools,
+        "_read_response_body",
+        AsyncMock(return_value=b"<html><body><p>Final page body</p></body></html>"),
+    )
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="Final page body " * 40),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "ok"
+    assert result.url == "https://example.com/final"
+    assert "Final page body" in result.text
+    assert session.calls == [("https://example.com/start", False), ("https://example.com/final", False)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}),
+    )
+
+    async def is_public(url: str) -> bool:
+        return "169.254.169.254" not in url
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "blocked"
+    assert "non-public redirect target" in result.text
+    # The private hop must never be requested.
+    assert session.calls == [("https://example.com/start", False)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    hops = agentic_tools.MAX_REDIRECTS + 2
+    session = _FakeSession(
+        *[_FakeResponse(status=302, headers={"Location": f"https://example.com/hop{i}"}) for i in range(hops)]
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "error"
+    assert result.text == "Redirect limit exceeded."
+    assert len(session.calls) == agentic_tools.MAX_REDIRECTS + 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(_FakeResponse(status=302, headers={}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "error"
+    assert "Malformed redirect" in result.text
+
+
+@pytest.mark.asyncio
+async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plan §5 politeness: a plain and a rendered fetch to the same host must
+    contend on the same per-host Semaphore(1) and never run concurrently."""
+    events: list[str] = []
+    release_plain = asyncio.Event()
+
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    async def blocking_read(resp: object, label: str) -> bytes:
+        events.append("plain_read_started")
+        await release_plain.wait()
+        events.append("plain_read_finished")
+        return b"<html><body><p>Long body</p></body></html>"
+
+    monkeypatch.setattr(agentic_tools, "_read_response_body", blocking_read)
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="body text " * 60),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            # Runs strictly after _try_rendered_fetch acquires the host gate.
+            events.append("rendered_started")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
+    await asyncio.sleep(0)
+    assert events == ["plain_read_started"]  # plain holds the example.com gate
+
+    rendered_task = asyncio.create_task(agentic_tools._try_rendered_fetch("https://example.com/rendered-page"))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    # Rendered must be parked on the shared host gate while plain holds it.
+    assert "rendered_started" not in events
+
+    release_plain.set()
+    plain_result = await plain_task
+    rendered_result = await rendered_task
+
+    assert plain_result.status == "ok"
+    assert rendered_result is not None and rendered_result.method == "rendered"
+    assert events.index("plain_read_finished") < events.index("rendered_started")
+
+
+@pytest.mark.asyncio
+async def test_fetch_ssrf_reject_returns_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=False))
+
+    outcome = await agentic_tools.fetch("http://127.0.0.1")
+
+    assert outcome.status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_fetch_playwright_missing_degrades_to_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok",
+                method="plain",
+                text="plain body",
+                links=[],
+                url="https://example.com/page",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.method == "plain"
+    assert outcome.content_markdown == "plain body"
+
+
+@pytest.mark.asyncio
+async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.MonkeyPatch) -> None:
+    semaphore_entries: list[str] = []
+
+    class RecordingSemaphore:
+        async def __aenter__(self) -> None:
+            semaphore_entries.append("entered")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            assert url == "https://example.com/page"
+            assert wait_until == "networkidle"
+            assert timeout == 35_000
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return '<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>'
+
+    routes: list[str] = []
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            routes.append(pattern)
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            assert kwargs["user_agent"]
+            assert "Accept-Language" in kwargs["extra_http_headers"]
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            assert headless is True
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: RecordingSemaphore())
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
+
+    assert outcome is not None
+    assert outcome.method == "rendered"
+    assert outcome.links == ["https://example.com/next"]
+    assert semaphore_entries == ["entered"]
+    assert routes == ["**/*"]
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 1: concurrent headless-Chromium launches must never exceed the
+    module-global cap, even across questions (the semaphore is per-process).
+
+    Fires more concurrent _try_rendered_fetch calls than the cap — each to a
+    distinct host so the per-host gate never serializes them — and gates each
+    fake launch on a barrier so we can measure the true concurrent-launch peak.
+    The peak must equal the cap (proving contention was actually reached) and
+    never exceed it."""
+    cap = 2
+    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
+
+    live = 0
+    peak = 0
+    hold = asyncio.Event()
+    at_cap = asyncio.Event()
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            if live >= cap:
+                at_cap.set()
+            try:
+                await hold.wait()
+            finally:
+                live -= 1
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="rendered body")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    tasks = [
+        asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host{index}.example.com/page"))
+        for index in range(cap + 3)
+    ]
+
+    # Let the first wave saturate the semaphore, then confirm it plateaued at
+    # the cap while the launches are still parked on the barrier.
+    await asyncio.wait_for(at_cap.wait(), timeout=1.0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert live == cap
+    assert peak == cap
+
+    hold.set()
+    results = await asyncio.gather(*tasks)
+
+    assert all(result is not None and result.method == "rendered" for result in results)
+    assert peak == cap
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-hop route guard must abort requests to non-public hosts.
+
+    Simulates a page whose client-side redirect targets a private host: the
+    guard registered via context.route re-runs is_public_http_url per request,
+    aborts the private hop, and no below-bound content reaches the outcome.
+    """
+    aborted: list[tuple[str, str]] = []
+    continued: list[str] = []
+
+    class FakeRoute:
+        def __init__(self, url: str) -> None:
+            self.request = SimpleNamespace(url=url)
+
+        async def continue_(self) -> None:
+            continued.append(self.request.url)
+
+        async def abort(self, error_code: str) -> None:
+            aborted.append((self.request.url, error_code))
+
+    guard_holder: list = []
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            # Drive the guard the way Chromium would: the public main-frame
+            # request continues; the page's client-side redirect to the
+            # private host is aborted.
+            guard = guard_holder[0]
+            main_route = FakeRoute(url)
+            await guard(main_route, main_route.request)
+            private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
+            await guard(private_route, private_route.request)
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>public content only</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            guard_holder.append(handler)
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def fake_is_public(url: str) -> bool:
+        return "169.254.169.254" not in url
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="public content only")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
+
+    assert outcome is not None
+    assert continued == ["https://example.com/page"]
+    assert aborted == [("http://169.254.169.254/latest/meta-data/", "blockedbyclient")]
+    assert "169.254.169.254" not in outcome.text
+    assert outcome.text == "public content only"
+
+
+@pytest.mark.asyncio
+async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "key")
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr(agentic_tools, "_run_document_read_sync", MagicMock(return_value="Quoted answer with dates."))
+
+    outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "document"
+    assert outcome.content_markdown == "Quoted answer with dates."
+
+
+@pytest.mark.asyncio
+async def test_read_document_genai_client_uses_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 2 (genai half): the genai Client is built with a client-side timeout
+    (ms) <= the read_document internal deadline, so a hung endpoint returns the
+    to_thread worker instead of stranding it in the shared ThreadPoolExecutor.
+
+    Patches the real ``google.genai.Client`` attribute and uses the real
+    ``HttpOptions`` so the asserted timeout is the value that would ship."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "key")
+    captured: dict[str, Any] = {}
+
+    def fake_client(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        models = SimpleNamespace(generate_content=lambda **_: SimpleNamespace(text="Quoted answer."))
+        return SimpleNamespace(models=models)
+
+    monkeypatch.setattr("google.genai.Client", fake_client)
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
+
+    assert outcome.status == "ok"
+    http_options = captured["http_options"]
+    # HttpOptions.timeout is in milliseconds; the read_document internal deadline is in seconds.
+    assert http_options.timeout is not None
+    assert http_options.timeout <= agentic_tools._READ_DOCUMENT_TIMEOUT_S * 1000
+
+
+@pytest.mark.asyncio
+async def test_read_document_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "key")
+    monkeypatch.setattr(agentic_tools, "_READ_DOCUMENT_TIMEOUT_S", 0.01)
+
+    async def slow_to_thread(fn, *args):
+        await asyncio.sleep(0.05)
+        return fn(*args)
+
+    monkeypatch.setattr("asyncio.to_thread", slow_to_thread)
+    monkeypatch.setattr(agentic_tools, "_run_document_read_sync", MagicMock(return_value="late result"))
+
+    outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
+
+    assert outcome.status == "error"
+    assert "timed out" in outcome.content_markdown
+
+
+@pytest.mark.asyncio
+async def test_read_document_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
+
+    assert outcome.status == "error"
+    assert "GOOGLE_API_KEY" in outcome.content_markdown

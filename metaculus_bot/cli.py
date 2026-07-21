@@ -13,10 +13,12 @@ from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
+    TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
     check_tournament_dates,
     env_flag_enabled,
 )
+from metaculus_bot.credit_telemetry import CreditTelemetry
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_donated_404_fallback_count,
@@ -87,7 +89,9 @@ def main() -> None:
     research_writer = None
     research_sink = None
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
-        from metaculus_bot.research.persistence import ResearchPersistenceWriter  # noqa: PLC0415
+        from metaculus_bot.research.persistence import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            ResearchPersistenceWriter,
+        )
 
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
@@ -119,35 +123,61 @@ def main() -> None:
         llms=llms,
     )
 
-    if run_mode == "tournament":
-        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
-        template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
-        forecast_reports = asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
-    elif run_mode == "minibench":
-        template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
-        )
-    elif run_mode in ("quarterly_cup", "metaculus_cup"):
-        # The metaculus cup is a good way to test the bot's performance on regularly open questions
-        template_bot.skip_previously_forecasted_questions = True  # to not risk explosive spend, we won't update preds
-        forecast_reports = asyncio.run(template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True))
-    elif run_mode == "test_questions":
-        # Example questions are a good way to test the bot's performance on a single question
-        EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-            # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
-        ]
-        template_bot.skip_previously_forecasted_questions = (
-            False  # obviously, we need to rerun test q predictions to test them :)
-        )
-        questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
-        forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
-    else:
-        raise ValueError(f"Invalid run mode: {run_mode}")
+    # Credit-balance telemetry: CREDIT_BALANCE/CREDIT_SPEND marker lines land in
+    # the run_logs/ artifact via the workflows' stdout tee, making per-run spend
+    # on the shared donated key durably grep-able. The end fetch runs in a
+    # finally so a crashed run still logs its spend; the floor check result is
+    # consumed AFTER forecasting/publishing below (reminder signal, not abort).
+    credit_telemetry = CreditTelemetry()
+    credit_telemetry.log_start()
+    donated_below_floor = False
+    try:
+        if run_mode == "tournament":
+            check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
+            # to not risk explosive spend, we won't update preds
+            template_bot.skip_previously_forecasted_questions = True
+            forecast_reports = asyncio.run(template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True))
+        elif run_mode == "minibench":
+            # to not risk explosive spend, we won't update preds
+            template_bot.skip_previously_forecasted_questions = True
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+            )
+        elif run_mode in ("quarterly_cup", "metaculus_cup"):
+            # The metaculus cup is a good way to test the bot's performance on regularly open questions
+            # to not risk explosive spend, we won't update preds
+            template_bot.skip_previously_forecasted_questions = True
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
+            )
+        elif run_mode == "test_questions":
+            # Example questions are a good way to test the bot's performance on a single question
+            EXAMPLE_QUESTIONS = [
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
+                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
+                # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
+                "https://www.metaculus.com/questions/20683/which-ai-world/",  # Scott Aaronson's five AI worlds
+                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+            ]
+            template_bot.skip_previously_forecasted_questions = (
+                False  # obviously, we need to rerun test q predictions to test them :)
+            )
+            # Optional override (test_bot_basic workflow): a comma/whitespace-
+            # separated list of Metaculus URLs to forecast instead of the full
+            # evergreen set. Unset -> the hardcoded EXAMPLE_QUESTIONS above.
+            override_urls = os.environ.get(TEST_QUESTIONS_OVERRIDE_ENV, "").replace(",", " ").split()
+            question_urls = override_urls or EXAMPLE_QUESTIONS
+            if override_urls:
+                logger.info(
+                    "TEST_QUESTIONS_OVERRIDE set: forecasting %d override question(s) instead of the evergreen set",
+                    len(override_urls),
+                )
+            questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
+            forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
+        else:
+            raise ValueError(f"Invalid run mode: {run_mode}")
+    finally:
+        donated_below_floor = credit_telemetry.log_end_and_check_floor()
 
     if research_writer is not None:
         research_writer.flush()
@@ -183,6 +213,12 @@ def main() -> None:
             generic_fallback,
             donated_404,
         )
+        sys.exit(1)
+
+    # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
+    # already logged by credit_telemetry). The run completed and published
+    # normally; exiting non-zero here is purely the reminder-to-refill signal.
+    if donated_below_floor:
         sys.exit(1)
 
     # Post-submission deprecation tripwire. Runs LAST so submission has fully

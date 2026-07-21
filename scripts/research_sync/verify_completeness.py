@@ -40,13 +40,8 @@ from pathlib import Path
 
 # Reuse the puller's authoritative enumeration + download + parse helpers so the QA
 # uses the exact same code paths as the sync itself.
-from scripts.download_research import (
-    RESEARCH_ARTIFACT_PREFIX,
-    download_artifact,
-    list_research_artifacts,
-    load_jsonl_records,
-    verify_gh_cli,
-)
+from scripts.download_research import RESEARCH_ARTIFACT_PREFIX, load_jsonl_records, research_jsonl_files
+from scripts.gha_artifacts import _download_artifact_to, list_research_artifacts, verify_gh_cli
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +117,8 @@ def main() -> None:
                 if run_id is None:
                     genuine_gaps.append(art)
                     continue
-                files = download_artifact(run_id, args.repo, art["name"], tmp_path)
+                run_dir = _download_artifact_to(run_id, args.repo, art["name"], tmp_path)
+                files = research_jsonl_files(run_dir) if run_dir is not None else []
                 has_records = any(load_jsonl_records(f) for f in files)
                 (genuine_gaps if has_records else empty_artifacts).append(art)
 

@@ -110,13 +110,31 @@ DEFAULT_MAX_CONCURRENT_RESEARCH: int = 6
 # Keep this modest to balance concurrency and rate limits.
 BENCHMARK_BATCH_SIZE: int = 4
 
-# Metaculus comment safety limits
-REPORT_SECTION_CHAR_LIMIT: int = 49_999
+# Metaculus comment safety limits. The published comment has three top-level
+# sections (# SUMMARY / # RESEARCH / # FORECASTS), each trimmed to its own
+# budget before assembly (see comment.trimming.trim_section). FORECASTS
+# (per-model rationales + fenced JSON forecast blocks) gets the largest share
+# because it carries the per-model attribution the residual pipeline parses;
+# RESEARCH is a lossy fallback-archive re-print; SUMMARY holds the
+# parser-critical bullets and is sized well above any realistic bullet block so
+# it never clips them. The three caps sum below COMMENT_CHAR_LIMIT; trim_comment
+# shrinks RESEARCH first (never bullets or rationales) if the assembled comment
+# plus framework overhead still overflows.
+FORECASTS_SECTION_CHAR_LIMIT: int = 89_999
+RESEARCH_SECTION_CHAR_LIMIT: int = 44_999
+SUMMARY_SECTION_CHAR_LIMIT: int = 13_999
 COMMENT_CHAR_LIMIT: int = 149_999
 
 # Optional environment variable to force research provider selection.
 # Accepted values (case-insensitive): "auto", "asknews", "exa", "perplexity", "openrouter"
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
+
+# Optional override for the --mode test_questions question set. When set to a
+# non-empty comma/whitespace-separated list of Metaculus question URLs, the
+# test_questions path forecasts exactly those instead of the hardcoded evergreen
+# EXAMPLE_QUESTIONS list (see cli.py). Used by the test_bot_basic workflow to run
+# a single question end-to-end; unset preserves full test_bot behavior.
+TEST_QUESTIONS_OVERRIDE_ENV: str = "TEST_QUESTIONS_OVERRIDE"
 
 # Credential env-var names. Named constants (matching the existing *_ENV
 # convention used for GOOGLE_API_KEY_ENV / FRED_API_KEY_ENV) so the literal
@@ -196,6 +214,14 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 # headroom above the normal retry envelope while still bounding a genuine hang.
 ASKNEWS_WALL_TIMEOUT: int = 300
 
+# --- OpenRouter credit telemetry ---
+# End-of-run floor for the DONATED key's remaining balance (limit_remaining).
+# Below this, cli.main logs a loud warning and exits non-zero AFTER all
+# forecasting/publishing completes — a reminder-to-refill signal, not an abort.
+# The floor is meaningless for the personal key (no limit_remaining), so it is
+# only checked against the donated key. See metaculus_bot/credit_telemetry.py.
+OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1.0)
+
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
 # (Atlas publishes `0.96 * estimate + 0.02`; we adopt the clip portion only).
@@ -253,11 +279,12 @@ NATIVE_SEARCH_MODEL_ENV: str = "NATIVE_SEARCH_MODEL"
 # Default model for native search (without openrouter/ prefix).
 # Critical-path research — this constant covers BOTH the always-on native-search
 # provider (every question) and the targeted search on the stacking path.
-# Strongest OpenAI tier because research depth compounds into every forecaster
-# prompt; effort stays at the env default LOW (see
-# NATIVE_SEARCH_REASONING_EFFORT_DEFAULT below) — sol-low ≥ terra-medium per
-# the AA Pareto frontier at similar latency.
-NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.6-sol"
+# Effort stays at the env default LOW (see NATIVE_SEARCH_REASONING_EFFORT_DEFAULT
+# below).
+# 2026-07-17: sol→terra per blind research-role audit
+# (scratch/research_role_audit_2026-07-17/ — terra won native-search role 1st;
+# sol 2nd; luna 3rd; verdict "MARGINAL EDGE").
+NATIVE_SEARCH_DEFAULT_MODEL: str = "openai/gpt-5.6-terra"
 # No temperature / top_p: reasoning models defer to provider defaults; the LLM
 # is built with temperature=None so litellm omits the param (see build_native_search_llm).
 NATIVE_SEARCH_MAX_TOKENS: int = 16_000
@@ -360,7 +387,14 @@ GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
 # uses google-genai directly via gemini_search_provider — that path needs the
 # search index.
 GAP_FILL_ANALYZER_MODEL: str = "openrouter/openai/gpt-5.6-terra"
-GAP_FILL_MAX_GAPS: int = 5
+# 2026-07-20: 5 → 4. The transcript vibe-analysis (Fable) found no positional
+# value cliff, so a fixed cutoff is safe now that the analyzer prompt ranks gaps
+# by decision-relevance (see gap_fill_analyzer_prompt — the 4th slot holds the
+# least valuable of the kept gaps rather than a random one). 3 was still judged
+# unsafe, but the 5th gap is empirically a completeness-stretch: only ~27% of 221
+# archived bundles rendered a 5th gap and the observed 5th gaps were
+# confirmatory, so 5→4 is near-zero risk. Do NOT go below 4.
+GAP_FILL_MAX_GAPS: int = 4
 # Analyzer call is non-grounded (no Google Search) and should return quickly.
 # Use a tight timeout to prevent a single hung analyzer request from holding a
 # research concurrency slot for the full grounded-search budget.
@@ -386,12 +420,56 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 # replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
 #
 # Agentic single-gap web research whose source-trust judgment lands directly in
-# every forecaster prompt. Small per-gap outputs mute sol's latency premium, and
-# the 5 workers run in parallel under a 420s cap (latency = slowest call, not
-# sum), so effort stays LOW. 2026-07-09 bench: sol-low matched terra-low coverage
-# 24/25 in 20% fewer chars and uniquely caught a research-internal error.
-GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-sol"
+# every forecaster prompt. The workers run in parallel under a 420s cap (latency
+# = slowest call, not sum), so effort stays LOW. 2026-07-20: sol → terra. terra
+# was preferred or within-noise vs sol across all three 2026-07 blind role audits
+# at ~40-50% lower cost, and these searches are ~44% of research spend (17 calls
+# in the 2026-07-19 run) — the single biggest research line item, so the cost cut
+# is the dominant consideration. (The 2026-07-09 bench had sol-low matching
+# terra-low coverage 24/25; the blind audits plus the cost weight flip it.)
+GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-terra"
 GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
+
+# --- Agentic gap-fill v2 (bounded research loop) ---
+# Second-generation gap-fill: a bounded agentic loop (metaculus_bot/research/
+# agentic/) that dry-runs the panel's own forecasting template to identify
+# fill/verify/resolution targets, then pursues them with search/fetch/read
+# tools. Runs CONCURRENTLY with v1 during the overlap window (both flags on);
+# soft-fails to "" like v1. See scratch_docs_and_planning/
+# agentic_gap_fill_v2_plan.md.
+GAP_FILL_V2_ENABLED_ENV: str = "GAP_FILL_V2_ENABLED"
+# Driver model + effort picked by the blind 5-arm replay eval 2026-07-17
+# (scratch/driver_replay_2026-07-17/blind_judge_report.md): terra-low ranked 1st
+# (fetch-verified grounding, best source mix, 30s wall, $0.36/q), terra-medium
+# 2nd; sol-low burned budget on near-duplicate searches (5th); sonnet-5 cited
+# unfetched URLs (disqualifying for a researcher). All candidates were
+# openai/anthropic, so the loop's litellm binding routes via the donated
+# OpenRouter key.
+GAP_FILL_V2_DRIVER_MODEL: str = os.getenv("GAP_FILL_V2_DRIVER_MODEL") or "openai/gpt-5.6-terra"
+GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
+# read_document backend model on the NATIVE google-genai path (tools.py
+# _run_document_read_sync). CAUTION: this id is UNVERIFIED on the native
+# AI Studio API until the paid smoke test — the repo's verified-model notes
+# ("gemini-3.5-flash works") all refer to the OpenRouter slug route, which maps
+# ids differently; the only id verified on the native SDK here is
+# GEMINI_SEARCH_DEFAULT_MODEL ("gemini-3-flash-preview"). A wrong id soft-fails
+# read_document (model-not-found -> error outcome), silently disabling the
+# directed-reading rung.
+GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
+# Parallel tool calls each count against the cap; steps are where latency
+# lives, so batching is encouraged rather than rationed.
+GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 20)
+# Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
+# 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
+# no research-phase wall-clock. The loop is anytime: hitting the deadline
+# emits banked findings, never "".
+GAP_FILL_V2_WALL_DEADLINE: float = _float_env("GAP_FILL_V2_WALL_DEADLINE", 540.0)
+# With less than this many seconds remaining, the harness rejects every tool
+# except conclude, forcing the loop to wrap up inside the wall deadline.
+GAP_FILL_V2_CONCLUDE_THRESHOLD: float = _float_env("GAP_FILL_V2_CONCLUDE_THRESHOLD", 90.0)
+# Below this many extracted chars, the fetch ladder escalates plain HTTP to
+# headless-Chromium rendering (JS-wall heuristic; tools.py consumes this).
+GAP_FILL_V2_MIN_CONTENT_CHARS: int = _int_env("GAP_FILL_V2_MIN_CONTENT_CHARS", 500)
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
@@ -414,9 +492,18 @@ FORECASTER_SOFT_DEADLINE: int = 600
 
 # Minimum number of successful base forecasters required to publish a question.
 # Below this, the question is skipped entirely rather than publishing a weak
-# ensemble. Chosen conservatively: median/stacker aggregation remains meaningful
-# with 3/6 inputs; below that we're closer to a single-model opinion.
-MIN_FORECASTERS_TO_PUBLISH: int = 3
+# ensemble.
+#
+# 2026-07-20: lowered to 1 (was 3 → 2 → 1 over the day). At n=3, min=3 tolerates
+# ZERO drops, min=2 tolerates one, min=1 accepts publishing on a single surviving
+# forecaster. The operator accepts a single-forecaster publish: median-of-1 = the
+# forecast itself, and exception-driven drops stay CI-visible (counted as
+# degradation since 687e113), so a degraded run — even one thinned to a lone
+# model — still reddens CI rather than silently withholding the question.
+# NOTE: forecaster.py short-circuits the n==1 case before spread computation and
+# stacking, because the spread_metrics helpers REQUIRE >=2 predictions and raise
+# otherwise; see the single-forecaster guard in _research_and_make_predictions.
+MIN_FORECASTERS_TO_PUBLISH: int = 1
 
 # Per-question wall-clock cutoff (58:30 of the 60-min Metaculus close window).
 # At deadline, in-flight forecasters are cancelled; we base-combine whatever
@@ -542,5 +629,79 @@ PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEO
 PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
 PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
 
+# Relevance gate for the prediction-market snapshot. A matched contract is labelled
+# ``likely-relevant`` (and its question earns the strong-evidence preamble) only when the
+# content-word overlap between the question (title + resolution criteria) and the contract
+# (title + rules) is >= MARKET_RELEVANCE_OVERLAP_MIN AND the matcher confidence is
+# >= MARKET_RELEVANCE_CONF_MIN; otherwise it is ``verify-carefully`` and the question gets a
+# neutral "fuzzy-matched, verify before weighting" preamble. Nothing is dropped — the gate only
+# governs labels + the header. Tuned on 403 hand-graded contracts (2026-07-19): 60% contract
+# precision / 57% recall, question-level header precision 34%->68%, false-strong 100%->17%. See
+# scratch/new_analyses_2026-07-18/threshold_sanity.md and market_match_precision.md §d.
+MARKET_RELEVANCE_OVERLAP_MIN: int = 3
+MARKET_RELEVANCE_CONF_MIN: float = 0.50
+
+# --- Time-Series Anchor Provider (Phase B) ---
+# Env-gated OFF by default. Renders a deterministic empirical-band anchor grounded
+# in the resolution series' OWN history (FRED/yfinance), for numeric questions that
+# route cleanly to a known series (via resolution-criteria URLs or a curated title
+# registry). No statsforecast / model selection — the Phase-A offline replay
+# (scratch/ts_anchor_replay_2026-07-16/synthesis.md) found CV-gated model picks beat
+# naive out-of-sample only 43% of the time; the empirical h-step-change band is the
+# render. Its value is grounding + SHARPENING our over-wide published low tail
+# (cov@10 was 0.02 vs a 0.10 target). Backtest-safe (the FIRST research provider that
+# is): live uses as_of=now, is_benchmarking uses question.open_time so series data up
+# to resolution IS the answer (NOT scheduled_resolution − buffer), with ALFRED
+# vintages at as_of for revising series.
+TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
+# Chart-image side-channel: when on (and TS_ANCHOR_ENABLED is also on), the
+# provider renders an 800x400 PNG of the anchor (series + P10-P90 band) for
+# single-level questions and stashes it per-qid; the forecaster passes it to
+# each base model as a vision message. OFF everywhere until the text-vs-image
+# A/B (FUTURE.md "TS anchor chart image"). Independent of TS_ANCHOR_ENABLED so
+# the text anchor can ship before the (costlier, unvalidated) image does.
+TS_ANCHOR_CHART_ENABLED_ENV: str = "TS_ANCHOR_CHART_ENABLED"
+# Wall-clock cap on the whole provider (fetch fan-out + render). Fetches run in
+# asyncio.to_thread under asyncio.wait_for; a hung endpoint soft-fails to "".
+TS_ANCHOR_TIMEOUT: float = float(os.environ.get("TS_ANCHOR_TIMEOUT", "20.0"))
+# Per-request HTTP timeout for a single FRED/ALFRED/yfinance fetch.
+TS_ANCHOR_HTTP_TIMEOUT: float = 15.0
+# History lookback for both the displayed tables and the empirical change/window-max
+# distributions. Spread legs use a shorter window (below) to exclude the 2020-04-20
+# negative WTI settlement that breaks the strictly-positive log-return construction.
+TS_ANCHOR_LOOKBACK_YEARS: int = 15
+TS_ANCHOR_SPREAD_LOOKBACK_YEARS: int = 5
+# Char budget for the whole rendered section (self-budgeted like resolution_source;
+# per-leg render truncates history tables so multi-leg spreads stay bounded).
+TS_ANCHOR_SECTION_MAX_CHARS: int = 6000
+# History-table lengths per resolution: last-N native-freq observations, weekly
+# down-sampled closes (~3 months of trading weeks), monthly down-sampled (~2 years).
+TS_ANCHOR_NATIVE_TABLE_ROWS: int = 10
+TS_ANCHOR_WEEKLY_TABLE_ROWS: int = 13
+TS_ANCHOR_MONTHLY_TABLE_ROWS: int = 24
+
 # --- Research persistence (write path for backtest replay) ---
 PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"
+
+# --- Raw research-provider payload logging (durable GHA-artifact tape) ---
+# Independent from PERSIST_RESEARCH (which archives the post-summarizer research
+# text keyed per question). This captures each provider's RAW return — AskNews
+# article dicts per phase, native/gemini raw responses + grounding, prediction-
+# market contracts, resolution-source per-URL fetches, gap-fill search results —
+# appended as JSONL to a run_logs/ file so the raw evidence behind every forecast
+# survives the 90-day artifact window without depending on published comments.
+# OFF by default in code (unset env) so tests/local runs never write; the four
+# workflow yamls set it ON.
+RAW_RESEARCH_LOG_ENABLED_ENV: str = "RAW_RESEARCH_LOG_ENABLED"
+# Directory the raw-research JSONL is appended to. Defaults to run_logs/, which
+# every workflow tees stdout to and uploads wholesale as an artifact — so the raw
+# log rides along with no upload-glob change. Overridable (tests point it at a
+# tmp dir) via the RAW_RESEARCH_LOG_DIR env var.
+RAW_RESEARCH_LOG_DIR_ENV: str = "RAW_RESEARCH_LOG_DIR"
+RAW_RESEARCH_LOG_DIR_DEFAULT: str = "run_logs"
+# Per-record serialized-payload cap. A raw AskNews dual-phase pull or a grounded
+# Gemini response can be large; beyond this many chars the payload is replaced
+# with a bounded truncation marker (preview + original length) so one giant pull
+# can't blow up the log file. GHA zips the artifact on upload, so on-disk size is
+# the only concern; 200 KB/record is generous headroom for real payloads.
+RAW_RESEARCH_MAX_PAYLOAD_CHARS: int = 200_000

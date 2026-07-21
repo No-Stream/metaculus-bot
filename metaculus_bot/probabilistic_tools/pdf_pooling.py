@@ -7,13 +7,15 @@ smears two sharp distributions into one wide low-information CDF, which over-dis
 tails and bleeds natural-log score. These functions are the rigorous alternatives a later
 offline harness scores against median; none of them is wired into the live path.
 
-All three operate on per-forecaster 201-point CDFs represented as ``list[Percentile]``
-(``.value`` = x on a shared ``np.linspace(lower, upper, 201)`` grid, ``.percentile`` =
-cumulative probability F(x) in [0, 1]) and emit a constraint-enforced ``list[Percentile]``
-on the question's own grid. Constraint enforcement reuses the same
+All three operate on per-forecaster CDFs represented as ``list[Percentile]``
+(``.value`` = x on the question's shared value grid, ``.percentile`` = cumulative
+probability F(x) in [0, 1]) and emit a constraint-enforced ``list[Percentile]`` on the same
+grid. The grid length follows the INPUT CDFs — 201 for continuous questions, the question's
+``cdf_size`` (``inbound_outcome_count + 1``) for discrete questions — rather than a hard-coded
+201; all inputs to one call must agree on length. Constraint enforcement reuses the same
 ``safe_cdf_bounds`` / ``enforce_min_steps`` layer that
 ``percentiles_to_metaculus_cdf_via_mixture`` uses, so outputs satisfy the Metaculus
-CDF rules (201 points, min-step, open/closed bounds, monotone).
+CDF rules (min-step, max-step, open/closed bounds, monotone) scaled to the grid length.
 
 - ``vincentize_cdfs``  — quantile averaging (preserves sharpness; the headline primitive).
 - ``apply_tail_floor`` — guarantee >= floor_eps PMF mass in boundary buckets (anti-saturation).
@@ -26,12 +28,26 @@ import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS
+from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, enforce_min_steps, safe_cdf_bounds
 
 # Probability grid for inverting a CDF to a quantile function. Dense enough that linear
 # interpolation back onto the value grid does not itself introduce visible bias.
 _QUANTILE_GRID_POINTS: int = 401
+
+
+def _uniform_cdf_length(cdfs: list[list[Percentile]]) -> int:
+    """Length N shared by every input CDF — the grid length the pooled CDF is emitted on.
+
+    N is the question's ``cdf_size`` (``inbound_outcome_count + 1``): 201 for continuous
+    questions, smaller for discrete ones. All per-forecaster CDFs for one question live on
+    the same grid, so they must agree on N. A length disagreement means the caller mixed CDFs
+    from different questions (a genuine bug), so raise rather than silently picking one.
+    """
+    lengths = {len(cdf) for cdf in cdfs}
+    if len(lengths) != 1:
+        raise ValueError(f"all input CDFs must share the same length; got lengths {sorted(lengths)}")
+    return lengths.pop()
 
 
 def _question_grid(question: NumericQuestion, num_points: int) -> np.ndarray:
@@ -66,20 +82,22 @@ def _finalize_cdf(
     cdf: np.ndarray,
     grid: np.ndarray,
     question: NumericQuestion,
-    *,
-    min_step: float = MIN_CDF_PROB_STEP,
 ) -> list[Percentile]:
     """Apply the shared Metaculus constraint layer and emit list[Percentile] on ``grid``.
 
     Mirrors the closing steps of ``percentiles_to_metaculus_cdf_via_mixture``: pre-clip to
     open-bound caps, pin closed endpoints, accumulate, enforce min-step (forward+backward
-    sweep), then ``safe_cdf_bounds`` for the max-step redistribution + final bounds.
+    sweep), then ``safe_cdf_bounds`` for the max-step redistribution + final bounds. The
+    min-step and max-step scale to ``len(grid)`` so discrete grids (``cdf_size != 201``)
+    satisfy the server's per-bin constraints, not just the 201-point ones.
     """
     open_lower = bool(question.open_lower_bound)
     open_upper = bool(question.open_upper_bound)
 
     hi_cap = 0.999 if open_upper else 1.0
     lo_cap = 0.001 if open_lower else 0.0
+
+    min_step, max_step = grid_step_constraints(len(grid))
 
     cdf = np.clip(np.asarray(cdf, dtype=float), lo_cap, hi_cap)
     if not open_lower:
@@ -90,7 +108,7 @@ def _finalize_cdf(
     cdf = np.maximum.accumulate(cdf)
     cdf = enforce_min_steps(cdf, min_step, upper_cap=hi_cap, lower_cap=lo_cap)
     cdf = np.maximum.accumulate(cdf)
-    cdf = safe_cdf_bounds(cdf, open_lower, open_upper)
+    cdf = safe_cdf_bounds(cdf, open_lower, open_upper, min_step=min_step, max_step=max_step)
 
     return [Percentile(value=float(grid[i]), percentile=float(cdf[i])) for i in range(len(grid))]
 
@@ -116,7 +134,7 @@ def vincentize_cdfs(
     if not cdfs:
         raise ValueError("cdfs must be non-empty")
 
-    grid = _question_grid(question, PCHIP_CDF_POINTS)
+    grid = _question_grid(question, _uniform_cdf_length(cdfs))
     prob_levels = np.linspace(0.0, 1.0, _QUANTILE_GRID_POINTS)
 
     # Invert each CDF to a quantile function on the shared probability grid. np.interp needs
@@ -209,14 +227,14 @@ def log_pool_cdfs(
             raise ValueError("weights must sum to a positive value")
         w = w_arr / total
 
-    grid = _question_grid(question, PCHIP_CDF_POINTS)
+    grid = _question_grid(question, _uniform_cdf_length(cdfs))
 
-    # Per-forecaster PMF over the full 202 buckets a 201-point CDF decomposes into: the
-    # below-lower boundary mass (cdf[0]), 200 interior masses (diff(cdf)), and the above-upper
-    # boundary mass (1 - cdf[-1]). Keeping BOTH boundary buckets is what makes the pool
-    # symmetric — dropping the upper bucket (and renormalizing) would silently discard the
-    # open-upper tail mass forecasters assign above the grid. Tiny epsilon keeps log-space
-    # pooling finite at empty buckets.
+    # Per-forecaster PMF over the full ``len(grid) + 1`` buckets an N-point CDF decomposes
+    # into: the below-lower boundary mass (cdf[0]), ``len(grid) - 1`` interior masses
+    # (diff(cdf)), and the above-upper boundary mass (1 - cdf[-1]). Keeping BOTH boundary
+    # buckets is what makes the pool symmetric — dropping the upper bucket (and renormalizing)
+    # would silently discard the open-upper tail mass forecasters assign above the grid. Tiny
+    # epsilon keeps log-space pooling finite at empty buckets.
     n_buckets = len(grid) + 1
     log_density_acc = np.zeros(n_buckets, dtype=float)
     pmf_eps = 1e-12

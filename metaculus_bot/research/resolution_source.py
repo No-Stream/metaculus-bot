@@ -54,11 +54,14 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
+    MAX_REDIRECTS,
+    REDIRECT_STATUSES,
     FilteringResolver,
     build_session,
     read_body_capped,
 )
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.raw_log import record_raw_research
 
 
 def _make_filtering_resolver() -> FilteringResolver:
@@ -91,11 +94,9 @@ logger = logging.getLogger(__name__)
 # Gamma, Kalshi, Manifold) and doesn't need this. If a third caller lands in
 # http_fetch that also takes user-supplied URLs, hoist this guard there.
 #
-# Number of HTTP redirects to follow before giving up. Real-world resolution
-# sources chain at most 1-2 hops (protocol/canonicalization); 5 leaves slack for
-# tracker redirects while keeping the SSRF re-guard cost bounded.
-_MAX_REDIRECTS: int = 5
-_REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
+# Redirect policy (hop cap + 3xx status set) lives in http_fetch.py as
+# MAX_REDIRECTS / REDIRECT_STATUSES, shared with research.agentic.tools so the
+# two SSRF-guarded fetchers can't drift.
 
 
 def _ip_is_disallowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -366,20 +367,50 @@ def _truncate_with_marker(text: str, cap: int, url: str) -> str:
     return text[:body_budget].rstrip() + marker
 
 
-def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
-    """Render successful fetches as a markdown body block (orchestrator adds the ``##`` header).
+def _render_fetch_failures(failures: list[FetchResult]) -> str:
+    """Render failed fetches as a compact ``"domain: status, domain: status"`` list."""
+    parts: list[str] = []
+    for r in failures:
+        try:
+            domain = urlparse(r.url).netloc or r.url
+        except ValueError:
+            domain = r.url
+        parts.append(f"{domain}: {r.status}")
+    return ", ".join(parts)
 
-    Returns ``""`` if no results are successful. Enforces
-    ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across sections: later sections are
-    trimmed (or dropped) once the budget is spent. Per-URL truncation is the
-    caller's responsibility (already applied in ``_fetch_one``); this cap
-    covers the aggregate section length. When one or more sections are dropped
-    entirely (budget spent before them), a final line names the dropped count
-    so downstream readers can tell the snapshot is partial.
+
+def format_resolution_sections(results: list[FetchResult], fetched_at: datetime) -> str:
+    """Render fetch results as a markdown body block (orchestrator adds the ``##`` header).
+
+    Returns ``""`` only when no URLs were attempted (empty ``results``). When
+    URLs were attempted:
+
+    - ALL failed (403 / JS wall / error / etc.) → a one-line notice naming the
+      unreachable domains and their statuses, so forecasters learn the resolving
+      page was never seen instead of silently getting nothing (the qid 44211
+      failure: the CBP dashboard 403'd and no one in the pipeline knew).
+    - SOME succeeded → the success sections as before, plus a terse trailing
+      note about any that failed.
+
+    Enforces ``RESOLUTION_SOURCE_TOTAL_MAX_CHARS`` across success sections:
+    later sections are trimmed (or dropped) once the budget is spent. Per-URL
+    truncation is the caller's responsibility (already applied in
+    ``_fetch_one``); this cap covers the aggregate section length. When one or
+    more sections are dropped entirely (budget spent before them), a final line
+    names the dropped count so downstream readers can tell the snapshot is partial.
     """
-    successes = [r for r in results if r.status == "success"]
-    if not successes:
+    if not results:
         return ""
+
+    successes = [r for r in results if r.status == "success"]
+    failures = [r for r in results if r.status != "success"]
+
+    if not successes:
+        n = len(failures)
+        return (
+            f"[{n} resolution source(s) could not be fetched: {_render_fetch_failures(failures)}] — "
+            f"the resolving page was unreachable; weight other evidence accordingly."
+        )
 
     fetched_iso = fetched_at.strftime("%Y-%m-%d")
     caveat = f"Snapshot of the cited resolution source(s) as of {fetched_iso} — primary grading evidence."
@@ -406,6 +437,11 @@ def format_resolution_sections(results: list[FetchResult], fetched_at: datetime)
     rendered = caveat + "\n\n" + "\n\n".join(sections)
     if dropped:
         rendered += f"\n\n[{dropped} additional source(s) omitted — section budget]"
+    if failures:
+        rendered += (
+            f"\n\n[Note: {len(failures)} other cited resolution source(s) could not be fetched: "
+            f"{_render_fetch_failures(failures)} — weight accordingly.]"
+        )
     return rendered
 
 
@@ -507,7 +543,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     :func:`_get_session`) provides the actual DNS-rebinding boundary; these
     preflight checks are fast-fail observability so we surface
     ``ssrf_blocked`` without opening a session. Redirects are followed in-band
-    with a hard ``_MAX_REDIRECTS`` cap.
+    with a hard ``MAX_REDIRECTS`` cap.
 
     No retries (Tier 1 anti-goal). Any aiohttp/asyncio error becomes ``error``.
     """
@@ -529,7 +565,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     # both context managers, releasing the semaphore before the next hop
     # acquires its own — no nesting, so no self-deadlock on revisited hosts).
     # Non-redirect responses fall through to the content-type routing below.
-    for _hop in range(_MAX_REDIRECTS + 1):
+    for _hop in range(MAX_REDIRECTS + 1):
         async with _sem_for_host(host_sems, current_url):
             try:
                 async with session.get(current_url, allow_redirects=False) as resp:
@@ -537,7 +573,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                     status = resp.status
                     content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
 
-                    if status in _REDIRECT_STATUSES:
+                    if status in REDIRECT_STATUSES:
                         location = resp.headers.get("Location") if resp.headers else None
                         if not location:
                             # Malformed redirect — no Location header.
@@ -692,8 +728,8 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                     content_type=None,
                 )
 
-    # Fell out of the loop -> exceeded _MAX_REDIRECTS.
-    logger.info(f"resolution_source redirect chain exceeded {_MAX_REDIRECTS} hops (final={current_url})")
+    # Fell out of the loop -> exceeded MAX_REDIRECTS.
+    logger.info(f"resolution_source redirect chain exceeded {MAX_REDIRECTS} hops (final={current_url})")
     return FetchResult(
         url=current_url,
         status="error",
@@ -788,6 +824,11 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
                 f"resolution_source: {n_fail}/{len(results)} urls unfetched "
                 f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch)",
             )
+        record_raw_research(
+            qid=getattr(question, "id_of_question", None),
+            provider="resolution_source",
+            payload=results,
+        )
         return format_resolution_sections(results, datetime.now(timezone.utc))
 
     return _fetch

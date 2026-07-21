@@ -158,6 +158,28 @@ class TestProcessSingleQuestion:
         detector_llm.invoke.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_provider_receives_question_object_not_text(self):
+        # ResearchCallable expects the MetaculusQuestion object; providers do attribute
+        # access (open_time, scheduled_resolution_time) that silently no-ops on a str.
+        received: list[Any] = []
+
+        async def recording_provider(arg: Any) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
+            received.append(arg)
+            return "research"  # noqa: ASYNC910
+
+        detector_llm = AsyncMock()
+        detector_llm.invoke.return_value = "NO"
+        semaphore = asyncio.Semaphore(5)
+
+        question = _make_question(42, text="Will X resolve?")
+        gt = _make_ground_truth(42)
+
+        await _process_single_question(question, gt, recording_provider, detector_llm, semaphore)
+
+        assert received == [question]  # the object itself, not question.question_text
+        assert received[0].question_text == "Will X resolve?"  # attribute access works on it
+
+    @pytest.mark.asyncio
     async def test_respects_semaphore(self):
         call_order: list[str] = []
 
@@ -200,11 +222,11 @@ class TestScreenResearchForLeakage:
             3: "NO - clean",
         }
 
-        async def invoke_side_effect(prompt: str) -> str:
+        async def invoke_side_effect(prompt: str) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
             for qid, resp in responses.items():
                 if f"Question {qid}" in prompt or f"question_{qid}" in prompt:
-                    return resp
-            return "NO"
+                    return resp  # noqa: ASYNC910
+            return "NO"  # noqa: ASYNC910
 
         mock_detector.invoke = invoke_side_effect
         mock_llm_class.return_value = mock_detector
@@ -265,12 +287,12 @@ class TestScreenResearchForLeakage:
     async def test_research_failure_keeps_question_no_cache(self, mock_choose_provider_with_name, mock_llm_class):
         call_count = 0
 
-        async def research_side_effect(text: str) -> str:
+        async def research_side_effect(text: str) -> str:  # noqa: ASYNC124  # test double; awaited by code under test
             nonlocal call_count
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("API error")
-            return "research text"
+            return "research text"  # noqa: ASYNC910
 
         mock_choose_provider_with_name.return_value = (research_side_effect, "mock")
 
