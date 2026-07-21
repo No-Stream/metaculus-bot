@@ -1412,6 +1412,12 @@ def gap_fill_analyzer_prompt(
         9. Missing counter-evidence — first pass is one-sided; a "consider the
            opposite" search would strengthen the forecast.
 
+        ORDER THE GAPS BY DECISION-RELEVANCE, most forecast-moving first. Before you
+        finalize the list, compare the candidate gaps against each other and rank
+        them: the gap whose resolution would most change a superforecaster's answer
+        goes first, the least impactful last. The list ORDER is the ranking — do NOT
+        add rank fields or scores; keep the schema exactly as below.
+
         Output STRICT JSON, nothing else, matching this schema exactly:
 
         {{"gaps": [

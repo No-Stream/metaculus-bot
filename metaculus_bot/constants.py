@@ -387,7 +387,14 @@ GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
 # uses google-genai directly via gemini_search_provider — that path needs the
 # search index.
 GAP_FILL_ANALYZER_MODEL: str = "openrouter/openai/gpt-5.6-terra"
-GAP_FILL_MAX_GAPS: int = 5
+# 2026-07-20: 5 → 4. The transcript vibe-analysis (Fable) found no positional
+# value cliff, so a fixed cutoff is safe now that the analyzer prompt ranks gaps
+# by decision-relevance (see gap_fill_analyzer_prompt — the 4th slot holds the
+# least valuable of the kept gaps rather than a random one). 3 was still judged
+# unsafe, but the 5th gap is empirically a completeness-stretch: only ~27% of 221
+# archived bundles rendered a 5th gap and the observed 5th gaps were
+# confirmatory, so 5→4 is near-zero risk. Do NOT go below 4.
+GAP_FILL_MAX_GAPS: int = 4
 # Analyzer call is non-grounded (no Google Search) and should return quickly.
 # Use a tight timeout to prevent a single hung analyzer request from holding a
 # research concurrency slot for the full grounded-search budget.
@@ -413,11 +420,14 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 # replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
 #
 # Agentic single-gap web research whose source-trust judgment lands directly in
-# every forecaster prompt. Small per-gap outputs mute sol's latency premium, and
-# the 5 workers run in parallel under a 420s cap (latency = slowest call, not
-# sum), so effort stays LOW. 2026-07-09 bench: sol-low matched terra-low coverage
-# 24/25 in 20% fewer chars and uniquely caught a research-internal error.
-GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-sol"
+# every forecaster prompt. The workers run in parallel under a 420s cap (latency
+# = slowest call, not sum), so effort stays LOW. 2026-07-20: sol → terra. terra
+# was preferred or within-noise vs sol across all three 2026-07 blind role audits
+# at ~40-50% lower cost, and these searches are ~44% of research spend (17 calls
+# in the 2026-07-19 run) — the single biggest research line item, so the cost cut
+# is the dominant consideration. (The 2026-07-09 bench had sol-low matching
+# terra-low coverage 24/25; the blind audits plus the cost weight flip it.)
+GAP_FILL_RESOLVER_MODEL: str = "openai/gpt-5.6-terra"
 GAP_FILL_RESOLVER_REASONING_EFFORT: str = "low"
 
 # --- Agentic gap-fill v2 (bounded research loop) ---
