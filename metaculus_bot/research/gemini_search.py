@@ -172,7 +172,12 @@ def _format_source_label(web: object) -> str:
     return title or domain
 
 
-def _format_grounded_response(response: genai_types.GenerateContentResponse) -> str:
+def _format_grounded_response(
+    response: genai_types.GenerateContentResponse,
+    *,
+    qid: int | None = None,
+    model: str | None = None,
+) -> str:
     """Stitch response text with inline citations from grounding metadata.
 
     Output format:
@@ -187,6 +192,15 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
     grounding_metadata.grounding_supports, iterating in reverse end_index order
     so index offsets stay valid while we mutate the string. Falls back to a
     plain-text + sources-list if supports are missing.
+
+    Grounded-chunk floor: a response with no grounding evidence at all — zero
+    google_search chunks AND no successful url_context read — is suppressed
+    (returns ``""``) rather than passed through, because the whole premise of this
+    provider is grounded retrieval and ungrounded Gemini text is a demonstrated
+    fabrication vector (Q38195, 2026-07-19: 30 search queries, 0 grounding chunks,
+    a confident fabricated contract table with fake ``[primary]`` tags reached
+    forecasters). ``qid`` / ``model`` are threaded in only to make that
+    suppression WARN greppable.
     """
     text = response.text or ""
     if not text:
@@ -197,19 +211,35 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
         return text
 
     metadata = candidates[0].grounding_metadata
-    if metadata is None:
-        # Grounding didn't fire — return plain text.
+    if metadata is None or not metadata.grounding_chunks:
+        # Grounded-chunk floor. No google_search grounding chunks reached us:
+        # either the search tool never fired (metadata is None) or it fired and
+        # grounded nothing (chunks empty, the Q38195 case). The only reason to
+        # still pass the text through is a successful url_context read — that is
+        # genuine retrieval, so it counts as grounding. Absent both, the text is
+        # ungrounded parametric output; suppress the section (the orchestrator
+        # then omits it) and leave a greppable WARN.
+        _, _, n_url_success, _ = _extract_url_context_telemetry(response)
+        if n_url_success == 0:
+            n_queries = len(metadata.web_search_queries or []) if metadata is not None else 0
+            logger.warning(f"GEMINI_UNGROUNDED_SUPPRESSED: question={qid} model={model} queries={n_queries}")
+            return ""
+        # url_context grounded the text but google_search produced no chunks: keep
+        # the text as-is (no citation markers to splice, no Sources block). The
+        # caller appends the url_context fetch marker.
         return text
 
     chunks = metadata.grounding_chunks
     supports = metadata.grounding_supports
 
-    if not chunks:
-        # Grounding enabled but model didn't cite anything — return the text as-is.
-        return text
-
-    # Insert inline citation markers based on supports, iterating right-to-left
-    # so earlier offsets remain stable as we mutate the string.
+    # Insert inline citation markers based on supports. Google's
+    # segment.end_index is a UTF-8 BYTE offset into the response text, so we
+    # splice on the encoded bytes rather than the Python str (which is indexed by
+    # codepoint). Indexing the str by a byte offset shifts every marker left by
+    # the count of multi-byte chars (em-dashes, smart quotes) before it, landing
+    # markers mid-word ("civilization. T[1]hese" instead of "civilization.[1]
+    # These"). Iterating right-to-left keeps earlier byte offsets valid as we
+    # mutate the buffer.
     annotated = text
     if supports:
         try:
@@ -218,6 +248,7 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
                 key=lambda s: s.segment.end_index if s.segment and s.segment.end_index is not None else 0,
                 reverse=True,
             )
+            annotated_bytes = text.encode("utf-8")
             for support in sorted_supports:
                 segment = support.segment
                 if segment is None or segment.end_index is None:
@@ -229,9 +260,10 @@ def _format_grounded_response(response: genai_types.GenerateContentResponse) -> 
                 markers = sorted({int(i) + 1 for i in chunk_indices})
                 marker_str = "[" + ", ".join(str(m) for m in markers) + "]"
                 end_index = segment.end_index
-                annotated = annotated[:end_index] + marker_str + annotated[end_index:]
-        except (AttributeError, TypeError, ValueError) as exc:
-            # Malformed supports shouldn't kill the whole response.
+                annotated_bytes = annotated_bytes[:end_index] + marker_str.encode("utf-8") + annotated_bytes[end_index:]
+            annotated = annotated_bytes.decode("utf-8")
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            # Malformed supports (or a byte offset that lands mid-codepoint) shouldn't kill the response.
             logger.warning(f"GeminiSearch: could not splice inline citations ({type(exc).__name__}): {exc}")
             annotated = text
 
@@ -290,7 +322,7 @@ async def invoke_gemini_grounded(
     # queries and sources) before formatting drops most of it.
     record_raw_research(qid=qid, provider="gemini_search", payload=response)
 
-    formatted = _format_grounded_response(response)
+    formatted = _format_grounded_response(response, qid=qid, model=model)
     n_chunks = 0
     candidates = response.candidates
     if candidates:

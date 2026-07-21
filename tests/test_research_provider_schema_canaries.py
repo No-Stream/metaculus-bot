@@ -231,11 +231,15 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         assert "vertexaisearch" not in out
 
     @pytest.mark.asyncio
-    async def test_real_response_with_empty_chunks_list(
+    async def test_real_response_with_empty_chunks_list_suppressed(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Grounding metadata present but chunks=[] — formatter returns plain text without sources."""
+        """Grounding metadata present but chunks=[] — grounded-chunk floor suppresses the section.
+
+        This is the Q38195 shape against real SDK types: grounding fired (metadata present) but
+        returned no chunks, so the model text is ungrounded and must not reach forecasters.
+        """
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
         response = _make_real_grounding_response(
@@ -250,15 +254,17 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
 
             out = await invoke_gemini_grounded("prompt")
 
-        assert out == "Plain text with no citations."
-        assert "### Sources" not in out
+        assert out == ""
 
     @pytest.mark.asyncio
-    async def test_real_response_with_none_grounding_metadata(
+    async def test_real_response_with_none_grounding_metadata_suppressed(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Candidate with grounding_metadata=None — formatter returns plain text."""
+        """Candidate with grounding_metadata=None — grounded-chunk floor suppresses the section.
+
+        Grounding never fired, so the answer is pure parametric text; the floor drops it.
+        """
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
         candidate = genai_types.Candidate(
@@ -273,7 +279,7 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
 
             out = await invoke_gemini_grounded("prompt")
 
-        assert out == "ungrounded answer"
+        assert out == ""
 
     @pytest.mark.asyncio
     async def test_real_response_uses_genai_property_for_text(
@@ -285,13 +291,15 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
         If a future SDK changes that derivation (e.g. `parts[0].text` → `parts[0].text_value`),
         our formatter — which reads ``response.text or ""`` — would silently produce the empty
         string and we'd ship "no research" payloads to the LLM. Pin the property contract here
-        so an SDK regression fails this test loudly.
+        so an SDK regression fails this test loudly. A grounding chunk clears the grounded-chunk
+        floor so the body text (which is what this test asserts on) actually flows through.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
+        blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x"
         response = _make_real_grounding_response(
             text="The actual response body.",
-            chunks=None,
+            chunks=[(blob, "Source", "example.com")],
             supports=None,
         )
         # Guard the property contract directly:
@@ -303,7 +311,7 @@ class TestGeminiGroundedFormatterAgainstRealTypes:
 
             out = await invoke_gemini_grounded("prompt")
 
-        assert out == "The actual response body."
+        assert out.startswith("The actual response body.")
 
 
 class TestGeminiToolWiringAgainstRealTypes:
