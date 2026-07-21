@@ -216,6 +216,7 @@ class ResearchOrchestrator:
                         # providers_used is kept only for legacy archive readers.
                         self._research_sink(
                             qid=qid,
+                            post_id=getattr(question, "id_of_post", None),
                             page_url=question.page_url,
                             question_text=question.question_text,
                             research_text=research,

@@ -38,6 +38,7 @@ from metaculus_bot.constants import (
     HEARTBEAT_INTERVAL,
 )
 from metaculus_bot.forecaster import TemplateForecaster  # noqa: F401  # used in annotations below
+from metaculus_bot.performance_analysis.id_mapping import QuestionIds
 from metaculus_bot.scoring_patches import apply_scoring_patches
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -130,9 +131,18 @@ def _filter_bots(
 
 
 def _load_research_from_archive(research_dir: str, questions: list) -> dict[int, str]:
-    """Load pre-cached research from a local archive directory into a research_cache dict."""
-    import json  # noqa: PLC0415
-    from pathlib import Path  # noqa: PLC0415
+    """Load pre-cached research from a local archive directory into a research_cache dict.
+
+    The returned cache is keyed on ``id_of_question`` — the id the orchestrator reads
+    it back by (``_lookup_research_cache``). But the archive FILE for a question may be
+    named after EITHER id: live persistence + comment-backfill write ``<question_id>.json``
+    while ``backfill_research_from_logs`` writes ``<post_id>.json`` (its qid is parsed from
+    the page URL). On a divergent post (post_id != question_id) a question-id-only lookup
+    silently misses a log-backfilled record, so we try both ids (question-id first) via
+    ``QuestionIds.lookup_order`` and cache under ``id_of_question`` regardless.
+    """
+    import json  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
+    from pathlib import Path  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
 
     cache: dict[int, str] = {}
     archive_path = Path(research_dir)
@@ -142,14 +152,17 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
 
     loaded = 0
     for q in questions:
-        qid = getattr(q, "id_of_question", None)
-        if qid is None:
+        ids = QuestionIds.from_question(q)
+        cache_key = ids.question_id
+        if cache_key is None:
             continue
-        record_file = archive_path / f"{qid}.json"
-        if record_file.exists():
-            record = json.loads(record_file.read_text())
-            cache[qid] = record.get("research_text", "")
-            loaded += 1
+        for file_id in ids.lookup_order():
+            record_file = archive_path / f"{file_id}.json"
+            if record_file.exists():
+                record = json.loads(record_file.read_text())
+                cache[cache_key] = record.get("research_text", "")
+                loaded += 1
+                break
 
     uncached = len(questions) - loaded
     logger.info(f"Loaded {loaded} cached research records from {research_dir} ({uncached} questions uncached)")

@@ -136,6 +136,11 @@ class TestExtractionRung:
         assert rec["rung"] == "block"
         assert rec["block_present"] is True
 
+    def test_qid_kind_is_question_id(self):
+        # EXTRACTION_RUNG logs question.id_of_question, so its records live in the
+        # QUESTION-id space — the tag a residual join uses to translate correctly.
+        assert _parse_one(EXTRACTION_RUNG_LINE)["qid_kind"] == "question_id"
+
     def test_line_timestamp_parsed(self):
         rec = _parse_one(EXTRACTION_RUNG_LINE)
         assert rec["line_ts"].startswith("2026-07-17T14:23:01")
@@ -174,6 +179,8 @@ class TestGapFillV2:
         rec = _parse_one(GAP_FILL_V2_LINE)
         assert rec["marker"] == "gap_fill_v2"
         assert rec["qid"] == 38975
+        # GAP_FILL_V2's question= comes from question.page_url -> a POST id.
+        assert rec["qid_kind"] == "post_id"
         assert rec["model"] == "openai/gpt-5.6-terra"
         assert rec["steps"] == 7
         assert rec["tool_calls"] == 9
@@ -340,6 +347,46 @@ class TestHtmlCommentMarkers:
         rec = _parse_one("<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=-4.0 -->")
         assert rec["marker"] == "clause_product_divergence_pp"
         assert rec["pp"] == -4.0
+
+
+class TestQidKindAcrossMarkers:
+    """qid_kind names the id space of each marker's ``question`` ref, so a residual
+    join can translate a query rather than silently dropping the other-keyed records.
+    """
+
+    def test_post_id_markers(self):
+        assert _parse_one(GHOST_FORECAST_LINE)["qid_kind"] == "post_id"
+        assert _parse_one(GHOST_FORECAST_JSON_LINE)["qid_kind"] == "post_id"
+
+    def test_question_id_markers(self):
+        assert _parse_one(OPEN_BOUND_PILING_LINE)["qid_kind"] == "question_id"
+        assert _parse_one(CLOSE_MARGIN_LINE)["qid_kind"] == "question_id"
+
+    def test_credit_markers_have_no_qid_kind(self):
+        # No ``question`` ref -> no id space -> the record carries neither qid nor qid_kind.
+        rec = _parse_one(CREDIT_SPEND_LINE)
+        assert "qid_kind" not in rec
+        assert "qid" not in rec
+
+    def test_divergent_question_recovered_by_both_id_forms(self):
+        # The real 38880/38195 divergence: EXTRACTION_RUNG carries the QUESTION id
+        # (38195), GAP_FILL_V2 carries the POST id (38880), same question. A per-marker
+        # grep on one id would miss the other; qid_kind tags each so a join can unify
+        # them (see tests/test_id_mapping.py::TestMarkerRecordsForQuestion).
+        extraction = PFX + (
+            "EXTRACTION_RUNG: question=38195 model=openai/gpt-5.6-sol qtype=numeric rung=block block_present=True"
+        )
+        gap_fill = (
+            "2026-07-19 06:30:00,000 - metaculus_bot.research.agentic.loop - INFO - "
+            "question=https://www.metaculus.com/questions/38880/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+            "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
+            "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0"
+        )
+        harvested = parse_log_text(extraction + "\n" + gap_fill + "\n", **_META)
+        er = harvested["extraction_rung"][0]
+        gf = harvested["gap_fill_v2"][0]
+        assert (er["qid"], er["qid_kind"]) == (38195, "question_id")
+        assert (gf["qid"], gf["qid_kind"]) == (38880, "post_id")
 
 
 class TestParseLogText:

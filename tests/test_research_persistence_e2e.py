@@ -77,9 +77,14 @@ forecast_job\tRun forecasts\t2026-05-22T14:10:00.0000000Z 2026-05-22 14:10:00,00
 """
 
 
-def _make_question(qid: int) -> types.SimpleNamespace:
-    """Create a minimal mock question with id_of_question attribute."""
-    return types.SimpleNamespace(id_of_question=qid)
+def _make_question(qid: int, post_id: int | None = None) -> types.SimpleNamespace:
+    """Create a minimal mock question with id_of_question (+ optional id_of_post).
+
+    ``post_id`` defaults to ``qid`` (the non-divergent single-question-post case); pass a
+    different value to simulate the post-id != question-id divergence (post 38880 wraps
+    question 38195), which the archive reader must tolerate.
+    """
+    return types.SimpleNamespace(id_of_question=qid, id_of_post=post_id if post_id is not None else qid)
 
 
 class TestWritePathE2E:
@@ -273,6 +278,42 @@ class TestReadPathE2E:
         questions = [_make_question(12345)]
         cache = _load_research_from_archive(nonexistent, questions)
         assert cache == {}
+
+    def test_divergent_question_found_via_question_id_file(self, tmp_path: Path) -> None:
+        # Live persistence + comment-backfill key the archive file on the QUESTION id.
+        # For the divergent 38880/38195 question, the reader must find latest/38195.json
+        # (question id) and cache it under the question id (the key the orchestrator reads back).
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        (latest_dir / "38195.json").write_text(json.dumps({"qid": 38195, "research_text": "R for 38195"}))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "R for 38195"}
+
+    def test_divergent_question_found_via_post_id_file(self, tmp_path: Path) -> None:
+        # backfill_research_from_logs keys the archive file on the POST id (parsed from
+        # the page URL). For the same divergent question the reader must fall back to
+        # latest/38880.json (post id) and STILL cache under the question id (38195) so
+        # the orchestrator's id_of_question lookup hits. A question-id-only reader would
+        # miss this record entirely.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        (latest_dir / "38880.json").write_text(json.dumps({"qid": 38880, "research_text": "R via post id"}))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "R via post id"}
+
+    def test_question_id_file_wins_over_post_id_file(self, tmp_path: Path) -> None:
+        # When both files exist (question-id record from live capture + post-id record
+        # from log backfill), the question-id file is preferred (lookup_order tries it
+        # first), matching the dominant writer and keeping one cache entry per question.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        (latest_dir / "38195.json").write_text(json.dumps({"research_text": "question-id record"}))
+        (latest_dir / "38880.json").write_text(json.dumps({"research_text": "post-id record"}))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "question-id record"}
 
     def test_empty_research_text_still_loaded(self, tmp_path: Path) -> None:
         latest_dir = tmp_path / "latest"
