@@ -645,6 +645,35 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if exception_group is not None:
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
+
+        # Single-forecaster short-circuit. With MIN_FORECASTERS_TO_PUBLISH=1 a
+        # question can survive on one forecaster, but the spread metrics
+        # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
+        # >=2 predictions and raise otherwise, and stacking a lone base model is
+        # meaningless. So when only one forecaster survived we skip spread +
+        # stacking entirely and hand the single prediction to the parent
+        # aggregator, whose _base_combine returns it as-is (snap-to-integers
+        # applied for discrete numerics). Placed before the budget gate and the
+        # per-strategy branches so it short-circuits every stacking path. The
+        # _stacker_outcome marker is "skipped" (stacking was skipped, non-stacked
+        # aggregation); the distinct log line records the single-forecaster reason.
+        if n_valid == 1 and self.aggregation_strategy in (
+            AggregationStrategy.STACKING,
+            AggregationStrategy.CONDITIONAL_STACKING,
+        ):
+            logger.info(
+                "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
+                "skipping spread + stacking, aggregating the lone prediction",
+                qid_for_log,
+            )
+            self._register_expected_base_combine(question)
+            self._stacker_outcome[question.id_of_question] = "skipped"
+            return ResearchWithPredictions(
+                research_report=_with_diagnostics(research),
+                summary_report=summary_report,
+                errors=errors,
+                predictions=valid_predictions,
+            )
         # Stacking budget gate. If we've burned through the per-Q wall-clock
         # budget (e.g. research stalled, fan-out used most of the budget),
         # skip the stacker LLM entirely and force the MEDIAN fallback. Typical

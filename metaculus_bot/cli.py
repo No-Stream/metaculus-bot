@@ -13,6 +13,7 @@ from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
+    TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
     check_tournament_dates,
     env_flag_enabled,
@@ -161,7 +162,17 @@ def main() -> None:
             template_bot.skip_previously_forecasted_questions = (
                 False  # obviously, we need to rerun test q predictions to test them :)
             )
-            questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
+            # Optional override (test_bot_basic workflow): a comma/whitespace-
+            # separated list of Metaculus URLs to forecast instead of the full
+            # evergreen set. Unset -> the hardcoded EXAMPLE_QUESTIONS above.
+            override_urls = os.environ.get(TEST_QUESTIONS_OVERRIDE_ENV, "").replace(",", " ").split()
+            question_urls = override_urls or EXAMPLE_QUESTIONS
+            if override_urls:
+                logger.info(
+                    "TEST_QUESTIONS_OVERRIDE set: forecasting %d override question(s) instead of the evergreen set",
+                    len(override_urls),
+                )
+            questions = [MetaculusApi.get_question_by_url(url) for url in question_urls]
             forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
         else:
             raise ValueError(f"Invalid run mode: {run_mode}")

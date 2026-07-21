@@ -155,13 +155,14 @@ def _make_bot(
     *,
     stacking_spread_thresholds: dict[str, float] | None = None,
     stacking_fallback_on_failure: bool = True,
+    n_forecasters: int = 2,
 ) -> TemplateForecaster:
     """Create a TemplateForecaster with CONDITIONAL_STACKING and mock-compatible LLMs."""
     test_llm = GeneralLlm(model="test-model", temperature=0.0)
     # `forecasters` holds a list at runtime (consumed by prepare_llm_config), which is
     # wider than the declared `dict[str, str | GeneralLlm]` param; annotate as Any to match.
     llms: dict[str, Any] = {
-        "forecasters": [test_llm, test_llm],
+        "forecasters": [test_llm] * n_forecasters,
         "stacker": test_llm,
         "analyzer": test_llm,
         "default": test_llm,
@@ -1259,3 +1260,105 @@ class TestConditionalStackingSkipLogMessage:
         assert "threshold=0.150" in message
         assert str(question.id_of_question) in message
         assert bot._conditional_stacking_skipped_count == 1
+
+
+class TestSingleForecasterShortCircuit:
+    """MIN_FORECASTERS_TO_PUBLISH=1 lets a question survive on one forecaster.
+
+    The spread metrics (compute_spread + the spread_metrics.py helpers) REQUIRE
+    >=2 predictions and raise otherwise, so the pipeline must short-circuit the
+    n==1 case before spread computation for every question type.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("qtype", "single_prediction"),
+        [
+            ("binary", ReasonedPrediction(prediction_value=0.42, reasoning="Model: m1\n\nLone binary.")),
+            (
+                "mc",
+                ReasonedPrediction(
+                    prediction_value=PredictedOptionList(
+                        predicted_options=[
+                            PredictedOption(option_name="A", probability=0.5),
+                            PredictedOption(option_name="B", probability=0.3),
+                            PredictedOption(option_name="C", probability=0.2),
+                        ]
+                    ),
+                    reasoning="Model: m1\n\nLone MC.",
+                ),
+            ),
+            (
+                "numeric",
+                ReasonedPrediction(
+                    prediction_value=_make_numeric_distribution(50.0), reasoning="Model: m1\n\nLone numeric."
+                ),
+            ),
+        ],
+        ids=["binary", "mc", "numeric"],
+    )
+    async def test_single_forecaster_skips_spread_and_publishes(self, qtype, single_prediction, caplog):
+        """A lone survivor publishes without crashing on spread; emits the skip label."""
+        bot = _make_bot()
+        if qtype == "binary":
+            question = _make_binary_question()
+        elif qtype == "mc":
+            question = _make_mc_question()
+        else:
+            question = make_mock_numeric_question(id_of_question=301)
+
+        with mock_stacking_pipeline(bot, predictions=[single_prediction]) as mocks:
+            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+                result = await bot._research_and_make_predictions(question)
+
+        # No spread-driven machinery ran (short-circuit fires before the branch).
+        mocks["crux"].assert_not_called()
+        mocks["targeted"].assert_not_called()
+
+        # The lone prediction is handed through untouched for base-combine.
+        assert len(result.predictions) == 1
+        assert result.predictions[0] is single_prediction
+
+        # Distinct single-forecaster skip log + "skipped" marker + registration.
+        skip_logs = [r.getMessage() for r in caplog.records if "single forecaster survived" in r.getMessage().lower()]
+        assert len(skip_logs) == 1
+        assert str(question.id_of_question) in skip_logs[0]
+        assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        assert question.id_of_question in bot._pipeline.expected_base_combines
+
+    @pytest.mark.asyncio
+    async def test_two_of_three_dropped_counts_degradation_and_publishes(self):
+        """Two of three forecasters raising: drop counter += 2, lone survivor still publishes.
+
+        Exercises the REAL _gather_predictions_with_wall_clock so the degradation
+        counter (consumed by cli.py's alertable exit) is verified end-to-end.
+        """
+        bot = _make_bot(n_forecasters=3)
+        question = _make_binary_question()
+        survivor = ReasonedPrediction(prediction_value=0.6, reasoning="Model: m1\n\nSurvivor.")
+
+        # Exactly one coroutine returns; the other two raise. asyncio is cooperative
+        # and fake_forecaster never awaits before the check, so exactly one call
+        # sees n == 1 regardless of task scheduling order.
+        call_state = {"n": 0}
+
+        async def fake_forecaster(*_args, **_kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                return survivor
+            raise ValueError("simulated forecaster failure")
+
+        with (
+            patch.object(bot, "_get_notepad") as mock_notepad,
+            patch.object(bot, "run_research", new=AsyncMock(return_value="research")),
+            patch.object(bot, "_forecaster_with_soft_deadline", new=AsyncMock(side_effect=fake_forecaster)),
+            patch("metaculus_bot.forecaster.extract_disagreement_crux", new=AsyncMock()) as mock_crux,
+        ):
+            mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
+            result = await bot._research_and_make_predictions(question)
+
+        assert bot._forecasters_dropped_count == 2
+        assert len(result.predictions) == 1
+        assert result.predictions[0] is survivor
+        assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        mock_crux.assert_not_called()

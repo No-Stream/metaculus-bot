@@ -129,6 +129,13 @@ COMMENT_CHAR_LIMIT: int = 149_999
 # Accepted values (case-insensitive): "auto", "asknews", "exa", "perplexity", "openrouter"
 RESEARCH_PROVIDER_ENV: str = "RESEARCH_PROVIDER"
 
+# Optional override for the --mode test_questions question set. When set to a
+# non-empty comma/whitespace-separated list of Metaculus question URLs, the
+# test_questions path forecasts exactly those instead of the hardcoded evergreen
+# EXAMPLE_QUESTIONS list (see cli.py). Used by the test_bot_basic workflow to run
+# a single question end-to-end; unset preserves full test_bot behavior.
+TEST_QUESTIONS_OVERRIDE_ENV: str = "TEST_QUESTIONS_OVERRIDE"
+
 # Credential env-var names. Named constants (matching the existing *_ENV
 # convention used for GOOGLE_API_KEY_ENV / FRED_API_KEY_ENV) so the literal
 # strings aren't duplicated across api_key_utils / fallback_openrouter /
@@ -477,14 +484,16 @@ FORECASTER_SOFT_DEADLINE: int = 600
 # Below this, the question is skipped entirely rather than publishing a weak
 # ensemble.
 #
-# 2026-07-20: lowered 3 → 2 alongside the drop to a 3-member roster. At n=3,
-# min=3 would tolerate ZERO drops — a single transient model failure (e.g. the
-# 2026-07-19 fable-5 message.content=None drop) would withhold the question
-# entirely. Publishing the median of 2 surviving forecasters beats not
-# publishing at all, and exception-driven drops stay CI-visible (counted as
-# degradation since 687e113), so a systematically-failing model still surfaces
-# rather than silently thinning the ensemble.
-MIN_FORECASTERS_TO_PUBLISH: int = 2
+# 2026-07-20: lowered to 1 (was 3 → 2 → 1 over the day). At n=3, min=3 tolerates
+# ZERO drops, min=2 tolerates one, min=1 accepts publishing on a single surviving
+# forecaster. The operator accepts a single-forecaster publish: median-of-1 = the
+# forecast itself, and exception-driven drops stay CI-visible (counted as
+# degradation since 687e113), so a degraded run — even one thinned to a lone
+# model — still reddens CI rather than silently withholding the question.
+# NOTE: forecaster.py short-circuits the n==1 case before spread computation and
+# stacking, because the spread_metrics helpers REQUIRE >=2 predictions and raise
+# otherwise; see the single-forecaster guard in _research_and_make_predictions.
+MIN_FORECASTERS_TO_PUBLISH: int = 1
 
 # Per-question wall-clock cutoff (58:30 of the 60-min Metaculus close window).
 # At deadline, in-flight forecasters are cancelled; we base-combine whatever

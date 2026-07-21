@@ -977,7 +977,15 @@ existing `stacking` module rather than the forecaster. Large-blast-radius (touch
 file in the pipeline), so it warrants its own PR **after the july15 branch merges** — tracked here
 so the file doesn't keep accreting in the meantime.
 
-### Price the high→xhigh reasoning-effort premium via backtest A/B (added 2026-07-20, MEDIUM)
+### Price the high→xhigh reasoning-effort premium via backtest A/B (added 2026-07-20, MEDIUM/low urgency)
+
+**Update 2026-07-20 (evening): the A/B as originally scoped is largely moot.** Two same-day changes
+gutted the stakes: the roster dropped to the 3-member triple (gpt-5.5 left), and the operator then
+dropped the gpt-5.6-sol forecaster xhigh→high — sol was ~70% of forecaster reasoning spend, so
+paying an unmeasured premium on the dominant-cost slot wasn't justified. The only xhigh slot left
+in the forecaster path is opus-4.8 (~$0.40/q), so the live question is now narrowly "does opus-4.8
+xhigh beat high?" — lower stakes, MEDIUM/low urgency. (The opus-4.8 stacker also runs xhigh but is
+prod-disabled, so that's backtest-only exposure.)
 
 Status: operator explicitly deferred 2026-07-20 — worth doing, but the backtest budget is
 contended; revisit when budget frees up or before the next major effort-config decision.
@@ -987,16 +995,18 @@ contended; revisit when budget frees up or before the next major effort-config d
 baseline-bot leaderboard) found default→high effort is clearly worth it: 8/8 within-model
 contrasts positive, sign test p=0.0078, median +2.9 spot-peer points/question, and thinking
 OFF→ON is the single largest knob (opus-4-5 flipped −1.9 → +2.9/Q). BUT the board has zero xhigh
-variants, so the high→xhigh premium — what we actually pay on 4 of 6 forecaster slots, ~64% of
-donated per-run spend per the 2026-07-19 credit audit — is unmeasured. The audit's
+variants, so the high→xhigh premium — which, at the 6-model roster this entry was written against,
+we paid on 4 of 6 forecaster slots, ~64% of donated per-run spend per the 2026-07-19 credit audit
+(now just the opus-4.8 forecaster after the evening sol drop) — is unmeasured. The audit's
 diminishing-returns hint is a weak single-seed prior, not evidence.
 
-**Proposed test.** A paired A/B backtest, high vs xhigh arms on the same questions, on
-gpt-5.6-sol + gpt-5.5 (the two xhigh OpenAI slots); ~`backtest_medium` scale (2 arms × 32
-questions), rough cost $60-90 at recent per-question rates.
+**Proposed test (rescoped 2026-07-20 evening).** A paired A/B backtest, high vs xhigh arms on the
+same questions, on the one remaining xhigh forecaster slot — opus-4.8 (originally scoped as
+gpt-5.6-sol + gpt-5.5, both since dropped from the xhigh forecaster set); ~`backtest_medium` scale
+(2 arms × 32 questions), rough cost $60-90 at recent per-question rates.
 
-**Decision rule when run.** If xhigh ≈ high within noise, drop those slots to high (saves a large
-fraction of the ~64%); if xhigh wins meaningfully, keep and consider extending xhigh to more slots.
+**Decision rule when run.** If xhigh ≈ high within noise, drop opus-4.8 to high too; if xhigh wins
+meaningfully, keep it and reconsider re-raising the other slots.
 
 ### ~~Harden `BoundSafeNumericDistribution.cdf` fallback for coarse grids~~ — DONE 2026-07-20 (added 2026-07-20)
 

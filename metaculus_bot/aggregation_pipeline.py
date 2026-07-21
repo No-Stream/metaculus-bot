@@ -231,7 +231,13 @@ class AggregationPipeline:
                 logger.info("STACKING base combine: single pre-stacked output; returning as-is")
             else:
                 logger.warning("Unexpected STACKING combine: single input without stacking context; returning as-is")
-            return predictions[0]
+            # Snap-to-integers for a lone numeric prediction — the
+            # min-forecasters=1 single-survivor path (forecaster.py short-circuits
+            # spread + stacking and hands the raw prediction through). No-op for
+            # binary/MC and for the pre-stacked STACKING output (whose discrete
+            # votes were already consumed in _stacking_aggregate, so the vote list
+            # is empty and majority_votes_discrete([]) is False).
+            return self._maybe_snap_to_integers(predictions[0], question)
 
         # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
         base_combine_strategy = (

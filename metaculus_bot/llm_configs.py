@@ -73,15 +73,19 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     # OPENROUTER_API_KEY now; the other two slots route via the donated key.
     # (Dates anchor config eras for residual analysis.)
     #
-    # OpenAI flagship (5.6 series). 2026-07-15: effort high -> xhigh (top OpenAI
-    # tier; forecaster quality is the product). Live-verified: OpenRouter's effort
-    # enum is max|xhigh|high|medium|low|minimal|none and this model accepts xhigh
-    # (bogus values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling is xhigh
-    # and OpenAI rejects max upstream even though OpenRouter's enum validation
-    # admits it.
+    # OpenAI flagship (5.6 series). 2026-07-20: effort xhigh -> high. The
+    # reasoning-effort audit (scratch/reasoning_effort_audit_2026-07-20/) found
+    # default->high clearly worth it but high->xhigh UNMEASURED; sol is ~70% of
+    # forecaster reasoning spend, so we stop paying the unmeasured premium on the
+    # dominant-cost slot. opus-4.8 keeps xhigh below as the remaining premium bet
+    # (FUTURE.md "Price the high->xhigh reasoning-effort premium"). (2026-07-15
+    # had bumped this high -> xhigh.) Live-verified: OpenRouter's effort enum is
+    # max|xhigh|high|medium|low|minimal|none and this model accepts high (bogus
+    # values 400). NOTE: "max" is Anthropic-only — OpenAI's ceiling is xhigh and
+    # OpenAI rejects max upstream even though OpenRouter's enum validation admits it.
     build_llm_with_openrouter_fallback(
         model="openrouter/openai/gpt-5.6-sol",
-        reasoning={"effort": "xhigh"},
+        reasoning={"effort": "high"},
         **_FORECASTER_CONFIG,
     ),
     # Anthropic slot. 2026-07-15: enabled:True (provider-default adaptive thinking)
