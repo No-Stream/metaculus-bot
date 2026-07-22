@@ -54,9 +54,13 @@ def plan_call(
     dry_run_forecast: dict[str, Any] | None = None,
 ) -> FakeToolCall:
     """A ``set_research_plan`` tool call — the W1 gate opener every loop needs
-    before any external tool runs. Defaults to an empty gap list (enough to open
-    the gate); pass fields to exercise plan telemetry."""
-    arguments: dict[str, Any] = {"gaps": gaps if gaps is not None else []}
+    before any external tool runs. Defaults to a single generic gap (a zero-gap
+    plan is now rejected, F3a, so the default must carry one to open the gate);
+    pass ``gaps`` to exercise plan telemetry / the conclude gate. Tests that then
+    conclude early without satisfying the W2 gap-accounting floor should pass
+    ``max_conclude_gate_rejections=0`` to keep the conclude gate out of the way."""
+    default_gaps = [{"id": "g1", "question": "What is the load-bearing fact?"}]
+    arguments: dict[str, Any] = {"gaps": gaps if gaps is not None else default_gaps}
     if sensitive_assumptions is not None:
         arguments["sensitive_assumptions"] = sensitive_assumptions
     if dry_run_forecast is not None:

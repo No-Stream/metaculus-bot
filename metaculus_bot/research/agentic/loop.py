@@ -331,6 +331,7 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
             },
             "gaps": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -343,7 +344,8 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
                 },
                 "description": (
                     "Ranked research gaps (most forecast-moving first): verify-targets "
-                    "(assumptions to check) AND fill-targets (facts absent from the briefing)."
+                    "(assumptions to check) AND fill-targets (facts absent from the briefing). "
+                    "At least one gap is required — a plan with no gaps is rejected."
                 ),
             },
         },
@@ -695,6 +697,20 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
     whether v2's research moved its own view.
     """
     gaps, gap_issues = _coerce_planned_gaps(arguments.get("gaps"), max_gaps=config.max_gaps)
+    # A plan with zero valid gaps is rejected (F3a): storing it would flip W1's
+    # plan_gate_active off (opening external tools) while _evaluate_conclude_gate
+    # returns None on `not plan.gaps` — disabling the W2 gate entirely and letting
+    # a driver conclude with zero research. Leave research_plan untouched (None, or
+    # a prior valid plan) so the W1 gate stays armed and re-planning to empty can't
+    # clobber an existing plan; nudge the driver to register real gaps.
+    if not gaps:
+        notes = "; ".join(gap_issues) if gap_issues else "provide at least one ranked research gap"
+        return ToolOutcome(
+            content_markdown=f"Research plan rejected: {_PLAN_REQUIRED_NUDGE} ({notes}).",
+            method="internal",
+            status="error",
+        )
+
     sensitive = arguments.get("sensitive_assumptions")
     sensitive_assumptions = [item for item in sensitive if isinstance(item, str)] if isinstance(sensitive, list) else []
     dry_run_forecast = arguments.get("dry_run_forecast")
@@ -829,21 +845,29 @@ def _evaluate_conclude_gate(
     hasn't met the work-list floor, else ``None`` (let the conclude proceed).
 
     Bypasses entirely — never blocks — when the deadline/budget forces a
-    conclusion (``_must_conclude``), when the plan gate soft-continued without a
-    plan (``plan_skipped``), when there are no plan gaps to enforce, or once the
-    rejection cap (``max_conclude_gate_rejections``) is hit.
+    conclusion (``_must_conclude``) or once the rejection cap
+    (``max_conclude_gate_rejections``) is hit (both guarantee no wedge).
+
+    When a real research plan exists (gaps registered) its work-list floor is
+    enforced regardless of ``plan_skipped`` — a valid plan set AFTER the plan-
+    nudge cap fired re-arms the gate (F3c: ``plan_skipped`` is checked only in the
+    no-plan branch below, not before the plan). When NO plan was set, a driver
+    that legitimately soft-continued past the plan-nudge cap (``plan_skipped``) is
+    let through, but an early conclude with no plan at all is rejected with a
+    plan-first nudge (F3b: a driver can't skip planning by never calling it).
     """
     if _must_conclude(state, config, now):
-        return None
-    if state.plan_skipped:
-        return None
-    plan = state.research_plan
-    if plan is None or not plan.gaps:
         return None
     if state.telemetry.conclude_gate_rejections >= config.max_conclude_gate_rejections:
         return None
 
-    debts = _conclude_gate_debts(state, _coerce_gap_accounting(arguments.get("gap_accounting")))
+    plan = state.research_plan
+    if plan is not None and plan.gaps:
+        debts = _conclude_gate_debts(state, _coerce_gap_accounting(arguments.get("gap_accounting")))
+    elif state.plan_skipped:
+        return None
+    else:
+        debts = ["no research plan was set — call set_research_plan with ranked gaps before concluding"]
     if not debts:
         return None
 

@@ -275,7 +275,9 @@ async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line()
                 _tool_spec("beta", _parallel_handler("beta")),
                 _tool_spec("gamma", _parallel_handler("gamma")),
             ],
-            _config(),
+            # cap=0 disables the W2 conclude gate: this test exercises parallel
+            # execution + budget-line rendering, and concludes without accounting.
+            _config(max_conclude_gate_rejections=0),
             llm_call=fake_llm,
         ),
         timeout=0.5,
@@ -289,8 +291,9 @@ async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line()
     budget_lines = [message["content"].splitlines()[-1] for message in tool_messages]
     assert len(set(budget_lines)) == 1
     assert budget_lines[0].startswith("[budget: ")
-    # plan (1) + alpha/beta/gamma (3) = 4 tool calls used.
-    assert budget_lines[0].endswith("4/14 tool calls used]")
+    # plan (1) + alpha/beta/gamma (3) = 4 tool calls used. The default plan's gap
+    # id trails as the W1 work-list suffix.
+    assert "4/14 tool calls used" in budget_lines[0]
 
 
 @pytest.mark.asyncio
@@ -320,7 +323,10 @@ async def test_budget_threshold_switches_to_conclude_mode_and_shrinks_tools() ->
 
     # The plan turn (tool message [0]) runs at full budget; the search (message
     # [1]) advances the clock to 5s remaining, tipping into must-conclude mode.
-    assert "[budget: 5s remaining — you must conclude now]" in _tool_messages(result)[1]["content"]
+    # The default plan's gap id trails as the W1 work-list suffix.
+    assert (
+        "[budget: 5s remaining — you must conclude now unaddressed_gaps=[g1]]" in _tool_messages(result)[1]["content"]
+    )
     # calls[2] is the conclude turn — the first LLM call made after the clock
     # crossed the threshold, so its tool schema is shrunk to internals only.
     assert _tool_names(fake_llm.calls[2]["tools"]) == ["set_research_plan", "record_findings", "conclude"]
@@ -528,8 +534,14 @@ async def test_findings_recorded_then_relisted_in_conclude_are_not_duplicated() 
         ]
     )
 
+    # cap=0 disables the W2 conclude gate: this test never plans (dedup is the
+    # subject) and concludes without gap accounting.
     result = await run_agentic_loop(
-        "system", "briefing cites https://example.com/un and https://example.com/nasa", [], _config(), llm_call=fake_llm
+        "system",
+        "briefing cites https://example.com/un and https://example.com/nasa",
+        [],
+        _config(max_conclude_gate_rejections=0),
+        llm_call=fake_llm,
     )
 
     md = result.findings_markdown
@@ -828,7 +840,9 @@ async def test_ghost_phase_runs_after_conclude_and_logs_marker(caplog: pytest.Lo
         ]
     )
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    result = await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     assert result.ghost is not None
     assert result.ghost.qtype == "binary"
@@ -850,7 +864,9 @@ async def test_ghost_phase_emits_full_fidelity_json_marker_binary(caplog: pytest
     ghost_text = 'analysis\n```json\n{"question_type":"binary","posterior_prob":0.42}\n```'
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
 
-    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     payload = _ghost_json_payload(caplog)
     assert payload == {"qtype": "binary", "prob": 0.42}
@@ -862,7 +878,9 @@ async def test_ghost_phase_emits_full_fidelity_json_marker_mc(caplog: pytest.Log
     ghost_text = 'analysis\n```json\n{"question_type":"multiple_choice","option_probs":{"Blue":0.3,"Red":0.7}}\n```'
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
 
-    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     payload = _ghost_json_payload(caplog)
     assert payload == {"qtype": "multiple_choice", "option_probs": {"Blue": 0.3, "Red": 0.7}}
@@ -876,7 +894,9 @@ async def test_ghost_phase_emits_full_fidelity_json_marker_numeric(caplog: pytes
     )
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
 
-    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     payload = _ghost_json_payload(caplog)
     # JSON serializes float keys as strings; the full percentile set survives round-trip.
@@ -892,7 +912,9 @@ async def test_ghost_phase_suppresses_json_marker_when_unparseable(caplog: pytes
     caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content="no block here")])
 
-    await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     # Legacy marker still fires (qtype=unknown); the JSON companion is suppressed.
     assert any("GHOST_FORECAST:" in r.getMessage() for r in caplog.records)
@@ -993,7 +1015,9 @@ async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pyte
     )
     fake_llm = FakeLlm([_response(tool_calls=[_tool_call("d", "conclude")]), _response(content=ghost_text)])
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, ghost_prompt="ghost now")
+    result = await run_agentic_loop(
+        "system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm, ghost_prompt="ghost now"
+    )
 
     assert result.ghost is not None and result.ghost.qtype == "numeric"
     assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []
@@ -1809,6 +1833,71 @@ class TestResearchPlanGate:
         plan_message = _tool_messages(result)[0]
         assert "kept the top 4 of 6 gaps" in plan_message["content"]
 
+    @pytest.mark.asyncio
+    async def test_zero_gap_plan_is_rejected_and_w1_gate_stays_armed(self) -> None:
+        """F3a: a zero-gap set_research_plan is rejected — research_plan is left
+        None so W1's external-tool gate stays armed. A follow-up external tool
+        call is still plan-rejected; the empty plan did not open the gate."""
+        invoked: list[str] = []
+
+        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            invoked.append(kwargs.get("query", ""))
+            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+        # Turn 1: empty-gap plan (rejected). Turn 2: an external tool that must
+        # still be plan-gated (only 1 nudge so far, cap not yet hit). Turn 3: a
+        # real plan. Turn 4: the external tool finally runs. Turn 5: conclude.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call("p0", gaps=[])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "too soon"})]),
+                _response(tool_calls=[_plan_call("p1", gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_tool_call("s2", "search_web", {"query": "now allowed"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_steps=7, max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        # The empty plan was rejected and did NOT open the gate, so the turn-2
+        # search was plan-rejected; only the post-real-plan search ran.
+        assert invoked == ["now allowed"]
+        plan_reject = _tool_messages(result)[0]
+        assert plan_reject["tool_call_id"] == "p0"
+        assert "status: error" in plan_reject["content"]
+        assert "Research plan rejected" in plan_reject["content"]
+        early_search = _tool_messages(result)[1]
+        assert early_search["tool_call_id"] == "s1"
+        assert "call set_research_plan first" in early_search["content"]
+        assert result.telemetry.plan_gaps == 1
+        assert result.telemetry.plan_skipped is False
+
+    @pytest.mark.asyncio
+    async def test_replan_to_empty_does_not_clobber_a_prior_valid_plan(self) -> None:
+        """F3a corollary: once a valid plan is set, a later empty re-plan is
+        rejected rather than clobbering it — plan_gaps keeps the real count."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call("p0", gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_plan_call("p1", gaps=[])]),
+                _response(tool_calls=[_tool_call("done1", "conclude", {"gap_accounting": _accounting("g1")})]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [], _config(max_steps=6, max_conclude_gate_rejections=0), llm_call=fake_llm
+        )
+
+        assert result.telemetry.plan_gaps == 1
+        replan = _tool_messages(result)[1]
+        assert "Research plan rejected" in replan["content"]
+
 
 def _accounting(*gap_ids: str, actions: str = "searched and fetched the source", status: str = "resolved") -> list:
     """gap_accounting entries for the given gap ids (default actions cite a fetch,
@@ -2086,6 +2175,80 @@ class TestConcludeGate:
 
         assert result.telemetry.plan_skipped is True
         assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_conclude_with_no_plan_is_rejected(self) -> None:
+        """F3b: conclude is not plan-gated, so a driver could conclude on turn 1
+        with no plan set (plan_skipped still False). The gate now rejects that —
+        planning can't be skipped by never calling set_research_plan."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # Turn 1 concludes with no plan -> rejected; turn 2's bare conclude is
+        # accepted by the rejection cap (=1), proving the loop can't wedge.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("c1", "conclude")]),
+                _response(tool_calls=[_tool_call("c2", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_steps=6, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        first_conclude = _tool_messages(result)[0]
+        assert "Conclude rejected" in first_conclude["content"]
+        assert "no research plan was set" in first_conclude["content"]
+        # The cap accepted the second conclude — no wedge.
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_valid_plan_after_nudge_cap_re_arms_the_gate(self) -> None:
+        """F3c: plan_skipped was checked before the plan and never cleared, so a
+        valid plan set after the plan-nudge cap fired stayed permanently exempt.
+        Now a real plan re-arms the gate even once plan_skipped is True."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # Turns 1-2: plan-less external calls hit the nudge cap (plan_skipped=True).
+        # Turn 3: a real plan registers. Turn 4: an early conclude with no
+        # gap_accounting must now be rejected (the gate is re-armed despite
+        # plan_skipped). Turn 5: the cap (=1) accepts, so no wedge.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("c1", "search_web", {"query": "q1"})]),
+                _response(tool_calls=[_tool_call("c2", "search_web", {"query": "q2"})]),
+                _response(tool_calls=[_plan_call("p1", gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_tool_call("d1", "conclude")]),
+                _response(tool_calls=[_tool_call("d2", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_steps=8, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.plan_skipped is True
+        assert result.telemetry.plan_gaps == 1
+        # The gate re-armed: the first post-plan conclude was rejected on the
+        # missing gap accounting, not waved through by the stale plan_skipped.
+        assert result.telemetry.conclude_gate_rejections == 1
+        rejected_conclude = _tool_messages(result)[-2]
+        assert "Conclude rejected" in rejected_conclude["content"]
+        assert "missing entries for gap(s): g1" in rejected_conclude["content"]
         assert result.telemetry.concluded_early is True
 
     @pytest.mark.asyncio
