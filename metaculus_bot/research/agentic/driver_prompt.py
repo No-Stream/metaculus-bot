@@ -159,7 +159,10 @@ RULES FOR FINDINGS (strictly enforced; violating findings are rejected):
     corresponding briefing content, so reserve the flag for genuine
     briefing errors, not mere source-vs-source conflicts. Detachment still
     applies: state what the source says; do not add what the correction
-    implies for the forecast.
+    implies for the forecast. A discrepancy sourced only from search
+    snippets will be demoted to "possible corrections" and will NOT supersede
+    the briefing; if you intend to contradict the briefing, fetch the primary
+    source first.
   - State facts. Never state or imply a view on how the question will
     resolve: no likelihood language, no "suggests/indicates", no
     recommendations, no summing-up of which way the evidence points.

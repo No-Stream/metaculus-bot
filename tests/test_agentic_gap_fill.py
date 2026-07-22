@@ -331,6 +331,19 @@ class TestDriverSystemPromptResearchPlan:
         assert "per-year bound table" in collapsed
 
 
+class TestDriverSystemPromptSnippetDemotion:
+    """W4: the discrepancy rule warns the driver that a snippet-only discrepancy
+    is demoted (won't supersede the briefing) and to fetch the primary source
+    before contradicting it — synergy with W2's fetch floor. The demotion is
+    code-enforced (loop-stamped tier); the prompt just tells the driver why."""
+
+    def test_discrepancy_rule_warns_snippet_only_is_demoted(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert 'A discrepancy sourced only from search snippets will be demoted to "possible corrections"' in collapsed
+        assert "will NOT supersede the briefing" in collapsed
+        assert "if you intend to contradict the briefing, fetch the primary source first" in collapsed
+
+
 @pytest.fixture
 def mock_llm() -> GeneralLlm:
     return GeneralLlm(model="test/model", temperature=0.0)
