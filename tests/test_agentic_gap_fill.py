@@ -352,6 +352,62 @@ class TestDriverSystemPromptResearchPlan:
         assert "per-year bound table" in collapsed
 
 
+class TestDriverSystemPromptConcludeGate:
+    """W2: STEP 3 must describe the conclude gate — the required gap_accounting
+    (per-gap gap_id / actions_taken / status), the three statuses, and what gets
+    an early conclude rejected (missing gap, too few calls, unmet fetch floor)."""
+
+    def test_step3_requires_gap_accounting(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "conclude REQUIRES a `gap_accounting` list" in collapsed
+        assert "one entry per gap in your research plan" in collapsed
+        # The three per-entry fields are named.
+        assert "gap_id:" in collapsed
+        assert "actions_taken:" in collapsed
+        assert "status:" in collapsed
+
+    def test_step3_lists_the_three_statuses(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "`resolved`" in collapsed
+        assert "`unresolved_parked`" in collapsed
+        assert "`not_decision_relevant_on_inspection`" in collapsed
+
+    def test_step3_describes_what_gets_rejected(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "An EARLY conclude" in collapsed and "REJECTED" in collapsed
+        assert "a plan gap is missing from the accounting" in collapsed
+        assert "fewer external tool calls than you have plan gaps" in collapsed
+        assert "the fetch floor is unmet" in collapsed
+        assert "Snippet-only research does not clear this floor" in collapsed
+        # The deadline exemption is stated, but not as a loophole to coast to.
+        assert "forced deadline conclusion is exempt" in collapsed
+        assert "do not coast to the deadline to dodge it" in collapsed
+
+
+class TestDriverSystemPromptMotivation:
+    """W2: the driver runs at low reasoning effort, so the system prompt carries
+    a motivation block explaining WHY thoroughness and verification are valued —
+    a wrong fact is costlier than a missing one; an unverified snippet is a
+    liability; depth on the few decision-relevant gaps beats breadth; fetch
+    primary sources before contradicting the briefing."""
+
+    def test_prompt_frames_wrong_facts_as_costly(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "A wrong fact does more damage than a missing one" in collapsed
+        # The concrete blow-up: an unverified snippet swung a whole ensemble.
+        assert "swung an entire ensemble the wrong way" in collapsed
+
+    def test_prompt_frames_unverified_snippet_as_liability(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "an unconfirmed snippet is a liability, not a finding" in collapsed
+        assert "a search excerpt is a lead, not a confirmation" in collapsed
+
+    def test_prompt_values_depth_over_breadth_and_primary_sources(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "real depth on the two or three gaps that actually move the forecast" in collapsed
+        assert "pull the primary source and read the operative language yourself" in collapsed
+
+
 @pytest.fixture
 def mock_llm() -> GeneralLlm:
     return GeneralLlm(model="test/model", temperature=0.0)
