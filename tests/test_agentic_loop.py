@@ -1018,6 +1018,19 @@ def _search_returning(content: str, links: list[str] | None = None):
     return _search
 
 
+def _returns_method(content: str, *, method: str, status: str = "ok", links: list[str] | None = None):
+    """A tool handler returning a ToolOutcome with a specific method/status —
+    used by the W4 tier-stamping tests to drive fetched vs snippet vs failed
+    retrievals through the loop."""
+
+    async def _handler(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(  # noqa: ASYNC910
+            content_markdown=content, links=links or [], method=method, status=status
+        )
+
+    return _handler
+
+
 class TestProvenanceGate:
     """Tier-1 hard URL gate + Tier-2 warn-only quote check on agentic findings.
 
@@ -1296,6 +1309,260 @@ class TestProvenanceGate:
         marker = next(r.getMessage() for r in caplog.records if "GAP_FILL_V2:" in r.getMessage())
         assert "provenance_rejections=1" in marker
         assert "quote_mismatch_warnings=0" in marker
+
+
+class TestHarvestVerificationTiers:
+    """W4: the per-call tier harvester. Fetched-class methods (document/rendered/
+    plain/cache) tier only the URLs actually retrieved (the arguments) "fetched";
+    snippet-class methods (search/news) tier every surfaced URL "snippet"; a
+    failed/blocked outcome or a non-retrieval method grants no tier at all."""
+
+    def test_fetched_class_methods_tier_argument_urls_fetched(self) -> None:
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        for method in ("document", "rendered", "plain", "cache"):
+            tiers = _harvest_verification_tiers(
+                "fetch",
+                {"url": "https://x.example/a"},
+                ToolOutcome(content_markdown="body", method=method),
+            )
+            assert tiers == {"https://x.example/a": "fetched"}, method
+
+    def test_fetched_class_does_not_tier_body_or_link_urls(self) -> None:
+        """A fetch's outbound links and in-body URLs are leads, not pages we
+        read — only the requested URL earns the fetched tier from this call."""
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        tiers = _harvest_verification_tiers(
+            "fetch",
+            {"url": "https://x.example/a"},
+            ToolOutcome(
+                content_markdown="body cites https://z.example/c",
+                links=["https://y.example/b"],
+                method="plain",
+            ),
+        )
+        assert tiers == {"https://x.example/a": "fetched"}
+
+    def test_search_class_methods_tier_all_surfaced_urls_snippet(self) -> None:
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        for method in ("search", "news"):
+            tiers = _harvest_verification_tiers(
+                "search_web",
+                {"query": "q"},
+                ToolOutcome(
+                    content_markdown="see https://x.example/a",
+                    links=["https://y.example/b"],
+                    method=method,
+                ),
+            )
+            assert tiers == {"https://x.example/a": "snippet", "https://y.example/b": "snippet"}, method
+
+    def test_failed_outcome_grants_no_tier(self) -> None:
+        """The 131.3 mechanism: a fetch that 403s (status != ok) confers no
+        authority, so a later search snippet of the same fact stays snippet."""
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        tiers = _harvest_verification_tiers(
+            "fetch",
+            {"url": "https://x.example/a"},
+            ToolOutcome(content_markdown="403", method="plain", status="blocked"),
+        )
+        assert tiers == {}
+
+    def test_internal_tool_and_unknown_method_grant_no_tier(self) -> None:
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        assert (
+            _harvest_verification_tiers("record_findings", {}, ToolOutcome(content_markdown="ok", method="internal"))
+            == {}
+        )
+        # document_needed is an intermediate fetch state, not a real retrieval.
+        assert (
+            _harvest_verification_tiers(
+                "fetch", {"url": "https://x.example/a"}, ToolOutcome(content_markdown="", method="document_needed")
+            )
+            == {}
+        )
+
+
+class TestVerificationTierStamping:
+    """W4 end-to-end: the loop stamps each banked finding's verification_tier
+    from the URL->best-method map — CODE-derived, not driver-claimed. A search-
+    then-fetch upgrades the tier; a failed retrieval leaves a discrepancy
+    snippet-tier and demoted (the 131.3 fix). Observed via the rendered markdown
+    (tier token on topic findings; block placement on discrepancies)."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_sourced_finding_renders_fetched_tier(self) -> None:
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://agency.example/report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call("rec1", "record_findings", {"findings": [_finding("https://agency.example/report")]})
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        fetch = _returns_method("The report body.", method="plain")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("fetch", fetch)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert "[verification: fetched]" in result.findings_markdown
+        assert "[verification: snippet]" not in result.findings_markdown
+
+    @pytest.mark.asyncio
+    async def test_search_sourced_finding_renders_snippet_tier(self) -> None:
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call("rec1", "record_findings", {"findings": [_finding("https://agency.example/report")]})
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _returns_method("See https://agency.example/report for the figures.", method="search")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert "[verification: snippet]" in result.findings_markdown
+        assert "[verification: fetched]" not in result.findings_markdown
+
+    @pytest.mark.asyncio
+    async def test_search_then_fetch_upgrades_tier_to_fetched(self) -> None:
+        """A URL first surfaced in a search snippet, then actually fetched,
+        upgrades to fetched (best-tier wins) — even though search ran first."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://agency.example/report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call("rec1", "record_findings", {"findings": [_finding("https://agency.example/report")]})
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _returns_method("See https://agency.example/report — snippet only.", method="search")
+        fetch = _returns_method("The full report body.", method="plain")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search), _tool_spec("fetch", fetch)],
+            _config(),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert "[verification: fetched]" in result.findings_markdown
+        assert "[verification: snippet]" not in result.findings_markdown
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_then_snippet_leaves_discrepancy_demoted(self) -> None:
+        """The 131.3 scenario end-to-end: the direct fetch 403s (no tier), a
+        search snippet then surfaces the contradicting figure, and the discrepancy
+        banked on that URL is snippet-tier — so it renders in the DEMOTED block,
+        never superseding the briefing."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://gov.example/figure"})]),
+                _response(tool_calls=[_tool_call("s1", "search_news", {"query": "figure"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://gov.example/figure",
+                                        quote="A snippet reports the figure is 131.3.",
+                                        discrepancy=True,
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        # The direct fetch is blocked (403) — grants no tier but still marks the
+        # URL tool-seen, so the discrepancy clears the provenance gate.
+        blocked_fetch = _returns_method("403 Forbidden", method="plain", status="blocked")
+        # The search snippet surfaces the contradicting figure at the same URL.
+        snippet_search = _returns_method("https://gov.example/figure says the figure is 131.3.", method="news")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("fetch", blocked_fetch), _tool_spec("search_news", snippet_search)],
+            _config(),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        md = result.findings_markdown
+        assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" in md
+        assert "### ⚠ Corrections to the briefing" not in md
+        assert "do NOT supersede the briefing" in md
+
+    @pytest.mark.asyncio
+    async def test_driver_supplied_tier_is_overwritten_by_code(self) -> None:
+        """A driver that puts verification_tier in its record_findings payload
+        cannot self-promote: the loop overwrites it from the URL->method map. A
+        snippet-only URL falsely claimed "fetched" renders as snippet."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    {
+                                        **_finding("https://agency.example/report"),
+                                        "verification_tier": "fetched",  # driver lie
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _returns_method("See https://agency.example/report for the figures.", method="search")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        # Code-derived snippet wins over the driver's "fetched" claim.
+        assert "[verification: snippet]" in result.findings_markdown
+        assert "[verification: fetched]" not in result.findings_markdown
 
 
 class TestResearchPlanGate:
