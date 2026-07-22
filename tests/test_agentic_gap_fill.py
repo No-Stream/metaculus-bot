@@ -47,12 +47,33 @@ _GHOST_BLOCK = '```json\n{"question_type": "binary", "posterior_prob": 0.12}\n``
 
 
 def _happy_path_llm() -> FakeLlm:
-    """Plan (W1 gate opener), one search step, then conclude with a finding, then the ghost turn."""
+    """Plan (W1 gate opener), one search step, then conclude with a finding, then the ghost turn.
+
+    The conclude carries W2 ``gap_accounting`` for the single plan gap, citing a
+    fetch in ``actions_taken`` so the per-gap fetch-floor clause is met.
+    """
     return FakeLlm(
         [
             _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "What is the June 2026 rate?"}])]),
             _response(tool_calls=[_tool_call("c1", "search_web", {"query": "BLS unemployment June 2026"})]),
-            _response(tool_calls=[_tool_call("c2", "conclude", {"final_findings": [_FINDING]})]),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c2",
+                        "conclude",
+                        {
+                            "final_findings": [_FINDING],
+                            "gap_accounting": [
+                                {
+                                    "gap_id": "g1",
+                                    "actions_taken": "fetched the BLS release and confirmed the June rate",
+                                    "status": "resolved",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            ),
             _response(content=_GHOST_BLOCK),
         ]
     )

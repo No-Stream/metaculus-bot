@@ -17,6 +17,7 @@ from metaculus_bot.research.agentic.artifact import detachment_lint, render_find
 from metaculus_bot.research.agentic.llm import build_default_llm_call
 from metaculus_bot.research.agentic.types import (
     Finding,
+    GapAccountingEntry,
     GhostForecast,
     LoopConfig,
     LoopResult,
@@ -240,6 +241,31 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
             "final_findings": {
                 "type": "array",
                 "items": finding_schema["properties"]["findings"]["items"],
+            },
+            "gap_accounting": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "gap_id": {"type": "string"},
+                        "actions_taken": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "resolved",
+                                "unresolved_parked",
+                                "not_decision_relevant_on_inspection",
+                            ],
+                        },
+                    },
+                    "required": ["gap_id", "actions_taken", "status"],
+                    "additionalProperties": True,
+                },
+                "description": (
+                    "REQUIRED before concluding early: one entry per research-plan gap "
+                    "(gap_id, what you did, and its status). An early conclude is rejected "
+                    "until every plan gap is accounted for and the fetch floor is met."
+                ),
             },
         },
         "additionalProperties": False,
@@ -642,7 +668,129 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
     return ToolOutcome(content_markdown="\n".join(lines), method="internal")
 
 
-async def _conclude_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOutcome:
+# Fetch floor (W2, clause c): the run must reach primary sources, not stop at
+# search snippets. The global fallback clause is satisfied at this many
+# fetch+read_document calls; the per-gap clause reads the driver's own
+# actions_taken note for a fetch/read mention.
+_FETCH_FLOOR_MIN_CALLS = 2
+_FETCH_ACTION_MARKERS = ("fetch", "read")
+
+
+def _external_tool_call_count(state: _LoopState) -> int:
+    """Accepted EXTERNAL tool calls this run — the internal bookkeeping tools
+    (set_research_plan / record_findings / conclude) don't count toward the
+    per-gap research floor."""
+    return sum(count for name, count in state.telemetry.per_tool_counts.items() if name not in _INTERNAL_TOOL_NAMES)
+
+
+def _coerce_gap_accounting(raw_accounting: Any) -> list[GapAccountingEntry]:
+    """Validate conclude's ``gap_accounting`` into entries, skipping malformed
+    ones (a skipped entry just reads as a still-unaccounted gap in the gate)."""
+    if not isinstance(raw_accounting, list):
+        return []
+    entries: list[GapAccountingEntry] = []
+    for raw_entry in raw_accounting:
+        try:
+            entries.append(GapAccountingEntry.model_validate(raw_entry))
+        except ValidationError:
+            continue
+    return entries
+
+
+def _actions_cite_fetch(actions_taken: str) -> bool:
+    """True when the driver's free-text ``actions_taken`` mentions fetching or
+    reading a source (the fetch floor's lenient per-gap self-report clause; the
+    telemetry-based clause is the robust one)."""
+    text = actions_taken.lower()
+    return any(marker in text for marker in _FETCH_ACTION_MARKERS)
+
+
+def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -> list[str]:
+    """Outstanding conclude-gate requirements (W2); empty means the early
+    conclusion may proceed. Only called when a research plan with gaps exists.
+
+    Enforces: (a) every plan gap appears in the accounting; (b) at least one
+    external tool call per plan gap (the loop can't attribute calls to gaps, so
+    this is the cheap global invariant); (c) the fetch floor — either the top-2
+    ranked gaps' accounting each cites a fetch/read action, OR the run made
+    ``_FETCH_FLOOR_MIN_CALLS``+ fetches/reads.
+    """
+    plan = state.research_plan
+    assert plan is not None and plan.gaps  # caller guards; keeps the type narrow
+    gaps = plan.gaps
+    debts: list[str] = []
+
+    accounted_ids = {entry.gap_id for entry in entries}
+    missing_ids = [gap.id for gap in gaps if gap.id not in accounted_ids]
+    if missing_ids:
+        debts.append(f"gap_accounting is missing entries for gap(s): {', '.join(missing_ids)}")
+
+    external_calls = _external_tool_call_count(state)
+    if external_calls < len(gaps):
+        debts.append(
+            f"only {external_calls} external tool call(s) made for {len(gaps)} plan gap(s) — "
+            "research each gap at least once before concluding"
+        )
+
+    fetches_reads = state.telemetry.per_tool_counts.get("fetch", 0) + state.telemetry.per_tool_counts.get(
+        "read_document", 0
+    )
+    entry_by_id = {entry.gap_id: entry for entry in entries}
+    top_gaps = gaps[:2]
+    top_cite_fetch = bool(top_gaps) and all(
+        gap.id in entry_by_id and _actions_cite_fetch(entry_by_id[gap.id].actions_taken) for gap in top_gaps
+    )
+    if not (top_cite_fetch or fetches_reads >= _FETCH_FLOOR_MIN_CALLS):
+        debts.append(
+            "fetch floor unmet: neither did the top-ranked gap(s) cite a fetch/read_document action "
+            f"nor did the run make {_FETCH_FLOOR_MIN_CALLS}+ fetches/reads (made {fetches_reads}) — "
+            "fetch a primary source before concluding on the load-bearing gaps"
+        )
+    return debts
+
+
+def _evaluate_conclude_gate(
+    state: _LoopState, arguments: dict[str, Any], config: LoopConfig, now: Callable[[], float]
+) -> ToolOutcome | None:
+    """The W2 anti-satisficing gate. Returns a blocking error ToolOutcome (loop
+    continues, ``conclude_gate_rejections`` bumped) when an EARLY conclusion
+    hasn't met the work-list floor, else ``None`` (let the conclude proceed).
+
+    Bypasses entirely — never blocks — when the deadline/budget forces a
+    conclusion (``_must_conclude``), when the plan gate soft-continued without a
+    plan (``plan_skipped``), when there are no plan gaps to enforce, or once the
+    rejection cap (``max_conclude_gate_rejections``) is hit.
+    """
+    if _must_conclude(state, config, now):
+        return None
+    if state.plan_skipped:
+        return None
+    plan = state.research_plan
+    if plan is None or not plan.gaps:
+        return None
+    if state.telemetry.conclude_gate_rejections >= config.max_conclude_gate_rejections:
+        return None
+
+    debts = _conclude_gate_debts(state, _coerce_gap_accounting(arguments.get("gap_accounting")))
+    if not debts:
+        return None
+
+    state.telemetry.conclude_gate_rejections += 1
+    lines = [
+        "Conclude rejected — resolve the outstanding research debt below before concluding "
+        "(a forced deadline conclusion overrides this):"
+    ]
+    lines.extend(f"- {debt}" for debt in debts)
+    return ToolOutcome(content_markdown="\n".join(lines), method="internal", status="error")
+
+
+async def _conclude_tool(
+    state: _LoopState, arguments: dict[str, Any], config: LoopConfig, now: Callable[[], float]
+) -> ToolOutcome:
+    gate_block = _evaluate_conclude_gate(state, arguments, config, now)
+    if gate_block is not None:
+        return gate_block
+
     validation = _validate_findings_payload(arguments.get("final_findings"), state, label="final_findings")
     pending_leads, pending_errors = _coerce_pending_leads(arguments.get("pending_leads"))
     banked, duplicates = _bank_findings(state, validation.accepted)
@@ -665,6 +813,7 @@ async def _execute_one_tool_call(
     tools_by_name: dict[str, ToolSpec],
     state: _LoopState,
     config: LoopConfig,
+    now: Callable[[], float],
 ) -> _ToolExecutionResult:
     try:
         arguments = _parse_arguments(tool_call.arguments)
@@ -711,7 +860,7 @@ async def _execute_one_tool_call(
         elif tool_call.name == "record_findings":
             handler = _record_findings_tool(state, arguments)
         elif tool_call.name == "conclude":
-            handler = _conclude_tool(state, arguments)
+            handler = _conclude_tool(state, arguments, config, now)
         else:
             handler = tools_by_name[tool_call.name].handler(**arguments)
         raw_outcome = await asyncio.wait_for(handler, timeout=timeout_s)
@@ -869,7 +1018,7 @@ async def _execute_tool_batch(
             state.telemetry.plan_skipped = True
 
     results = await asyncio.gather(
-        *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in accepted]
+        *[_execute_one_tool_call(tool_call, tools_by_name, state, config, now) for tool_call in accepted]
     )
     provenance_texts: list[str] = []
     for result in results:
@@ -931,7 +1080,7 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         "%sGAP_FILL_V2: model=%s steps=%s tool_calls=%s searches=%s fetches=%s rendered=%s reads=%s "
         "dup_tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
         "pending_leads=%s lint_rejections=%s provenance_rejections=%s quote_mismatch_warnings=%s "
-        "plan_gaps=%s plan_skipped=%s",
+        "plan_gaps=%s plan_skipped=%s conclude_gate_rejections=%s",
         log_prefix,
         state.telemetry.model,
         state.telemetry.steps,
@@ -951,6 +1100,7 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         state.telemetry.quote_mismatch_warnings,
         state.telemetry.plan_gaps,
         state.telemetry.plan_skipped,
+        state.telemetry.conclude_gate_rejections,
     )
 
 

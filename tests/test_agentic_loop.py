@@ -51,6 +51,7 @@ def _config(
     conclude_threshold_s: float = 0.1,
     max_result_chars: int = 8000,
     max_steps: int = 5,
+    max_conclude_gate_rejections: int = 2,
 ) -> LoopConfig:
     return LoopConfig(
         model=model,
@@ -60,6 +61,7 @@ def _config(
         conclude_threshold_s=conclude_threshold_s,
         max_result_chars=max_result_chars,
         max_steps=max_steps,
+        max_conclude_gate_rejections=max_conclude_gate_rejections,
     )
 
 
@@ -104,7 +106,27 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
                     )
                 ]
             ),
-            _response(tool_calls=[_tool_call("done1", "conclude", {"pending_leads": ["Check the appendix."]})]),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "done1",
+                        "conclude",
+                        {
+                            "pending_leads": ["Check the appendix."],
+                            # W2 conclude gate: one gap, so its accounting must
+                            # cover g1 and (per-gap fetch-floor clause) cite a
+                            # fetch/read action in actions_taken.
+                            "gap_accounting": [
+                                {
+                                    "gap_id": "g1",
+                                    "actions_taken": "fetched the primary source and confirmed the date",
+                                    "status": "resolved",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            ),
         ]
     )
 
@@ -146,6 +168,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     assert "dup_tool_calls=0" in marker
     assert "plan_gaps=1" in marker
     assert "plan_skipped=False" in marker
+    assert "conclude_gate_rejections=0" in marker
 
 
 @pytest.mark.asyncio
@@ -458,8 +481,15 @@ async def test_derivation_banned_phrase_is_not_a_lint_rejection() -> None:
         ]
     )
 
+    # max_conclude_gate_rejections=0 disables the W2 gate: this test exercises
+    # the W3 lint carve-out, not the conclude gate, and concludes without
+    # research/accounting.
     result = await run_agentic_loop(
-        "system", "briefing cites https://example.com/grg", [], _config(), llm_call=fake_llm
+        "system",
+        "briefing cites https://example.com/grg",
+        [],
+        _config(max_conclude_gate_rejections=0),
+        llm_call=fake_llm,
     )
 
     assert result.telemetry.lint_rejections == 0
@@ -1293,8 +1323,14 @@ class TestResearchPlanGate:
             ]
         )
 
+        # W1 test: cap=0 disables the W2 conclude gate so the early conclude here
+        # isn't blocked (the plan-gate nudge is what this exercises).
         result = await run_agentic_loop(
-            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
         )
 
         # The premature call was rejected: its handler never ran, and its tool
@@ -1325,8 +1361,14 @@ class TestResearchPlanGate:
             ]
         )
 
+        # W1 test: cap=0 disables the W2 conclude gate (early conclude, no
+        # gap_accounting) so the plan-accepted path is what's under test.
         result = await run_agentic_loop(
-            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
         )
 
         assert invoked == ["allowed"]
@@ -1353,7 +1395,16 @@ class TestResearchPlanGate:
             ]
         )
 
-        await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, log_prefix="question=https://q/1/ ")
+        # cap=0 disables the W2 gate: this test asserts the GHOST_PRE telemetry,
+        # not the conclude gate, and concludes without research/accounting.
+        await run_agentic_loop(
+            "system",
+            "user",
+            [],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+            log_prefix="question=https://q/1/ ",
+        )
 
         pre_json_lines = [m.getMessage() for m in caplog.records if "GHOST_PRE_JSON:" in m.getMessage()]
         assert len(pre_json_lines) == 1
@@ -1380,7 +1431,8 @@ class TestResearchPlanGate:
             ]
         )
 
-        await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+        # cap=0 disables the W2 gate: GHOST_PRE-suppression telemetry is the subject.
+        await run_agentic_loop("system", "user", [], _config(max_conclude_gate_rejections=0), llm_call=fake_llm)
 
         assert any("GHOST_PRE:" in m.getMessage() for m in caplog.records)
         assert not any("GHOST_PRE_JSON:" in m.getMessage() for m in caplog.records)
@@ -1441,8 +1493,13 @@ class TestResearchPlanGate:
             ]
         )
 
+        # cap=0 disables the W2 gate: the budget-line work-list (W1) is the subject.
         result = await run_agentic_loop(
-            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
         )
 
         # The search result's budget line carries both gap ids.
@@ -1462,12 +1519,326 @@ class TestResearchPlanGate:
             ]
         )
 
-        result = await run_agentic_loop("system", "user", [], _config(max_tool_calls=14), llm_call=fake_llm)
+        # cap=0 disables the W2 gate: the max_gaps cap (W1) is the subject here.
+        result = await run_agentic_loop(
+            "system", "user", [], _config(max_tool_calls=14, max_conclude_gate_rejections=0), llm_call=fake_llm
+        )
 
         # Default max_gaps is 4; only the top 4 survive.
         assert result.telemetry.plan_gaps == 4
         plan_message = _tool_messages(result)[0]
         assert "kept the top 4 of 6 gaps" in plan_message["content"]
+
+
+def _accounting(*gap_ids: str, actions: str = "searched and fetched the source", status: str = "resolved") -> list:
+    """gap_accounting entries for the given gap ids (default actions cite a fetch,
+    satisfying the per-gap fetch-floor clause)."""
+    return [{"gap_id": gap_id, "actions_taken": actions, "status": status} for gap_id in gap_ids]
+
+
+class TestConcludeGate:
+    """W2: the conclude gate blocks an EARLY conclusion until the driver's
+    gap_accounting covers every plan gap, the run made ≥1 external call per gap,
+    and the fetch floor is met (top-2 gaps cite a fetch, OR ≥2 fetches/reads).
+    A rejection continues the loop (no stop, no banking) and bumps
+    conclude_gate_rejections; the cap accepts unconditionally after 2 rejections;
+    must_conclude (deadline) and plan_skipped bypass it entirely."""
+
+    @pytest.mark.asyncio
+    async def test_reject_missing_gap_id_then_accept_on_complete_accounting(self) -> None:
+        """A conclude whose accounting omits a plan gap is rejected (loop
+        continues); a follow-up conclude that covers every gap is accepted."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+
+        # Plan has two gaps; two fetches meet the per-gap call count + fetch floor.
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example"}),
+                        _tool_call("f2", "fetch", {"url": "https://b.example"}),
+                    ]
+                ),
+                # First conclude accounts for only g1 -> rejected.
+                _response(tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1")})]),
+                # Second conclude accounts for both -> accepted.
+                _response(tool_calls=[_tool_call("c2", "conclude", {"gap_accounting": _accounting("g1", "g2")})]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("fetch", fetch)], _config(max_steps=8), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        first_conclude = _tool_messages(result)[-2]
+        assert "Conclude rejected" in first_conclude["content"]
+        assert "missing entries for gap(s): g2" in first_conclude["content"]
+        # The accepted conclude actually stopped the loop.
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_reject_too_few_external_calls(self) -> None:
+        """Two plan gaps but only one external tool call: the ≥1-call-per-gap
+        invariant is unmet, so the conclude is rejected even with full accounting."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://a.example"})]),
+                # cap=0 keeps the rejection observable (the loop would otherwise
+                # loop; here it soft-fails after the single scripted conclude).
+                _response(tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1", "g2")})]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("fetch", fetch)],
+            _config(max_steps=6, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        conclude_message = _tool_messages(result)[-1]
+        assert "only 1 external tool call(s) made for 2 plan gap(s)" in conclude_message["content"]
+        # Rejected -> the loop did not conclude early; it soft-failed on exhaustion.
+        assert result.telemetry.concluded_early is False
+
+    @pytest.mark.asyncio
+    async def test_reject_when_both_fetch_floor_clauses_fail(self) -> None:
+        """One gap, one external call, but it's a search (no fetch/read) and the
+        accounting doesn't cite a fetch: both fetch-floor clauses fail -> reject."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "x"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "c1",
+                            "conclude",
+                            {"gap_accounting": _accounting("g1", actions="searched only, no primary source")},
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_steps=6, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        conclude_message = _tool_messages(result)[-1]
+        assert "fetch floor unmet" in conclude_message["content"]
+
+    @pytest.mark.asyncio
+    async def test_accept_via_per_gap_fetch_clause(self) -> None:
+        """Fetch-floor clause (a): the top-ranked gap's accounting cites a fetch,
+        even though the run's own fetch count is below the global floor (one
+        rendered fetch). The conclude is accepted."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://a.example"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "c1",
+                            "conclude",
+                            {"gap_accounting": _accounting("g1", actions="fetched the primary source PDF")},
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("fetch", fetch)], _config(max_steps=6), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_accept_via_global_fetch_count_clause(self) -> None:
+        """Fetch-floor clause (b): the run made ≥2 fetches/reads, so a conclude
+        whose accounting does NOT cite a fetch per gap is still accepted."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example"}),
+                        _tool_call("f2", "fetch", {"url": "https://b.example"}),
+                    ]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "c1",
+                            "conclude",
+                            {"gap_accounting": _accounting("g1", actions="reviewed the search snippets")},
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("fetch", fetch)], _config(max_steps=6), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_must_conclude_bypasses_gate(self) -> None:
+        """Budget exhaustion (_must_conclude) overrides the gate: a conclude with
+        no gap_accounting at all is accepted, and the rejection counter stays 0."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # max_tool_calls=2: plan (1) + one search (2) exhausts the budget, so the
+        # conclude turn is in must-conclude mode and the gate is bypassed.
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "x"})]),
+                _response(tool_calls=[_tool_call("c1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(max_tool_calls=2), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_rejection_cap_accepts_after_two_rejections(self) -> None:
+        """After max_conclude_gate_rejections (2) blocked concludes, the third is
+        accepted unconditionally so a pathological driver can't loop forever."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # A single gap, one snippet-only search, and three bare concludes that all
+        # fail the fetch floor. The first two are rejected; the third is accepted
+        # by the cap.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "x"})]),
+                _response(
+                    tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+                _response(
+                    tool_calls=[_tool_call("c2", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+                _response(
+                    tool_calls=[_tool_call("c3", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(max_steps=8), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 2
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_plan_skipped_bypasses_gate(self) -> None:
+        """When the plan-nudge cap forced a soft-continue (plan_skipped), there is
+        no plan to enforce, so the conclude gate is bypassed."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # Two plan-less external turns hit the nudge cap; turn 3 runs un-gated;
+        # turn 4 concludes with no accounting -> accepted (plan_skipped bypass).
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("c1", "search_web", {"query": "q1"})]),
+                _response(tool_calls=[_tool_call("c2", "search_web", {"query": "q2"})]),
+                _response(tool_calls=[_tool_call("c3", "search_web", {"query": "q3"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(max_steps=8), llm_call=fake_llm
+        )
+
+        assert result.telemetry.plan_skipped is True
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_conclude_gate_rejections_surface_in_marker(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "x"})]),
+                # One rejected conclude (fetch floor unmet), then the cap accepts.
+                _response(
+                    tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+                _response(
+                    tool_calls=[_tool_call("c2", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+            ]
+        )
+
+        await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("search_web", search_web)],
+            _config(max_steps=8, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        marker = next(r.getMessage() for r in caplog.records if "GAP_FILL_V2:" in r.getMessage())
+        assert "conclude_gate_rejections=1" in marker
 
 
 class TestNormalizeUrl:
