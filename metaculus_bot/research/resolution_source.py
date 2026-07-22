@@ -296,9 +296,14 @@ def extract_source_urls(text: str) -> list[str]:
 
 
 def is_metaculus_self_ref(url: str) -> bool:
-    """A URL that points back at Metaculus is a self-reference (no new info)."""
+    """A URL that points back at Metaculus is a self-reference (no new info).
+
+    Uses ``.hostname`` (not ``.netloc``) so a port or userinfo can't slip a
+    metaculus URL past the check — ``.netloc`` keeps ``:443`` / ``user@``, which
+    would defeat the exact-host and suffix comparisons below.
+    """
     try:
-        host = urlparse(url).netloc.lower()
+        host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return False
     return host == "metaculus.com" or host.endswith(".metaculus.com")
@@ -307,7 +312,7 @@ def is_metaculus_self_ref(url: str) -> bool:
 def is_fred_url(url: str) -> bool:
     """FRED series URLs are already served by the financial-data provider."""
     try:
-        host = urlparse(url).netloc.lower()
+        host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return False
     return host == "fred.stlouisfed.org"
@@ -323,7 +328,7 @@ def is_yahoo_ticker_url(url: str) -> bool:
         parsed = urlparse(url)
     except ValueError:
         return False
-    return parsed.netloc.lower() == "finance.yahoo.com" and parsed.path.startswith("/quote/")
+    return (parsed.hostname or "").lower() == "finance.yahoo.com" and parsed.path.startswith("/quote/")
 
 
 def select_fetchable_urls(criteria: str | None, fine_print: str | None) -> list[str]:
@@ -594,6 +599,21 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                             return FetchResult(
                                 url=next_url,
                                 status="ssrf_blocked",
+                                text="",
+                                http_status=status,
+                                content_type=content_type or None,
+                            )
+                        if is_metaculus_self_ref(next_url):
+                            # The URL pre-filter drops metaculus self-refs, but a 3xx can
+                            # still land on metaculus.com; don't follow it (no new info,
+                            # and keeps our IP off the same host the critical API uses).
+                            logger.info(
+                                f"resolution_source metaculus_self_ref (redirect): "
+                                f"{urlparse(current_url).netloc} -> {urlparse(next_url).netloc}"
+                            )
+                            return FetchResult(
+                                url=next_url,
+                                status="blocked",
                                 text="",
                                 http_status=status,
                                 content_type=content_type or None,

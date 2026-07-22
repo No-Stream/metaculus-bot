@@ -610,6 +610,47 @@ async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: p
     assert "Malformed redirect" in result.text
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.metaculus.com/questions/12345/",
+        "https://metaculus.com/q/12345",
+        "https://www.metaculus.com:443/questions/12345/",  # port must not bypass the block
+        "https://sub.metaculus.com/page",  # subdomain
+    ],
+)
+@pytest.mark.asyncio
+async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # is_public_http_url is stubbed True so the metaculus URL clears the SSRF gate
+    # (as it would in prod — metaculus is public); the real is_metaculus_self_ref
+    # then blocks it. _get_session raises if reached, proving no HTTP is attempted.
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    get_session = MagicMock(side_effect=AssertionError("must not open a session for a metaculus URL"))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", get_session)
+
+    result = await agentic_tools._fetch_plain(url)
+
+    assert result.status == "blocked"
+    assert "metaculus.com" in result.text
+    get_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_blocks_redirect_to_metaculus(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "https://www.metaculus.com/questions/12345/"}),
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "blocked"
+    assert "metaculus.com" in result.text
+    # The metaculus hop must never be requested (only the initial URL was GET-ed).
+    assert session.calls == [("https://example.com/start", False)]
+
+
 @pytest.mark.asyncio
 async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
     """Plan §5 politeness: a plain and a rendered fetch to the same host must

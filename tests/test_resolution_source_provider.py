@@ -315,15 +315,29 @@ class TestSkipPredicates:
         assert is_metaculus_self_ref("https://www.metaculus.com/questions/12345") is True
         assert is_metaculus_self_ref("https://example.com/metaculus-fan") is False
 
+    def test_is_metaculus_self_ref_port_and_userinfo_do_not_bypass(self):
+        # .hostname strips port + userinfo; .netloc would have kept them and let
+        # these slip past the exact-host / suffix checks.
+        assert is_metaculus_self_ref("https://www.metaculus.com:443/questions/12345") is True
+        assert is_metaculus_self_ref("https://metaculus.com:8080/q/1") is True
+        assert is_metaculus_self_ref("https://user@metaculus.com/q/1") is True
+        assert is_metaculus_self_ref("https://sub.metaculus.com/page") is True
+        # A host that merely contains the string is not a self-ref.
+        assert is_metaculus_self_ref("https://notmetaculus.com/x") is False
+
     def test_is_fred_url(self):
         assert is_fred_url("https://fred.stlouisfed.org/series/DGS10") is True
         assert is_fred_url("https://stlouisfed.org/other") is False
+        # Port must not bypass (.hostname fix).
+        assert is_fred_url("https://fred.stlouisfed.org:443/series/DGS10") is True
 
     def test_is_yahoo_ticker_url(self):
         assert is_yahoo_ticker_url("https://finance.yahoo.com/quote/AAPL") is True
         assert is_yahoo_ticker_url("https://finance.yahoo.com/quote/BTC-USD/history") is True
         # Generic Yahoo articles are still fetchable — only /quote/ URLs are yfinance-served.
         assert is_yahoo_ticker_url("https://finance.yahoo.com/news/some-article") is False
+        # Port must not bypass (.hostname fix).
+        assert is_yahoo_ticker_url("https://finance.yahoo.com:443/quote/AAPL") is True
 
 
 class TestSelectFetchableUrls:
@@ -954,6 +968,24 @@ class TestFetchOneSsrf:
         )
         result = await _fetch_one(session, "https://redirect.example.com/x", {})
         assert result.status == "ssrf_blocked"
+
+    async def test_redirect_to_metaculus_is_blocked(self):
+        # 302 from a public URL to metaculus.com. The SSRF guard passes (metaculus
+        # is public) but the self-ref check stops the hop — no GET of metaculus.com
+        # (FakeSession has no handler for it, so a follow would raise), status blocked.
+        session = FakeSession(
+            {
+                "https://redirect.example.com/x": FakeResponse(
+                    302,
+                    body=b"",
+                    content_type="text/html",
+                    headers={"Location": "https://www.metaculus.com/questions/12345/"},
+                ),
+            }
+        )
+        result = await _fetch_one(session, "https://redirect.example.com/x", {})
+        assert result.status == "blocked"
+        assert result.url == "https://www.metaculus.com/questions/12345/"
 
     async def test_single_redirect_to_public_page_succeeds(self, article_html):
         # 302 from one public URL to another public URL — the loop follows,

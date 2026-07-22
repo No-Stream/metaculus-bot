@@ -88,6 +88,7 @@ FETCH_DESCRIPTION = (
     "are leads you can fetch next.\n"
     "Use read_document instead only when you need a specific question answered\n"
     "from inside a long/complex document.\n"
+    "Do NOT fetch metaculus.com URLs — the question brief already reflects them.\n"
     'Example: fetch(url="https://www.ons.gov.uk/releases/gdpquarterly")\n'
     'Example: fetch(url="https://example.gov/long-report", start_char=12000)'
 )
@@ -437,12 +438,32 @@ async def _read_response_body(resp: aiohttp.ClientResponse, label: str) -> bytes
     return await read_body_capped(resp, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, label=label)
 
 
+_METACULUS_FETCH_BLOCK_MSG = (
+    "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
+)
+
+
 async def _fetch_plain(url: str) -> PlainFetchResult:
     if not await resolution_source.is_public_http_url(url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
             text="Blocked non-public or unsupported URL.",
+            links=[],
+            url=url,
+        )
+    # Block metaculus.com from our runner IP. Question pages are a JS SPA whose
+    # near-empty plain fetch would auto-escalate to headless Chromium, whose
+    # route guard then permits the SPA's own XHR fan-out to the Metaculus API —
+    # all from our IP, on the same host the critical API calls use. Blocking here
+    # (before _get_session) kills both our-IP rungs; rendered only runs after a
+    # plain fetch. The brief already embeds the resolution criteria these URLs
+    # would yield. (read_document is Gemini's IP, not ours, so it is not gated.)
+    if resolution_source.is_metaculus_self_ref(url):
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=_METACULUS_FETCH_BLOCK_MSG,
             links=[],
             url=url,
         )
@@ -473,6 +494,17 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                                     status="blocked",
                                     method="plain",
                                     text="Blocked non-public redirect target.",
+                                    links=[],
+                                    url=next_url,
+                                    content_type=content_type or None,
+                                )
+                            # A 3xx to metaculus.com must not be followed either (same
+                            # our-IP / no-new-info rationale as the initial-URL block).
+                            if resolution_source.is_metaculus_self_ref(next_url):
+                                return PlainFetchResult(
+                                    status="blocked",
+                                    method="plain",
+                                    text=_METACULUS_FETCH_BLOCK_MSG,
                                     links=[],
                                     url=next_url,
                                     content_type=content_type or None,
