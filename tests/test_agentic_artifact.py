@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from metaculus_bot.research.agentic.artifact import detachment_lint, render_findings
 from metaculus_bot.research.agentic.types import Finding
 
@@ -54,6 +56,9 @@ def test_render_findings_hoists_discrepancies_to_corrections_block_first() -> No
             retrieved_how="fetch",
             topic="labor",
             discrepancy=True,
+            # W4: a fetched-tier discrepancy keeps the supersede banner; this test
+            # exercises the hoist-above-topics behavior on the supersede block.
+            verification_tier="fetched",
         ),
         Finding(
             claim="The ministry published a bulletin.",
@@ -74,6 +79,139 @@ def test_render_findings_hoists_discrepancies_to_corrections_block_first() -> No
         in rendered
     )
     assert "The briefing says the rate is 7%, but the source says 5.2%." in rendered
+
+
+def _discrepancy(
+    tier: Literal["fetched", "snippet"] | None, *, claim: str, url: str = "https://example.com/correction"
+) -> Finding:
+    return Finding(
+        claim=claim,
+        source_url=url,
+        quote="The source states the corrected figure.",
+        date="2026-07-10",
+        retrieved_how="fetch",
+        topic="labor",
+        discrepancy=True,
+        verification_tier=tier,
+    )
+
+
+def test_fetched_discrepancy_keeps_supersede_block() -> None:
+    """W4: a discrepancy stamped ``fetched`` (primary source pulled) renders under
+    the supersede header with its supersede banner — full authority."""
+    rendered = render_findings([_discrepancy("fetched", claim="Briefing says 7%; source says 5.2%.")], [])
+
+    assert "### ⚠ Corrections to the briefing" in rendered
+    assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" not in rendered
+    assert (
+        "The sourced findings below contradict the research briefing and supersede the corresponding briefing content."
+        in rendered
+    )
+    assert "Briefing says 7%; source says 5.2%." in rendered
+
+
+def test_snippet_discrepancy_renders_demoted_block_not_supersede() -> None:
+    """W4 core fix (131.3): a discrepancy stamped ``snippet`` renders under the
+    demoted header with a banner stating it does NOT supersede the briefing — the
+    supersede header/banner must be absent."""
+    rendered = render_findings([_discrepancy("snippet", claim="Briefing says 133; a snippet says 131.3.")], [])
+
+    assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" in rendered
+    assert "### ⚠ Corrections to the briefing" not in rendered
+    assert "do NOT supersede the briefing" in rendered
+    assert "treat them as leads that contradict it" in rendered
+    assert "Briefing says 133; a snippet says 131.3." in rendered
+    # The supersede banner text must NOT appear anywhere.
+    assert "supersede the corresponding briefing content" not in rendered
+
+
+def test_untiered_discrepancy_is_demoted() -> None:
+    """A discrepancy with no tier (None — its URL was never retrieved through a
+    tool, or only via a failed fetch) is demoted conservatively, same as snippet."""
+    rendered = render_findings([_discrepancy(None, claim="Briefing says X; an untiered source says Y.")], [])
+
+    assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" in rendered
+    assert "### ⚠ Corrections to the briefing" not in rendered
+
+
+def test_mixed_discrepancies_render_both_blocks_supersede_first() -> None:
+    """W4: a run with both a fetched and a snippet discrepancy renders BOTH
+    correction blocks, supersede first, then demoted, both above the topic
+    blocks; non-discrepancy findings stay in their topic block."""
+    findings = [
+        _discrepancy("snippet", claim="Snippet-only correction.", url="https://example.com/snippet"),
+        _discrepancy("fetched", claim="Fetched correction.", url="https://example.com/fetched"),
+        Finding(
+            claim="The ministry published a bulletin.",
+            source_url="https://example.com/bulletin",
+            quote="Bulletin issued July 10.",
+            date="2026-07-10",
+            retrieved_how="fetch",
+            topic="labor",
+            verification_tier="fetched",
+        ),
+    ]
+
+    rendered = render_findings(findings, [])
+
+    supersede_at = rendered.index("### ⚠ Corrections to the briefing")
+    demoted_at = rendered.index("### ⚠ Possible corrections (snippet-sourced — recheck advised)")
+    topic_at = rendered.index("### labor")
+    assert supersede_at < demoted_at < topic_at
+    assert "Fetched correction." in rendered
+    assert "Snippet-only correction." in rendered
+    assert "The ministry published a bulletin." in rendered
+
+
+def test_verification_tier_renders_compactly_on_topic_findings() -> None:
+    """W4: a non-discrepancy finding carrying a tier shows it inline alongside
+    retrieved_how, so the panel sees each finding's retrieval quality."""
+    findings = [
+        Finding(
+            claim="The agency reported the figure.",
+            source_url="https://example.com/fetched",
+            quote="The figure is 4.1 percent.",
+            date="2026-07-01",
+            retrieved_how="fetch",
+            topic="labor",
+            verification_tier="fetched",
+        ),
+        Finding(
+            claim="A secondary source echoed a figure.",
+            source_url="https://example.com/snippet",
+            quote="Reported at about 4 percent.",
+            date="2026-07-02",
+            retrieved_how="search_web",
+            topic="labor",
+            verification_tier="snippet",
+        ),
+    ]
+
+    rendered = render_findings(findings, [])
+
+    assert "Retrieved how: fetch [verification: fetched]" in rendered
+    assert "Retrieved how: search_web [verification: snippet]" in rendered
+
+
+def test_untiered_topic_finding_omits_verification_token() -> None:
+    """A finding with no tier (briefing-grounded, never tool-retrieved) renders
+    the plain retrieved-how line — no stray verification token."""
+    rendered = render_findings(
+        [
+            Finding(
+                claim="The ministry published a bulletin.",
+                source_url="https://example.com/bulletin",
+                quote="Bulletin issued July 10.",
+                date="2026-07-10",
+                retrieved_how="fetch",
+                topic="labor",
+            )
+        ],
+        [],
+    )
+
+    assert "Retrieved how: fetch" in rendered
+    assert "[verification:" not in rendered
 
 
 def test_render_findings_without_discrepancies_has_no_corrections_block() -> None:

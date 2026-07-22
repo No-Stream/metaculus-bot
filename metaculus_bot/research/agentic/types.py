@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +39,16 @@ class Finding(BaseModel):
     # facts — see artifact.detachment_lint); rendered under a "Derived analysis"
     # label so the panel weights it as our synthesis, not a source claim.
     derivation: str | None = None
+    # Retrieval-quality tier (W4), stamped by the loop at banking time from the
+    # finding's source_url via the URL->best-method-seen map — CODE-derived,
+    # never driver-claimed (the free-text (A)-(D) tags in `claim` stay advisory).
+    # "fetched" when the URL was seen via a fetch/read (document/rendered/plain/
+    # cache); "snippet" when only via a search/news result. None until stamped
+    # (a briefing-only URL is never seen through a tool, so it has no tier). A
+    # discrepancy finding must be "fetched" to keep the supersede banner — a
+    # snippet-tier discrepancy is demoted to "possible corrections" (the 131.3
+    # failure mode). See loop._stamp_verification_tier and artifact.render_findings.
+    verification_tier: Literal["fetched", "snippet"] | None = None
 
 
 class GhostForecast(BaseModel):
