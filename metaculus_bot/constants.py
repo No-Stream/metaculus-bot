@@ -457,8 +457,12 @@ GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
 # directed-reading rung.
 GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
 # Parallel tool calls each count against the cap; steps are where latency
-# lives, so batching is encouraged rather than rationed.
-GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 20)
+# lives, so batching is encouraged rather than rationed. Raised 20 -> 30 with
+# the W2 ambition floor (2026-07-21): v2 runs 41-60s of the 540s deadline, so
+# the headroom is free — the satisficing problem was ambition, not budget, and
+# with the conclude-gate floor in place the extra slots let the driver dig
+# deeper on the few decision-relevant gaps instead of stopping early.
+GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 30)
 # Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
 # 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
 # no research-phase wall-clock. The loop is anytime: hitting the deadline
