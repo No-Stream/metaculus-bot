@@ -77,24 +77,50 @@ def _retrieved_how_line(finding: Finding) -> str:
     return f"Retrieved how: {finding.retrieved_how} [verification: {finding.verification_tier}]"
 
 
+def _finding_body_lines(finding: Finding, *, include_tier: bool) -> list[str]:
+    """Render one finding's body (label, claim, source, quote, derivation, date,
+    retrieved-how) — the single shared renderer for BOTH the corrections blocks
+    and the topic blocks, so a derived correction keeps its arithmetic support in
+    either path (F5). A finding can be both ``discrepancy=True`` and carry a
+    ``derivation`` (the literal 131.3 shape: "briefing says 133; arithmetic from
+    quoted sources gives 131.3"), and that evidence must not vanish when the
+    finding routes to a corrections block.
+
+    ``include_tier`` controls only the retrieved-how line: topic findings append
+    the loop-stamped verification tier inline (W4); correction findings omit it —
+    their block header already states the tier. Deterministic: the derivation
+    label/line are emitted iff the field is set, in stable field order.
+    """
+    body: list[str] = []
+    if finding.derivation:
+        # W3: label our arithmetic synthesis so the panel weights it as a derived
+        # analysis, not a source claim.
+        body.append(_DERIVED_ANALYSIS_LABEL)
+    body.append(f"Claim: {finding.claim}")
+    body.append(f"Source: {finding.source_url}")
+    body.append("Quote:")
+    body.extend(_quote_lines(finding.quote))
+    if finding.derivation:
+        body.append(f"Derivation: {finding.derivation}")
+    body.append(f"Date: {finding.date}")
+    body.append(_retrieved_how_line(finding) if include_tier else f"Retrieved how: {finding.retrieved_how}")
+    return body
+
+
 def _append_correction_block(lines: list[str], header: str, banner: str, corrections: list[Finding]) -> None:
     """Append one corrections block (header + banner + each finding) to ``lines``.
 
     Shared by the fetched (supersede) and snippet-sourced (demoted) blocks so the
     two stay byte-for-byte parallel except for their header/banner. Corrections
-    intentionally omit the tier token — their block header already states it.
+    omit the tier token (the block header already states it) but keep the derived-
+    analysis label/derivation via the shared body renderer (F5).
     """
     lines.append("")
     lines.append(header)
     lines.append(banner)
     lines.append("")
     for finding in corrections:
-        lines.append(f"Claim: {finding.claim}")
-        lines.append(f"Source: {finding.source_url}")
-        lines.append("Quote:")
-        lines.extend(_quote_lines(finding.quote))
-        lines.append(f"Date: {finding.date}")
-        lines.append(f"Retrieved how: {finding.retrieved_how}")
+        lines.extend(_finding_body_lines(finding, include_tier=False))
         lines.append("")
     lines.pop()
 
@@ -127,19 +153,7 @@ def render_findings(findings: list[Finding], pending_leads: list[str]) -> str:
         lines.append("")
         lines.append(f"### {topic}")
         for finding in grouped[topic]:
-            if finding.derivation:
-                # W3: label our arithmetic synthesis so the panel weights it as
-                # a derived analysis, not a source claim. Deterministic: emitted
-                # iff the field is set, in stable field order.
-                lines.append(_DERIVED_ANALYSIS_LABEL)
-            lines.append(f"Claim: {finding.claim}")
-            lines.append(f"Source: {finding.source_url}")
-            lines.append("Quote:")
-            lines.extend(_quote_lines(finding.quote))
-            if finding.derivation:
-                lines.append(f"Derivation: {finding.derivation}")
-            lines.append(f"Date: {finding.date}")
-            lines.append(_retrieved_how_line(finding))
+            lines.extend(_finding_body_lines(finding, include_tier=True))
             lines.append("")
         lines.pop()
 

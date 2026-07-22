@@ -308,6 +308,73 @@ def test_render_labels_derived_findings() -> None:
     )
 
 
+def test_fetched_discrepancy_renders_derivation_in_supersede_block() -> None:
+    """F5: a finding that is both discrepancy=True and carries a derivation — the
+    literal 131.3 shape ("briefing says 133; arithmetic from quoted sources gives
+    131.3") — routes to the supersede block and must KEEP its arithmetic support:
+    the derived-analysis label and the Derivation line, not just Claim/Quote."""
+    finding = Finding(
+        claim="Briefing says 133; the quoted sources sum to 131.3.",
+        source_url="https://example.com/correction",
+        quote="Line items: 40.0, 51.3, 40.0.",
+        date="2026-07-10",
+        retrieved_how="fetch",
+        topic="labor",
+        discrepancy=True,
+        verification_tier="fetched",
+        derivation="40.0 + 51.3 + 40.0 = 131.3, not the 133 the briefing states.",
+    )
+
+    rendered = render_findings([finding], [])
+
+    assert "### ⚠ Corrections to the briefing" in rendered
+    # The arithmetic support survives in the corrections block.
+    assert "Derived analysis (arithmetic from quoted sources)" in rendered
+    assert "Derivation: 40.0 + 51.3 + 40.0 = 131.3, not the 133 the briefing states." in rendered
+    # The label/derivation sit inside the corrections block, above the topic blocks.
+    assert rendered.index("### ⚠ Corrections to the briefing") < rendered.index("Derived analysis")
+
+
+def test_snippet_discrepancy_renders_derivation_in_demoted_block() -> None:
+    """F5, demoted variant: a snippet-tier derived discrepancy keeps its
+    derivation in the possible-corrections block too."""
+    finding = Finding(
+        claim="Briefing says 133; a snippet's numbers give 131.3.",
+        source_url="https://example.com/snippet",
+        quote="Reported components: 40, 51.3, 40.",
+        date="2026-07-10",
+        retrieved_how="search_web",
+        topic="labor",
+        discrepancy=True,
+        verification_tier="snippet",
+        derivation="40 + 51.3 + 40 = 131.3.",
+    )
+
+    rendered = render_findings([finding], [])
+
+    assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" in rendered
+    assert "Derived analysis (arithmetic from quoted sources)" in rendered
+    assert "Derivation: 40 + 51.3 + 40 = 131.3." in rendered
+
+
+def test_derived_correction_render_is_deterministic() -> None:
+    """Determinism guard extended to derived corrections: repeated renders of a
+    derived discrepancy produce byte-identical output."""
+    finding = Finding(
+        claim="Briefing says 133; arithmetic gives 131.3.",
+        source_url="https://example.com/correction",
+        quote="Components: 40.0, 51.3, 40.0.",
+        date="2026-07-10",
+        retrieved_how="fetch",
+        topic="labor",
+        discrepancy=True,
+        verification_tier="fetched",
+        derivation="40.0 + 51.3 + 40.0 = 131.3.",
+    )
+
+    assert render_findings([finding], []) == render_findings([finding], [])
+
+
 def test_render_omits_derivation_label_for_plain_findings() -> None:
     """A finding with no derivation renders exactly as before — no stray label."""
     rendered = render_findings(
