@@ -65,6 +65,35 @@ _TRACKER_PARAM_NAMES = frozenset({"gclid", "fbclid", "mc_cid", "mc_eid", "ref", 
 _QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Retrieval-quality tiers (W4). ToolOutcome.method records HOW a URL's content
+# reached the driver; we collapse the seven method values into two tiers so a
+# finding stamped from the URL->best-method map carries honest authority. A
+# "fetched" URL is one whose actual page/document we pulled (document/rendered/
+# plain/cache); a "snippet" URL was only seen in a search/news result. A
+# discrepancy resting on a snippet must NOT supersede the briefing (the 131.3
+# failure mode: a crowd-median "correction" from a search snippet after the
+# direct fetch 403'd, which every forecaster then adopted). Methods absent here
+# (internal bookkeeping, error/blocked outcomes) contribute no tier — the URL
+# still counts for the provenance gate, but the finding stays untiered and a
+# discrepancy on it is demoted, conservatively. See artifact.render_findings.
+_METHOD_TO_TIER: dict[str, str] = {
+    "document": "fetched",
+    "rendered": "fetched",
+    "plain": "fetched",
+    "cache": "fetched",
+    "search": "snippet",
+    "news": "snippet",
+}
+# fetched outranks snippet, so a URL seen via search THEN fetched upgrades.
+_TIER_RANK: dict[str, int] = {"snippet": 0, "fetched": 1}
+
+
+def _method_to_tier(method: str) -> str | None:
+    """Map a ToolOutcome.method to a verification tier ("fetched"/"snippet"), or
+    None when the method isn't a real content retrieval (internal bookkeeping,
+    error/blocked states) and so grants no retrieval authority."""
+    return _METHOD_TO_TIER.get(method)
+
 
 def _normalize_url(url: str) -> str | None:
     """Canonicalize a URL for provenance comparison.
@@ -144,6 +173,13 @@ class _LoopState:
     # arguments plus every URL in a tool result's content/links. Discrepancy
     # findings must cite one of these (a fresh primary-source check).
     tool_seen_urls: set[str] = field(default_factory=set)
+    # Normalized URL -> best retrieval tier seen this run ("fetched" outranks
+    # "snippet"), stamped onto each finding's verification_tier at banking time
+    # (W4). Only successful (status=ok) tool outcomes contribute a tier, so a
+    # 403'd fetch never grants "fetched" authority — a later search snippet of
+    # the same fact lands "snippet" and its discrepancy is demoted. A URL only
+    # in the briefing (never retrieved) is absent here -> untiered finding.
+    url_best_tier: dict[str, str] = field(default_factory=dict)
     # Normalized URLs embedded in the frozen briefing bundle. Non-discrepancy
     # findings may cite these too; discrepancies may NOT.
     briefing_urls: set[str] = field(default_factory=set)
@@ -186,6 +222,12 @@ class _ToolExecutionResult:
     # warn-only quote check searches. Accumulated into loop state post-gather.
     provenance_urls: list[str] = field(default_factory=list)
     provenance_text: str = ""
+    # Normalized URL -> verification tier this call established (W4). Only
+    # populated for successful retrievals: a fetched-class call tiers the URLs it
+    # actually retrieved (its arguments) "fetched"; a snippet-class call tiers
+    # every URL it surfaced "snippet". Merged into state.url_best_tier (best-tier
+    # wins) post-gather. Empty when the outcome granted no retrieval authority.
+    provenance_tiers: dict[str, str] = field(default_factory=dict)
 
 
 def _tool_schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -526,27 +568,41 @@ def _coerce_pending_leads(raw_pending_leads: Any) -> tuple[list[str], list[str]]
     return pending_leads, issues
 
 
+def _stamp_verification_tier(finding: Finding, state: _LoopState) -> Finding:
+    """Return a copy of ``finding`` with ``verification_tier`` set from the
+    URL->best-tier map (W4) — CODE-derived, so any driver-supplied tier is
+    overwritten. A source_url the driver never retrieved through a tool (e.g. a
+    briefing-only URL) is absent from the map and stays untiered (None)."""
+    normalized = _normalize_url(finding.source_url)
+    tier = state.url_best_tier.get(normalized) if normalized is not None else None
+    return finding.model_copy(update={"verification_tier": tier})
+
+
 def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int]:
     """Append findings to ``state.findings``, skipping ones already banked this run.
 
     Returns ``(banked, duplicates)``. Banking is idempotent by full-field
-    identity — the finding's canonical JSON serialization: a driver that records
-    findings incrementally with ``record_findings`` and then re-lists the same
-    ones in ``conclude``'s ``final_findings`` (observed on Q578 — 8 findings
-    rendered 16 times) no longer doubles the list. Serializing every field keeps
+    identity — the finding's canonical JSON serialization EXCLUDING the
+    loop-stamped ``verification_tier``: a driver that records findings
+    incrementally with ``record_findings`` and then re-lists the same ones in
+    ``conclude``'s ``final_findings`` (observed on Q578 — 8 findings rendered 16
+    times) no longer doubles the list, even if the URL's tier upgraded (search
+    then fetch) between the two banks. Serializing every OTHER field keeps
     genuinely distinct findings that happen to share a source/quote (a different
     ``claim`` or ``topic``) separate, and stays correct if ``Finding`` gains a
-    field.
+    field. Each banked finding carries the code-derived tier (W4).
     """
     banked = 0
     duplicates = 0
     for finding in accepted:
-        key = finding.model_dump_json()
+        # Key on the driver-stable identity (tier is loop-stamped, so exclude it)
+        # so dedup survives a between-bank tier upgrade.
+        key = finding.model_dump_json(exclude={"verification_tier"})
         if key in state.seen_finding_keys:
             duplicates += 1
             continue
         state.seen_finding_keys.add(key)
-        state.findings.append(finding)
+        state.findings.append(_stamp_verification_tier(finding, state))
         banked += 1
     return banked, duplicates
 
@@ -736,6 +792,7 @@ async def _execute_one_tool_call(
         )
 
     provenance_urls, provenance_text = _harvest_provenance(tool_call.name, arguments, outcome)
+    provenance_tiers = _harvest_verification_tiers(tool_call.name, arguments, outcome)
     return _ToolExecutionResult(
         tool_call_id=tool_call.id,
         tool_name=tool_call.name,
@@ -743,6 +800,7 @@ async def _execute_one_tool_call(
         method=outcome.method,
         provenance_urls=provenance_urls,
         provenance_text=provenance_text,
+        provenance_tiers=provenance_tiers,
     )
 
 
@@ -769,6 +827,48 @@ def _harvest_provenance(tool_name: str, arguments: dict[str, Any], outcome: Tool
         if normalized is not None:
             urls.append(normalized)
     return urls, outcome.content_markdown
+
+
+def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outcome: ToolOutcome) -> dict[str, str]:
+    """Assign a retrieval tier to the URLs this EXTERNAL tool call established (W4).
+
+    Only a successful (``status == "ok"``) outcome grants a tier — a 403'd/
+    blocked fetch confers no authority, which is the exact 131.3 mechanism (the
+    real fetch failed, so a later search snippet must not inherit "fetched").
+
+    A **fetched-class** call (document/rendered/plain/cache) tiers ONLY the URLs
+    it actually retrieved — the ``url`` arguments the driver asked for — as
+    "fetched". Its outbound links/body URLs are mere leads, not pages we read, so
+    they get no tier from this call (a later fetch of one of them would). A
+    **snippet-class** call (search/news) tiers every URL it surfaced (arguments,
+    body, links) as "snippet": the driver saw only the excerpt, never the page.
+    """
+    if tool_name in _INTERNAL_TOOL_NAMES or outcome.status != "ok":
+        return {}
+    tier = _method_to_tier(outcome.method)
+    if tier is None:
+        return {}
+    tiers: dict[str, str] = {}
+    if tier == "fetched":
+        # Only the requested URLs (arguments) count as retrieved pages.
+        for value in arguments.values():
+            if isinstance(value, str):
+                for normalized in _iter_normalized_urls(value):
+                    tiers[normalized] = tier
+    else:
+        # snippet: every URL the search/news result surfaced was seen only as an
+        # excerpt — arguments, body, and links all carry the same weak tier.
+        for value in arguments.values():
+            if isinstance(value, str):
+                for normalized in _iter_normalized_urls(value):
+                    tiers[normalized] = tier
+        for normalized in _iter_normalized_urls(outcome.content_markdown):
+            tiers[normalized] = tier
+        for link in outcome.links:
+            normalized = _normalize_url(link)
+            if normalized is not None:
+                tiers[normalized] = tier
+    return tiers
 
 
 def _normalized_call_key(tool_call: _ToolCall) -> tuple[str, str]:
@@ -879,6 +979,13 @@ async def _execute_tool_batch(
         # verify a finding's source_url against what the driver actually
         # retrieved. Internal tools contribute nothing (see _harvest_provenance).
         state.tool_seen_urls.update(result.provenance_urls)
+        # Merge per-call verification tiers, keeping the best tier seen per URL
+        # (fetched outranks snippet) — a URL first seen via search then fetched
+        # upgrades to "fetched" (W4).
+        for url, tier in result.provenance_tiers.items():
+            existing = state.url_best_tier.get(url)
+            if existing is None or _TIER_RANK[tier] > _TIER_RANK[existing]:
+                state.url_best_tier[url] = tier
         if result.provenance_text:
             provenance_texts.append(result.provenance_text)
     if provenance_texts:
