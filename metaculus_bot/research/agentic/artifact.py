@@ -25,8 +25,20 @@ _BANNED_REGISTER_PATTERNS: tuple[str, ...] = (
 )
 _BANNED_REGISTER_RE = re.compile(r"\b(?:" + "|".join(_BANNED_REGISTER_PATTERNS) + r")\b", re.IGNORECASE)
 
+# Label prefixing a finding that carries a ``derivation`` (W3) — flags the
+# arithmetic synthesis as ours so the panel weights it accordingly.
+_DERIVED_ANALYSIS_LABEL = "Derived analysis (arithmetic from quoted sources)"
+
 
 def detachment_lint(finding: Finding) -> list[str]:
+    # Only ``claim`` and ``topic`` are scanned. ``derivation`` (W3) is
+    # deliberately EXEMPT — it is arithmetic-only synthesis over the finding's
+    # own quoted numbers (a saw-tooth-style bound/rate table), which needs no
+    # likelihood language and would false-positive on incidental register words
+    # inside a computation. Do NOT add ``derivation`` here; the contract that
+    # keeps it safe (every input quoted, arithmetic only, no new facts) is a
+    # prompt/render-side convention, not a lint rule. ``quote`` stays unscanned
+    # too — it is verbatim source text, not the driver's own register.
     violations: list[str] = []
     for field_name, value in (("claim", finding.claim), ("topic", finding.topic)):
         matches = [match.group(0) for match in _BANNED_REGISTER_RE.finditer(value)]
@@ -72,10 +84,17 @@ def render_findings(findings: list[Finding], pending_leads: list[str]) -> str:
         lines.append("")
         lines.append(f"### {topic}")
         for finding in grouped[topic]:
+            if finding.derivation:
+                # W3: label our arithmetic synthesis so the panel weights it as
+                # a derived analysis, not a source claim. Deterministic: emitted
+                # iff the field is set, in stable field order.
+                lines.append(_DERIVED_ANALYSIS_LABEL)
             lines.append(f"Claim: {finding.claim}")
             lines.append(f"Source: {finding.source_url}")
             lines.append("Quote:")
             lines.extend(_quote_lines(finding.quote))
+            if finding.derivation:
+                lines.append(f"Derivation: {finding.derivation}")
             lines.append(f"Date: {finding.date}")
             lines.append(f"Retrieved how: {finding.retrieved_how}")
             lines.append("")

@@ -126,6 +126,19 @@ search. Batch independent tool calls in parallel. Record findings with
 record_findings as you confirm them — do not hold everything for the end. The
 per-turn budget line lists your outstanding gaps so you can see what is left.
 
+  YOU MAY DERIVE. When your quoted source values allow a decision-relevant
+  computation the panel would otherwise have to do itself — a bound, a rate,
+  a reconciliation of two metrics — put the arithmetic in the finding's
+  `derivation` field. Every input number in the derivation must ALSO appear as
+  a quoted value with its URL in the same finding's quote/source. The
+  derivation holds arithmetic and its result only: no likelihood language, no
+  new facts, no read on the outcome. Example shape: from a quoted record of the
+  oldest verified human by year, derive a per-year bound table (each year's
+  maximum, and the year-over-year step) — the inputs are the quoted ages, the
+  derivation is the table and its arithmetic. Derived findings are labeled to
+  the panel as our synthesis; use the field only for arithmetic you can show
+  entirely from quoted numbers.
+
 STEP 3 — CONCLUDE. Call conclude when (a) every fill/verify/resolution target
 is resolved or confidently unreachable, or (b) the budget line tells you to.
 If the briefing already covers everything and your dry run surfaced no

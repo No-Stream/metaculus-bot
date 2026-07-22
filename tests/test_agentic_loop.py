@@ -422,6 +422,51 @@ async def test_record_findings_rejects_lint_and_banks_clean_findings() -> None:
     assert "findings[0] rejected" in _tool_messages(result)[0]["content"]
 
 
+@pytest.mark.asyncio
+async def test_derivation_banned_phrase_is_not_a_lint_rejection() -> None:
+    """W3: a banned-register phrase confined to the ``derivation`` field is the
+    arithmetic-synthesis carve-out — it clears the lint, banks, and does NOT bump
+    lint_rejections. The same phrase in ``claim`` would still be rejected."""
+    fake_llm = FakeLlm(
+        [
+            _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "What are the yearly records?"}])]),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "record1",
+                        "record_findings",
+                        {
+                            "findings": [
+                                {
+                                    "claim": "Per-year oldest-human bound reconstructed from the quoted record.",
+                                    "source_url": "https://example.com/grg",
+                                    "quote": "1997: 122; 1998: 116; 1999: 119.",
+                                    "date": "2026-07-01",
+                                    "retrieved_how": "fetch",
+                                    "topic": "oldest-human bounds",
+                                    "derivation": (
+                                        "1997 max 122; the annual record probably tops the prior year by 1 — "
+                                        "arithmetic only, inputs above."
+                                    ),
+                                }
+                            ]
+                        },
+                    )
+                ]
+            ),
+            _response(tool_calls=[_tool_call("done1", "conclude")]),
+        ]
+    )
+
+    result = await run_agentic_loop(
+        "system", "briefing cites https://example.com/grg", [], _config(), llm_call=fake_llm
+    )
+
+    assert result.telemetry.lint_rejections == 0
+    assert "Per-year oldest-human bound reconstructed from the quoted record." in result.findings_markdown
+    assert "Derived analysis (arithmetic from quoted sources)" in result.findings_markdown
+
+
 _FINDING_UN = {
     "claim": "The UN projects a population peak of ~10.3 billion in the mid-2080s.",
     "source_url": "https://example.com/un",

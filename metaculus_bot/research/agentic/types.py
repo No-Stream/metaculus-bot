@@ -32,6 +32,13 @@ class Finding(BaseModel):
     retrieved_how: str = ""
     topic: str = "general"
     discrepancy: bool = False
+    # Arithmetic-only synthesis over the finding's own quoted numbers (W3): a
+    # derived table, bound, or rate whose every input appears as a quoted value
+    # with URL in this finding's quote/source fields. Exempt from the
+    # detachment lint (arithmetic + its result, no likelihood language, no new
+    # facts — see artifact.detachment_lint); rendered under a "Derived analysis"
+    # label so the panel weights it as our synthesis, not a source claim.
+    derivation: str | None = None
 
 
 class GhostForecast(BaseModel):

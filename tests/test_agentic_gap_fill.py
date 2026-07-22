@@ -317,6 +317,19 @@ class TestDriverSystemPromptResearchPlan:
         assert "Work your ranked gaps in order" in collapsed
         assert "per-turn budget line lists your outstanding gaps" in collapsed
 
+    def test_step2_carries_derivation_license(self) -> None:
+        """W3: STEP 2 grants a narrow synthesis license — the driver may put
+        decision-relevant arithmetic in the ``derivation`` field, with every input
+        quoted. The saw-tooth-style per-year bound table is the exemplar shape."""
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "YOU MAY DERIVE" in collapsed
+        assert "put the arithmetic in the finding's `derivation` field" in collapsed
+        # Every input number must be a quoted value in the same finding.
+        assert "Every input number in the derivation must ALSO appear" in collapsed
+        assert "no likelihood language, no new facts" in collapsed
+        # Exemplar: derive a per-year bound table from quoted record data.
+        assert "per-year bound table" in collapsed
+
 
 @pytest.fixture
 def mock_llm() -> GeneralLlm:

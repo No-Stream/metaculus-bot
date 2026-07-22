@@ -121,3 +121,95 @@ def test_detachment_lint_flags_claim_and_topic_only() -> None:
     assert "claim contains banned register 'likely'" in violations
     assert "topic contains banned register 'Bullish'" in violations
     assert all("odds are" not in violation for violation in violations)
+
+
+def test_detachment_lint_exempts_derivation_field() -> None:
+    """W3: the ``derivation`` field is arithmetic-only synthesis (saw-tooth-class
+    tables/bounds) and is exempt from the banned-register scan. The SAME phrase
+    that trips the lint in ``claim`` passes when it appears only in derivation."""
+    banned_phrase = "the annual record probably tops the prior year by 1"
+    exempt = Finding(
+        claim="Yearly oldest-human records reconstructed from the quoted table.",
+        source_url="https://example.com/table",
+        quote="1997: 122; 1998: 116; 1999: 119.",
+        derivation=banned_phrase,
+    )
+    linted = Finding(
+        claim=banned_phrase,
+        source_url="https://example.com/table",
+        quote="1997: 122; 1998: 116; 1999: 119.",
+    )
+
+    assert detachment_lint(exempt) == []
+    assert any("probably" in violation for violation in detachment_lint(linted))
+
+
+def test_render_labels_derived_findings() -> None:
+    """W3: a finding carrying a derivation gets a visible label in its topic block
+    so forecasters weight it as our synthesis, not a source claim."""
+    findings = [
+        Finding(
+            claim="Per-year upper bound on the oldest living human, from the quoted record.",
+            source_url="https://example.com/grg",
+            quote="Verified oldest person 1990-2000: 122, 122, 122, 122, 119, 117, 116, 115, 114, 113.",
+            date="2026-07-01",
+            retrieved_how="fetch",
+            topic="oldest-human bounds",
+            derivation="Max verified age per calendar year: 1990=122 ... 2000=113; annual step never exceeds +1.",
+        )
+    ]
+
+    rendered = render_findings(findings, [])
+
+    assert "### oldest-human bounds" in rendered
+    assert "Derived analysis (arithmetic from quoted sources)" in rendered
+    assert "Max verified age per calendar year" in rendered
+    # The label sits inside the topic block, not before it.
+    assert rendered.index("### oldest-human bounds") < rendered.index(
+        "Derived analysis (arithmetic from quoted sources)"
+    )
+
+
+def test_render_omits_derivation_label_for_plain_findings() -> None:
+    """A finding with no derivation renders exactly as before — no stray label."""
+    rendered = render_findings(
+        [
+            Finding(
+                claim="The ministry published a bulletin.",
+                source_url="https://example.com/bulletin",
+                quote="Bulletin issued July 10.",
+                date="2026-07-10",
+                retrieved_how="fetch",
+                topic="labor",
+            )
+        ],
+        [],
+    )
+
+    assert "Derived analysis" not in rendered
+
+
+def test_render_with_derivation_is_deterministic() -> None:
+    """Determinism guard extended to the derivation label: repeated renders of the
+    same findings produce byte-identical output."""
+    findings = [
+        Finding(
+            claim="Derived bound table.",
+            source_url="https://example.com/a",
+            quote="Row values: 10, 11, 12.",
+            date="2026-07-01",
+            retrieved_how="fetch",
+            topic="alpha",
+            derivation="10 + 1 = 11; 11 + 1 = 12.",
+        ),
+        Finding(
+            claim="A plain source claim.",
+            source_url="https://example.com/b",
+            quote="Report published.",
+            date="2026-07-02",
+            retrieved_how="fetch",
+            topic="beta",
+        ),
+    ]
+
+    assert render_findings(findings, ["lead"]) == render_findings(findings, ["lead"])

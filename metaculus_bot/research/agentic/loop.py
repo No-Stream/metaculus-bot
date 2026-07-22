@@ -215,6 +215,15 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
                         "retrieved_how": {"type": "string"},
                         "topic": {"type": "string"},
                         "discrepancy": {"type": "boolean"},
+                        "derivation": {
+                            "type": "string",
+                            "description": (
+                                "OPTIONAL arithmetic-only synthesis over THIS finding's quoted numbers "
+                                "(a derived table, bound, or rate). Every input number must appear as a "
+                                "quoted value with URL in this finding's quote/source. Arithmetic and its "
+                                "result only — no likelihood language, no new facts."
+                            ),
+                        },
                     },
                     "required": ["claim", "source_url", "quote"],
                     "additionalProperties": True,
@@ -282,7 +291,8 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
         ),
         _tool_schema(
             "record_findings",
-            "Bank detached findings. Claims must stay citation-only and avoid likelihood or verdict language.",
+            "Bank detached findings. Claims must stay citation-only and avoid likelihood or verdict language. "
+            "Optional derivation field carries arithmetic-only synthesis over the finding's own quoted numbers.",
             finding_schema,
         ),
         _tool_schema(
