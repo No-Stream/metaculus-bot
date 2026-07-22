@@ -8,6 +8,8 @@ from metaculus_bot.research.agentic.types import (
     LoopConfig,
     LoopResult,
     LoopTelemetry,
+    PlannedGap,
+    ResearchPlan,
     ToolOutcome,
     ToolSpec,
 )
@@ -18,6 +20,8 @@ __all__ = [
     "LoopConfig",
     "LoopResult",
     "LoopTelemetry",
+    "PlannedGap",
+    "ResearchPlan",
     "ToolOutcome",
     "ToolSpec",
     "build_default_llm_call",

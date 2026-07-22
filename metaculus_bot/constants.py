@@ -470,6 +470,12 @@ GAP_FILL_V2_CONCLUDE_THRESHOLD: float = _float_env("GAP_FILL_V2_CONCLUDE_THRESHO
 # Below this many extracted chars, the fetch ladder escalates plain HTTP to
 # headless-Chromium rendering (JS-wall heuristic; tools.py consumes this).
 GAP_FILL_V2_MIN_CONTENT_CHARS: int = _int_env("GAP_FILL_V2_MIN_CONTENT_CHARS", 500)
+# Max ranked gaps the driver's set_research_plan tool may register (W1). An
+# INDEPENDENT knob from v1's GAP_FILL_MAX_GAPS: v2 gaps are cheap (no dedicated
+# per-gap search call — the driver works one shared tool budget), but a focused
+# work-list still beats a sprawling one. The gap list is ranked by
+# decision-relevance, so the cap drops the least forecast-moving gaps.
+GAP_FILL_V2_MAX_GAPS: int = _int_env("GAP_FILL_V2_MAX_GAPS", 4)
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"

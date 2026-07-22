@@ -40,6 +40,38 @@ class GhostForecast(BaseModel):
     parsed_summary: str = ""
 
 
+class PlannedGap(BaseModel):
+    """One ranked research gap the driver commits to in set_research_plan (W1).
+
+    ``id`` is the driver-chosen handle W2's conclude-time accounting keys on;
+    ``question`` is the factual question to resolve; ``why_decision_relevant``
+    is the ranking rationale (the trailing slot holds the least forecast-moving
+    gap). Both verify-targets (assumptions to check) and fill-targets (facts
+    absent from the briefing) live here — the debiased union of v1's and v2's
+    targeting questions.
+    """
+
+    id: str
+    question: str
+    why_decision_relevant: str = ""
+
+
+class ResearchPlan(BaseModel):
+    """The driver's turn-one research plan, emitted via set_research_plan (W1).
+
+    The private dry run stays in the driver's reasoning; its outputs surface
+    here. ``dry_run_forecast`` is the qtype-shaped structured-block payload (same
+    schema family as the ghost) used only for the GHOST_PRE telemetry delta;
+    ``sensitive_assumptions`` are the 3-5 assumptions that would most move the
+    forecast if wrong; ``gaps`` is the ranked work-list (capped at
+    ``GAP_FILL_V2_MAX_GAPS``). W2 reads ``gaps`` for conclude-time accounting.
+    """
+
+    dry_run_forecast: dict[str, Any] | None = None
+    sensitive_assumptions: list[str] = Field(default_factory=list)
+    gaps: list[PlannedGap] = Field(default_factory=list)
+
+
 @dataclass(slots=True)
 class LoopConfig:
     model: str
@@ -49,6 +81,13 @@ class LoopConfig:
     conclude_threshold_s: float = 90.0
     max_result_chars: int = 8000
     max_steps: int = 20
+    # Max ranked gaps set_research_plan accepts (W1). Extra gaps beyond this are
+    # dropped (the driver ranks them, so the tail holds the least valuable).
+    max_gaps: int = 4
+    # How many times the plan-required gate may reject an external tool call
+    # before the loop soft-continues without a plan (W1). Prevents a driver that
+    # never plans from wedging the loop.
+    max_plan_nudges: int = 2
 
 
 @dataclass(slots=True)
@@ -78,6 +117,13 @@ class LoopTelemetry:
     # ellipsis-joined quotes make a hard gate too false-positive-prone; we
     # measure the real miss rate first).
     quote_mismatch_warnings: int = 0
+    # Ranked gaps the driver registered via set_research_plan (W1). 0 when no
+    # plan was set (see plan_skipped).
+    plan_gaps: int = 0
+    # True when the driver never called set_research_plan and the plan-nudge cap
+    # was hit, so the loop soft-continued without a plan (W1). A pathological
+    # driver can't wedge the loop on the plan gate; this flags the degraded run.
+    plan_skipped: bool = False
 
 
 @dataclass(slots=True)

@@ -22,6 +22,7 @@ from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from tests.agentic_fakes import FakeLlm
+from tests.agentic_fakes import plan_call as _plan_call
 from tests.agentic_fakes import response as _response
 from tests.agentic_fakes import tool_call as _tool_call
 from tests.pipeline_test_helpers import (
@@ -46,9 +47,10 @@ _GHOST_BLOCK = '```json\n{"question_type": "binary", "posterior_prob": 0.12}\n``
 
 
 def _happy_path_llm() -> FakeLlm:
-    """One search step, then conclude with a finding, then the ghost turn."""
+    """Plan (W1 gate opener), one search step, then conclude with a finding, then the ghost turn."""
     return FakeLlm(
         [
+            _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "What is the June 2026 rate?"}])]),
             _response(tool_calls=[_tool_call("c1", "search_web", {"query": "BLS unemployment June 2026"})]),
             _response(tool_calls=[_tool_call("c2", "conclude", {"final_findings": [_FINDING]})]),
             _response(content=_GHOST_BLOCK),
@@ -187,7 +189,7 @@ class TestRunGapFillV2Seam:
         assert len(captured) == 1
         payload = captured[0]
         assert payload["telemetry"]["findings_count"] == 1
-        assert payload["telemetry"]["tool_calls"] == 2  # search_web + conclude
+        assert payload["telemetry"]["tool_calls"] == 3  # set_research_plan + search_web + conclude
         roles = [
             message["role"] for message in payload["transcript"]
         ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
@@ -282,6 +284,38 @@ class TestDriverSystemPromptCatalyst:
         assert "stated plainly with no read on what it means for the outcome" in collapsed
         assert "supports the status-quo lean" not in collapsed
         assert "supports the lean" not in collapsed
+
+
+class TestDriverSystemPromptResearchPlan:
+    """W1: STEP 1 directs the driver to keep the dry run private but emit its
+    outputs via set_research_plan, and to build the gap list from the briefing
+    alone (v1-analyzer style) with both verify- and fill-targets."""
+
+    def test_step1_requires_set_research_plan(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "set_research_plan" in collapsed
+        assert "REQUIRED before any research tool" in collapsed
+        assert "external tool calls are rejected until you call it" in collapsed
+
+    def test_step1_keeps_dry_run_private_but_emits_outputs(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "This reasoning stays PRIVATE" in collapsed
+        assert "dry-run forecast as the template's STRUCTURED FORECAST block" in collapsed
+        assert "sensitive assumptions that would most move that forecast if wrong" in collapsed
+
+    def test_step1_gap_list_from_briefing_alone_with_both_target_kinds(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "Build the gap list from the BRIEFING ALONE" in collapsed
+        assert "what load-bearing fact is missing or unverified" in collapsed
+        assert "rank the most forecast-moving gap first" in collapsed
+        # Both verify-targets (assumptions to check) AND fill-targets (absent facts).
+        assert "verify-targets (assumptions to check against a primary source)" in collapsed
+        assert "fill-targets (facts the briefing simply does not contain)" in collapsed
+
+    def test_step2_references_the_ranked_gaps(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "Work your ranked gaps in order" in collapsed
+        assert "per-turn budget line lists your outstanding gaps" in collapsed
 
 
 @pytest.fixture

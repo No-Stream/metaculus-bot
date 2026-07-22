@@ -25,6 +25,7 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_DRIVER_EFFORT,
     GAP_FILL_V2_DRIVER_MODEL,
     GAP_FILL_V2_ENABLED_ENV,
+    GAP_FILL_V2_MAX_GAPS,
     GAP_FILL_V2_MAX_TOOL_CALLS,
     GAP_FILL_V2_WALL_DEADLINE,
     env_flag_enabled,
@@ -96,6 +97,7 @@ async def run_gap_fill_v2(
             max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
             wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
             conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
+            max_gaps=GAP_FILL_V2_MAX_GAPS,
         )
         question_ref = question.page_url or str(question.id_of_question)
         result = await run_agentic_loop(

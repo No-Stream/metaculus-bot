@@ -21,6 +21,8 @@ from metaculus_bot.research.agentic.types import (
     LoopConfig,
     LoopResult,
     LoopTelemetry,
+    PlannedGap,
+    ResearchPlan,
     ToolOutcome,
     ToolSpec,
 )
@@ -37,8 +39,15 @@ logger = logging.getLogger(__name__)
 LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
 
 _INTERNAL_TOOL_TIMEOUT_S = 5.0
-_INTERNAL_TOOL_NAMES = ("record_findings", "conclude")
+_INTERNAL_TOOL_NAMES = ("set_research_plan", "record_findings", "conclude")
 _NUDGE = "call conclude or use tools"
+# Returned in place of an external tool's result until set_research_plan has run
+# (W1). Mirrors _NUDGE mechanics: the driver sees why the call was rejected and
+# what to do instead. Capped at LoopConfig.max_plan_nudges (then soft-continue).
+_PLAN_REQUIRED_NUDGE = (
+    "call set_research_plan first — register your dry-run forecast, sensitive "
+    "assumptions, and ranked research gaps before using any research tool"
+)
 
 # Provenance gate (source_url grounding + quote spot-check). A finding is
 # rendered under a "supersedes-the-briefing" banner and shown to every base
@@ -144,6 +153,17 @@ class _LoopState:
     nudged_for_no_action: bool = False
     explicit_conclude: bool = False
     stop_loop: bool = False
+    # Per-run log prefix (question ref), so internal-tool handlers can emit
+    # markers keyed the same way as the ghost phase (GHOST_PRE at plan-set time).
+    log_prefix: str = ""
+    # Turn-one research plan (W1). None until set_research_plan runs; external
+    # tool calls are rejected with _PLAN_REQUIRED_NUDGE until it exists (unless
+    # the plan-nudge cap forces a soft-continue). W2 reads research_plan.gaps.
+    research_plan: ResearchPlan | None = None
+    # Count of external tool calls rejected by the plan gate, and whether the cap
+    # was hit so we soft-continued without a plan (telemetry plan_skipped).
+    plan_nudges: int = 0
+    plan_skipped: bool = False
 
 
 @dataclass(slots=True)
@@ -215,7 +235,51 @@ def _internal_tool_schemas() -> list[dict[str, Any]]:
         },
         "additionalProperties": False,
     }
+    plan_schema = {
+        "type": "object",
+        "properties": {
+            "dry_run_forecast": {
+                "type": "object",
+                "description": (
+                    "Your private dry-run forecast as the panel's STRUCTURED FORECAST block "
+                    "(same shape as the template: question_type + posterior_prob / option_probs / "
+                    "declared_percentiles). Telemetry only — never shown to the panel."
+                ),
+                "additionalProperties": True,
+            },
+            "sensitive_assumptions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "3-5 assumptions that would most move your forecast if wrong.",
+            },
+            "gaps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "why_decision_relevant": {"type": "string"},
+                    },
+                    "required": ["id", "question"],
+                    "additionalProperties": True,
+                },
+                "description": (
+                    "Ranked research gaps (most forecast-moving first): verify-targets "
+                    "(assumptions to check) AND fill-targets (facts absent from the briefing)."
+                ),
+            },
+        },
+        "required": ["gaps"],
+        "additionalProperties": False,
+    }
     return [
+        _tool_schema(
+            "set_research_plan",
+            "Register your turn-one research plan (dry-run forecast, sensitive assumptions, ranked gaps). "
+            "REQUIRED before any research tool — external tool calls are rejected until this is set.",
+            plan_schema,
+        ),
         _tool_schema(
             "record_findings",
             "Bank detached findings. Claims must stay citation-only and avoid likelihood or verdict language.",
@@ -311,11 +375,30 @@ def _truncate_content(content: str, max_chars: int) -> tuple[str, bool]:
     return f"{clipped}\n[truncated at {len(content)} chars]", True
 
 
+def _unaddressed_gaps_suffix(state: _LoopState) -> str:
+    """Render the driver's outstanding gap work-list for the budget line (W1).
+
+    W1 accounting is deliberately coarse: it lists EVERY plan gap id until W2's
+    conclude-time gap_accounting lands (the plan's W2 section explicitly says to
+    build strict per-call attribution there, not here — a per-call gap_id param
+    would mean touching every external tool's schema). So the suffix shows the
+    full work-list debt as a standing reminder, not a live-shrinking count.
+    """
+    if state.research_plan is None or not state.research_plan.gaps:
+        return ""
+    gap_ids = ", ".join(gap.id for gap in state.research_plan.gaps)
+    return f" unaddressed_gaps=[{gap_ids}]"
+
+
 def _budget_line(state: _LoopState, config: LoopConfig, now: Callable[[], float]) -> str:
     remaining = int(_remaining_s(state, now))
+    gaps = _unaddressed_gaps_suffix(state)
     if _must_conclude(state, config, now):
-        return f"\n[budget: {remaining}s remaining — you must conclude now]"
-    return f"\n[budget: {remaining}s remaining, {state.telemetry.tool_calls}/{config.max_tool_calls} tool calls used]"
+        return f"\n[budget: {remaining}s remaining — you must conclude now{gaps}]"
+    return (
+        f"\n[budget: {remaining}s remaining, "
+        f"{state.telemetry.tool_calls}/{config.max_tool_calls} tool calls used{gaps}]"
+    )
 
 
 def _format_tool_content(tool_name: str, outcome: ToolOutcome, max_chars: int) -> str:
@@ -478,6 +561,77 @@ async def _record_findings_tool(state: _LoopState, arguments: dict[str, Any]) ->
     return ToolOutcome(content_markdown="\n".join(lines), method="internal")
 
 
+def _coerce_planned_gaps(raw_gaps: Any, *, max_gaps: int) -> tuple[list[PlannedGap], list[str]]:
+    """Validate the plan's ``gaps`` list, capping at ``max_gaps`` (the tail — least
+    forecast-moving — is dropped since the driver ranks them). Returns
+    ``(gaps, issues)``; malformed entries are skipped with a reason."""
+    if raw_gaps is None or not isinstance(raw_gaps, list):
+        return [], ["gaps must be a list of {id, question, why_decision_relevant}"]
+    gaps: list[PlannedGap] = []
+    issues: list[str] = []
+    for index, raw_gap in enumerate(raw_gaps):
+        try:
+            gaps.append(PlannedGap.model_validate(raw_gap))
+        except ValidationError as exc:
+            issues.append(f"gaps[{index}] invalid: {exc.errors()[0]['msg']}")
+    if len(gaps) > max_gaps:
+        issues.append(f"kept the top {max_gaps} of {len(gaps)} gaps (ranked); dropped the rest")
+        gaps = gaps[:max_gaps]
+    return gaps, issues
+
+
+def _summarize_dry_run(dry_run_forecast: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize the plan's dry-run forecast dict into the GHOST_FORECAST_JSON payload
+    shape, reusing the ghost parser so GHOST_PRE_JSON and GHOST_FORECAST_JSON are
+    directly comparable. Returns ``None`` when absent or unparseable (the JSON
+    marker line is then suppressed, same as the ghost path)."""
+    if not isinstance(dry_run_forecast, dict):
+        return None
+    # Wrap the dict as a fenced block so the tested _summarize_ghost path parses
+    # it identically to a real ghost — no second parsing code path.
+    raw_text = f"```json\n{json.dumps(dry_run_forecast, separators=(',', ':'))}\n```"
+    _qtype, _summary, forecast = _summarize_ghost(raw_text)
+    return forecast
+
+
+async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], config: LoopConfig) -> ToolOutcome:
+    """Register the driver's turn-one research plan (W1).
+
+    Stores ``state.research_plan`` (W2 reads its gaps for conclude-time
+    accounting) and emits the GHOST_PRE / GHOST_PRE_JSON telemetry — the pre-
+    research counterpart to the concluding ghost, so the pre/post delta measures
+    whether v2's research moved its own view.
+    """
+    gaps, gap_issues = _coerce_planned_gaps(arguments.get("gaps"), max_gaps=config.max_gaps)
+    sensitive = arguments.get("sensitive_assumptions")
+    sensitive_assumptions = [item for item in sensitive if isinstance(item, str)] if isinstance(sensitive, list) else []
+    dry_run_forecast = arguments.get("dry_run_forecast")
+    dry_run_forecast = dry_run_forecast if isinstance(dry_run_forecast, dict) else None
+
+    state.research_plan = ResearchPlan(
+        dry_run_forecast=dry_run_forecast,
+        sensitive_assumptions=sensitive_assumptions,
+        gaps=gaps,
+    )
+    state.telemetry.plan_gaps = len(gaps)
+
+    forecast = _summarize_dry_run(dry_run_forecast)
+    logger.info(
+        "%sGHOST_PRE: gaps=%s sensitive_assumptions=%s",
+        state.log_prefix,
+        len(gaps),
+        len(sensitive_assumptions),
+    )
+    if forecast is not None:
+        logger.info("%sGHOST_PRE_JSON: %s", state.log_prefix, json.dumps(forecast, separators=(",", ":")))
+
+    lines = [f"Research plan set: {len(gaps)} gap(s), {len(sensitive_assumptions)} sensitive assumption(s)."]
+    if gap_issues:
+        lines.append("Notes:")
+        lines.extend(f"- {item}" for item in gap_issues)
+    return ToolOutcome(content_markdown="\n".join(lines), method="internal")
+
+
 async def _conclude_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOutcome:
     validation = _validate_findings_payload(arguments.get("final_findings"), state, label="final_findings")
     pending_leads, pending_errors = _coerce_pending_leads(arguments.get("pending_leads"))
@@ -542,7 +696,9 @@ async def _execute_one_tool_call(
         # instead of escaping the batch gather and aborting the whole pass —
         # matching the unknown-tool path. Internal tools bind positionally and
         # can't hit this.
-        if tool_call.name == "record_findings":
+        if tool_call.name == "set_research_plan":
+            handler = _set_research_plan_tool(state, arguments, config)
+        elif tool_call.name == "record_findings":
             handler = _record_findings_tool(state, arguments)
         elif tool_call.name == "conclude":
             handler = _conclude_tool(state, arguments)
@@ -637,6 +793,15 @@ def _budget_rejected_content(tool_name: str, config: LoopConfig) -> str:
     return _format_tool_content(tool_name, outcome, config.max_result_chars)
 
 
+def _plan_rejected_content(tool_name: str, config: LoopConfig) -> str:
+    outcome = ToolOutcome(
+        content_markdown=f"Tool call rejected: {_PLAN_REQUIRED_NUDGE}.",
+        method="internal",
+        status="error",
+    )
+    return _format_tool_content(tool_name, outcome, config.max_result_chars)
+
+
 async def _execute_tool_batch(
     tool_calls: list[_ToolCall],
     *,
@@ -647,7 +812,17 @@ async def _execute_tool_batch(
 ) -> None:
     duplicate_call_ids: set[str] = set()
     rejected_call_ids: set[str] = set()
+    plan_rejected_call_ids: set[str] = set()
     accepted: list[_ToolCall] = []
+
+    # Plan gate (W1): external tool calls are rejected until set_research_plan
+    # has run. Checked once per batch (before gather), so a parallel batch of
+    # external calls emitted before any plan is all rejected together and counts
+    # as a single nudge — a driver gets config.max_plan_nudges turns to plan,
+    # after which the loop soft-continues (plan_skipped) rather than wedging.
+    # Internal tools (set_research_plan/record_findings/conclude) are never
+    # plan-gated, so the driver can always plan, bank, or finish.
+    plan_gate_active = state.research_plan is None and not state.plan_skipped
 
     # Clamp the batch to the remaining call slots. With parallel_tool_calls a
     # single turn can emit more calls than budget allows; without this an
@@ -658,6 +833,9 @@ async def _execute_tool_batch(
     # telemetry.tool_calls stays consistent with _must_conclude's gate.
     for tool_call in tool_calls:
         is_internal = tool_call.name in _INTERNAL_TOOL_NAMES
+        if not is_internal and plan_gate_active:
+            plan_rejected_call_ids.add(tool_call.id)
+            continue
         if not is_internal and state.telemetry.tool_calls >= config.max_tool_calls:
             rejected_call_ids.add(tool_call.id)
             continue
@@ -671,6 +849,14 @@ async def _execute_tool_batch(
         else:
             state.seen_tool_calls.add(call_key)
         accepted.append(tool_call)
+
+    # Record the plan nudge (once per gated batch) and flip to soft-continue
+    # once the cap is hit, so the NEXT batch's external calls run un-gated.
+    if plan_rejected_call_ids:
+        state.plan_nudges += 1
+        if state.plan_nudges >= config.max_plan_nudges:
+            state.plan_skipped = True
+            state.telemetry.plan_skipped = True
 
     results = await asyncio.gather(
         *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in accepted]
@@ -696,7 +882,9 @@ async def _execute_tool_batch(
     # budget-exhausted error response.
     budget_line = _budget_line(state, config, now)
     for tool_call in tool_calls:
-        if tool_call.id in rejected_call_ids:
+        if tool_call.id in plan_rejected_call_ids:
+            content = _plan_rejected_content(tool_call.name, config)
+        elif tool_call.id in rejected_call_ids:
             content = _budget_rejected_content(tool_call.name, config)
         else:
             result = results_by_id[tool_call.id]
@@ -732,7 +920,8 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     logger.info(
         "%sGAP_FILL_V2: model=%s steps=%s tool_calls=%s searches=%s fetches=%s rendered=%s reads=%s "
         "dup_tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
-        "pending_leads=%s lint_rejections=%s provenance_rejections=%s quote_mismatch_warnings=%s",
+        "pending_leads=%s lint_rejections=%s provenance_rejections=%s quote_mismatch_warnings=%s "
+        "plan_gaps=%s plan_skipped=%s",
         log_prefix,
         state.telemetry.model,
         state.telemetry.steps,
@@ -750,6 +939,8 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         state.telemetry.lint_rejections,
         state.telemetry.provenance_rejections,
         state.telemetry.quote_mismatch_warnings,
+        state.telemetry.plan_gaps,
+        state.telemetry.plan_skipped,
     )
 
 
@@ -914,6 +1105,7 @@ async def run_agentic_loop(
         ],
         started_at_s=now_fn(),
         deadline_at_s=now_fn() + config.wall_deadline_s,
+        log_prefix=log_prefix,
     )
     state.telemetry.model = config.model
     # Seed the provenance sets from the frozen brief: its embedded URLs

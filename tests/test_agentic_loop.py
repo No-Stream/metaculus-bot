@@ -11,6 +11,7 @@ from metaculus_bot.research.agentic.loop import _summarize_ghost, run_agentic_lo
 from metaculus_bot.research.agentic.types import LoopConfig, ToolOutcome, ToolSpec
 from metaculus_bot.structured_output_schema import NumericStructured
 from tests.agentic_fakes import FakeLlm
+from tests.agentic_fakes import plan_call as _plan_call
 from tests.agentic_fakes import response as _response
 from tests.agentic_fakes import tool_call as _tool_call
 
@@ -81,6 +82,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "When was the report published?"}])]),
             _response(tool_calls=[_tool_call("search1", "search_web", {"query": "report"})]),
             _response(
                 tool_calls=[
@@ -117,9 +119,16 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     assert "## Agentic Research Findings" in result.findings_markdown
     assert "The report was published on July 1." in result.findings_markdown
     assert result.telemetry.model == "openai/gpt-5.4-mini"
-    assert result.telemetry.steps == 3
-    assert result.telemetry.tool_calls == 3
-    assert result.telemetry.per_tool_counts == {"search_web": 1, "record_findings": 1, "conclude": 1}
+    assert result.telemetry.steps == 4
+    assert result.telemetry.tool_calls == 4
+    assert result.telemetry.per_tool_counts == {
+        "set_research_plan": 1,
+        "search_web": 1,
+        "record_findings": 1,
+        "conclude": 1,
+    }
+    assert result.telemetry.plan_gaps == 1
+    assert result.telemetry.plan_skipped is False
     assert result.telemetry.rendered_fetches == 0
     assert result.telemetry.dup_tool_calls == 0
     assert result.telemetry.findings_count == 1
@@ -135,6 +144,8 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     assert "rendered=0" in marker
     assert "reads=0" in marker
     assert "dup_tool_calls=0" in marker
+    assert "plan_gaps=1" in marker
+    assert "plan_skipped=False" in marker
 
 
 @pytest.mark.asyncio
@@ -149,6 +160,7 @@ async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCapture
     # Same args with shuffled key order still count as the same call.
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report", "extra": 1})]),
             _response(tool_calls=[_tool_call("s2", "search_web", {"extra": 1, "query": "report"})]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
@@ -164,8 +176,9 @@ async def test_duplicate_tool_calls_counted_and_warned(caplog: pytest.LogCapture
     )
 
     assert result.telemetry.dup_tool_calls == 1
+    # tool_messages[0] is the set_research_plan result; the two searches follow.
     tool_messages = _tool_messages(result)
-    first, second = tool_messages[0], tool_messages[1]
+    first, second = tool_messages[1], tool_messages[2]
     assert "already made earlier in this run" not in first["content"]
     assert "already made earlier in this run" in second["content"]
     # The duplicate still executed — counter + warning only, no enforcement.
@@ -181,6 +194,7 @@ async def test_rendered_fetch_outcomes_counted_in_telemetry() -> None:
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://example.com"})]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
         ]
@@ -217,6 +231,7 @@ async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line()
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(
                 tool_calls=[
                     _tool_call("a", "alpha"),
@@ -245,12 +260,14 @@ async def test_parallel_tool_calls_execute_concurrently_and_append_budget_line()
 
     assert started == ["alpha", "beta", "gamma"]
     assert set(finished) == {"alpha", "beta", "gamma"}
-    tool_messages = _tool_messages(result)[:3]
+    # tool_messages[0] is the set_research_plan result; the parallel batch follows.
+    tool_messages = _tool_messages(result)[1:4]
     assert [message["name"] for message in tool_messages] == ["alpha", "beta", "gamma"]
     budget_lines = [message["content"].splitlines()[-1] for message in tool_messages]
     assert len(set(budget_lines)) == 1
     assert budget_lines[0].startswith("[budget: ")
-    assert budget_lines[0].endswith("3/14 tool calls used]")
+    # plan (1) + alpha/beta/gamma (3) = 4 tool calls used.
+    assert budget_lines[0].endswith("4/14 tool calls used]")
 
 
 @pytest.mark.asyncio
@@ -263,6 +280,7 @@ async def test_budget_threshold_switches_to_conclude_mode_and_shrinks_tools() ->
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("search1", "search_web")]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
         ]
@@ -277,8 +295,12 @@ async def test_budget_threshold_switches_to_conclude_mode_and_shrinks_tools() ->
         now=clock,
     )
 
-    assert "[budget: 5s remaining — you must conclude now]" in _tool_messages(result)[0]["content"]
-    assert _tool_names(fake_llm.calls[1]["tools"]) == ["record_findings", "conclude"]
+    # The plan turn (tool message [0]) runs at full budget; the search (message
+    # [1]) advances the clock to 5s remaining, tipping into must-conclude mode.
+    assert "[budget: 5s remaining — you must conclude now]" in _tool_messages(result)[1]["content"]
+    # calls[2] is the conclude turn — the first LLM call made after the clock
+    # crossed the threshold, so its tool schema is shrunk to internals only.
+    assert _tool_names(fake_llm.calls[2]["tools"]) == ["set_research_plan", "record_findings", "conclude"]
 
 
 @pytest.mark.asyncio
@@ -287,8 +309,11 @@ async def test_deadline_mid_tool_still_returns_banked_findings() -> None:
         await asyncio.sleep(0.2)
         return ToolOutcome(content_markdown="too slow", method="plain")
 
+    # Turn 1 sets the plan (so the external slow_tool clears the W1 gate); turn 2
+    # banks a finding and fires the slow tool that trips the wall deadline.
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(
                 tool_calls=[
                     _tool_call(
@@ -307,7 +332,7 @@ async def test_deadline_mid_tool_still_returns_banked_findings() -> None:
                     ),
                     _tool_call("slow1", "slow_tool"),
                 ]
-            )
+            ),
         ]
     )
 
@@ -317,7 +342,7 @@ async def test_deadline_mid_tool_still_returns_banked_findings() -> None:
         # (a non-discrepancy finding may cite a briefing URL).
         "briefing cites https://example.com/statute",
         [_tool_spec("slow_tool", slow_tool, timeout_s=1.0)],
-        _config(wall_deadline_s=0.05, max_steps=2),
+        _config(wall_deadline_s=0.05, max_steps=3),
         llm_call=fake_llm,
     )
 
@@ -334,6 +359,7 @@ async def test_tool_timeout_is_reported_and_loop_continues() -> None:
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("slow1", "slow_tool")]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
         ]
@@ -347,8 +373,9 @@ async def test_tool_timeout_is_reported_and_loop_continues() -> None:
         llm_call=fake_llm,
     )
 
-    assert "status: timeout" in _tool_messages(result)[0]["content"]
-    assert result.telemetry.steps == 2
+    # tool_messages[0] is the plan result; the timed-out slow_tool is [1].
+    assert "status: timeout" in _tool_messages(result)[1]["content"]
+    assert result.telemetry.steps == 3
 
 
 @pytest.mark.asyncio
@@ -469,8 +496,11 @@ async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
     async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
         return ToolOutcome(content_markdown="done", method="search")  # noqa: ASYNC910
 
+    # Budget of 2: the plan call (1) plus one external search (2) exhaust it, so
+    # the conclude turn's tool schema shrinks to internals only.
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("search1", "search_web")]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
         ]
@@ -480,12 +510,13 @@ async def test_cap_exhaustion_restricts_next_step_to_internal_tools() -> None:
         "system",
         "user",
         [_tool_spec("search_web", search_web)],
-        _config(max_tool_calls=1),
+        _config(max_tool_calls=2),
         llm_call=fake_llm,
     )
 
-    assert _tool_names(fake_llm.calls[1]["tools"]) == ["record_findings", "conclude"]
-    assert result.telemetry.tool_calls == 2
+    # calls[2] is the conclude turn — offered only internal tools once the cap hit.
+    assert _tool_names(fake_llm.calls[2]["tools"]) == ["set_research_plan", "record_findings", "conclude"]
+    assert result.telemetry.tool_calls == 3
 
 
 _CLEAN_FINDING = {
@@ -510,6 +541,7 @@ async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continu
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("bad1", "strict_tool", {"query": "x", "unexpected": 1})]),
             _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
@@ -524,8 +556,9 @@ async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continu
         llm_call=fake_llm,
     )
 
-    assert result.telemetry.steps == 3  # loop ran all three turns — no abort
-    bad_message = _tool_messages(result)[0]
+    assert result.telemetry.steps == 4  # loop ran all four turns — no abort
+    # tool_messages[0] is the plan result; the bind-error tool result is [1].
+    bad_message = _tool_messages(result)[1]
     assert bad_message["tool_call_id"] == "bad1"
     assert "status: error" in bad_message["content"]
     assert "TypeError" in bad_message["content"]
@@ -545,6 +578,7 @@ async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_conti
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("bad1", "strict_tool", {})]),  # no `query`
             _response(tool_calls=[_tool_call("record1", "record_findings", {"findings": [_CLEAN_FINDING]})]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
@@ -559,8 +593,9 @@ async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_conti
         llm_call=fake_llm,
     )
 
-    assert result.telemetry.steps == 3
-    bad_message = _tool_messages(result)[0]
+    assert result.telemetry.steps == 4
+    # tool_messages[0] is the plan result; the bind-error tool result is [1].
+    bad_message = _tool_messages(result)[1]
     assert bad_message["tool_call_id"] == "bad1"
     assert "status: error" in bad_message["content"]
     assert "TypeError" in bad_message["content"]
@@ -581,8 +616,11 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
         invoked.append(query)
         return ToolOutcome(content_markdown=f"result {query}", method="search")  # noqa: ASYNC910
 
+    # Budget of 3: the plan call (1) leaves two external slots, so q1/q2 run and
+    # the overflow q3 is budget-rejected — the shape this test exercises.
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(
                 tool_calls=[
                     _tool_call("c1", "search_web", {"query": "q1"}),
@@ -599,7 +637,7 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
         "system",
         "briefing cites https://example.com",
         [_tool_spec("search_web", search_web)],
-        _config(max_tool_calls=2),
+        _config(max_tool_calls=3),
         llm_call=fake_llm,
     )
 
@@ -608,8 +646,8 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
     assert len(invoked) == 2
     assert result.telemetry.per_tool_counts["search_web"] == 2
 
-    # Every tool_call_id in the batch got exactly one response, in order.
-    batch_messages = _tool_messages(result)[:3]
+    # tool_messages[0] is the plan result; the clamped parallel batch is [1:4].
+    batch_messages = _tool_messages(result)[1:4]
     assert [message["tool_call_id"] for message in batch_messages] == ["c1", "c2", "c3"]
 
     rejected_message = next(message for message in batch_messages if message["tool_call_id"] == "c3")
@@ -629,6 +667,7 @@ async def test_append_only_message_history_is_preserved_across_steps() -> None:
 
     fake_llm = FakeLlm(
         [
+            _response(tool_calls=[_plan_call()]),
             _response(tool_calls=[_tool_call("search1", "search_web")]),
             _response(tool_calls=[_tool_call("done1", "conclude")]),
         ]
@@ -945,6 +984,7 @@ class TestProvenanceGate:
         result content) grounds a non-discrepancy finding."""
         fake_llm = FakeLlm(
             [
+                _response(tool_calls=[_plan_call()]),
                 _response(tool_calls=[_tool_call("s1", "search_web", {"query": "minutes"})]),
                 _response(
                     tool_calls=[
@@ -1022,6 +1062,7 @@ class TestProvenanceGate:
         """The same discrepancy is accepted when the URL DID come from a tool."""
         fake_llm = FakeLlm(
             [
+                _response(tool_calls=[_plan_call()]),
                 _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://gov.example/report"})]),
                 _response(
                     tool_calls=[
@@ -1052,6 +1093,7 @@ class TestProvenanceGate:
         normalize to the tool-seen URL, so the finding is grounded."""
         fake_llm = FakeLlm(
             [
+                _response(tool_calls=[_plan_call()]),
                 _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
                 _response(
                     tool_calls=[
@@ -1081,6 +1123,7 @@ class TestProvenanceGate:
         caplog.set_level(logging.WARNING, logger="metaculus_bot.research.agentic.loop")
         fake_llm = FakeLlm(
             [
+                _response(tool_calls=[_plan_call()]),
                 _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
                 _response(
                     tool_calls=[
@@ -1122,6 +1165,7 @@ class TestProvenanceGate:
         tool content does not warn."""
         fake_llm = FakeLlm(
             [
+                _response(tool_calls=[_plan_call()]),
                 _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
                 _response(
                     tool_calls=[
@@ -1177,6 +1221,208 @@ class TestProvenanceGate:
         marker = next(r.getMessage() for r in caplog.records if "GAP_FILL_V2:" in r.getMessage())
         assert "provenance_rejections=1" in marker
         assert "quote_mismatch_warnings=0" in marker
+
+
+class TestResearchPlanGate:
+    """W1: set_research_plan is required before any external tool call. Until it
+    runs, external calls are rejected with a nudge; the plan-nudge cap forces a
+    soft-continue (plan_skipped) so a driver that never plans can't wedge. The
+    plan also emits the GHOST_PRE / GHOST_PRE_JSON pre-research telemetry."""
+
+    @pytest.mark.asyncio
+    async def test_external_tool_before_plan_is_rejected_with_nudge(self) -> None:
+        invoked: list[str] = []
+
+        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            invoked.append(kwargs.get("query", ""))
+            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+        # Turn 1 calls an external tool with no plan set -> rejected. Turn 2 sets
+        # the plan. Turn 3's search then runs. Turn 4 concludes.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("early", "search_web", {"query": "too soon"})]),
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "now allowed"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+        )
+
+        # The premature call was rejected: its handler never ran, and its tool
+        # message carries the plan-required nudge.
+        assert invoked == ["now allowed"]
+        early_message = _tool_messages(result)[0]
+        assert early_message["tool_call_id"] == "early"
+        assert "status: error" in early_message["content"]
+        assert "call set_research_plan first" in early_message["content"]
+        # A rejected pre-plan call is NOT counted against the tool-call budget.
+        assert result.telemetry.per_tool_counts.get("search_web") == 1
+        assert result.telemetry.plan_skipped is False
+        assert "The" not in result.findings_markdown or result.telemetry.findings_count == 0
+
+    @pytest.mark.asyncio
+    async def test_plan_accepted_then_external_tool_runs(self) -> None:
+        invoked: list[str] = []
+
+        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            invoked.append(kwargs.get("query", ""))
+            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "allowed"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+        )
+
+        assert invoked == ["allowed"]
+        assert result.telemetry.plan_gaps == 1
+        assert result.telemetry.plan_skipped is False
+
+    @pytest.mark.asyncio
+    async def test_plan_emits_ghost_pre_json_marker(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The dry-run forecast passed to set_research_plan is logged as GHOST_PRE
+        / GHOST_PRE_JSON — the pre-research counterpart to the concluding ghost."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _plan_call(
+                            gaps=[{"id": "g1", "question": "q?"}],
+                            sensitive_assumptions=["the incumbent runs again", "turnout stays flat"],
+                            dry_run_forecast={"question_type": "binary", "posterior_prob": 0.37},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm, log_prefix="question=https://q/1/ ")
+
+        pre_json_lines = [m.getMessage() for m in caplog.records if "GHOST_PRE_JSON:" in m.getMessage()]
+        assert len(pre_json_lines) == 1
+        blob = pre_json_lines[0].split("GHOST_PRE_JSON:", 1)[1].strip()
+        assert json.loads(blob) == {"qtype": "binary", "prob": 0.37}
+        # The GHOST_PRE summary line carries the plan shape and the question ref.
+        pre_lines = [m.getMessage() for m in caplog.records if "GHOST_PRE:" in m.getMessage()]
+        # GHOST_PRE_JSON also contains "GHOST_PRE" as a substring, so filter it out.
+        pre_summary = [m for m in pre_lines if "GHOST_PRE_JSON:" not in m]
+        assert len(pre_summary) == 1
+        assert "gaps=1" in pre_summary[0]
+        assert "sensitive_assumptions=2" in pre_summary[0]
+        assert "question=https://q/1/" in pre_summary[0]
+
+    @pytest.mark.asyncio
+    async def test_ghost_pre_json_suppressed_when_no_dry_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        """No dry_run_forecast -> the GHOST_PRE summary still fires but the JSON
+        companion is suppressed (nothing to serialize), mirroring the ghost path."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q?"}])]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+
+        assert any("GHOST_PRE:" in m.getMessage() for m in caplog.records)
+        assert not any("GHOST_PRE_JSON:" in m.getMessage() for m in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_plan_nudge_cap_soft_continues_without_plan(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A driver that never plans hits the plan-nudge cap (2), after which the
+        loop soft-continues: the external tool runs un-gated and plan_skipped is
+        logged. This is the anti-wedge guard."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        invoked: list[str] = []
+
+        async def search_web(**kwargs: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            invoked.append(kwargs.get("query", ""))
+            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+        # Three external-only turns: turns 1 and 2 are plan-rejected (2 nudges ==
+        # cap), turn 3 runs un-gated, turn 4 concludes.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("c1", "search_web", {"query": "q1"})]),
+                _response(tool_calls=[_tool_call("c2", "search_web", {"query": "q2"})]),
+                _response(tool_calls=[_tool_call("c3", "search_web", {"query": "q3"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(max_steps=6), llm_call=fake_llm
+        )
+
+        # First two calls were rejected pre-plan; the third ran once the cap
+        # forced a soft-continue.
+        assert invoked == ["q3"]
+        assert result.telemetry.plan_skipped is True
+        assert result.telemetry.plan_gaps == 0
+        marker = next(m.getMessage() for m in caplog.records if "GAP_FILL_V2:" in m.getMessage())
+        assert "plan_skipped=True" in marker
+        assert "plan_gaps=0" in marker
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_gaps_appear_in_budget_line(self) -> None:
+        """After a plan is set, the per-turn budget line lists the plan's gap ids
+        as the driver's outstanding work-list (W1 coarse accounting)."""
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="ran", method="search")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _plan_call(gaps=[{"id": "gap-a", "question": "q1?"}, {"id": "gap-b", "question": "q2?"}])
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "x"})]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "user", [_tool_spec("search_web", search_web)], _config(), llm_call=fake_llm
+        )
+
+        # The search result's budget line carries both gap ids.
+        search_message = _tool_messages(result)[1]
+        budget_line = search_message["content"].splitlines()[-1]
+        assert "unaddressed_gaps=[gap-a, gap-b]" in budget_line
+
+    @pytest.mark.asyncio
+    async def test_gap_list_capped_at_max_gaps(self) -> None:
+        """set_research_plan drops gaps beyond config.max_gaps (the ranked tail),
+        keeping the top-N; plan_gaps reflects the kept count."""
+        gaps = [{"id": f"g{i}", "question": f"q{i}?"} for i in range(6)]
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=gaps)]),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop("system", "user", [], _config(max_tool_calls=14), llm_call=fake_llm)
+
+        # Default max_gaps is 4; only the top 4 survive.
+        assert result.telemetry.plan_gaps == 4
+        plan_message = _tool_messages(result)[0]
+        assert "kept the top 4 of 6 gaps" in plan_message["content"]
 
 
 class TestNormalizeUrl:
