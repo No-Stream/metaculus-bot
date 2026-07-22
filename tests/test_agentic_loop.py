@@ -2121,6 +2121,94 @@ class TestConcludeGate:
         assert "conclude_gate_rejections=1" in marker
 
 
+class TestActionsCiteFetch:
+    """F2: the per-gap fetch-floor self-report clause matches fetch/read verbs on
+    word boundaries. A bare substring test fired on "already"/"spread" (contain
+    "read") and on the honest failed-fetch note "could not fetch the source" —
+    both cleared the floor with zero real retrievals."""
+
+    def test_narration_words_containing_read_do_not_clear(self) -> None:
+        from metaculus_bot.research.agentic.loop import _actions_cite_fetch
+
+        for phrase in (
+            "already covered by the briefing",
+            "spread the estimates across scenarios",
+            "the thread was inconclusive",
+            "ready to conclude",
+            "readily available in the digest",
+        ):
+            assert _actions_cite_fetch(phrase) is False, phrase
+
+    def test_failed_or_attempted_fetch_note_does_not_clear(self) -> None:
+        from metaculus_bot.research.agentic.loop import _actions_cite_fetch
+
+        for phrase in (
+            "could not fetch the primary source",
+            "tried to fetch but it 403'd",
+            "will fetch next run",
+        ):
+            assert _actions_cite_fetch(phrase) is False, phrase
+
+    def test_real_fetch_read_mentions_clear(self) -> None:
+        from metaculus_bot.research.agentic.loop import _actions_cite_fetch
+
+        for phrase in (
+            "read the PDF and confirmed the figure",
+            "fetched the release",
+            "fetches the dataset and cross-checked",
+            "fetching the report resolved it",
+            "used read_document on the filing",
+            "reads the appendix table",
+        ):
+            assert _actions_cite_fetch(phrase) is True, phrase
+
+
+class TestFetchFloorCountsSuccessfulRetrievals:
+    """F4: the global fetch-floor clause counts successful fetched-tier
+    retrievals (url_best_tier), not fetch/read tool CALLS. per_tool_counts
+    increments at accept time regardless of outcome, so two 403'd fetches would
+    otherwise clear the floor though they reached nothing — the 131.3 mechanism."""
+
+    @pytest.mark.asyncio
+    async def test_two_blocked_fetches_do_not_clear_the_global_floor(self) -> None:
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            # Both fetches 403 (status=blocked): no fetched tier is granted, so
+            # url_best_tier stays empty and the global floor is unmet.
+            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")  # noqa: ASYNC910
+
+        # One gap; the accounting cites "searched" (no fetch verb), so the per-gap
+        # clause fails too. With two fetch CALLS but zero successful retrievals,
+        # the conclude must be rejected on the fetch floor.
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}])]),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example"}),
+                        _tool_call("f2", "fetch", {"url": "https://b.example"}),
+                    ]
+                ),
+                _response(
+                    tool_calls=[_tool_call("c1", "conclude", {"gap_accounting": _accounting("g1", actions="searched")})]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("fetch", fetch)],
+            _config(max_steps=6, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        conclude_message = _tool_messages(result)[-1]
+        assert "fetch floor unmet" in conclude_message["content"]
+        # made 0 — the two calls happened but neither retrieved a primary source.
+        assert "made 0" in conclude_message["content"]
+
+
 class TestNormalizeUrl:
     def test_lowercases_scheme_and_host_only(self) -> None:
         from metaculus_bot.research.agentic.loop import _normalize_url

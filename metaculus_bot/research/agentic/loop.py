@@ -726,10 +726,19 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
 
 # Fetch floor (W2, clause c): the run must reach primary sources, not stop at
 # search snippets. The global fallback clause is satisfied at this many
-# fetch+read_document calls; the per-gap clause reads the driver's own
+# successful fetched-tier retrievals; the per-gap clause reads the driver's own
 # actions_taken note for a fetch/read mention.
 _FETCH_FLOOR_MIN_CALLS = 2
-_FETCH_ACTION_MARKERS = ("fetch", "read")
+# Word-boundary match on fetch/read verbs so common narration words don't count:
+# a bare substring "read" fired on "already"/"spread"/"thread"/"ready", and
+# "could not fetch the source" (an honest failed-fetch note) satisfied the floor
+# with zero real retrievals (F2). \b anchors kill the "read"-in-a-word matches;
+# the fetch verb is required CONJUGATED (fetched/fetches/fetching) so bare
+# present-tense "fetch" — overwhelmingly negated/attempted ("could not fetch",
+# "try to fetch") in a past-actions note — doesn't clear, while any real
+# completed fetch/read mention still does. (bare `read` stays: its past tense is
+# spelled identically, so "read the PDF" must count.)
+_FETCH_ACTION_RE = re.compile(r"\b(?:fetch(?:ed|es|ing)|read(?:s|ing|_document)?)\b", re.IGNORECASE)
 
 
 def _external_tool_call_count(state: _LoopState) -> int:
@@ -756,9 +765,9 @@ def _coerce_gap_accounting(raw_accounting: Any) -> list[GapAccountingEntry]:
 def _actions_cite_fetch(actions_taken: str) -> bool:
     """True when the driver's free-text ``actions_taken`` mentions fetching or
     reading a source (the fetch floor's lenient per-gap self-report clause; the
-    telemetry-based clause is the robust one)."""
-    text = actions_taken.lower()
-    return any(marker in text for marker in _FETCH_ACTION_MARKERS)
+    telemetry-based clause is the robust one). Matches fetch/read verbs on word
+    boundaries so "already"/"spread"/"could not fetch" don't false-positive."""
+    return bool(_FETCH_ACTION_RE.search(actions_taken))
 
 
 def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -> list[str]:
@@ -788,11 +797,18 @@ def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -
             "research each gap at least once before concluding"
         )
 
-    fetches_reads = state.telemetry.per_tool_counts.get("fetch", 0) + state.telemetry.per_tool_counts.get(
-        "read_document", 0
-    )
+    # Count only successfully-retrieved primary sources, not fetch/read tool
+    # CALLS: per_tool_counts increments at accept time regardless of outcome, so
+    # two 403'd fetches would clear the floor though they reached nothing — the
+    # exact 131.3 mechanism, and exactly what W4's tier map already excludes
+    # (url_best_tier is populated only from status=="ok" fetched-class outcomes).
+    # Reusing it makes W2's "fetched" agree with W4's (F4). (Distinct URLs, so a
+    # single page fetched twice counts once — the intent is breadth of primary
+    # sources reached.)
+    fetches_reads = sum(1 for tier in state.url_best_tier.values() if tier == "fetched")
     entry_by_id = {entry.gap_id: entry for entry in entries}
-    top_gaps = gaps[:2]
+    # Top-2 ranked gaps: a finite-N fetch-floor clause, not subsampling.
+    top_gaps = gaps[:2]  # HARNESS-SCAN-EXEMPT-subsampling
     top_cite_fetch = bool(top_gaps) and all(
         gap.id in entry_by_id and _actions_cite_fetch(entry_by_id[gap.id].actions_taken) for gap in top_gaps
     )
