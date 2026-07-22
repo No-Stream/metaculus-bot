@@ -55,7 +55,7 @@ def render_findings(findings: list[Finding], pending_leads: list[str]) -> str:
         lines.append("")
         lines.append("### ⚠ Corrections to the briefing")
         lines.append(
-            "The verified findings below contradict the research briefing and supersede the corresponding briefing content."
+            "The sourced findings below contradict the research briefing and supersede the corresponding briefing content."
         )
         lines.append("")
         for finding in corrections:

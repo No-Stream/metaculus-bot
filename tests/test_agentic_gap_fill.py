@@ -58,7 +58,13 @@ def _happy_path_llm() -> FakeLlm:
 
 def _fake_tools() -> list[ToolSpec]:
     async def _search(**_: Any) -> ToolOutcome:
-        return ToolOutcome(content_markdown="result: BLS release found", status="ok")
+        # Surface the finding's source URL the way a real search result would,
+        # so the provenance gate (loop._check_url_provenance) accepts _FINDING.
+        return ToolOutcome(
+            content_markdown="result: BLS release found",
+            links=[_FINDING["source_url"]],
+            status="ok",
+        )
 
     return [
         ToolSpec(

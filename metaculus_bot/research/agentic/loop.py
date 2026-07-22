@@ -4,10 +4,12 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
@@ -38,6 +40,82 @@ _INTERNAL_TOOL_TIMEOUT_S = 5.0
 _INTERNAL_TOOL_NAMES = ("record_findings", "conclude")
 _NUDGE = "call conclude or use tools"
 
+# Provenance gate (source_url grounding + quote spot-check). A finding is
+# rendered under a "supersedes-the-briefing" banner and shown to every base
+# forecaster, so a hallucinated/mistyped citation from the low-effort driver
+# would silently override correct research. The URL check is a HARD gate; the
+# quote check is WARN-ONLY (read_document paraphrases and ellipsis-joined
+# quotes make a hard quote gate too false-positive-prone). The banner says
+# "sourced" (not "verified") because only the URL is gated — see artifact.py.
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+_URL_TRAILING_PUNCT = ".,;:)]}>\"'"
+_TRACKER_PARAM_PREFIXES = ("utm_",)
+_TRACKER_PARAM_NAMES = frozenset({"gclid", "fbclid", "mc_cid", "mc_eid", "ref", "ref_src", "igshid", "spm"})
+# All straight/curly quote glyphs and backticks collapse to one token so a
+# driver quote using curly quotes still matches straight-quoted source text.
+_QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_url(url: str) -> str | None:
+    """Canonicalize a URL for provenance comparison.
+
+    Lowercases scheme + host, drops the fragment, strips a trailing slash from
+    the path, and removes common tracker query params (``utm_*``, ``gclid``,
+    ``fbclid``, ...). Returns ``None`` for non-http(s) or unparseable input, so
+    those never count as provenance.
+    """
+    candidate = url.strip().rstrip(_URL_TRAILING_PUNCT)
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        return None
+    host = parts.netloc.lower()
+    if not host:
+        return None
+    path = parts.path.rstrip("/")
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith(_TRACKER_PARAM_PREFIXES) and key.lower() not in _TRACKER_PARAM_NAMES
+    ]
+    return urlunsplit((scheme, host, path, urlencode(kept_params), ""))
+
+
+def _iter_normalized_urls(text: str) -> Iterator[str]:
+    """Yield the normalized form of every http(s) URL found in free text."""
+    for match in _URL_IN_TEXT_RE.finditer(text):
+        normalized = _normalize_url(match.group(0))
+        if normalized is not None:
+            yield normalized
+
+
+def _normalize_quote_text(text: str) -> str:
+    """Lowercase, collapse whitespace, and unify quote glyphs for substring matching."""
+    return _WHITESPACE_RE.sub(" ", _QUOTE_GLYPHS_RE.sub("'", text)).strip().lower()
+
+
+def _quote_is_grounded(quote: str, tool_content_normalized: str) -> bool:
+    """True when the finding's quote appears (normalized) in the tool contents.
+
+    An empty quote is treated as grounded — there is nothing to verify.
+    """
+    normalized_quote = _normalize_quote_text(quote)
+    if not normalized_quote:
+        return True
+    return normalized_quote in tool_content_normalized
+
+
+class _FindingsValidation(NamedTuple):
+    accepted: list[Finding]
+    rejected: list[str]
+    lint_rejections: int
+    provenance_rejections: int
+    quote_mismatch_warnings: int
+
 
 @dataclass(slots=True)
 class _LoopState:
@@ -52,6 +130,17 @@ class _LoopState:
     seen_finding_keys: set[str] = field(default_factory=set)
     pending_leads: list[str] = field(default_factory=list)
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
+    # Provenance gate accumulators (see the _normalize_url block). Normalized
+    # URLs the driver actually saw via a TOOL this run — fetch/read call
+    # arguments plus every URL in a tool result's content/links. Discrepancy
+    # findings must cite one of these (a fresh primary-source check).
+    tool_seen_urls: set[str] = field(default_factory=set)
+    # Normalized URLs embedded in the frozen briefing bundle. Non-discrepancy
+    # findings may cite these too; discrepancies may NOT.
+    briefing_urls: set[str] = field(default_factory=set)
+    # Concatenated, normalized tool-result contents — the corpus the warn-only
+    # quote spot-check searches.
+    tool_content_normalized: str = ""
     nudged_for_no_action: bool = False
     explicit_conclude: bool = False
     stop_loop: bool = False
@@ -70,6 +159,13 @@ class _ToolExecutionResult:
     tool_name: str
     content: str
     method: str = ""
+    # Provenance harvested from an EXTERNAL tool call (never internal
+    # record_findings/conclude, whose echoed rejection text would otherwise let
+    # a hallucinated URL launder itself into the seen-set): the normalized URLs
+    # the driver saw/requested this call, and the normalized result text the
+    # warn-only quote check searches. Accumulated into loop state post-gather.
+    provenance_urls: list[str] = field(default_factory=list)
+    provenance_text: str = ""
 
 
 def _tool_schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -248,19 +344,50 @@ def _parse_arguments(arguments: str) -> dict[str, Any]:
     return parsed
 
 
+def _check_url_provenance(finding: Finding, state: _LoopState) -> str | None:
+    """Return a rejection reason if the finding's source_url isn't grounded, else None.
+
+    A non-discrepancy finding is grounded when its normalized URL appears
+    anywhere the driver could have seen it — a tool result this run OR the
+    frozen briefing. A discrepancy finding must rest on a fresh primary-source
+    check (per the driver prompt), so only a TOOL-sourced URL counts; a
+    briefing-embedded URL does not.
+    """
+    normalized = _normalize_url(finding.source_url)
+    if normalized is None:
+        return f"source_url {finding.source_url!r} is not a valid http(s) URL"
+    if normalized in state.tool_seen_urls:
+        return None
+    if finding.discrepancy:
+        return (
+            f"discrepancy source_url {finding.source_url!r} was not seen in any tool result this run; "
+            "a discrepancy must rest on a fresh primary-source check (search/fetch/read), "
+            "not a URL already in the briefing"
+        )
+    if normalized in state.briefing_urls:
+        return None
+    return (
+        f"source_url {finding.source_url!r} did not appear in any tool result or the briefing this run; "
+        "cite a URL you actually retrieved"
+    )
+
+
 def _validate_findings_payload(
     raw_findings: Any,
+    state: _LoopState,
     *,
     label: Literal["findings", "final_findings"],
-) -> tuple[list[Finding], list[str], int]:
+) -> _FindingsValidation:
     if raw_findings is None:
-        return [], [], 0
+        return _FindingsValidation([], [], 0, 0, 0)
     if not isinstance(raw_findings, list):
-        return [], [f"{label} must be a list"], 0
+        return _FindingsValidation([], [f"{label} must be a list"], 0, 0, 0)
 
     accepted: list[Finding] = []
     rejected: list[str] = []
     lint_rejections = 0
+    provenance_rejections = 0
+    quote_mismatch_warnings = 0
     for index, raw_finding in enumerate(raw_findings):
         try:
             finding = Finding.model_validate(raw_finding)
@@ -272,8 +399,22 @@ def _validate_findings_payload(
             lint_rejections += 1
             rejected.append(f"{label}[{index}] rejected: {'; '.join(violations)}")
             continue
+        provenance_reason = _check_url_provenance(finding, state)
+        if provenance_reason is not None:
+            provenance_rejections += 1
+            rejected.append(f"{label}[{index}] rejected: {provenance_reason}")
+            continue
+        # WARN-ONLY quote spot-check: a miss is logged and counted but the
+        # finding is still accepted (read_document paraphrases, ellipsis joins).
+        if not _quote_is_grounded(finding.quote, state.tool_content_normalized):
+            quote_mismatch_warnings += 1
+            logger.warning(
+                "GAP_FILL_V2 quote_mismatch: source_url=%s quote=%r not found verbatim in tool contents",
+                finding.source_url,
+                finding.quote,
+            )
         accepted.append(finding)
-    return accepted, rejected, lint_rejections
+    return _FindingsValidation(accepted, rejected, lint_rejections, provenance_rejections, quote_mismatch_warnings)
 
 
 def _coerce_pending_leads(raw_pending_leads: Any) -> tuple[list[str], list[str]]:
@@ -317,37 +458,41 @@ def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int
     return banked, duplicates
 
 
+def _apply_findings_telemetry(state: _LoopState, validation: _FindingsValidation) -> None:
+    state.telemetry.lint_rejections += validation.lint_rejections
+    state.telemetry.provenance_rejections += validation.provenance_rejections
+    state.telemetry.quote_mismatch_warnings += validation.quote_mismatch_warnings
+
+
 async def _record_findings_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOutcome:
-    accepted, rejected, lint_rejections = _validate_findings_payload(arguments.get("findings"), label="findings")
-    banked, duplicates = _bank_findings(state, accepted)
-    state.telemetry.lint_rejections += lint_rejections
+    validation = _validate_findings_payload(arguments.get("findings"), state, label="findings")
+    banked, duplicates = _bank_findings(state, validation.accepted)
+    _apply_findings_telemetry(state, validation)
 
     lines = [f"Recorded {banked} finding(s)."]
     if duplicates:
         lines.append(f"Skipped {duplicates} finding(s) already recorded earlier in this run.")
-    if rejected:
+    if validation.rejected:
         lines.append("Rejected:")
-        lines.extend(f"- {item}" for item in rejected)
+        lines.extend(f"- {item}" for item in validation.rejected)
     return ToolOutcome(content_markdown="\n".join(lines), method="internal")
 
 
 async def _conclude_tool(state: _LoopState, arguments: dict[str, Any]) -> ToolOutcome:
-    accepted, rejected, lint_rejections = _validate_findings_payload(
-        arguments.get("final_findings"), label="final_findings"
-    )
+    validation = _validate_findings_payload(arguments.get("final_findings"), state, label="final_findings")
     pending_leads, pending_errors = _coerce_pending_leads(arguments.get("pending_leads"))
-    banked, duplicates = _bank_findings(state, accepted)
+    banked, duplicates = _bank_findings(state, validation.accepted)
     state.pending_leads = pending_leads
-    state.telemetry.lint_rejections += lint_rejections
+    _apply_findings_telemetry(state, validation)
     state.explicit_conclude = True
     state.stop_loop = True
 
     lines = [f"Concluded with {banked} final finding(s) and {len(pending_leads)} pending lead(s)."]
     if duplicates:
         lines.append(f"Skipped {duplicates} final finding(s) already recorded earlier in this run.")
-    if rejected or pending_errors:
+    if validation.rejected or pending_errors:
         lines.append("Rejected:")
-        lines.extend(f"- {item}" for item in [*rejected, *pending_errors])
+        lines.extend(f"- {item}" for item in [*validation.rejected, *pending_errors])
     return ToolOutcome(content_markdown="\n".join(lines), method="internal")
 
 
@@ -424,12 +569,40 @@ async def _execute_one_tool_call(
             status="error",
         )
 
+    provenance_urls, provenance_text = _harvest_provenance(tool_call.name, arguments, outcome)
     return _ToolExecutionResult(
         tool_call_id=tool_call.id,
         tool_name=tool_call.name,
         content=_format_tool_content(tool_call.name, outcome, config.max_result_chars),
         method=outcome.method,
+        provenance_urls=provenance_urls,
+        provenance_text=provenance_text,
     )
+
+
+def _harvest_provenance(tool_name: str, arguments: dict[str, Any], outcome: ToolOutcome) -> tuple[list[str], str]:
+    """Collect the normalized URLs and result text a single EXTERNAL tool call surfaced.
+
+    Internal bookkeeping tools contribute nothing: their echoed content restates
+    the driver's own rejected findings, so harvesting them would let a
+    hallucinated URL launder itself into ``tool_seen_urls``.
+    """
+    if tool_name in _INTERNAL_TOOL_NAMES:
+        return [], ""
+    urls: list[str] = []
+    # (a) URLs the driver requested/saw — fetch/read take a `url` argument;
+    # scan every string arg value so a URL typed into a query counts too.
+    for value in arguments.values():
+        if isinstance(value, str):
+            urls.extend(_iter_normalized_urls(value))
+    # (b) URLs embedded in the result content and the outcome's link list
+    # (search results carry their source URLs there).
+    urls.extend(_iter_normalized_urls(outcome.content_markdown))
+    for link in outcome.links:
+        normalized = _normalize_url(link)
+        if normalized is not None:
+            urls.append(normalized)
+    return urls, outcome.content_markdown
 
 
 def _normalized_call_key(tool_call: _ToolCall) -> tuple[str, str]:
@@ -502,9 +675,20 @@ async def _execute_tool_batch(
     results = await asyncio.gather(
         *[_execute_one_tool_call(tool_call, tools_by_name, state, config) for tool_call in accepted]
     )
+    provenance_texts: list[str] = []
     for result in results:
         if result.method == "rendered":
             state.telemetry.rendered_fetches += 1
+        # Accumulate provenance so a LATER turn's record_findings/conclude can
+        # verify a finding's source_url against what the driver actually
+        # retrieved. Internal tools contribute nothing (see _harvest_provenance).
+        state.tool_seen_urls.update(result.provenance_urls)
+        if result.provenance_text:
+            provenance_texts.append(result.provenance_text)
+    if provenance_texts:
+        state.tool_content_normalized = _normalize_quote_text(
+            f"{state.tool_content_normalized} {' '.join(provenance_texts)}"
+        )
     results_by_id = {result.tool_call_id: result for result in results}
 
     # Exactly one tool message per tool_call_id, in the assistant's original
@@ -548,7 +732,7 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     logger.info(
         "%sGAP_FILL_V2: model=%s steps=%s tool_calls=%s searches=%s fetches=%s rendered=%s reads=%s "
         "dup_tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
-        "pending_leads=%s lint_rejections=%s",
+        "pending_leads=%s lint_rejections=%s provenance_rejections=%s quote_mismatch_warnings=%s",
         log_prefix,
         state.telemetry.model,
         state.telemetry.steps,
@@ -564,6 +748,8 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         len(state.findings),
         len(state.pending_leads),
         state.telemetry.lint_rejections,
+        state.telemetry.provenance_rejections,
+        state.telemetry.quote_mismatch_warnings,
     )
 
 
@@ -730,6 +916,12 @@ async def run_agentic_loop(
         deadline_at_s=now_fn() + config.wall_deadline_s,
     )
     state.telemetry.model = config.model
+    # Seed the provenance sets from the frozen brief: its embedded URLs
+    # (resolution-source snapshot, market snapshot, AskNews digests) are things
+    # the driver saw, so a NON-discrepancy finding may cite them. The system
+    # prompt is a fixed template that embeds no question URLs. A discrepancy
+    # finding may NOT lean on these — see _check_url_provenance.
+    state.briefing_urls = set(_iter_normalized_urls(user_brief))
 
     try:
         return await asyncio.wait_for(

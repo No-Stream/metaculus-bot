@@ -313,7 +313,9 @@ async def test_deadline_mid_tool_still_returns_banked_findings() -> None:
 
     result = await run_agentic_loop(
         "system",
-        "user",
+        # Briefing embeds the cited URL, so the finding is provenance-grounded
+        # (a non-discrepancy finding may cite a briefing URL).
+        "briefing cites https://example.com/statute",
         [_tool_spec("slow_tool", slow_tool, timeout_s=1.0)],
         _config(wall_deadline_s=0.05, max_steps=2),
         llm_call=fake_llm,
@@ -381,7 +383,11 @@ async def test_record_findings_rejects_lint_and_banks_clean_findings() -> None:
         ]
     )
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+    # Briefing embeds the clean finding's URL so it clears the provenance gate;
+    # the lint rejection is what this test exercises.
+    result = await run_agentic_loop(
+        "system", "briefing cites https://example.com/good", [], _config(), llm_call=fake_llm
+    )
 
     assert "The board published the minutes." in result.findings_markdown
     assert "This likely resolves soon." not in result.findings_markdown
@@ -420,7 +426,9 @@ async def test_findings_recorded_then_relisted_in_conclude_are_not_duplicated() 
         ]
     )
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+    result = await run_agentic_loop(
+        "system", "briefing cites https://example.com/un and https://example.com/nasa", [], _config(), llm_call=fake_llm
+    )
 
     md = result.findings_markdown
     assert md.count("The UN projects a population peak") == 1
@@ -448,7 +456,9 @@ async def test_findings_sharing_source_but_distinct_claim_are_both_kept() -> Non
         ]
     )
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+    result = await run_agentic_loop(
+        "system", "briefing cites https://example.com/nasa", [], _config(), llm_call=fake_llm
+    )
 
     assert result.telemetry.findings_count == 2
     assert "NEO Surveyor" in result.findings_markdown
@@ -507,7 +517,11 @@ async def test_external_tool_bind_error_extra_key_becomes_error_and_loop_continu
     )
 
     result = await run_agentic_loop(
-        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+        "system",
+        "briefing cites https://example.com",
+        [_tool_spec("strict_tool", strict_tool)],
+        _config(),
+        llm_call=fake_llm,
     )
 
     assert result.telemetry.steps == 3  # loop ran all three turns — no abort
@@ -538,7 +552,11 @@ async def test_external_tool_bind_error_missing_key_becomes_error_and_loop_conti
     )
 
     result = await run_agentic_loop(
-        "system", "user", [_tool_spec("strict_tool", strict_tool)], _config(), llm_call=fake_llm
+        "system",
+        "briefing cites https://example.com",
+        [_tool_spec("strict_tool", strict_tool)],
+        _config(),
+        llm_call=fake_llm,
     )
 
     assert result.telemetry.steps == 3
@@ -579,7 +597,7 @@ async def test_batch_clamped_to_remaining_budget_rejects_overflow_external_calls
 
     result = await run_agentic_loop(
         "system",
-        "user",
+        "briefing cites https://example.com",
         [_tool_spec("search_web", search_web)],
         _config(max_tool_calls=2),
         llm_call=fake_llm,
@@ -654,7 +672,9 @@ async def test_soft_fail_preserves_banked_findings_on_broken_llm_response() -> N
         ]
     )
 
-    result = await run_agentic_loop("system", "user", [], _config(), llm_call=fake_llm)
+    result = await run_agentic_loop(
+        "system", "briefing cites https://example.com/bulletin", [], _config(), llm_call=fake_llm
+    )
 
     assert "The agency released the bulletin." in result.findings_markdown
     assert result.ghost is None
@@ -863,3 +883,318 @@ async def test_ghost_phase_numeric_emits_no_qtype_mismatch_warnings(caplog: pyte
 
     assert result.ghost is not None and result.ghost.qtype == "numeric"
     assert [r for r in caplog.records if "question_type mismatch" in r.getMessage()] == []
+
+
+def _finding(source_url: str, *, quote: str = "Verbatim quote from the source.", discrepancy: bool = False) -> dict:
+    return {
+        "claim": "The board published the minutes on July 1.",
+        "source_url": source_url,
+        "quote": quote,
+        "date": "2026-07-01",
+        "retrieved_how": "fetch",
+        "topic": "minutes",
+        "discrepancy": discrepancy,
+    }
+
+
+def _search_returning(content: str, links: list[str] | None = None):
+    async def _search(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        return ToolOutcome(content_markdown=content, links=links or [], method="search")  # noqa: ASYNC910
+
+    return _search
+
+
+class TestProvenanceGate:
+    """Tier-1 hard URL gate + Tier-2 warn-only quote check on agentic findings.
+
+    A finding is rendered under a "supersedes-the-briefing" banner shown to
+    every base forecaster, so a hallucinated/mistyped citation from the
+    low-effort driver would silently override correct research. The URL check is
+    a hard gate; the quote check only warns."""
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_url_is_rejected_and_counted(self) -> None:
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://hallucinated.example/nowhere")]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop("system", "briefing with no URLs", [], _config(), llm_call=fake_llm)
+
+        assert "The board published the minutes" not in result.findings_markdown
+        assert result.telemetry.findings_count == 0
+        assert result.telemetry.provenance_rejections == 1
+        # The rejection reason is fed back through the existing "Rejected:" channel.
+        rejection = _tool_messages(result)[0]["content"]
+        assert "findings[0] rejected" in rejection
+        assert "did not appear in any tool result or the briefing" in rejection
+
+    @pytest.mark.asyncio
+    async def test_url_from_tool_result_is_accepted(self) -> None:
+        """A URL the driver retrieved via a tool (here, embedded in search
+        result content) grounds a non-discrepancy finding."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "minutes"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://agency.example/minutes")]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("Found it at https://agency.example/minutes — details follow.")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert "The board published the minutes" in result.findings_markdown
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.provenance_rejections == 0
+
+    @pytest.mark.asyncio
+    async def test_briefing_url_accepted_for_non_discrepancy(self) -> None:
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _tool_call("rec1", "record_findings", {"findings": [_finding("https://gov.example/report")]})
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing cites https://gov.example/report as a source", [], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.provenance_rejections == 0
+
+    @pytest.mark.asyncio
+    async def test_briefing_only_url_rejected_for_discrepancy(self) -> None:
+        """A discrepancy must rest on a fresh primary-source check, so a URL that
+        appears ONLY in the briefing (never in a tool result) does not ground it."""
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://gov.example/report", discrepancy=True)]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing cites https://gov.example/report as a source", [], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 0
+        assert result.telemetry.provenance_rejections == 1
+        rejection = _tool_messages(result)[0]["content"]
+        assert "discrepancy source_url" in rejection
+        assert "fresh primary-source check" in rejection
+
+    @pytest.mark.asyncio
+    async def test_tool_sourced_url_accepted_for_discrepancy(self) -> None:
+        """The same discrepancy is accepted when the URL DID come from a tool."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://gov.example/report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://gov.example/report", discrepancy=True)]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        # The fetch's URL ARGUMENT is what the driver saw — enough to ground it,
+        # even though the result body carries no URL.
+        fetch = _search_returning("The report body, no links here.")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("fetch", fetch)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.provenance_rejections == 0
+
+    @pytest.mark.asyncio
+    async def test_url_variant_normalizes_to_seen_url_and_is_accepted(self) -> None:
+        """Trailing slash, utm params, and a fragment on the cited URL all
+        normalize to the tool-seen URL, so the finding is grounded."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://Agency.example/report/?utm_source=news#section-2")]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("See https://agency.example/report for the figures.")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.provenance_rejections == 0
+
+    @pytest.mark.asyncio
+    async def test_quote_mismatch_warns_but_accepts(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A quote not found in the tool contents is warn-only: the finding is
+        still accepted, quote_mismatch_warnings increments, and a WARN is logged."""
+        caplog.set_level(logging.WARNING, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="A sentence that never appears in the tool result body.",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("See https://agency.example/report — the body says something else entirely.")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1  # accepted despite the quote miss
+        assert result.telemetry.provenance_rejections == 0
+        assert result.telemetry.quote_mismatch_warnings == 1
+        assert any(
+            "GAP_FILL_V2 quote_mismatch" in r.getMessage()
+            for r in caplog.records
+            if r.name == "metaculus_bot.research.agentic.loop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_quote_found_in_tool_content_emits_no_warning(self) -> None:
+        """A quote present (modulo whitespace/quote-glyph normalization) in the
+        tool content does not warn."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="The rate was 4.1 percent.",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        # Curly quotes + extra whitespace in the source still match the finding.
+        search = _search_returning(
+            "https://agency.example/report says:  “The rate   was 4.1 percent.”  Full text follows."
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_provenance_counters_surface_in_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://hallucinated.example/nowhere")]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+
+        await run_agentic_loop("system", "briefing with no URLs", [], _config(), llm_call=fake_llm)
+
+        marker = next(r.getMessage() for r in caplog.records if "GAP_FILL_V2:" in r.getMessage())
+        assert "provenance_rejections=1" in marker
+        assert "quote_mismatch_warnings=0" in marker
+
+
+class TestNormalizeUrl:
+    def test_lowercases_scheme_and_host_only(self) -> None:
+        from metaculus_bot.research.agentic.loop import _normalize_url
+
+        assert _normalize_url("HTTPS://Example.COM/Path") == "https://example.com/Path"
+
+    def test_strips_trailing_slash_fragment_and_trackers(self) -> None:
+        from metaculus_bot.research.agentic.loop import _normalize_url
+
+        assert (
+            _normalize_url("https://example.com/report/?utm_source=x&id=7&gclid=abc#frag")
+            == "https://example.com/report?id=7"
+        )
+
+    def test_rejects_non_http_scheme(self) -> None:
+        from metaculus_bot.research.agentic.loop import _normalize_url
+
+        assert _normalize_url("ftp://example.com/file") is None
+        assert _normalize_url("not a url") is None

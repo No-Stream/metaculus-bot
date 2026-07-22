@@ -70,7 +70,7 @@ def test_render_findings_hoists_discrepancies_to_corrections_block_first() -> No
     assert "### ⚠ Corrections to the briefing" in rendered
     assert rendered.index("### ⚠ Corrections to the briefing") < rendered.index("### labor")
     assert (
-        "The verified findings below contradict the research briefing and supersede the corresponding briefing content."
+        "The sourced findings below contradict the research briefing and supersede the corresponding briefing content."
         in rendered
     )
     assert "The briefing says the rate is 7%, but the source says 5.2%." in rendered

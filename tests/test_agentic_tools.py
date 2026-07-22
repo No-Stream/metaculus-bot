@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -619,6 +620,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
 
     async def blocking_read(resp: object, label: str) -> bytes:
         events.append("plain_read_started")
@@ -658,7 +660,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
             return None
 
     class FakeChromium:
-        async def launch(self, *, headless: bool) -> FakeBrowser:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
             return FakeBrowser()
 
     class FakePlaywrightManager:
@@ -771,7 +773,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             return None
 
     class FakeChromium:
-        async def launch(self, *, headless: bool) -> FakeBrowser:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
             assert headless is True
             return FakeBrowser()
 
@@ -784,6 +786,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: RecordingSemaphore())
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
@@ -845,7 +848,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
             return None
 
     class FakeChromium:
-        async def launch(self, *, headless: bool) -> FakeBrowser:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
             nonlocal live, peak
             live += 1
             peak = max(peak, live)
@@ -866,6 +869,9 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
+    monkeypatch.setattr(
+        agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("host.example.com", "93.184.216.34"))
+    )
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -952,7 +958,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
             return None
 
     class FakeChromium:
-        async def launch(self, *, headless: bool) -> FakeBrowser:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
             return FakeBrowser()
 
     class FakePlaywrightManager:
@@ -967,6 +973,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     async def fake_is_public(url: str) -> bool:
         return "169.254.169.254" not in url
 
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
     monkeypatch.setattr(
@@ -984,6 +991,199 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     assert aborted == [("http://169.254.169.254/latest/meta-data/", "blockedbyclient")]
     assert "169.254.169.254" not in outcome.text
     assert outcome.text == "public content only"
+
+
+def _addrinfo(ip: str) -> list[tuple[Any, ...]]:
+    """A minimal getaddrinfo return; only sockaddr[0] (the IP string) is read."""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+
+def _addrinfo6(ip: str) -> list[tuple[Any, ...]]:
+    """IPv6 getaddrinfo return; sockaddr is (ip, port, flowinfo, scopeid)."""
+    return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, 0, 0, 0))]
+
+
+def test_host_resolver_rule_ipv4_is_bare() -> None:
+    assert agentic_tools._host_resolver_rule("example.com", "93.184.216.34") == (
+        "--host-resolver-rules=MAP example.com 93.184.216.34"
+    )
+
+
+def test_host_resolver_rule_ipv6_is_bracketed() -> None:
+    # Chromium's rule parser requires IPv6 literals bracketed in the MAP target.
+    assert agentic_tools._host_resolver_rule("example.com", "2606:2800:220:1:248:1893:25c8:1946") == (
+        "--host-resolver-rules=MAP example.com [2606:2800:220:1:248:1893:25c8:1946]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_public_ip_returns_host_and_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("93.184.216.34")))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_private_ip_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("10.0.0.5")))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://internal.example.com/page") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_link_local_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The Azure IMDS / cloud-metadata address is link-local — must fail closed.
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("169.254.169.254")))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://rebind.example.com/page") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_rejects_when_any_address_disallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A rebinding host that resolves to BOTH a public and a private IP must be
+    # rejected wholesale (same stance as the aiohttp preflight/FilteringResolver).
+    mixed = _addrinfo("93.184.216.34") + _addrinfo("127.0.0.1")
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=mixed))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://mixed.example.com/page") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_ipv6_public_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo6("2606:2800:220:1:248:1893:25c8:1946")))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://v6.example.com/page") == (
+        "v6.example.com",
+        "2606:2800:220:1:248:1893:25c8:1946",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_ip_literal_public_pins_to_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An IP-literal host needs no DNS; getaddrinfo must not even be consulted.
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
+
+    assert await agentic_tools._resolve_pinned_host("https://93.184.216.34/page") == ("93.184.216.34", "93.184.216.34")
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_ip_literal_private_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=AssertionError("getaddrinfo must not run")))
+
+    assert await agentic_tools._resolve_pinned_host("http://127.0.0.1/latest/meta-data/") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_userinfo_and_scheme_fail_closed() -> None:
+    # Userinfo defeats hostname trust; non-http(s) schemes are never fetched.
+    assert await agentic_tools._resolve_pinned_host("https://trusted@169.254.169.254/") is None
+    assert await agentic_tools._resolve_pinned_host("ftp://example.com/x") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=socket.gaierror("no such host")))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    assert await agentic_tools._resolve_pinned_host("https://nxdomain.example.com/page") is None
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vetting fails (disallowed / unresolvable host) → Chromium is NOT launched
+    and the rung returns the graceful-failure ``None`` the ladder degrades on."""
+    launched: list[Any] = []
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> Any:
+            launched.append(args)
+            raise AssertionError("Chromium must not launch for a non-pinnable host")
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=None))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
+
+    assert outcome is None
+    assert launched == []
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vetting succeeds → Chromium launches with a ``--host-resolver-rules=MAP``
+    arg pinning the main-frame host to exactly the vetted public IP."""
+    launch_args: list[list[str] | None] = []
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>Rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
+            launch_args.append(args)
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setitem(
+        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+    )
+
+    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
+
+    assert outcome is not None and outcome.method == "rendered"
+    assert len(launch_args) == 1
+    assert launch_args[0] == ["--host-resolver-rules=MAP example.com 93.184.216.34"]
 
 
 @pytest.mark.asyncio

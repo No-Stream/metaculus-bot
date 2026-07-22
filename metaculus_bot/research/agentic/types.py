@@ -69,6 +69,15 @@ class LoopTelemetry:
     findings_count: int = 0
     pending_leads_count: int = 0
     lint_rejections: int = 0
+    # Findings dropped because their cited source_url never appeared in a tool
+    # result this run (and, for discrepancies, was not tool-sourced) — the hard
+    # provenance gate. See loop._validate_findings_payload.
+    provenance_rejections: int = 0
+    # Findings ACCEPTED despite their quote not being found verbatim in the
+    # per-loop tool contents — a warn-only signal (read_document paraphrases and
+    # ellipsis-joined quotes make a hard gate too false-positive-prone; we
+    # measure the real miss rate first).
+    quote_mismatch_warnings: int = 0
 
 
 @dataclass(slots=True)
