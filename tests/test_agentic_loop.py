@@ -1344,6 +1344,19 @@ class TestHarvestVerificationTiers:
         )
         assert tiers == {"https://x.example/a": "fetched"}
 
+    def test_read_document_ask_url_is_not_tiered_fetched(self) -> None:
+        """F1: read_document takes a free-text ``ask``. A URL the driver types
+        into ``ask`` (e.g. "compare with https://other") was never retrieved —
+        only the ``url`` page was — so only ``url`` earns the fetched tier."""
+        from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
+
+        tiers = _harvest_verification_tiers(
+            "read_document",
+            {"url": "https://x.example/a", "ask": "how does this compare to https://other.example/b?"},
+            ToolOutcome(content_markdown="the answer", method="document"),
+        )
+        assert tiers == {"https://x.example/a": "fetched"}
+
     def test_search_class_methods_tier_all_surfaced_urls_snippet(self) -> None:
         from metaculus_bot.research.agentic.loop import _harvest_verification_tiers
 

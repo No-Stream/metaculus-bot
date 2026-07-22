@@ -953,6 +953,30 @@ async def _execute_one_tool_call(
     )
 
 
+def _surfaced_urls(arguments: dict[str, Any], outcome: ToolOutcome) -> list[str]:
+    """Normalized URLs an EXTERNAL tool call actually surfaced.
+
+    Exactly the ``url`` the driver asked the tool to retrieve (fetch/read_document
+    take one — a search's ``query`` is a search term, not a retrieval target)
+    plus every URL in the result body and link list. A URL merely typed into a
+    free-text argument (read_document's ``ask``, a ``query``) was NOT retrieved by
+    the tool, so it is deliberately excluded: that is what stops a URL a driver
+    pastes into ``ask`` from laundering itself into provenance or a "fetched" tier
+    (F1). Both ``_harvest_provenance`` and the snippet tier path share this so a
+    URL can never be provenance-seen without a matching tier, or vice versa (F7).
+    """
+    urls: list[str] = []
+    requested = arguments.get("url")
+    if isinstance(requested, str):
+        urls.extend(_iter_normalized_urls(requested))
+    urls.extend(_iter_normalized_urls(outcome.content_markdown))
+    for link in outcome.links:
+        normalized = _normalize_url(link)
+        if normalized is not None:
+            urls.append(normalized)
+    return urls
+
+
 def _harvest_provenance(tool_name: str, arguments: dict[str, Any], outcome: ToolOutcome) -> tuple[list[str], str]:
     """Collect the normalized URLs and result text a single EXTERNAL tool call surfaced.
 
@@ -962,20 +986,7 @@ def _harvest_provenance(tool_name: str, arguments: dict[str, Any], outcome: Tool
     """
     if tool_name in _INTERNAL_TOOL_NAMES:
         return [], ""
-    urls: list[str] = []
-    # (a) URLs the driver requested/saw — fetch/read take a `url` argument;
-    # scan every string arg value so a URL typed into a query counts too.
-    for value in arguments.values():
-        if isinstance(value, str):
-            urls.extend(_iter_normalized_urls(value))
-    # (b) URLs embedded in the result content and the outcome's link list
-    # (search results carry their source URLs there).
-    urls.extend(_iter_normalized_urls(outcome.content_markdown))
-    for link in outcome.links:
-        normalized = _normalize_url(link)
-        if normalized is not None:
-            urls.append(normalized)
-    return urls, outcome.content_markdown
+    return _surfaced_urls(arguments, outcome), outcome.content_markdown
 
 
 def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outcome: ToolOutcome) -> dict[str, str]:
@@ -985,39 +996,29 @@ def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outco
     blocked fetch confers no authority, which is the exact 131.3 mechanism (the
     real fetch failed, so a later search snippet must not inherit "fetched").
 
-    A **fetched-class** call (document/rendered/plain/cache) tiers ONLY the URLs
-    it actually retrieved — the ``url`` arguments the driver asked for — as
-    "fetched". Its outbound links/body URLs are mere leads, not pages we read, so
-    they get no tier from this call (a later fetch of one of them would). A
-    **snippet-class** call (search/news) tiers every URL it surfaced (arguments,
-    body, links) as "snippet": the driver saw only the excerpt, never the page.
+    A **fetched-class** call (document/rendered/plain/cache) tiers ONLY the page
+    it actually retrieved — the ``url`` argument the driver asked for — as
+    "fetched". A URL merely named in a free-text ``ask`` (or in the result
+    body/links) is a lead, not a page we read, so it earns no tier from this call
+    (F1: an ``ask``-URL must not inherit fetched authority). A **snippet-class**
+    call (search/news) tiers every URL it surfaced (the exact set provenance
+    harvests — requested ``url``, body, links) as "snippet": the driver saw only
+    the excerpt, never the page.
     """
     if tool_name in _INTERNAL_TOOL_NAMES or outcome.status != "ok":
         return {}
     tier = _method_to_tier(outcome.method)
     if tier is None:
         return {}
-    tiers: dict[str, str] = {}
     if tier == "fetched":
-        # Only the requested URLs (arguments) count as retrieved pages.
-        for value in arguments.values():
-            if isinstance(value, str):
-                for normalized in _iter_normalized_urls(value):
-                    tiers[normalized] = tier
-    else:
-        # snippet: every URL the search/news result surfaced was seen only as an
-        # excerpt — arguments, body, and links all carry the same weak tier.
-        for value in arguments.values():
-            if isinstance(value, str):
-                for normalized in _iter_normalized_urls(value):
-                    tiers[normalized] = tier
-        for normalized in _iter_normalized_urls(outcome.content_markdown):
-            tiers[normalized] = tier
-        for link in outcome.links:
-            normalized = _normalize_url(link)
-            if normalized is not None:
-                tiers[normalized] = tier
-    return tiers
+        # Only the requested page (the `url` argument) counts as retrieved.
+        requested = arguments.get("url")
+        if not isinstance(requested, str):
+            return {}
+        return {normalized: tier for normalized in _iter_normalized_urls(requested)}
+    # snippet: every surfaced URL was seen only as an excerpt. Reuse provenance's
+    # URL set so tier and provenance can't drift (F7).
+    return {normalized: tier for normalized in _surfaced_urls(arguments, outcome)}
 
 
 def _normalized_call_key(tool_call: _ToolCall) -> tuple[str, str]:
