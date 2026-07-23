@@ -17,13 +17,20 @@ the patch could become a silent no-op. Fix at HEAD: repoint the fetch-hardening
 patches at ``MetaculusClient``.
 
 Seam 3 (``TestPublishHardeningWrapsRealPublishPath``): ``publish_hardening``
-wraps the four ``MetaculusApi.post_*`` classmethods to inject a socket
-``timeout`` (and retry) on the blocking ``requests.post`` inside each. The
-0.2.54 report ``publish_report_to_metaculus`` methods call
-``MetaculusApi.post_*`` directly, so the injected timeout reaches the real HTTP
-boundary. At ft HEAD publishing moves to ``MetaculusClient().post_*`` (instance
-methods), so wrapping the class methods becomes a no-op and the timeout would
-silently vanish. Fix at HEAD: repoint publish hardening at ``MetaculusClient``.
+wraps the shared private helper ``MetaculusClient._post_question_prediction``
+(the single POST all three public ``post_*_question_prediction`` wrappers
+delegate to) and ``post_question_comment`` to inject a socket ``timeout`` (and
+retry) on the blocking ``requests.post`` inside each, sitting *beneath* the
+upstream ``@retry_with_exponential_backoff`` via ``__wrapped__`` so ours is the
+single retry layer. The 0.2.92 report ``publish_report_to_metaculus`` methods
+publish through ``MetaculusClient()`` instance methods, so driving the real
+publish path lets us assert our timeout landed on every POST. Two ways a future
+ft version silently breaks this: (a) it reroutes publishing away from those
+methods (positive test regresses to the upstream 30s default and goes red);
+(b) it renames the private helper ``_post_question_prediction`` — caught by the
+dedicated ``test_post_question_prediction_helper_seam_exists`` below, which pins
+that the shared helper still exists and carries ``__wrapped__``, and by the
+fail-fast raise in ``apply_publish_hardening``.
 
 Seam 4 (``TestQuestionBoundsPatchTargetExistsAndBehaves``): ``question_patches``
 monkeypatches ``BoundedQuestionMixin._get_bounds_from_api_json``. On 0.2.92
@@ -276,12 +283,15 @@ def _reset_publish_hardening_state(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestPublishHardeningWrapsRealPublishPath:
     """Seam 3: publish hardening's injected socket timeout must reach the real HTTP boundary.
 
-    ``publish_hardening`` wraps the four ``MetaculusClient.post_*`` instance
-    methods to force ``timeout=PUBLISH_POST_TIMEOUT`` on the underlying
-    ``requests.post``. The 0.2.92 report publish methods call those methods on the
-    client instance, so driving ``publish_report_to_metaculus`` for each question
-    type with the HTTP boundary mocked lets us assert our timeout landed on every
-    captured POST.
+    ``publish_hardening`` wraps the shared private helper
+    ``MetaculusClient._post_question_prediction`` (which all three public
+    ``post_*_question_prediction`` wrappers delegate to) and
+    ``post_question_comment`` to force ``timeout=PUBLISH_POST_TIMEOUT`` on the
+    underlying ``requests.post``. The 0.2.92 report publish methods call the public
+    wrappers on the client instance, which delegate into the hardened helper, so
+    driving ``publish_report_to_metaculus`` for each question type with the HTTP
+    boundary mocked lets us assert our timeout landed on every captured POST
+    (prediction + comment).
 
     Negative control (``test_..._without_hardening_no_timeout_injected``) drives
     the same publish path WITHOUT ``apply_publish_hardening`` and asserts the POST
@@ -290,9 +300,10 @@ class TestPublishHardeningWrapsRealPublishPath:
     meaningful. (0.2.92's MetaculusClient always passes its own ``timeout``, so
     "no timeout at all" is no longer the unhardened baseline; the wrapper's job is
     to *override* it with the tighter publish ceiling.) If a future ft version
-    reroutes publishing away from ``MetaculusClient.post_*``, wrapping those
-    methods becomes a silent no-op: the positive test regresses to the upstream
-    default (30s, not our value) and goes red.
+    reroutes publishing away from those methods, wrapping them becomes a silent
+    no-op: the positive test regresses to the upstream default (30s, not our value)
+    and goes red. A rename of the private helper is caught separately by
+    ``test_post_question_prediction_helper_seam_exists``.
     """
 
     @pytest.fixture(autouse=True)
@@ -421,6 +432,44 @@ class TestPublishHardeningWrapsRealPublishPath:
             assert timeout is not None, f"upstream MetaculusClient always sets its own timeout; got {kwargs}"
             assert timeout != publish_hardening.PUBLISH_POST_TIMEOUT, (
                 f"unhardened publish must carry the upstream default, not our injected value; got {kwargs}"
+            )
+
+    def test_post_question_prediction_helper_seam_exists(self) -> None:
+        """The shared private helper we patch must exist and carry ``__wrapped__`` (decorated upstream).
+
+        publish_hardening patches ``MetaculusClient._post_question_prediction`` (the single POST
+        all three public ``post_*_question_prediction`` wrappers delegate to) — NOT the public
+        wrappers — and unwraps its ``@retry_with_exponential_backoff`` via ``__wrapped__`` so ours
+        is the single retry layer. Two ft-drift failure modes this pins:
+
+        - If ft renames/moves the helper, ``apply_publish_hardening`` would silently leave
+          predictions unhardened. It now raises (fail-fast), and this seam-pin goes red first.
+        - If ft drops the upstream decorator, ``__wrapped__`` disappears; this goes red, flagging
+          that the unwrap became a no-op and the single-retry-layer reasoning needs re-checking.
+
+        The ``_isolated`` fixture resets publish-hardening state but never applies it (hardening
+        runs lazily from cli.py, never at import), so the descriptor read here is the pristine
+        upstream one, not our wrapper.
+        """
+        assert "_post_question_prediction" in publish_hardening._PATCHED_METHODS, (
+            "the fix must patch the shared private helper, not the public prediction wrappers"
+        )
+        helper = MetaculusClient.__dict__["_post_question_prediction"]
+        assert callable(helper), "MetaculusClient must define _post_question_prediction directly on the class"
+        assert hasattr(helper, "__wrapped__"), (
+            "_post_question_prediction must be @retry_with_exponential_backoff-decorated upstream "
+            "(carry __wrapped__) — the unwrap that makes our retry the single layer depends on it"
+        )
+        # The three public prediction wrappers still exist and stay OUT of the patch table:
+        # they delegate into the hardened helper, keeping only their synchronous input validation.
+        for public in (
+            "post_binary_question_prediction",
+            "post_numeric_question_prediction",
+            "post_multiple_choice_question_prediction",
+        ):
+            assert public in MetaculusClient.__dict__, f"public wrapper {public} vanished from ft"
+            assert public not in publish_hardening._PATCHED_METHODS, (
+                f"{public} must stay unpatched (it delegates into the hardened helper)"
             )
 
 

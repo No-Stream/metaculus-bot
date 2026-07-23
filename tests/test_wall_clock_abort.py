@@ -6,14 +6,18 @@ in-flight forecasters get cancelled, completed predictions ride a base-combine
 median, and stacking is skipped if remaining budget falls below
 `WALL_CLOCK_STACKING_MIN_BUDGET`.
 
-Publish hardening is a separate concern: the four `MetaculusApi.post_*`
-classmethods are monkey-patched to add `PUBLISH_POST_TIMEOUT` (20s) per call
-plus `PUBLISH_POST_RETRIES` (1) on timeout / connection errors. See
-`metaculus_bot/publish_hardening.py`.
+Publish hardening is a separate concern: the shared prediction helper
+`MetaculusClient._post_question_prediction` (the single POST that all three
+public `post_*_question_prediction` wrappers delegate to) and
+`post_question_comment` are monkey-patched to add `PUBLISH_POST_TIMEOUT` (20s)
+per call plus `PUBLISH_POST_RETRIES` (1) on timeout / connection errors. Both
+are wrapped *beneath* their upstream `@retry_with_exponential_backoff` so ours
+is the single retry layer on each path. See `metaculus_bot/publish_hardening.py`.
 """
 
 import asyncio
 import concurrent.futures
+import functools
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -306,20 +310,28 @@ def test_publish_hardening_idempotent(monkeypatch):
         assert after_first[name] is after_second[name]
 
 
-def test_publish_hardening_patches_instance_methods_for_all_instances(monkeypatch):
-    """F18 regression, 0.2.92 form: hardened post_* are INSTANCE methods, callable on any instance.
+def test_publish_hardening_patches_shared_prediction_helper_not_public_wrappers(monkeypatch):
+    """0.2.92 seam: hardening wraps the shared private helper; public wrappers stay pristine and delegate.
 
-    The pre-0.2.92 shim used classmethods, so the wrapper was re-wrapped as a
-    classmethod. 0.2.92 publishes through instance methods on the client the bot
-    constructs (``self.metaculus_client``), so the wrapper must be a plain function
-    bound as an instance method — wrapping it as a classmethod would bind ``self``
-    to ``cls`` and silently break the bot's instance calls. A class-level patch
-    resolves through the class for every instance, so two distinct clients both
-    route through the hardened method with ``self`` bound correctly.
+    The three public ``post_*_question_prediction`` methods are *undecorated*
+    wrappers that only validate input and delegate to the
+    ``@retry_with_exponential_backoff()``-decorated ``_post_question_prediction``.
+    Patching the public wrappers (an earlier version) left that inner upstream
+    retry stacked *beneath* ours — the double-retry bug this fix removes. So
+    hardening patches ``_post_question_prediction`` instead: the public wrappers
+    are left untouched and route into the hardened helper. The wrapper must be a
+    plain function bound as an instance method (not a classmethod — that would
+    bind ``self`` to ``cls`` and break the bot's instance calls), so two distinct
+    clients both route through it with ``self`` bound correctly.
     """
     from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
     from metaculus_bot import publish_hardening
+
+    # Pin the fix: the patch table targets the shared private helper, not the
+    # public prediction wrappers. This is the crux of the double-retry fix.
+    assert "_post_question_prediction" in publish_hardening._PATCHED_METHODS
+    assert "post_binary_question_prediction" not in publish_hardening._PATCHED_METHODS
 
     # Snapshot + restore via monkeypatch.
     for name in publish_hardening._PATCHED_METHODS:
@@ -331,8 +343,11 @@ def test_publish_hardening_patches_instance_methods_for_all_instances(monkeypatc
         monkeypatch.setattr(MetaculusClient, publish_hardening._SENTINEL, False, raising=False)
         delattr(MetaculusClient, publish_hardening._SENTINEL)
 
-    # Stub _post_question_prediction so we don't hit the network. It's the
-    # underlying instance call inside post_binary_question_prediction.
+    # The public wrapper is never patched; capture it to prove hardening leaves it be.
+    public_wrapper_before = MetaculusClient.__dict__["post_binary_question_prediction"]
+
+    # Stub the shared private helper (what hardening now wraps) so we don't hit
+    # the network. It's the single POST every public prediction wrapper delegates to.
     calls: list[tuple[int, dict]] = []
 
     def fake_post_question_prediction(self, question_id, payload):
@@ -342,14 +357,86 @@ def test_publish_hardening_patches_instance_methods_for_all_instances(monkeypatc
 
     publish_hardening.apply_publish_hardening()
 
+    # After hardening: the private helper is our wrapper; the public wrapper is untouched.
+    assert MetaculusClient.__dict__["_post_question_prediction"] is not fake_post_question_prediction
+    assert MetaculusClient.__dict__["post_binary_question_prediction"] is public_wrapper_before
+
     # Two distinct instances (the bot constructs its own) must both route through
-    # the class-level hardened method without a self/cls binding error.
+    # the pristine public wrapper -> hardened helper without a self/cls binding error.
     MetaculusClient().post_binary_question_prediction(question_id=1, prediction_in_decimal=0.5)
     MetaculusClient().post_binary_question_prediction(question_id=2, prediction_in_decimal=0.6)
 
     assert len(calls) == 2
     assert calls[0][0] == 1
     assert calls[1][0] == 2
+
+
+def test_publish_hardening_unwraps_upstream_retry_so_it_is_the_single_layer(monkeypatch):
+    """Regression: the ``__wrapped__`` unwrap strips the upstream retry so ours is the ONLY layer.
+
+    Before the fix, our wrapper sat on top of the still-decorated
+    ``_post_question_prediction``, so a stall triggered BOTH retry loops: the
+    inner upstream one (up to 4 attempts, sleeping min(delay*jitter, 75s) each)
+    ran to completion inside a worker that our outer ``Future.result`` had already
+    abandoned. Here we install a fake upstream helper with its own retry loop and
+    a ``functools.wraps``-style ``__wrapped__`` pointing at the raw inner. After
+    ``apply_publish_hardening`` unwraps ``__wrapped__``, the inner is called
+    exactly once per OUTER attempt — proving the upstream retry loop was stripped
+    (otherwise the inner would fire outer_attempts * upstream_attempts times).
+    """
+    from forecasting_tools.helpers.metaculus_client import MetaculusClient
+
+    from metaculus_bot import publish_hardening
+
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_TIMEOUT", 0.5)
+    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_RETRIES", 1)
+
+    # Snapshot + restore the patched methods and clear the sentinel.
+    for name in publish_hardening._PATCHED_METHODS:
+        monkeypatch.setattr(MetaculusClient, name, MetaculusClient.__dict__[name])
+    if hasattr(MetaculusClient, publish_hardening._SENTINEL):
+        monkeypatch.setattr(MetaculusClient, publish_hardening._SENTINEL, False)
+        delattr(MetaculusClient, publish_hardening._SENTINEL)
+    else:
+        monkeypatch.setattr(MetaculusClient, publish_hardening._SENTINEL, False, raising=False)
+        delattr(MetaculusClient, publish_hardening._SENTINEL)
+
+    inner_calls = {"n": 0}
+    upstream_attempts = 4  # mimic @retry_with_exponential_backoff (max_retries=3 -> 4 tries)
+
+    def raw_inner(self, question_id, payload):
+        inner_calls["n"] += 1
+        raise requests.Timeout("simulated socket-close stall")
+
+    # A stand-in for the upstream @retry_with_exponential_backoff-decorated helper:
+    # its own retry loop over raw_inner, plus __wrapped__ = raw_inner (what wraps sets).
+    @functools.wraps(raw_inner)
+    def fake_decorated(self, question_id, payload):
+        last_exc: BaseException = RuntimeError("never ran")
+        for _ in range(upstream_attempts):
+            try:
+                return raw_inner(self, question_id, payload)
+            except requests.RequestException as exc:
+                last_exc = exc
+        raise last_exc
+
+    assert fake_decorated.__wrapped__ is raw_inner  # functools.wraps set the unwrap seam
+
+    monkeypatch.setattr(MetaculusClient, "_post_question_prediction", fake_decorated)
+    publish_hardening.apply_publish_hardening()
+
+    outer_attempts = publish_hardening.PUBLISH_POST_RETRIES + 1  # == 2
+    with pytest.raises(requests.Timeout):
+        MetaculusClient()._post_question_prediction(1, {"probability_yes": 0.5})
+
+    # Single-layer invariant: raw_inner fires once per OUTER attempt. If the unwrap
+    # had failed, our wrapper would have wrapped fake_decorated and each outer
+    # attempt would spin the inner loop -> outer_attempts * upstream_attempts (8).
+    assert inner_calls["n"] == outer_attempts, (
+        f"expected {outer_attempts} inner calls (single retry layer), got {inner_calls['n']}; "
+        "the upstream retry was NOT stripped via __wrapped__"
+    )
+    assert inner_calls["n"] != outer_attempts * upstream_attempts, "double-retry stack present"
 
 
 def test_publish_hardening_injects_socket_timeout(monkeypatch):

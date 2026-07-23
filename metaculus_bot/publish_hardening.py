@@ -1,19 +1,21 @@
 """Wall-clock hardening for the synchronous Metaculus publish path.
 
-forecasting-tools makes the four publish POSTs against
+forecasting-tools makes the publish POSTs against
 ``https://www.metaculus.com/api/`` via blocking ``requests.post`` calls (see
-``forecasting_tools/helpers/metaculus_client.py``):
+``forecasting_tools/helpers/metaculus_client.py``). The three prediction POSTs
+all funnel through one shared private helper; the comment POST is standalone:
 
-- ``MetaculusClient.post_binary_question_prediction``          -> ``requests.post``
-- ``MetaculusClient.post_numeric_question_prediction``         -> ``requests.post``
-- ``MetaculusClient.post_multiple_choice_question_prediction`` -> ``requests.post``
-- ``MetaculusClient.post_question_comment``                    -> ``requests.post``
+- ``post_binary_question_prediction`` / ``post_numeric_question_prediction`` /
+  ``post_multiple_choice_question_prediction`` -> ``_post_question_prediction`` -> ``requests.post``
+- ``post_question_comment`` -> ``requests.post``
 
 If the Metaculus API hangs mid-tournament, those calls block the asyncio event
 loop (they're invoked synchronously from inside the ``async def
 publish_report_to_metaculus`` methods on each report type) and block every other
-Q in the batch from publishing. ``apply_publish_hardening()`` monkey-patches each
-of those four methods at startup with two layers of defense:
+Q in the batch from publishing. ``apply_publish_hardening()`` monkey-patches the
+shared prediction helper ``_post_question_prediction`` (which covers all three
+prediction types) and ``post_question_comment`` at startup with two layers of
+defense:
 
 1. Request-side socket timeout (primary): for the duration of the wrapped call,
    ``requests.post`` on the metaculus_client module is patched to set
@@ -26,9 +28,32 @@ of those four methods at startup with two layers of defense:
    timeout (e.g. unbounded DNS resolution before connect). Note that
    ``Future.cancel()`` does NOT interrupt a running thread; without layer (1)
    the worker would keep running until socket close, risking duplicate publishes
-   on retry. Layer (1) makes that scenario unreachable.
+   on retry. Because we patch the shared private helper and unwrap its upstream
+   ``@retry_with_exponential_backoff`` (below), there is no inner retry left to
+   catch the socket-close ``Timeout`` and sleep through it, so an abandoned
+   worker dies when its socket closes at ``PUBLISH_POST_TIMEOUT`` rather than
+   lingering for minutes. Layer (1) makes the abandoned-worker scenario
+   unreachable.
 
 Each wrapper retries once on timeout / connection error.
+
+**Why patch the private helper, not the public prediction wrappers.** The three
+public ``post_*_question_prediction`` methods are *undecorated* wrappers that do
+synchronous input validation (bounds/monotonicity checks that raise
+``ValueError``) and then delegate to the ``@retry_with_exponential_backoff()``-
+decorated ``_post_question_prediction``. Patching the public wrappers (as an
+earlier version did) left that inner upstream retry in place — a second retry
+loop *beneath* ours. On a stall the outer ``Future.result`` cap fired at 20s but
+the abandoned worker kept running for 2-4 min inside the inner retry (catch
+socket-close ``Timeout`` -> ``sleep(min(delay*jitter, 75s))`` -> retry), which
+(a) let overlapping ``_inject_socket_timeout`` contexts leak the process-global
+patched ``requests.post`` (the save/restore assumes LIFO and has no lock) and
+(b) saturated the publish thread pool during a sustained API stall. Patching
+``_post_question_prediction`` and unwrapping its decorator collapses the
+prediction path to a single retry layer; the public wrappers keep their
+validation on the caller thread and delegate into the hardened helper. (The one
+non-idempotent publish, ``post_question_comment``, was already single-layer and
+stays wrapped exactly as before.)
 
 **0.2.92 architecture.** Publishing moved from the (now deprecated)
 ``MetaculusApi`` classmethod shim onto ``MetaculusClient``. ``ForecastBot``
@@ -49,15 +74,13 @@ Two 0.2.92 behaviors shape the two layers:
   thread dies at the cap instead of lingering to the upstream 30s. Overriding is
   safe here: the only caller is ``MetaculusClient`` itself (small publish
   payloads), and a tighter publish ceiling is exactly the intent.
-- ``post_question_comment`` and the shared ``_post_question_prediction`` are
-  already ``@retry_with_exponential_backoff()`` decorated upstream. For
-  ``post_question_comment`` we wrap **beneath** that decorator (via
-  ``__wrapped__``) so our retry is the single layer. The three prediction methods
-  are undecorated public wrappers that delegate to the decorated
-  ``_post_question_prediction``; that inner upstream retry remains one layer
-  below ours. Total wall-clock is bounded by the ``Future.result`` cap
-  regardless, and duplicate-publish risk on retry is inherent to any
-  retry-on-timeout and unchanged by the upgrade.
+- Both patched methods (``_post_question_prediction`` and
+  ``post_question_comment``) are ``@retry_with_exponential_backoff()`` decorated
+  upstream. We wrap **beneath** that decorator (via ``__wrapped__``) for both, so
+  ours is the single retry layer on each path. Total wall-clock is bounded by the
+  ``Future.result`` cap regardless, and duplicate-publish risk on retry is
+  inherent to any retry-on-timeout (a re-POST is an idempotent overwrite for
+  predictions).
 
 We use ``concurrent.futures.ThreadPoolExecutor`` (rather than asyncio.to_thread)
 because the patched callsite remains synchronous — calling code is
@@ -91,16 +114,22 @@ logger = logging.getLogger(__name__)
 
 _SENTINEL = "_publish_hardening_applied"
 
-# Method names to patch. Each is a synchronous instance method on MetaculusClient
-# that wraps (directly or via _post_question_prediction) a single requests.post.
+# Method names to patch. Both are @retry_with_exponential_backoff()-decorated
+# instance methods on MetaculusClient that each wrap a single requests.post; we
+# install our wrapper *beneath* the upstream decorator (via __wrapped__) so ours
+# is the single retry layer. ``_post_question_prediction`` is the shared private
+# helper that all three public ``post_*_question_prediction`` wrappers delegate
+# to, so patching it hardens every prediction type at once (the public wrappers
+# keep their synchronous input validation on the caller thread). We deliberately
+# do NOT patch the public prediction wrappers: they're undecorated, so wrapping
+# them would leave the inner upstream retry on ``_post_question_prediction`` in
+# place, stacking two retry loops on the prediction path (see module docstring).
 _PATCHED_METHODS: tuple[str, ...] = (
-    "post_binary_question_prediction",
-    "post_numeric_question_prediction",
-    "post_multiple_choice_question_prediction",
+    "_post_question_prediction",
     "post_question_comment",
 )
 
-# Single shared executor across the four wrappers. Publish calls are infrequent
+# Single shared executor across both wrappers. Publish calls are infrequent
 # and serialized within a single Q's publish_report_to_metaculus().
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -194,10 +223,17 @@ def apply_publish_hardening() -> None:
     for method_name in _PATCHED_METHODS:
         # These are plain instance methods on MetaculusClient (not classmethods),
         # so we install a plain function that Python binds as an instance method.
-        # Wrap the *undecorated* original (``__wrapped__``) when present so we sit
-        # beneath any upstream @retry_with_exponential_backoff (e.g. on
-        # post_question_comment) rather than stacking two retry loops.
-        raw = MetaculusClient.__dict__[method_name]
+        # Wrap the *undecorated* original (``__wrapped__``) so we sit beneath the
+        # upstream @retry_with_exponential_backoff on both patched methods rather
+        # than stacking two retry loops. Fail fast (rather than silently skip) if
+        # the seam moved: an ft rename would otherwise leave publishes unhardened.
+        raw = MetaculusClient.__dict__.get(method_name)
+        if raw is None:
+            raise AttributeError(
+                f"PUBLISH_HARDENING: MetaculusClient defines no {method_name!r} to patch. "
+                "The forecasting-tools publish seam moved or was renamed; repoint "
+                "_PATCHED_METHODS (see tests/test_ft_upgrade_seams.py::TestPublishHardeningWrapsRealPublishPath)."
+            )
         original_func = getattr(raw, "__wrapped__", raw)
         wrapped = _wrap_with_timeout_retry(method_name, original_func)
         setattr(MetaculusClient, method_name, wrapped)
