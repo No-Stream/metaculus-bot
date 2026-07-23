@@ -97,17 +97,22 @@ class TestBacktestFilterExcludesConditionals:
             f"backtest filter must exclude conditional questions; allowed_types={allowed}"
         )
 
-    async def test_constructed_filter_admits_the_three_supported_types(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The three types the backtest can actually score must all be in the allowed set.
+    async def test_constructed_filter_admits_exactly_the_three_supported_types(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The allowed set must be EXACTLY the three types the backtest can score.
 
-        The 0.2.54 default also carries ``date``/``discrete`` (harmlessly dropped
-        later by extraction), so this pins a subset rather than exact equality —
-        exact-3 becomes true only once W5 pins allowed_types explicitly.
+        W5 pinned ``allowed_types`` to ``["binary", "multiple_choice", "numeric"]``,
+        so this is now exact equality (order-independent) rather than the
+        pre-pin subset check: the 0.2.54 default carried extra ``date``/``discrete``
+        entries, but the explicit pin drops them, and ``discrete`` is folded under
+        numeric (DiscreteQuestion subclasses NumericQuestion) so it needs no slot.
         """
         api_filter = await _capture_constructed_filter(monkeypatch)
         allowed = api_filter.allowed_types
-        for supported in SUPPORTED_QUESTION_TYPES:
-            assert supported in allowed, f"{supported!r} must be in allowed_types; got {allowed}"
+        assert set(allowed) == set(SUPPORTED_QUESTION_TYPES), (
+            f"allowed_types must be exactly {sorted(SUPPORTED_QUESTION_TYPES)}; got {allowed}"
+        )
 
 
 class TestGroundTruthExtractionRejectsUnsupportedTypes:

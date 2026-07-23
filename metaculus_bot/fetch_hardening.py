@@ -1,38 +1,59 @@
 """Bounded retry + per-request timeout for the Metaculus question-list GET.
 
-Stock forecasting-tools issues ``requests.get`` against
-``https://www.metaculus.com/api/posts/`` with no timeout and no retry, so a
-single transient 403/429/5xx anywhere in the question pagination kills the
-whole CI run. Observed 2026-05-19: a CDN/WAF-style 403 (33s stall + generic
-"API only available to authenticated users" body) returned on a healthy key
-and known-good tournament; the same key worked seconds before and after.
+forecasting-tools issues ``requests.get`` against
+``https://www.metaculus.com/api/posts/`` from ``MetaculusClient`` — a single
+transient 403/429/5xx anywhere in the question pagination could kill the whole
+CI run. Observed 2026-05-19: a CDN/WAF-style 403 (33s stall + generic "API only
+available to authenticated users" body) returned on a healthy key and known-good
+tournament; the same key worked seconds before and after.
 
-This module applies two patches at startup, both via
-``apply_fetch_hardening()`` (idempotent, sentinel-guarded):
+**0.2.92 architecture.** The live fetch chokepoint moved from the (now
+deprecated) ``MetaculusApi`` classmethod shim onto ``MetaculusClient``
+(``forecasting_tools/helpers/metaculus_client.py``). ``ForecastBot`` publishes
+and fetches through an *instance* — ``self.metaculus_client = MetaculusClient()``
+— and reports/fetches call plain **instance methods** on it. Patching the
+deprecated ``MetaculusApi`` shim would test green and silently no-op in prod, so
+we patch ``MetaculusClient`` at the class level: instance method lookup resolves
+through the class, so a class-level patch covers every instance the bot builds
+(verified with an instance-identity probe).
 
-1. Global socket-timeout patch: ``forecasting_tools.helpers.metaculus_api``'s
-   ``requests.get`` is replaced once with a wrapper that injects
-   ``timeout=FETCH_GET_TIMEOUT`` if the caller didn't supply one. Patched
-   once and left in place — no per-request toggle. This dodges a lost-update
-   race that toggling would introduce under any future concurrent caller,
-   and tightens the default for every GET in forecasting-tools that funnels
-   through this module (defense in depth).
+Two behaviors in 0.2.92 change how we harden:
 
-2. Bounded retry on ``MetaculusApi._get_questions_from_api`` — the single
+- ``MetaculusClient`` passes ``timeout=self.timeout`` (default 30s) on the
+  chokepoint GET, so the request already has a socket-timeout ceiling. We accept
+  that upstream 30s for the chokepoint (tighter than our historical 60s, and the
+  retry layer absorbs a slow-then-403 stall regardless). The socket-timeout
+  install below is retained as **defense in depth** — it still bites bare GETs
+  that omit a timeout (e.g. ``get_current_user_id``) and any future one.
+- ``_get_questions_from_api`` is already ``@retry_with_exponential_backoff()``
+  decorated upstream (retries on *any* ``RequestException``, including 401/404/
+  422). We wrap **beneath** that decorator (via ``__wrapped__``) so our bounded
+  retry is the single authoritative layer with an explicit status policy —
+  fail-fast on 401/404/422, retry only 403/429/5xx + transport errors — rather
+  than stacking two retry loops.
+
+``apply_fetch_hardening()`` applies both patches (idempotent, sentinel-guarded):
+
+1. Global socket-timeout patch: ``metaculus_client``'s ``requests.get`` is
+   replaced once with a wrapper that injects ``timeout=FETCH_GET_TIMEOUT`` if the
+   caller didn't supply one. Patched once and left in place — no per-request
+   toggle. This dodges a lost-update race that toggling would introduce under any
+   future concurrent caller.
+
+2. Bounded retry on ``MetaculusClient._get_questions_from_api`` — the single
    chokepoint for every question-list GET (fed by ``forecast_on_tournament``,
    ``forecast_questions``, and the random/sequential pagination strategies).
    Retries with exponential backoff + jitter on retryable failures:
    ``requests.Timeout``, ``requests.ConnectionError``, and HTTP statuses
    ``{403, 429, 500, 502, 503, 504}``. 403 is included because the observed
-   failure was a Cloudflare-style edge-layer 403 with auth-flavored body, not
-   a real auth failure. A genuinely missing token would have raised
-   ``ValueError`` synchronously from ``_get_auth_headers`` before ever
-   reaching this wrapper, and a real 401 (which we do NOT retry) would still
-   surface immediately.
+   failure was a Cloudflare-style edge-layer 403 with auth-flavored body, not a
+   real auth failure. A genuinely missing token raises ``ValueError``
+   synchronously from ``_get_auth_headers`` before ever reaching this wrapper, and
+   a real 401 (which we do NOT retry) still surfaces immediately.
 
-Unlike publish_hardening, we don't need a ``concurrent.futures`` Future
-wrapper here: the fetch path runs once at startup before the asyncio event
-loop spins up, so a request-side socket timeout is a sufficient ceiling.
+Unlike publish_hardening, we don't need a ``concurrent.futures`` Future wrapper
+here: the fetch path runs once at startup before the asyncio event loop spins up,
+so a request-side socket timeout is a sufficient ceiling.
 """
 
 from __future__ import annotations
@@ -44,8 +65,8 @@ import time
 from typing import Any, Callable
 
 import requests
-from forecasting_tools import MetaculusApi
-from forecasting_tools.helpers import metaculus_api as _ft_metaculus_api
+from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot.constants import (
     FETCH_GET_BACKOFF_BASE,
@@ -74,26 +95,27 @@ _RETRYABLE_STATUSES: frozenset[int] = frozenset({403, 429, 500, 502, 503, 504})
 
 
 def _install_get_timeout_default(timeout_s: float) -> None:
-    """Patch ``forecasting_tools.helpers.metaculus_api.requests.get`` once globally.
+    """Patch ``forecasting_tools.helpers.metaculus_client.requests.get`` once globally.
 
-    Wraps the module's ``requests.get`` to inject ``timeout=timeout_s`` when
-    the caller doesn't supply one. Idempotent: called from ``apply_fetch_hardening``
+    Wraps the module's ``requests.get`` to inject ``timeout=timeout_s`` when the
+    caller doesn't supply one. Idempotent: called from ``apply_fetch_hardening``
     which is itself sentinel-guarded, so no double-wrapping.
 
-    Patched once and left in place rather than toggled per-request — that
-    avoids the lost-update race a context-managed patch would have if
-    multiple threads ever entered the wrapper simultaneously, and tightens
-    the default for every GET in forecasting-tools that flows through this
-    module (the bot's call site is single-threaded, but defense in depth).
+    Patched once and left in place rather than toggled per-request — that avoids
+    the lost-update race a context-managed patch would have if multiple threads
+    ever entered the wrapper simultaneously. In 0.2.92 the question-list
+    chokepoint already passes ``timeout=self.timeout`` (30s), so this is
+    defense-in-depth: it bites bare GETs (e.g. ``get_current_user_id``) that omit
+    a timeout, and is a no-op where one is already supplied.
     """
-    original_get = _ft_metaculus_api.requests.get
+    original_get = _ft_metaculus_client.requests.get
 
     @functools.wraps(original_get)
     def get_with_timeout(*args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("timeout", timeout_s)
         return original_get(*args, **kwargs)
 
-    _ft_metaculus_api.requests.get = get_with_timeout
+    _ft_metaculus_client.requests.get = get_with_timeout
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -144,21 +166,26 @@ def _backoff_seconds(attempt: int) -> float:
 def _wrap_with_retry(method_name: str, original: Callable[..., Any]) -> Callable[..., Any]:
     """Return a wrapper that runs ``original`` with bounded retry on transient failures.
 
-    Per-request socket timeout is handled separately by the global patch
-    installed in ``apply_fetch_hardening``; this wrapper only owns retry.
+    ``original`` is the undecorated ``MetaculusClient`` instance method, so the
+    wrapper is installed as a plain function (an instance method) and forwards
+    ``self`` through ``*args`` transparently. Per-request socket timeout is
+    handled separately by the global patch installed in ``apply_fetch_hardening``;
+    this wrapper only owns retry.
     """
 
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         # Read at call time so test monkeypatching of FETCH_GET_RETRIES works.
-        from metaculus_bot.constants import FETCH_GET_RETRIES as _retries
+        from metaculus_bot.constants import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            FETCH_GET_RETRIES as _retries,
+        )
 
         attempts = _retries + 1
 
         for attempt in range(1, attempts + 1):
             try:
                 return original(*args, **kwargs)
-            except Exception as exc:
+            except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except: retry-then-reraise, re-raised below on non-retryable / last attempt
                 if not _is_retryable(exc) or attempt == attempts:
                     raise
                 sleep_s = _backoff_seconds(attempt)
@@ -177,7 +204,7 @@ def _wrap_with_retry(method_name: str, original: Callable[..., Any]) -> Callable
 
 def apply_fetch_hardening() -> None:
     """Install fetch hardening: global GET timeout default + bounded retry on the question-list path. Idempotent."""
-    if getattr(MetaculusApi, _SENTINEL, False):
+    if getattr(MetaculusClient, _SENTINEL, False):
         return
 
     # Layer 1: global socket-timeout default on forecasting-tools' requests.get.
@@ -186,20 +213,20 @@ def apply_fetch_hardening() -> None:
     _install_get_timeout_default(FETCH_GET_TIMEOUT)
 
     # Layer 2: bounded retry on the single chokepoint for question-list GETs.
+    # These are plain instance methods on MetaculusClient (not classmethods), so
+    # we install a plain function that Python binds as an instance method. We
+    # wrap the *undecorated* original (``__wrapped__``) to sit beneath upstream's
+    # own @retry_with_exponential_backoff — ours is then the single retry layer
+    # with an explicit status policy, rather than stacking two loops.
     for method_name in _PATCHED_METHODS:
-        descriptor = MetaculusApi.__dict__[method_name]
-        if isinstance(descriptor, classmethod):
-            original_func = descriptor.__func__
-        else:
-            # Defensive: forecasting-tools could change the decorator someday.
-            original_func = getattr(MetaculusApi, method_name)
-
+        raw = MetaculusClient.__dict__[method_name]
+        original_func = getattr(raw, "__wrapped__", raw)
         wrapped = _wrap_with_retry(method_name, original_func)
-        setattr(MetaculusApi, method_name, classmethod(wrapped))
+        setattr(MetaculusClient, method_name, wrapped)
 
-    setattr(MetaculusApi, _SENTINEL, True)
+    setattr(MetaculusClient, _SENTINEL, True)
     logger.info(
-        "Fetch hardening applied: %d MetaculusApi GET method(s) wrapped (%ds timeout, %d retries, exp backoff)",
+        "Fetch hardening applied: %d MetaculusClient GET method(s) wrapped (%ds timeout, %d retries, exp backoff)",
         len(_PATCHED_METHODS),
         FETCH_GET_TIMEOUT,
         FETCH_GET_RETRIES,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 from forecasting_tools.data_models.forecast_report import ForecastReport
@@ -23,6 +24,9 @@ from metaculus_bot.numeric.utils import (
 )
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.utils.logging_utils import compact_log_report_summary
+
+if TYPE_CHECKING:
+    from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 
 def _open_time() -> datetime:
@@ -383,7 +387,10 @@ class DummyReport(ForecastReport):
     async def aggregate_predictions(cls: type, predictions: list, question: MetaculusQuestion) -> "DummyReport":
         raise NotImplementedError()
 
-    async def publish_report_to_metaculus(self) -> None:
+    async def publish_report_to_metaculus(self, metaculus_client: MetaculusClient | None = None) -> None:
+        # metaculus_client added to match the 0.2.92 base signature
+        # (publish_report_to_metaculus(self, metaculus_client=None)); this double
+        # never publishes, so the arg is accepted and ignored.
         raise NotImplementedError()
 
 

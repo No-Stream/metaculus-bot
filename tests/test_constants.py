@@ -46,14 +46,17 @@ class TestBinaryClampBounds:
         assert BINARY_PROB_MAX == 0.98
 
 
-class TestMCClampBoundsUnchanged:
-    """MC clamp bounds stay at [0.005, 0.995] — Workstream B only touches binary."""
+class TestMCClampBounds:
+    """MC clamp bounds are [0.01, 0.99], aligned to ft 0.2.92's PredictedOptionList
+    validator (which clamps every option into [0.01, 0.99] on construction). Matching
+    those bounds makes the upstream validator a no-op on our output — see the constant's
+    comment and clamp_and_renormalize_probs."""
 
-    def test_mc_prob_min_is_0_005(self):
-        assert MC_PROB_MIN == 0.005
+    def test_mc_prob_min_is_0_01(self):
+        assert MC_PROB_MIN == 0.01
 
-    def test_mc_prob_max_is_0_995(self):
-        assert MC_PROB_MAX == 0.995
+    def test_mc_prob_max_is_0_99(self):
+        assert MC_PROB_MAX == 0.99
 
 
 class TestNativeSearchDefaults:

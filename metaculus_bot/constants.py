@@ -229,9 +229,17 @@ OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1
 BINARY_PROB_MIN: float = 0.02
 BINARY_PROB_MAX: float = 0.98
 
-# Multiple-choice prediction clamp
-MC_PROB_MIN: float = 0.005
-MC_PROB_MAX: float = 0.995
+# Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
+# PredictedOptionList validator, which unconditionally clamps every option into
+# [0.01, 0.99], renormalizes, and raises ValueError when any option moves > 0.05
+# from its input. Matching those bounds makes the upstream validator a no-op on
+# our already-clamped, sum-1 output, eliminating publish-time ValueError risk on
+# many-option ballots (a dominant option + several near-floor options is exactly
+# where the upstream renormalize-after-clamp fires the >0.05 raise). See
+# clamp_and_renormalize_probs / clamp_and_renormalize_mc, which clamp BEFORE every
+# PredictedOptionList construction.
+MC_PROB_MIN: float = 0.01
+MC_PROB_MAX: float = 0.99
 
 # --- Post-hoc Platt calibration of the final published probability ---
 # Final-output logistic recalibration following Metaculus's notebook

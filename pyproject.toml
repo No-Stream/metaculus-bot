@@ -13,8 +13,8 @@ dependencies = [
     "openai>=1.57.4",
     "playwright>=1.54.0",
     "python-dotenv>=1.0.1",
-    "forecasting-tools==0.2.54", # FROZEN: depends on internal data_models.*/helpers.* paths — do not change
-    "litellm>=1.59.1,<2.0.0",    # cap matches forecasting-tools constraint; litellm ships frequent behavior changes
+    "forecasting-tools==0.2.92",
+    "litellm>=1.84.0,<2.0.0", # cap matches forecasting-tools constraint; litellm ships frequent behavior changes
     "aiohttp>=3.12.15",
     "yfinance>=0.2.48",
     "fredapi>=0.5.2",
@@ -53,23 +53,6 @@ dev = [
     "arviz>=1.2.0",
     "h5netcdf>=1.8.1",
     "h5py>=3.16.0",
-]
-
-[tool.uv]
-# CVE overrides (2026-07-19). Both defeat constraints declared by the FROZEN
-# forecasting-tools==0.2.54; re-evaluate (and ideally delete) on its next bump.
-override-dependencies = [
-    # forecasting-tools caps pillow<12 but never imports PIL; the real consumers
-    # in the tree (streamlit <13, matplotlib >=9) accept 12.x. Forces the
-    # 13-advisory pillow 11.3.0 CVE backlog onto the fixed 12.3.0 line.
-    "pillow>=12.3.0",
-]
-exclude-dependencies = [
-    # transformers is a declared-but-unused forecasting-tools dep (zero imports
-    # there or in our code — verified 2026-07-19) carrying a critical RCE advisory
-    # (GHSA-fgcw-684q-jj6r) whose fix (5.5.0) sits above the <5.0.0 cap. Excluding
-    # it drops transformers (and its safetensors subtree) from the lock entirely.
-    "transformers",
 ]
 
 [build-system]

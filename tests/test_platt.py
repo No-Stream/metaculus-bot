@@ -201,20 +201,25 @@ class TestApplyMCPlatt:
         With 10 options and several below the 0.02 binary floor, the older
         implementation (which routed every option through ``apply_binary_platt``)
         clamped each to >= 0.02 BEFORE MC renormalization. That broke
-        many-option questions: the effective MC floor became 0.02, not 0.005,
+        many-option questions: the effective MC floor became 0.02, not 0.01,
         and any low-probability option got artificially inflated.
 
         The fix routes options through the bound-free Platt helper and lets
-        ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.005, 0.995]``
+        ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.01, 0.99]``
         bounds. Reference is built by hand: apply Platt math + cap directly,
         then clamp to MC bounds, then renormalize. (Comparing against
         ``apply_mc_platt`` would be circular.)
+
+        Inputs are chosen in ``[MC_PROB_MIN, BINARY_PROB_MIN)`` = ``[0.01, 0.02)``
+        summing to exactly 1.0, so ft 0.2.92's PredictedOptionList construction is
+        a no-op and the hand-built reference (from ``raw``) matches the actual path
+        option-for-option.
         """
         params = PlattParams(bias=0.0, slope=1.2)
-        # 10 options: three below the 0.02 binary floor, seven that absorb the rest.
-        # Sum is exactly 1.0 before calibration.
-        small = [0.005, 0.010, 0.015]  # sum 0.030
-        large = [0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.07]  # sum 0.97
+        # 10 options: three in [0.01, 0.02) (below the 0.02 binary floor, at/above the
+        # 0.01 MC floor), seven that absorb the rest. Sum is exactly 1.0 before calibration.
+        small = [0.010, 0.013, 0.017]  # sum 0.040
+        large = [0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.06]  # sum 0.96
         raw = small + large
         assert sum(raw) == pytest.approx(1.0, abs=1e-12)
         names = [f"opt_{i}" for i in range(len(raw))]

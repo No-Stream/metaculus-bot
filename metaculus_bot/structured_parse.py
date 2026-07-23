@@ -74,8 +74,10 @@ def _build_constrained_llm(response_format_model: type[BaseModel], parser_model:
     """
     return build_llm_with_openrouter_fallback(
         parser_model,
-        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-        # reasoning models defer to provider defaults. No top_p.
+        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
+        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
+        # kept to pin provider-default sampling against a future default flip. reasoning
+        # models defer to provider defaults. No top_p.
         temperature=None,
         max_tokens=32_000,
         stream=False,

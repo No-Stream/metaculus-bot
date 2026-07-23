@@ -3,7 +3,8 @@ Tests for custom probability clamping in prediction extraction.
 
 Tests that probabilities are correctly clamped after LLM extraction:
 - Binary questions: 2% to 98% (0.02 to 0.98) — see note below
-- Multiple choice questions: 0.5% to 99.5% (0.005 to 0.995) with renormalization
+- Multiple choice questions: 1% to 99% (0.01 to 0.99) with renormalization, aligned to
+  ft 0.2.92's PredictedOptionList validator (see the MC clamp constants)
 
 Binary bounds were widened from [0.01, 0.99] to [0.02, 0.98] on 2026-05-12
 following Preseen-Atlas (spring-AIB-2026 leader), whose comments publish
@@ -18,6 +19,9 @@ from forecasting_tools.data_models.multiple_choice_report import (
     PredictedOption,
     PredictedOptionList,
 )
+
+from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
+from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 
 
 class TestProbabilityClamping:
@@ -51,101 +55,68 @@ class TestProbabilityClamping:
         clamped = max(0.02, min(0.98, raw_prediction))
         assert clamped == 0.98, f"Expected 0.98, got {clamped}"
 
-    def test_mc_clamping_logic(self):
-        """Test multiple choice prediction clamping logic."""
-        # Test the exact clamping and renormalization logic used in main.py:401-409
+    def test_mc_clamping_clamps_extremes_to_bounds(self):
+        """clamp_and_renormalize_mc pins extreme options into [MC_PROB_MIN, MC_PROB_MAX] and renormalizes."""
+        pol = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Option A", probability=0.0001),  # -> floored to MC_PROB_MIN
+                PredictedOption(option_name="Option B", probability=0.9999),  # -> ceilinged to MC_PROB_MAX
+            ]
+        )
+        clamp_and_renormalize_mc(pol)
 
-        # Create options with extreme values
-        options = [
-            PredictedOption(option_name="Option A", probability=0.0001),  # Should be clamped to 0.005
-            PredictedOption(option_name="Option B", probability=0.9999),  # Should be clamped to 0.995
-        ]
-        predicted_option_list = PredictedOptionList(predicted_options=options)
-
-        # Apply custom clamping to 0.5%/99.5% for multiple choice questions
-        for option in predicted_option_list.predicted_options:
-            option.probability = max(0.005, min(0.995, option.probability))
-
-        # Renormalize to ensure probabilities sum to 1 after clamping
-        total_prob = sum(option.probability for option in predicted_option_list.predicted_options)
-        if total_prob > 0:
-            for option in predicted_option_list.predicted_options:
-                option.probability /= total_prob
-
-        # Check that values were clamped and renormalized
-        option_a = next(opt for opt in predicted_option_list.predicted_options if opt.option_name == "Option A")
-        option_b = next(opt for opt in predicted_option_list.predicted_options if opt.option_name == "Option B")
-
-        # Values should be clamped to [0.005, 0.995]
-        assert option_a.probability >= 0.005, f"Option A probability {option_a.probability} should be >= 0.005"
-        assert option_b.probability <= 0.995, f"Option B probability {option_b.probability} should be <= 0.995"
-
-        # Probabilities should sum to 1 after renormalization
-        total_prob = sum(opt.probability for opt in predicted_option_list.predicted_options)
+        for option in pol.predicted_options:
+            assert MC_PROB_MIN <= option.probability <= MC_PROB_MAX, (
+                f"{option.option_name} probability {option.probability} outside [{MC_PROB_MIN}, {MC_PROB_MAX}]"
+            )
+        total_prob = sum(o.probability for o in pol.predicted_options)
         assert abs(total_prob - 1.0) < 1e-10, f"Probabilities should sum to 1, got {total_prob}"
 
-    def test_mc_clamping_with_renormalization(self):
-        """Test multiple choice clamping with renormalization."""
-        # Create options that will need renormalization after clamping
-        options = [
-            PredictedOption(option_name="Option A", probability=0.0001),  # Will become 0.005
-            PredictedOption(option_name="Option B", probability=0.0001),  # Will become 0.005
-            PredictedOption(option_name="Option C", probability=0.9998),  # Will become 0.995
-        ]
-        predicted_option_list = PredictedOptionList(predicted_options=options)
+    def test_mc_clamping_holds_floor_under_renormalization(self):
+        """Regression for renormalize-below-floor drift.
 
-        # Apply custom clamping to 0.5%/99.5% for multiple choice questions
-        for option in predicted_option_list.predicted_options:
-            option.probability = max(0.005, min(0.995, option.probability))
+        With a dominant option plus near-floor siblings, the old clamp-then-divide
+        pushed the floored siblings back UNDER MC_PROB_MIN (dividing by a >1 total).
+        clamp_and_renormalize_mc now guarantees EVERY option stays within
+        [MC_PROB_MIN, MC_PROB_MAX] after renormalization.
+        """
+        pol = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Option A", probability=0.0001),  # near-floor sibling
+                PredictedOption(option_name="Option B", probability=0.0001),  # near-floor sibling
+                PredictedOption(option_name="Option C", probability=0.9998),  # dominant
+            ]
+        )
+        clamp_and_renormalize_mc(pol)
 
-        # Renormalize to ensure probabilities sum to 1 after clamping
-        total_prob = sum(option.probability for option in predicted_option_list.predicted_options)
-        if total_prob > 0:
-            for option in predicted_option_list.predicted_options:
-                option.probability /= total_prob
-
-        # After renormalization, values may go slightly below the minimum bound
-        # but should still be reasonable (close to minimum)
-        for option in predicted_option_list.predicted_options:
-            assert option.probability >= 0.001, (
-                f"Option {option.option_name} probability {option.probability} too low after renormalization"
+        for option in pol.predicted_options:
+            assert option.probability >= MC_PROB_MIN, (
+                f"{option.option_name} probability {option.probability} drifted below MC_PROB_MIN ({MC_PROB_MIN})"
             )
-            assert option.probability <= 1.0, (
-                f"Option {option.option_name} probability {option.probability} too high after renormalization"
-            )
-
-        # Probabilities should sum to 1 after renormalization
-        total_prob = sum(opt.probability for opt in predicted_option_list.predicted_options)
+            assert option.probability <= MC_PROB_MAX
+        total_prob = sum(o.probability for o in pol.predicted_options)
         assert abs(total_prob - 1.0) < 1e-10, f"Probabilities should sum to 1, got {total_prob}"
 
     def test_mc_clamping_preserves_normal_values(self):
-        """Test multiple choice clamping preserves normal values."""
-        # Create options with normal values (should be preserved)
-        options = [
-            PredictedOption(option_name="Option A", probability=0.3),
-            PredictedOption(option_name="Option B", probability=0.7),
-        ]
-        predicted_option_list = PredictedOptionList(predicted_options=options)
+        """Comfortably in-bounds options are approximately preserved (only renormalization epsilon)."""
+        pol = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="Option A", probability=0.3),
+                PredictedOption(option_name="Option B", probability=0.7),
+            ]
+        )
+        clamp_and_renormalize_mc(pol)
 
-        # Apply custom clamping to 0.5%/99.5% for multiple choice questions
-        for option in predicted_option_list.predicted_options:
-            option.probability = max(0.005, min(0.995, option.probability))
+        option_a = next(o for o in pol.predicted_options if o.option_name == "Option A")
+        option_b = next(o for o in pol.predicted_options if o.option_name == "Option B")
+        assert option_a.probability == pytest.approx(0.3, abs=1e-9), (
+            f"Option A should be ~0.3, got {option_a.probability}"
+        )
+        assert option_b.probability == pytest.approx(0.7, abs=1e-9), (
+            f"Option B should be ~0.7, got {option_b.probability}"
+        )
 
-        # Renormalize to ensure probabilities sum to 1 after clamping
-        total_prob = sum(option.probability for option in predicted_option_list.predicted_options)
-        if total_prob > 0:
-            for option in predicted_option_list.predicted_options:
-                option.probability /= total_prob
-
-        # Values should be approximately preserved (within small renormalization error)
-        option_a = next(opt for opt in predicted_option_list.predicted_options if opt.option_name == "Option A")
-        option_b = next(opt for opt in predicted_option_list.predicted_options if opt.option_name == "Option B")
-
-        assert abs(option_a.probability - 0.3) < 0.01, f"Option A should be ~0.3, got {option_a.probability}"
-        assert abs(option_b.probability - 0.7) < 0.01, f"Option B should be ~0.7, got {option_b.probability}"
-
-        # Probabilities should sum to 1
-        total_prob = sum(opt.probability for opt in predicted_option_list.predicted_options)
+        total_prob = sum(o.probability for o in pol.predicted_options)
         assert abs(total_prob - 1.0) < 1e-10, f"Probabilities should sum to 1, got {total_prob}"
 
     def test_boundary_conditions(self):
@@ -156,11 +127,11 @@ class TestProbabilityClamping:
         assert max(0.02, min(0.98, 0.019)) == 0.02
         assert max(0.02, min(0.98, 0.981)) == 0.98
 
-        # MC boundaries (unchanged — Workstream B is binary-only).
-        assert max(0.005, min(0.995, 0.005)) == 0.005
-        assert max(0.005, min(0.995, 0.995)) == 0.995
-        assert max(0.005, min(0.995, 0.004)) == 0.005
-        assert max(0.005, min(0.995, 0.996)) == 0.995
+        # MC boundaries — aligned to ft 0.2.92's [0.01, 0.99]; MC_PROB_MIN/MAX are the single source.
+        assert max(MC_PROB_MIN, min(MC_PROB_MAX, MC_PROB_MIN)) == MC_PROB_MIN
+        assert max(MC_PROB_MIN, min(MC_PROB_MAX, MC_PROB_MAX)) == MC_PROB_MAX
+        assert max(MC_PROB_MIN, min(MC_PROB_MAX, 0.004)) == MC_PROB_MIN
+        assert max(MC_PROB_MIN, min(MC_PROB_MAX, 0.996)) == MC_PROB_MAX
 
 
 if __name__ == "__main__":

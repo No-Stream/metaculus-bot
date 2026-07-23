@@ -2,19 +2,29 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from forecasting_tools import MetaculusQuestion
+from forecasting_tools import BinaryQuestion, MetaculusQuestion
+from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 
 from main import TemplateForecaster
+
+
+def _supported_question(done: bool = False) -> MetaculusQuestion:
+    """A stand-in question that survives forecast_questions' unsupported-type gate.
+
+    forecast_questions drops anything that is not Binary/MC/Numeric up front, so a
+    bare object no longer reaches the cap/skip logic. A spec'd MagicMock passes
+    ``isinstance(q, BinaryQuestion)`` while letting us set ``already_forecasted``
+    for the skip filter — the cap logic never touches any other attribute.
+    """
+    q = MagicMock(spec=BinaryQuestion)
+    q.already_forecasted = done
+    return cast(MetaculusQuestion, q)
 
 
 @pytest.mark.asyncio
 async def test_cap_applied_after_skip(monkeypatch):
     # Create 15 questions, first 5 already forecasted -> 10 unforecasted remain
-    class Q:
-        def __init__(self, done: bool):
-            self.already_forecasted = done
-
-    questions = [Q(True) for _ in range(5)] + [Q(False) for _ in range(10)]
+    questions = [_supported_question(True) for _ in range(5)] + [_supported_question(False) for _ in range(10)]
 
     captured = []
 
@@ -23,7 +33,6 @@ async def test_cap_applied_after_skip(monkeypatch):
         return [MagicMock() for _ in range(len(questions_arg))]
 
     # Patch base class method to observe how many questions are forwarded after capping
-    from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 
     monkeypatch.setattr(ForecastBot, "forecast_questions", stub_forecast_questions, raising=True)
 
@@ -47,19 +56,13 @@ async def test_cap_applied_after_skip(monkeypatch):
 @pytest.mark.asyncio
 async def test_cap_limits_to_10(monkeypatch):
     # 12 unforecasted questions -> expect 10 due to cap
-    class Q:
-        def __init__(self):
-            self.already_forecasted = False
-
-    questions = [Q() for _ in range(12)]
+    questions = [_supported_question() for _ in range(12)]
 
     captured = []
 
     async def stub_forecast_questions(self, questions_arg, return_exceptions=False):
         captured.append(len(questions_arg))
         return [MagicMock() for _ in range(len(questions_arg))]
-
-    from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 
     monkeypatch.setattr(ForecastBot, "forecast_questions", stub_forecast_questions, raising=True)
 
@@ -82,19 +85,13 @@ async def test_cap_limits_to_10(monkeypatch):
 @pytest.mark.asyncio
 async def test_no_cap_when_below_limit(monkeypatch):
     # 7 unforecasted questions -> should pass through unchanged
-    class Q:
-        def __init__(self):
-            self.already_forecasted = False
-
-    questions = [Q() for _ in range(7)]
+    questions = [_supported_question() for _ in range(7)]
 
     captured = []
 
     async def stub_forecast_questions(self, questions_arg, return_exceptions=False):
         captured.append(len(questions_arg))
         return [MagicMock() for _ in range(len(questions_arg))]
-
-    from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 
     monkeypatch.setattr(ForecastBot, "forecast_questions", stub_forecast_questions, raising=True)
 

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from forecasting_tools import BinaryQuestion, NumericQuestion
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption, PredictedOptionList
-from forecasting_tools.data_models.numeric_report import NumericDistribution
+from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 
 from metaculus_bot.calibration import PlattParams, apply_binary_platt, apply_mc_platt
 from metaculus_bot.constants import PLATT_BINARY_MAX_ABS_DEVIATION, PLATT_MC_MAX_ABS_DEVIATION
@@ -129,7 +129,9 @@ class TestMaybeSnapToIntegers:
         cdf_values = np.linspace(0.001, 0.999, 201).tolist()
         dist = MagicMock(spec=NumericDistribution)
         dist._pchip_cdf_values = cdf_values
-        dist.declared_percentiles = []
+        # ft 0.2.92 requires >= 2 declared percentiles when snap_distribution_to_integers
+        # rebuilds the distribution; the snap reads _pchip_cdf_values, not these.
+        dist.declared_percentiles = [Percentile(value=2.5, percentile=0.25), Percentile(value=7.5, percentile=0.75)]
 
         votes = [True, True, True, False, False]
         result = maybe_snap_to_integers(dist, q, votes)

@@ -674,11 +674,18 @@ silent-degradation footguns, load-bearing rationale channel, zero competitive pr
   json-repair → LLM-parser salvage → `ValueExtractionError`). The old "wait for ~50 questions of
   shadow-divergence data" trigger was operator-waived for `EXTRACTION_RUNG` telemetry + a gated
   `test_bot` eyeball.
-- **Workstream B (active, ~1 focused day):** unfreeze `forecasting-tools` 0.2.54 → 0.2.92+. Two
-  verified breaks: our PCHIP subclasses override `.cdf` but HEAD moved internals to `get_cdf()`
-  (silent bypass of our CDF machinery); `fetch_hardening` patch target moved to `MetaculusClient`
-  (silent no-op). Plus a validator audit — HEAD's `_check_too_far_from_bounds` (25% wiggle) may
-  conflict with our beyond-range open-bound design. Unlocks the litellm/cryptography CVE fixes below.
+- **Workstream B — DONE 2026-07-23 (branch `gapfill-tweaks`).** Unfroze `forecasting-tools`
+  0.2.54 → 0.2.92 (litellm 1.92.0, openai 2.x). Both verified breaks fixed: the PCHIP subclasses
+  now override `get_cdf()` — not just `.cdf`, which 0.2.92 made a deprecated shim delegating to it —
+  so our CDF machinery can't be silently bypassed, and the `fetch_hardening` / `publish_hardening`
+  patches retarget `MetaculusClient` (with a `__wrapped__` single-retry policy). The validator
+  audit resolved by threading `strict_validation=False` / `standardize_cdf=False` on our numeric
+  distributions, which preserves our beyond-range open-bound percentiles past
+  `_check_too_far_from_bounds`. MC clamp moved to `[0.01, 0.99]` (ft 0.2.92's validator bounds) via
+  the drift-free `clamp_and_renormalize_probs`; `required_successful_predictions=0.0` keeps our own
+  `min_forecasters_to_publish` guard the sole publish arbiter. Cleared the litellm/cryptography CVE
+  backlog below. Full plan: `scratch_docs_and_planning/ft_unfreeze_plan_2026-07-22.md` (gitignored —
+  local only).
 
 ### Percent-form block labels vanish silently in comment recovery (added 2026-07-15)
 
@@ -693,25 +700,29 @@ exist: `_validate_percentile_labels`, `_CANONICAL_PERCENT_LABEL_SETS`, parsing.p
 signal: a model whose per-question percentile coverage drops to zero in a post-flip pull while its
 `EXTRACTION_RUNG` prod telemetry stays healthy.
 
-### Dependency CVEs gated by the frozen `forecasting-tools` pin
+### Dependency CVEs after the forecasting-tools unfreeze (updated 2026-07-23)
 
-`make audit` (osv-scanner over `uv.lock`) flags CVEs we can't patch while
-`forecasting-tools==0.2.54` is frozen. As of 2026-07-19 the gated set is down to two packages:
+`make audit` (osv-scanner over `uv.lock`) is clean after the 0.2.54 → 0.2.92 unfreeze. The old
+gated set collapsed:
 
-- **litellm 1.80.0** — four high-severity CVEs (GHSA-4xpc-pv4p-pm3w 9.5, GHSA-jjhc-v7c2-5hh6 9.4,
-  GHSA-53mr/69x8 8.6–8.7), fixed in 1.83.x–1.84.0; forecasting-tools pins litellm to exactly 1.80.0
-  (our `<2.0.0` cap is not binding), unreachable without bumping forecasting-tools.
-- **cryptography 45.0.4** — incl. one 9.8 (PYSEC-2026-36), transitive via asknews/google-auth/mcp.
+- **litellm — CLEARED.** 0.2.92 moved litellm 1.80.0 → 1.92.0, past every previously-gated litellm
+  CVE (the 9.x severities plus the proxy-server RBAC / auth-bypass set). All litellm entries were
+  removed from `osv-scanner.toml`.
+- **cryptography — down to two accepted advisories.** The asknews 0.11.32 → 0.13.54 bump lifted its
+  `cryptography<45.0.5` cap to `<46.0.7`, so cryptography moved 45.0.4 → 46.0.6. Two of the four old
+  cryptography advisories are fixed at 46.0.6; the remaining two still fire and their fixes are
+  unreachable behind asknews's `<46.0.7` cap: **GHSA-p423-j2cm-9vmq** (CVE-2026-39892, CVSS 9.8
+  buffer overflow on non-contiguous buffers, fixed 46.0.7) and **GHSA-537c-gmf6-5ccf** (CVSS 7.5
+  vulnerable OpenSSL bundled in the wheels, fixed 48.0.1). Both stay ignored in `osv-scanner.toml`
+  with updated reasons; drop them once asknews lifts the cap.
+- **pillow / transformers / pydantic-settings — CLEARED.** The `[tool.uv]` override/exclude-
+  dependencies workarounds were deleted from pyproject.toml at the bump; none resolve to a
+  vulnerable version anymore.
 
-Resolved 2026-07-19: pillow and transformers came off the gated list via `[tool.uv]` settings in
-pyproject.toml (pillow forced past the never-importing forecasting-tools `<12` cap to 12.3.0 via
-`override-dependencies`; transformers — declared-but-unused, with an unreachable-fix critical RCE —
-removed from resolution entirely via `exclude-dependencies`), and pydantic-settings via an in-range
-bump to 2.14.2. Re-evaluate (and ideally delete) both settings at the next forecasting-tools bump.
-
-Accepted consequence of freezing forecasting-tools. Revisit on the next forecasting-tools upgrade
-(re-run `make audit`); if a CVE becomes actively exploited first, evaluate a `[tool.uv]
-override-dependencies` + re-validate the numeric/stacking pipeline. CI runs the same scan on every PR.
+Re-audit at the next forecasting-tools or asknews bump (re-run `make audit`, prune resolved IDs). If
+one of the two accepted cryptography CVEs becomes actively exploited before asknews lifts its cap,
+evaluate a `[tool.uv] override-dependencies` bump + re-validate the research pipeline. CI runs the
+same scan on every PR.
 
 ### Promote the core pipeline to `basedpyright` strict
 
@@ -1054,10 +1065,12 @@ stacks — a field-wide hazard of undated archive URLs, not a one-off. Idea: a f
 fabricated dates, summarizer certainty inflation). Low priority (offending provider gone; prompt-side
 date-stamping + single-source flagging are the nearer lever) but worth doing before any new provider swap.
 
-Related dependency follow-up (from the 2026-06-01 desloppify pass): **raise version floors to
-current-installed** (`litellm ^1.80` vs `^1.59.1`, `openai` to latest, evaluate moving `forecasting-tools`
-off the pinned `0.2.54`). Forecast-affecting — **gate on a `make backtest_medium` before/after, don't bump
-blind**. (The poetry→uv migration follow-up shipped 2026-06.)
+Related dependency follow-up (from the 2026-06-01 desloppify pass) — **DONE 2026-07-23 (branch
+`gapfill-tweaks`).** `forecasting-tools` moved off the pinned `0.2.54` to `0.2.92`, dragging litellm
+to 1.92.0 and openai to 2.x. This is forecast-affecting; the pre/post `make backtest_medium` gate
+was NOT run (paid) — coverage is the full offline unit/integration suite, and the operator-triggered
+paid `test_bot` GHA run is the final live gate before prod. (The poetry→uv migration follow-up
+shipped 2026-06.)
 
 ### Gemini grounding via OpenRouter — currently NOT supported (added 2026-05-17)
 

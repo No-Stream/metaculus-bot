@@ -28,6 +28,7 @@ from forecasting_tools import (
     MonetaryCostManager,
     run_benchmark_streamlit_page,
 )
+from forecasting_tools.data_models.questions import QuestionBasicType
 from tqdm import tqdm
 
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
@@ -58,9 +59,6 @@ from metaculus_bot.scoring_patches import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Mirror of forecasting_tools' ApiFilter.allowed_types element type (not publicly re-exported).
-type QuestionBasicType = Literal["binary", "numeric", "multiple_choice", "date", "discrete"]
 
 load_environment()
 

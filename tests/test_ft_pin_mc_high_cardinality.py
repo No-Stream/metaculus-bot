@@ -1,7 +1,7 @@
 """Pin test for the forecasting-tools 0.2.54 -> 0.2.92 upgrade: high-cardinality MC.
 
 Companion to ``tests/test_ft_upgrade_seams.py`` and ``tests/test_ft_numeric_seams.py``
-(FUTURE.md Workstream B). Green on the currently-installed 0.2.54; it defines
+(FUTURE.md Workstream B). Revised 2026-07-23 for the installed 0.2.92; it defines
 "done" for the multiple-choice clamp seam at the upgrade.
 
 The seam: at 0.2.92 upstream's ``PredictedOptionList`` constructor drops its
@@ -12,6 +12,11 @@ dominant option and several near-floor options is exactly where that raise
 fires: the near-floor options each jump to ``0.01``, inflating the sum enough
 that renormalization drags the dominant option down by >0.05.
 
+The fix (W4): align ``MC_PROB_MIN``/``MC_PROB_MAX`` to ``[0.01, 0.99]`` and clamp
++ renormalize BEFORE every ``PredictedOptionList`` construction (drift-free, via
+``clamp_and_renormalize_probs``), so upstream's constructor is a no-op and never
+raises.
+
 Two pins:
 
 Pin 1 (``TestHighCardinalityMcSurvivesRealPipeline`` -- an INVARIANT PIN):
@@ -19,16 +24,18 @@ drives the *real* prod MC path -- ``extract_mc`` (deterministic block rung, no
 parser-LLM call) -> per-model ``clamp_and_renormalize_mc`` -> ``MEDIAN`` combine
 via ``aggregation_strategies`` -- on a 7-option dominant+near-floor ballot and
 asserts the resulting ``PredictedOptionList`` respects OUR
-``[MC_PROB_MIN, MC_PROB_MAX]`` clamp bounds. This proves no raw/unclamped list
-reaches the publish boundary; at 0.2.92 the fix must keep our clamp ahead of
-upstream's stricter constructor so this stays green.
+``[MC_PROB_MIN, MC_PROB_MAX]`` clamp bounds, with the sub-0.01 near-floor options
+floored exactly to ``MC_PROB_MIN``. This proves no raw/unclamped list reaches the
+publish boundary; the pre-construction clamp keeps our values ahead of upstream's
+stricter constructor.
 
-Pin 2 (``TestRawSubFloorConstructionPreservedOn0254`` -- a DECISION PIN):
-documents that a *raw* ``PredictedOptionList`` built directly from sub-floor
-(0.002) options survives construction verbatim on 0.2.54 (via the early return),
-with a worked example of the dominant+eight-near-floor shape that fires the
-0.2.92 raise. This is the semantics the upgrade changes, so it is a conscious
-revision at 0.2.92, not a silent drift -- the W4 fix agent revises it.
+Pin 2 (``TestRawSubFloorConstructionRaisesOn0292`` -- a DECISION PIN, resolved):
+pins that a *raw* ``PredictedOptionList`` built directly from sub-floor (0.002)
+options -- the dominant+eight-near-floor shape -- now RAISES ``ValueError`` on
+0.2.92 (the 0.002 options clamp to 0.01, inflating the sum so renormalization
+drags the 0.984 dominant down by ~0.059), and that our pipeline
+(``build_mc_prediction``) clamps that same shape BEFORE construction so it stays
+in bounds without raising.
 """
 
 from __future__ import annotations
@@ -45,14 +52,16 @@ from forecasting_tools.data_models.multiple_choice_report import (
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy, combine_multiple_choice_predictions
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
+from metaculus_bot.mc_processing import build_mc_prediction
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
+from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import extract_mc
 
 # A 7-option ballot: one dominant option plus six near-floor options. ">=6
 # options" is the cardinality the seam calls out. The near-floor share (0.006)
-# sits in the [MC_PROB_MIN, 0.01) band -- at/above OUR 0.005 floor, but BELOW
-# upstream 0.2.92's 0.01 floor -- which is precisely where the two clamp regimes
-# diverge.
+# sits BELOW the aligned MC_PROB_MIN=0.01 floor, so the pre-construction clamp
+# floors it to MC_PROB_MIN -- the drift-free repair keeps the floored siblings at
+# exactly 0.01 even under the dominant option's renormalization pull.
 _DOMINANT = "Alpha"
 _NEAR_FLOOR = ["Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf"]
 _OPTIONS = [_DOMINANT, *_NEAR_FLOOR]
@@ -86,18 +95,17 @@ def _near_floor_ballot(floor_share: float) -> dict[str, float]:
 class TestHighCardinalityMcSurvivesRealPipeline:
     """INVARIANT PIN: a >=6-option near-floor ballot survives extract -> clamp -> aggregate, bounded.
 
-    On 0.2.54 the whole prod path yields a valid ``PredictedOptionList`` whose
-    every option respects OUR ``[MC_PROB_MIN, MC_PROB_MAX]`` bounds, so no
-    raw/unclamped list escapes to publish. At 0.2.92 the upgrade must keep this
-    green by threading our clamp ahead of upstream's stricter constructor.
+    The whole prod path yields a valid ``PredictedOptionList`` whose every option
+    respects OUR ``[MC_PROB_MIN, MC_PROB_MAX]`` bounds, so no raw/unclamped list
+    escapes to publish. The pre-construction clamp threads our bounds ahead of
+    upstream's stricter constructor, keeping this green on 0.2.92.
 
-    The near-floor share is 0.006 rather than a truly sub-``MC_PROB_MIN`` value
-    on purpose: at/above our 0.005 floor the per-model clamp is an identity and
-    the ballot already sums to 1.0, so renormalization is exact and the bounds
-    assertion is not confounded by the renormalize-below-floor drift a sub-floor
-    input would introduce (a large dominant option divides several floored
-    siblings just under 0.005). That drift is a separate, known property of
-    ``clamp_and_renormalize_mc`` and is not what this seam pins.
+    The near-floor share is 0.006, which is now BELOW the aligned ``MC_PROB_MIN``
+    (0.01), so the clamp floors those options exactly to ``MC_PROB_MIN``. The
+    drift-free repair in ``clamp_and_renormalize_probs`` is what guarantees they
+    stay at 0.01 rather than dividing back under it when the dominant option keeps
+    the post-clamp total above 1 — the exact renormalize-below-floor drift this
+    pipeline used to have.
     """
 
     @pytest.fixture
@@ -136,13 +144,13 @@ class TestHighCardinalityMcSurvivesRealPipeline:
                 f"option {option.option_name!r} probability {option.probability} outside [{MC_PROB_MIN}, {MC_PROB_MAX}]"
             )
 
-        # Non-vacuity: the near-floor options really do sit in the [MC_PROB_MIN, 0.01)
-        # band -- below upstream 0.2.92's 0.01 floor -- so the seam is exercised, not
-        # dodged by accidentally comfortable probabilities.
+        # Non-vacuity: the near-floor options were sub-0.01 on input (0.006) and are
+        # floored exactly to MC_PROB_MIN (0.01) -- so the clamp bites, the seam is
+        # exercised, not dodged by accidentally comfortable probabilities.
         near_floor_probs = [o.probability for o in pol.predicted_options if o.option_name in _NEAR_FLOOR]
         assert near_floor_probs, "expected the near-floor options to be present"
-        assert all(MC_PROB_MIN <= p < 0.01 for p in near_floor_probs), (
-            f"near-floor options must land in [MC_PROB_MIN, 0.01); got {near_floor_probs}"
+        assert all(p == pytest.approx(MC_PROB_MIN) for p in near_floor_probs), (
+            f"sub-0.01 near-floor options must floor to MC_PROB_MIN (0.01); got {near_floor_probs}"
         )
 
     def test_full_path_extract_clamp_median_is_bounded(self, parser_llm: MagicMock) -> None:
@@ -164,49 +172,62 @@ class TestHighCardinalityMcSurvivesRealPipeline:
         # The aggregate is still a dominant-plus-near-floor shape (not smeared into
         # a uniform), so the pin covers the shape the 0.2.92 raise targets.
         assert dominant_prob > 0.9, f"dominant option should remain dominant after MEDIAN combine; got {dominant_prob}"
-        assert all(MC_PROB_MIN <= p < 0.01 for p in near_floor_probs), (
-            f"aggregated near-floor options must stay in [MC_PROB_MIN, 0.01); got {near_floor_probs}"
+        assert all(p == pytest.approx(MC_PROB_MIN) for p in near_floor_probs), (
+            f"aggregated sub-0.01 near-floor options must floor to MC_PROB_MIN (0.01); got {near_floor_probs}"
         )
 
 
-class TestRawSubFloorConstructionPreservedOn0254:
-    """DECISION PIN: raw PredictedOptionList construction preserves sub-floor options verbatim on 0.2.54.
+class TestRawSubFloorConstructionRaisesOn0292:
+    """DECISION PIN (resolved 2026-07-23 for ft 0.2.92): raw sub-floor construction RAISES; our pipeline clamps first.
 
-    # DECISION PIN: encodes 0.2.54 PredictedOptionList construction semantics
-    # -- when abs(sum - 1) < 0.0001 the constructor returns the options verbatim
-    # with NO clamp -- so a raw list with sub-floor (0.002) options is preserved.
-    # At ft 0.2.92 this is consciously revised: the constructor drops that early
-    # return, unconditionally clamps every option into [0.01, 0.99], renormalizes,
-    # and raises ValueError when any option moves > 0.05. For the exact shape below
+    # DECISION PIN: 0.2.54's PredictedOptionList constructor returned sub-floor
+    # options verbatim (abs(sum - 1) < 0.0001 early return). 0.2.92 drops that:
+    # it unconditionally clamps every option into [0.01, 0.99], renormalizes, and
+    # raises ValueError when any option moves > 0.05. For the exact shape here
     # (one dominant 0.984 option + eight near-floor 0.002 options), the eight clamp
     # 0.002 -> 0.01, inflating the sum to 1.064, which drags the dominant
-    # 0.984 -> ~0.925 (a ~0.059 move) and fires the raise. The W4 fix agent revises
-    # this test to the 0.2.92 semantics and confirms our pipeline clamps to
-    # [MC_PROB_MIN, MC_PROB_MAX] BEFORE any such raw construction can reach upstream.
+    # 0.984 -> ~0.925 (a ~0.059 move) and fires the raise. The W4 fix aligns
+    # MC_PROB_MIN/MAX to [0.01, 0.99] and clamps BEFORE construction, so our
+    # pipeline (build_mc_prediction) handles this shape without ever hitting the raise.
     """
 
-    def test_sub_floor_options_survive_construction_verbatim(self) -> None:
-        """A raw sub-floor ballot summing to exactly 1.0 is preserved verbatim on 0.2.54 (the early-return path)."""
-        dominant = 0.984
-        sub_floor = 0.002
-        near_floor_names = [f"opt{i}" for i in range(8)]  # 8 near-floor options -> the >=6-option raise regime
+    _DOMINANT = 0.984
+    _SUB_FLOOR = 0.002
+    _NEAR_FLOOR_NAMES = [f"opt{i}" for i in range(8)]  # 8 near-floor options -> the >=6-option raise regime
 
-        pol = PredictedOptionList(
-            predicted_options=[
-                PredictedOption(option_name="Dominant", probability=dominant),
-                *[PredictedOption(option_name=name, probability=sub_floor) for name in near_floor_names],
-            ]
-        )
-
-        by_name = {o.option_name: o.probability for o in pol.predicted_options}
-        # Precondition for the early return: the ballot sums to (float-)exactly 1.0.
-        assert sum(by_name.values()) == pytest.approx(1.0, abs=1e-9)
-        # 0.2.54: options are kept verbatim -- the 0.002 sub-floor probabilities are
-        # NOT clamped up to 0.01. This raw/unclamped list is exactly what our
-        # pipeline must never hand upstream once 0.2.92 lands.
-        assert by_name["Dominant"] == pytest.approx(dominant)
-        for name in near_floor_names:
-            assert by_name[name] == pytest.approx(sub_floor)
-            assert by_name[name] < 0.01, (
-                "sub-floor option is below upstream 0.2.92's 0.01 floor, yet preserved on 0.2.54"
+    def test_raw_sub_floor_construction_raises(self) -> None:
+        """A raw dominant + eight-sub-floor ballot now RAISES on 0.2.92 construction (the >0.05-move guard)."""
+        with pytest.raises(ValueError):
+            PredictedOptionList(
+                predicted_options=[
+                    PredictedOption(option_name="Dominant", probability=self._DOMINANT),
+                    *[
+                        PredictedOption(option_name=name, probability=self._SUB_FLOOR)
+                        for name in self._NEAR_FLOOR_NAMES
+                    ],
+                ]
             )
+
+    def test_pipeline_clamps_sub_floor_shape_before_construction(self) -> None:
+        """build_mc_prediction clamps the same shape BEFORE construction, so it lands in bounds without raising."""
+        options = ["Dominant", *self._NEAR_FLOOR_NAMES]
+        raw = [
+            OptionProbability(option_name="Dominant", probability=self._DOMINANT),
+            *[OptionProbability(option_name=name, probability=self._SUB_FLOOR) for name in self._NEAR_FLOOR_NAMES],
+        ]
+
+        pol = build_mc_prediction(raw, options)  # must not raise
+
+        assert {o.option_name for o in pol.predicted_options} == set(options)
+        assert sum(o.probability for o in pol.predicted_options) == pytest.approx(1.0)
+        for option in pol.predicted_options:
+            assert MC_PROB_MIN <= option.probability <= MC_PROB_MAX, (
+                f"option {option.option_name!r} probability {option.probability} outside [{MC_PROB_MIN}, {MC_PROB_MAX}]"
+            )
+        # The eight sub-floor options are floored to MC_PROB_MIN; the dominant stays dominant.
+        near_floor_probs = [o.probability for o in pol.predicted_options if o.option_name in self._NEAR_FLOOR_NAMES]
+        assert all(p == pytest.approx(MC_PROB_MIN) for p in near_floor_probs), (
+            f"sub-floor options must floor to MC_PROB_MIN (0.01); got {near_floor_probs}"
+        )
+        dominant_prob = next(o.probability for o in pol.predicted_options if o.option_name == "Dominant")
+        assert dominant_prob > 0.9, f"dominant option should stay dominant; got {dominant_prob}"

@@ -4,16 +4,16 @@ that the 0.2.54 -> 0.2.92 upgrade is known to touch (FUTURE.md Workstream B).
 All tests are green on the currently-installed 0.2.54. They fall into two
 kinds:
 
-Pin 1 (``TestMcSubOnePercentProbabilityIsPublished`` — a DECISION PIN):
-``clamp_and_renormalize_mc`` floors option probabilities at ``MC_PROB_MIN =
-0.005``, so an option landing in ``[0.005, 0.01)`` survives our per-model clamp,
-the ``aggregation_strategies`` median combine, and the report publish path
-sub-0.01 on 0.2.54. At 0.2.92 the upstream ``PredictedOptionList`` validator
-dropped its ``abs(sum - 1) < 0.0001`` early return and unconditionally clamps
-every option into ``[0.01, 0.99]`` on construction, so a 0.007 option would be
-bumped to 0.01. That is a *conscious* semantics decision at upgrade time (keep
-our 0.005 floor or adopt upstream's 0.01), not a silent drift — hence the pin is
-tagged as a DECISION PIN rather than an invariant we intend to preserve.
+Pin 1 (``TestMcSubOnePercentProbabilityIsFloored`` — a DECISION PIN, RESOLVED
+2026-07-23 at the 0.2.92 upgrade): the decision was to ADOPT upstream's 0.01 floor.
+``MC_PROB_MIN`` moved 0.005 -> 0.01 and ``MC_PROB_MAX`` 0.995 -> 0.99 to match ft
+0.2.92's ``PredictedOptionList`` validator, which dropped its ``abs(sum - 1) < 0.0001``
+early return and unconditionally clamps every option into ``[0.01, 0.99]`` on
+construction (raising on any >0.05 move). ``clamp_and_renormalize_mc`` now floors a
+sub-0.01 option to ``MC_PROB_MIN``, so a 0.007 option is bumped to 0.01 through the
+per-model clamp, the ``aggregation_strategies`` median combine, and the report publish
+path. The pin below records that floored-at-0.01 behavior, replacing the old sub-0.01
+semantics it was tagged to flag.
 
 Pin 2 (``TestNumericDistributionAcceptsBeyondRangePercentiles`` — an INVARIANT
 PIN): our numeric pipeline expresses out-of-bound probability mass by placing
@@ -38,7 +38,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 from forecasting_tools import (
-    MetaculusApi,
+    MetaculusClient,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
@@ -91,11 +91,12 @@ def _declared(values: Sequence[float]) -> list[Percentile]:
     return [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values)]
 
 
-class TestMcSubOnePercentProbabilityIsPublished:
-    """DECISION PIN: an MC option in [0.005, 0.01) survives our aggregation and publishes sub-0.01.
+class TestMcSubOnePercentProbabilityIsFloored:
+    """DECISION PIN (resolved 2026-07-23 for ft 0.2.92): a sub-0.01 MC option is floored to
+    MC_PROB_MIN (0.01) through per-model clamp, median combine, and publish.
 
-    # DECISION PIN: encodes MC_PROB_MIN=0.005 semantics; will be consciously
-    # revised at ft 0.2.92 where upstream clamps [0.01,0.99].
+    # DECISION PIN: encodes the MC_PROB_MIN=0.01 alignment adopted at the ft 0.2.92
+    # upgrade (was MC_PROB_MIN=0.005 / sub-0.01-survives on 0.2.54).
     """
 
     @pytest.fixture
@@ -112,34 +113,46 @@ class TestMcSubOnePercentProbabilityIsPublished:
         )
 
     def _capture_mc_publish(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-        """Mock the two publish classmethods and return a container for the captured MC payload."""
+        """Mock the two publish methods and return a container for the captured MC payload.
+
+        0.2.92 publishes via ``MetaculusClient`` instance methods, so ``fake_post_mc``
+        takes ``self`` (bound as an instance method) and the mock boundary is the
+        client class, not the deprecated ``MetaculusApi`` shim.
+        """
         captured: dict[str, Any] = {}
 
-        def fake_post_mc(question_id: int, options_with_probabilities: dict[str, float]) -> Any:
+        def fake_post_mc(self: Any, question_id: int, options_with_probabilities: dict[str, float]) -> Any:
             captured["question_id"] = question_id
             captured["options"] = dict(options_with_probabilities)
             return MagicMock()
 
-        monkeypatch.setattr(MetaculusApi, "post_multiple_choice_question_prediction", fake_post_mc)
-        monkeypatch.setattr(MetaculusApi, "post_question_comment", MagicMock())
+        monkeypatch.setattr(MetaculusClient, "post_multiple_choice_question_prediction", fake_post_mc)
+        monkeypatch.setattr(MetaculusClient, "post_question_comment", MagicMock())
         return captured
 
-    def test_per_model_clamp_preserves_sub_one_percent_option(self) -> None:
-        """clamp_and_renormalize_mc floors at 0.005, so a 0.007 option is left in the [0.005, 0.01) band."""
+    def test_per_model_clamp_floors_sub_one_percent_to_min(self) -> None:
+        """clamp_and_renormalize_mc floors at 0.01 (MC_PROB_MIN), so a 0.007 option is bumped to the floor."""
         clamped = clamp_and_renormalize_mc(_pol(0.007))
         a_prob = clamped.predicted_options[0].probability
-        assert MC_PROB_MIN <= a_prob < 0.01, f"per-model clamp must keep 0.007 in [0.005, 0.01); got {a_prob}"
+        assert a_prob == pytest.approx(MC_PROB_MIN), (
+            f"per-model clamp must floor 0.007 to MC_PROB_MIN (0.01); got {a_prob}"
+        )
 
-    def test_median_combine_then_publish_emits_sub_one_percent(
+    def test_median_combine_then_publish_floors_at_min(
         self, mc_question: MultipleChoiceQuestion, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Full prod MC path: per-model clamp -> aggregation_strategies MEDIAN -> publish, all sub-0.01."""
+        """Full prod MC path: per-model clamp -> aggregation_strategies MEDIAN -> publish, all floored at MC_PROB_MIN."""
         per_model = [clamp_and_renormalize_mc(_pol(a)) for a in (0.006, 0.007, 0.008)]
         aggregated = combine_multiple_choice_predictions(per_model, AggregationStrategy.MEDIAN)
 
-        # The aggregated object already carries the sub-0.01 mass on 0.2.54 (no re-clamp to 0.01).
+        # Every input option is sub-0.01, so the aggregate carries A floored at ~MC_PROB_MIN.
+        # The MEDIAN of the three per-model ballots does not sum to exactly 1, so the final
+        # renormalization leaves A a hair above 0.01 rather than exactly on it — hence abs=1e-3.
         agg_a = aggregated.predicted_options[0].probability
-        assert agg_a < 0.01, f"median combine must not clamp 0.007 up to 0.01 on 0.2.54; got {agg_a}"
+        assert agg_a >= MC_PROB_MIN, f"aggregate must not drift below the MC floor; got {agg_a}"
+        assert agg_a == pytest.approx(MC_PROB_MIN, abs=1e-3), (
+            f"median combine floors sub-0.01 mass at ~MC_PROB_MIN; got {agg_a}"
+        )
 
         captured = self._capture_mc_publish(monkeypatch)
         report = MultipleChoiceReport(question=mc_question, prediction=aggregated, explanation="# Seam test")
@@ -147,21 +160,20 @@ class TestMcSubOnePercentProbabilityIsPublished:
 
         assert captured["question_id"] == mc_question.id_of_question
         published_a = captured["options"]["A"]
-        assert published_a < 0.01, f"published MC probability must stay sub-0.01 on 0.2.54; got {published_a}"
-        # Sanity: it is the actual small mass, not a dropped-to-zero option.
-        assert published_a > 0.0
+        assert published_a == pytest.approx(MC_PROB_MIN, abs=1e-3), (
+            f"published MC probability floors at ~MC_PROB_MIN (0.01); got {published_a}"
+        )
 
-    def test_floor_is_half_a_percent_not_one_percent(self) -> None:
-        """Non-vacuity: a below-floor option is raised toward 0.005 (our floor), NOT to upstream's 0.01.
+    def test_floor_is_one_percent(self) -> None:
+        """Non-vacuity: a below-floor option is raised to MC_PROB_MIN (0.01), matching ft 0.2.92's upstream floor.
 
-        If the clamp floor were 0.01 (the 0.2.92 upstream semantics), a 0.001 input
-        would land >= 0.01 and this assertion would fail — that discrimination is
-        what makes the sub-0.01 pin above meaningful rather than accidental.
+        Under the old 0.005 floor a 0.001 input would land sub-0.01; the 0.01-alignment
+        adopted at the upgrade floors it exactly at MC_PROB_MIN, which is what this pins.
         """
         clamped = clamp_and_renormalize_mc(_pol(0.001))
         a_prob = clamped.predicted_options[0].probability
         assert a_prob > 0.001, "the clamp must actually raise a below-floor option (proves it fires)"
-        assert a_prob < 0.01, f"our 0.005 floor keeps a floored option sub-0.01; upstream's 0.01 would not ({a_prob})"
+        assert a_prob == pytest.approx(MC_PROB_MIN), f"the aligned floor is 0.01, not the old 0.005; got {a_prob}"
 
     def test_in_bounds_option_is_untouched_by_clamp(self) -> None:
         """Non-vacuity: a comfortably in-bounds option is not perturbed, so the clamp only bites the tail."""

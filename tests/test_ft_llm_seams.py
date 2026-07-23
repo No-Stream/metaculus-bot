@@ -17,16 +17,17 @@ Seams covered:
   ``pass_through_unknown_kwargs`` these arrive mangled and the models silently
   run with the wrong reasoning effort / no web plugin / no structured output.
 
-* **temperature=None workaround** (``TestTemperatureNoneWorkaround``): the
-  0.2.54 ctor default is ``temperature=0`` — so our reasoning configs pass
+* **temperature default semantics** (``TestTemperatureNoneWorkaround``): pre-0.2.92
+  the ctor default was ``temperature=0`` — so our reasoning configs pass
   ``temperature=None`` *explicitly* to keep a hard ``0`` from being injected
-  (reasoning models degrade under an explicit sampling temperature). At 0.2.92
-  the ctor default flips to ``None``; this pair of tests is the canary that
-  documents the invariant we were built against. NOTE: ``temperature=None`` does
-  NOT drop the key from the acompletion kwargs — the funnel forwards
-  ``temperature=None`` and litellm (with ``drop_params``) strips the None value
-  downstream. We pin the funnel behaviour we can observe: ``None`` is forwarded
-  unchanged, and omitting the arg injects ``0``.
+  (reasoning models degrade under an explicit sampling temperature). At 0.2.92 the
+  ctor default flipped to ``None`` (revised here in W5), so that explicit ``None``
+  is now redundant-but-harmless and is kept as a defensive pin against a future
+  default flip. NOTE: ``temperature=None`` does NOT drop the key from the
+  acompletion kwargs — the funnel forwards ``temperature=None`` and litellm (with
+  ``drop_params``) strips the None value downstream. We pin the funnel behaviour we
+  can observe: both the explicit ``None`` and the omitted arg reach the funnel as
+  ``None`` at 0.2.92 (pre-0.2.92 the omitted arg injected ``0``).
 
 * **litellm.drop_params global** (``TestDropParamsGlobal``): the agentic
   research loop calls raw ``acompletion`` and relies on ``litellm.drop_params``
@@ -243,10 +244,16 @@ class TestProductionKwargShapesReachAcompletion:
 
 
 class TestTemperatureNoneWorkaround:
-    """The temperature=None workaround: pins the 0.2.54 default (0) our configs were built against.
+    """Temperature default semantics at 0.2.92.
 
-    At 0.2.92 the ctor default flips 0 -> None, so these two tests together document
-    the invariant that the migration must not silently reintroduce a hard 0.
+    Decision (W5, 0.2.92 upgrade): the ``GeneralLlm`` ctor default flipped 0 -> None
+    at 0.2.92 (verified: general_llm.py stores ``temperature`` unchanged, default
+    ``None``). So omitting the arg now yields ``None`` just like passing it — the
+    hard-0 injection these tests were the canary for is gone. Our reasoning configs
+    still pass ``temperature=None`` explicitly; that is now redundant-but-harmless
+    and is kept as a defensive pin against a future upstream default flip. These two
+    tests pin the new invariant: both the explicit ``None`` and the omitted arg reach
+    the funnel as ``None`` (litellm's drop_params strips it downstream), never a 0.
     """
 
     async def test_temperature_none_is_forwarded_not_coerced_to_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,11 +267,12 @@ class TestTemperatureNoneWorkaround:
         # drop_params strips the None value before it hits the provider.
         assert calls[0]["temperature"] is None
 
-    async def test_omitting_temperature_injects_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Negative control: the 0.2.54 ctor default IS 0, so omitting the arg injects a hard 0.
+    async def test_omitting_temperature_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """0.2.92 semantics: the ctor default is None, so omitting the arg yields None (no injected 0).
 
-        This is exactly why our reasoning configs pass ``temperature=None`` explicitly,
-        and it is the default that flips to None at 0.2.92.
+        Pre-0.2.92 this injected a hard 0, which is why our reasoning configs pass
+        ``temperature=None`` explicitly. At 0.2.92 that explicit None is redundant
+        with the new default — this test pins that omission no longer reintroduces a 0.
         """
         calls = _install_acompletion(monkeypatch)
         llm = GeneralLlm(model="openrouter/openai/gpt-5.6-sol", timeout=480, allowed_tries=1)
@@ -272,7 +280,7 @@ class TestTemperatureNoneWorkaround:
         await llm.invoke("hi")
 
         assert len(calls) == 1
-        assert calls[0]["temperature"] == 0
+        assert calls[0]["temperature"] is None
 
 
 class TestDropParamsGlobal:

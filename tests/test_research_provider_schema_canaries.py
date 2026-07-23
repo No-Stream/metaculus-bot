@@ -510,8 +510,10 @@ class TestAskNewsSDKResponseShapeContract:
             article_url="https://example.com/news/hist-real",
             source_id="OldWire",
         )
-        hot_response = SearchResponse(as_dicts=[hot_article], as_string=None, offset=0)
-        hist_response = SearchResponse(as_dicts=[historical_article], as_string=None, offset=0)
+        # hit_cache added in asknews 0.13.x (Optional[bool], defaults None at runtime);
+        # pass it explicitly so basedpyright's synthesized __init__ is satisfied.
+        hot_response = SearchResponse(as_dicts=[hot_article], as_string=None, offset=0, hit_cache=None)
+        hist_response = SearchResponse(as_dicts=[historical_article], as_string=None, offset=0, hit_cache=None)
 
         # Async-context-manager mock for AsyncAskNewsSDK(...).
         fake_sdk = MagicMock()

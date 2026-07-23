@@ -568,8 +568,8 @@ class ResearchOrchestrator:
             model_name = "perplexity/sonar-reasoning-pro"
         model = GeneralLlm(
             model=model_name,
-            # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-            # defer to provider defaults. No top_p.
+            # temperature=None defers to provider defaults; redundant on ft 0.2.92
+            # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
         )

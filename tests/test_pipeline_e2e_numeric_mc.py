@@ -444,14 +444,14 @@ class TestMCClampingAndRenormalization:
 
     @pytest.mark.e2e
     def test_mc_clamping_and_renormalization(self):
+        from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
         from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 
         extreme_prediction = _mc_option_list([0.99, 0.005, 0.005])
         clamped = clamp_and_renormalize_mc(extreme_prediction)
 
         for opt in clamped.predicted_options:
-            assert opt.probability <= 0.995
-            assert opt.probability >= 0.005
+            assert MC_PROB_MIN <= opt.probability <= MC_PROB_MAX
 
         total = sum(o.probability for o in clamped.predicted_options)
         assert abs(total - 1.0) < 1e-6

@@ -38,7 +38,7 @@ from json_repair import repair_json
 from pydantic import ValidationError
 
 from metaculus_bot.exceptions import ValueExtractionError
-from metaculus_bot.mc_processing import build_mc_prediction
+from metaculus_bot.mc_processing import build_mc_prediction, clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_output_schema import (
@@ -313,9 +313,10 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], Predi
         # options literally named "Option A"/"Option B". The block already declares
         # exact per-option probabilities, so we map straight onto the canonical
         # names in question order. Any unmatched key or missing option fails the
-        # rung (→ validation → next rung). Renormalize to 1.0 only to satisfy
-        # PredictedOptionList construction; the caller still applies
-        # clamp_and_renormalize_mc.
+        # rung (→ validation → next rung). Clamp + renormalize BEFORE constructing
+        # the PredictedOptionList so ft 0.2.92's clamp-and-renormalize validator
+        # (which raises on any >0.05 move) is a no-op; the caller still applies
+        # clamp_and_renormalize_mc idempotently.
         canonical_by_norm = {opt.strip().lower(): opt for opt in options}
         matched: dict[str, float] = {}
         for key, prob in block.option_probs.items():
@@ -326,11 +327,11 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], Predi
         total = sum(matched.values())
         if total <= 0:
             raise ValueError(f"block option probabilities sum to {total}")
+        ordered = [(name, matched[name]) for name in options if name in matched]
+        clamped = clamp_and_renormalize_probs([prob for _, prob in ordered])
         return PredictedOptionList(
             predicted_options=[
-                PredictedOption(option_name=name, probability=matched[name] / total)
-                for name in options
-                if name in matched
+                PredictedOption(option_name=name, probability=prob) for (name, _), prob in zip(ordered, clamped)
             ]
         )
 

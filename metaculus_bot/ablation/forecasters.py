@@ -60,6 +60,7 @@ from metaculus_bot.constants import FORECASTER_SOFT_DEADLINE
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
+from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 
 logger = logging.getLogger(__name__)
 
@@ -359,10 +360,15 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
     if payload_type == "binary":
         return float(payload["prob"])
     if payload_type == "multiple_choice":
+        # Clamp + renormalize cached probabilities BEFORE construction so ft 0.2.92's
+        # clamp-and-renormalize validator is a no-op on old-era payloads that may carry
+        # sub-0.01 options (which would otherwise fire the >0.05 raise on reload).
+        options_payload = payload["options"]
+        clamped = clamp_and_renormalize_probs([float(opt["probability"]) for opt in options_payload])
         return PredictedOptionList(
             predicted_options=[
-                PredictedOption(option_name=opt["option_name"], probability=float(opt["probability"]))
-                for opt in payload["options"]
+                PredictedOption(option_name=opt["option_name"], probability=prob)
+                for opt, prob in zip(options_payload, clamped)
             ]
         )
     if payload_type == "numeric":

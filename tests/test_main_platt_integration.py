@@ -316,9 +316,9 @@ async def test_mc_many_options_can_fall_below_binary_floor(monkeypatch: pytest.M
     (0.005, 0.010, 0.015). The pre-fix path routed every option through
     ``apply_binary_platt``, which clamped each to >= 0.02 BEFORE MC
     renormalization — making the effective MC floor 0.02 instead of the
-    documented 0.005, and inflating tiny options 4-10x. The fix routes
+    documented 0.01, and inflating tiny options 2-4x. The fix routes
     options through the bound-free Platt helper and lets
-    ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.005, 0.995]``
+    ``clamp_and_renormalize_mc`` apply the MC-correct ``[0.01, 0.99]``
     bounds at the tail.
 
     Reference is hand-computed (Platt math + MC-bounds clamp + renormalize)

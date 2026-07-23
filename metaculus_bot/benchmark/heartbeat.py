@@ -15,7 +15,7 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
     """
     try:
         original_run = Benchmarker._run_a_batch  # type: ignore[attr-defined]
-    except Exception:  # pragma: no cover
+    except AttributeError:  # pragma: no cover  # ft renamed/moved the batch method — skip the (cosmetic) heartbeat
         return
 
     if getattr(Benchmarker._run_a_batch, "_has_heartbeat", False):  # type: ignore[attr-defined]
@@ -33,7 +33,7 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
                 logger.info(
                     f"[HB] {batch.benchmark.name} | {len(batch.questions)} questions | elapsed {elapsed_min:.1f}m"
                 )
-            except Exception as e:
+            except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except  # must not abort the running batch
                 logger.debug(f"Heartbeat progress update failed: {e}")
 
         progress_state["completed_batches"] = progress_state.get("completed_batches", 0) + 1
@@ -42,19 +42,23 @@ def install_benchmarker_heartbeat(interval_seconds: int, progress_state: dict) -
         return await task
 
     setattr(_run_with_heartbeat, "_has_heartbeat", True)
-    Benchmarker._run_a_batch = _run_with_heartbeat  # type: ignore[assignment]
+    # Monkey-patch: reattach as the batch method. setattr keeps ty from nominally
+    # comparing the two method types (the # type: ignore covers pyright).
+    setattr(Benchmarker, "_run_a_batch", _run_with_heartbeat)  # type: ignore[assignment]  # noqa: B010
 
 
 def update_progress_estimate(batch, state: dict) -> None:
     if not state.get("total_predictions"):
         return
     completed_batches = state.get("completed_batches", 0)
-    completed_predictions = completed_batches * len(batch.questions) * len(batch.forecast_bots)
+    # A QuestionBatch runs exactly one bot (batch.bot is singular), so a completed
+    # batch contributes len(batch.questions) predictions — not scaled by a bot count.
+    completed_predictions = completed_batches * len(batch.questions)
     elapsed_total = (state.get("_time_fn", __import__("time").time))() - state.get("start_time", 0)
     if completed_batches > 0:
         avg_batch_time = elapsed_total / (completed_batches + 0.5)
         progress_in_current = min(0.8, (elapsed_total % avg_batch_time) / avg_batch_time)
-        completed_predictions += int(progress_in_current * len(batch.questions) * len(batch.forecast_bots))
+        completed_predictions += int(progress_in_current * len(batch.questions))
     completed_predictions = min(completed_predictions, state.get("total_predictions", 0))
     pbar = state.get("pbar")
     if pbar is not None:

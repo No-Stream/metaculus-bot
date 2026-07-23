@@ -11,6 +11,7 @@ from forecasting_tools import (
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
 from metaculus_bot.numeric.utils import nominal_bounds
+from metaculus_bot.time_utils import _as_utc
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
@@ -76,22 +77,6 @@ def _benchmarking_warning(context: BenchmarkingContext = "search") -> str:
         "\n\nIMPORTANT: This is a benchmarking run. DO NOT search for or include "
         "prediction-market odds, forecasts, or betting lines — that would be data leakage."
     )
-
-
-def _as_utc(moment: datetime) -> datetime:
-    """Normalize a possibly-naive datetime to tz-aware UTC.
-
-    Metaculus API timestamps parse as NAIVE UTC on forecasting-tools 0.2.54 (its
-    ``strptime`` treats the trailing ``Z`` as a literal, dropping the offset) and
-    as tz-aware UTC on 0.2.92+ (``pendulum.parse`` + an ``add_timezone_to_dates``
-    validator). Assuming naive == UTC keeps ``_forecasting_window_str``'s
-    ``today − open_time`` subtraction from raising ``TypeError`` on mixed
-    naive/aware operands after the upgrade, with no behavior change on 0.2.54's
-    naive inputs. Mirrors ``metaculus_bot.close_margin._as_utc``.
-    """
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
 
 
 def _forecasting_window_str(

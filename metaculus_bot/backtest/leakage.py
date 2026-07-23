@@ -26,8 +26,8 @@ async def screen_research_for_leakage(
     concurrency: int = ASKNEWS_MAX_CONCURRENCY,
 ) -> tuple[list[MetaculusQuestion], dict[int, GroundTruth], dict[int, str]]:
     research_provider, _ = choose_provider_with_name(is_benchmarking=True)
-    # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-    # reasoning models defer to provider defaults. No top_p.
+    # temperature=None defers reasoning models to provider defaults; redundant on
+    # ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
     detector_llm = GeneralLlm(
         model=LEAKAGE_DETECTOR_MODEL, temperature=None, max_tokens=500, reasoning={"effort": "low"}
     )

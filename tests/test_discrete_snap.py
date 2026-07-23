@@ -186,9 +186,16 @@ def create_pchip_distribution_from_cdf(
 ) -> NumericDistribution:
     from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
+    # ft 0.2.92 requires >= 2 declared percentiles (0.2.54 accepted one). The
+    # declared values are irrelevant to the snap tests — they exercise the
+    # pre-built ``cdf`` — so use two in-bounds, strictly-increasing percentiles.
+    lb, ub = float(question.lower_bound), float(question.upper_bound)
     return create_pchip_numeric_distribution(
         pchip_cdf=cdf,
-        percentile_list=[Percentile(value=float(question.lower_bound + question.upper_bound) / 2, percentile=0.5)],
+        percentile_list=[
+            Percentile(percentile=0.25, value=lb + 0.25 * (ub - lb)),
+            Percentile(percentile=0.75, value=lb + 0.75 * (ub - lb)),
+        ],
         question=question,
         zero_point=zero_point,
     )
@@ -230,7 +237,7 @@ class TestEdgeCases:
         """Question with cdf_size != 201 (already discrete) → skip."""
         question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
         dist = NumericDistribution(
-            declared_percentiles=[Percentile(value=3.0, percentile=0.5)],
+            declared_percentiles=[Percentile(value=2.0, percentile=0.25), Percentile(value=5.0, percentile=0.75)],
             open_upper_bound=False,
             open_lower_bound=False,
             upper_bound=7.5,
@@ -243,34 +250,17 @@ class TestEdgeCases:
 
     def test_log_scaled_small_range(self):
         """Log-scaled question with small integer range → snapping still works."""
-        # Create a question with zero_point but few integers
-        question = _make_question(lower_bound=0.0, upper_bound=20.0, zero_point=0.0)
+        # Log-scaled with few integers. zero_point must be strictly below lower_bound
+        # (ft 0.2.92 enforces this in NumericDistribution; 0.2.54 did not validate it).
+        question = _make_question(lower_bound=0.0, upper_bound=20.0, zero_point=-1.0)
         cdf = _make_smooth_cdf(0.0, 20.0, center=10.0, spread=3.0)
-        dist_kwargs = question.model_dump()
-        # Remove fields that aren't in NumericDistribution
-        for field in [
-            "id_of_question",
-            "id_of_post",
-            "page_url",
-            "question_text",
-            "background_info",
-            "resolution_criteria",
-            "fine_print",
-            "published_time",
-            "close_time",
-            "unit_of_measure",
-            "question_type",
-            "nominal_upper_bound",
-            "nominal_lower_bound",
-        ]:
-            dist_kwargs.pop(field, None)
         from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
         dist = create_pchip_numeric_distribution(
             pchip_cdf=cdf,
-            percentile_list=[Percentile(value=10.0, percentile=0.5)],
+            percentile_list=[Percentile(value=5.0, percentile=0.25), Percentile(value=15.0, percentile=0.75)],
             question=question,
-            zero_point=0.0,
+            zero_point=-1.0,
         )
         result = snap_distribution_to_integers(dist, question)
         # 21 integers in [0, 20], should snap
@@ -278,9 +268,9 @@ class TestEdgeCases:
 
     def test_log_scaled_huge_range_skipped(self):
         """Log-scaled question with huge integer range → skip."""
-        question = _make_question(lower_bound=0.0, upper_bound=10000.0, zero_point=0.0)
+        question = _make_question(lower_bound=0.0, upper_bound=10000.0, zero_point=-1.0)
         cdf = _make_smooth_cdf(0.0, 10000.0, center=5000.0, spread=1000.0)
-        dist = create_pchip_distribution_from_cdf(cdf, question, zero_point=0.0)
+        dist = create_pchip_distribution_from_cdf(cdf, question, zero_point=-1.0)
         result = snap_distribution_to_integers(dist, question)
         assert result is None
 
@@ -499,7 +489,7 @@ class TestSnapDistributionToIntegers:
     def test_skips_discrete_question(self):
         question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
         dist = NumericDistribution(
-            declared_percentiles=[Percentile(value=3.0, percentile=0.5)],
+            declared_percentiles=[Percentile(value=2.0, percentile=0.25), Percentile(value=5.0, percentile=0.75)],
             open_upper_bound=False,
             open_lower_bound=False,
             upper_bound=7.5,

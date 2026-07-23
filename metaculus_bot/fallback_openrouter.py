@@ -318,9 +318,12 @@ class FallbackOpenRouterLlm(GeneralLlm):
             GeneralLlm(model=model, api_key=secondary_api_key, **kwargs) if secondary_api_key else None
         )
 
-    async def invoke(self, prompt: Any) -> str:  # type: ignore[override]
+    async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str:  # type: ignore[override]
+        # system_prompt widened in to match 0.2.92's GeneralLlm.invoke signature
+        # (invoke(prompt, system_prompt=None)); threaded through both key paths so a
+        # system prompt survives a donated->personal fallback unchanged.
         try:
-            return await self._invoke_once_using_primary(prompt)
+            return await self._invoke_once_using_primary(prompt, system_prompt)
         except Exception as e:
             # Re-record with the actual model slug. should_retry_with_general_key
             # also calls the matcher with "<unknown>" — duplicates are fine since
@@ -364,16 +367,16 @@ class FallbackOpenRouterLlm(GeneralLlm):
                 # output; on cancellation the secondary is cancelled too. The
                 # primary's exception is intentionally discarded because the
                 # caller asked for a fallback, not a re-raise.
-                return await self._invoke_once_using_secondary(prompt)  # noqa: ASYNC120
+                return await self._invoke_once_using_secondary(prompt, system_prompt)  # noqa: ASYNC120
             raise
 
-    async def _invoke_once_using_primary(self, prompt: Any) -> str:
-        return await super().invoke(prompt)
+    async def _invoke_once_using_primary(self, prompt: Any, system_prompt: str | None = None) -> str:
+        return await super().invoke(prompt, system_prompt)
 
-    async def _invoke_once_using_secondary(self, prompt: Any) -> str:
+    async def _invoke_once_using_secondary(self, prompt: Any, system_prompt: str | None = None) -> str:
         if self._secondary_llm is None:
             raise RuntimeError("No secondary key configured for fallback")
-        return await self._secondary_llm.invoke(prompt)
+        return await self._secondary_llm.invoke(prompt, system_prompt)
 
 
 def build_llm_with_openrouter_fallback(model: str, **kwargs: Any) -> GeneralLlm:

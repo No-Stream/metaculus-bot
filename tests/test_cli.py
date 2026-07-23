@@ -75,6 +75,14 @@ def _cli_main_test_mode(alertable_count: int, *, donated_below_floor: bool = Fal
             # MetaculusApi.get_question_by_url returns a dummy question object; we
             # pass through a Mock so list construction doesn't explode.
             patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
+            # cli.main() applies fetch/publish hardening at startup, which globally
+            # and permanently mutates MetaculusClient (patches post_*/_get_questions_from_api,
+            # sets a sentinel). Left un-stubbed those mutations leak into every later
+            # test in the session — a randomly-ordered run then poisons the publish/fetch
+            # seam tests' un-hardened negative controls. Stub them: this test pins the
+            # exit-status wiring, not the hardening install (covered by its own tests).
+            patch("metaculus_bot.cli.apply_publish_hardening"),
+            patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates"),
             # Patch log_report_summary: a classmethod on TemplateForecaster that
             # iterates forecast_reports. Our stub returns []; patch the method
