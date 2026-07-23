@@ -77,15 +77,16 @@ def _tool_names(tools_json: list[dict[str, Any]] | None) -> list[str]:
 async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
 
-    async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
-        return ToolOutcome(  # noqa: ASYNC910
-            content_markdown="Authoritative page text.", links=["https://example.com"], method="search"
-        )
+    async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+        # Reach a primary source: a rendered fetch tiers the URL "fetched", so the
+        # conclude gate's fetch floor is satisfied by a real retrieval — not by the
+        # accounting's fetch-verb prose alone.
+        return ToolOutcome(content_markdown="Authoritative page text.", method="rendered")  # noqa: ASYNC910
 
     fake_llm = FakeLlm(
         [
             _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "When was the report published?"}])]),
-            _response(tool_calls=[_tool_call("search1", "search_web", {"query": "report"})]),
+            _response(tool_calls=[_tool_call("fetch1", "fetch", {"url": "https://example.com"})]),
             _response(
                 tool_calls=[
                     _tool_call(
@@ -98,7 +99,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
                                     "source_url": "https://example.com",
                                     "quote": "Published on July 1, 2026.",
                                     "date": "2026-07-01",
-                                    "retrieved_how": "search_web",
+                                    "retrieved_how": "fetch",
                                     "topic": "timeline",
                                 }
                             ]
@@ -133,7 +134,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     result = await run_agentic_loop(
         "system",
         "user",
-        [_tool_spec("search_web", search_web)],
+        [_tool_spec("fetch", fetch)],
         _config(),
         llm_call=fake_llm,
     )
@@ -145,13 +146,13 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     assert result.telemetry.tool_calls == 4
     assert result.telemetry.per_tool_counts == {
         "set_research_plan": 1,
-        "search_web": 1,
+        "fetch": 1,
         "record_findings": 1,
         "conclude": 1,
     }
     assert result.telemetry.plan_gaps == 1
     assert result.telemetry.plan_skipped is False
-    assert result.telemetry.rendered_fetches == 0
+    assert result.telemetry.rendered_fetches == 1
     assert result.telemetry.dup_tool_calls == 0
     assert result.telemetry.findings_count == 1
     assert result.telemetry.pending_leads_count == 1
@@ -161,9 +162,9 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     # Plan-§6 marker shape: model + per-surface counters, grep-able in run_logs.
     marker = marker_lines[0]
     assert "model=openai/gpt-5.4-mini" in marker
-    assert "searches=1" in marker
-    assert "fetches=0" in marker
-    assert "rendered=0" in marker
+    assert "searches=0" in marker
+    assert "fetches=1" in marker
+    assert "rendered=1" in marker
     assert "reads=0" in marker
     assert "dup_tool_calls=0" in marker
     assert "plan_gaps=1" in marker
@@ -2160,6 +2161,114 @@ class TestConcludeGate:
 
         result = await run_agentic_loop(
             "system", "user", [_tool_spec("fetch", fetch)], _config(max_steps=6), llm_call=fake_llm
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 0
+        assert result.telemetry.concluded_early is True
+
+    @pytest.mark.asyncio
+    async def test_reject_when_prose_cites_fetch_but_no_successful_retrieval(self) -> None:
+        """Fetch-floor tightening: the top-ranked gaps' accounting cites fetch/read
+        verbs, but every fetch 403'd (zero successful fetched-tier retrievals). The
+        per-gap prose clause no longer clears the floor on its own -> reject."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            # Every fetch 403s (status=blocked): no fetched tier is granted, so
+            # url_best_tier stays empty and fetches_reads is 0 despite the calls.
+            return ToolOutcome(content_markdown="Fetch blocked with HTTP 403.", method="plain", status="blocked")  # noqa: ASYNC910
+
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example"}),
+                        _tool_call("f2", "fetch", {"url": "https://b.example"}),
+                    ]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "c1",
+                            "conclude",
+                            {
+                                "gap_accounting": _accounting(
+                                    "g1", actions="fetched the primary source but received 403"
+                                )
+                                + _accounting("g2", actions="read_document timed out")
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("fetch", fetch)],
+            _config(max_steps=6, max_conclude_gate_rejections=1),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.conclude_gate_rejections == 1
+        conclude_message = _tool_messages(result)[-1]
+        assert "fetch floor unmet" in conclude_message["content"]
+        # made 0 — both fetches 403'd, so no primary source was reached even though
+        # the per-gap accounting narrates a fetch/read for each top gap.
+        assert "made 0" in conclude_message["content"]
+        assert result.telemetry.concluded_early is False
+
+    @pytest.mark.asyncio
+    async def test_accept_with_one_successful_fetch_below_global_floor(self) -> None:
+        """The tightened per-gap clause still serves its purpose: one load-bearing
+        fetched-tier retrieval plus honest per-gap fetch citations is accepted even
+        though the run's fetch count (1) is below the global 2-fetch floor."""
+
+        async def fetch(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="body", method="rendered")  # noqa: ASYNC910
+
+        async def search_web(**_: Any) -> ToolOutcome:  # noqa: ASYNC124 - async-by-contract test handler
+            return ToolOutcome(content_markdown="snippet", method="search")  # noqa: ASYNC910
+
+        # Two gaps -> the per-gap external floor needs >=2 external calls: one
+        # successful fetch (fetched tier) plus one search (snippet tier). That
+        # leaves fetches_reads=1, below the global floor of 2, so acceptance rides
+        # on the per-gap fetch citations backed by the single real retrieval.
+        fake_llm = FakeLlm(
+            [
+                _response(
+                    tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "q1?"}, {"id": "g2", "question": "q2?"}])]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call("f1", "fetch", {"url": "https://a.example"}),
+                        _tool_call("s1", "search_web", {"query": "x"}),
+                    ]
+                ),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "c1",
+                            "conclude",
+                            {
+                                "gap_accounting": _accounting("g1", actions="fetched the primary source PDF")
+                                + _accounting("g2", actions="read the appendix table")
+                            },
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "user",
+            [_tool_spec("fetch", fetch), _tool_spec("search_web", search_web)],
+            _config(max_steps=6),
+            llm_call=fake_llm,
         )
 
         assert result.telemetry.conclude_gate_rejections == 0

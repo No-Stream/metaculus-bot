@@ -801,8 +801,11 @@ def _coerce_gap_accounting(raw_accounting: Any) -> list[GapAccountingEntry]:
 
 def _actions_cite_fetch(actions_taken: str) -> bool:
     """True when the driver's free-text ``actions_taken`` mentions fetching or
-    reading a source (the fetch floor's lenient per-gap self-report clause; the
-    telemetry-based clause is the robust one). Matches fetch/read verbs on word
+    reading a source (the fetch floor's per-gap self-report clause). This prose
+    signal is no longer trusted on its own: a failure note ("fetched the source
+    but got a 403") also matches, so the conclude gate now counts it only
+    alongside >=1 successful fetched-tier retrieval (see ``_conclude_gate_debts``);
+    the telemetry-based clause is the robust one. Matches fetch/read verbs on word
     boundaries so "already"/"spread"/"could not fetch" don't false-positive."""
     return bool(_FETCH_ACTION_RE.search(actions_taken))
 
@@ -814,8 +817,11 @@ def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -
     Enforces: (a) every plan gap appears in the accounting; (b) at least one
     external tool call per plan gap (the loop can't attribute calls to gaps, so
     this is the cheap global invariant); (c) the fetch floor — either the top-2
-    ranked gaps' accounting each cites a fetch/read action, OR the run made
-    ``_FETCH_FLOOR_MIN_CALLS``+ fetches/reads.
+    ranked gaps' accounting each cites a fetch/read action AND the run made >=1
+    successful fetched-tier retrieval, OR the run made ``_FETCH_FLOOR_MIN_CALLS``+
+    fetches/reads. The >=1-retrieval conjunct stops prose alone (which can cite a
+    fetch verb even in a failure note) from clearing the floor with zero pages
+    reached.
     """
     plan = state.research_plan
     assert plan is not None and plan.gaps  # caller guards; keeps the type narrow
@@ -849,11 +855,18 @@ def _conclude_gate_debts(state: _LoopState, entries: list[GapAccountingEntry]) -
     top_cite_fetch = bool(top_gaps) and all(
         gap.id in entry_by_id and _actions_cite_fetch(entry_by_id[gap.id].actions_taken) for gap in top_gaps
     )
-    if not (top_cite_fetch or fetches_reads >= _FETCH_FLOOR_MIN_CALLS):
+    # The per-gap prose clause counts ONLY alongside >=1 real successful retrieval:
+    # a fetch-verb note ("fetched the source but got a 403") also matches the
+    # actions regex, so prose alone could clear the floor with zero pages reached.
+    # Requiring one real fetched-tier retrieval closes that hole while preserving
+    # the clause's purpose (one load-bearing fetch + honest per-gap notes beats the
+    # global 2-fetch bar). The global clause remains a fetch-count-only fallback.
+    if not ((top_cite_fetch and fetches_reads >= 1) or fetches_reads >= _FETCH_FLOOR_MIN_CALLS):
         debts.append(
-            "fetch floor unmet: neither did the top-ranked gap(s) cite a fetch/read_document action "
-            f"nor did the run make {_FETCH_FLOOR_MIN_CALLS}+ fetches/reads (made {fetches_reads}) — "
-            "fetch a primary source before concluding on the load-bearing gaps"
+            "fetch floor unmet: a top-ranked gap's fetch/read_document citation now counts only "
+            f"alongside at least one successful fetched-tier retrieval (the run made {fetches_reads}); "
+            f"otherwise make {_FETCH_FLOOR_MIN_CALLS}+ fetches/reads — fetch a primary source before "
+            "concluding on the load-bearing gaps"
         )
     return debts
 

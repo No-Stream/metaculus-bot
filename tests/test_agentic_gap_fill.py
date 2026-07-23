@@ -47,15 +47,17 @@ _GHOST_BLOCK = '```json\n{"question_type": "binary", "posterior_prob": 0.12}\n``
 
 
 def _happy_path_llm() -> FakeLlm:
-    """Plan (W1 gate opener), one search step, then conclude with a finding, then the ghost turn.
+    """Plan (W1 gate opener), one fetch step, then conclude with a finding, then the ghost turn.
 
-    The conclude carries W2 ``gap_accounting`` for the single plan gap, citing a
-    fetch in ``actions_taken`` so the per-gap fetch-floor clause is met.
+    The fetch is a real fetched-tier retrieval of the finding's source URL, so the
+    conclude satisfies both the finding's provenance and the W2 fetch floor: the
+    top-gap ``gap_accounting`` cites a fetch in ``actions_taken`` AND >=1 successful
+    fetched-tier retrieval landed (prose alone no longer clears the floor).
     """
     return FakeLlm(
         [
             _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "What is the June 2026 rate?"}])]),
-            _response(tool_calls=[_tool_call("c1", "search_web", {"query": "BLS unemployment June 2026"})]),
+            _response(tool_calls=[_tool_call("c1", "fetch", {"url": _FINDING["source_url"]})]),
             _response(
                 tool_calls=[
                     _tool_call(
@@ -89,6 +91,17 @@ def _fake_tools() -> list[ToolSpec]:
             status="ok",
         )
 
+    async def _fetch(**_: Any) -> ToolOutcome:
+        # A rendered fetch of the finding's source page: a fetched-class outcome
+        # tiers the call's `url` argument "fetched", satisfying both the provenance
+        # gate and the conclude gate's fetch floor with a real primary-source
+        # retrieval (which the finding's prose claims — not prose alone).
+        return ToolOutcome(
+            content_markdown="BLS release: The unemployment rate was 4.1 percent in June.",
+            method="rendered",
+            status="ok",
+        )
+
     return [
         ToolSpec(
             name="search_web",
@@ -96,7 +109,14 @@ def _fake_tools() -> list[ToolSpec]:
             parameters={"type": "object", "properties": {}, "additionalProperties": True},
             handler=_search,
             timeout_s=1.0,
-        )
+        ),
+        ToolSpec(
+            name="fetch",
+            description="fake fetch",
+            parameters={"type": "object", "properties": {}, "additionalProperties": True},
+            handler=_fetch,
+            timeout_s=1.0,
+        ),
     ]
 
 
@@ -210,7 +230,7 @@ class TestRunGapFillV2Seam:
         assert len(captured) == 1
         payload = captured[0]
         assert payload["telemetry"]["findings_count"] == 1
-        assert payload["telemetry"]["tool_calls"] == 3  # set_research_plan + search_web + conclude
+        assert payload["telemetry"]["tool_calls"] == 3  # set_research_plan + fetch + conclude
         roles = [
             message["role"] for message in payload["transcript"]
         ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
