@@ -315,6 +315,78 @@ class TestReadPathE2E:
         cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
         assert cache == {38195: "question-id record"}
 
+    def test_foreign_record_behind_post_id_filename_rejected(self, tmp_path: Path) -> None:
+        # The filename keyspace mixes both id spaces: question A's post id (38880) can name
+        # a file that actually holds question B's record (B's question_id == 38880, written
+        # by live persistence). Trusting the filename would silently replay B's research as
+        # A's — the reader must check the record's self-declared identity and leave A uncached.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        foreign_record = {
+            "qid": 38880,
+            "page_url": "https://www.metaculus.com/questions/40123/question-b/",
+            "research_text": "question B's research",
+        }
+        (latest_dir / "38880.json").write_text(json.dumps(foreign_record))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {}
+
+    def test_genuine_log_backfill_record_behind_post_id_filename_accepted(self, tmp_path: Path) -> None:
+        # Regression guard for the fallback's purpose: a real log-backfill record for OUR
+        # divergent question (page_url embeds our post id) must still load.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        record = {
+            "qid": 38880,
+            "page_url": "https://www.metaculus.com/questions/38880/our-question/",
+            "research_text": "R via post id",
+        }
+        (latest_dir / "38880.json").write_text(json.dumps(record))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "R via post id"}
+
+    def test_schema_v2_record_with_mismatching_post_id_rejected(self, tmp_path: Path) -> None:
+        # Schema-v2 live records carry an explicit post_id field; a contradicting one is
+        # authoritative even when the page_url happens to embed our id.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        record = {
+            "schema_version": 2,
+            "qid": 38880,
+            "post_id": 40123,
+            "page_url": "https://www.metaculus.com/questions/38880/",
+            "research_text": "foreign v2 record",
+        }
+        (latest_dir / "38880.json").write_text(json.dumps(record))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {}
+
+    def test_rejected_first_rung_falls_through_to_next(self, tmp_path: Path) -> None:
+        # A foreign record behind the question-id filename must not shadow a genuine
+        # post-id record: rejection continues down lookup_order instead of breaking.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        foreign = {"page_url": "https://www.metaculus.com/questions/40123/", "research_text": "foreign"}
+        genuine = {"page_url": "https://www.metaculus.com/questions/38880/", "research_text": "genuine"}
+        (latest_dir / "38195.json").write_text(json.dumps(foreign))
+        (latest_dir / "38880.json").write_text(json.dumps(genuine))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "genuine"}
+
+    def test_legacy_record_without_identity_fields_accepted(self, tmp_path: Path) -> None:
+        # Records with no post_id and no parseable page_url can't be validated — they
+        # pass, preserving the pre-validator behavior for legacy archive data.
+        latest_dir = tmp_path / "latest"
+        latest_dir.mkdir()
+        (latest_dir / "38195.json").write_text(json.dumps({"research_text": "legacy record"}))
+
+        cache = _load_research_from_archive(str(latest_dir), [_make_question(38195, post_id=38880)])
+        assert cache == {38195: "legacy record"}
+
     def test_empty_research_text_still_loaded(self, tmp_path: Path) -> None:
         latest_dir = tmp_path / "latest"
         latest_dir.mkdir()

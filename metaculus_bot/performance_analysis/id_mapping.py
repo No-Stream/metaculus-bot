@@ -33,6 +33,7 @@ respects ``qid_kind``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -41,6 +42,13 @@ from dataclasses import dataclass
 # lockstep (a typo on either side would silently re-open the split-brain).
 QID_KIND_POST_ID = "post_id"
 QID_KIND_QUESTION_ID = "question_id"
+
+# The id embedded in a Metaculus page URL (a POST id, except comment-backfill
+# records which build the URL from the question id). Duplicated from
+# ``scripts.backfill_research_from_logs.QID_PATTERN`` because scripts stay free of
+# package imports (same convention as the telemetry markers' local qid_kind
+# literals); ``tests/test_id_mapping.py`` pins the two patterns equal.
+PAGE_URL_ID_PATTERN = re.compile(r"metaculus\.com/(?:questions|c/[^/]+)/(\d+)")
 
 
 def _coerce_int(value: object) -> int | None:
@@ -114,6 +122,40 @@ class QuestionIds:
         if kind == QID_KIND_QUESTION_ID:
             return self.question_id
         return None
+
+    def matches_archive_record(self, record: dict) -> bool:
+        """Whether a research-archive record can belong to this question.
+
+        Archive filenames carry no ``qid_kind`` — live persistence and comment
+        backfill key ``latest/<id>.json`` on the QUESTION id while the log
+        backfill keys on the POST id — so a filename hit alone is the blind
+        "match either id" this module's docstring calls unsafe: question A's
+        post id can equal a different question B's question id, and A's
+        post-id-named file may then hold B's record. This validator rejects a
+        record whose self-declared identity contradicts ``self``:
+
+        * an explicit post-id field — ``post_id`` on schema-v2 live records,
+          ``on_post`` on comment-backfill records — that differs from
+          ``self.post_id``; a matching one is authoritative and accepts
+          outright (a post id uniquely identifies the post); or
+        * a ``page_url`` whose embedded id is not one of this question's ids.
+          The URL id is ambiguous across writers (log backfill embeds the POST
+          id, comment backfill the QUESTION id), hence the either-id check.
+
+        Records with neither field usable pass, preserving legacy behavior for
+        log-backfill records, whose only identity is the page URL.
+        """
+        record_post_id = _coerce_int(record.get("post_id"))
+        if record_post_id is None:
+            record_post_id = _coerce_int(record.get("on_post"))
+        if record_post_id is not None and self.post_id is not None:
+            return record_post_id == self.post_id
+        page_url = record.get("page_url")
+        if isinstance(page_url, str):
+            match = PAGE_URL_ID_PATTERN.search(page_url)
+            if match is not None and int(match.group(1)) not in self.all_ids():
+                return False
+        return True
 
 
 class QuestionIdMap:

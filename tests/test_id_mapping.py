@@ -18,12 +18,14 @@ from __future__ import annotations
 import types
 
 from metaculus_bot.performance_analysis.id_mapping import (
+    PAGE_URL_ID_PATTERN,
     QID_KIND_POST_ID,
     QID_KIND_QUESTION_ID,
     QuestionIdMap,
     QuestionIds,
     marker_records_for_question,
 )
+from scripts import backfill_research_from_logs
 from scripts.telemetry import markers as telemetry_markers
 
 # The 38880/38195 divergent question, and a non-divergent one (post == question).
@@ -77,6 +79,74 @@ class TestQuestionIds:
         ids = QuestionIds.from_perf_record({"post_id": "38880", "question_id": 38195.0})
         assert ids.post_id == DIVERGENT_POST_ID
         assert ids.question_id == DIVERGENT_QUESTION_ID
+
+
+class TestMatchesArchiveRecord:
+    """QuestionIds.matches_archive_record — rejects foreign records a filename hit would admit.
+
+    Archive filenames mix both id spaces (question-id from live/comment writers, post-id
+    from the log backfill) with no qid_kind, so a filename match alone is the blind
+    "match either id" this module documents as unsafe. The validator checks the record's
+    self-declared identity (explicit ``post_id`` field, or the id embedded in ``page_url``).
+    """
+
+    IDS = QuestionIds(post_id=DIVERGENT_POST_ID, question_id=DIVERGENT_QUESTION_ID)
+
+    def test_accepts_page_url_carrying_post_id(self):
+        # A genuine log-backfill record: page_url embeds OUR post id.
+        record = {"qid": DIVERGENT_POST_ID, "page_url": f"https://www.metaculus.com/questions/{DIVERGENT_POST_ID}/x/"}
+        assert self.IDS.matches_archive_record(record)
+
+    def test_accepts_page_url_carrying_question_id(self):
+        # A comment-backfill record: page_url is built from the QUESTION id.
+        record = {"page_url": f"https://www.metaculus.com/questions/{DIVERGENT_QUESTION_ID}/"}
+        assert self.IDS.matches_archive_record(record)
+
+    def test_rejects_page_url_of_foreign_post(self):
+        # The collision: our post id names a file that holds question B's record.
+        record = {"qid": 99999, "page_url": "https://www.metaculus.com/questions/99999/other-question/"}
+        assert not self.IDS.matches_archive_record(record)
+
+    def test_explicit_post_id_field_is_authoritative(self):
+        # Schema-v2 live records carry an explicit post_id; it decides regardless of page_url.
+        ours = {"post_id": DIVERGENT_POST_ID, "page_url": "https://www.metaculus.com/questions/99999/"}
+        foreign = {"post_id": 99999, "page_url": f"https://www.metaculus.com/questions/{DIVERGENT_POST_ID}/"}
+        assert self.IDS.matches_archive_record(ours)
+        assert not self.IDS.matches_archive_record(foreign)
+
+    def test_on_post_field_disambiguates_comment_backfill_records(self):
+        # Comment-backfill records build page_url from the QUESTION id, so a foreign one
+        # whose question id equals OUR post id passes the URL check — but its explicit
+        # on_post field (the foreign post's id) betrays it.
+        foreign = {
+            "on_post": 99999,
+            "page_url": f"https://www.metaculus.com/questions/{DIVERGENT_POST_ID}/",
+            "run_id": "comment-1",
+        }
+        ours = {
+            "on_post": DIVERGENT_POST_ID,
+            "page_url": f"https://www.metaculus.com/questions/{DIVERGENT_QUESTION_ID}/",
+            "run_id": "comment-2",
+        }
+        assert not self.IDS.matches_archive_record(foreign)
+        assert self.IDS.matches_archive_record(ours)
+
+    def test_accepts_record_with_no_identity_fields(self):
+        # Legacy records with neither post_id nor a parseable page_url pass (current behavior).
+        assert self.IDS.matches_archive_record({"research_text": "r"})
+        assert self.IDS.matches_archive_record({"page_url": "", "post_id": None})
+        assert self.IDS.matches_archive_record({"page_url": "https://example.com/not-metaculus/123/"})
+
+    def test_community_page_url_form_is_parsed(self):
+        record = {"page_url": f"https://www.metaculus.com/c/some-community/{DIVERGENT_POST_ID}/slug/"}
+        assert self.IDS.matches_archive_record(record)
+        foreign = {"page_url": "https://www.metaculus.com/c/some-community/99999/slug/"}
+        assert not self.IDS.matches_archive_record(foreign)
+
+    def test_page_url_pattern_pinned_to_log_backfill_extractor(self):
+        # id_mapping duplicates the log-backfill qid regex (scripts stay package-import-free);
+        # pin them equal so the two never drift apart silently.
+        assert PAGE_URL_ID_PATTERN.pattern == backfill_research_from_logs.QID_PATTERN.pattern
 
 
 class TestQuestionIdMap:

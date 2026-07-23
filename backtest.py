@@ -140,6 +140,12 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
     the page URL). On a divergent post (post_id != question_id) a question-id-only lookup
     silently misses a log-backfilled record, so we try both ids (question-id first) via
     ``QuestionIds.lookup_order`` and cache under ``id_of_question`` regardless.
+
+    Because the filename keyspace mixes both id spaces, a filename hit can be a FOREIGN
+    question's record (question A's post id colliding with question B's question id).
+    Each hit is therefore validated against the record's self-declared identity
+    (``QuestionIds.matches_archive_record``); a mismatch skips to the next rung, leaving
+    the question uncached (live research) rather than silently replaying B's research as A's.
     """
     import json  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
     from pathlib import Path  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
@@ -158,11 +164,18 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
             continue
         for file_id in ids.lookup_order():
             record_file = archive_path / f"{file_id}.json"
-            if record_file.exists():
-                record = json.loads(record_file.read_text())
-                cache[cache_key] = record.get("research_text", "")
-                loaded += 1
-                break
+            if not record_file.exists():
+                continue
+            record = json.loads(record_file.read_text())
+            if not ids.matches_archive_record(record):
+                logger.warning(
+                    f"Archive file {record_file.name} exists but identifies a different post "
+                    f"(question ids {ids}) — skipping"
+                )
+                continue
+            cache[cache_key] = record.get("research_text", "")
+            loaded += 1
+            break
 
     uncached = len(questions) - loaded
     logger.info(f"Loaded {loaded} cached research records from {research_dir} ({uncached} questions uncached)")
@@ -173,7 +186,7 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
 
 async def run_backtest(args: argparse.Namespace) -> None:
     """Run the full backtest pipeline."""
-    # 1. Fetch resolved questions and extract ground truths
+    # Fetch resolved questions and extract ground truths
     logger.info(
         f"Fetching {args.num_questions} resolved questions "
         f"(tournament={args.tournament}, resolved_after={args.resolved_after})"
@@ -190,7 +203,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         f"Prepared {len(question_set.questions)} questions with {len(question_set.ground_truths)} ground truths"
     )
 
-    # 2. Research: either load from pre-cached archive or run live with leakage screening
+    # Research: either load from pre-cached archive or run live with leakage screening
     if args.research_dir:
         research_cache = _load_research_from_archive(args.research_dir, question_set.questions)
         clean_questions = question_set.questions
@@ -206,7 +219,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     question_set.research_cache = research_cache
     logger.info(f"After research setup: {len(clean_questions)} questions, {len(research_cache)} cached")
 
-    # 3. Create bots
+    # Create bots
     bots: list[TemplateForecaster] = create_individual_bots(
         # INDIVIDUAL_MODEL_SPECS values are str | GeneralLlm (the "name" key is a str); the factory
         # reads "name"/"forecaster" by key, so the looser value type is safe to pass here.
@@ -220,11 +233,11 @@ async def run_backtest(args: argparse.Namespace) -> None:
 
     bots = _filter_bots(bots, args.include_models, args.exclude_models)
 
-    # 4. Apply scoring patches for mixed question types
+    # Apply scoring patches for mixed question types
     apply_scoring_patches()
 
     with MonetaryCostManager() as cost_manager:
-        # 5. Run Benchmarker
+        # Run Benchmarker
         total_predictions = len(bots) * len(clean_questions)
         logger.info(
             f"Starting backtest: {len(bots)} bots x {len(clean_questions)} questions "
@@ -256,7 +269,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         logger.info("Benchmarker completed, scoring against ground truth...")
         sys.stdout.flush()
 
-        # 6. Score each bot's reports against ground truth
+        # Score each bot's reports against ground truth
         results: list[BacktestResult] = []
         for benchmark in benchmarks:
             bot_scores: list[QuestionScore] = []
@@ -294,7 +307,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
                     community_str = f" | Community: {agg['community_mean']:.4f}"
                 logger.info(f"  {metric_name}: Bot mean = {agg['bot_mean']:.4f} (n={agg['n']}){community_str}")
 
-        # 7. Generate report and save data
+        # Generate report and save data
         report_text = generate_backtest_report(results, question_set, output_path="backtests/backtest_report.md")
         save_backtest_data(question_set, results, output_dir="backtests")
 
