@@ -287,6 +287,29 @@ class TestRouting:
         rc = "See https://finance.yahoo.com/quote/NVDA and https://finance.yahoo.com/quote/AAPL."
         assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
 
+    def test_two_yahoo_tickers_return_to_level_wording_skips(self, caplog):
+        # "return TO <level>" is a LEVEL question (dollars), not a relative return: the bare
+        # "return" substring used to route this to the mean-zero pp spread band (wrong-unit).
+        # The word-boundary gate's "(?!\s+to\b)" lookahead excludes it -> skip + log.
+        qt = "Will the price of NVDA return to $400 before AAPL does?"
+        rc = "Compares https://finance.yahoo.com/quote/NVDA and https://finance.yahoo.com/quote/AAPL."
+        with caplog.at_level(logging.INFO):
+            assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+        assert any("no relative-return wording" in r.message for r in caplog.records)
+
+    def test_two_yahoo_tickers_singular_return_phrasing_routes_to_spread(self):
+        # Guards against a plural-only fix: the SINGULAR "return(URL) minus return(URL)"
+        # criteria wording (no plural "returns" anywhere in the text) must still route to
+        # spread -- "return(" is followed by "(", not " to", so the lookahead lets it match.
+        qt = "Where will the CL=F versus ^GSPC figure land over the window?"
+        rc = "return(https://finance.yahoo.com/quote/CL=F) minus return(https://finance.yahoo.com/quote/%5EGSPC)."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert route.kind == "spread"
+        assert route.spec.series_id == "CL=F"
+        assert route.spec_b is not None
+        assert route.spec_b.series_id == "^GSPC"
+
     def test_routes_via_template_keyword(self):
         route = route_question(_make_numeric_q(question_text="Where will the 10-year treasury yield close?"))
         assert route is not None

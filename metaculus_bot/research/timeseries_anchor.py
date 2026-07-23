@@ -112,7 +112,17 @@ _MAX_KEYWORD_RE = re.compile(r"\b(highest|peak|maximum|max)\b", re.IGNORECASE)
 # spread band would be actively wrong-unit — gate the route on this wording and skip
 # otherwise. Kept conservative: return / outperform / relative only (not bare "vs", which
 # appears in ratio and level comparisons too).
-_RELATIVE_RETURN_KEYWORDS: tuple[str, ...] = ("return", "outperform", "relative")
+#
+# Word-boundary matching (not a bare substring scan): the "return(s) TO <level>"
+# construction is a LEVEL question ("will the price return to $400"), not a relative
+# return, so it must NOT route to the spread band. The `(?!\s+to\b)` lookahead excludes
+# exactly that phrasing while keeping the observed relative-return wordings — "X's returns
+# exceed Y's" (plural, followed by "exceed") and "return(URL) minus return(URL)" (singular,
+# followed by "(" not " to"). `outperform` stays a prefix match (outperform/outperforms/
+# outperformed); `relative` stays a whole-word match (kept broad — genuine "performance of
+# X relative to Y" phrasings must still route, and the bounds backstop already catches
+# ratio/level shapes that slip through).
+_RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelative\b", re.IGNORECASE)
 
 # The non-revising FRED allowlist lives in ts_fetch (fetch-layer knowledge shared with
 # financial_data); imported above as FRED_NON_REVISING_SERIES.
@@ -348,10 +358,10 @@ def _wants_max(text: str) -> bool:
 
 def _wants_relative_return(text: str) -> bool:
     """True when the question wording asks for a relative return between the two tickers
-    (the only quantity the spread band represents). Case-insensitive substring match on
-    ``_RELATIVE_RETURN_KEYWORDS``."""
-    lowered = text.lower()
-    return any(kw in lowered for kw in _RELATIVE_RETURN_KEYWORDS)
+    (the only quantity the spread band represents). Word-boundary match on
+    ``_RELATIVE_RETURN_RE``, which excludes the "return(s) to <level>" level-question
+    construction while keeping return / outperform / relative wordings."""
+    return bool(_RELATIVE_RETURN_RE.search(text))
 
 
 def _entry_quantity_ok(entry: _TemplateEntry, lowered: str) -> bool:
