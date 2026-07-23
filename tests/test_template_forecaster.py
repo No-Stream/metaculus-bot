@@ -675,7 +675,7 @@ async def test_soft_deadline_timeout_counted_once_through_gather(
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm):
-    """Property must sum all six degradation counters. Using distinct powers of 2
+    """Property must sum all seven degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -694,8 +694,9 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm):
     bot._stacker_fallback_used_count = 8
     bot._stacker_fallback_failed_count = 16
     bot._research_provider_timeout_count = 32
+    bot._gap_fill_v2_error_count = 64
 
-    assert bot.alertable_count == 63
+    assert bot.alertable_count == 127
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):

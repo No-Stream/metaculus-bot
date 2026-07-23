@@ -38,7 +38,19 @@ GAP_FILL_V2_LINE = (
     "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
     "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0 "
     "provenance_rejections=1 quote_mismatch_warnings=2 plan_gaps=3 plan_skipped=False "
-    "conclude_gate_rejections=1"
+    "conclude_gate_rejections=1 error=None"
+)
+# A crashed v2 run: byte-identical counters to a legitimate idle run EXCEPT the
+# error= field carries repr(exc). This is the whole point of the field — the
+# fastapi eager-import defect emitted steps=0 tool_calls=0 findings=0 (identical
+# to "driver found nothing") and only error= makes the crash greppable.
+GAP_FILL_V2_CRASHED_LINE = (
+    "2026-07-23 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+    "steps=0 tool_calls=0 searches=0 fetches=0 rendered=0 reads=0 dup_tool_calls=0 deadline_hit=False "
+    "concluded_early=False wall_s=0.12 findings=0 pending_leads=0 lint_rejections=0 "
+    "provenance_rejections=0 quote_mismatch_warnings=0 plan_gaps=0 plan_skipped=False "
+    "conclude_gate_rejections=0 error=APIConnectionError(\"No module named 'fastapi'\")"
 )
 # Pre-2026-07-21 completion format (ends at lint_rejections). Replace-by-run
 # re-harvesting replays old logs, so the parser must keep accepting this shape.
@@ -221,10 +233,24 @@ class TestGapFillV2:
         assert rec["plan_gaps"] == 3
         assert rec["plan_skipped"] is False
         assert rec["conclude_gate_rejections"] == 1
+        # error= (added 2026-07-23) coerces "None" to Python None on a healthy run.
+        assert rec["error"] is None
+
+    def test_crashed_run_carries_error_repr(self):
+        # The distinguishing signal: a v2 crash and a legitimate idle run emit
+        # byte-identical counters; only error= tells them apart (the fastapi
+        # eager-import defect was silently dead precisely because this was missing).
+        rec = _parse_one(GAP_FILL_V2_CRASHED_LINE)
+        assert rec["marker"] == "gap_fill_v2"
+        assert rec["steps"] == 0
+        assert rec["tool_calls"] == 0
+        assert rec["findings"] == 0
+        # repr(exc) is preserved verbatim (spaces and all) — it is not coerced away.
+        assert rec["error"] == "APIConnectionError(\"No module named 'fastapi'\")"
 
     def test_legacy_line_without_new_counters_still_harvests(self):
         # Old-format lines (pre-2026-07-21) must keep parsing on re-harvest; the
-        # five new counter fields come through as None, not a dropped record.
+        # five new counter fields plus error come through as None, not a dropped record.
         rec = _parse_one(GAP_FILL_V2_LEGACY_LINE)
         assert rec["marker"] == "gap_fill_v2"
         assert rec["qid"] == 38975
@@ -234,6 +260,7 @@ class TestGapFillV2:
         assert rec["plan_gaps"] is None
         assert rec["plan_skipped"] is None
         assert rec["conclude_gate_rejections"] is None
+        assert rec["error"] is None
 
 
 class TestGhostPre:

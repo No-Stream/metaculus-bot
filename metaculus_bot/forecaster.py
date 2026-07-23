@@ -390,13 +390,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d",
+            "research_provider_timeouts=%d, gap_fill_v2_errors=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
             self._stacker_fallback_used_count,
             self._stacker_fallback_failed_count,
             self._research_provider_timeout_count,
+            self._gap_fill_v2_error_count,
         )
 
         return results
@@ -408,6 +409,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @_research_provider_timeout_count.setter
     def _research_provider_timeout_count(self, value: int) -> None:
         self._research.timeout_count = value
+
+    @property
+    def _gap_fill_v2_error_count(self) -> int:
+        return self._research.gap_fill_v2_error_count
+
+    @_gap_fill_v2_error_count.setter
+    def _gap_fill_v2_error_count(self, value: int) -> None:
+        self._research.gap_fill_v2_error_count = value
 
     @property
     def alertable_count(self) -> int:
@@ -424,6 +433,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._stacker_fallback_used_count
             + self._stacker_fallback_failed_count
             + self._research_provider_timeout_count
+            + self._gap_fill_v2_error_count
         )
 
     async def _run_stacking(

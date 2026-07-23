@@ -36,6 +36,14 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             # through to OpenRouter (validated live by scratch/driver_replay_2026-07-17).
             "allowed_openai_params": ["reasoning_effort"],
             "temperature": None,
+            # litellm ≥1.92 eagerly imports its proxy MCP-gateway handler (which
+            # requires fastapi, a proxy-only extra we don't install) whenever `tools`
+            # is passed — even for plain function tools that never touch the gateway.
+            # We run our own tool-dispatch loop, so skip the import. Private litellm
+            # kwarg, popped before the provider sees it; version-scoped to the 1.x
+            # line (safe under our <2.0.0 cap — if it's ever dropped, this crashes
+            # loudly rather than silently regressing).
+            "_skip_mcp_handler": True,
         }
         if tools_json is not None:
             kwargs["tools"] = tools_json

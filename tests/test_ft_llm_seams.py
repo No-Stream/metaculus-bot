@@ -42,6 +42,24 @@ Seams covered:
   drive the fake all the way down at the ``acompletion`` boundary (not at
   ``_invoke_once_using_primary``) so the real two-instance key funnel is
   exercised.
+
+* **agentic tools-path executes under the installed litellm**
+  (``TestAgenticToolsPathExecutesUnderLitellm``): the agentic gap-fill v2 loop is
+  the ONLY caller that passes ``tools=`` to ``acompletion``. litellm >=1.92
+  eagerly imports its proxy MCP-gateway handler — which needs ``fastapi``, a
+  proxy-only extra we do NOT install — whenever ``tools=`` is present, BEFORE it
+  checks whether MCP is actually in use. That import fired on v2's first call,
+  crashed with ``ModuleNotFoundError: No module named 'fastapi'`` (wrapped as
+  ``APIConnectionError``), and the loop soft-failed to "" — so v2 (an always-on
+  prod research feature) was SILENTLY DEAD with nothing red in CI. The fix
+  (``research/agentic/llm.py`` passes ``_skip_mcp_handler=True``) skips that
+  import. This test drives the REAL ``litellm.acompletion`` through the REAL
+  production wrapper ``build_default_llm_call`` with a non-empty ``tools_json``
+  (offline via ``mock_response`` — the mock short-circuits the network but the
+  MCP import still fires because it is gated on ``tools=`` first), so it CRASHES
+  if the skip kwarg is ever dropped. Unlike the shape-pins above, this pins that
+  the tools-path can EXECUTE at all under the installed litellm — the exact gap
+  that let the fastapi defect ship.
 """
 
 from __future__ import annotations
@@ -59,6 +77,8 @@ from litellm.types.utils import Choices, Message, Usage
 
 from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
 from metaculus_bot.llm_configs import FORECASTER_LLMS
+from metaculus_bot.research.agentic import llm as agentic_llm
+from metaculus_bot.research.agentic.types import LoopConfig
 from metaculus_bot.research.providers import build_native_search_llm
 from metaculus_bot.structured_parse import PercentileListWrapper, _build_constrained_llm
 
@@ -378,3 +398,72 @@ class TestFallbackOpenRouterKeySwap:
 
         assert out == "PERSONAL-KEY ANSWER"
         assert [c["api_key"] for c in calls] == ["donated-key", "personal-key"]
+
+
+def _forward_to_real_litellm_with_mock(mock_text: str):
+    """Wrap the REAL ``litellm.acompletion``, injecting ``mock_response``.
+
+    The whole point of this indirection: ``build_default_llm_call``'s
+    ``_call_once`` builds the kwargs dict internally and calls
+    ``acompletion(**kwargs)`` against the ``acompletion`` symbol bound in
+    ``research/agentic/llm.py``. We monkeypatch that symbol to this wrapper, which
+    forwards to the genuine ``litellm.acompletion`` with ``mock_response`` added.
+    That keeps the REAL litellm call executing — so litellm's ``tools=``-gated
+    eager import of its proxy MCP-gateway handler still fires (``mock_response``
+    only short-circuits the network, AFTER that import). A plain ``AsyncMock``
+    here would defeat the whole test by skipping the import entirely.
+    """
+
+    async def _wrapper(**kwargs: Any) -> Any:
+        return await litellm.acompletion(**kwargs, mock_response=mock_text)
+
+    return _wrapper
+
+
+class TestAgenticToolsPathExecutesUnderLitellm:
+    """The agentic tools-path must be able to EXECUTE under the installed litellm.
+
+    See the module docstring: v2 is the only ``tools=`` caller, litellm >=1.92
+    eagerly imports a fastapi-dependent MCP handler on ``tools=`` before checking
+    if MCP is used, and that crashed v2 silently. This drives the real
+    ``litellm.acompletion`` through the real ``build_default_llm_call`` wrapper
+    with a real ``tools_json`` (offline via ``mock_response``), so it goes red the
+    instant ``_skip_mcp_handler=True`` is dropped from ``llm.py``.
+    """
+
+    async def test_tools_path_survives_litellm_mcp_import_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # drop_params must be True for the wrapper's OpenRouter reasoning_effort
+        # kwarg handling; a GeneralLlm invoke sets it globally in prod, but this
+        # test never constructs one, so set it here (monkeypatch auto-restores).
+        monkeypatch.setattr(litellm, "drop_params", True)
+        # Personal-key-only routing keeps the wrapper on a single deterministic
+        # acompletion call (no donated->personal fallback branch to reason about).
+        monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-personal-key")
+        # Forward to the REAL litellm so the tools=-gated MCP import actually runs.
+        monkeypatch.setattr(agentic_llm, "acompletion", _forward_to_real_litellm_with_mock("MOCKED"))
+
+        call = agentic_llm.build_default_llm_call(LoopConfig(model="openai/gpt-5.6-terra", reasoning_effort="low"))
+        # One plain function tool — exactly the shape the gap-fill loop passes.
+        # Its presence is what trips litellm's eager MCP-handler import.
+        tools_json = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch",
+                    "description": "fetch a url",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"],
+                    },
+                },
+            }
+        ]
+
+        # Without _skip_mcp_handler=True in llm.py this raises APIConnectionError
+        # (wrapping ModuleNotFoundError: No module named 'fastapi'); with it, the
+        # real litellm call reaches the mock and returns cleanly.
+        result = await call([{"role": "user", "content": "hi"}], tools_json)
+
+        assert result.choices[0].message.content == "MOCKED"

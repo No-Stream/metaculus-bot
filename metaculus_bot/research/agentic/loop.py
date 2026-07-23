@@ -1262,7 +1262,7 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         "%sGAP_FILL_V2: model=%s steps=%s tool_calls=%s searches=%s fetches=%s rendered=%s reads=%s "
         "dup_tool_calls=%s deadline_hit=%s concluded_early=%s wall_s=%.2f findings=%s "
         "pending_leads=%s lint_rejections=%s provenance_rejections=%s quote_mismatch_warnings=%s "
-        "plan_gaps=%s plan_skipped=%s conclude_gate_rejections=%s",
+        "plan_gaps=%s plan_skipped=%s conclude_gate_rejections=%s error=%s",
         log_prefix,
         state.telemetry.model,
         state.telemetry.steps,
@@ -1283,6 +1283,7 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
         state.telemetry.plan_gaps,
         state.telemetry.plan_skipped,
         state.telemetry.conclude_gate_rejections,
+        state.telemetry.error,
     )
 
 
@@ -1478,8 +1479,13 @@ async def run_agentic_loop(
         findings_markdown = render_findings(state.findings, state.pending_leads)
         _log_completion(state, log_prefix)
         return _freeze_result(state, findings_markdown, None)
-    except Exception:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
+    except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
         logger.exception("%sAgentic loop failed; soft-failing to banked findings if any", log_prefix)
+        # Stamp the crash so the completion marker (error=...) and the
+        # orchestrator's alertable counter can tell this apart from an idle
+        # "found nothing" run — the TimeoutError branch above deliberately does
+        # NOT set this (a deadline hit is expected degradation, not a crash).
+        state.telemetry.error = repr(exc)
         state.telemetry.wall_s = now_fn() - state.started_at_s
         findings_markdown = render_findings(state.findings, state.pending_leads)
         _log_completion(state, log_prefix)

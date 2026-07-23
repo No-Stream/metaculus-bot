@@ -206,13 +206,33 @@ class TestRunGapFillV2Seam:
     ) -> None:
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
         caplog.set_level(logging.ERROR, logger="metaculus_bot.research.agentic_gap_fill")
+        errors: list[BaseException] = []
         with patch(
             "metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools",
             side_effect=RuntimeError("tool construction exploded"),
         ):
-            result = await run_gap_fill_v2(make_real_binary_question(), BUNDLE, is_benchmarking=False)
+            result = await run_gap_fill_v2(
+                make_real_binary_question(), BUNDLE, is_benchmarking=False, on_error=errors.append
+            )
         assert result == ""
         assert any("Gap-fill v2 seam failed" in record.getMessage() for record in caplog.records)
+        # The construction-error soft-fail must fire on_error with the exception —
+        # this is the orchestrator's only crash signal for this path (no marker,
+        # no archive payload). It is the crash-counter's path (b) hook.
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_on_error_not_called_on_flag_off_skip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """on_error is a CRASH signal, not a skip signal: a clean flag-off early
+        return must never fire it (else every non-v2 run would falsely alert)."""
+        monkeypatch.delenv("GAP_FILL_V2_ENABLED", raising=False)
+        errors: list[BaseException] = []
+        result = await run_gap_fill_v2(
+            make_real_binary_question(), BUNDLE, is_benchmarking=False, on_error=errors.append
+        )
+        assert result == ""
+        assert errors == []
 
     @pytest.mark.asyncio
     async def test_archive_sink_receives_transcript_and_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -635,7 +655,7 @@ class TestOrchestratorBothFlags:
         provider = AsyncMock(return_value="research prose")
         trace = {"transcript": [{"role": "system", "content": "x"}], "telemetry": {"steps": 2}}
 
-        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None):
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
             if archive_sink is not None:
                 archive_sink(trace)
             return "## Agentic Research Findings\n\nClaim: something."
@@ -698,3 +718,119 @@ class TestOrchestratorBothFlags:
         records = [json.loads(line) for line in out.read_text().strip().splitlines()]
         assert records[0]["gap_fill_v2"] == trace
         assert "gap_fill_v2" not in records[1]
+
+
+class TestGapFillV2CrashCounter:
+    """The alertable crash counter (orchestrator.gap_fill_v2_error_count).
+
+    Detection backstop for the CLASS of bug the fastapi eager-import defect
+    exposed: v2 crashed on step 0, soft-failed to "", and emitted a marker
+    byte-identical to a legitimate idle run — nothing reddened CI. A genuine
+    crash must now bump an alertable counter; an idle "found nothing" run and a
+    deadline hit must NOT. Three mutually-exclusive crash paths, one bump each
+    (see orchestrator._count_gap_fill_v2_error). A dead-on-arrival bug bumps it
+    on every question; a rare transient bumps it once (accepted false alarm).
+    """
+
+    @pytest.mark.asyncio
+    async def test_seam_construction_crash_bumps_counter_once(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (b) end-to-end: the REAL run_gap_fill_v2 seam crashes in tool
+        construction, soft-fails to "", and its on_error callback bumps the
+        orchestrator counter exactly once (no payload -> post-gather check is a no-op)."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools",
+                side_effect=RuntimeError("tool construction exploded"),
+            ),
+        ):
+            research = await orch.run_research(make_real_binary_question())
+
+        assert "## Agentic Research Findings" not in research  # soft-failed, still published
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_loop_internal_soft_fail_bumps_counter_via_telemetry_error(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (a): the loop ran but hit its catch-all soft-fail, stamping
+        telemetry.error and returning normally. The orchestrator's post-gather
+        check reads the archived telemetry error and bumps the counter."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+            # Mirror the loop's soft-fail: it swallows the crash, stamps
+            # telemetry.error, still archives the payload, and returns findings ("").
+            if archive_sink is not None:
+                archive_sink(
+                    {"transcript": [], "telemetry": {"steps": 0, "error": "APIConnectionError('boom')"}, "ghost": None}
+                )
+            return ""
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch("metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", side_effect=_fake_v2),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_import_escape_error_bumps_counter(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (c): an error escaping the seam entirely (e.g. a broken import)
+        is caught by _run_v2's own except, which counts it directly."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("v2 escaped its own soft-fail"),
+            ),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_idle_run_does_not_bump_counter(self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Negative control: a clean run that legitimately found nothing (telemetry
+        error is None) must NOT bump the counter — otherwise every empty-findings
+        question would falsely redden CI. This is the byte-identical-marker case."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+            if archive_sink is not None:
+                archive_sink({"transcript": [], "telemetry": {"steps": 0, "error": None}, "ghost": None})
+            return ""  # nothing to research — a legitimate empty run, not a crash
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch("metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", side_effect=_fake_v2),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 0

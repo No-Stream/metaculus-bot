@@ -176,6 +176,16 @@ class LoopTelemetry:
     # Persistent 2s in prod flag a gate that's too strict or a prompt that's
     # unclear; see loop._conclude_tool and the GAP_FILL_V2 completion marker.
     conclude_gate_rejections: int = 0
+    # ``repr(exc)`` of the exception that tripped the loop's catch-all soft-fail
+    # (loop.py, the ``except Exception`` after the wall-deadline guard). None on
+    # every healthy run AND on a deadline hit (an expected degradation, not a
+    # crash — that path sets ``deadline_hit`` instead). This is the single field
+    # that distinguishes a real crash from a legitimate "driver found nothing"
+    # run: without it, a step-0 crash emits the byte-identical
+    # ``steps=0 tool_calls=0 findings=0`` marker as an idle run (the fastapi
+    # eager-import defect was silently dead for exactly this reason). The
+    # orchestrator reads it to bump the alertable crash counter.
+    error: str | None = None
 
 
 @dataclass(slots=True)

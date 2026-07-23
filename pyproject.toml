@@ -83,6 +83,7 @@ markers = [
     "live: requires real API keys and makes real LLM calls (deselected by default)",
     "e2e: end-to-end pipeline tests with mocked LLMs",
     "integration: cross-component contract tests",
+    "allow_network: opt out of the autouse network-egress guard (real sockets to non-localhost hosts)",
 ]
 addopts = "-m 'not live'"
 asyncio_mode = "auto"

@@ -162,6 +162,10 @@ MARKER_SPECS: list[MarkerSpec] = [
         # added 2026-07-21) is OPTIONAL: re-harvesting replays pre-branch logs whose
         # lines end at lint_rejections, and a mandatory tail would drop every one of
         # those records on the next replace-by-run sync. Missing groups coerce to None.
+        # ``error`` (added 2026-07-23) is nested one level deeper — it is always
+        # emitted alongside the 2026-07-21 counters, so it can only appear after
+        # conclude_gate_rejections; it captures greedily to end-of-line because it
+        # holds ``repr(exc)`` which contains spaces (``error=None`` on healthy runs).
         re.compile(
             r"(?:question=(?P<question>\S+)\s+)?GAP_FILL_V2:\s*model=(?P<model>.+?)"
             r"\s+steps=(?P<steps>\S+)\s+tool_calls=(?P<tool_calls>\S+)\s+searches=(?P<searches>\S+)"
@@ -173,7 +177,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:\s+provenance_rejections=(?P<provenance_rejections>\S+)"
             r"\s+quote_mismatch_warnings=(?P<quote_mismatch_warnings>\S+)"
             r"\s+plan_gaps=(?P<plan_gaps>\S+)\s+plan_skipped=(?P<plan_skipped>\S+)"
-            r"\s+conclude_gate_rejections=(?P<conclude_gate_rejections>\S+))?"
+            r"\s+conclude_gate_rejections=(?P<conclude_gate_rejections>\S+)"
+            r"(?:\s+error=(?P<error>.*))?)?"
         ),
         qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py emits question.page_url (post id)
     ),

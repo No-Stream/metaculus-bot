@@ -1,4 +1,6 @@
+import socket
 from datetime import datetime, timedelta
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -6,6 +8,82 @@ from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQue
 
 _OPEN = datetime(2026, 1, 1)
 _RESOLVE = datetime(2026, 5, 1)
+
+
+# ---------------------------------------------------------------------------
+# Network-egress guard (money-safety backstop)
+# ---------------------------------------------------------------------------
+
+# Hosts a socket may connect to without tripping the guard. Loopback only —
+# everything else is a real host and must be stubbed by the test. AF_UNIX and
+# socket.socketpair() are allowed unconditionally (they never carry an INET
+# address); asyncio's self-pipe / event-loop internals rely on them, so blocking
+# them would wedge the whole suite.
+_ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", "::"})
+
+
+def _host_from_address(address: Any) -> str | None:
+    """Pull the host out of a connect() address (INET = (host, port), INET6 adds flow/scope)."""
+    if isinstance(address, tuple) and address:
+        return address[0]
+    return None
+
+
+def _address_is_blocked(family: int, address: Any) -> bool:
+    """True iff this is an AF_INET/AF_INET6 connect to a non-loopback host."""
+    if family not in (socket.AF_INET, socket.AF_INET6):
+        # AF_UNIX and everything else (socketpair, unix domain sockets) is fine.
+        return False
+    host = _host_from_address(address)
+    if host is None:
+        return False
+    return host not in _ALLOWED_HOSTS
+
+
+@pytest.fixture(autouse=True)
+def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Block all real network egress during the test suite (money-safety backstop).
+
+    Monkeypatches ``socket.socket.connect`` / ``connect_ex`` to raise a clear
+    ``RuntimeError`` for any AF_INET/AF_INET6 connect to a non-localhost host, so
+    no test can silently reach a paid API. Modeled on how ``pytest-socket`` gates
+    (localhost + AF_UNIX + socketpair allowed, real hosts blocked) without taking
+    the dependency.
+
+    Opt out with ``@pytest.mark.allow_network`` on a test that must reach a real
+    host (the ``live`` suite is already deselected by ``addopts = -m 'not live'``,
+    so this marker is a belt-and-suspenders escape hatch, not the primary gate).
+
+    See also ``metaculus_bot.ablation.offline_replay.no_network()`` — a scoped
+    context manager (ablation replay only) that blocks ``socket.getaddrinfo`` at
+    the DNS level; this autouse guard is complementary, blocking ``connect`` /
+    ``connect_ex`` at the socket level so it also catches literal-IP connects that
+    skip DNS resolution entirely. Different scopes on purpose; don't consolidate.
+    """
+    if request.node.get_closest_marker("allow_network") is not None:
+        return
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def guarded_connect(self: socket.socket, address: Any) -> Any:
+        if _address_is_blocked(self.family, address):
+            raise RuntimeError(
+                f"Network access blocked in tests: {address}. "
+                "Stub the client or mark the test @pytest.mark.allow_network."
+            )
+        return real_connect(self, address)
+
+    def guarded_connect_ex(self: socket.socket, address: Any) -> Any:
+        if _address_is_blocked(self.family, address):
+            raise RuntimeError(
+                f"Network access blocked in tests: {address}. "
+                "Stub the client or mark the test @pytest.mark.allow_network."
+            )
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
 
 
 def make_mock_binary_question(qid: int = 1001) -> MagicMock:
