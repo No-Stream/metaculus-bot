@@ -6,6 +6,7 @@ tests loudly instead of silently dropping records from the archive:
 
 * EXTRACTION_RUNG   -> metaculus_bot/value_extraction.py:_log_extraction
 * GAP_FILL_V2       -> metaculus_bot/research/agentic/loop.py:_log_completion
+* GHOST_PRE[_JSON]  -> metaculus_bot/research/agentic/loop.py:_set_research_plan_tool
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
@@ -32,10 +33,29 @@ EXTRACTION_RUNG_LINE = (
     PFX + "EXTRACTION_RUNG: question=12345 model=openai/gpt-5.6-sol qtype=binary rung=block block_present=True"
 )
 GAP_FILL_V2_LINE = (
+    "2026-07-21 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+    "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
+    "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0 "
+    "provenance_rejections=1 quote_mismatch_warnings=2 plan_gaps=3 plan_skipped=False "
+    "conclude_gate_rejections=1"
+)
+# Pre-2026-07-21 completion format (ends at lint_rejections). Replace-by-run
+# re-harvesting replays old logs, so the parser must keep accepting this shape.
+GAP_FILL_V2_LEGACY_LINE = (
     "2026-07-17 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
     "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
     "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
     "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0"
+)
+GHOST_PRE_LINE = (
+    "2026-07-21 14:25:09,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_PRE: gaps=3 sensitive_assumptions=2"
+)
+GHOST_PRE_JSON_LINE = (
+    "2026-07-21 14:25:09,001 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_PRE_JSON: "
+    '{"qtype":"binary","prob":0.35}'
 )
 GHOST_FORECAST_LINE = (
     "2026-07-17 14:25:11,000 - metaculus_bot.research.agentic.loop - INFO - "
@@ -195,6 +215,53 @@ class TestGapFillV2:
         assert rec["findings"] == 5
         assert rec["pending_leads"] == 1
         assert rec["lint_rejections"] == 0
+        # The five loop counters added 2026-07-21 (see loop.py:_log_completion).
+        assert rec["provenance_rejections"] == 1
+        assert rec["quote_mismatch_warnings"] == 2
+        assert rec["plan_gaps"] == 3
+        assert rec["plan_skipped"] is False
+        assert rec["conclude_gate_rejections"] == 1
+
+    def test_legacy_line_without_new_counters_still_harvests(self):
+        # Old-format lines (pre-2026-07-21) must keep parsing on re-harvest; the
+        # five new counter fields come through as None, not a dropped record.
+        rec = _parse_one(GAP_FILL_V2_LEGACY_LINE)
+        assert rec["marker"] == "gap_fill_v2"
+        assert rec["qid"] == 38975
+        assert rec["lint_rejections"] == 0
+        assert rec["provenance_rejections"] is None
+        assert rec["quote_mismatch_warnings"] is None
+        assert rec["plan_gaps"] is None
+        assert rec["plan_skipped"] is None
+        assert rec["conclude_gate_rejections"] is None
+
+
+class TestGhostPre:
+    def test_fields(self):
+        rec = _parse_one(GHOST_PRE_LINE)
+        assert rec["marker"] == "ghost_pre"
+        # question= comes from log_prefix (question.page_url) -> a POST id.
+        assert rec["qid"] == 38975
+        assert rec["qid_kind"] == "post_id"
+        assert rec["gaps"] == 3
+        assert rec["sensitive_assumptions"] == 2
+
+    def test_json_payload_round_trips(self):
+        rec = _parse_one(GHOST_PRE_JSON_LINE)
+        assert rec["marker"] == "ghost_pre_json"
+        assert rec["qid"] == 38975
+        assert rec["qid_kind"] == "post_id"
+        # forecast_json stays a raw string (never coerced) so the scorer can json.loads it.
+        assert json.loads(rec["forecast_json"]) == {"qtype": "binary", "prob": 0.35}
+
+    def test_does_not_collide_with_ghost_forecast_pair(self):
+        # GHOST_PRE: / GHOST_PRE_JSON: / GHOST_FORECAST: / GHOST_FORECAST_JSON: are
+        # four distinct tokens — each line must harvest as exactly its own marker
+        # under the one-marker-per-line break.
+        assert _parse_one(GHOST_PRE_LINE)["marker"] == "ghost_pre"
+        assert _parse_one(GHOST_PRE_JSON_LINE)["marker"] == "ghost_pre_json"
+        assert _parse_one(GHOST_FORECAST_LINE)["marker"] == "ghost_forecast"
+        assert _parse_one(GHOST_FORECAST_JSON_LINE)["marker"] == "ghost_forecast_json"
 
 
 class TestGhostForecast:
@@ -355,6 +422,8 @@ class TestQidKindAcrossMarkers:
     """
 
     def test_post_id_markers(self):
+        assert _parse_one(GHOST_PRE_LINE)["qid_kind"] == "post_id"
+        assert _parse_one(GHOST_PRE_JSON_LINE)["qid_kind"] == "post_id"
         assert _parse_one(GHOST_FORECAST_LINE)["qid_kind"] == "post_id"
         assert _parse_one(GHOST_FORECAST_JSON_LINE)["qid_kind"] == "post_id"
 

@@ -191,8 +191,8 @@ sync_research:
 	@echo ""
 	@echo "Archive ready at backtests/research_archive/latest/"
 
-# Harvest run-log telemetry markers (EXTRACTION_RUNG, GAP_FILL_V2, GHOST_FORECAST,
-# OPEN_BOUND_PILING, CREDIT_*) from GHA artifacts into the durable local archive
+# Harvest run-log telemetry markers (EXTRACTION_RUNG, GAP_FILL_V2, GHOST_PRE[_JSON],
+# GHOST_FORECAST[_JSON], OPEN_BOUND_PILING, CREDIT_*) from GHA artifacts into the durable local archive
 # (backtests/telemetry_archive/). Prod runs bundle run_logs/ inside research-* and
 # test_bot uploads a separate logs-* artifact, so the downloader pulls both families.
 # Read-only + free (GitHub API only) and idempotent (replace-by-run), so it's safe on
