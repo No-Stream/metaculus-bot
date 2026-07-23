@@ -56,3 +56,15 @@ reason = "litellm 1.80.0 proxy-server RBAC CVE; we use litellm as a client SDK o
 [[IgnoredVulns]]
 id = "GHSA-wpfp-gwwc-vwq6"
 reason = "litellm 1.80.0 proxy-server RBAC CVE; we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; client-side fix unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-4g5m-c9r5-49xf"
+reason = "litellm proxy-server CVE (local file read via /health/test_connection oidc/file refs, admin-privileged); we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; fix (1.83.10) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-5jmr-gcrj-2c9q"
+reason = "litellm proxy-server CVE (path traversal in Skills ZIP upload via /v1/skills); we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; fix (1.83.7) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-72m8-9m7m-h278"
+reason = "litellm proxy-server CVE (code injection via custom-code guardrail create/update endpoints); we use litellm as a client SDK only (no proxy server), so unreachable. Pinned under frozen forecasting-tools==0.2.54; fix (1.82.0) unreachable until that pin moves"
+[[IgnoredVulns]]
+id = "GHSA-7488-6r32-c95q"
+reason = "litellm proxy-server CVE (CVSS 8.8 auth bypass on the proxy's /mcp/ MCP endpoint — failed key validation fell back to an empty UserAPIKeyAuth); we use litellm as a client SDK only (no proxy server, no MCP routes), so unreachable. Pinned under frozen forecasting-tools==0.2.54; fix (1.84.0) unreachable until that pin moves"
