@@ -1,32 +1,77 @@
 """Seam-pinning tests for the forecasting-tools integration points that the
 0.2.54 -> 0.2.92+ upgrade is known to silently break (FUTURE.md Workstream B).
 
-Seam 1: our ``PchipNumericDistribution`` overrides only the ``.cdf`` property,
-which the 0.2.54 publish path reads directly — at ft HEAD that internal read
-becomes ``get_cdf()``, which we don't override, so the base-class CDF builder
-would silently take over and publish the wrong distribution. Seam 2:
-``fetch_hardening`` patches ``MetaculusApi._get_questions_from_api``, the 0.2.54
-chokepoint for every question-list GET — at ft HEAD the real fetch moves to
-``MetaculusClient``, so the patch could become a silent no-op. Both tests are
-green on 0.2.54 and are expected to go red at HEAD until (1) ``get_cdf()`` is
-overridden on our distribution subclasses and (2) the fetch-hardening patches
-are repointed at ``MetaculusClient``.
+All tests are green on the currently-installed 0.2.54 and are designed to go red
+at ft HEAD until the corresponding shim is repointed at the moved seam.
+
+Seam 1 (``TestPchipCdfIsWhatGetsPublished``): our ``PchipNumericDistribution``
+overrides only the ``.cdf`` property, which the 0.2.54 publish path reads
+directly — at ft HEAD that internal read becomes ``get_cdf()``, which we don't
+override, so the base-class CDF builder would silently take over and publish the
+wrong distribution. Fix at HEAD: override ``get_cdf()`` on our subclasses.
+
+Seam 2 (``TestPublicFetchRoutesThroughHardenedChokepoint``): ``fetch_hardening``
+patches ``MetaculusApi._get_questions_from_api``, the 0.2.54 chokepoint for every
+question-list GET — at ft HEAD the real fetch moves to ``MetaculusClient``, so
+the patch could become a silent no-op. Fix at HEAD: repoint the fetch-hardening
+patches at ``MetaculusClient``.
+
+Seam 3 (``TestPublishHardeningWrapsRealPublishPath``): ``publish_hardening``
+wraps the four ``MetaculusApi.post_*`` classmethods to inject a socket
+``timeout`` (and retry) on the blocking ``requests.post`` inside each. The
+0.2.54 report ``publish_report_to_metaculus`` methods call
+``MetaculusApi.post_*`` directly, so the injected timeout reaches the real HTTP
+boundary. At ft HEAD publishing moves to ``MetaculusClient().post_*`` (instance
+methods), so wrapping the class methods becomes a no-op and the timeout would
+silently vanish. Fix at HEAD: repoint publish hardening at ``MetaculusClient``.
+
+Seam 4 (``TestQuestionBoundsPatchTargetExistsAndBehaves``): ``question_patches``
+monkeypatches ``BoundedQuestionMixin._get_bounds_from_api_json`` to coerce int
+scaling bounds to float before the upstream ``isinstance(x, float)`` asserts
+fire. 0.2.92 adds its own ``float()`` coercion there, making our patch redundant
+(and our closure-captured ``_original_func`` a moving target) — this pins the
+patched tuple contract and that the captured original still rejects ints, so the
+redundancy is a deliberate removal at upgrade time, not a silent behavior drift.
+
+Seam 5 (``TestHeartbeatWrapsRunABatch``): ``install_benchmarker_heartbeat`` wraps
+``Benchmarker._run_a_batch`` (0.2.54, in ``cp_benchmarking``) to emit progress
+logs during long backtests. If ft HEAD renames the batch method or moves the
+Benchmarker module, the wrap becomes a silent no-op and backtests lose their
+heartbeat. This pins that the wrap actually replaces the method and that a stub
+batch run emits the ``[HB]`` log line.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import requests
-from forecasting_tools import MetaculusApi, NumericDistribution, NumericQuestion
+from forecasting_tools import (
+    Benchmarker,
+    BinaryQuestion,
+    MetaculusApi,
+    MultipleChoiceQuestion,
+    NumericDistribution,
+    NumericQuestion,
+)
+from forecasting_tools.data_models.binary_report import BinaryReport
+from forecasting_tools.data_models.multiple_choice_report import (
+    MultipleChoiceReport,
+    PredictedOption,
+    PredictedOptionList,
+)
 from forecasting_tools.data_models.numeric_report import NumericReport, Percentile
+from forecasting_tools.data_models.questions import BoundedQuestionMixin
 from forecasting_tools.helpers import metaculus_api as ft_api
 from forecasting_tools.helpers.metaculus_api import ApiFilter
 
-from metaculus_bot import fetch_hardening
+from metaculus_bot import fetch_hardening, publish_hardening
+from metaculus_bot.benchmark.heartbeat import install_benchmarker_heartbeat
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
@@ -203,3 +248,326 @@ class TestPublicFetchRoutesThroughHardenedChokepoint:
 
         assert result == []
         assert n_calls["n"] == 2
+
+
+def _reset_publish_hardening_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore the patched MetaculusApi.post_* classmethods and clear the sentinel.
+
+    ``apply_publish_hardening`` mutates the MetaculusApi class in place and is
+    idempotent via a sentinel. Snapshot the current descriptors through
+    monkeypatch (auto-restored on teardown) and clear the sentinel so each test
+    exercises a fresh install. ``monkeypatch.delattr(..., raising=False)`` is
+    used for the sentinel because it is teardown-safe whether or not the test
+    subsequently re-applies hardening (the negative-control test deliberately
+    does not), unlike a manual setattr+delattr dance.
+    """
+
+    for name in publish_hardening._PATCHED_METHODS:
+        monkeypatch.setattr(MetaculusApi, name, MetaculusApi.__dict__[name])
+
+    monkeypatch.delattr(MetaculusApi, publish_hardening._SENTINEL, raising=False)
+
+
+class TestPublishHardeningWrapsRealPublishPath:
+    """Seam 3: publish hardening's injected socket timeout must reach the real HTTP boundary.
+
+    ``publish_hardening`` wraps ``MetaculusApi.post_*`` to inject
+    ``timeout=PUBLISH_POST_TIMEOUT`` on the underlying ``requests.post``. The
+    0.2.54 report publish methods call those classmethods directly, so driving
+    ``publish_report_to_metaculus`` for each question type with the HTTP boundary
+    mocked lets us assert the injected timeout landed on every captured POST.
+
+    Negative control (``test_..._without_hardening_no_timeout_injected``) drives
+    the same publish path WITHOUT ``apply_publish_hardening`` and asserts NO
+    timeout is injected — that non-vacuity proof is what makes the positive
+    assertion meaningful. If ft HEAD reroutes publishing to
+    ``MetaculusClient().post_*`` instance methods, wrapping the class methods
+    becomes a silent no-op: the positive test regresses to the negative case
+    (captured timeouts are ``None``) and goes red.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A token for _get_auth_headers and a clean hardening install per test.
+        monkeypatch.setenv("METACULUS_TOKEN", "test-token")
+        _reset_publish_hardening_state(monkeypatch)
+
+    def _install_capturing_transport(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        """Patch forecasting-tools' ``requests.post`` to capture kwargs and 200-OK.
+
+        Returns the mutable list of captured kwarg dicts (one per POST).
+        """
+
+        captured: list[dict[str, Any]] = []
+
+        def fake_post(*_args: Any, **kwargs: Any) -> Any:
+            captured.append(dict(kwargs))
+            response = MagicMock()
+            response.status_code = 200
+            response.raise_for_status.return_value = None
+            response.json.return_value = {}
+            return response
+
+        monkeypatch.setattr(ft_api.requests, "post", fake_post)
+        return captured
+
+    @pytest.fixture
+    def binary_report(self) -> BinaryReport:
+        question = BinaryQuestion(
+            question_text="Will it?",
+            id_of_question=101,
+            id_of_post=101,
+            page_url="https://www.metaculus.com/questions/101/",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+        )
+        return BinaryReport(question=question, prediction=0.5, explanation="# Seam test")
+
+    @pytest.fixture
+    def numeric_report(self) -> NumericReport:
+        question = NumericQuestion(
+            question_text="How many?",
+            id_of_question=102,
+            id_of_post=102,
+            page_url="https://www.metaculus.com/questions/102/",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            lower_bound=0.0,
+            upper_bound=100.0,
+            open_lower_bound=False,
+            open_upper_bound=False,
+            zero_point=None,
+            unit_of_measure="units",
+            cdf_size=201,
+        )
+        declared = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES)]
+        distribution = NumericDistribution.from_question(declared, question)
+        return NumericReport(question=question, prediction=distribution, explanation="# Seam test")
+
+    @pytest.fixture
+    def multiple_choice_report(self) -> MultipleChoiceReport:
+        question = MultipleChoiceQuestion(
+            question_text="Which?",
+            id_of_question=103,
+            id_of_post=103,
+            page_url="https://www.metaculus.com/questions/103/",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            options=["A", "B", "C"],
+        )
+        options = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="A", probability=0.5),
+                PredictedOption(option_name="B", probability=0.3),
+                PredictedOption(option_name="C", probability=0.2),
+            ]
+        )
+        return MultipleChoiceReport(question=question, prediction=options, explanation="# Seam test")
+
+    @pytest.mark.parametrize("report_fixture", ["binary_report", "numeric_report", "multiple_choice_report"])
+    def test_publish_injects_socket_timeout_on_every_post(
+        self, report_fixture: str, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After apply_publish_hardening, every POST on the real publish path carries the injected timeout."""
+        report = request.getfixturevalue(report_fixture)
+        captured = self._install_capturing_transport(monkeypatch)
+        publish_hardening.apply_publish_hardening()
+
+        asyncio.run(report.publish_report_to_metaculus())
+
+        # Each report type does a prediction POST + a comment POST — both go
+        # through a wrapped classmethod, so both must carry the injected timeout.
+        assert len(captured) == 2, f"expected prediction + comment POST, got {len(captured)}"
+        for kwargs in captured:
+            assert kwargs.get("timeout") == publish_hardening.PUBLISH_POST_TIMEOUT, (
+                f"publish hardening must inject timeout on every POST; got {kwargs}"
+            )
+
+    @pytest.mark.parametrize("report_fixture", ["binary_report", "numeric_report", "multiple_choice_report"])
+    def test_publish_without_hardening_no_timeout_injected(
+        self, report_fixture: str, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: without apply_publish_hardening, no timeout reaches the POST.
+
+        Proves the positive test isn't vacuous — the timeout only appears because
+        the wrapper injected it, not because something else defaults it.
+        """
+        report = request.getfixturevalue(report_fixture)
+        captured = self._install_capturing_transport(monkeypatch)
+        # Deliberately do NOT call apply_publish_hardening().
+
+        asyncio.run(report.publish_report_to_metaculus())
+
+        assert len(captured) == 2
+        for kwargs in captured:
+            assert kwargs.get("timeout") is None, f"unhardened publish must not carry a timeout; got {kwargs}"
+
+
+class TestQuestionBoundsPatchTargetExistsAndBehaves:
+    """Seam 4: our int->float bounds patch target must exist and honor the tuple contract.
+
+    ``question_patches.apply_question_patches`` is applied at
+    ``metaculus_bot`` import (``metaculus_bot/__init__.py``), so by the time this
+    module imports, ``BoundedQuestionMixin._get_bounds_from_api_json`` is already
+    the patched classmethod. This pins two things: (1) the patch coerces int
+    scaling bounds to float and returns the exact 5-tuple contract, and (2) the
+    closure-captured original (the 0.2.54 body) still rejects ints — so at 0.2.92,
+    where upstream adds its own float() coercion, the redundancy is removed
+    deliberately rather than drifting silently.
+    """
+
+    @staticmethod
+    def _scaling_json(
+        *,
+        range_max: int | float,
+        range_min: int | float,
+        zero_point: int | float | None = None,
+        open_upper_bound: bool = False,
+        open_lower_bound: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "question": {
+                "open_upper_bound": open_upper_bound,
+                "open_lower_bound": open_lower_bound,
+                "scaling": {"range_max": range_max, "range_min": range_min, "zero_point": zero_point},
+            }
+        }
+
+    def test_patch_is_installed_as_classmethod(self) -> None:
+        descriptor = BoundedQuestionMixin.__dict__["_get_bounds_from_api_json"]
+        assert isinstance(descriptor, classmethod), "our patch reattaches as a classmethod"
+        assert descriptor.__func__.__name__ == "_patched", (
+            "the installed function is our patch, not the upstream original"
+        )
+
+    def test_int_bounds_return_exact_patched_tuple_contract(self) -> None:
+        result = BoundedQuestionMixin._get_bounds_from_api_json(
+            self._scaling_json(range_max=200, range_min=0, zero_point=100)
+        )
+        # Exact tuple: (open_upper, open_lower, upper, lower, zero_point), ints coerced to float.
+        assert result == (False, True, 200.0, 0.0, 100.0)
+        open_upper, open_lower, upper, lower, zero_point = result
+        assert isinstance(open_upper, bool) and isinstance(open_lower, bool)
+        assert isinstance(upper, float) and isinstance(lower, float)
+        assert isinstance(zero_point, float)
+
+    def test_none_zero_point_preserved(self) -> None:
+        result = BoundedQuestionMixin._get_bounds_from_api_json(
+            self._scaling_json(range_max=200, range_min=0, zero_point=None)
+        )
+        assert result == (False, True, 200.0, 0.0, None)
+
+    def test_end_to_end_numeric_question_builds_from_int_scaling(self) -> None:
+        """The whole point of the patch: NumericQuestion.from_metaculus_api_json survives int scaling."""
+        api_json = {
+            "id": 4242,
+            "nr_forecasters": 100,
+            "forecasts_count": 250,
+            "published_at": "2026-01-01T00:00:00Z",
+            "projects": {"default_project": {"id": 32813}, "tournament": [{"slug": "ft-seam-test"}]},
+            "question": {
+                "id": 4242,
+                "title": "How many?",
+                "status": "open",
+                "description": "bg",
+                "fine_print": "fp",
+                "resolution_criteria": "rc",
+                "unit": "units",
+                "type": "numeric",
+                # Integer scaling — the exact shape that trips the upstream isinstance assert.
+                "scaling": {"range_max": 200, "range_min": 0, "zero_point": None, "inbound_outcome_count": 200},
+                "open_upper_bound": False,
+                "open_lower_bound": True,
+                "include_bots_in_aggregates": False,
+                "question_weight": 1.0,
+                "scheduled_close_time": "2027-01-01T00:00:00Z",
+                "scheduled_resolve_time": "2027-01-02T00:00:00Z",
+                "open_time": "2026-01-01T00:00:00Z",
+            },
+        }
+        question = NumericQuestion.from_metaculus_api_json(api_json)
+        assert question.lower_bound == 0.0 and isinstance(question.lower_bound, float)
+        assert question.upper_bound == 200.0 and isinstance(question.upper_bound, float)
+        assert question.open_lower_bound is True and question.open_upper_bound is False
+
+    def test_captured_original_still_rejects_ints(self) -> None:
+        """Negative control: the closure-captured 0.2.54 original still asserts on ints.
+
+        Proves the patch — not upstream — is what tolerates ints on 0.2.54. At
+        0.2.92 the upstream body gains its own float() coercion, so this control
+        is the signal that the patch has become redundant and can be dropped.
+        """
+        descriptor = BoundedQuestionMixin.__dict__["_get_bounds_from_api_json"]
+        free = dict(zip(descriptor.__func__.__code__.co_freevars, descriptor.__func__.__closure__ or ()))
+        original = free["_original_func"].cell_contents
+
+        with pytest.raises(AssertionError):
+            original(BoundedQuestionMixin, self._scaling_json(range_max=200, range_min=0))
+
+
+class TestHeartbeatWrapsRunABatch:
+    """Seam 5: the heartbeat must actually replace Benchmarker._run_a_batch and fire.
+
+    ``install_benchmarker_heartbeat`` wraps ``Benchmarker._run_a_batch`` (0.2.54,
+    ``cp_benchmarking.benchmarker``) so long backtests emit ``[HB]`` progress
+    logs. This pins that the wrap swaps the method for a different callable (with
+    the ``_has_heartbeat`` sentinel) and that a stubbed batch run both delegates
+    to the original and logs the heartbeat. If ft HEAD renames the batch method
+    or relocates Benchmarker, the wrap silently no-ops and this goes red.
+    """
+
+    @pytest.fixture
+    def restore_run_a_batch(self) -> Any:
+        original = Benchmarker.__dict__["_run_a_batch"]
+        try:
+            yield
+        finally:
+            Benchmarker._run_a_batch = original
+
+    def test_install_wraps_and_heartbeat_fires(
+        self, restore_run_a_batch: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        calls: list[Any] = []
+
+        async def stub_run_a_batch(self: Any, batch: Any) -> None:
+            calls.append(batch)
+
+        Benchmarker._run_a_batch = stub_run_a_batch  # type: ignore[assignment]
+
+        # interval_seconds=0 so the heartbeat loop ticks at least once before the
+        # stubbed batch (which returns immediately) completes.
+        install_benchmarker_heartbeat(interval_seconds=0, progress_state={})
+
+        wrapped = Benchmarker._run_a_batch
+        assert wrapped is not stub_run_a_batch, "heartbeat must replace the batch method"
+        assert getattr(wrapped, "_has_heartbeat", False) is True, "the wrapper must carry the _has_heartbeat sentinel"
+
+        batch = MagicMock()
+        batch.benchmark.name = "seam-batch"
+        batch.questions = [object(), object()]
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.benchmark.heartbeat"):
+            asyncio.run(Benchmarker._run_a_batch(MagicMock(), batch))
+
+        assert len(calls) == 1, "the wrapper must delegate to the original _run_a_batch"
+        heartbeat_logs = [r.getMessage() for r in caplog.records if "[HB]" in r.getMessage()]
+        assert heartbeat_logs, "a heartbeat log line must fire during the batch run"
+        assert "seam-batch" in heartbeat_logs[0]
+
+    def test_install_is_idempotent(self, restore_run_a_batch: None) -> None:
+        """A second install must not double-wrap (guards against runaway nesting)."""
+
+        async def stub_run_a_batch(self: Any, batch: Any) -> None:
+            return None
+
+        Benchmarker._run_a_batch = stub_run_a_batch  # type: ignore[assignment]
+
+        install_benchmarker_heartbeat(interval_seconds=0, progress_state={})
+        after_first = Benchmarker._run_a_batch
+        install_benchmarker_heartbeat(interval_seconds=0, progress_state={})
+        after_second = Benchmarker._run_a_batch
+
+        assert after_first is after_second, "second install must be a no-op (already wrapped)"
