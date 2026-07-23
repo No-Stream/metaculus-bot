@@ -1601,6 +1601,82 @@ class TestVerificationTierStamping:
         assert "[verification: snippet]" in result.findings_markdown
         assert "[verification: fetched]" not in result.findings_markdown
 
+    @pytest.mark.asyncio
+    async def test_relist_after_fetch_upgrade_restamps_banked_discrepancy(self) -> None:
+        """Bank-then-fetch-then-relist: a discrepancy banked from a search
+        snippet, whose URL is THEN successfully fetched, upgrades to fetched
+        authority when the driver re-lists it in conclude — the duplicate branch
+        restamps the stored finding instead of leaving it snippet-stamped, so
+        the verified correction renders in the supersede block, not demoted."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_news", {"query": "figure"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://gov.example/figure", discrepancy=True)]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("f1", "fetch", {"url": "https://gov.example/figure"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "done1",
+                            "conclude",
+                            {"final_findings": [_finding("https://gov.example/figure", discrepancy=True)]},
+                        )
+                    ]
+                ),
+            ]
+        )
+        snippet_search = _returns_method("https://gov.example/figure says the figure is 131.3.", method="news")
+        fetch = _returns_method("The full primary-source page.", method="plain")
+
+        # cap=0 keeps the W2 conclude gate out of the way (this test's subject is
+        # the duplicate-restamp, not gap accounting).
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_news", snippet_search), _tool_spec("fetch", fetch)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        md = result.findings_markdown
+        assert "### ⚠ Corrections to the briefing" in md
+        assert "### ⚠ Possible corrections (snippet-sourced — recheck advised)" not in md
+        conclude_message = _tool_messages(result)[-1]
+        assert "Skipped 1 final finding(s) already recorded earlier in this run." in conclude_message["content"]
+
+    def test_bank_duplicate_restamps_tier_upgrade_only(self) -> None:
+        """_bank_findings unit: a duplicate re-record restamps the stored finding
+        from the (upgraded) tier map, counts as a duplicate, and never appends;
+        a re-record without a tier change leaves the stored finding as-is."""
+        from metaculus_bot.research.agentic.loop import _bank_findings, _LoopState
+        from metaculus_bot.research.agentic.types import Finding
+
+        state = _LoopState(messages=[], started_at_s=0.0, deadline_at_s=100.0)
+        finding = Finding.model_validate(_finding("https://gov.example/figure", discrepancy=True))
+        state.url_best_tier["https://gov.example/figure"] = "snippet"
+
+        assert _bank_findings(state, [finding]) == (1, 0)
+        assert state.findings[0].verification_tier == "snippet"
+
+        # Same tier map: duplicate skipped, stamp unchanged.
+        assert _bank_findings(state, [finding]) == (0, 1)
+        assert state.findings[0].verification_tier == "snippet"
+
+        # Tier upgraded between banks: the re-record restamps the stored copy.
+        state.url_best_tier["https://gov.example/figure"] = "fetched"
+        assert _bank_findings(state, [finding]) == (0, 1)
+        assert len(state.findings) == 1
+        assert state.findings[0].verification_tier == "fetched"
+
 
 class TestResearchPlanGate:
     """W1: set_research_plan is required before any external tool call. Until it

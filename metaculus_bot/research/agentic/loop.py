@@ -89,6 +89,13 @@ _METHOD_TO_TIER: dict[str, str] = {
 _TIER_RANK: dict[str, int] = {"snippet": 0, "fetched": 1}
 
 
+def _outranks(candidate: str | None, incumbent: str | None) -> bool:
+    """True when ``candidate`` is a strictly better verification tier than
+    ``incumbent``. None (untiered — the URL was never retrieved through a tool)
+    ranks below every real tier."""
+    return (-1 if candidate is None else _TIER_RANK[candidate]) > (-1 if incumbent is None else _TIER_RANK[incumbent])
+
+
 def _method_to_tier(method: str) -> str | None:
     """Map a ToolOutcome.method to a verification tier ("fetched"/"snippet"), or
     None when the method isn't a real content retrieval (internal bookkeeping,
@@ -163,10 +170,11 @@ class _LoopState:
     deadline_at_s: float
     telemetry: LoopTelemetry = field(default_factory=LoopTelemetry)
     findings: list[Finding] = field(default_factory=list)
-    # Canonical-JSON identities of already-banked findings, so re-recording the same
-    # finding (record_findings then a re-list in conclude's final_findings) is a
-    # no-op instead of a double-append. See _bank_findings.
-    seen_finding_keys: set[str] = field(default_factory=set)
+    # Canonical-JSON identity -> index in ``findings`` for already-banked
+    # findings, so re-recording the same finding (record_findings then a re-list
+    # in conclude's final_findings) restamps the stored copy's tier instead of
+    # double-appending. See _bank_findings.
+    seen_finding_keys: dict[str, int] = field(default_factory=dict)
     pending_leads: list[str] = field(default_factory=list)
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     # Provenance gate accumulators (see the _normalize_url block). Normalized
@@ -614,11 +622,20 @@ def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int
     loop-stamped ``verification_tier``: a driver that records findings
     incrementally with ``record_findings`` and then re-lists the same ones in
     ``conclude``'s ``final_findings`` (observed on Q578 — 8 findings rendered 16
-    times) no longer doubles the list, even if the URL's tier upgraded (search
-    then fetch) between the two banks. Serializing every OTHER field keeps
+    times) no longer doubles the list. Serializing every OTHER field keeps
     genuinely distinct findings that happen to share a source/quote (a different
     ``claim`` or ``topic``) separate, and stays correct if ``Finding`` gains a
     field. Each banked finding carries the code-derived tier (W4).
+
+    A duplicate still RESTAMPS the stored finding's tier: when the URL's tier
+    upgraded between the two banks (banked from a search snippet, then the same
+    URL was successfully fetched, then re-listed in conclude), the affirmative
+    re-record carries the fetched authority forward — otherwise a verified
+    discrepancy would stay demoted to the "possible corrections" block. Only an
+    explicit re-record upgrades (never a bare fetch alone: the driver may have
+    fetched, seen the claim was wrong, and deliberately not re-listed it), and
+    the best-tier merge in ``url_best_tier`` makes the restamp monotonic — a
+    tier never downgrades.
     """
     banked = 0
     duplicates = 0
@@ -626,11 +643,15 @@ def _bank_findings(state: _LoopState, accepted: list[Finding]) -> tuple[int, int
         # Key on the driver-stable identity (tier is loop-stamped, so exclude it)
         # so dedup survives a between-bank tier upgrade.
         key = finding.model_dump_json(exclude={"verification_tier"})
-        if key in state.seen_finding_keys:
+        stamped = _stamp_verification_tier(finding, state)
+        existing_index = state.seen_finding_keys.get(key)
+        if existing_index is not None:
             duplicates += 1
+            if _outranks(stamped.verification_tier, state.findings[existing_index].verification_tier):
+                state.findings[existing_index] = stamped
             continue
-        state.seen_finding_keys.add(key)
-        state.findings.append(_stamp_verification_tier(finding, state))
+        state.seen_finding_keys[key] = len(state.findings)
+        state.findings.append(stamped)
         banked += 1
     return banked, duplicates
 
