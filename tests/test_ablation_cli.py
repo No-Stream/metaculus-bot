@@ -30,7 +30,7 @@ The orchestrator's contract under test:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -5350,8 +5350,11 @@ class TestQuestionShimTimeFields:
         assert isinstance(shim.scheduled_resolution_time, datetime), (
             f"shim.scheduled_resolution_time must be a datetime, got {type(shim.scheduled_resolution_time).__name__}"
         )
-        assert shim.open_time == original_open
-        assert shim.scheduled_resolution_time == original_resolve
+        # ft 0.2.92's add_timezone_to_dates validator coerces the naive manifest
+        # datetimes to tz-aware UTC when the shim is constructed (old on-disk manifests
+        # still hold naive ISO strings), so the rehydrated values are aware UTC.
+        assert shim.open_time == original_open.replace(tzinfo=timezone.utc)
+        assert shim.scheduled_resolution_time == original_resolve.replace(tzinfo=timezone.utc)
         # Sanity: subtraction (the operation that would crash on a sub-MagicMock) works.
         delta = shim.scheduled_resolution_time - shim.open_time
         assert delta.days > 0
@@ -6326,3 +6329,59 @@ class TestNumericCdfSizeShimRoundTrip:
         shim = _build_question_shim_from_manifest_entry(1, entry)
         assert isinstance(shim, NumericQuestion)
         assert shim.cdf_size == 201
+
+
+# ---------------------------------------------------------------------------
+# ft 0.2.92 tz-aware resolution-time window filter (lives here per the W2 brief:
+# tests/test_backtest_question_prep.py — the natural home for question_prep —
+# was outside this worker's scope, so the comparison-path test is parked in an
+# owned file). ft 0.2.92 coerces actual_resolution_time to tz-aware UTC at
+# construction; backtest window boundaries come from a naive strptime, so the
+# filter must normalize both sides or the naive-vs-aware ordering raises
+# TypeError and aborts every backtest fetch. The existing question_prep fixtures
+# set actual_resolution_time POST-construction (which skips the validator, so it
+# stays naive) and thus never exercise the aware path that fires in production.
+# ---------------------------------------------------------------------------
+
+
+class TestFilterHandlesTzAwareResolutionTime:
+    @pytest.mark.asyncio
+    async def test_fetch_filters_mixed_tz_aware_and_naive_resolution_times(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Aware (production) and naive (local fixture) resolution times both filter cleanly.
+
+        Regression for the 0.2.92 naive-vs-aware TypeError: the aware questions mirror
+        real API-sourced questions; the naive one exercises OUR ``_as_utc`` normalization
+        of a naive value (the tz-robust path that must stay covered).
+        """
+        from forecasting_tools.data_models.questions import QuestionState  # noqa: PLC0415
+
+        from metaculus_bot.backtest.question_prep import fetch_resolved_questions  # noqa: PLC0415
+
+        def _binary(qid: int, resolved_at: datetime) -> BinaryQuestion:
+            return BinaryQuestion(
+                question_text=f"Q{qid}?",
+                id_of_question=qid,
+                resolution_string="yes",
+                community_prediction_at_access_time=0.6,
+                state=QuestionState.RESOLVED,
+                api_json={},
+                actual_resolution_time=resolved_at,
+            )
+
+        aware_in_window = _binary(9101, datetime(2026, 3, 1, tzinfo=timezone.utc))
+        aware_after_upper = _binary(9102, datetime(2026, 6, 1, tzinfo=timezone.utc))  # >= upper => excluded
+        naive_in_window = _binary(9103, datetime(2026, 3, 15))  # naive => _as_utc must normalize
+
+        mock_fetch = AsyncMock(return_value=[aware_in_window, aware_after_upper, naive_in_window])
+        monkeypatch.setattr("metaculus_bot.backtest.question_prep._fetch_with_retries", mock_fetch)
+
+        result = await fetch_resolved_questions(
+            total_questions=10,
+            resolved_after="2026-01-01",
+            resolved_before="2026-05-01",
+        )
+
+        qids = {q.id_of_question for q in result.questions}
+        assert qids == {9101, 9103}

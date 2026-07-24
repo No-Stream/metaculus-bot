@@ -60,8 +60,11 @@ def validate_cdf_construction(prediction: NumericDistribution, question: Numeric
 
     try:
         # Force CDF construction to surface any issues
-        _ = prediction.cdf
-    except (AssertionError, ZeroDivisionError) as e:
+        _ = prediction.get_cdf()
+    except (AssertionError, ValueError, ZeroDivisionError) as e:
+        # 0.2.92's get_cdf() validators raise ValueError (0.2.54 raised AssertionError
+        # from an inline min-spacing assert); catch both so a degenerate CDF is logged
+        # and re-raised to drop the question rather than escaping unlogged.
         log_cdf_diagnostics_on_error(prediction, question, e)
         raise
 

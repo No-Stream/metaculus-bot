@@ -6,6 +6,7 @@ tests loudly instead of silently dropping records from the archive:
 
 * EXTRACTION_RUNG   -> metaculus_bot/value_extraction.py:_log_extraction
 * GAP_FILL_V2       -> metaculus_bot/research/agentic/loop.py:_log_completion
+* GHOST_PRE[_JSON]  -> metaculus_bot/research/agentic/loop.py:_set_research_plan_tool
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
@@ -32,10 +33,41 @@ EXTRACTION_RUNG_LINE = (
     PFX + "EXTRACTION_RUNG: question=12345 model=openai/gpt-5.6-sol qtype=binary rung=block block_present=True"
 )
 GAP_FILL_V2_LINE = (
+    "2026-07-21 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+    "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
+    "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0 "
+    "provenance_rejections=1 quote_mismatch_warnings=2 plan_gaps=3 plan_skipped=False "
+    "conclude_gate_rejections=1 error=None"
+)
+# A crashed v2 run: byte-identical counters to a legitimate idle run EXCEPT the
+# error= field carries repr(exc). This is the whole point of the field — the
+# fastapi eager-import defect emitted steps=0 tool_calls=0 findings=0 (identical
+# to "driver found nothing") and only error= makes the crash greppable.
+GAP_FILL_V2_CRASHED_LINE = (
+    "2026-07-23 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+    "steps=0 tool_calls=0 searches=0 fetches=0 rendered=0 reads=0 dup_tool_calls=0 deadline_hit=False "
+    "concluded_early=False wall_s=0.12 findings=0 pending_leads=0 lint_rejections=0 "
+    "provenance_rejections=0 quote_mismatch_warnings=0 plan_gaps=0 plan_skipped=False "
+    "conclude_gate_rejections=0 error=APIConnectionError(\"No module named 'fastapi'\")"
+)
+# Pre-2026-07-21 completion format (ends at lint_rejections). Replace-by-run
+# re-harvesting replays old logs, so the parser must keep accepting this shape.
+GAP_FILL_V2_LEGACY_LINE = (
     "2026-07-17 14:25:10,000 - metaculus_bot.research.agentic.loop - INFO - "
     "question=https://www.metaculus.com/questions/38975/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
     "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
     "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0"
+)
+GHOST_PRE_LINE = (
+    "2026-07-21 14:25:09,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_PRE: gaps=3 sensitive_assumptions=2"
+)
+GHOST_PRE_JSON_LINE = (
+    "2026-07-21 14:25:09,001 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_PRE_JSON: "
+    '{"qtype":"binary","prob":0.35}'
 )
 GHOST_FORECAST_LINE = (
     "2026-07-17 14:25:11,000 - metaculus_bot.research.agentic.loop - INFO - "
@@ -136,6 +168,11 @@ class TestExtractionRung:
         assert rec["rung"] == "block"
         assert rec["block_present"] is True
 
+    def test_qid_kind_is_question_id(self):
+        # EXTRACTION_RUNG logs question.id_of_question, so its records live in the
+        # QUESTION-id space — the tag a residual join uses to translate correctly.
+        assert _parse_one(EXTRACTION_RUNG_LINE)["qid_kind"] == "question_id"
+
     def test_line_timestamp_parsed(self):
         rec = _parse_one(EXTRACTION_RUNG_LINE)
         assert rec["line_ts"].startswith("2026-07-17T14:23:01")
@@ -174,6 +211,8 @@ class TestGapFillV2:
         rec = _parse_one(GAP_FILL_V2_LINE)
         assert rec["marker"] == "gap_fill_v2"
         assert rec["qid"] == 38975
+        # GAP_FILL_V2's question= comes from question.page_url -> a POST id.
+        assert rec["qid_kind"] == "post_id"
         assert rec["model"] == "openai/gpt-5.6-terra"
         assert rec["steps"] == 7
         assert rec["tool_calls"] == 9
@@ -188,6 +227,68 @@ class TestGapFillV2:
         assert rec["findings"] == 5
         assert rec["pending_leads"] == 1
         assert rec["lint_rejections"] == 0
+        # The five loop counters added 2026-07-21 (see loop.py:_log_completion).
+        assert rec["provenance_rejections"] == 1
+        assert rec["quote_mismatch_warnings"] == 2
+        assert rec["plan_gaps"] == 3
+        assert rec["plan_skipped"] is False
+        assert rec["conclude_gate_rejections"] == 1
+        # error= (added 2026-07-23) coerces "None" to Python None on a healthy run.
+        assert rec["error"] is None
+
+    def test_crashed_run_carries_error_repr(self):
+        # The distinguishing signal: a v2 crash and a legitimate idle run emit
+        # byte-identical counters; only error= tells them apart (the fastapi
+        # eager-import defect was silently dead precisely because this was missing).
+        rec = _parse_one(GAP_FILL_V2_CRASHED_LINE)
+        assert rec["marker"] == "gap_fill_v2"
+        assert rec["steps"] == 0
+        assert rec["tool_calls"] == 0
+        assert rec["findings"] == 0
+        # repr(exc) is preserved verbatim (spaces and all) — it is not coerced away.
+        assert rec["error"] == "APIConnectionError(\"No module named 'fastapi'\")"
+
+    def test_legacy_line_without_new_counters_still_harvests(self):
+        # Old-format lines (pre-2026-07-21) must keep parsing on re-harvest; the
+        # five new counter fields plus error come through as None, not a dropped record.
+        rec = _parse_one(GAP_FILL_V2_LEGACY_LINE)
+        assert rec["marker"] == "gap_fill_v2"
+        assert rec["qid"] == 38975
+        assert rec["lint_rejections"] == 0
+        assert rec["provenance_rejections"] is None
+        assert rec["quote_mismatch_warnings"] is None
+        assert rec["plan_gaps"] is None
+        assert rec["plan_skipped"] is None
+        assert rec["conclude_gate_rejections"] is None
+        assert rec["error"] is None
+
+
+class TestGhostPre:
+    def test_fields(self):
+        rec = _parse_one(GHOST_PRE_LINE)
+        assert rec["marker"] == "ghost_pre"
+        # question= comes from log_prefix (question.page_url) -> a POST id.
+        assert rec["qid"] == 38975
+        assert rec["qid_kind"] == "post_id"
+        assert rec["gaps"] == 3
+        assert rec["sensitive_assumptions"] == 2
+
+    def test_json_payload_round_trips(self):
+        rec = _parse_one(GHOST_PRE_JSON_LINE)
+        assert rec["marker"] == "ghost_pre_json"
+        assert rec["qid"] == 38975
+        assert rec["qid_kind"] == "post_id"
+        # forecast_json stays a raw string (never coerced) so the scorer can json.loads it.
+        assert json.loads(rec["forecast_json"]) == {"qtype": "binary", "prob": 0.35}
+
+    def test_does_not_collide_with_ghost_forecast_pair(self):
+        # GHOST_PRE: / GHOST_PRE_JSON: / GHOST_FORECAST: / GHOST_FORECAST_JSON: are
+        # four distinct tokens — each line must harvest as exactly its own marker
+        # under the one-marker-per-line break.
+        assert _parse_one(GHOST_PRE_LINE)["marker"] == "ghost_pre"
+        assert _parse_one(GHOST_PRE_JSON_LINE)["marker"] == "ghost_pre_json"
+        assert _parse_one(GHOST_FORECAST_LINE)["marker"] == "ghost_forecast"
+        assert _parse_one(GHOST_FORECAST_JSON_LINE)["marker"] == "ghost_forecast_json"
 
 
 class TestGhostForecast:
@@ -340,6 +441,48 @@ class TestHtmlCommentMarkers:
         rec = _parse_one("<!-- CLAUSE_PRODUCT_DIVERGENCE_PP=-4.0 -->")
         assert rec["marker"] == "clause_product_divergence_pp"
         assert rec["pp"] == -4.0
+
+
+class TestQidKindAcrossMarkers:
+    """qid_kind names the id space of each marker's ``question`` ref, so a residual
+    join can translate a query rather than silently dropping the other-keyed records.
+    """
+
+    def test_post_id_markers(self):
+        assert _parse_one(GHOST_PRE_LINE)["qid_kind"] == "post_id"
+        assert _parse_one(GHOST_PRE_JSON_LINE)["qid_kind"] == "post_id"
+        assert _parse_one(GHOST_FORECAST_LINE)["qid_kind"] == "post_id"
+        assert _parse_one(GHOST_FORECAST_JSON_LINE)["qid_kind"] == "post_id"
+
+    def test_question_id_markers(self):
+        assert _parse_one(OPEN_BOUND_PILING_LINE)["qid_kind"] == "question_id"
+        assert _parse_one(CLOSE_MARGIN_LINE)["qid_kind"] == "question_id"
+
+    def test_credit_markers_have_no_qid_kind(self):
+        # No ``question`` ref -> no id space -> the record carries neither qid nor qid_kind.
+        rec = _parse_one(CREDIT_SPEND_LINE)
+        assert "qid_kind" not in rec
+        assert "qid" not in rec
+
+    def test_divergent_question_recovered_by_both_id_forms(self):
+        # The real 38880/38195 divergence: EXTRACTION_RUNG carries the QUESTION id
+        # (38195), GAP_FILL_V2 carries the POST id (38880), same question. A per-marker
+        # grep on one id would miss the other; qid_kind tags each so a join can unify
+        # them (see tests/test_id_mapping.py::TestMarkerRecordsForQuestion).
+        extraction = PFX + (
+            "EXTRACTION_RUNG: question=38195 model=openai/gpt-5.6-sol qtype=numeric rung=block block_present=True"
+        )
+        gap_fill = (
+            "2026-07-19 06:30:00,000 - metaculus_bot.research.agentic.loop - INFO - "
+            "question=https://www.metaculus.com/questions/38880/ GAP_FILL_V2: model=openai/gpt-5.6-terra "
+            "steps=7 tool_calls=9 searches=4 fetches=3 rendered=1 reads=2 dup_tool_calls=0 deadline_hit=False "
+            "concluded_early=True wall_s=312.44 findings=5 pending_leads=1 lint_rejections=0"
+        )
+        harvested = parse_log_text(extraction + "\n" + gap_fill + "\n", **_META)
+        er = harvested["extraction_rung"][0]
+        gf = harvested["gap_fill_v2"][0]
+        assert (er["qid"], er["qid_kind"]) == (38195, "question_id")
+        assert (gf["qid"], gf["qid_kind"]) == (38880, "post_id")
 
 
 class TestParseLogText:

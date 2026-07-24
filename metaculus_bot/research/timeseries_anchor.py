@@ -20,7 +20,10 @@ Routing is deterministic (no LLM):
   (a) URL extraction from resolution_criteria + fine_print (FRED series / Yahoo
       ticker URLs — the resolving source, highest precedence);
   (b) a conservative curated title-keyword registry.
-Ambiguous → "" + log. Two Yahoo tickers → a relative-return spread block.
+Ambiguous → "" + log. Two Yahoo tickers with relative-return wording → a
+relative-return spread block; other two-ticker framings (a ratio, a price
+difference, or a single ticker's level) skip — a mean-zero relative-log-return
+band in percentage points is wrong-unit for those.
 
 Estimators are pure-numpy ports of ``estimators.py`` (simplified, no registry or
 CV policy): level/spread → empirical h-step-change quantiles (log for strictly-
@@ -102,6 +105,24 @@ _MARKDOWN_ESCAPE_RE = re.compile(r"\\([_&.\-#()])")
 # "Highest / peak / maximum" framings resolve on the forward-window max, not the
 # period-end level.
 _MAX_KEYWORD_RE = re.compile(r"\b(highest|peak|maximum|max)\b", re.IGNORECASE)
+# The two-ticker spread route builds a mean-zero relative-log-return band in percentage
+# points. That is the right quantity ONLY for the relative-return family ("X's returns
+# exceed Y's"). A two-ticker question asking for a ratio, a price difference, or a single
+# ticker's level resolves in a different unit entirely (a ~85x ratio, dollars), so the
+# spread band would be actively wrong-unit — gate the route on this wording and skip
+# otherwise. Kept conservative: return / outperform / relative only (not bare "vs", which
+# appears in ratio and level comparisons too).
+#
+# Word-boundary matching (not a bare substring scan): the "return(s) TO <level>"
+# construction is a LEVEL question ("will the price return to $400"), not a relative
+# return, so it must NOT route to the spread band. The `(?!\s+to\b)` lookahead excludes
+# exactly that phrasing while keeping the observed relative-return wordings — "X's returns
+# exceed Y's" (plural, followed by "exceed") and "return(URL) minus return(URL)" (singular,
+# followed by "(" not " to"). `outperform` stays a prefix match (outperform/outperforms/
+# outperformed); `relative` stays a whole-word match (kept broad — genuine "performance of
+# X relative to Y" phrasings must still route, and the bounds backstop already catches
+# ratio/level shapes that slip through).
+_RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelative\b", re.IGNORECASE)
 
 # The non-revising FRED allowlist lives in ts_fetch (fetch-layer knowledge shared with
 # financial_data); imported above as FRED_NON_REVISING_SERIES.
@@ -335,6 +356,14 @@ def _wants_max(text: str) -> bool:
     return bool(_MAX_KEYWORD_RE.search(text))
 
 
+def _wants_relative_return(text: str) -> bool:
+    """True when the question wording asks for a relative return between the two tickers
+    (the only quantity the spread band represents). Word-boundary match on
+    ``_RELATIVE_RETURN_RE``, which excludes the "return(s) to <level>" level-question
+    construction while keeping return / outperform / relative wordings."""
+    return bool(_RELATIVE_RETURN_RE.search(text))
+
+
 def _entry_quantity_ok(entry: _TemplateEntry, lowered: str) -> bool:
     """The derivation gate, independent of title-keyword matching: at least one
     ``require_any_keywords`` present (when any are declared) AND no ``exclude_keywords``.
@@ -435,6 +464,17 @@ def route_question(question: MetaculusQuestion) -> _Route | None:
     total_ids = len(fred) + len(tickers)
     if total_ids >= 1:
         if len(tickers) == 2 and not fred:
+            # The spread band is a mean-zero relative-log-return in pp — right only for the
+            # relative-return family. Skip a ratio / price-difference / single-level
+            # two-ticker question rather than inject a wrong-unit band.
+            if not _wants_relative_return(text):
+                logger.info(
+                    "ts_anchor: two Yahoo tickers %s but no relative-return wording "
+                    "(return/outperform/relative) for qid=%s — skipping (spread band would be wrong-unit)",
+                    tickers,
+                    getattr(question, "id_of_question", None),
+                )
+                return None
             return _Route(
                 kind="spread",
                 spec=SeriesSpec(source="yfinance", series_id=tickers[0], column="Close"),
@@ -843,7 +883,12 @@ def _render_spread(
     *,
     route: _Route,
     calendar_days: int,
-) -> str:
+) -> tuple[str, tuple[float, float, float]]:
+    """Return the rendered spread section text and its P10/P50/P90 relative-return band
+    (pp). Mirrors ``_render_single``'s (text, band) shape so ``build_anchor_section`` can
+    run the same ``_band_misses_bounds`` bounds-overlap backstop on the spread path. The
+    spread always emits a band (a too-short history raises ValueError first), so the band
+    is never None here."""
     spread_series = _build_spread_series(series_a, series_b)  # raises ValueError on bad legs
     freq = _detect_freq(pd.DatetimeIndex(spread_series.index))
     h = horizon_steps(freq, calendar_days)
@@ -879,7 +924,7 @@ def _render_spread(
         "not a directional signal."
     )
     parts.append(f"\n_{PROVENANCE_FOOTER}_")
-    return "\n".join(parts)
+    return "\n".join(parts), band
 
 
 def _truncate_section(text: str) -> str:
@@ -986,7 +1031,25 @@ def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
         assert route.spec_b is not None  # kind=="spread" always sets spec_b
         series_a = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_SPREAD_LOOKBACK_YEARS)
         series_b = fetch_series(route.spec_b, ceiling, lookback_years=TS_ANCHOR_SPREAD_LOOKBACK_YEARS)
-        return _truncate_section(_render_spread(series_a, series_b, route=route, calendar_days=calendar_days))
+        spread_text, spread_band = _render_spread(series_a, series_b, route=route, calendar_days=calendar_days)
+        if _band_misses_bounds(question, spread_band):
+            logger.warning(
+                "ts_anchor: relative-return spread band P10/P90 %s/%s has zero overlap with question "
+                "bounds [%s, %s] (open_lower=%s open_upper=%s) — legs=%s/%s qid=%s url=%s; skipping "
+                "section (likely a wrong-quantity two-ticker question — ratio / price-difference / level)",
+                _fmt(spread_band[0]),
+                _fmt(spread_band[2]),
+                question.lower_bound,
+                question.upper_bound,
+                question.open_lower_bound,
+                question.open_upper_bound,
+                route.spec.series_id,
+                route.spec_b.series_id,
+                question.id_of_question,
+                question.page_url,
+            )
+            return ""
+        return _truncate_section(spread_text)
 
     series = fetch_series(route.spec, ceiling, lookback_years=TS_ANCHOR_LOOKBACK_YEARS)
     # For a forward-max question whose window has already opened, the max over the

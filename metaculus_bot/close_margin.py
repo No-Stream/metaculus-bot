@@ -22,22 +22,11 @@ parser's None sentinel). Returns ``None`` — skip, emit nothing — when
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
-
-def _as_utc(moment: datetime) -> datetime:
-    """Normalize a possibly-naive datetime to tz-aware UTC.
-
-    Metaculus API timestamps parse as NAIVE UTC (the framework's ``strptime`` drops
-    the trailing ``Z``), so a naive value is assumed UTC; a tz-aware value is
-    converted. This keeps the ``close − submit`` subtraction from raising on mixed
-    naive/aware operands.
-    """
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+from metaculus_bot.time_utils import _as_utc
 
 
 def format_close_margin_marker(question: MetaculusQuestion, submitted_at: datetime) -> str | None:

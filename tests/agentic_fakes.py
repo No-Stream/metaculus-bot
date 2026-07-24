@@ -46,6 +46,28 @@ def tool_call(tool_id: str, name: str, arguments: dict[str, Any] | None = None) 
     return FakeToolCall(tool_id, FakeFunction(name=name, arguments=json.dumps(arguments or {})))
 
 
+def plan_call(
+    tool_id: str = "plan0",
+    *,
+    gaps: list[dict[str, Any]] | None = None,
+    sensitive_assumptions: list[str] | None = None,
+    dry_run_forecast: dict[str, Any] | None = None,
+) -> FakeToolCall:
+    """A ``set_research_plan`` tool call — the W1 gate opener every loop needs
+    before any external tool runs. Defaults to a single generic gap (a zero-gap
+    plan is now rejected, F3a, so the default must carry one to open the gate);
+    pass ``gaps`` to exercise plan telemetry / the conclude gate. Tests that then
+    conclude early without satisfying the W2 gap-accounting floor should pass
+    ``max_conclude_gate_rejections=0`` to keep the conclude gate out of the way."""
+    default_gaps = [{"id": "g1", "question": "What is the load-bearing fact?"}]
+    arguments: dict[str, Any] = {"gaps": gaps if gaps is not None else default_gaps}
+    if sensitive_assumptions is not None:
+        arguments["sensitive_assumptions"] = sensitive_assumptions
+    if dry_run_forecast is not None:
+        arguments["dry_run_forecast"] = dry_run_forecast
+    return tool_call(tool_id, "set_research_plan", arguments)
+
+
 def response(content: str = "", tool_calls: list[FakeToolCall] | None = None) -> FakeResponse:
     return FakeResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=tool_calls))])
 

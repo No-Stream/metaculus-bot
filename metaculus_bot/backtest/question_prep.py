@@ -33,6 +33,7 @@ from metaculus_bot.constants import (
     BACKTEST_OVERFETCH_RATIO,
     FETCH_RETRY_BACKOFFS,
 )
+from metaculus_bot.time_utils import _as_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -80,8 +81,11 @@ async def fetch_resolved_questions(
             (no upper bound). Together yields the half-open interval
             [resolved_after, resolved_before).
     """
-    resolved_after_dt = datetime.strptime(resolved_after, "%Y-%m-%d")
-    resolved_before_dt = datetime.strptime(resolved_before, "%Y-%m-%d") if resolved_before else None
+    # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
+    # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
+    # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
+    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))
+    resolved_before_dt = _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None
 
     overfetch_count = total_questions * BACKTEST_OVERFETCH_RATIO
     logger.info(
@@ -177,11 +181,16 @@ def _filter_and_extract(
             skip_counts["no_resolution_time"] += 1
             continue
 
-        if q.actual_resolution_time < resolved_after_dt:
+        # API-sourced datetimes are tz-aware UTC (ft 0.2.92); locally-built test
+        # fixtures may still be naive. Normalize to UTC so the window comparisons
+        # against the (also-normalized) boundaries never mix naive/aware operands.
+        resolved_at = _as_utc(q.actual_resolution_time)
+
+        if resolved_at < resolved_after_dt:
             skip_counts["too_early"] += 1
             continue
 
-        if resolved_before_dt is not None and q.actual_resolution_time >= resolved_before_dt:
+        if resolved_before_dt is not None and resolved_at >= resolved_before_dt:
             skip_counts["too_late"] += 1
             continue
 
@@ -229,8 +238,11 @@ async def fetch_resolved_questions_stratified(
     if tournaments is None:
         tournaments = [BACKTEST_DEFAULT_TOURNAMENT]
 
-    resolved_after_dt = datetime.strptime(resolved_after, "%Y-%m-%d")
-    resolved_before_dt = datetime.strptime(resolved_before, "%Y-%m-%d") if resolved_before else None
+    # ft 0.2.92 coerces question datetimes (incl. actual_resolution_time) to tz-aware
+    # UTC at construction. The strptime boundaries are naive, so normalize them to UTC
+    # too — otherwise the naive/aware ordering comparisons in _filter_and_extract raise.
+    resolved_after_dt = _as_utc(datetime.strptime(resolved_after, "%Y-%m-%d"))
+    resolved_before_dt = _as_utc(datetime.strptime(resolved_before, "%Y-%m-%d")) if resolved_before else None
 
     per_type_targets = {
         "binary": num_binary,
@@ -372,6 +384,13 @@ async def _fetch_with_retries(
         allowed_statuses=["resolved"],
         allowed_tournaments=[tournament],
         num_forecasters_gte=min_forecasters,
+        # Pin the type universe to the three types the backtest scoring path
+        # (_extract_ground_truth) can handle. Pre-0.2.92 the ApiFilter default
+        # excluded conditionals anyway; at 0.2.92 the default admits the new
+        # conditional type, which would silently widen the backtest universe with
+        # questions extraction can't score. Discrete is folded under numeric
+        # (DiscreteQuestion subclasses NumericQuestion), so it needs no separate slot.
+        allowed_types=["binary", "multiple_choice", "numeric"],
     )
 
     def _is_retryable_error(err: Exception) -> bool:

@@ -33,8 +33,17 @@ class ResearchPersistenceWriter:
         gap_fill_v2: dict | None = None,
         provider_diagnostics_block: str | None = None,
         asknews_raw: str | None = None,
+        post_id: int | None = None,
     ) -> None:
         """Record a single question's research output.
+
+        ``qid`` is the Metaculus QUESTION id (``id_of_question``); the archive keys
+        ``latest/<qid>.json`` on it. ``post_id`` is the separate POST id (the id in
+        ``page_url``) and diverges from ``qid`` on newer posts. It is written as an
+        explicit field so residual analysis can join a research record to telemetry
+        markers keyed on the post id (``GAP_FILL_V2`` / ``GHOST_FORECAST``) and to
+        the perf dataset WITHOUT re-parsing the page URL. Additive: it defaults to
+        None (older readers and the URL still carry the post id) so nothing breaks.
 
         ``providers_used`` is legacy and ambiguous — in live-capture records it
         meant "attempted", in comment-backfill records "succeeded-with-output".
@@ -64,6 +73,7 @@ class ResearchPersistenceWriter:
         record: dict[str, object] = {
             "schema_version": RESEARCH_SCHEMA_VERSION,
             "qid": qid,
+            "post_id": post_id,
             "page_url": page_url,
             "question_text": question_text,
             "research_text": research_text,

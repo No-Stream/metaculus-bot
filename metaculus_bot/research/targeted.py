@@ -199,8 +199,8 @@ async def _run_analyzer(
     llm = build_llm_with_openrouter_fallback(
         model=GAP_FILL_ANALYZER_MODEL,
         reasoning={"effort": "low"},
-        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-        # reasoning models defer to provider defaults. No top_p.
+        # temperature=None defers reasoning models to provider defaults; redundant
+        # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
         temperature=None,
         timeout=GAP_FILL_ANALYZER_TIMEOUT,
         allowed_tries=1,

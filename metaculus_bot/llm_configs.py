@@ -22,9 +22,9 @@ __all__ = [
     "PREDICTION_MARKET_KEYWORD_LLM_CONFIG",
 ]
 # Reasoning models ignore (or degrade under) explicit sampling params, so we
-# defer to provider defaults. temperature=None is load-bearing: GeneralLlm
-# injects temperature=0 when the arg is omitted, so None is what makes litellm
-# drop it; top_p flows via **kwargs and is simply never set.
+# defer to provider defaults. temperature=None is explicit but redundant on
+# ft 0.2.92, whose GeneralLlm ctor already defaults temperature to None (0.2.54
+# injected 0 when the arg was omitted); top_p flows via **kwargs and is never set.
 REASONING_MODEL_CONFIG: dict[str, Any] = {
     "temperature": None,
     "max_tokens": 64_000,  # Prevent truncation; all current forecasters/stackers support 64k output
@@ -33,8 +33,9 @@ REASONING_MODEL_CONFIG: dict[str, Any] = {
     "allowed_tries": 3,
 }
 # Low-effort utility slots (parser, summarizer, analyzer). Same sampling-param
-# rationale as REASONING_MODEL_CONFIG: temperature=None keeps litellm from
-# injecting temperature=0; top_p left unset for provider defaults.
+# rationale as REASONING_MODEL_CONFIG: temperature=None defers to provider
+# defaults (redundant on ft 0.2.92, whose ctor default is already None); top_p
+# left unset.
 UTILITY_MODEL_CONFIG: dict[str, Any] = {
     "temperature": None,
     "max_tokens": 32_000,
@@ -203,8 +204,8 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
-# temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-# reasoning models defer to provider defaults. top_p left unset.
+# temperature=None defers reasoning models to provider defaults; redundant on
+# ft 0.2.92 (GeneralLlm ctor default is already None). top_p left unset.
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.4-mini",
     "temperature": None,

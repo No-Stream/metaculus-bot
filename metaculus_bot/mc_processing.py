@@ -9,6 +9,66 @@ from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.simple_types import OptionProbability
 
 
+def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
+    """Clamp probabilities into ``[MC_PROB_MIN, MC_PROB_MAX]`` and renormalize to sum 1,
+    guaranteeing every returned value stays within the bounds.
+
+    Callers construct ``PredictedOptionList`` from the result; ft 0.2.92's validator
+    re-clamps to ``[0.01, 0.99]`` + renormalizes + raises when any option moves > 0.05,
+    so feeding it already-in-bounds, sum-1 values makes that validator a no-op.
+
+    The naive clamp-then-divide can push a clamped option back out of bounds: when a
+    dominant option keeps the post-clamp total above 1, dividing drags the floored
+    siblings below ``MC_PROB_MIN`` again (e.g. ``0.984 + 8x0.002`` -> the eight floor to
+    0.01 but the >1 total divides them back under it). We keep the cheap clamp-then-divide
+    for the common in-budget case, then repair any residual violation by pinning the
+    offending options at their bound and rescaling only the still-free mass, iterating
+    until the invariant holds.
+    """
+    n = len(probabilities)
+    if n == 0:
+        return []
+    # Degenerate: the floor alone cannot fit under a unit sum (>= 100 options at a 0.01
+    # floor). No in-bounds sum-1 solution exists; fall back to a single clamp+renorm,
+    # which at least keeps sum ~= 1 for the upstream sum gate.
+    if n * MC_PROB_MIN >= 1.0:
+        clamped_degenerate = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
+        total_degenerate = sum(clamped_degenerate)
+        return [p / total_degenerate for p in clamped_degenerate] if total_degenerate > 0 else [1.0 / n] * n
+
+    probs = [max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for p in probabilities]
+    total = sum(probs)
+    if total <= 0:
+        return [1.0 / n] * n
+    probs = [p / total for p in probs]
+
+    pinned = [False] * n
+    for _ in range(n):
+        violators = [i for i in range(n) if not pinned[i] and not (MC_PROB_MIN <= probs[i] <= MC_PROB_MAX)]
+        if not violators:
+            break
+        for i in violators:
+            probs[i] = MC_PROB_MIN if probs[i] < MC_PROB_MIN else MC_PROB_MAX
+            pinned[i] = True
+        free = [i for i in range(n) if not pinned[i]]
+        if not free:
+            break
+        budget = 1.0 - sum(probs[i] for i in range(n) if pinned[i])
+        free_sum = sum(probs[i] for i in free)
+        if budget <= 0:
+            for i in free:
+                probs[i] = MC_PROB_MIN
+        elif free_sum > 0:
+            scale = budget / free_sum
+            for i in free:
+                probs[i] *= scale
+        else:
+            share = budget / len(free)
+            for i in free:
+                probs[i] = share
+    return probs
+
+
 def _normalize_name(name: str) -> str:
     # Trim common prefixes like "Option X:" while preserving canonical names when matching
     stripped = name.strip()
@@ -32,8 +92,9 @@ def build_mc_prediction(
 
     - Filters to allowed option names (case-insensitive match against provided canonicals).
     - Aggregates duplicates by summing probabilities.
-    - Renormalizes probabilities to sum to 1.0.
-    - Applies clamping to [MC_PROB_MIN, MC_PROB_MAX] followed by a second renormalization.
+    - Clamps to [MC_PROB_MIN, MC_PROB_MAX] and renormalizes to sum 1.0 BEFORE
+      constructing the PredictedOptionList, so ft 0.2.92's clamp-and-renormalize
+      validator is a no-op on construction (no publish-time ValueError).
     - Preserves the order of `allowed_options` in the final list.
     """
     # Map normalized allowed names to canonical. Both sides must normalize the
@@ -61,25 +122,13 @@ def build_mc_prediction(
         even = 1.0 / len(allowed_options)
         pairs = [(name, even) for name in allowed_options]
 
-    # First renormalization (before constructing PredictedOptionList)
-    total = sum(p for _, p in pairs)
-    if total > 0:
-        pairs = [(n, p / total) for n, p in pairs]
-
-    # Construct PredictedOptionList (will validate sum close to 1.0)
-    pol = PredictedOptionList(predicted_options=[PredictedOption(option_name=n, probability=p) for n, p in pairs])
-
-    # Clamp and re-normalize to our configured bounds
-    # Clamp
-    for option in pol.predicted_options:
-        option.probability = max(MC_PROB_MIN, min(MC_PROB_MAX, option.probability))
-    # Normalize again
-    total2 = sum(o.probability for o in pol.predicted_options)
-    if total2 > 0:
-        for option in pol.predicted_options:
-            option.probability /= total2
-
-    return pol
+    # Clamp + renormalize the floats BEFORE construction so ft 0.2.92's validator
+    # (which clamps to [0.01, 0.99] + renormalizes + raises on any >0.05 move) sees
+    # already-in-bounds, sum-1 values and is a no-op.
+    clamped = clamp_and_renormalize_probs([p for _, p in pairs])
+    return PredictedOptionList(
+        predicted_options=[PredictedOption(option_name=n, probability=p) for (n, _), p in zip(pairs, clamped)]
+    )
 
 
-__all__ = ["build_mc_prediction"]
+__all__ = ["build_mc_prediction", "clamp_and_renormalize_probs"]

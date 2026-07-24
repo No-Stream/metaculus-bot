@@ -135,14 +135,20 @@ async def test_pchip_fallback_failure_diagnostics(mock_format, mock_generate, ca
         )
     ]
 
-    # Force fallback NumericDistribution.cdf to raise via a fake class
+    # Force fallback CDF construction to raise via a fake class. ft 0.2.92 builds
+    # the CDF in get_cdf() (the fallback path and diagnostics call it directly);
+    # cdf is only a deprecated alias delegating to it. Mirror that surface so the
+    # spacing AssertionError surfaces where the production code actually reads it.
     class FakeND:
         def __init__(self, *args, **kwargs):
             self.declared_percentiles = plist
 
+        def get_cdf(self):
+            raise AssertionError("Percentiles at indices are too close")
+
         @property
         def cdf(self):  # noqa: D401
-            raise AssertionError("Percentiles at indices are too close")
+            return self.get_cdf()
 
     with (
         patch(

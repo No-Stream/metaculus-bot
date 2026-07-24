@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from forecasting_tools import (
@@ -11,6 +11,7 @@ from forecasting_tools import (
 
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
 from metaculus_bot.numeric.utils import nominal_bounds
+from metaculus_bot.time_utils import _as_utc
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
@@ -95,9 +96,16 @@ def _forecasting_window_str(
     assert question.open_time is not None, "question.open_time is required"
     assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
 
-    today = datetime.now()
-    elapsed_days = (today - question.open_time).days
-    remaining_days = (question.scheduled_resolution_time - today).days
+    # Normalize both sides to tz-aware UTC before subtracting: ft 0.2.92 makes
+    # question datetimes tz-aware, and ``datetime.now()`` (naive) minus an aware
+    # value raises TypeError. ``datetime.now(timezone.utc)`` also fixes 0.2.54's
+    # latent naive-local-vs-naive-UTC skew (harmless only when the host runs UTC,
+    # e.g. CI). The rendered dates are unchanged for current naive UTC inputs.
+    today = datetime.now(timezone.utc)
+    open_time = _as_utc(question.open_time)
+    scheduled_resolution_time = _as_utc(question.scheduled_resolution_time)
+    elapsed_days = (today - open_time).days
+    remaining_days = (scheduled_resolution_time - today).days
 
     return (
         f"Today: {today.strftime('%Y-%m-%d')}\n"
@@ -113,8 +121,12 @@ def _forecasting_window_str(
 
 
 def _today_str() -> str:
-    """Today's date, formatted to match ``_forecasting_window_str``'s "Today:" line."""
-    return datetime.now().strftime("%Y-%m-%d")
+    """Today's date (UTC), formatted to match ``_forecasting_window_str``'s "Today:" line.
+
+    UTC so it agrees with ``_forecasting_window_str`` (which normalizes to UTC)
+    within the same prompt bundle, regardless of host timezone.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:

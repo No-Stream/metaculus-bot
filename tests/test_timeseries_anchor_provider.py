@@ -241,8 +241,69 @@ class TestRouting:
         assert route.spec.series_id == "^VIX"
 
     def test_two_yahoo_tickers_route_to_spread(self):
-        rc = "ret(https://finance.yahoo.com/quote/CL=F) minus ret(https://finance.yahoo.com/quote/%5EGSPC)."
-        route = route_question(_make_numeric_q(resolution_criteria=rc))
+        # The relative-return family (all 47 observed two-ticker questions phrase it "X's
+        # returns exceed Y's"): two Yahoo tickers + relative-return wording -> spread.
+        qt = "How much will CL=F's returns exceed ^GSPC's over the window?"
+        rc = "return(https://finance.yahoo.com/quote/CL=F) minus return(https://finance.yahoo.com/quote/%5EGSPC)."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert route.kind == "spread"
+        assert route.spec.series_id == "CL=F"
+        assert route.spec_b is not None
+        assert route.spec_b.series_id == "^GSPC"
+
+    def test_two_yahoo_tickers_relative_outperform_wording_routes_to_spread(self):
+        # "outperform" is part of the relative-return keyword set -> spread.
+        qt = "Will NVDA outperform AAPL over the window?"
+        rc = "Compares https://finance.yahoo.com/quote/NVDA and https://finance.yahoo.com/quote/AAPL."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert route.kind == "spread"
+        assert route.spec.series_id == "NVDA"
+        assert route.spec_b is not None
+        assert route.spec_b.series_id == "AAPL"
+
+    def test_two_yahoo_tickers_ratio_wording_skips(self, caplog):
+        # A gold/silver RATIO question (~85x) cites two Yahoo tickers but asks for a ratio,
+        # not a relative return -> the mean-zero pp band would be wrong-unit, so skip + log.
+        qt = "What will the gold-to-silver price ratio be on the resolution date?"
+        rc = "Ratio of https://finance.yahoo.com/quote/GC=F to https://finance.yahoo.com/quote/SI=F."
+        with caplog.at_level(logging.INFO):
+            assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+        assert any("no relative-return wording" in r.message for r in caplog.records)
+
+    def test_two_yahoo_tickers_price_difference_wording_skips(self, caplog):
+        # A price-DIFFERENCE question (dollars) cites two Yahoo tickers -> skip (wrong unit).
+        qt = "What will the price of gold minus the price of silver be, in dollars?"
+        rc = "https://finance.yahoo.com/quote/GC=F minus https://finance.yahoo.com/quote/SI=F."
+        with caplog.at_level(logging.INFO):
+            assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+        assert any("no relative-return wording" in r.message for r in caplog.records)
+
+    def test_two_yahoo_tickers_single_level_wording_skips(self):
+        # A single ticker's LEVEL, with a second ticker cited only as context -> the level
+        # (dollars) is wrong-unit for the spread band, and there's no relret wording -> skip.
+        qt = "What will the closing price of NVDA be, with AAPL cited for comparison?"
+        rc = "See https://finance.yahoo.com/quote/NVDA and https://finance.yahoo.com/quote/AAPL."
+        assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+
+    def test_two_yahoo_tickers_return_to_level_wording_skips(self, caplog):
+        # "return TO <level>" is a LEVEL question (dollars), not a relative return: the bare
+        # "return" substring used to route this to the mean-zero pp spread band (wrong-unit).
+        # The word-boundary gate's "(?!\s+to\b)" lookahead excludes it -> skip + log.
+        qt = "Will the price of NVDA return to $400 before AAPL does?"
+        rc = "Compares https://finance.yahoo.com/quote/NVDA and https://finance.yahoo.com/quote/AAPL."
+        with caplog.at_level(logging.INFO):
+            assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+        assert any("no relative-return wording" in r.message for r in caplog.records)
+
+    def test_two_yahoo_tickers_singular_return_phrasing_routes_to_spread(self):
+        # Guards against a plural-only fix: the SINGULAR "return(URL) minus return(URL)"
+        # criteria wording (no plural "returns" anywhere in the text) must still route to
+        # spread -- "return(" is followed by "(", not " to", so the lookahead lets it match.
+        qt = "Where will the CL=F versus ^GSPC figure land over the window?"
+        rc = "return(https://finance.yahoo.com/quote/CL=F) minus return(https://finance.yahoo.com/quote/%5EGSPC)."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
         assert route is not None
         assert route.kind == "spread"
         assert route.spec.series_id == "CL=F"
@@ -646,8 +707,10 @@ class TestRenderSpread:
             label_b="^GSPC",
         )
 
-        out = _render_spread(series_a, series_b, route=route, calendar_days=14)
+        out, band = _render_spread(series_a, series_b, route=route, calendar_days=14)
 
+        assert band is not None  # the spread always emits a band; returned for the bounds backstop
+        assert len(band) == 3  # P10/P50/P90
         assert "Relative-return spread: CL=F vs ^GSPC" in out
         assert "- CL=F latest:" in out
         assert "- ^GSPC latest:" in out
@@ -1134,6 +1197,54 @@ class TestBoundsBackstop:
         out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
 
         assert out  # non-empty; the band ~0.3 lies within [0, 1]
+        assert "P10 / P50 / P90 →" in out
+
+    # The spread path is now wired through the same backstop as the single path (part 2 of
+    # the two-ticker fix). A relative-return-worded two-ticker question PASSES the wording
+    # gate, but if its displayed bounds are a wrong-unit range (a ratio's [60, 110], not a
+    # ±pp band) the backstop still drops the section — belt-and-suspenders behind the gate.
+    @staticmethod
+    def _spread_fetch(spec, _ceiling, **_kwargs):
+        if spec.series_id == "CL=F":
+            return _daily_positive_series("CL=F", seed=1)
+        return _daily_positive_series("^GSPC", seed=2) * 40.0
+
+    @staticmethod
+    def _relret_two_ticker_q(*, lower_bound: float, upper_bound: float, qid: int = 8201) -> MagicMock:
+        # Passes the relative-return wording gate (routes to spread), 14-day horizon -> a
+        # ±few-pp mean-zero band.
+        qt = "How much will CL=F's returns exceed ^GSPC's over the window?"
+        rc = "return(https://finance.yahoo.com/quote/CL=F) minus return(https://finance.yahoo.com/quote/%5EGSPC)."
+        return _make_numeric_q(
+            qid=qid,
+            question_text=qt,
+            resolution_criteria=rc,
+            scheduled_resolution_time=datetime(2026, 3, 29, tzinfo=UTC),  # 14 days past the 2026-03-15 as_of
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+        )
+
+    def test_build_anchor_section_spread_skips_on_bounds_mismatch(self, monkeypatch, caplog):
+        # gold/silver-ratio-shaped bounds [60, 110] vs a ±few-pp mean-zero spread band ->
+        # dropped by the newly-wired backstop with a spread-specific WARN.
+        monkeypatch.setattr(ts, "fetch_series", self._spread_fetch)
+        q = self._relret_two_ticker_q(lower_bound=60.0, upper_bound=110.0)
+
+        with caplog.at_level(logging.WARNING):
+            out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out == ""
+        assert any("zero overlap with question bounds" in r.message for r in caplog.records)
+
+    def test_build_anchor_section_spread_renders_when_band_within_bounds(self, monkeypatch):
+        # Same spread, but a pp-scale range [-50, 50] that contains the ±few-pp band -> renders.
+        monkeypatch.setattr(ts, "fetch_series", self._spread_fetch)
+        q = self._relret_two_ticker_q(lower_bound=-50.0, upper_bound=50.0, qid=8202)
+
+        out = build_anchor_section(q, datetime(2026, 3, 15, tzinfo=UTC))
+
+        assert out  # non-empty; the ±few-pp band lies within [-50, 50]
+        assert "Relative-return spread: CL=F vs ^GSPC" in out
         assert "P10 / P50 / P90 →" in out
 
 

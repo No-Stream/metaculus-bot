@@ -121,8 +121,8 @@ def _build_detector_llm(model: str) -> GeneralLlm:
     """
     return GeneralLlm(
         model=model,
-        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-        # reasoning models defer to provider defaults. No top_p.
+        # temperature=None defers reasoning models to provider defaults; redundant
+        # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
         temperature=None,
         max_tokens=32_000,
         extra_body={"response_format": {"type": "json_object"}},

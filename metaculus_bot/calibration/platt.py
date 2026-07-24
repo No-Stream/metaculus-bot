@@ -222,7 +222,7 @@ def apply_mc_platt(
     clamp — that floor (0.02) is too aggressive for many-option questions,
     where options legitimately sit below it. After the per-option transforms,
     ``clamp_and_renormalize_mc`` enforces the MC-correct bounds
-    ``[MC_PROB_MIN, MC_PROB_MAX]`` (0.005 / 0.995) and rescales to sum to 1.
+    ``[MC_PROB_MIN, MC_PROB_MAX]`` (0.01 / 0.99) and rescales to sum to 1.
 
     Returns the same ``PredictedOptionList`` for convenience (option
     probabilities are mutated in place, mirroring ``clamp_and_renormalize_mc``).

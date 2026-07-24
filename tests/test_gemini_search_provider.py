@@ -63,10 +63,15 @@ def _make_response(
     chunks: list[CannedWebChunk] | None = None,
     supports: list[CannedSupport] | None = None,
     url_metadata: Sequence[object] | None = None,
+    web_search_queries: list[str] | None = None,
 ) -> SimpleNamespace:
+    # ``web_search_queries`` is a declared field on the real SDK GroundingMetadata
+    # (Optional[list[str]]); the zero-chunk floor reads it to size its WARN, so the
+    # attribute must always be present here (defaults to None) to mirror the SDK.
     metadata = SimpleNamespace(
         grounding_chunks=chunks,
         grounding_supports=supports,
+        web_search_queries=web_search_queries,
     )
     url_context_metadata = SimpleNamespace(url_metadata=url_metadata) if url_metadata is not None else None
     candidate = SimpleNamespace(
@@ -346,6 +351,55 @@ async def test_inline_citation_markers_inserted(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
+async def test_inline_citation_markers_respect_utf8_byte_offsets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: Google's segment.end_index is a UTF-8 BYTE offset, not a codepoint index.
+
+    Derived from the real Q578 gemini_search record
+    (backtests/research_archive/raw/29718821482.jsonl). The model text contains an
+    em-dash (``—``, 3 bytes / 1 codepoint) at codepoint 194, so at the first
+    support's byte offset 291 the byte cursor runs 2 ahead of the codepoint cursor.
+    The pre-fix code sliced the Python str at codepoint 291 and produced the
+    observed mid-word corruption ``"...civilization. T[1]hese estimates"``. The
+    correct byte-space splice lands the marker at the sentence boundary:
+    ``"...civilization.[1] These estimates"``.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    # Verbatim opening of the Q578 raw payload text, trimmed to the minimal
+    # reproducing snippet (through the first two sentences).
+    text = (
+        "There is no scientific consensus that humans will go extinct before 2100, "
+        "but researchers and specialized forecasters have produced a wide range of "
+        'probabilistic estimates for "existential risk"—defined as events that '
+        "could cause human extinction or the permanent collapse of civilization. "
+        "These estimates vary significantly."
+    )
+    # Sanity-anchor the fixture to the real payload's geometry: em-dash at
+    # codepoint 194, first support end_index at byte 291.
+    assert text.index("—") == 194
+    byte_end_index = 291
+    # The byte offset points at the space after "civilization." — one past the period.
+    assert text.encode("utf-8")[:byte_end_index].decode("utf-8").endswith("collapse of civilization.")
+
+    blob = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AbC"
+    chunks = [CannedWebChunk(uri=blob, title="RAND", domain="rand.org")]
+    supports = [CannedSupport(seg=CannedSegment(end_index=byte_end_index, text=""), indices=[0])]
+    response = _make_response(text, chunks=chunks, supports=supports)
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt")
+
+    # The marker lands cleanly at the sentence boundary...
+    assert "collapse of civilization.[1] These estimates" in out
+    # ...and the pre-fix mid-word corruption is gone.
+    assert "T[1]hese" not in out
+    assert "civilization. T[1]" not in out
+
+
+@pytest.mark.asyncio
 async def test_missing_grounding_metadata_returns_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
     """A response with no grounding metadata still returns its plain text."""
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
@@ -382,6 +436,54 @@ async def test_empty_response_text_returns_empty(monkeypatch: pytest.MonkeyPatch
         out = await invoke_gemini_grounded("prompt")
 
     assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_zero_grounding_chunks_suppresses_ungrounded_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression (Q38195): grounding metadata present, chunks empty, many search queries.
+
+    On the real Q38195 record Gemini issued 30 web-search queries and Google
+    returned ZERO grounding chunks, yet the model emitted a confident, fabricated
+    contract table with fake ``[primary]`` tags. Pre-fix, the formatter passed that
+    ungrounded parametric text through verbatim (the fabrication reached
+    forecasters). Post-fix, a response whose grounding fired-but-returned-no-chunks
+    must be suppressed entirely (``""``) so the section is omitted upstream, and a
+    greppable WARN must fire.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    fabricated = (
+        "Generative AI has emerged as a primary driver of labor tension. "
+        "Key contract expirations: Boeing IAM 837 (July 22, 2029) [primary]."
+    )
+    # grounding_metadata present (grounding fired), grounding_chunks empty, and
+    # a populated web_search_queries list — the exact Q38195 shape.
+    response = _make_response(
+        fabricated,
+        chunks=None,
+        supports=None,
+        web_search_queries=[f"query {i}" for i in range(30)],
+    )
+    fake_client = _make_client_with_response(response)
+
+    with (
+        patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client),
+        caplog.at_level("WARNING"),
+    ):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=38195)
+
+    # The ungrounded fabrication must NOT reach the forecaster.
+    assert out == ""
+    assert "[primary]" not in out
+    assert "Boeing" not in out
+    # A greppable WARN with the query count must fire.
+    assert "GEMINI_UNGROUNDED_SUPPRESSED" in caplog.text
+    assert "queries=30" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -510,10 +612,14 @@ async def test_url_context_none_marker_when_no_fetches(monkeypatch: pytest.Monke
     """When url_context fired but fetched nothing (empty url_metadata), a terse greppable
     ``_url_context: none_`` marker is appended — distinguishing 'fired but empty' from
     'we don't capture it' — and NO fetch list is emitted.
+
+    The response carries a grounding chunk so it clears the grounded-chunk floor; this
+    isolates the url_context marker layer, which is orthogonal to grounding.
     """
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
-    response = _make_response("body text", url_metadata=[])
+    chunks = [CannedWebChunk(uri="https://vertexaisearch/redirect", title="Src", domain="src.example.com")]
+    response = _make_response("body text", chunks=chunks, url_metadata=[])
     fake_client = _make_client_with_response(response)
 
     with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
@@ -529,13 +635,18 @@ async def test_url_context_none_marker_when_no_fetches(monkeypatch: pytest.Monke
 @pytest.mark.asyncio
 async def test_no_url_context_marker_when_tool_did_not_fire(monkeypatch: pytest.MonkeyPatch) -> None:
     """When url_context produced no signal at all (no url_context_metadata on the candidate),
-    the returned text must be the grounded body only — no fetch list AND no terse 'none' marker.
-    This pins the requirement that an inert url_context tool never pollutes forecaster-facing research.
+    the returned text must carry no url_context marker of any kind — no fetch list AND no terse
+    'none' marker. This pins the requirement that an inert url_context tool never pollutes
+    forecaster-facing research.
+
+    The response carries a grounding chunk so it clears the grounded-chunk floor; the Sources block
+    it produces is expected and orthogonal to the url_context marker layer under test.
     """
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
     # url_metadata=None makes _make_response build url_context_metadata=None on the candidate.
-    response = _make_response("body text", url_metadata=None)
+    chunks = [CannedWebChunk(uri="https://vertexaisearch/redirect", title="Src", domain="src.example.com")]
+    response = _make_response("body text", chunks=chunks, url_metadata=None)
     fake_client = _make_client_with_response(response)
 
     with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
@@ -543,7 +654,7 @@ async def test_no_url_context_marker_when_tool_did_not_fire(monkeypatch: pytest.
 
         out = await invoke_gemini_grounded("prompt")
 
-    assert out == "body text"
+    assert out.startswith("body text")
     assert "### URL Context Fetches" not in out
     assert "_url_context: none_" not in out
 
@@ -553,16 +664,20 @@ async def test_url_context_none_marker_when_all_fetches_failed(monkeypatch: pyte
     """When url_context fired but every retrieval FAILED, the forecaster-facing text collapses to the
     terse ``_url_context: none_`` marker — the failed URLs must NOT be listed as research context
     (only successful fetches were actually read). The failed URL is still in the INFO audit log.
+
+    The response carries a grounding chunk so google_search grounding clears the floor; the failed
+    url_context fetch is orthogonal.
     """
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
 
+    chunks = [CannedWebChunk(uri="https://vertexaisearch/redirect", title="Src", domain="src.example.com")]
     url_metadata = [
         CannedUrlMeta(
             retrieved_url="https://example.com/bad",
             url_retrieval_status=CannedStatus("URL_RETRIEVAL_STATUS_ERROR"),
         ),
     ]
-    response = _make_response("body text", url_metadata=url_metadata)
+    response = _make_response("body text", chunks=chunks, url_metadata=url_metadata)
     fake_client = _make_client_with_response(response)
 
     with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):

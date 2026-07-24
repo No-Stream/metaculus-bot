@@ -17,7 +17,7 @@ from forecasting_tools import (  # AskNewsSearcher,
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
-from forecasting_tools.data_models.questions import DateQuestion
+from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
 
 from metaculus_bot import stacking as stacking
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
@@ -184,6 +184,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             folder_to_save_reports_to=folder_to_save_reports_to,
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
             llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
+            # 0.2.92 added an upstream success-rate gate in
+            # _handle_errors_in__run_individual_question: it raises when
+            # len(predictions) < expected_total_predictions * required_successful_predictions.
+            # expected_total_predictions == predictions_per_research_report, which
+            # prepare_llm_config sets to len(forecaster_llms) (3 in prod). At the
+            # 0.5 default the gate would reject a single-survivor publish (1 < 3*0.5),
+            # contradicting MIN_FORECASTERS_TO_PUBLISH=1. Pin it to 0.0 so OUR
+            # min_forecasters_to_publish guard (above) stays the sole arbiter of
+            # whether a degraded ensemble still publishes.
+            required_successful_predictions=0.0,
         )
 
         # Benchmark/backtest harnesses tag each bot instance with a display name
@@ -320,6 +330,27 @@ class TemplateForecaster(CompactLoggingForecastBot):
         questions: Sequence[MetaculusQuestion],
         return_exceptions: bool = False,
     ) -> list[ForecastReport] | list[ForecastReport | BaseException]:
+        # Unsupported-type guard. 0.2.92's ApiFilter default and tournament fetch
+        # can now return ConditionalQuestion (a new type) alongside DateQuestion —
+        # neither of which this bot forecasts (_make_prediction has no runner for
+        # them). Drop them up front with a loud WARNING instead of letting them
+        # reach the fan-out and surface as per-question exceptions. This is the
+        # single chokepoint every entry path funnels through: both
+        # forecast_on_tournament and forecast_question call forecast_questions, so
+        # filtering here covers the tournament path and the test/URL path without a
+        # separate filter in cli.py. DiscreteQuestion subclasses NumericQuestion and
+        # is intentionally kept.
+        supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion)
+        supported_questions = [q for q in questions if isinstance(q, supported_types)]
+        if len(supported_questions) != len(questions):
+            dropped_type_names = sorted({type(q).__name__ for q in questions if not isinstance(q, supported_types)})
+            logger.warning(
+                "Skipping %d unsupported question(s) this bot cannot forecast (types: %s)",
+                len(questions) - len(supported_questions),
+                dropped_type_names,
+            )
+            questions = supported_questions
+
         # Apply skip filter first (mirrors base class behavior) so we cap unforecasted items
         if self.skip_previously_forecasted_questions:
             unforecasted_questions = [q for q in questions if not q.already_forecasted]
@@ -359,13 +390,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d",
+            "research_provider_timeouts=%d, gap_fill_v2_errors=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
             self._stacker_fallback_used_count,
             self._stacker_fallback_failed_count,
             self._research_provider_timeout_count,
+            self._gap_fill_v2_error_count,
         )
 
         return results
@@ -377,6 +409,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @_research_provider_timeout_count.setter
     def _research_provider_timeout_count(self, value: int) -> None:
         self._research.timeout_count = value
+
+    @property
+    def _gap_fill_v2_error_count(self) -> int:
+        return self._research.gap_fill_v2_error_count
+
+    @_gap_fill_v2_error_count.setter
+    def _gap_fill_v2_error_count(self, value: int) -> None:
+        self._research.gap_fill_v2_error_count = value
 
     @property
     def alertable_count(self) -> int:
@@ -393,6 +433,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._stacker_fallback_used_count
             + self._stacker_fallback_failed_count
             + self._research_provider_timeout_count
+            + self._gap_fill_v2_error_count
         )
 
     async def _run_stacking(
@@ -901,9 +942,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
     def _format_forecaster_rationales(
         self,
         report_number: int,
-        collection: ResearchWithPredictions,
+        researched_predictions: ResearchWithPredictions,
     ) -> str:
-        text = super()._format_forecaster_rationales(report_number, collection).lstrip()
+        # Param name mirrors the 0.2.92 base signature (renamed from the earlier
+        # positional name) so the override stays keyword-compatible with callers.
+        text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
         return trim_section(text, f"report_{report_number}_rationales")
 
     def _create_unified_explanation(
@@ -987,8 +1030,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, NumericQuestion):
             forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm, chart_b64)  # noqa: E731
-        elif isinstance(question, DateQuestion):
-            raise NotImplementedError("Date questions not supported yet")
+        elif isinstance(question, (DateQuestion, ConditionalQuestion)):
+            # forecast_questions filters these out up front; this is the
+            # defense-in-depth backstop for any path that reaches _make_prediction
+            # directly with an unsupported type.
+            raise NotImplementedError(f"{type(question).__name__} is not supported by this bot")
         else:
             raise ValueError(f"Unknown question type: {type(question)}")
 

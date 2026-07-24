@@ -12,7 +12,7 @@ duration of a context manager scoped to one specific question.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
 
@@ -42,9 +42,7 @@ def _question(
     )
 
 
-# ---------------------------------------------------------------------------
 # compute_mid_window_today
-# ---------------------------------------------------------------------------
 
 
 class TestComputeMidWindowToday:
@@ -69,9 +67,7 @@ class TestComputeMidWindowToday:
             compute_mid_window_today(question)
 
 
-# ---------------------------------------------------------------------------
 # patched_window_for_question
-# ---------------------------------------------------------------------------
 
 
 class TestPatchedWindowForQuestion:
@@ -85,7 +81,7 @@ class TestPatchedWindowForQuestion:
 
         # Mid-window of Jan 1 → May 1 is Mar 2.
         assert "Today: 2026-03-02" in output
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         assert f"Today: {today_str}" not in output
 
     def test_restored_on_normal_exit(self) -> None:
@@ -121,7 +117,8 @@ class TestPatchedWindowForQuestion:
         with patched_window_for_question(question_a):
             output_b = prompts_module._forecasting_window_str(cast(NumericQuestion, question_b))
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        # _forecasting_window_str renders "Today:" in UTC (tz-robust since the ft-0.2.92 prep).
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         assert f"Today: {today_str}" in output_b
 
     def test_falls_through_for_other_question_when_id_is_none(self) -> None:
@@ -133,7 +130,7 @@ class TestPatchedWindowForQuestion:
         with patched_window_for_question(question_a):
             output_b = prompts_module._forecasting_window_str(cast(NumericQuestion, question_b))
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         assert f"Today: {today_str}" in output_b
 
     def test_output_structure_matches_original(self) -> None:
@@ -172,9 +169,7 @@ class TestPatchedWindowForQuestion:
         assert prompts_module._forecasting_window_str is before
 
 
-# ---------------------------------------------------------------------------
 # patched_gap_fill_year_for_question
-# ---------------------------------------------------------------------------
 
 
 class TestPatchedGapFillYearForQuestion:
@@ -229,9 +224,7 @@ class TestPatchedGapFillYearForQuestion:
         assert "Will BTC hit 200k?" in prompt
 
 
-# ---------------------------------------------------------------------------
 # patched_window_and_year_for_question
-# ---------------------------------------------------------------------------
 
 
 class TestPatchedWindowAndYearForQuestion:

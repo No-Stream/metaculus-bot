@@ -16,7 +16,8 @@ from forecasting_tools.data_models.numeric_report import (
 )
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN, NUM_RAMP_K_FACTOR
+from metaculus_bot.constants import NUM_RAMP_K_FACTOR
+from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
@@ -178,7 +179,7 @@ def aggregate_numeric(
         raise ValueError(f"Invalid aggregation method: {method}")
 
     numeric_predictions = list(predictions)
-    cdfs_as_dfs = [pd.DataFrame([p.model_dump() for p in pred.cdf]) for pred in numeric_predictions]
+    cdfs_as_dfs = [pd.DataFrame([p.model_dump() for p in pred.get_cdf()]) for pred in numeric_predictions]
     combined_cdf = pd.concat(cdfs_as_dfs, ignore_index=True)
 
     agg_series = combined_cdf.groupby("value", sort=True)["percentile"].agg(method)
@@ -254,20 +255,16 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
 def clamp_and_renormalize_mc(
     predicted_option_list: PredictedOptionList,
 ) -> PredictedOptionList:
-    """Clamp MC option probabilities and renormalize in-place.
+    """Clamp MC option probabilities into [MC_PROB_MIN, MC_PROB_MAX] and renormalize in-place.
 
-    - Clamps each option probability to [MC_PROB_MIN, MC_PROB_MAX].
-    - Renormalizes so that probabilities sum to 1.0 (if total > 0).
-    - Returns the same `PredictedOptionList` for convenience.
+    Delegates the math to ``clamp_and_renormalize_probs`` so the drift-free clamp is a
+    single source shared with every pre-construction clamp site. Renormalization can no
+    longer push a floored option back below the floor (the ``0.984 + 8x0.002`` case), so
+    every option is guaranteed to land in [MC_PROB_MIN, MC_PROB_MAX] with the list summing
+    to 1.0. Returns the same `PredictedOptionList` for convenience.
     """
-    # Clamp
-    for option in predicted_option_list.predicted_options:
-        option.probability = max(MC_PROB_MIN, min(MC_PROB_MAX, option.probability))
-
-    # Renormalize
-    total_prob = sum(option.probability for option in predicted_option_list.predicted_options)
-    if total_prob > 0:
-        for option in predicted_option_list.predicted_options:
-            option.probability /= total_prob
+    clamped = clamp_and_renormalize_probs([option.probability for option in predicted_option_list.predicted_options])
+    for option, probability in zip(predicted_option_list.predicted_options, clamped):
+        option.probability = probability
 
     return predicted_option_list

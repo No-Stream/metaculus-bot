@@ -20,7 +20,8 @@ archives (both gitignored) are the only durable copies:
   independent of published comments — it makes the AskNews summarizer relevance gate
   auditable after the fact.
 - `backtests/telemetry_archive/` — run-log telemetry markers (`EXTRACTION_RUNG`,
-  `GAP_FILL_V2`, `GHOST_FORECAST`, `OPEN_BOUND_PILING`, `CREDIT_*`) harvested from the
+  `GAP_FILL_V2`, `GHOST_PRE[_JSON]`, `GHOST_FORECAST[_JSON]`, `OPEN_BOUND_PILING`,
+  `CREDIT_*`) harvested from the
   same artifacts; feeds parser-drift watch, gap-fill v2 diagnostics, credit burn-rate,
   and the ghost-vs-published scoring gate.
 

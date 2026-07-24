@@ -64,14 +64,14 @@ def main() -> None:
     logging.getLogger("metaculus_bot.forecaster").setLevel(logging.DEBUG)
     logging.getLogger("openai.agents").setLevel(logging.ERROR)
 
-    # Wrap MetaculusApi publish POSTs with timeout + retry. See
-    # metaculus_bot/publish_hardening.py for rationale (stock requests.post
-    # has no timeout; a single hung POST blocks the whole batch).
+    # Wrap MetaculusClient publish POSTs with timeout + retry. See
+    # metaculus_bot/publish_hardening.py for rationale (a single hung POST
+    # blocks the whole batch; we bound it tighter than the upstream default).
     apply_publish_hardening()
 
-    # Wrap MetaculusApi question-list GET with timeout + bounded retry. See
-    # metaculus_bot/fetch_hardening.py for rationale (stock requests.get has
-    # no timeout/retry; a single transient 403/429/5xx kills the whole run).
+    # Wrap MetaculusClient question-list GET with bounded retry. See
+    # metaculus_bot/fetch_hardening.py for rationale (a single transient
+    # 403/429/5xx would otherwise kill the whole run).
     apply_fetch_hardening()
 
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")

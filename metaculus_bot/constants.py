@@ -229,9 +229,17 @@ OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1
 BINARY_PROB_MIN: float = 0.02
 BINARY_PROB_MAX: float = 0.98
 
-# Multiple-choice prediction clamp
-MC_PROB_MIN: float = 0.005
-MC_PROB_MAX: float = 0.995
+# Multiple-choice prediction clamp. Aligned to forecasting-tools 0.2.92's
+# PredictedOptionList validator, which unconditionally clamps every option into
+# [0.01, 0.99], renormalizes, and raises ValueError when any option moves > 0.05
+# from its input. Matching those bounds makes the upstream validator a no-op on
+# our already-clamped, sum-1 output, eliminating publish-time ValueError risk on
+# many-option ballots (a dominant option + several near-floor options is exactly
+# where the upstream renormalize-after-clamp fires the >0.05 raise). See
+# clamp_and_renormalize_probs / clamp_and_renormalize_mc, which clamp BEFORE every
+# PredictedOptionList construction.
+MC_PROB_MIN: float = 0.01
+MC_PROB_MAX: float = 0.99
 
 # --- Post-hoc Platt calibration of the final published probability ---
 # Final-output logistic recalibration following Metaculus's notebook
@@ -457,8 +465,12 @@ GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
 # directed-reading rung.
 GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
 # Parallel tool calls each count against the cap; steps are where latency
-# lives, so batching is encouraged rather than rationed.
-GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 20)
+# lives, so batching is encouraged rather than rationed. Raised 20 -> 30 with
+# the W2 ambition floor (2026-07-21): v2 runs 41-60s of the 540s deadline, so
+# the headroom is free — the satisficing problem was ambition, not budget, and
+# with the conclude-gate floor in place the extra slots let the driver dig
+# deeper on the few decision-relevant gaps instead of stopping early.
+GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 30)
 # Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
 # 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
 # no research-phase wall-clock. The loop is anytime: hitting the deadline
@@ -470,6 +482,12 @@ GAP_FILL_V2_CONCLUDE_THRESHOLD: float = _float_env("GAP_FILL_V2_CONCLUDE_THRESHO
 # Below this many extracted chars, the fetch ladder escalates plain HTTP to
 # headless-Chromium rendering (JS-wall heuristic; tools.py consumes this).
 GAP_FILL_V2_MIN_CONTENT_CHARS: int = _int_env("GAP_FILL_V2_MIN_CONTENT_CHARS", 500)
+# Max ranked gaps the driver's set_research_plan tool may register (W1). An
+# INDEPENDENT knob from v1's GAP_FILL_MAX_GAPS: v2 gaps are cheap (no dedicated
+# per-gap search call — the driver works one shared tool budget), but a focused
+# work-list still beats a sprawling one. The gap list is ranked by
+# decision-relevance, so the cap drops the least forecast-moving gaps.
+GAP_FILL_V2_MAX_GAPS: int = _int_env("GAP_FILL_V2_MAX_GAPS", 4)
 
 # --- Financial Data Provider ---
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"

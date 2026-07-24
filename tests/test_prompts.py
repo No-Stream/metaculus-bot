@@ -9,7 +9,7 @@ backtest scores would silently get polluted with prediction-market data.
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -638,8 +638,12 @@ class TestStatusQuoDerivation:
         assert "status-quo derivation" in lowered
         # The model must state the platform-state premise in its own words...
         assert "open and unresolved as of" in lowered
-        # ...with today's date interpolated so the statement is concrete.
-        assert datetime.now().strftime("%Y-%m-%d") in prompt
+        # ...with today's date interpolated so the statement is concrete. The
+        # prompt uses UTC (see prompts._forecasting_window_str, which uses
+        # datetime.now(timezone.utc) to stay tz-aware against ft's aware question
+        # datetimes), so assert the UTC date too — a naive datetime.now() flakes
+        # in the evening-local/next-day-UTC window.
+        assert datetime.now(timezone.utc).strftime("%Y-%m-%d") in prompt
         # Moving off the status quo requires naming a post-open trigger.
         assert "post-open event" in lowered
         # And an explicit commitment about the window.

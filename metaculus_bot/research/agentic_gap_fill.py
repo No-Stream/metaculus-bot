@@ -25,6 +25,7 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_DRIVER_EFFORT,
     GAP_FILL_V2_DRIVER_MODEL,
     GAP_FILL_V2_ENABLED_ENV,
+    GAP_FILL_V2_MAX_GAPS,
     GAP_FILL_V2_MAX_TOOL_CALLS,
     GAP_FILL_V2_WALL_DEADLINE,
     env_flag_enabled,
@@ -58,6 +59,7 @@ async def run_gap_fill_v2(
     *,
     is_benchmarking: bool,
     archive_sink: Callable[[dict[str, Any]], None] | None = None,
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> str:
     """Run the agentic gap-fill v2 loop and return its findings section.
 
@@ -69,6 +71,16 @@ async def run_gap_fill_v2(
     persistence — including empty-findings runs, whose telemetry is still worth
     keeping. ``ghost`` is the serialized ghost forecast (or ``None`` when the
     ghost phase did not run or failed).
+
+    ``on_error`` (if given) is called with the exception when this seam's
+    prompt/tool-construction step CRASHES — the belt-and-suspenders soft-fail
+    below. It fires ONLY on that construction-error path, which produces no
+    marker and no archive payload, so it is the only crash signal the caller can
+    observe for it (the loop-internal soft-fail is instead observable via the
+    archive payload's ``telemetry["error"]``, and an import failure never reaches
+    here). It is NOT called on the legitimate flag-off / benchmarking /
+    unsupported-qtype early returns — those are skips, not crashes. Mirrors the
+    ``archive_sink`` callback pattern so the orchestrator stays thin.
     """
     if not env_flag_enabled(GAP_FILL_V2_ENABLED_ENV):
         return ""
@@ -96,6 +108,7 @@ async def run_gap_fill_v2(
             max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
             wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
             conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
+            max_gaps=GAP_FILL_V2_MAX_GAPS,
         )
         question_ref = question.page_url or str(question.id_of_question)
         result = await run_agentic_loop(
@@ -115,6 +128,8 @@ async def run_gap_fill_v2(
                 }
             )
         return result.findings_markdown
-    except _GAP_FILL_V2_SOFT_FAIL_EXCEPTIONS:
+    except _GAP_FILL_V2_SOFT_FAIL_EXCEPTIONS as exc:
         logger.exception("Gap-fill v2 seam failed; continuing without v2 findings")
+        if on_error is not None:
+            on_error(exc)
         return ""

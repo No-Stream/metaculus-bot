@@ -13,8 +13,8 @@ from typing import Any, Literal
 from forecasting_tools import PredictedOptionList
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MAX, MC_PROB_MIN
-from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
+from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 
 __all__ = ["aggregate_binary", "aggregate_mc"]
 
@@ -42,17 +42,16 @@ def aggregate_mc(
     """
     agg_fn = _AGG_FUNC[method]
     n_options = len(option_order)
-    raw_probs: dict[str, float] = {}
+    ordered_raw: list[float] = []
     for name in option_order:
         values = per_option_values.get(name, [])
-        if not values:
-            raw_probs[name] = 1.0 / n_options
-        else:
-            raw_probs[name] = float(agg_fn(values))
+        ordered_raw.append(float(agg_fn(values)) if values else 1.0 / n_options)
 
-    clamped = {name: max(MC_PROB_MIN, min(MC_PROB_MAX, p)) for name, p in raw_probs.items()}
-    total = sum(clamped.values())
-    normalized = {name: (p / total) for name, p in clamped.items()} if total > 0 else clamped
-    aggregated_options = [PredictedOption(option_name=name, probability=normalized[name]) for name in option_order]
-    aggregated_list = PredictedOptionList(predicted_options=aggregated_options)
-    return clamp_and_renormalize_mc(aggregated_list)
+    # Drift-free clamp + renormalize (the single shared helper build_mc_prediction
+    # uses). Guarantees every option lands in [MC_PROB_MIN, MC_PROB_MAX] summing to
+    # 1.0, so the PredictedOptionList validator is a no-op on construction — unlike
+    # the old manual clamp-then-divide, where renormalization could drag a floored
+    # option back below the floor.
+    normalized = clamp_and_renormalize_probs(ordered_raw)
+    aggregated_options = [PredictedOption(option_name=name, probability=p) for name, p in zip(option_order, normalized)]
+    return PredictedOptionList(predicted_options=aggregated_options)

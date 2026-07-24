@@ -220,19 +220,27 @@ def create_pchip_numeric_distribution(
             super().__init__(*args, **kwargs)
             self._pchip_cdf_values = pchip_cdf_values
 
-        @property
-        def cdf(self) -> list[Percentile]:
-            """Return PCHIP-generated CDF as Percentile objects."""
-            # Create the value axis (201 points from lower to upper bound)
-            x_vals = np.linspace(self.lower_bound, self.upper_bound, len(self._pchip_cdf_values))
+        def get_cdf(self) -> list[Percentile]:
+            """Return the pre-computed PCHIP CDF as Percentile objects.
 
-            # Create Percentile objects with correct mapping:
-            # _pchip_cdf_values contains the probability values (0-1)
-            # x_vals contains the corresponding question values
+            forecasting-tools 0.2.92's publish and aggregate paths read
+            ``get_cdf()`` (``.cdf`` is a deprecated shim on the base class), so
+            we override the *method* — not just the property — to guarantee our
+            PCHIP output is what gets submitted, never the base-class builder's.
+            """
+            # Create the value axis (201 points from lower to upper bound).
+            # _pchip_cdf_values holds the probability heights (0-1); x_vals the
+            # corresponding question values.
+            x_vals = np.linspace(self.lower_bound, self.upper_bound, len(self._pchip_cdf_values))
             return [
                 Percentile(percentile=prob_val, value=question_val)
                 for question_val, prob_val in zip(x_vals, self._pchip_cdf_values)
             ]
+
+        @property
+        def cdf(self) -> list[Percentile]:
+            """Deprecated alias for :meth:`get_cdf` (returns identical data)."""
+            return self.get_cdf()
 
     return PchipNumericDistribution(
         pchip_cdf_values=pchip_cdf,
@@ -243,6 +251,15 @@ def create_pchip_numeric_distribution(
         lower_bound=question.lower_bound,
         zero_point=zero_point,
         cdf_size=getattr(question, "cdf_size", None),
+        # Our CDF is already the final, min/max-step- and bound-enforced submission,
+        # exposed via the get_cdf() override above. strict_validation=False stops the
+        # 0.2.92 validators from (a) rejecting our beyond-open-bound percentile
+        # convention (_check_too_far_from_bounds) and (b) mutating declared_percentiles
+        # (_check_and_update_repeating_values) that diagnostics + spread metrics read
+        # verbatim; standardize_cdf=False keeps the base machinery from ever
+        # re-standardizing a distribution we already finalized.
+        strict_validation=False,
+        standardize_cdf=False,
     )
 
 
@@ -253,18 +270,21 @@ def create_fallback_numeric_distribution(
 ) -> NumericDistribution:
     """Create fallback NumericDistribution when PCHIP fails.
 
-    Wraps forecasting-tools' native ``.cdf`` builder but re-pins open-bound
-    endpoints through ``safe_cdf_bounds``. The native builder anchors an open
-    lower bound at ``int(0.5 * percentile_min)`` percent, which rounds to 0%
-    (``cdf[0] == 0.0``) once the standard set includes P1 (``percentile_min ==
-    1.0`` → ``int(0.5) == 0``). Metaculus rejects open-bound CDFs with
-    ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999``, so enforce the legal range here.
+    Wraps forecasting-tools' native CDF builder (``get_cdf()``) but re-pins
+    open-bound endpoints through ``safe_cdf_bounds``. Metaculus rejects open-bound
+    CDFs with ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999`` and caps the per-bin step,
+    so we enforce the legal range and max-step here rather than trust the raw
+    builder output.
+
+    ``standardize_cdf=False`` keeps ``get_cdf()`` on the non-standardizing raw
+    linear-interpolation path (the 0.2.54 behavior this fallback was written
+    against); the endpoint/step enforcement is our own ``safe_cdf_bounds`` pass,
+    not upstream's ``_standardize_cdf``.
     """
 
     class BoundSafeNumericDistribution(NumericDistribution):
-        @property
-        def cdf(self) -> list[Percentile]:
-            base = super().cdf
+        def get_cdf(self) -> list[Percentile]:
+            base = super().get_cdf()
             if not (self.open_lower_bound or self.open_upper_bound):
                 return base
             probs = np.array([p.percentile for p in base], dtype=float)
@@ -282,6 +302,11 @@ def create_fallback_numeric_distribution(
             )
             return [Percentile(percentile=float(prob), value=p.value) for prob, p in zip(safe, base)]
 
+        @property
+        def cdf(self) -> list[Percentile]:
+            """Deprecated alias for :meth:`get_cdf` (returns identical data)."""
+            return self.get_cdf()
+
     return BoundSafeNumericDistribution(
         declared_percentiles=percentile_list,
         open_upper_bound=question.open_upper_bound,
@@ -290,4 +315,11 @@ def create_fallback_numeric_distribution(
         lower_bound=question.lower_bound,
         zero_point=zero_point,
         cdf_size=getattr(question, "cdf_size", None),
+        # strict_validation=False: preserve the beyond-range declared percentiles
+        # verbatim (no _check_too_far_from_bounds rejection, no
+        # _check_and_update_repeating_values mutation). standardize_cdf=False: keep
+        # super().get_cdf() on the raw linear-interp path — our safe_cdf_bounds pass
+        # in get_cdf() owns endpoint/step enforcement.
+        strict_validation=False,
+        standardize_cdf=False,
     )

@@ -16,7 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
-from forecasting_tools import MetaculusApi
+from forecasting_tools.helpers import metaculus_client as ft_client
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import fetch_hardening
 
@@ -356,8 +357,6 @@ def test_wrapper_passes_args_and_kwargs_through():
 
 def test_install_get_timeout_default_adds_timeout_when_caller_omits(monkeypatch):
     """Bare `requests.get(url, params=...)` should pick up the installed default."""
-    from forecasting_tools.helpers import metaculus_api as ft_api
-
     captured = {}
     inner_calls = {"n": 0}
 
@@ -368,12 +367,12 @@ def test_install_get_timeout_default_adds_timeout_when_caller_omits(monkeypatch)
 
     # Stage the inner ``requests.get`` BEFORE installing the wrapper so the
     # wrapper closes over our fake, not the real network-call. monkeypatch
-    # restores ``ft_api.requests.get`` to the real one after the test.
-    monkeypatch.setattr(ft_api.requests, "get", fake_inner_get)
+    # restores ``ft_client.requests.get`` to the real one after the test.
+    monkeypatch.setattr(ft_client.requests, "get", fake_inner_get)
 
     fetch_hardening._install_get_timeout_default(7.5)
 
-    ft_api.requests.get("http://example.com", params={"x": 1})
+    ft_client.requests.get("http://example.com", params={"x": 1})
 
     assert inner_calls["n"] == 1
     assert captured.get("timeout") == 7.5
@@ -381,19 +380,17 @@ def test_install_get_timeout_default_adds_timeout_when_caller_omits(monkeypatch)
 
 def test_install_get_timeout_default_respects_caller_supplied_timeout(monkeypatch):
     """If the caller already passed timeout=, don't clobber it."""
-    from forecasting_tools.helpers import metaculus_api as ft_api
-
     captured = {}
 
     def fake_inner_get(*args, **kwargs):
         captured.update(kwargs)
         return MagicMock()
 
-    monkeypatch.setattr(ft_api.requests, "get", fake_inner_get)
+    monkeypatch.setattr(ft_client.requests, "get", fake_inner_get)
 
     fetch_hardening._install_get_timeout_default(7.5)
 
-    ft_api.requests.get("http://example.com", timeout=2.0)
+    ft_client.requests.get("http://example.com", timeout=2.0)
 
     assert captured.get("timeout") == 2.0
 
@@ -406,51 +403,54 @@ def test_install_get_timeout_default_respects_caller_supplied_timeout(monkeypatc
 def _reset_fetch_hardening_state(monkeypatch):
     """Snapshot + restore patched methods, sentinel, and the global requests.get wrapper.
 
-    apply_fetch_hardening permanently swaps ``ft_api.requests.get`` for a
+    apply_fetch_hardening permanently swaps ``ft_client.requests.get`` for a
     timeout-injecting wrapper. monkeypatch.setattr restores the original
     bound view after the test, preventing leakage across tests.
     """
-    from forecasting_tools.helpers import metaculus_api as ft_api
-
     for name in fetch_hardening._PATCHED_METHODS:
-        monkeypatch.setattr(MetaculusApi, name, MetaculusApi.__dict__[name])
+        monkeypatch.setattr(MetaculusClient, name, MetaculusClient.__dict__[name])
 
-    monkeypatch.setattr(ft_api.requests, "get", ft_api.requests.get)
+    monkeypatch.setattr(ft_client.requests, "get", ft_client.requests.get)
 
-    if hasattr(MetaculusApi, fetch_hardening._SENTINEL):
-        monkeypatch.setattr(MetaculusApi, fetch_hardening._SENTINEL, False)
-        delattr(MetaculusApi, fetch_hardening._SENTINEL)
+    if hasattr(MetaculusClient, fetch_hardening._SENTINEL):
+        monkeypatch.setattr(MetaculusClient, fetch_hardening._SENTINEL, False)
+        delattr(MetaculusClient, fetch_hardening._SENTINEL)
     else:
-        monkeypatch.setattr(MetaculusApi, fetch_hardening._SENTINEL, False, raising=False)
-        delattr(MetaculusApi, fetch_hardening._SENTINEL)
+        monkeypatch.setattr(MetaculusClient, fetch_hardening._SENTINEL, False, raising=False)
+        delattr(MetaculusClient, fetch_hardening._SENTINEL)
 
 
 def test_apply_fetch_hardening_idempotent(monkeypatch):
     _reset_fetch_hardening_state(monkeypatch)
 
     fetch_hardening.apply_fetch_hardening()
-    after_first = {name: MetaculusApi.__dict__[name].__func__ for name in fetch_hardening._PATCHED_METHODS}
+    after_first = {name: MetaculusClient.__dict__[name] for name in fetch_hardening._PATCHED_METHODS}
 
     fetch_hardening.apply_fetch_hardening()
-    after_second = {name: MetaculusApi.__dict__[name].__func__ for name in fetch_hardening._PATCHED_METHODS}
+    after_second = {name: MetaculusClient.__dict__[name] for name in fetch_hardening._PATCHED_METHODS}
 
     for name in fetch_hardening._PATCHED_METHODS:
         assert after_first[name] is after_second[name]
 
 
-def test_apply_fetch_hardening_supports_class_and_instance_calls(monkeypatch):
-    """Wrapped method must be callable as both ClassName.foo() and ClassName().foo().
+def test_apply_fetch_hardening_patches_instance_method_not_classmethod(monkeypatch):
+    """0.2.92's fetch chokepoint is an INSTANCE method, so the wrapper must be one too.
 
-    Same regression class as F18 in publish_hardening: setattr(...) of a plain
-    function would break instance-level calls (self gets bound as cls).
-    fetch_hardening re-wraps as classmethod, same as publish_hardening.
+    Regression guard analogous to F18: wrapping as a ``classmethod`` (the pre-0.2.92
+    MetaculusApi shape) would bind ``self`` to ``cls`` and silently break the bot's
+    instance-level ``self.metaculus_client._get_questions_from_api(...)`` calls. The
+    wrapper must be a plain function (bound as an instance method) that preserves the
+    undecorated original beneath it (``__wrapped__``), so we sit beneath — not stacked
+    on — upstream's own retry decorator.
     """
     _reset_fetch_hardening_state(monkeypatch)
 
     fetch_hardening.apply_fetch_hardening()
 
-    descriptor = MetaculusApi.__dict__[fetch_hardening._PATCHED_METHODS[0]]
-    assert isinstance(descriptor, classmethod)
+    descriptor = MetaculusClient.__dict__[fetch_hardening._PATCHED_METHODS[0]]
+    assert not isinstance(descriptor, classmethod)
+    assert callable(descriptor)
+    assert hasattr(descriptor, "__wrapped__"), "wrapper must retain the undecorated original beneath it"
 
 
 def test_apply_fetch_hardening_logs_summary(monkeypatch, caplog):
@@ -470,17 +470,15 @@ def test_apply_fetch_hardening_logs_summary(monkeypatch, caplog):
 def test_patched_get_questions_from_api_recovers_from_403(monkeypatch):
     """Simulate the 2026-05-19 incident: first call 403, second succeeds.
 
-    Patches ``requests.get`` on the forecasting-tools module so the real
+    Patches ``requests.get`` on the metaculus_client module so the real
     `_get_questions_from_api` runs end-to-end through the hardened wrapper.
     """
-    from forecasting_tools.helpers import metaculus_api as ft_api
-
     _reset_fetch_hardening_state(monkeypatch)
     monkeypatch.setattr("metaculus_bot.constants.FETCH_GET_RETRIES", 2)
     monkeypatch.setattr("metaculus_bot.fetch_hardening.FETCH_GET_RETRIES", 2)
-    # Make sleep between random.uniform(2, 3) inside _get_questions_from_api a no-op
+    # Make the _sleep_between_requests pause inside _get_questions_from_api a no-op
     # so the test stays fast.
-    monkeypatch.setattr("forecasting_tools.helpers.metaculus_api.time.sleep", lambda *_: None)
+    monkeypatch.setattr("forecasting_tools.helpers.metaculus_client.time.sleep", lambda *_: None)
     # Token check inside _get_auth_headers reads os.getenv at call time.
     monkeypatch.setenv("METACULUS_TOKEN", "test-token")
 
@@ -509,13 +507,14 @@ def test_patched_get_questions_from_api_recovers_from_403(monkeypatch):
     # Stage the inner ``requests.get`` BEFORE apply_fetch_hardening so the
     # global GET-timeout wrapper closes over our fake. This mirrors how the
     # real installation would close over forecasting-tools' real requests.get.
-    monkeypatch.setattr(ft_api.requests, "get", fake_get)
+    monkeypatch.setattr(ft_client.requests, "get", fake_get)
 
     fetch_hardening.apply_fetch_hardening()
 
-    # Drive the real wrapped method. GroupQuestionMode is a Literal type
-    # ("exclude" | "unpack_subquestions"), not an enum.
-    result = MetaculusApi._get_questions_from_api({"limit": 100, "offset": 0}, "exclude")
+    # Drive the real wrapped method on a MetaculusClient instance (what the bot
+    # constructs). GroupQuestionMode is a Literal type ("exclude" |
+    # "unpack_subquestions"), not an enum.
+    result = MetaculusClient()._get_questions_from_api({"limit": 100, "offset": 0}, "exclude")
     assert result == []
     assert n_calls["n"] == 2  # 403 then success
     # The global GET-timeout wrapper should have injected timeout= on every call.

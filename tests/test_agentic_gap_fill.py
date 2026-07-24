@@ -7,6 +7,7 @@ Everything is mocked — zero LLM/network calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -16,12 +17,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.research.agentic import run_agentic_loop as _real_run_agentic_loop
 from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
-from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
+from metaculus_bot.research.agentic.types import LoopTelemetry, ToolOutcome, ToolSpec
 from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 from tests.agentic_fakes import FakeLlm
+from tests.agentic_fakes import plan_call as _plan_call
 from tests.agentic_fakes import response as _response
 from tests.agentic_fakes import tool_call as _tool_call
 from tests.pipeline_test_helpers import (
@@ -46,11 +49,35 @@ _GHOST_BLOCK = '```json\n{"question_type": "binary", "posterior_prob": 0.12}\n``
 
 
 def _happy_path_llm() -> FakeLlm:
-    """One search step, then conclude with a finding, then the ghost turn."""
+    """Plan (W1 gate opener), one fetch step, then conclude with a finding, then the ghost turn.
+
+    The fetch is a real fetched-tier retrieval of the finding's source URL, so the
+    conclude satisfies both the finding's provenance and the W2 fetch floor: the
+    top-gap ``gap_accounting`` cites a fetch in ``actions_taken`` AND >=1 successful
+    fetched-tier retrieval landed (prose alone no longer clears the floor).
+    """
     return FakeLlm(
         [
-            _response(tool_calls=[_tool_call("c1", "search_web", {"query": "BLS unemployment June 2026"})]),
-            _response(tool_calls=[_tool_call("c2", "conclude", {"final_findings": [_FINDING]})]),
+            _response(tool_calls=[_plan_call(gaps=[{"id": "g1", "question": "What is the June 2026 rate?"}])]),
+            _response(tool_calls=[_tool_call("c1", "fetch", {"url": _FINDING["source_url"]})]),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c2",
+                        "conclude",
+                        {
+                            "final_findings": [_FINDING],
+                            "gap_accounting": [
+                                {
+                                    "gap_id": "g1",
+                                    "actions_taken": "fetched the BLS release and confirmed the June rate",
+                                    "status": "resolved",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            ),
             _response(content=_GHOST_BLOCK),
         ]
     )
@@ -58,7 +85,24 @@ def _happy_path_llm() -> FakeLlm:
 
 def _fake_tools() -> list[ToolSpec]:
     async def _search(**_: Any) -> ToolOutcome:
-        return ToolOutcome(content_markdown="result: BLS release found", status="ok")
+        # Surface the finding's source URL the way a real search result would,
+        # so the provenance gate (loop._check_url_provenance) accepts _FINDING.
+        return ToolOutcome(
+            content_markdown="result: BLS release found",
+            links=[_FINDING["source_url"]],
+            status="ok",
+        )
+
+    async def _fetch(**_: Any) -> ToolOutcome:
+        # A rendered fetch of the finding's source page: a fetched-class outcome
+        # tiers the call's `url` argument "fetched", satisfying both the provenance
+        # gate and the conclude gate's fetch floor with a real primary-source
+        # retrieval (which the finding's prose claims — not prose alone).
+        return ToolOutcome(
+            content_markdown="BLS release: The unemployment rate was 4.1 percent in June.",
+            method="rendered",
+            status="ok",
+        )
 
     return [
         ToolSpec(
@@ -67,7 +111,14 @@ def _fake_tools() -> list[ToolSpec]:
             parameters={"type": "object", "properties": {}, "additionalProperties": True},
             handler=_search,
             timeout_s=1.0,
-        )
+        ),
+        ToolSpec(
+            name="fetch",
+            description="fake fetch",
+            parameters={"type": "object", "properties": {}, "additionalProperties": True},
+            handler=_fetch,
+            timeout_s=1.0,
+        ),
     ]
 
 
@@ -157,13 +208,33 @@ class TestRunGapFillV2Seam:
     ) -> None:
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
         caplog.set_level(logging.ERROR, logger="metaculus_bot.research.agentic_gap_fill")
+        errors: list[BaseException] = []
         with patch(
             "metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools",
             side_effect=RuntimeError("tool construction exploded"),
         ):
-            result = await run_gap_fill_v2(make_real_binary_question(), BUNDLE, is_benchmarking=False)
+            result = await run_gap_fill_v2(
+                make_real_binary_question(), BUNDLE, is_benchmarking=False, on_error=errors.append
+            )
         assert result == ""
         assert any("Gap-fill v2 seam failed" in record.getMessage() for record in caplog.records)
+        # The construction-error soft-fail must fire on_error with the exception —
+        # this is the orchestrator's only crash signal for this path (no marker,
+        # no archive payload). It is the crash-counter's path (b) hook.
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_on_error_not_called_on_flag_off_skip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """on_error is a CRASH signal, not a skip signal: a clean flag-off early
+        return must never fire it (else every non-v2 run would falsely alert)."""
+        monkeypatch.delenv("GAP_FILL_V2_ENABLED", raising=False)
+        errors: list[BaseException] = []
+        result = await run_gap_fill_v2(
+            make_real_binary_question(), BUNDLE, is_benchmarking=False, on_error=errors.append
+        )
+        assert result == ""
+        assert errors == []
 
     @pytest.mark.asyncio
     async def test_archive_sink_receives_transcript_and_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,7 +252,7 @@ class TestRunGapFillV2Seam:
         assert len(captured) == 1
         payload = captured[0]
         assert payload["telemetry"]["findings_count"] == 1
-        assert payload["telemetry"]["tool_calls"] == 2  # search_web + conclude
+        assert payload["telemetry"]["tool_calls"] == 3  # set_research_plan + fetch + conclude
         roles = [
             message["role"] for message in payload["transcript"]
         ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
@@ -276,6 +347,120 @@ class TestDriverSystemPromptCatalyst:
         assert "stated plainly with no read on what it means for the outcome" in collapsed
         assert "supports the status-quo lean" not in collapsed
         assert "supports the lean" not in collapsed
+
+
+class TestDriverSystemPromptResearchPlan:
+    """W1: STEP 1 directs the driver to keep the dry run private but emit its
+    outputs via set_research_plan, and to build the gap list from the briefing
+    alone (v1-analyzer style) with both verify- and fill-targets."""
+
+    def test_step1_requires_set_research_plan(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "set_research_plan" in collapsed
+        assert "REQUIRED before any research tool" in collapsed
+        assert "external tool calls are rejected until you call it" in collapsed
+
+    def test_step1_keeps_dry_run_private_but_emits_outputs(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "This reasoning stays PRIVATE" in collapsed
+        assert "dry-run forecast as the template's STRUCTURED FORECAST block" in collapsed
+        assert "sensitive assumptions that would most move that forecast if wrong" in collapsed
+
+    def test_step1_gap_list_from_briefing_alone_with_both_target_kinds(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "Build the gap list from the BRIEFING ALONE" in collapsed
+        assert "what load-bearing fact is missing or unverified" in collapsed
+        assert "rank the most forecast-moving gap first" in collapsed
+        # Both verify-targets (assumptions to check) AND fill-targets (absent facts).
+        assert "verify-targets (assumptions to check against a primary source)" in collapsed
+        assert "fill-targets (facts the briefing simply does not contain)" in collapsed
+
+    def test_step2_references_the_ranked_gaps(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "Work your ranked gaps in order" in collapsed
+        assert "per-turn budget line lists your outstanding gaps" in collapsed
+
+    def test_step2_carries_derivation_license(self) -> None:
+        """W3: STEP 2 grants a narrow synthesis license — the driver may put
+        decision-relevant arithmetic in the ``derivation`` field, with every input
+        quoted. The saw-tooth-style per-year bound table is the exemplar shape."""
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "YOU MAY DERIVE" in collapsed
+        assert "put the arithmetic in the finding's `derivation` field" in collapsed
+        # Every input number must be a quoted value in the same finding.
+        assert "Every input number in the derivation must ALSO appear" in collapsed
+        assert "no likelihood language, no new facts" in collapsed
+        # Exemplar: derive a per-year bound table from quoted record data.
+        assert "per-year bound table" in collapsed
+
+
+class TestDriverSystemPromptConcludeGate:
+    """W2: STEP 3 must describe the conclude gate — the required gap_accounting
+    (per-gap gap_id / actions_taken / status), the three statuses, and what gets
+    an early conclude rejected (missing gap, too few calls, unmet fetch floor)."""
+
+    def test_step3_requires_gap_accounting(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "conclude REQUIRES a `gap_accounting` list" in collapsed
+        assert "one entry per gap in your research plan" in collapsed
+        # The three per-entry fields are named.
+        assert "gap_id:" in collapsed
+        assert "actions_taken:" in collapsed
+        assert "status:" in collapsed
+
+    def test_step3_lists_the_three_statuses(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "`resolved`" in collapsed
+        assert "`unresolved_parked`" in collapsed
+        assert "`not_decision_relevant_on_inspection`" in collapsed
+
+    def test_step3_describes_what_gets_rejected(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "An EARLY conclude" in collapsed and "REJECTED" in collapsed
+        assert "a plan gap is missing from the accounting" in collapsed
+        assert "fewer external tool calls than you have plan gaps" in collapsed
+        assert "the fetch floor is unmet" in collapsed
+        assert "Snippet-only research does not clear this floor" in collapsed
+        # The deadline exemption is stated, but not as a loophole to coast to.
+        assert "forced deadline conclusion is exempt" in collapsed
+        assert "do not coast to the deadline to dodge it" in collapsed
+
+
+class TestDriverSystemPromptMotivation:
+    """W2: the driver runs at low reasoning effort, so the system prompt carries
+    a motivation block explaining WHY thoroughness and verification are valued —
+    a wrong fact is costlier than a missing one; an unverified snippet is a
+    liability; depth on the few decision-relevant gaps beats breadth; fetch
+    primary sources before contradicting the briefing."""
+
+    def test_prompt_frames_wrong_facts_as_costly(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "A wrong fact does more damage than a missing one" in collapsed
+        # The concrete blow-up: an unverified snippet swung a whole ensemble.
+        assert "swung an entire ensemble the wrong way" in collapsed
+
+    def test_prompt_frames_unverified_snippet_as_liability(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "an unconfirmed snippet is a liability, not a finding" in collapsed
+        assert "a search excerpt is a lead, not a confirmation" in collapsed
+
+    def test_prompt_values_depth_over_breadth_and_primary_sources(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert "real depth on the two or three gaps that actually move the forecast" in collapsed
+        assert "pull the primary source and read the operative language yourself" in collapsed
+
+
+class TestDriverSystemPromptSnippetDemotion:
+    """W4: the discrepancy rule warns the driver that a snippet-only discrepancy
+    is demoted (won't supersede the briefing) and to fetch the primary source
+    before contradicting it — synergy with W2's fetch floor. The demotion is
+    code-enforced (loop-stamped tier); the prompt just tells the driver why."""
+
+    def test_discrepancy_rule_warns_snippet_only_is_demoted(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-07-21").split())
+        assert 'A discrepancy sourced only from search snippets will be demoted to "possible corrections"' in collapsed
+        assert "will NOT supersede the briefing" in collapsed
+        assert "if you intend to contradict the briefing, fetch the primary source first" in collapsed
 
 
 @pytest.fixture
@@ -472,7 +657,7 @@ class TestOrchestratorBothFlags:
         provider = AsyncMock(return_value="research prose")
         trace = {"transcript": [{"role": "system", "content": "x"}], "telemetry": {"steps": 2}}
 
-        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None):
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
             if archive_sink is not None:
                 archive_sink(trace)
             return "## Agentic Research Findings\n\nClaim: something."
@@ -535,3 +720,201 @@ class TestOrchestratorBothFlags:
         records = [json.loads(line) for line in out.read_text().strip().splitlines()]
         assert records[0]["gap_fill_v2"] == trace
         assert "gap_fill_v2" not in records[1]
+
+
+async def _run_v2_through_orchestrator_with_driver(orch: ResearchOrchestrator, driver: Any) -> LoopTelemetry:
+    """Run the REAL agentic loop end-to-end through the orchestrator with a stub
+    ``driver``, returning the loop's telemetry.
+
+    ``run_agentic_loop`` is wrapped (patched only in the seam's namespace, so the
+    wrapper still calls the genuine loop) to capture the ``LoopResult.telemetry``
+    for assertions the orchestrator counter alone can't make — ``deadline_hit`` and
+    ``error``. ``build_default_llm_call`` is stubbed to ``driver`` (the loop's first
+    ``llm_call``), tools are faked, and a single ``AsyncMock`` stands in for the
+    research providers — mirroring the other crash-counter tests. The REAL loop's
+    ``except asyncio.TimeoutError`` classification runs, which is the point.
+    """
+    captured: dict[str, Any] = {}
+
+    async def _capturing_loop(*args: Any, **kwargs: Any) -> Any:
+        result = await _real_run_agentic_loop(*args, **kwargs)
+        captured["telemetry"] = result.telemetry
+        return result
+
+    provider = AsyncMock(return_value="research prose")
+    with (
+        patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+        patch("metaculus_bot.research.agentic_gap_fill.run_agentic_loop", _capturing_loop),
+        patch("metaculus_bot.research.agentic.loop.build_default_llm_call", return_value=driver),
+        patch("metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools", return_value=_fake_tools()),
+    ):
+        await orch.run_research(make_real_binary_question())
+    return captured["telemetry"]
+
+
+class TestGapFillV2CrashCounter:
+    """The alertable crash counter (orchestrator.gap_fill_v2_error_count).
+
+    Detection backstop for the CLASS of bug the fastapi eager-import defect
+    exposed: v2 crashed on step 0, soft-failed to "", and emitted a marker
+    byte-identical to a legitimate idle run — nothing reddened CI. A genuine
+    crash must now bump an alertable counter; an idle "found nothing" run and a
+    deadline hit must NOT. Three mutually-exclusive crash paths, one bump each
+    (see orchestrator._count_gap_fill_v2_error). A dead-on-arrival bug bumps it
+    on every question; a rare transient bumps it once (accepted false alarm).
+    """
+
+    @pytest.mark.asyncio
+    async def test_seam_construction_crash_bumps_counter_once(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (b) end-to-end: the REAL run_gap_fill_v2 seam crashes in tool
+        construction, soft-fails to "", and its on_error callback bumps the
+        orchestrator counter exactly once (no payload -> post-gather check is a no-op)."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools",
+                side_effect=RuntimeError("tool construction exploded"),
+            ),
+        ):
+            research = await orch.run_research(make_real_binary_question())
+
+        assert "## Agentic Research Findings" not in research  # soft-failed, still published
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_loop_internal_soft_fail_bumps_counter_via_telemetry_error(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (a): the loop ran but hit its catch-all soft-fail, stamping
+        telemetry.error and returning normally. The orchestrator's post-gather
+        check reads the archived telemetry error and bumps the counter."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+            # Mirror the loop's soft-fail: it swallows the crash, stamps
+            # telemetry.error, still archives the payload, and returns findings ("").
+            if archive_sink is not None:
+                archive_sink(
+                    {"transcript": [], "telemetry": {"steps": 0, "error": "APIConnectionError('boom')"}, "ghost": None}
+                )
+            return ""
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch("metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", side_effect=_fake_v2),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_import_escape_error_bumps_counter(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path (c): an error escaping the seam entirely (e.g. a broken import)
+        is caught by _run_v2's own except, which counts it directly."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("v2 escaped its own soft-fail"),
+            ),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_idle_run_does_not_bump_counter(self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Negative control: a clean run that legitimately found nothing (telemetry
+        error is None) must NOT bump the counter — otherwise every empty-findings
+        question would falsely redden CI. This is the byte-identical-marker case."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="research prose")
+
+        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+            if archive_sink is not None:
+                archive_sink({"transcript": [], "telemetry": {"steps": 0, "error": None}, "ghost": None})
+            return ""  # nothing to research — a legitimate empty run, not a crash
+
+        with (
+            patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+            patch("metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", side_effect=_fake_v2),
+        ):
+            await orch.run_research(make_real_binary_question())
+
+        assert orch.gap_fill_v2_error_count == 0
+
+    @pytest.mark.asyncio
+    async def test_genuine_deadline_through_real_loop_does_not_bump_counter(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control through the REAL loop: a driver that runs past the wall
+        deadline is a genuine deadline hit, not a crash — deadline_hit=True, no
+        stamped error, counter stays 0. An expected-degradation deadline must not
+        redden CI (the class's 'a deadline hit must NOT [bump]' contract)."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        # Tiny wall deadline so the outer wait_for fires fast — but kept above the
+        # _DEADLINE_SLOP_S (0.5s) epsilon so elapsed ≈ wall_deadline_s classifies as
+        # a real deadline rather than being swallowed by the slop allowance.
+        monkeypatch.setattr("metaculus_bot.research.agentic_gap_fill.GAP_FILL_V2_WALL_DEADLINE", 1.0)
+
+        async def _sleeping_driver(_messages: Any, _tools: Any) -> Any:
+            await asyncio.sleep(30)  # cancelled by the outer wait_for deadline
+            raise AssertionError("driver should have been cancelled by the deadline")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        telemetry = await _run_v2_through_orchestrator_with_driver(orch, _sleeping_driver)
+
+        assert telemetry.deadline_hit is True
+        assert telemetry.error is None
+        assert orch.gap_fill_v2_error_count == 0
+
+    @pytest.mark.asyncio
+    async def test_spurious_inner_timeout_bumps_counter_and_is_not_a_deadline(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the TimeoutError misclassification: a bare (builtin)
+        TimeoutError raised INSIDE the driver — well before the wall deadline — is a
+        crash, not a deadline. On Python 3.11+ asyncio.TimeoutError IS builtin
+        TimeoutError, so pre-fix code stamped deadline_hit=True and never counted it.
+        Post-fix: error is stamped, deadline_hit=False, and the counter bumps once
+        via the orchestrator's post-gather archive-telemetry path."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        # Default (large) wall deadline: the driver raises immediately, so elapsed is
+        # ~0, far below wall_deadline_s - slop, forcing the crash classification.
+
+        async def _timeout_driver(_messages: Any, _tools: Any) -> Any:
+            raise TimeoutError("simulated connection-level timeout")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        telemetry = await _run_v2_through_orchestrator_with_driver(orch, _timeout_driver)
+
+        assert telemetry.deadline_hit is False
+        assert telemetry.error is not None
+        assert "TimeoutError" in telemetry.error
+        assert orch.gap_fill_v2_error_count == 1

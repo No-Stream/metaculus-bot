@@ -7,6 +7,7 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import NumericDistribution
 from forecasting_tools.data_models.questions import NumericQuestion
 
+from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.utils import aggregate_binary_mean, aggregate_numeric
 
 
@@ -53,18 +54,14 @@ def _aggregate_mc_options(
                 option_probabilities[option.option_name] = []
             option_probabilities[option.option_name].append(option.probability)
 
-    # Aggregate per option
-    aggregated_options = [
-        PredictedOption(option_name=name, probability=agg_fn(probs)) for name, probs in option_probabilities.items()
-    ]
-
-    # Renormalize to ensure probabilities sum to 1.0
-    total_prob = sum(opt.probability for opt in aggregated_options)
-    if total_prob > 0:
-        for option in aggregated_options:
-            option.probability /= total_prob
-
-    return PredictedOptionList(predicted_options=aggregated_options)
+    # Aggregate per option, then clamp + renormalize BEFORE constructing the
+    # PredictedOptionList so ft 0.2.92's clamp-and-renormalize validator (which raises on
+    # any >0.05 move) is a no-op on a dominant + near-floor aggregate.
+    names = list(option_probabilities.keys())
+    clamped = clamp_and_renormalize_probs([agg_fn(option_probabilities[name]) for name in names])
+    return PredictedOptionList(
+        predicted_options=[PredictedOption(option_name=name, probability=prob) for name, prob in zip(names, clamped)]
+    )
 
 
 def aggregate_multiple_choice_mean(

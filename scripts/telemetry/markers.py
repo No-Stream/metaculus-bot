@@ -6,6 +6,10 @@ against the ACTUAL emitted format strings (the source of truth):
 
 * ``EXTRACTION_RUNG``   — ``metaculus_bot/value_extraction.py`` ``_log_extraction``
 * ``GAP_FILL_V2``       — ``metaculus_bot/research/agentic/loop.py`` ``_log_completion``
+* ``GHOST_PRE`` / ``GHOST_PRE_JSON`` — ``metaculus_bot/research/agentic/loop.py``
+  ``_set_research_plan_tool`` (the pre-research counterpart to the concluding
+  ghost pair below; the GHOST_PRE↔GHOST_FORECAST delta measures whether v2's
+  research moved its own view)
 * ``GHOST_FORECAST``    — ``metaculus_bot/research/agentic/loop.py`` ``_run_ghost_phase``
 * ``GHOST_FORECAST_JSON`` — ``metaculus_bot/research/agentic/loop.py`` ``_run_ghost_phase``
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
@@ -30,12 +34,31 @@ The parser matches on the marker TOKEN via ``re.search``, so it is agnostic to t
 log-line prefix (the prod ``%(asctime)s - %(name)s - %(levelname)s - %(message)s``
 format and the ablation ``%(asctime)s %(levelname)s %(name)s | %(message)s`` format
 both work).
+
+POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
+and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
+types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
+``CLOSE_MARGIN`` emit ``question.id_of_question`` (the QUESTION id) while
+``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
+``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
+``qid_kind`` and every harvested record carries it, so a residual join keyed on one
+id can TRANSLATE into the record's own space rather than silently dropping the
+records keyed on the other (see :mod:`metaculus_bot.performance_analysis.id_mapping`).
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+# The two Metaculus id spaces a marker's ``question=`` ref can live in. Kept as
+# LOCAL literals (not imported from ``metaculus_bot``) so this parser and the whole
+# ``scripts.telemetry`` archive stack stay pure-stdlib — ``make sync_telemetry`` must
+# not drag in forecasting_tools/numpy/streamlit just to grep logs. The canonical
+# definitions live in ``metaculus_bot.performance_analysis.id_mapping``; the two are
+# pinned equal by ``tests/test_id_mapping.py::test_qid_kind_constants_match_markers``.
+QID_KIND_POST_ID = "post_id"
+QID_KIND_QUESTION_ID = "question_id"
 
 # Fields captured as free text / references — never numerically coerced. ``question``
 # is a raw ref (URL or bare id); ``summary`` is the ghost-forecast free-text summary;
@@ -55,10 +78,18 @@ _BARE_INT_RE = re.compile(r"\d+")
 
 @dataclass(frozen=True)
 class MarkerSpec:
-    """One telemetry marker: its archive-file stem + the regex extracting its fields."""
+    """One telemetry marker: its archive-file stem, the field regex, and its id space.
+
+    ``qid_kind`` names which Metaculus id space the marker's ``question=`` ref lives
+    in (``"post_id"`` or ``"question_id"``); ``None`` for markers with no question
+    ref (the credit markers). It is stamped onto every harvested record so a
+    residual join knows how to translate a query into the record's id space instead
+    of guessing (see the module docstring + ``performance_analysis.id_mapping``).
+    """
 
     name: str
     regex: re.Pattern[str]
+    qid_kind: str | None = None
 
 
 def coerce_value(raw: str | None) -> object:
@@ -111,11 +142,11 @@ def _parse_line_ts(line: str) -> str | None:
 
 
 # --- Marker registry ---------------------------------------------------------
-# ``question=`` on GAP_FILL_V2 / GHOST_FORECAST / GHOST_FORECAST_JSON comes from
-# ``log_prefix`` (see ``agentic_gap_fill.py``: ``f"question={ref} "``) and is
-# prepended BEFORE the marker token, so it's an optional leading group there. On
-# EXTRACTION_RUNG / OPEN_BOUND_PILING / CLOSE_MARGIN the ``question=`` is a normal
-# field AFTER the token.
+# ``question=`` on GAP_FILL_V2 / GHOST_PRE / GHOST_PRE_JSON / GHOST_FORECAST /
+# GHOST_FORECAST_JSON comes from ``log_prefix`` (see ``agentic_gap_fill.py``:
+# ``f"question={ref} "``) and is prepended BEFORE the marker token, so it's an
+# optional leading group there. On EXTRACTION_RUNG / OPEN_BOUND_PILING /
+# CLOSE_MARGIN the ``question=`` is a normal field AFTER the token.
 MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "extraction_rung",
@@ -123,9 +154,18 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"EXTRACTION_RUNG:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
             r"\s+qtype=(?P<qtype>\S+)\s+rung=(?P<rung>\S+)\s+block_present=(?P<block_present>\S+)"
         ),
+        qid_kind=QID_KIND_QUESTION_ID,  # value_extraction.py emits question.id_of_question
     ),
     MarkerSpec(
         "gap_fill_v2",
+        # The trailing counter group (provenance_rejections .. conclude_gate_rejections,
+        # added 2026-07-21) is OPTIONAL: re-harvesting replays pre-branch logs whose
+        # lines end at lint_rejections, and a mandatory tail would drop every one of
+        # those records on the next replace-by-run sync. Missing groups coerce to None.
+        # ``error`` (added 2026-07-23) is nested one level deeper — it is always
+        # emitted alongside the 2026-07-21 counters, so it can only appear after
+        # conclude_gate_rejections; it captures greedily to end-of-line because it
+        # holds ``repr(exc)`` which contains spaces (``error=None`` on healthy runs).
         re.compile(
             r"(?:question=(?P<question>\S+)\s+)?GAP_FILL_V2:\s*model=(?P<model>.+?)"
             r"\s+steps=(?P<steps>\S+)\s+tool_calls=(?P<tool_calls>\S+)\s+searches=(?P<searches>\S+)"
@@ -134,13 +174,38 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+concluded_early=(?P<concluded_early>\S+)\s+wall_s=(?P<wall_s>\S+)"
             r"\s+findings=(?P<findings>\S+)\s+pending_leads=(?P<pending_leads>\S+)"
             r"\s+lint_rejections=(?P<lint_rejections>\S+)"
+            r"(?:\s+provenance_rejections=(?P<provenance_rejections>\S+)"
+            r"\s+quote_mismatch_warnings=(?P<quote_mismatch_warnings>\S+)"
+            r"\s+plan_gaps=(?P<plan_gaps>\S+)\s+plan_skipped=(?P<plan_skipped>\S+)"
+            r"\s+conclude_gate_rejections=(?P<conclude_gate_rejections>\S+)"
+            r"(?:\s+error=(?P<error>.*))?)?"
         ),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py emits question.page_url (post id)
+    ),
+    # Pre-research counterparts to the GHOST_FORECAST pair below, emitted by
+    # ``_set_research_plan_tool`` at plan-set time. ``question=`` comes from the
+    # same ``log_prefix`` leading group, and the ``GHOST_PRE:`` token requires the
+    # colon so it can't collide with ``GHOST_PRE_JSON`` under the one-marker-per-line
+    # ``break`` (same mechanism as the GHOST_FORECAST / GHOST_FORECAST_JSON pair).
+    MarkerSpec(
+        "ghost_pre",
+        re.compile(
+            r"(?:question=(?P<question>\S+)\s+)?GHOST_PRE:\s*gaps=(?P<gaps>\S+)"
+            r"\s+sensitive_assumptions=(?P<sensitive_assumptions>\S+)"
+        ),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
+    ),
+    MarkerSpec(
+        "ghost_pre_json",
+        re.compile(r"(?:question=(?P<question>\S+)\s+)?GHOST_PRE_JSON:\s*(?P<forecast_json>\{.*\})\s*$"),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
     ),
     MarkerSpec(
         "ghost_forecast",
         re.compile(
             r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST:\s*qtype=(?P<qtype>\S+)\s+summary=(?P<summary>.*)$"
         ),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
     ),
     # Additive full-fidelity companion to ``ghost_forecast``. ``question=`` comes
     # from ``log_prefix`` (same leading-group mechanism as GAP_FILL_V2 /
@@ -152,6 +217,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "ghost_forecast_json",
         re.compile(r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST_JSON:\s*(?P<forecast_json>\{.*\})\s*$"),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
     ),
     MarkerSpec(
         "open_bound_piling",
@@ -160,6 +226,7 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+bound=(?P<bound>\S+)\s+bin_mass=(?P<bin_mass>\S+)"
             r"\s+declared_edge=(?P<declared_edge>\S+)\s+bound_value=(?P<bound_value>\S+)"
         ),
+        qid_kind=QID_KIND_QUESTION_ID,  # numeric/diagnostics.py emits question.id_of_question
     ),
     MarkerSpec(
         "close_margin",
@@ -168,6 +235,7 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+submitted_at=(?P<submitted_at>\S+)\s+window_s=(?P<window_s>\S+)"
             r"\s+margin_s=(?P<margin_s>\S+)\s+margin_frac=(?P<margin_frac>\S+)"
         ),
+        qid_kind=QID_KIND_QUESTION_ID,  # close_margin.py emits question.id_of_question
     ),
     MarkerSpec(
         "credit_balance",
@@ -229,6 +297,10 @@ def _build_record(
         record[field] = raw if field in _RAW_FIELDS else coerce_value(raw)
     if "question" in record:
         record["qid"] = qid_from_ref(record["question"])
+        # ``qid_kind`` names which Metaculus id space ``qid`` lives in, so a residual
+        # join can translate a query into this record's space instead of guessing
+        # (see the module docstring). Only meaningful for question-bearing markers.
+        record["qid_kind"] = spec.qid_kind
     return record
 
 

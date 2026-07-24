@@ -298,6 +298,13 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
             temperature=None,
             num_searches_to_run=2,
             num_sites_per_search=10,
+            # 0.2.92 gained SmartSearcher citation controls (include_works_cited_list,
+            # use_brackets_around_citations), both defaulting to False. Pin them
+            # False explicitly so the research-text shape stays as it is today — no
+            # appended works-cited footer, no inline [n] brackets — even if a future
+            # upstream default flips them on.
+            include_works_cited_list=False,
+            use_brackets_around_citations=False,
         )
         prompt = (
             "You are an assistant to a superforecaster. The superforecaster will give"
@@ -314,8 +321,9 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         model_name = "openrouter/perplexity/sonar-reasoning-pro" if use_open_router else "perplexity/sonar-pro"
-        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-        # defer to provider defaults. No top_p.
+        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
+        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
+        # kept to pin provider-default sampling against a future default flip. No top_p.
         model = GeneralLlm(model=model_name, temperature=None)
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
@@ -371,8 +379,10 @@ def build_native_search_llm(
 
     kwargs: dict = dict(
         model=model_with_search,
-        # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-        # reasoning models defer to provider defaults. top_p left unset.
+        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
+        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
+        # kept to pin provider-default sampling against a future default flip. reasoning
+        # models defer to provider defaults. top_p left unset.
         temperature=None,
         max_tokens=NATIVE_SEARCH_MAX_TOKENS,
         timeout=NATIVE_SEARCH_TIMEOUT,

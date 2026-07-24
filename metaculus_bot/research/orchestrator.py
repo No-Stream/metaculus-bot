@@ -110,6 +110,15 @@ class ResearchOrchestrator:
         # pop_provider_diagnostics when assembling the published comment.
         self._comment_diagnostics: dict[int, str] = {}
         self.timeout_count: int = 0
+        # Genuine gap-fill-v2 CRASHES (not idle "driver found nothing" runs, not
+        # deadline hits). Mirrors timeout_count: surfaced to the forecaster as
+        # _gap_fill_v2_error_count and folded into alertable_count so a dead v2
+        # feature reddens CI. A dead-on-arrival bug (the fastapi eager-import
+        # defect) bumps this on EVERY question -> CI reddens immediately; a
+        # one-off transient provider 500 bumps it once -> an accepted rare false
+        # alarm (investigating that beats silently missing a dead feature). See
+        # run_research for the three mutually-exclusive bump points.
+        self.gap_fill_v2_error_count: int = 0
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)
@@ -164,6 +173,21 @@ class ResearchOrchestrator:
                         logger.exception("Gap-fill v1 stage failed; proceeding without it")
                         return ""
 
+                def _count_gap_fill_v2_error(_exc: BaseException) -> None:
+                    # Bumped ONLY on a genuine v2 crash, never on an idle
+                    # "found nothing" run or a deadline hit. Three
+                    # mutually-exclusive crash paths, one bump each (no
+                    # double-count): (a) the loop-internal soft-fail — detected
+                    # post-gather via the archive payload's telemetry["error"];
+                    # (b) this seam's construction-error soft-fail — via
+                    # run_gap_fill_v2's on_error callback; (c) the import/escape
+                    # error in _run_v2's except — counted directly there. (a) and
+                    # (b) are exclusive because (b)'s error means the loop never
+                    # ran (no payload), and (c) is exclusive of both because the
+                    # seam swallows all Exception, so nothing escapes it once
+                    # construction succeeds.
+                    self.gap_fill_v2_error_count += 1
+
                 async def _run_v2() -> str:
                     if not gap_fill_v2_active:
                         return ""
@@ -177,12 +201,27 @@ class ResearchOrchestrator:
                             research,
                             is_benchmarking=self._is_benchmarking,
                             archive_sink=_capture_gap_fill_v2,
+                            on_error=_count_gap_fill_v2_error,
                         )
                     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
                         logger.exception("Gap-fill v2 stage failed; proceeding without it")
+                        # Path (c): an import failure (or any escape past the
+                        # seam's own soft-fail) is a crash — count it directly
+                        # here since no payload/on_error fires on this path.
+                        self.gap_fill_v2_error_count += 1
                         return ""
 
                 addendum, v2_findings = await asyncio.gather(_run_v1(), _run_v2())
+                # Path (a): the loop ran but hit its catch-all soft-fail. The
+                # loop swallows the crash and returns findings normally, so the
+                # only crash signal is the stamped telemetry["error"] on the
+                # archive payload. Checked here (not in _run_v2) so it can't
+                # double-count with the on_error/except paths above — those
+                # produce no payload with a non-None telemetry error.
+                if gap_fill_v2_payload is not None:
+                    v2_telemetry = gap_fill_v2_payload.get("telemetry")
+                    if isinstance(v2_telemetry, dict) and v2_telemetry.get("error") is not None:
+                        self.gap_fill_v2_error_count += 1
                 if addendum:
                     research = f"{research}\n\n---\n\n## Targeted Gap-Fill (second pass)\n\n{addendum}"
                 if v2_findings:
@@ -216,6 +255,7 @@ class ResearchOrchestrator:
                         # providers_used is kept only for legacy archive readers.
                         self._research_sink(
                             qid=qid,
+                            post_id=getattr(question, "id_of_post", None),
                             page_url=question.page_url,
                             question_text=question.question_text,
                             research_text=research,
@@ -567,8 +607,8 @@ class ResearchOrchestrator:
             model_name = "perplexity/sonar-reasoning-pro"
         model = GeneralLlm(
             model=model_name,
-            # temperature=None (not omitted): GeneralLlm injects temperature=0 otherwise;
-            # defer to provider defaults. No top_p.
+            # temperature=None defers to provider defaults; redundant on ft 0.2.92
+            # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
         )

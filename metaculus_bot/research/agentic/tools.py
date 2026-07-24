@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
+import socket
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -86,6 +88,7 @@ FETCH_DESCRIPTION = (
     "are leads you can fetch next.\n"
     "Use read_document instead only when you need a specific question answered\n"
     "from inside a long/complex document.\n"
+    "Do NOT fetch metaculus.com URLs — the question brief already reflects them.\n"
     'Example: fetch(url="https://www.ons.gov.uk/releases/gdpquarterly")\n'
     'Example: fetch(url="https://example.gov/long-report", start_char=12000)'
 )
@@ -435,12 +438,32 @@ async def _read_response_body(resp: aiohttp.ClientResponse, label: str) -> bytes
     return await read_body_capped(resp, max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, label=label)
 
 
+_METACULUS_FETCH_BLOCK_MSG = (
+    "Metaculus pages are already reflected in the question brief; do not fetch metaculus.com URLs."
+)
+
+
 async def _fetch_plain(url: str) -> PlainFetchResult:
     if not await resolution_source.is_public_http_url(url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
             text="Blocked non-public or unsupported URL.",
+            links=[],
+            url=url,
+        )
+    # Block metaculus.com from our runner IP. Question pages are a JS SPA whose
+    # near-empty plain fetch would auto-escalate to headless Chromium, whose
+    # route guard then permits the SPA's own XHR fan-out to the Metaculus API —
+    # all from our IP, on the same host the critical API calls use. Blocking here
+    # (before _get_session) kills both our-IP rungs; rendered only runs after a
+    # plain fetch. The brief already embeds the resolution criteria these URLs
+    # would yield. (read_document is Gemini's IP, not ours, so it is not gated.)
+    if resolution_source.is_metaculus_self_ref(url):
+        return PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=_METACULUS_FETCH_BLOCK_MSG,
             links=[],
             url=url,
         )
@@ -471,6 +494,17 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                                     status="blocked",
                                     method="plain",
                                     text="Blocked non-public redirect target.",
+                                    links=[],
+                                    url=next_url,
+                                    content_type=content_type or None,
+                                )
+                            # A 3xx to metaculus.com must not be followed either (same
+                            # our-IP / no-new-info rationale as the initial-URL block).
+                            if resolution_source.is_metaculus_self_ref(next_url):
+                                return PlainFetchResult(
+                                    status="blocked",
+                                    method="plain",
+                                    text=_METACULUS_FETCH_BLOCK_MSG,
                                     links=[],
                                     url=next_url,
                                     content_type=content_type or None,
@@ -573,6 +607,91 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
     return PlainFetchResult(status="error", method="plain", text="Redirect limit exceeded.", links=[], url=url)
 
 
+def _host_resolver_rule(host: str, ip: str) -> str:
+    """Build the Chromium ``--host-resolver-rules`` MAP value pinning ``host`` to ``ip``.
+
+    IPv6 literals must be bracketed in the MAP target per Chromium's rule parser
+    (``MAP host [dead::beef]``); IPv4 literals are bare. A malformed ``ip`` is
+    passed through unbracketed — callers only ever feed this a value already
+    vetted by :func:`_resolve_pinned_host`, so that branch is defensive only.
+    """
+    try:
+        parsed_ip = ipaddress.ip_address(ip)
+    except ValueError:
+        target = ip
+    else:
+        target = f"[{ip}]" if parsed_ip.version == 6 else ip
+    return f"--host-resolver-rules=MAP {host} {target}"
+
+
+async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
+    """Vet ``url``'s host and resolve it to ONE public IP for Chromium DNS pinning.
+
+    Returns ``(host, vetted_ip)`` — the ``--host-resolver-rules=MAP`` operands — or
+    ``None`` when the URL is non-public, unresolvable, or ANY resolved address is
+    disallowed. Mirrors :func:`resolution_source.is_public_http_url`'s classification
+    (scheme, userinfo, and the shared :func:`resolution_source._ip_is_disallowed`
+    predicate) so Chromium can only dial an address the airtight aiohttp
+    ``FilteringResolver`` path would also accept.
+
+    This is what closes the DNS-rebinding TOCTOU on the rendered rung: the per-request
+    ``_guard_route`` preflight runs its own ``getaddrinfo`` independently of Chromium's
+    socket connect, so a rebinding host (TTL 0) can pass the preflight and connect to a
+    private IP. Pinning the main-frame host to a single pre-vetted IP removes that
+    second resolution entirely — Chromium's connect can only reach the vetted address.
+
+    Fails CLOSED: on any rejection the caller skips Chromium for that host and the
+    fetch ladder degrades to plain / read_document.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    # Userinfo defeats hostname-based trust (`https://trusted@10.0.0.1/`).
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    host = parsed.hostname or ""
+    if not host:
+        return None
+
+    # IP-literal host: no DNS to rebind. Vet directly and pin to itself.
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if resolution_source._ip_is_disallowed(literal):
+            return None
+        return host, str(literal)
+
+    # Hostname branch: resolve once off the event loop, reject if ANY resolved
+    # address is disallowed (same rebinding-defense stance as the preflight),
+    # and pin to the first survivor.
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except (socket.gaierror, OSError):
+        return None
+    vetted_ip: str | None = None
+    for info in infos:
+        # sockaddr shape: IPv4 = (ip, port); IPv6 = (ip, port, flowinfo, scopeid).
+        sockaddr = info[4] if len(info) >= 5 else None
+        if not sockaddr:
+            return None
+        try:
+            resolved = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return None
+        if resolution_source._ip_is_disallowed(resolved):
+            return None
+        if vetted_ip is None:
+            vetted_ip = str(resolved)
+    if vetted_ip is None:
+        return None
+    return host, vetted_ip
+
+
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
         from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
@@ -580,22 +699,45 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
         _warn_playwright_unavailable_once(exc)
         return None
 
+    # Pin Chromium's DNS to a single pre-vetted public IP BEFORE launch. If the
+    # host can't be resolved to a public address, fail closed: skip Chromium and
+    # let the ladder fall back to plain / read_document (same graceful-failure
+    # signal as a playwright-unavailable / render-error return).
+    pinned = await _resolve_pinned_host(url)
+    if pinned is None:
+        logger.warning("agentic rendered fetch skipped (host not pinnable to a public IP): %s", urlparse(url).netloc)
+        return None
+    host, vetted_ip = pinned
+
     try:
         async with _host_gate(url), _RENDERED_FETCH_GLOBAL_SEMAPHORE:
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=True)
+                # --host-resolver-rules pins the browser's own resolution to the IP we
+                # vetted above, so Chromium's socket connect cannot independently
+                # re-resolve `host` to a private address (the DNS-rebinding TOCTOU that
+                # the per-request preflight in _guard_route alone cannot close). A fresh
+                # browser is launched per call, so per-launch host-resolver-rules is clean.
+                browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=[_host_resolver_rule(host, vetted_ip)],
+                )
                 context = await browser.new_context(
                     user_agent=BROWSER_HEADERS["User-Agent"],
                     extra_http_headers={key: value for key, value in BROWSER_HEADERS.items() if key != "User-Agent"},
                 )
 
-                # Re-apply the SSRF check to EVERY request Chromium makes (main-frame
-                # goto, server and client-side redirects, subresources) — Chromium does
-                # its own DNS resolution and redirect-following outside the aiohttp
-                # FilteringResolver boundary. Residual DNS-rebinding TOCTOU: the route
-                # handler's getaddrinfo resolves independently of Chromium's connect,
-                # so unlike the aiohttp FilteringResolver this is not airtight; a
-                # filtering forward proxy would be — deferred as its own change.
+                # Defense-in-depth on top of the main-frame pin above. The route guard
+                # re-checks EVERY request Chromium makes (main-frame goto, server and
+                # client-side redirects, subresources) against is_public_http_url.
+                # Threat model: these fetches run on GitHub-hosted Azure runners, where a
+                # request to a link-local / RFC1918 host (Azure IMDS at 169.254.169.254,
+                # localhost services, the internal runner network) would exfiltrate
+                # internal content into the research prompt AND the public Metaculus
+                # comment. The main-frame host is now pinned, so its rebinding TOCTOU is
+                # closed; subresource / redirect hosts remain guarded only by this
+                # per-request preflight (whose getaddrinfo resolves independently of
+                # Chromium's connect), so their rebinding TOCTOU is a documented residual
+                # — a filtering forward proxy would close it, deferred as its own change.
                 async def _guard_route(route: Any, request: Any) -> None:
                     if await resolution_source.is_public_http_url(request.url):
                         await route.continue_()

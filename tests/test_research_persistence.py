@@ -47,6 +47,36 @@ class TestResearchPersistenceWriter:
         assert record["research_chars"] == len("Some research about X happening.")
         assert record["schema_version"] == RESEARCH_SCHEMA_VERSION
 
+    def test_post_id_written_when_provided(self, tmp_path: Path) -> None:
+        # The divergent 38880/38195 case: qid is the QUESTION id, post_id the POST id.
+        # post_id is written as an explicit field so residual analysis can join to
+        # post-id-keyed telemetry (GAP_FILL_V2 / GHOST_FORECAST) without URL parsing.
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer.record(
+            qid=38195,
+            post_id=38880,
+            page_url="https://www.metaculus.com/questions/38880/",
+            question_text="Q?",
+            research_text="body",
+            providers_used=["asknews"],
+            gap_fill_used=False,
+        )
+        record = writer._records[0]
+        assert record["qid"] == 38195
+        assert record["post_id"] == 38880
+
+    def test_post_id_defaults_to_none_for_older_callers(self, tmp_path: Path) -> None:
+        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer.record(
+            qid=12345,
+            page_url="https://www.metaculus.com/questions/12345/",
+            question_text="Q?",
+            research_text="body",
+            providers_used=[],
+            gap_fill_used=False,
+        )
+        assert writer._records[0]["post_id"] is None
+
     def test_multiple_records_produce_multiple_lines(self, tmp_path: Path) -> None:
         writer = ResearchPersistenceWriter(run_mode="minibench", tournament_id="t-1", run_id="local")
         for i in range(5):
