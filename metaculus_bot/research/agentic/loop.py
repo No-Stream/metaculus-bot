@@ -1428,6 +1428,27 @@ async def _run_loop_body(
     return _freeze_result(state, findings_markdown, ghost)
 
 
+# Slop allowance when deciding whether a TimeoutError out of the outer wait_for
+# is a genuine wall-deadline hit. On Python 3.11+ asyncio.TimeoutError IS builtin
+# TimeoutError, so a connection-level timeout raised inside the (unguarded)
+# driver call surfaces in the same except as a real wait_for deadline. We tell
+# them apart by elapsed wall time: a genuine deadline hit has elapsed ≈
+# wall_deadline_s, an inner timeout fires earlier. This epsilon absorbs
+# scheduling jitter in that comparison.
+_DEADLINE_SLOP_S = 0.5
+
+
+def _finalize_loop_exit(state: _LoopState, now_fn: Callable[[], float], log_prefix: str) -> LoopResult:
+    """Shared soft-fail tail for the deadline-hit and crash exits of the outer
+    ``wait_for``: stamp elapsed wall time, render whatever findings were banked,
+    emit the completion marker, and freeze. Callers set ``deadline_hit`` /
+    ``error`` on ``state.telemetry`` before calling."""
+    state.telemetry.wall_s = now_fn() - state.started_at_s
+    findings_markdown = render_findings(state.findings, state.pending_leads)
+    _log_completion(state, log_prefix)
+    return _freeze_result(state, findings_markdown, None)
+
+
 async def run_agentic_loop(
     system_prompt: str,
     user_brief: str,
@@ -1473,23 +1494,30 @@ async def run_agentic_loop(
         )
     except asyncio.CancelledError:
         raise
-    except asyncio.TimeoutError:
-        state.telemetry.deadline_hit = True
-        state.telemetry.wall_s = now_fn() - state.started_at_s
-        findings_markdown = render_findings(state.findings, state.pending_leads)
-        _log_completion(state, log_prefix)
-        return _freeze_result(state, findings_markdown, None)
+    except asyncio.TimeoutError as exc:
+        # asyncio.TimeoutError == builtin TimeoutError on 3.11+, so a bare
+        # connection-level timeout from inside the unguarded driver call lands
+        # here too — NOT just a genuine outer wait_for deadline. Classify by
+        # elapsed wall time: a real deadline hit has elapsed ≈ wall_deadline_s; an
+        # inner timeout fires earlier and is a crash, so it stamps error and
+        # bumps the orchestrator counter like any other soft-fail.
+        elapsed = now_fn() - state.started_at_s
+        if elapsed >= config.wall_deadline_s - _DEADLINE_SLOP_S:
+            state.telemetry.deadline_hit = True
+        else:
+            logger.exception("%sAgentic loop hit a non-deadline TimeoutError; soft-failing", log_prefix)
+            # Newline-sanitize: the GAP_FILL_V2 marker regex captures error= to
+            # end-of-line, so an embedded newline would truncate the harvest.
+            state.telemetry.error = repr(exc).replace("\n", " ")
+        return _finalize_loop_exit(state, now_fn, log_prefix)
     except Exception as exc:  # noqa: BLE001, HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
         logger.exception("%sAgentic loop failed; soft-failing to banked findings if any", log_prefix)
         # Stamp the crash so the completion marker (error=...) and the
         # orchestrator's alertable counter can tell this apart from an idle
-        # "found nothing" run — the TimeoutError branch above deliberately does
-        # NOT set this (a deadline hit is expected degradation, not a crash).
-        state.telemetry.error = repr(exc)
-        state.telemetry.wall_s = now_fn() - state.started_at_s
-        findings_markdown = render_findings(state.findings, state.pending_leads)
-        _log_completion(state, log_prefix)
-        return _freeze_result(state, findings_markdown, None)
+        # "found nothing" run — a genuine deadline hit (above) sets deadline_hit
+        # instead and leaves error None. Newline-sanitize for the marker regex.
+        state.telemetry.error = repr(exc).replace("\n", " ")
+        return _finalize_loop_exit(state, now_fn, log_prefix)
 
 
 __all__ = ["LlmCall", "run_agentic_loop"]

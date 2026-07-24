@@ -50,9 +50,19 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     (localhost + AF_UNIX + socketpair allowed, real hosts blocked) without taking
     the dependency.
 
-    Opt out with ``@pytest.mark.allow_network`` on a test that must reach a real
-    host (the ``live`` suite is already deselected by ``addopts = -m 'not live'``,
-    so this marker is a belt-and-suspenders escape hatch, not the primary gate).
+    Two independent markers skip the guard:
+
+    - ``@pytest.mark.allow_network`` — a normally-selected test that must reach a
+      real host (belt-and-suspenders escape hatch).
+    - ``@pytest.mark.live`` — the live suite (e.g. ``tests/test_smoke_real_llm.py``),
+      which makes real API calls by design and carries no ``allow_network`` marker.
+
+    Deselection and exemption are separate concerns. ``addopts = -m 'not live'``
+    DESELECTS the live suite so a plain ``make test`` never runs it (and it never
+    reaches this guard). ``make test_live`` (``pytest -m live``) re-selects it, at
+    which point this exemption is what keeps the guard from blocking the real API
+    calls those tests exist to make. So the ``live`` exemption is load-bearing for
+    ``make test_live``, not merely belt-and-suspenders.
 
     See also ``metaculus_bot.ablation.offline_replay.no_network()`` — a scoped
     context manager (ablation replay only) that blocks ``socket.getaddrinfo`` at
@@ -61,6 +71,8 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     skip DNS resolution entirely. Different scopes on purpose; don't consolidate.
     """
     if request.node.get_closest_marker("allow_network") is not None:
+        return
+    if request.node.get_closest_marker("live") is not None:
         return
 
     real_connect = socket.socket.connect

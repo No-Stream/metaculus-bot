@@ -64,6 +64,7 @@ Seams covered:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import agents
@@ -400,7 +401,7 @@ class TestFallbackOpenRouterKeySwap:
         assert [c["api_key"] for c in calls] == ["donated-key", "personal-key"]
 
 
-def _forward_to_real_litellm_with_mock(mock_text: str):
+def _forward_to_real_litellm_with_mock(mock_text: str) -> tuple[Callable[..., Any], list[dict[str, Any]]]:
     """Wrap the REAL ``litellm.acompletion``, injecting ``mock_response``.
 
     The whole point of this indirection: ``build_default_llm_call``'s
@@ -412,12 +413,18 @@ def _forward_to_real_litellm_with_mock(mock_text: str):
     eager import of its proxy MCP-gateway handler still fires (``mock_response``
     only short-circuits the network, AFTER that import). A plain ``AsyncMock``
     here would defeat the whole test by skipping the import entirely.
+
+    Returns the wrapper plus a ``calls`` list recording each forwarded call's
+    kwargs, so a test can assert what actually reached ``litellm.acompletion``
+    (specifically that a non-empty ``tools=`` did — the seam only fires on that).
     """
+    calls: list[dict[str, Any]] = []
 
     async def _wrapper(**kwargs: Any) -> Any:
+        calls.append(kwargs)
         return await litellm.acompletion(**kwargs, mock_response=mock_text)
 
-    return _wrapper
+    return _wrapper, calls
 
 
 class TestAgenticToolsPathExecutesUnderLitellm:
@@ -441,7 +448,8 @@ class TestAgenticToolsPathExecutesUnderLitellm:
         monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-personal-key")
         # Forward to the REAL litellm so the tools=-gated MCP import actually runs.
-        monkeypatch.setattr(agentic_llm, "acompletion", _forward_to_real_litellm_with_mock("MOCKED"))
+        wrapper, forwarded_calls = _forward_to_real_litellm_with_mock("MOCKED")
+        monkeypatch.setattr(agentic_llm, "acompletion", wrapper)
 
         call = agentic_llm.build_default_llm_call(LoopConfig(model="openai/gpt-5.6-terra", reasoning_effort="low"))
         # One plain function tool — exactly the shape the gap-fill loop passes.
@@ -467,3 +475,11 @@ class TestAgenticToolsPathExecutesUnderLitellm:
         result = await call([{"role": "user", "content": "hi"}], tools_json)
 
         assert result.choices[0].message.content == "MOCKED"
+        # The MCP-import seam only fires when a non-empty tools= actually reaches
+        # litellm.acompletion. Assert it did, so this test can't silently stop
+        # exercising the fastapi gate (e.g. if the wrapper's kwarg plumbing drifts).
+        assert forwarded_calls, "wrapper never forwarded a call to litellm.acompletion"
+        forwarded_tools = forwarded_calls[-1].get("tools")
+        assert isinstance(forwarded_tools, list) and forwarded_tools, (
+            f"tools= did not reach litellm.acompletion as a non-empty list: {forwarded_tools!r}"
+        )

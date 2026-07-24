@@ -7,6 +7,7 @@ Everything is mocked — zero LLM/network calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -16,8 +17,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.research.agentic import run_agentic_loop as _real_run_agentic_loop
 from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
-from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
+from metaculus_bot.research.agentic.types import LoopTelemetry, ToolOutcome, ToolSpec
 from metaculus_bot.research.agentic_gap_fill import run_gap_fill_v2
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
@@ -720,6 +722,36 @@ class TestOrchestratorBothFlags:
         assert "gap_fill_v2" not in records[1]
 
 
+async def _run_v2_through_orchestrator_with_driver(orch: ResearchOrchestrator, driver: Any) -> LoopTelemetry:
+    """Run the REAL agentic loop end-to-end through the orchestrator with a stub
+    ``driver``, returning the loop's telemetry.
+
+    ``run_agentic_loop`` is wrapped (patched only in the seam's namespace, so the
+    wrapper still calls the genuine loop) to capture the ``LoopResult.telemetry``
+    for assertions the orchestrator counter alone can't make — ``deadline_hit`` and
+    ``error``. ``build_default_llm_call`` is stubbed to ``driver`` (the loop's first
+    ``llm_call``), tools are faked, and a single ``AsyncMock`` stands in for the
+    research providers — mirroring the other crash-counter tests. The REAL loop's
+    ``except asyncio.TimeoutError`` classification runs, which is the point.
+    """
+    captured: dict[str, Any] = {}
+
+    async def _capturing_loop(*args: Any, **kwargs: Any) -> Any:
+        result = await _real_run_agentic_loop(*args, **kwargs)
+        captured["telemetry"] = result.telemetry
+        return result
+
+    provider = AsyncMock(return_value="research prose")
+    with (
+        patch.object(orch, "_select_research_providers", return_value=[(provider, "native_search")]),
+        patch("metaculus_bot.research.agentic_gap_fill.run_agentic_loop", _capturing_loop),
+        patch("metaculus_bot.research.agentic.loop.build_default_llm_call", return_value=driver),
+        patch("metaculus_bot.research.agentic_gap_fill.build_gap_fill_tools", return_value=_fake_tools()),
+    ):
+        await orch.run_research(make_real_binary_question())
+    return captured["telemetry"]
+
+
 class TestGapFillV2CrashCounter:
     """The alertable crash counter (orchestrator.gap_fill_v2_error_count).
 
@@ -834,3 +866,55 @@ class TestGapFillV2CrashCounter:
             await orch.run_research(make_real_binary_question())
 
         assert orch.gap_fill_v2_error_count == 0
+
+    @pytest.mark.asyncio
+    async def test_genuine_deadline_through_real_loop_does_not_bump_counter(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control through the REAL loop: a driver that runs past the wall
+        deadline is a genuine deadline hit, not a crash — deadline_hit=True, no
+        stamped error, counter stays 0. An expected-degradation deadline must not
+        redden CI (the class's 'a deadline hit must NOT [bump]' contract)."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        # Tiny wall deadline so the outer wait_for fires fast — but kept above the
+        # _DEADLINE_SLOP_S (0.5s) epsilon so elapsed ≈ wall_deadline_s classifies as
+        # a real deadline rather than being swallowed by the slop allowance.
+        monkeypatch.setattr("metaculus_bot.research.agentic_gap_fill.GAP_FILL_V2_WALL_DEADLINE", 1.0)
+
+        async def _sleeping_driver(_messages: Any, _tools: Any) -> Any:
+            await asyncio.sleep(30)  # cancelled by the outer wait_for deadline
+            raise AssertionError("driver should have been cancelled by the deadline")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        telemetry = await _run_v2_through_orchestrator_with_driver(orch, _sleeping_driver)
+
+        assert telemetry.deadline_hit is True
+        assert telemetry.error is None
+        assert orch.gap_fill_v2_error_count == 0
+
+    @pytest.mark.asyncio
+    async def test_spurious_inner_timeout_bumps_counter_and_is_not_a_deadline(
+        self, mock_llm: GeneralLlm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the TimeoutError misclassification: a bare (builtin)
+        TimeoutError raised INSIDE the driver — well before the wall deadline — is a
+        crash, not a deadline. On Python 3.11+ asyncio.TimeoutError IS builtin
+        TimeoutError, so pre-fix code stamped deadline_hit=True and never counted it.
+        Post-fix: error is stamped, deadline_hit=False, and the counter bumps once
+        via the orchestrator's post-gather archive-telemetry path."""
+        monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        # Default (large) wall deadline: the driver raises immediately, so elapsed is
+        # ~0, far below wall_deadline_s - slop, forcing the crash classification.
+
+        async def _timeout_driver(_messages: Any, _tools: Any) -> Any:
+            raise TimeoutError("simulated connection-level timeout")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        telemetry = await _run_v2_through_orchestrator_with_driver(orch, _timeout_driver)
+
+        assert telemetry.deadline_hit is False
+        assert telemetry.error is not None
+        assert "TimeoutError" in telemetry.error
+        assert orch.gap_fill_v2_error_count == 1

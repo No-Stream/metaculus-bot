@@ -61,6 +61,7 @@ so those specific rungs are not covered here (they are unit-tested in
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -718,7 +719,21 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
     # Gap-fill v2 executed and did not crash (the fastapi tripwire).
     v2_lines = [m for m in messages if "GAP_FILL_V2:" in m]
     assert v2_lines, "no GAP_FILL_V2 marker — the agentic v2 loop never ran"
-    assert any("error=None" in m for m in v2_lines), f"gap-fill v2 crashed (fastapi-class bug?): {v2_lines}"
+    clean_v2_lines = [m for m in v2_lines if "error=None" in m]
+    assert clean_v2_lines, f"gap-fill v2 crashed (fastapi-class bug?): {v2_lines}"
+    # A crash-free marker (error=None) with tool_calls=0 would still pass the check
+    # above even though the driver never issued a tool call — i.e. a driver that
+    # stopped sending tools looks identical to a healthy run. Require >=1 tool call
+    # so "the v2 loop executed" means it actually drove the tools= path. The
+    # agentic_router scripts set_research_plan + conclude, so tool_calls is >=2 here.
+    # (?<!dup_) keeps the match off the sibling dup_tool_calls= field.
+    tool_call_counts = [
+        int(match.group(1)) for m in clean_v2_lines if (match := re.search(r"(?<!dup_)tool_calls=(\d+)", m))
+    ]
+    assert tool_call_counts, f"GAP_FILL_V2 marker has no tool_calls= field: {clean_v2_lines}"
+    assert any(n > 0 for n in tool_call_counts), (
+        f"gap-fill v2 ran but issued no tool calls (tool_calls=0) — driver stopped sending tools: {clean_v2_lines}"
+    )
 
     # Provider diagnostics show the stubbed providers ran end to end. Each required
     # provider must report `ok` (its real formatting code produced non-empty text),
