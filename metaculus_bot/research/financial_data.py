@@ -28,6 +28,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
@@ -587,6 +588,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         unknown = _flag_unknown_classifier_ids(classifier_tickers, classifier_fred, extracted)
 
         tasks: list[asyncio.Task] = []
+        identifiers: list[str] = []  # the ticker/FRED id each task fetches, parallel to tasks
 
         for ticker in tickers:
             tasks.append(
@@ -594,17 +596,20 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
                     asyncio.to_thread(_fetch_yfinance_data, ticker, as_of=as_of, is_benchmarking=is_benchmarking)
                 )
             )
+            identifiers.append(ticker)
 
         if is_benchmarking:
             # Keyless ceilinged path — no FRED_API_KEY needed, works in CI, and returns
             # point-in-time vintages instead of today's revisions.
             for series_id in fred_series:
                 tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data_ceiling, series_id, as_of)))
+                identifiers.append(series_id)
         else:
             fred_api_key = os.getenv(FRED_API_KEY_ENV)
             if fred_api_key:
                 for series_id in fred_series:
                     tasks.append(asyncio.ensure_future(asyncio.to_thread(_fetch_fred_data, series_id, fred_api_key)))
+                    identifiers.append(series_id)
             elif fred_series:
                 logger.info(f"FRED_API_KEY not set, skipping {len(fred_series)} FRED series fetches")
 
@@ -614,12 +619,22 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         non_empty_results = []
-        for result in results:
+        # Per-identifier outcome for the diagnostics block: a requested ticker/FRED
+        # series that errored or returned no data is a lost source, so a partial
+        # financial fetch stays visible even when other identifiers succeed.
+        sources: dict[str, str] = {}
+        for identifier, result in zip(identifiers, results, strict=True):
             if isinstance(result, Exception):
                 logger.warning(f"Financial data fetch task failed: {result}")
+                sources[identifier] = "error"
                 continue
             if isinstance(result, str) and result.strip():
                 non_empty_results.append(result)
+                sources[identifier] = "ok"
+            else:
+                sources[identifier] = "empty"
+
+        record_provider_detail(getattr(question, "id_of_question", None), "financial_data", {"sources": sources})
 
         if not non_empty_results:
             return ""

@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Literal
 
 import aiohttp
+import ijson
 import litellm.exceptions
 from forecasting_tools.data_models.questions import MetaculusQuestion
 from rapidfuzz import fuzz
@@ -61,7 +62,8 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
-from metaculus_bot.research.http_fetch import build_session, read_body_capped
+from metaculus_bot.research.http_fetch import build_session, read_body_capped, read_body_snippet
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
 
@@ -131,6 +133,31 @@ PREDICTIT_CACHE_TTL_S = 6 * 60 * 60  # 6h
 # Max events to prefetch from Kalshi (G0 used 3k; cap matches).
 KALSHI_PREFETCH_EVENT_LIMIT = 3000
 
+# Kalshi /series streaming bounds. The endpoint is UNPAGINATED (no limit/cursor;
+# verified against docs.kalshi.com 2026-07-25), so its full-catalogue body only
+# grows — on 2026-07-25 it crossed the shared 10 MiB read cap (10.02 MiB) and
+# was silently dropped, killing the entity-recall path. We stream-parse it (see
+# `_kalshi_fetch_series_streamed`) and retain only the fields entity-matching
+# needs, so PEAK MEMORY tracks the retained metadata, not the raw payload, and a
+# growing catalogue can't re-trip a fixed size wall. These bound the STREAM:
+#  - KALSHI_SERIES_MAX_BYTES is a generous last-resort guard against a runaway /
+#    compressed-bomb body; it sits ~6x above the live catalogue so normal growth
+#    never trips it, and a breach is LOUD + counted (never a silent drop).
+#  - the read timeout covers streaming the whole body (the shared 10s per-call
+#    timeout is for small search responses; series is a bulk endpoint). It is a
+#    WALL-CLOCK budget for the whole fetch, retry included, so the bounded retry
+#    can't push this fetch past what the surrounding PREDICTION_MARKET_TIMEOUT
+#    allows the whole snapshot.
+KALSHI_SERIES_MAX_BYTES = 64 * 1024 * 1024
+KALSHI_SERIES_HTTP_TIMEOUT = 30.0
+KALSHI_SERIES_MAX_ATTEMPTS = 2
+_KALSHI_SERIES_READ_CHUNK_BYTES = 65536
+# Mirrors _http_get_with_backoff's default retryable set (403 = Kalshi's rate-limit
+# shape); >= 500 is also retried.
+_KALSHI_SERIES_RETRYABLE_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
+# ijson structural events, i.e. the ones that carry no scalar `value` to keep.
+_IJSON_CONTAINER_EVENTS = frozenset({"start_map", "map_key", "end_map", "start_array", "end_array"})
+
 # Buffer applied to scheduled_resolution_time when the orchestrator derives a
 # default `as_of`. Subtracting a day keeps backtest as_of strictly before any
 # market that closes alongside the question, defending against same-day leakage.
@@ -170,6 +197,12 @@ class MarketMatch:
 @dataclass
 class MarketSnapshot:
     matches: list[MarketMatch] = field(default_factory=list)
+    # Per-source outcome tokens ({source_name: token}) for the provider-diagnostics
+    # line: the 4 platforms plus `kalshi_series` (the entity-index fetch). A token
+    # starting with "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)",
+    # "error(...)") is a LOST source. Lets partial degradation — a live platform
+    # while a sub-source silently died — surface per-question. See provider_diagnostics.
+    sources: dict[str, str] = field(default_factory=dict)
 
 
 def _liquidity_label(m: MarketMatch) -> str:
@@ -218,13 +251,47 @@ _KEYWORD_CACHE: dict[int, list[str]] = {}
 # at different as-of instants from sharing a snapshot computed at one as-of.
 _SNAPSHOT_CACHE: dict[tuple[int, str], MarketSnapshot] = {}
 
+# Per-run count of Kalshi /series fetch failures. The series fetch feeds the
+# entity-recall path; when it dies (HTTP/transport/parse error, or the generous
+# safety ceiling) the provider still returns fuzzy-over-events matches, so the
+# failure is otherwise INVISIBLE — no counter, status="ok" (the 2026-07-25
+# observability hole: research_provider_timeouts=0 while the path was dead).
+# The orchestrator folds this into alertable_count, so a series path that's dead
+# every question reddens CI instead of vanishing. A one-off transient bumps it
+# once (an accepted rare false alarm, mirroring gap_fill_v2_error_count).
+# Module-level like the caches => accumulates per run; reset between tests.
+_KALSHI_SERIES_FETCH_FAILURES: int = 0
+
+
+def _bump_kalshi_series_failure() -> None:
+    global _KALSHI_SERIES_FETCH_FAILURES
+    _KALSHI_SERIES_FETCH_FAILURES += 1
+
+
+def kalshi_series_fetch_failures() -> int:
+    """Per-run count of Kalshi /series fetch failures (folded into alertable_count)."""
+    return _KALSHI_SERIES_FETCH_FAILURES
+
+
+def reset_series_degradation_counter() -> None:
+    """Zero the series-degradation counter at run start.
+
+    The provider is a stateless callable, so the counter lives at module scope;
+    without a run-start reset it would leak across runs sharing one process (and
+    across tests, polluting every later alertable_count == 0 assertion). Called
+    from forecast_questions alongside reset_pchip_stats — same per-run cadence."""
+    global _KALSHI_SERIES_FETCH_FAILURES
+    _KALSHI_SERIES_FETCH_FAILURES = 0
+
 
 def _reset_session_caches() -> None:
     """Clear all per-session caches. Called between tests and at session start."""
+    global _KALSHI_SERIES_FETCH_FAILURES
     _KALSHI_CACHE.clear()
     _PREDICTIT_CACHE.clear()
     _KEYWORD_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
+    _KALSHI_SERIES_FETCH_FAILURES = 0
 
 
 def _get_session() -> aiohttp.ClientSession:
@@ -435,8 +502,8 @@ async def _http_get_with_backoff(
                     cumulative_sleep += sleep_for
                     continue
                 if status != 200:
-                    text = (await resp.text())[:200]
-                    logger.warning(f"{label} HTTP {status} non-retryable: {text}")
+                    snippet = await read_body_snippet(resp)
+                    logger.warning(f"{label} HTTP {status} non-retryable: {snippet}")
                     return None
                 return await _read_json_capped(resp, label)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -748,8 +815,8 @@ async def _kalshi_prefetch_events(
                     logger.warning("Kalshi 429 during prefetch; stopping pagination early")
                     break
                 if resp.status != 200:
-                    text = (await resp.text())[:200]
-                    logger.warning(f"Kalshi prefetch HTTP {resp.status}: {text}")
+                    snippet = await read_body_snippet(resp)
+                    logger.warning(f"Kalshi prefetch HTTP {resp.status}: {snippet}")
                     break
                 data = await _read_json_capped(resp, "Kalshi prefetch")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -941,28 +1008,170 @@ def _match_entities_to_series(
     return [t for t, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)][:KALSHI_ENTITY_MAX_SERIES]
 
 
-async def _kalshi_prefetch_series(session: Any) -> list[dict]:
+async def _kalshi_fetch_series_attempt(session: Any, *, timeout_s: float) -> tuple[list[dict] | None, str, bool]:
+    """One streamed /series request. Returns ``(series, reason, retryable)``.
+
+    Parses at the ijson EVENT level (`ijson.parse_coro` yields prefix-annotated
+    events) rather than materializing each series object, for two reasons:
+
+    - Only the four fields entity-matching consumes are ever retained, so peak
+      memory tracks the kept metadata (~kilobytes/series) instead of the raw
+      payload, and the catalogue can grow without tripping a fixed size wall.
+    - The events expose the TOP-LEVEL shape, which item-level extraction cannot
+      see: an HTTP 200 carrying ``{"error": "temporarily unavailable"}`` or
+      ``{"series": null}`` yields zero items, exactly like a legitimately empty
+      catalogue. Without `saw_series_array` that lands in the 6h cache as a valid
+      empty index and silently disables entity matching.
+
+    ``retryable`` is True for transport failures and transient statuses, and for a
+    missing ``series`` array (the "temporarily unavailable" 200 is a transient
+    upstream state, and such a body is tiny). It is False for the size ceiling and
+    for malformed JSON, where a second identical request just burns the budget.
+    """
+    kept: list[dict] = []
+    saw_series_array = False
+
+    @ijson.coroutine
+    def _collect():  # noqa: ANN202  # ijson push-parser target (untyped ijson coroutine)
+        nonlocal saw_series_array
+        current: dict[str, Any] | None = None
+        while True:
+            prefix, event, value = yield
+            if prefix == "series":
+                if event == "start_array":
+                    saw_series_array = True
+                continue
+            if prefix == "series.item":
+                if event == "start_map":
+                    current = {"ticker": None, "title": None, "category": None, "tags": []}
+                elif event == "end_map":
+                    if current is not None and current["ticker"] and current["title"]:
+                        kept.append(current)
+                    current = None
+                continue
+            if current is None or event in _IJSON_CONTAINER_EVENTS:
+                continue
+            if prefix == "series.item.ticker":
+                current["ticker"] = value
+            elif prefix == "series.item.title":
+                current["title"] = value
+            elif prefix == "series.item.category":
+                current["category"] = value
+            elif prefix == "series.item.tags.item":
+                current["tags"].append(value)
+
+    timeout = aiohttp.ClientTimeout(total=timeout_s, sock_read=timeout_s)
+    total = 0
+    try:
+        async with session.get(KALSHI_SERIES_URL, params={}, timeout=timeout) as resp:
+            if resp.status != 200:
+                snippet = await read_body_snippet(resp)
+                logger.warning(f"Kalshi series HTTP {resp.status}: {snippet}")
+                retryable = resp.status in _KALSHI_SERIES_RETRYABLE_STATUSES or resp.status >= 500
+                return None, f"error(http_{resp.status})", retryable
+            parser = ijson.parse_coro(_collect())
+            try:
+                async for chunk in resp.content.iter_chunked(_KALSHI_SERIES_READ_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > KALSHI_SERIES_MAX_BYTES:
+                        logger.warning(
+                            f"Kalshi series body exceeded safety ceiling "
+                            f"({total} bytes read > {KALSHI_SERIES_MAX_BYTES}); aborting stream"
+                        )
+                        return None, "dropped(size_cap)", False
+                    parser.send(chunk)
+                parser.close()
+            except ijson.JSONError as e:
+                logger.warning(f"Kalshi series stream parse failed: {type(e).__name__}: {e}")
+                return None, "error(parse)", False
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"Kalshi series transient error: {type(e).__name__}: {e}")
+        return None, f"error({type(e).__name__})", True
+    if not saw_series_array:
+        logger.warning(
+            f"Kalshi series payload carried no top-level 'series' array ({total} bytes); "
+            f"treating as a lost index, not an empty catalogue"
+        )
+        return None, "error(no_series_array)", True
+    return kept, "", False
+
+
+async def _kalshi_fetch_series_streamed(session: Any) -> tuple[list[dict] | None, str]:
+    """Stream the Kalshi /series body under a bounded retry, keeping only the four
+    fields entity-matching consumes (see `_kalshi_fetch_series_attempt`).
+
+    Retries once on a transient failure — a 503 or a connection reset would
+    otherwise drop Kalshi entity recall for the whole question. Each attempt
+    re-issues the request with a FRESH parser and accumulator, so a half-consumed
+    stream is never resumed. KALSHI_SERIES_HTTP_TIMEOUT is a WALL-CLOCK budget
+    shared by all attempts (each attempt gets what's left of it), so adding the
+    retry cannot extend the time this fetch takes from the surrounding
+    PREDICTION_MARKET_TIMEOUT the whole snapshot runs under.
+
+    Returns ``(series, reason)``: ``(list, "")`` on success (list may be empty for a
+    valid-but-empty catalogue), or ``(None, token)`` on failure, where ``token`` is a
+    provider-diagnostics source token — ``"dropped(size_cap)"`` for the ceiling,
+    ``"error(...)"`` for HTTP / transport / parse / payload-shape failure — so a lost
+    series index surfaces per-question in the diagnostics line, not just in the run
+    counter.
+    """
+    deadline = time.monotonic() + KALSHI_SERIES_HTTP_TIMEOUT
+    reason = "error(unknown)"
+    for attempt in range(KALSHI_SERIES_MAX_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            logger.warning(f"Kalshi series budget exhausted before attempt {attempt + 1}; giving up")
+            break
+        series, reason, retryable = await _kalshi_fetch_series_attempt(session, timeout_s=remaining)
+        if series is not None:
+            return series, ""
+        if not retryable or attempt + 1 >= KALSHI_SERIES_MAX_ATTEMPTS:
+            break
+        if deadline - time.monotonic() <= HTTP_RETRY_BACKOFF_SECS:
+            logger.warning(f"Kalshi series {reason}: retry budget exhausted; giving up")
+            break
+        logger.warning(
+            f"Kalshi series {reason}; retry {attempt + 2}/{KALSHI_SERIES_MAX_ATTEMPTS} "
+            f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+        )
+        await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
+    return None, reason
+
+
+async def _kalshi_prefetch_series(session: Any, *, outcome_sink: dict[str, str] | None = None) -> list[dict]:
     """Fetch the Kalshi series list once (ticker/title/category/tags), cache ~6h.
 
-    Kalshi exposes no full-text search; the series list is the sanctioned entity->ticker
-    index (one unpaginated call). Soft-fails to [] — entity retrieval is best-effort on top
-    of the fuzzy-over-prefetch path.
+    Kalshi exposes no full-text search; the series list is the sanctioned
+    entity->ticker index. It arrives as one ever-growing unpaginated body, so we
+    STREAM-PARSE it (`_kalshi_fetch_series_streamed`) rather than buffering.
+
+    A fetch failure bumps the module degradation counter (so a silently-dead
+    series path reddens CI) and is NOT cached, so the next question re-attempts.
+    Soft-fails to [] — entity retrieval is best-effort on top of the
+    fuzzy-over-prefetch path.
+
+    ``outcome_sink`` (optional) receives a ``{"kalshi_series": token}`` entry — the
+    series-index source outcome for the provider-diagnostics line, so a lost index
+    (``dropped(size_cap)`` / ``error(...)``) is visible per-question, not only in
+    the aggregate run counter. ``ok(N)`` when N series were available (fetched or
+    cached), ``none`` for a valid-but-empty catalogue.
     """
     cached = _KALSHI_CACHE.get("series")
     if cached is not None:
         ts, series = cached
         if (time.monotonic() - ts) < KALSHI_CACHE_TTL_S:
+            if outcome_sink is not None:
+                outcome_sink["kalshi_series"] = f"ok({len(series)})" if series else "none"
             return series  # noqa: ASYNC910
 
-    payload = await _http_get_with_backoff(session, KALSHI_SERIES_URL, {}, max_attempts=2, label="Kalshi series")
-    if not isinstance(payload, dict):
-        if payload is not None:
-            logger.warning("Kalshi series returned non-dict payload")
+    series, reason = await _kalshi_fetch_series_streamed(session)
+    if series is None:
+        _bump_kalshi_series_failure()
+        if outcome_sink is not None:
+            outcome_sink["kalshi_series"] = reason or "error(unknown)"
         return []  # noqa: ASYNC910
-    series = payload.get("series")
-    if not isinstance(series, list):
-        return []  # noqa: ASYNC910
-    series = [s for s in series if isinstance(s, dict)]
+    if outcome_sink is not None:
+        outcome_sink["kalshi_series"] = f"ok({len(series)})" if series else "none"
     _KALSHI_CACHE["series"] = (time.monotonic(), series)
     return series  # noqa: ASYNC910
 
@@ -996,7 +1205,9 @@ async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[di
     return events  # noqa: ASYNC910
 
 
-async def _kalshi_entity_matches(session: Any, question: Any, queries: list[str], *, top_k: int) -> list[MarketMatch]:
+async def _kalshi_entity_matches(
+    session: Any, question: Any, queries: list[str], *, top_k: int, outcome_sink: dict[str, str] | None = None
+) -> list[MarketMatch]:
     """Entity-targeted Kalshi retrieval, additive to the fuzzy-over-prefetch pass.
 
     Extracts salient title entities, matches them against the series list, fetches those
@@ -1004,11 +1215,14 @@ async def _kalshi_entity_matches(session: Any, question: Any, queries: list[str]
     market retrieved because its series matched an entity survives even when the LLM query
     text does not). Closes the recall hole where the exact-title market is absent from / drowned
     in the capped prefetch dump. Soft-fails to [] at every boundary.
+
+    ``outcome_sink`` is forwarded to `_kalshi_prefetch_series` to record the series-index
+    source outcome for the provider-diagnostics line.
     """
     entities = _extract_title_entities(question)
     if not entities:
         return []
-    series = await _kalshi_prefetch_series(session)
+    series = await _kalshi_prefetch_series(session, outcome_sink=outcome_sink)
     if not series:
         return []
     tickers = _match_entities_to_series(entities, series)
@@ -1271,6 +1485,11 @@ async def _fetch_market_snapshot_impl(
         return MarketSnapshot(matches=[])
 
     all_matches: list[MarketMatch] = []
+    # Per-source outcome tokens for the provider-diagnostics line. The platform loop
+    # writes each platform's token; the Kalshi closure writes `kalshi_series` (the
+    # entity-index fetch) via this same dict as its outcome_sink. Single-threaded
+    # asyncio => distinct keys, no race.
+    sources: dict[str, str] = {}
 
     async def _poly_for_all_queries() -> list[MarketMatch]:
         tasks = [_polymarket_search(session, q) for q in queries]
@@ -1294,7 +1513,11 @@ async def _fetch_market_snapshot_impl(
         # Entity-targeted retrieval on top of fuzzy-over-prefetch: pulls the series/events
         # matching salient title entities (e.g. an exact ESPY / BET-Awards market) that the
         # capped prefetch dump misses. Additive; soft-fails to [] internally.
-        merged.extend(await _kalshi_entity_matches(session, question, queries, top_k=max_matches_per_platform + 2))
+        merged.extend(
+            await _kalshi_entity_matches(
+                session, question, queries, top_k=max_matches_per_platform + 2, outcome_sink=sources
+            )
+        )
         return merged
 
     async def _predictit_for_all_queries() -> list[MarketMatch]:
@@ -1319,12 +1542,14 @@ async def _fetch_market_snapshot_impl(
     for platform, task in platform_tasks:
         try:
             matches = await task
+            sources[platform] = f"ok({len(matches)})" if matches else "none"
         except (aiohttp.ClientError, OSError, RuntimeError) as e:
             # Inner platform helpers each call asyncio.gather(..., return_exceptions=True)
             # so coroutines don't propagate. This narrow catch covers residual
             # transport/runtime errors only. AttributeError/TypeError remain bugs.
             logger.warning(f"Platform {platform} failed (soft-fail): {type(e).__name__}: {e}")
             matches = []
+            sources[platform] = f"error({type(e).__name__})"
         all_matches.extend(matches)
 
     # Dedup within-platform by market_url (or title fallback), cap per platform.
@@ -1355,7 +1580,7 @@ async def _fetch_market_snapshot_impl(
     for plat in ("polymarket", "kalshi", "manifold", "predictit"):
         combined.extend(by_platform[plat])
 
-    return MarketSnapshot(matches=combined)
+    return MarketSnapshot(matches=combined, sources=sources)
 
 
 def _flatten_results(results: list[Any], platform: str) -> list[MarketMatch]:
@@ -1522,6 +1747,15 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
             as_of = datetime.now(timezone.utc)
 
         snapshot = await fetch_market_snapshot(question, as_of=as_of, timeout=PREDICTION_MARKET_TIMEOUT)
+        # Surface per-source outcomes so the orchestrator's diagnostics line shows
+        # partial degradation (a live platform while a sub-source silently died).
+        # Recorded here at the ResearchCallable boundary so it's keyed to the qid the
+        # orchestrator pops; no-op when qid is None.
+        record_provider_detail(
+            getattr(question, "id_of_question", None),
+            "prediction_market",
+            {"sources": snapshot.sources},
+        )
         record_raw_research(
             qid=getattr(question, "id_of_question", None),
             provider="prediction_market",

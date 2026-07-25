@@ -45,6 +45,19 @@ def rationale_with(block_json: str) -> str:
     return f"## Analysis\n\nSome careful reasoning here.\n\n```json\n{block_json}\n```\n"
 
 
+def numeric_block(scale: float, *, trailing_comma: bool = False) -> str:
+    """A full-13-percentile numeric block whose values are ``scale * (i + 1)``."""
+    pcts = ", ".join(f'"{p}": {scale * (i + 1)}' for i, p in enumerate(STANDARD_PERCENTILES))
+    tail = "," if trailing_comma else ""
+    return f'{{"question_type": "numeric", "declared_percentiles": {{{pcts}}}, "outcome_type": "continuous"{tail}}}'
+
+
+def mc_block(probs: list[float], *, trailing_comma: bool = False) -> str:
+    body = ", ".join(f'"{name}": {prob}' for name, prob in zip(OPTIONS, probs))
+    tail = "," if trailing_comma else ""
+    return f'{{"question_type": "multiple_choice", "option_probs": {{{body}}}{tail}}}'
+
+
 def full_percentile_list() -> list[Percentile]:
     return [Percentile(percentile=p, value=float(i + 1)) for i, p in enumerate(STANDARD_PERCENTILES)]
 
@@ -172,6 +185,171 @@ class TestRungRepair:
         # half-truncated block) or the llm rung salvaged. Never a partial set.
         assert len(outcome.value) == 13
         assert outcome.rung in ("repair", "llm")
+
+    @pytest.mark.asyncio
+    async def test_repair_iterates_past_unrepairable_trailing_block(self) -> None:
+        """Rung 2 repairs each fenced candidate best-first, not just the last by
+        position: a malformed-but-repairable real forecast (trailing comma) sitting
+        behind an unrepairable trailing schema-recap (``<your value>``) is still
+        recovered by repair, without an LLM call."""
+        real = '{"question_type": "binary", "posterior_prob": 0.28,}'  # trailing comma — repairable
+        recap = '{"question_type": "binary", "posterior_prob": <your value>}'  # json_repair → string, invalid
+        text = rationale_with(real) + rationale_with(recap)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(text, PARSER_LLM)
+        assert outcome.value == pytest.approx(0.28)
+        assert outcome.rung == "repair"
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repair_iterates_tail_balanced_blobs(self) -> None:
+        """No fence at all: the tail-scan tries each balanced-brace blob, so a junk
+        leading blob doesn't block a valid trailing payload from being repaired."""
+        text = f'## Analysis\n\nreasoning...\n\n{{"note": "not a forecast"}}\n{VALID_BINARY_BLOCK}\n'
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(text, PARSER_LLM)
+        assert outcome.value == pytest.approx(0.28)
+        assert outcome.rung == "repair"
+        assert outcome.block_present is False
+        llm.assert_not_awaited()
+
+
+class TestFinalBlockPrecedence:
+    """The model's INTENDED FINAL block outranks an earlier valid one.
+
+    Regression (2026-07-25): validity-aware selection returned the first
+    candidate that STRICTLY validated, walking backward from the end of the
+    rationale. A valid DRAFT block earlier in the text therefore beat a
+    malformed final answer — and because rung 2 only ran when rung 1 returned
+    None, that malformed final block never reached ``json_repair``, whose whole
+    job is fixing defects like a trailing comma. The bot published the
+    superseded draft. The deterministic rungs now walk CANDIDATE-major: strict
+    parse and repair are both applied to a candidate before a lower-ranked one
+    is considered.
+    """
+
+    @pytest.mark.asyncio
+    async def test_repairable_final_binary_block_beats_earlier_valid_draft(self) -> None:
+        draft = '{"question_type": "binary", "posterior_prob": 0.40}'
+        final = '{"question_type": "binary", "posterior_prob": 0.72,}'  # trailing comma — repairable
+        text = (
+            "Draft thinking below.\n"
+            + rationale_with(draft)
+            + "On reflection my final answer is higher.\n"
+            + rationale_with(final)
+        )
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(text, PARSER_LLM)
+        assert outcome.value == pytest.approx(0.72)
+        assert outcome.rung == "repair"
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repairable_final_numeric_block_beats_earlier_valid(self) -> None:
+        text = rationale_with(numeric_block(1.0)) + rationale_with(numeric_block(10.0, trailing_comma=True))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_numeric(text, PARSER_LLM)
+        assert outcome.rung == "repair"
+        assert [float(p.percentile) for p in outcome.value] == STANDARD_PERCENTILES
+        assert float(outcome.value[0].value) == pytest.approx(10.0)  # the final block's scale, not the draft's
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repairable_final_mc_block_beats_earlier_valid(self) -> None:
+        text = rationale_with(mc_block([0.5, 0.3, 0.2])) + rationale_with(
+            mc_block([0.1, 0.2, 0.7], trailing_comma=True)
+        )
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
+        assert outcome.rung == "repair"
+        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        assert probs["Option C"] == pytest.approx(0.7, abs=0.02)  # the final block's answer
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unrepairable_final_block_yields_to_earlier_valid_block(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A trailing schema-example block is the observed prod failure mode, and no
+        deterministic route recovers a value from it — so the real forecast earlier in
+        the rationale wins, with the fallback logged for drift-watching."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.value_extraction")
+        forecast = '{"question_type": "binary", "posterior_prob": 0.42}'
+        recap = '{"question_type": "binary", "posterior_prob": <your value>}'
+        text = rationale_with(forecast) + "For reference the schema is:\n" + rationale_with(recap)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(text, PARSER_LLM, question_id=11, model_name="m")
+        assert outcome.value == pytest.approx(0.42)
+        assert outcome.rung == "block"
+        llm.assert_not_awaited()
+        fallback = [r for r in caplog.records if "BLOCK_FALLBACK:" in r.getMessage()]
+        assert len(fallback) == 1
+        assert fallback[0].levelno == logging.INFO
+        assert "skipped=1" in fallback[0].getMessage()
+        # A recovered forecast is never announced as a failure, at either layer.
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_schema_valid_but_unusable_final_block_yields_to_earlier_valid(self) -> None:
+        """A trailing block can pass the schema yet fail the ladder's own contract (the
+        numeric schema needs only {0.1, 0.5, 0.9}; the ladder needs all 13). Repair
+        cannot change already-valid JSON, so the walk falls back deterministically
+        instead of spending an LLM salvage call."""
+        partial = '{"question_type": "numeric", "declared_percentiles": {"0.1": 10.0, "0.5": 50.0, "0.9": 90.0}}'
+        text = rationale_with(numeric_block(2.0)) + rationale_with(partial)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_numeric(text, PARSER_LLM)
+        assert outcome.rung == "block"
+        assert len(outcome.value) == 13
+        assert float(outcome.value[0].value) == pytest.approx(2.0)
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mc_unmatched_option_final_block_yields_to_earlier_valid(self) -> None:
+        bad_key = '{"question_type": "multiple_choice", "option_probs": {"Option A": 0.5, "Option Z": 0.5}}'
+        text = rationale_with(mc_block([0.5, 0.3, 0.2])) + rationale_with(bad_key)
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
+        assert outcome.rung == "block"
+        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        assert probs["Option A"] == pytest.approx(0.5, abs=0.02)
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_valid_numeric_blocks_last_wins(self) -> None:
+        text = rationale_with(numeric_block(1.0)) + rationale_with(numeric_block(10.0))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_numeric(text, PARSER_LLM)
+        assert outcome.rung == "block"
+        assert float(outcome.value[0].value) == pytest.approx(10.0)
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_valid_mc_blocks_last_wins(self) -> None:
+        text = rationale_with(mc_block([0.5, 0.3, 0.2])) + rationale_with(mc_block([0.1, 0.2, 0.7]))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_mc(text, OPTIONS, PARSER_LLM)
+        assert outcome.rung == "block"
+        probs = {o.option_name: o.probability for o in outcome.value.predicted_options}
+        assert probs["Option C"] == pytest.approx(0.7, abs=0.02)
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unfenced_tail_scan_prefers_the_last_blob(self) -> None:
+        """The tail scan carries the same position primacy: with two bare JSON objects
+        in the tail, the LAST one is the model's final answer."""
+        text = (
+            "## Analysis\n\nreasoning...\n\n"
+            '{"question_type": "binary", "posterior_prob": 0.40}\n'
+            "on reflection:\n"
+            '{"question_type": "binary", "posterior_prob": 0.72}\n'
+        )
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_binary(text, PARSER_LLM)
+        assert outcome.value == pytest.approx(0.72)
+        assert outcome.rung == "repair"
+        assert outcome.block_present is False
+        llm.assert_not_awaited()
 
 
 class TestRungLlm:

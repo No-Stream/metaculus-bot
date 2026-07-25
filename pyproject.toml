@@ -27,6 +27,7 @@ dependencies = [
     "typeguard>=4.5", # imported at top level in backtest.py / community_benchmark.py / scoring_patches.py
     "trafilatura>=2.1.0",
     "json-repair>=0.61.1",
+    "ijson>=3.5.1",
 ]
 # supply-chain note: prefer pinning; avoid adding packages published <1wk ago.
 # The freshness window is enforced at lock time via `uv lock --exclude-newer <ts>`

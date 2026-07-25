@@ -423,3 +423,184 @@ async def test_predicate_param_overrides_transient_type_check() -> None:
 
     assert out == "ok"
     assert awaitable.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Zero-output slow-exemption (2026-07-25 fix).
+#
+# A forecaster (claude-opus-4.8) returned a whitespace-only HTTP 200 body from
+# OpenRouter; litellm re-wrapped the JSONDecodeError as an APIError whose message
+# starts "Unable to get json response". The failure arrived SLOWLY (>30s of
+# reasoning at xhigh effort), so the universal elapsed gate blocked the only
+# retry layer and the forecaster was dropped — the question published on 2 of 3
+# models and CI went red, with NO retry WARNING in the log.
+#
+# The fix exempts ZERO-OUTPUT failures (empty/whitespace body → APIError "Unable
+# to get json response"; empty completion → forecasting-tools RuntimeError "empty
+# string") from the elapsed gate: a slow zero-output is re-rolled ONCE, no
+# backoff. A genuine slow timeout / generic slow failure stays blocked, because
+# re-rolling a call that already spent the wall budget is the deadline risk the
+# gate exists to prevent. The exemption is ANDed with should_retry, so it only
+# fires on the broad-predicate sites (forecasters/crux/summarizer); the
+# transient-predicate sites (stacker, research) reject APIError/RuntimeError by
+# type and are untouched.
+# ---------------------------------------------------------------------------
+
+# The exact production signature from the 2026-07-25 run: an HTTP 200 with a
+# whitespace-only body, so litellm's raw_response.json() raised a JSONDecodeError
+# ("Expecting value: line 269 column 1") that litellm re-wrapped as this APIError.
+_PROD_WHITESPACE_BODY_MESSAGE = "Unable to get json response - Expecting value: line 269 column 1 (char 1474)"
+
+
+def _api_error(message: str) -> litellm_exc.APIError:
+    """Build a litellm APIError mirroring the OpenRouter empty-body failure shape."""
+    return litellm_exc.APIError(
+        status_code=500, message=message, llm_provider="openrouter", model="anthropic/claude-opus-4.8"
+    )
+
+
+@pytest.mark.asyncio
+async def test_slow_zero_output_api_error_is_retried_and_succeeds() -> None:
+    """The 2026-07-25 regression: a slow (>gate) whitespace-body APIError is re-rolled once.
+
+    Exact production message + a body that failed to JSON-parse. The first monotonic
+    reading is the attempt start (0.0); every later reading is past the gate, forcing
+    the slow-failure branch on attempt 0. The re-roll then wins.
+    """
+    awaitable = AsyncMock(side_effect=[_api_error(_PROD_WHITESPACE_BODY_MESSAGE), "recovered"])
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
+
+    assert out == "recovered"
+    assert awaitable.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_empty_string_runtimeerror_is_retried() -> None:
+    """forecasting-tools' empty-completion RuntimeError, arriving slowly, is re-rolled once.
+
+    The body parsed fine but the completion string was empty; general_llm.py raises
+    ``RuntimeError("LLM answer is an empty string ...")``. That is zero-output too.
+    """
+    err = RuntimeError("LLM answer is an empty string. The model was anthropic/claude-opus-4.8 and the prompt was: ...")
+    awaitable = AsyncMock(side_effect=[err, "ok"])
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_numeric")
+
+    assert out == "ok"
+    assert awaitable.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_zero_output_emits_warning_with_label(caplog: pytest.LogCaptureFixture) -> None:
+    """The slow zero-output re-roll logs a WARNING carrying the label (diagnosable next time).
+
+    The 2026-07-25 run had NO retry WARNING because the gate silently blocked the
+    retry; the exemption must make its re-roll visible in logs.
+    """
+    awaitable = AsyncMock(side_effect=[_api_error(_PROD_WHITESPACE_BODY_MESSAGE), "ok"])
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with caplog.at_level("WARNING", logger="metaculus_bot.llm_retry"):
+            out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_mc")
+
+    assert out == "ok"
+    warnings = [r for r in caplog.records if "forecaster_mc" in r.message]
+    assert len(warnings) == 1
+    assert "zero-output" in warnings[0].message
+
+
+@pytest.mark.asyncio
+async def test_slow_zero_output_reroll_capped_at_one_no_backoff(_no_real_sleep: AsyncMock) -> None:
+    """A persistently-failing slow zero-output is re-rolled EXACTLY once (no backoff ladder).
+
+    The exemption bypasses the deadline gate, so it must stay bounded: one immediate
+    re-roll, no backoff sleeps. Uses a real (tiny) sleep against a small gate so each
+    attempt genuinely measures as slow, exercising the real time.monotonic path.
+    """
+
+    async def _slow_zero_output() -> str:
+        await _REAL_SLEEP(0.05)  # > the 0.01s gate below → measured as slow
+        raise _api_error(_PROD_WHITESPACE_BODY_MESSAGE)
+
+    awaitable = AsyncMock(side_effect=_slow_zero_output)
+
+    with pytest.raises(litellm_exc.APIError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b", max_elapsed_s=0.01)
+
+    assert awaitable.await_count == 2  # attempt 0 + exactly one exempted re-roll
+    _no_real_sleep.assert_not_awaited()  # the exemption path takes no backoff sleep
+
+
+@pytest.mark.asyncio
+async def test_fast_zero_output_api_error_retried_unchanged() -> None:
+    """A FAST whitespace-body APIError retries via the normal ladder (behavior unchanged)."""
+    awaitable = AsyncMock(side_effect=[_api_error(_PROD_WHITESPACE_BODY_MESSAGE), "ok"])
+
+    out = await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+
+    assert out == "ok"
+    assert awaitable.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_non_empty_runtimeerror_not_exempted() -> None:
+    """A slow RuntimeError whose message is NOT the empty-completion signal stays blocked.
+
+    Guards the zero-output predicate against over-matching by exception TYPE: only the
+    "empty string" message shape is exempt, not every RuntimeError.
+    """
+    awaitable = AsyncMock(side_effect=RuntimeError("some unrelated runtime failure"))
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with pytest.raises(RuntimeError):
+            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+
+    assert awaitable.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_permanent_error_not_retried_even_slow() -> None:
+    """A permanent error (BadRequestError) is never retried, even slow — the exemption can't reach it.
+
+    The zero-output check is ANDed with should_retry, and the permanent types are not
+    litellm.APIError / RuntimeError subclasses, so a permanent error can never sneak
+    through the slow-exemption path. Content-policy blocks and bad requests must still
+    fail fast (CLAUDE.md §2).
+    """
+    awaitable = AsyncMock(
+        side_effect=litellm_exc.BadRequestError("Unable to get json response - malformed", model="m", llm_provider="o")
+    )
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with pytest.raises(litellm_exc.BadRequestError):
+            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="b")
+
+    assert awaitable.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_predicate_does_not_exempt_zero_output() -> None:
+    """The default (transient-type) predicate does NOT get the zero-output exemption.
+
+    The stacker and research providers call invoke_with_transient_retry with the
+    default predicate; a whitespace-body APIError is not a transient TYPE, so
+    should_retry rejects it and the exemption never fires. This is what scopes the
+    fix to the broad-predicate sites (forecasters/crux/summarizer) without any
+    per-call-site branching — the stacker's tight 500s/300s budget is untouched.
+    """
+    awaitable = AsyncMock(side_effect=_api_error(_PROD_WHITESPACE_BODY_MESSAGE))
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with pytest.raises(litellm_exc.APIError):
+            await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
+
+    assert awaitable.await_count == 1

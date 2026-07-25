@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -288,10 +289,23 @@ def _make_kalshi_events_payload() -> dict:
     }
 
 
+class _FakeContent:
+    """Streams the payload as JSON bytes for the Kalshi /series stream-parse path."""
+
+    def __init__(self, payload):
+        self._data = b"" if payload is None else json.dumps(payload).encode()
+
+    async def iter_chunked(self, n: int):  # noqa: ASYNC900, ASYNC911
+        step = max(1, n)
+        for i in range(0, len(self._data), step):
+            yield self._data[i : i + step]  # noqa: ASYNC911
+
+
 class _FakeResponse:
     def __init__(self, status: int, payload):
         self.status = status
         self._payload = payload
+        self.content = _FakeContent(payload)
 
     async def json(self):
         await asyncio.sleep(0)

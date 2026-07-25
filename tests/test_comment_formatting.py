@@ -323,3 +323,110 @@ class TestBuildUnifiedExplanation:
         )
         assert len(result) <= COMMENT_CHAR_LIMIT
         assert STACKER_OUTCOME_PRIMARY in result
+
+    # -----------------------------------------------------------------------
+    # FORECASTERS_USED ensemble-size disclosure (n contributed / N configured)
+    # -----------------------------------------------------------------------
+
+    def test_forecasters_used_marker_degraded_ensemble(self):
+        from metaculus_bot.comment.formatting import build_unified_explanation
+        from metaculus_bot.comment.markers import FORECASTERS_USED_MARKER_RE
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped_config_off",
+            n_used=2,
+            n_configured=3,
+        )
+        match = FORECASTERS_USED_MARKER_RE.search(result)
+        assert match is not None and match.group(1) == "2" and match.group(2) == "3"
+        # Additive: existing markers are untouched.
+        assert STACKER_OUTCOME_SKIPPED_CONFIG_OFF in result
+
+    def test_forecasters_used_marker_full_ensemble_distinguishable(self):
+        # The whole point: a full-ensemble comment (3/3) is distinguishable from a
+        # degraded one (2/3), so a missing bullet can't be confused with a roster change.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        full = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped",
+            n_used=3,
+            n_configured=3,
+        )
+        degraded = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped",
+            n_used=2,
+            n_configured=3,
+        )
+        assert "<!-- FORECASTERS_USED=3/3 -->" in full
+        assert "<!-- FORECASTERS_USED=2/3 -->" in degraded
+
+    def test_forecasters_used_marker_single_forecaster(self):
+        # MIN_FORECASTERS_TO_PUBLISH=1: a lone-survivor publish is disclosed too.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped",
+            n_used=1,
+            n_configured=3,
+        )
+        assert "<!-- FORECASTERS_USED=1/3 -->" in result
+
+    def test_forecasters_used_marker_on_non_stacking_strategy(self):
+        # Ensemble size is orthogonal to stacking: the marker rides even on the
+        # non-stacking early-return path (backtests use MEAN).
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.MEAN,
+            stacker_outcome=None,
+            n_used=2,
+            n_configured=3,
+        )
+        assert "<!-- FORECASTERS_USED=2/3 -->" in result
+        # Non-stacking path still emits no stacker markers.
+        assert "STACKER_OUTCOME=" not in result
+
+    def test_forecasters_used_marker_absent_when_counts_not_provided(self):
+        # Back-compat: callers that don't pass counts (existing tests, legacy
+        # paths) get no marker — never a spurious 0/0.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.STACKING,
+            stacker_outcome="primary",
+        )
+        assert "FORECASTERS_USED=" not in result
+
+    def test_forecasters_used_marker_survives_trimming(self):
+        # A disclosure that gets middle-trimmed away on a 150k comment is
+        # worthless: it must ride the preserved tail alongside the stacker markers.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+        from metaculus_bot.constants import COMMENT_CHAR_LIMIT
+
+        huge_base = "# SUMMARY\n" + ("X" * (COMMENT_CHAR_LIMIT + 5000))
+        result = build_unified_explanation(
+            base_text=huge_base,
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped_config_off",
+            n_used=2,
+            n_configured=3,
+        )
+        assert len(result) <= COMMENT_CHAR_LIMIT
+        assert "<!-- FORECASTERS_USED=2/3 -->" in result

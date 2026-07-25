@@ -25,6 +25,8 @@ from metaculus_bot.structured_output_schema import (
     StatedPrior,
     extract_first_balanced_braces,
     extract_json_block,
+    extract_json_block_candidates,
+    iter_balanced_braces,
     parse_structured_block,
 )
 from metaculus_bot.tool_runner import _aggregate_binary_lines, _parse_all_blocks
@@ -1021,6 +1023,60 @@ class TestExtractFirstBalancedBraces:
         assert extract_first_balanced_braces('{"a": 1') is None
 
 
+class TestExtractJsonBlockCandidates:
+    """The candidate ranking behind validity-aware selection: tagged before
+    untagged, last-by-position first within a tier, empty bodies skipped."""
+
+    def test_empty_input_returns_empty_list(self) -> None:
+        assert extract_json_block_candidates("") == []
+
+    def test_no_fence_returns_empty_list(self) -> None:
+        assert extract_json_block_candidates("plain prose, no fence") == []
+
+    def test_tagged_ranked_last_by_position_first(self) -> None:
+        text = '```json\n{"a": 1}\n```\n```json\n{"b": 2}\n```\n'
+        assert extract_json_block_candidates(text) == ['{"b": 2}', '{"a": 1}']
+
+    def test_tagged_ranked_ahead_of_untagged(self) -> None:
+        # Untagged appears LATER in the text but still ranks below the tagged one.
+        text = '```json\n{"tagged": 1}\n```\n```\n{"untagged": 2}\n```\n'
+        assert extract_json_block_candidates(text) == ['{"tagged": 1}', '{"untagged": 2}']
+
+    def test_empty_bodied_fence_skipped(self) -> None:
+        text = '```json\n\n```\n```json\n{"a": 1}\n```\n'
+        assert extract_json_block_candidates(text) == ['{"a": 1}']
+
+    def test_extract_json_block_returns_first_candidate(self) -> None:
+        text = '```json\n{"a": 1}\n```\n```json\n{"b": 2}\n```\n'
+        assert extract_json_block(text) == '{"b": 2}'
+        assert extract_json_block(text) == extract_json_block_candidates(text)[0]
+
+
+class TestIterBalancedBraces:
+    """iter_balanced_braces yields EVERY top-level balanced block; the repair
+    rung iterates them so a junk leading blob doesn't block a valid later one."""
+
+    def test_yields_multiple_top_level_blocks(self) -> None:
+        text = 'junk {"first": 1} middle {"second": 2} tail'
+        assert list(iter_balanced_braces(text)) == ['{"first": 1}', '{"second": 2}']
+
+    def test_no_braces_yields_nothing(self) -> None:
+        assert list(iter_balanced_braces("plain prose")) == []
+
+    def test_stops_after_unbalanced_run(self) -> None:
+        # First blob closes; the second run is unbalanced, so nothing further.
+        text = '{"ok": 1} then {"unbalanced": '
+        assert list(iter_balanced_braces(text)) == ['{"ok": 1}']
+
+    def test_brace_inside_string_not_counted_across_blocks(self) -> None:
+        text = '{"a": "has } brace"} and {"b": 2}'
+        assert list(iter_balanced_braces(text)) == ['{"a": "has } brace"}', '{"b": 2}']
+
+    def test_first_of_iter_matches_extract_first_balanced_braces(self) -> None:
+        text = '{"first": 1} then {"second": 2}'
+        assert next(iter_balanced_braces(text)) == extract_first_balanced_braces(text)
+
+
 # ===========================================================================
 # parse_structured_block
 # ===========================================================================
@@ -1142,6 +1198,152 @@ class TestParseStructuredBlock:
         dumped = valid_discrete_block.model_dump_json()
         loaded = DiscreteCountStructured.model_validate_json(dumped)
         assert loaded.model_dump() == valid_discrete_block.model_dump()
+
+
+class TestValidityAwareBlockSelection:
+    """Selection keeps the last block that VALIDATES, not the last by position.
+
+    Regression: a trailing schema-recap / example block (the model echoing the
+    STRUCTURED FORECAST schema after its real forecast) used to shadow a valid
+    earlier block, because ``extract_json_block`` returned the last block
+    unconditionally and ``parse_structured_block`` validated only that one. A
+    model swap could surface this without warning, and a recap block with
+    DIFFERENT numbers would publish the wrong forecast. Selection now walks all
+    candidates and keeps the first that validates for the requested type.
+    """
+
+    def test_valid_block_then_malformed_trailing_block_selects_valid(self) -> None:
+        # The team lead's reproduction, adapted to the real schema field
+        # (``posterior_prob`` — the verbatim repro used ``prediction_in_decimal``,
+        # which is not a BinaryStructured field, so BOTH its blocks are invalid).
+        # A valid forecast block followed by a malformed schema-recap.
+        text = (
+            "reasoning here\n"
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            "Note, the schema looks like:\n"
+            '```json\n{"question_type": "binary", "posterior_prob": <your value>}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_valid_block_then_schema_invalid_trailing_selects_valid(self) -> None:
+        # Trailing block is well-formed JSON but fails schema validation
+        # (posterior_prob outside [0, 1]); the valid earlier block is kept.
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```json\n{"question_type": "binary", "posterior_prob": 1.5}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_valid_block_then_wrong_qtype_trailing_selects_valid(self) -> None:
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```json\n{"question_type": "numeric", "declared_percentiles": '
+            '{"0.1": 1.0, "0.5": 5.0, "0.9": 9.0}}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_two_valid_blocks_last_by_position_wins(self) -> None:
+        # Tiebreak preserved: among VALID blocks the last by position wins
+        # (the prompt asks for the forecast block last).
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.1}\n```\n'
+            '```json\n{"question_type": "binary", "posterior_prob": 0.9}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.9)
+
+    def test_only_malformed_block_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Honest-failure path unchanged: no valid candidate → None at WARNING.
+        text = "```json\n{this is not valid json\n```"
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(text, "binary")
+        assert result is None
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_valid_untagged_recovered_when_tagged_all_invalid(self) -> None:
+        # Tagged blocks are tried first; when none validate, a valid untagged
+        # ``` fence is recovered (previously any tagged block suppressed untagged).
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": <bad>}\n```\n'
+            '```\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_valid_tagged_outranks_valid_untagged(self) -> None:
+        # Preference order preserved: a valid tagged block wins over a valid
+        # untagged one even when the untagged appears later in the text.
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```\n{"question_type": "binary", "posterior_prob": 0.9}\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_skip_then_recover_logs_info_not_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```json\n{"question_type": "binary", "posterior_prob": <your value>}\n```\n'
+        )
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.structured_output_schema"):
+            result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        # A skipped-then-recovered trailing block is an INFO signal (the prompt
+        # contract eroding), never a scary WARNING — extraction succeeded.
+        assert any(record.levelno == logging.INFO and "skip" in record.message.lower() for record in caplog.records)
+        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+    def test_truncated_closed_final_block_skipped_for_valid(self) -> None:
+        # Model hit its token limit mid-block but the fence still closed: the
+        # truncated JSON fails to parse and the earlier valid block is kept.
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```json\n{"question_type": "binary", "posterior_pr\n```\n'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_truncated_unclosed_final_fence_ignored(self) -> None:
+        # An unclosed final fence never matches the fence pattern, so it can't
+        # shadow the valid earlier block.
+        text = (
+            '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
+            '```json\n{"question_type": "binary", "posterior_pr'
+        )
+        result = parse_structured_block(text, "binary")
+        assert isinstance(result, BinaryStructured)
+        assert result.posterior_prob == pytest.approx(0.42)
+
+    def test_numeric_valid_then_malformed_trailing_selects_valid(self) -> None:
+        text = (
+            '```json\n{"question_type": "numeric", "declared_percentiles": '
+            '{"0.1": 1.0, "0.5": 5.0, "0.9": 9.0}}\n```\n'
+            '```json\n{"question_type": "numeric", "declared_percentiles": '
+            '{"0.1": <a>, "0.5": <b>, "0.9": <c>}}\n```\n'
+        )
+        result = parse_structured_block(text, "numeric")
+        assert isinstance(result, NumericStructured)
+        assert result.declared_percentiles is not None
+        assert result.declared_percentiles[0.5] == pytest.approx(5.0)
+
+    def test_mc_valid_then_malformed_trailing_selects_valid(self) -> None:
+        text = (
+            '```json\n{"question_type": "multiple_choice", "option_probs": {"A": 0.6, "B": 0.4}}\n```\n'
+            '```json\n{"question_type": "multiple_choice", "option_probs": {"A": <x>, "B": <y>}}\n```\n'
+        )
+        result = parse_structured_block(text, "multiple_choice")
+        assert isinstance(result, MultipleChoiceStructured)
+        assert result.option_probs == {"A": 0.6, "B": 0.4}
 
 
 # ===========================================================================

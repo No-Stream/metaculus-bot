@@ -35,6 +35,7 @@ from typing import Literal, TypeGuard
 
 from metaculus_bot.comment.markers import (
     BASE_MODEL_SUBBLOCK_SPLIT_RE,
+    FORECASTERS_USED_MARKER_RE,
     HISTORICAL_STACKER_SIGNATURE_RE,
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
@@ -332,6 +333,23 @@ def parse_stacked_marker(comment_text: str) -> bool | None:
     if match is None:
         return None
     return match.group(1).lower() == "true"
+
+
+def parse_forecasters_used_marker(comment_text: str) -> tuple[int, int] | None:
+    """Return ``(n_used, n_configured)`` from a FORECASTERS_USED marker, else None.
+
+    ``n_used`` is how many forecasters contributed to the published aggregate (==
+    the number of per-model summary bullets); ``n_configured`` is the roster size
+    that run. When ``n_used < n_configured`` the question published on a degraded
+    ensemble (a model dropped), which is what disambiguates a missing bullet from
+    a genuine roster change. Older comments predating the marker return None
+    (unknown ensemble size), so callers can distinguish "known degraded",
+    "known full", and "unknown".
+    """
+    match = FORECASTERS_USED_MARKER_RE.search(comment_text)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _iter_per_model_blocks(

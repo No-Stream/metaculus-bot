@@ -24,16 +24,20 @@ Tests cover (one per behavior):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import aiohttp
 import pytest
 
 from metaculus_bot.research import prediction_market as pmp
+from metaculus_bot.research.http_fetch import ERROR_SNIPPET_BYTES
 from metaculus_bot.research.prediction_market import (
     MarketMatch,
     MarketSnapshot,
@@ -72,11 +76,41 @@ def _reset_provider_caches():
 # ---------------------------------------------------------------------------
 
 
+class _FakeStreamContent:
+    """Stub for `resp.content`: streams a payload as JSON bytes via `iter_chunked`.
+
+    The Kalshi /series fetch stream-parses `resp.content.iter_chunked()`; the
+    other JSON endpoints go through `_read_json_capped`, which gates on a `.read`
+    attribute FakeResponse deliberately lacks, so they still use the `.json()`
+    path. `raw_content` overrides the serialized bytes so a test can inject
+    malformed JSON.
+    """
+
+    def __init__(self, payload: Any, raw_content: bytes | None = None):
+        if raw_content is not None:
+            self._data = raw_content
+        elif payload is None:
+            self._data = b""
+        else:
+            self._data = json.dumps(payload).encode()
+
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+        step = max(1, n)
+        for i in range(0, len(self._data), step):
+            yield self._data[i : i + step]
+
+
 class FakeResponse:
-    def __init__(self, status: int, payload: Any = None, text: str | None = None):
+    def __init__(self, status: int, payload: Any = None, text: str | None = None, raw_content: bytes | None = None):
         self.status = status
         self._payload = payload
-        self._text = text if text is not None else ""
+        # Real aiohttp serves `.text()` and `.content` from ONE body, so an error-page
+        # stub must stream its text too: the non-200 log path reads a BOUNDED snippet
+        # off `.content`, and a stub holding its text outside the stream would hide a
+        # regression back to whole-body `resp.text()`.
+        if raw_content is None and payload is None and text:
+            raw_content = text.encode()
+        self.content = _FakeStreamContent(payload, raw_content=raw_content)
 
     async def json(self) -> Any:
         if self._payload is None:
@@ -84,7 +118,10 @@ class FakeResponse:
         return self._payload  # noqa: ASYNC910
 
     async def text(self) -> str:
-        return self._text  # noqa: ASYNC910
+        # Faithful to aiohttp: reads the WHOLE body (the memory trap the bounded
+        # snippet read exists to avoid).
+        chunks = [chunk async for chunk in self.content.iter_chunked(65536)]
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     async def __aenter__(self) -> "FakeResponse":
         return self  # noqa: ASYNC910
@@ -1522,3 +1559,366 @@ class TestKalshiEntityRetrieval:
         session = FakeSession(handlers)
         matches = await _kalshi_entity_matches(session, q, ["athlete"], top_k=5)
         assert matches == []
+
+
+# ---------------------------------------------------------------------------
+# Kalshi /series streaming fetch (2026-07-25 fix: the unpaginated series body
+# crossed the shared 10 MiB read cap and silently zeroed the entity-recall path;
+# we now stream-parse it with a generous safety ceiling + a degradation counter)
+# ---------------------------------------------------------------------------
+
+_KALSHI_SERIES_URL = "https://api.elections.kalshi.com/trade-api/v2/series"
+
+
+def _big_series_payload(n_series: int, junk_chars: int) -> dict:
+    """A series catalogue whose serialized JSON is dominated by fields the
+    extractor DROPS (mirrors the real payload, where per-series contract terms /
+    settlement sources are the bulk we don't need for entity matching)."""
+    junk = "x" * junk_chars
+    series: list[dict] = [
+        {
+            "ticker": f"KX{i:05d}",
+            "title": f"Series number {i} about topic {i}",
+            "category": "Politics",
+            "tags": [f"tag{i}"],
+            "contract_terms_url": junk,  # heavy field, not retained
+            "settlement_sources": [junk],  # heavy field, not retained
+        }
+        for i in range(n_series)
+    ]
+    series.append({"ticker": "KXESPYS", "title": "ESPY Awards Best Male Athlete", "tags": ["espy"]})
+    return {"series": series}
+
+
+class TestKalshiSeriesStreaming:
+    @pytest.mark.asyncio
+    async def test_streams_catalogue_larger_than_old_10mib_cap(self):
+        """Regression for the 2026-07-25 prod failure: a /series body LARGER than
+        the old 10 MiB read cap must parse fully (the old buffered read dropped
+        it), and only {ticker,title,category,tags} are retained per series."""
+        payload = _big_series_payload(n_series=1400, junk_chars=8000)
+        # Precondition: this catalogue really is bigger than the old cap that dropped it.
+        assert len(json.dumps(payload).encode()) > pmp.MAX_RESPONSE_BYTES
+
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, payload)})
+        series = await pmp._kalshi_prefetch_series(session)
+
+        assert len(series) == 1401  # 1400 filler + the ESPY target
+        assert pmp.kalshi_series_fetch_failures() == 0
+        # Heavy fields dropped; only the four entity-matching fields retained.
+        assert set(series[0].keys()) == {"ticker", "title", "category", "tags"}
+        # Entity matching still finds the target series in the streamed result.
+        assert _match_entities_to_series(["ESPY", "Best Male Athlete"], series) == ["KXESPYS"]
+
+    @pytest.mark.asyncio
+    async def test_over_ceiling_returns_empty_and_counts_degradation(self, monkeypatch, caplog):
+        """When the generous safety ceiling trips, the fetch aborts LOUD + COUNTED
+        (a degradation counter that reddens CI), never a silent drop."""
+        monkeypatch.setattr(pmp, "KALSHI_SERIES_MAX_BYTES", 500)
+        payload = {"series": [{"ticker": f"KX{i}", "title": f"t{i}"} for i in range(200)]}
+        assert len(json.dumps(payload).encode()) > 500
+
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, payload)})
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        assert any("ceiling" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING)
+        # A failure is NOT cached, so the next question re-attempts.
+        assert "series" not in pmp._KALSHI_CACHE
+
+    @pytest.mark.asyncio
+    async def test_http_error_counts_degradation(self, caplog):
+        """A non-200 on /series is the exact 'provider silently dead' hole: it
+        must bump the degradation counter (the run reported timeouts=0 while the
+        path was dead)."""
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(503, text="upstream boom")})
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        assert any("kalshi series" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING)
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_counts_degradation(self, caplog):
+        """A truncated/garbled body must fail loud + counted, not parse into junk."""
+        truncated = b'{"series": [ {"ticker": "KXA", "title": "Alpha"'
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, payload=None, raw_content=truncated)})
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        # "Loud" is the whole point of the counted path — assert the warning, not just the count.
+        assert any("parse failed" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING), (
+            "a garbled body must log WHY it was dropped"
+        )
+
+    @pytest.mark.asyncio
+    async def test_transient_error_counts_degradation(self, caplog, monkeypatch):
+        """A connection reset on every attempt must soft-fail to [] + a counted
+        degradation, never escape into the provider (the fuzzy-over-events pass
+        still has to run)."""
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0)
+
+        class _ExplodingSession:
+            def get(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise aiohttp.ClientConnectionError("connection reset by peer")
+
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(_ExplodingSession())
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        assert any("transient error" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING)
+
+    @pytest.mark.asyncio
+    async def test_missing_series_array_is_a_counted_failure(self, caplog):
+        """An HTTP 200 carrying `{"error": ...}` yields zero series items, exactly
+        like an empty catalogue. Streaming can only tell them apart by watching for
+        the top-level `series` ARRAY; without that the error body is cached as a
+        valid empty index for 6h and entity matching dies silently."""
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, {"error": "temporarily unavailable"})})
+        sink: dict[str, str] = {}
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session, outcome_sink=sink)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        assert sink["kalshi_series"] == "error(no_series_array)"  # a LOST source, not benign `none`
+        assert "series" not in pmp._KALSHI_CACHE  # never cached, so the next question re-attempts
+        assert any("no top-level" in r.getMessage().lower() for r in caplog.records if r.levelno == logging.WARNING)
+
+    @pytest.mark.asyncio
+    async def test_non_array_series_is_a_counted_failure(self):
+        """`{"series": null}` is the same hole as a missing key: present but unusable."""
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, {"series": None})})
+        sink: dict[str, str] = {}
+        series = await pmp._kalshi_prefetch_series(session, outcome_sink=sink)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 1
+        assert sink["kalshi_series"] == "error(no_series_array)"
+
+    @pytest.mark.asyncio
+    async def test_transient_status_is_retried_and_can_succeed(self, monkeypatch):
+        """A 503 that would have succeeded on retry must not silently drop entity
+        recall for the question (the streaming rewrite dropped the old max_attempts=2)."""
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0)
+        payload = {"series": [{"ticker": "KXA", "title": "Alpha", "tags": ["a"]}]}
+        session = FakeSession(
+            {_KALSHI_SERIES_URL: [FakeResponse(503, text="upstream boom"), FakeResponse(200, payload)]}
+        )
+
+        series = await pmp._kalshi_prefetch_series(session)
+
+        assert [s["ticker"] for s in series] == ["KXA"]
+        assert session._call_counts[_KALSHI_SERIES_URL] == 2
+        assert pmp.kalshi_series_fetch_failures() == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_restarts_the_parse_instead_of_resuming_it(self, monkeypatch):
+        """The retry must re-issue the request with a FRESH parser and accumulator:
+        a stream that died mid-array must not leave its partial series in the result
+        (nor duplicate the ones the second attempt re-sends)."""
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0)
+        payload = {"series": [{"ticker": f"KX{i}", "title": f"Title {i}"} for i in range(3)]}
+        body = json.dumps(payload).encode()
+
+        class _DyingContent(_FakeStreamContent):
+            """A stream that dies half way through the series array."""
+
+            async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+                del n  # chunk size is irrelevant; this stream dies mid-array by design
+                yield body[: len(body) // 2]
+                raise aiohttp.ClientPayloadError("response payload truncated")
+
+        dying = FakeResponse(200, payload)
+        dying.content = _DyingContent(payload)
+        session = FakeSession({_KALSHI_SERIES_URL: [dying, FakeResponse(200, payload)]})
+
+        series = await pmp._kalshi_prefetch_series(session)
+
+        assert [s["ticker"] for s in series] == ["KX0", "KX1", "KX2"]
+        assert session._call_counts[_KALSHI_SERIES_URL] == 2
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_status_is_not_retried(self, monkeypatch):
+        """A 404 is a deterministic answer; retrying it just burns the budget."""
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0)
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(404, text="no such endpoint")})
+
+        series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert session._call_counts[_KALSHI_SERIES_URL] == 1
+        assert pmp.kalshi_series_fetch_failures() == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_stays_inside_the_wall_clock_budget(self, monkeypatch, caplog):
+        """KALSHI_SERIES_HTTP_TIMEOUT is the budget for the WHOLE fetch, retry
+        included, so adding the retry can't push this fetch past what the
+        surrounding PREDICTION_MARKET_TIMEOUT allows the entire snapshot. With the
+        budget spent, neither the backoff nor the second attempt may be taken —
+        asserted on elapsed WALL CLOCK, since a skipped attempt after a full-length
+        sleep would still have blown the budget."""
+        monkeypatch.setattr(pmp, "KALSHI_SERIES_HTTP_TIMEOUT", 0.01)
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 5.0)
+        payload = {"series": [{"ticker": "KXA", "title": "Alpha"}]}
+        session = FakeSession({_KALSHI_SERIES_URL: [FakeResponse(503, text="boom"), FakeResponse(200, payload)]})
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session)
+        elapsed = time.monotonic() - started
+
+        assert series == []
+        assert elapsed < 1.0, f"fetch took {elapsed:.2f}s on a 0.01s budget"
+        assert session._call_counts[_KALSHI_SERIES_URL] == 1  # retry skipped: no budget left
+        assert any("budget exhausted" in r.getMessage().lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_200_body_read_is_bounded(self, caplog):
+        """A CDN 429/502 can answer with a huge HTML error page. `resp.text()`
+        buffers and decompresses ALL of it before the caller slices 200 chars,
+        blowing the very ceiling the streamed read exists to enforce — so the
+        error snippet must come off a bounded read."""
+        served = 0
+
+        class _HugeErrorPage(_FakeStreamContent):
+            """An error page far bigger than the snippet, counting what gets served."""
+
+            async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:  # noqa: ASYNC900
+                nonlocal served
+                for _ in range(200):  # 200 * n bytes of error page available
+                    served += n
+                    yield b"E" * n
+
+        resp = FakeResponse(502)
+        resp.content = _HugeErrorPage(None)
+        session = FakeSession({_KALSHI_SERIES_URL: resp})
+
+        with caplog.at_level(logging.WARNING):
+            series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert served <= 2 * ERROR_SNIPPET_BYTES, f"read {served} bytes of the error page; expected a bounded read"
+        logged = next(r.getMessage() for r in caplog.records if "HTTP 502" in r.getMessage())
+        assert len(logged) < 4096
+
+    @pytest.mark.asyncio
+    async def test_empty_but_valid_catalogue_is_not_a_degradation(self):
+        """An empty (but well-formed) catalogue is a valid response, not a
+        failure: return [] WITHOUT bumping the counter, and cache it."""
+        session = FakeSession({_KALSHI_SERIES_URL: FakeResponse(200, {"series": []})})
+        series = await pmp._kalshi_prefetch_series(session)
+
+        assert series == []
+        assert pmp.kalshi_series_fetch_failures() == 0
+        assert "series" in pmp._KALSHI_CACHE  # valid empty result is cached
+
+    @pytest.mark.asyncio
+    async def test_degradation_counter_folds_into_orchestrator(self):
+        """Wiring: the module counter surfaces via ResearchOrchestrator, which the
+        forecaster sums into alertable_count (so a dead series path reddens CI)."""
+        from metaculus_bot.research.orchestrator import (
+            ResearchOrchestrator,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        orch = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+        assert orch.prediction_market_degraded_count == 0
+        pmp._bump_kalshi_series_failure()
+        pmp._bump_kalshi_series_failure()
+        assert orch.prediction_market_degraded_count == 2
+
+
+class TestSnapshotSourceDiagnostics:
+    """Per-source outcome tokens on MarketSnapshot.sources, drained by the
+    orchestrator into the provider-diagnostics line so PARTIAL degradation (a live
+    platform while the Kalshi series index silently died) is visible per-question."""
+
+    _HANDLERS_BASE = {
+        "https://gamma-api.polymarket.com/public-search": {"events": [], "markets": []},
+        "https://api.manifold.markets/v0/search-markets": [],
+        "https://api.elections.kalshi.com/trade-api/v2/events": {"events": [], "cursor": ""},
+        "https://www.predictit.org/api/marketdata/all/": {"markets": []},
+    }
+
+    def _handlers(self, series_payload: dict) -> dict:
+        h = {url: FakeResponse(200, payload) for url, payload in self._HANDLERS_BASE.items()}
+        h["https://api.elections.kalshi.com/trade-api/v2/series"] = FakeResponse(200, series_payload)
+        return h
+
+    @staticmethod
+    def _fake_llm():
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "SpaceX Starship orbit"  # noqa: ASYNC910
+
+        return FakeLlm
+
+    @pytest.mark.asyncio
+    async def test_healthy_run_records_sources_with_no_loss(self, mock_question):
+        handlers = self._handlers({"series": [{"ticker": "KXSPACEX", "title": "SpaceX launches", "tags": ["spacex"]}]})
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        # All 4 platforms plus the series index are recorded; the series fetch succeeded.
+        assert set(snapshot.sources) == {"polymarket", "manifold", "kalshi", "predictit", "kalshi_series"}
+        assert snapshot.sources["kalshi_series"] == "ok(1)"
+        # No lost source -> the diagnostics suffix stays empty (byte-identical to a healthy line).
+        from metaculus_bot.research.provider_diagnostics import (
+            _partial_loss_suffix,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        assert _partial_loss_suffix({"sources": snapshot.sources}) == ""
+
+    @pytest.mark.asyncio
+    async def test_series_drop_surfaces_as_lost_source(self, monkeypatch, mock_question):
+        # Series body over the (shrunk) ceiling: the platform stays live (events path),
+        # but the entity-index source is lost -> a visible, classified loss.
+        monkeypatch.setattr(pmp, "KALSHI_SERIES_MAX_BYTES", 500)
+        big_series = {"series": [{"ticker": f"KX{i}", "title": f"series {i}"} for i in range(200)]}
+        handlers = self._handlers(big_series)
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources["kalshi_series"] == "dropped(size_cap)"
+        from metaculus_bot.research.provider_diagnostics import (
+            _partial_loss_suffix,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        suffix = _partial_loss_suffix({"sources": snapshot.sources})
+        assert "lost=kalshi_series:dropped(size_cap)" in suffix
+
+    @pytest.mark.asyncio
+    async def test_provider_records_sources_into_registry(self, monkeypatch, mock_question):
+        """The _fetch ResearchCallable records the sources map into the provider-detail
+        registry keyed by (qid, 'prediction_market') for the orchestrator to drain."""
+        monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
+        monkeypatch.setattr(pmp, "KALSHI_SERIES_MAX_BYTES", 500)
+        handlers = self._handlers({"series": [{"ticker": f"KX{i}", "title": f"series {i}"} for i in range(200)]})
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            provider = pmp.prediction_market_provider()
+            await provider(mock_question)
+
+        from metaculus_bot.research.provider_diagnostics import (
+            pop_provider_detail,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        detail = pop_provider_detail(mock_question.id_of_question, "prediction_market")
+        assert detail.get("sources", {}).get("kalshi_series") == "dropped(size_cap)"

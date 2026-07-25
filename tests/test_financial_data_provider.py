@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
+
 
 def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> MagicMock:
     """Build a minimal MetaculusQuestion-shaped mock for the ResearchCallable
@@ -627,6 +629,63 @@ class TestDeterministicRouting:
                 monkeypatch.undo()
 
         assert "### CPIAUCSL" in result
+
+    @pytest.mark.asyncio
+    async def test_records_per_identifier_detail_for_diagnostics(self) -> None:
+        """A ticker that returns no data is recorded as a lost source, so a partial
+        financial_data fetch (one ticker ok, one empty) is visible in diagnostics
+        even though the provider still returns usable output (status `ok`)."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL, FAKE\nFRED_SERIES: NONE"
+
+        def _yf(ticker: str, **kwargs: object) -> str:
+            return "### AAPL\n- Current price: 190" if ticker == "AAPL" else ""
+
+        question = _make_q("Will Apple stock exceed $200 by end of 2026?")
+        question.id_of_question = 7777
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_yf),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            result = await financial_data_provider()(question)
+
+        assert "### AAPL" in result  # the good ticker contributed
+        sources = pop_provider_detail(question.id_of_question, "financial_data")["sources"]
+        assert sources["AAPL"] == "ok"  # contributed data
+        assert sources["FAKE"] == "empty"  # requested but returned nothing — a lost source
+
+    @pytest.mark.asyncio
+    async def test_records_error_detail_when_a_fetch_task_raises(self) -> None:
+        """A raising fetch (yfinance HTTP failure) is gathered as an exception, not an
+        empty string, so it needs its own `error` token: without it the identifier is
+        absent from the source map entirely and the diagnostics line reads as fully
+        healthy while one requested series never arrived."""
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL, MSFT\nFRED_SERIES: NONE"
+
+        def _yf(ticker: str, **kwargs: object) -> str:
+            if ticker == "AAPL":
+                return "### AAPL\n- Current price: 190"
+            raise RuntimeError("yfinance upstream 503")
+
+        question = _make_q("Will Apple stock exceed $200 by end of 2026?")
+        question.id_of_question = 7778
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data._fetch_yfinance_data", side_effect=_yf),
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            result = await financial_data_provider()(question)
+
+        assert "### AAPL" in result  # the healthy ticker still contributes
+        sources = pop_provider_detail(question.id_of_question, "financial_data")["sources"]
+        assert sources["AAPL"] == "ok"
+        assert sources["MSFT"] == "error"  # the raised fetch is a LOST source, not a missing key
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

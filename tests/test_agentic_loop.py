@@ -1312,6 +1312,372 @@ class TestProvenanceGate:
         assert result.telemetry.quote_mismatch_warnings == 0
 
     @pytest.mark.asyncio
+    async def test_glyph_wrapped_quote_is_grounded(self) -> None:
+        """A finding whose quote is WRAPPED in quote glyphs (the shape the driver
+        actually emits) must still ground against unwrapped source text.
+
+        Regression: `_normalize_quote_text` used to SUBSTITUTE every glyph with a
+        straight apostrophe rather than stripping it, so a wrapped quote
+        normalized to `'the rate was 4.1 percent.'` — with leading/trailing
+        apostrophes absent from the source — and the substring test failed on
+        text that was genuinely verbatim. In the 2026-07-25 prod run this fired
+        on 22 of 22 findings, making the anti-fabrication check dead.
+        """
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="“The rate was 4.1 percent.”",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("https://agency.example/report says: The rate was 4.1 percent. Full text follows.")
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_ellipsis_joined_quote_grounds_per_span(self) -> None:
+        """An ellipsis-joined quote grounds when EVERY span appears in the tool
+        contents, so the driver's documented eliding style is not a false alarm.
+
+        A contiguous substring test can never satisfy a stitched quote; the check
+        splits on ellipsis and requires each span to ground independently.
+        """
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "shares"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote='"Windows | 56.61%" ... "Linux | 4.36%"',
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report table: Windows | 56.61% then Unknown | 21.45% then Linux | 4.36% end."
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_ellipsis_quote_with_absent_span_still_warns(self) -> None:
+        """Per-span grounding must not become a rubber stamp: if any span is
+        absent from the tool contents, the mismatch still warns."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "shares"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote='"Windows | 56.61%" ... "Linux | 99.99%"',
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report table: Windows | 56.61% then Unknown | 21.45% then Linux | 4.36% end."
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_quote_is_grounded(self) -> None:
+        """A whitespace-only quote normalizes to empty — nothing to verify — so it
+        grounds without warning. Only a truly blank quote passes for free; a short
+        non-blank quote is still substring-tested (see the fallback below)."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {"findings": [_finding("https://agency.example/report", quote="   ")]},
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning("See https://agency.example/report for the figures.")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_glyphs_on_both_sides_ground(self) -> None:
+        """When the SOURCE text is itself wrapped in quote glyphs, a glyph-wrapped
+        finding quote still grounds — deletion is symmetric, so both sides converge
+        (the quote uses curly single quotes, the source straight doubles)."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "report"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="‘The rate was 4.1 percent.’",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning('https://agency.example/report quotes: "The rate was 4.1 percent." verbatim.')
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_unicode_ellipsis_joined_quote_grounds_per_span(self) -> None:
+        """The Unicode ellipsis (…) is a span boundary too, so a quote elided with
+        it grounds per-span exactly like the literal '...' form."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "shares"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote='"Windows | 56.61%" … "Linux | 4.36%"',
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report table: Windows | 56.61% then Unknown | 21.45% then Linux | 4.36% end."
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_ellipsis_spans_across_separate_tool_outputs_ground(self) -> None:
+        """The quote corpus concatenates every tool result, so an ellipsis-joined
+        quote grounds even when its two spans came from two different retrievals."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "windows"})]),
+                _response(tool_calls=[_tool_call("s2", "search_news", {"query": "linux"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote='"Windows | 56.61%" ... "Linux | 4.36%"',
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        web = _search_returning("https://agency.example/report first cell: Windows | 56.61% here.")
+        news = _search_returning("A separate wire reports the tail cell: Linux | 4.36% today.")
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", web), _tool_spec("search_news", news)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_short_fabricated_numeric_span_still_warns(self) -> None:
+        """A fabricated NUMBER riding alongside one long genuine span must warn.
+
+        Regression (forge panel, proven by execution): the span filter DROPPED
+        sub-floor spans instead of checking them, so a quote pairing a real long
+        clause with an invented short figure grounded cleanly. Numbers are the
+        high-risk case — short, fabricated, and what a forecaster acts on.
+        """
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "rate"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="The unemployment rate reached a new high this quarter ... 47.3%",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report — The unemployment rate reached a new high this quarter, "
+            "officials said. The figure was 3.9%."
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1  # still accepted — warn-only
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_short_genuine_numeric_span_does_not_warn(self) -> None:
+        """A short numeric span that IS present must not warn — otherwise the fix
+        would false-positive on every real table-cell elision."""
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "rate"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote="The unemployment rate reached a new high this quarter ... 3.9%",
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report — The unemployment rate reached a new high this quarter, "
+            "officials said. The figure was 3.9%."
+        )
+
+        result = await run_agentic_loop(
+            "system", "briefing with no URLs", [_tool_spec("search_web", search)], _config(), llm_call=fake_llm
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
     async def test_provenance_counters_surface_in_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
         fake_llm = FakeLlm(

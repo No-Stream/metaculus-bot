@@ -1,9 +1,10 @@
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Sequence, cast
+from typing import Any, Callable, Coroutine, NamedTuple, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
@@ -44,6 +45,8 @@ from metaculus_bot.constants import (
     WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
+from metaculus_bot.exceptions import ValueExtractionError
+from metaculus_bot.llm_retry import is_zero_output_failure
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
@@ -64,6 +67,46 @@ from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 logger = logging.getLogger(__name__)
 
 load_environment()
+
+
+# --- Forecaster-drop attribution (systematic-failure observability) ----------
+# When a forecaster is dropped from the ensemble, we record WHICH model, WHICH
+# question, and WHY — turning the bare forecasters_dropped=N scalar into a signal
+# that can tell a one-off blip from a model going systematically bad (a refusal
+# class, a routing problem, provider-wide instability). Each cause below is
+# honestly DETERMINABLE at its recording site (see the _record_forecaster_drop
+# call sites); we never guess — "error_other" is the explicit catch-all.
+DROP_CAUSE_TIMEOUT_WALL_CLOCK = "timeout_wall_clock"  # per-question wall-clock budget expired; task cancelled
+DROP_CAUSE_TIMEOUT_SOFT_DEADLINE = "timeout_soft_deadline"  # per-forecaster FORECASTER_SOFT_DEADLINE exceeded
+DROP_CAUSE_ZERO_OUTPUT = "zero_output"  # provider returned no usable content (empty/whitespace body)
+DROP_CAUSE_PARSE_EXTRACTION = "parse_extraction"  # the value-extraction ladder exhausted every rung
+DROP_CAUSE_ERROR_OTHER = "error_other"  # a raised exception outside the classes above
+
+
+class _ForecasterDrop(NamedTuple):
+    """One dropped ensemble member, attributed. ``model`` is the GeneralLlm slug,
+    ``qid`` the question id (None only when a site genuinely can't know it), and
+    ``cause`` one of the ``DROP_CAUSE_*`` categories."""
+
+    model: str
+    qid: int | None
+    cause: str
+
+
+def _classify_raised_drop_cause(exc: BaseException) -> str:
+    """Map an exception that dropped a forecaster to a ``DROP_CAUSE_*`` category.
+
+    Inspects the ALREADY-CAUGHT exception's type/shape — no new try/except. Reuses
+    ``llm_retry.is_zero_output_failure`` so this telemetry's "zero_output" label
+    agrees with the retry gate's own classification by construction (the 2026-07-25
+    OpenRouter whitespace-drip). ``asyncio.TimeoutError`` is recorded at the
+    soft-deadline site and excluded before this is called, so it never lands here.
+    """
+    if is_zero_output_failure(exc):
+        return DROP_CAUSE_ZERO_OUTPUT
+    if isinstance(exc, ValueExtractionError):
+        return DROP_CAUSE_PARSE_EXTRACTION
+    return DROP_CAUSE_ERROR_OTHER
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -163,7 +206,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # --- Alerting counters (consumed by cli.py to decide sys.exit status) ---
         self._forecasters_dropped_count: int = 0
+        # Per-model drop attribution (same lifecycle as the scalar above — one
+        # bot instance == one run). _record_forecaster_drop is the single write
+        # path that keeps this list and the scalar in lockstep.
+        self._forecaster_drops: list[_ForecasterDrop] = []
         self._questions_failed_to_publish: int = 0
+        # qid -> forecasters that contributed to the published value, recorded by
+        # _research_and_make_predictions and drained by _create_unified_explanation
+        # for the FORECASTERS_USED marker. Needed because the stacked path returns a
+        # single aggregated prediction, so the published collection can't be counted.
+        self._contributing_forecasters: defaultdict[int, int] = defaultdict(int)
 
         self._conditional_stacking_triggered_count: int = 0
         self._conditional_stacking_skipped_count: int = 0
@@ -369,6 +421,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             logger.info(f"📊 {bot_name}: Processing {len(questions)} questions...")
 
         reset_pchip_stats()
+        self._research.reset_run_degradation_counters()
 
         results = await super().forecast_questions(questions, return_exceptions)
 
@@ -390,7 +443,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d, gap_fill_v2_errors=%d",
+            "research_provider_timeouts=%d, gap_fill_v2_errors=%d, prediction_market_degraded=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
@@ -398,7 +451,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self._stacker_fallback_failed_count,
             self._research_provider_timeout_count,
             self._gap_fill_v2_error_count,
+            self._prediction_market_degraded_count,
         )
+        # Per-model attribution for the forecasters_dropped scalar above: which
+        # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
+        # WARNING when one model failed across multiple questions this run.
+        self._emit_forecaster_drop_telemetry()
 
         return results
 
@@ -409,6 +467,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @_research_provider_timeout_count.setter
     def _research_provider_timeout_count(self, value: int) -> None:
         self._research.timeout_count = value
+
+    @property
+    def _prediction_market_degraded_count(self) -> int:
+        return self._research.prediction_market_degraded_count
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -434,7 +496,73 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._stacker_fallback_failed_count
             + self._research_provider_timeout_count
             + self._gap_fill_v2_error_count
+            + self._prediction_market_degraded_count
         )
+
+    def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
+        """Record ONE dropped ensemble member with attribution, bumping the scalar.
+
+        The single write path for both the attributed drops list (which model,
+        which question, why) and the legacy ``_forecasters_dropped_count`` scalar,
+        so the two can never drift. The scalar stays a plain settable int for
+        continuity — the telemetry archive and ``alertable_count`` both read it.
+        """
+        self._forecaster_drops.append(_ForecasterDrop(model=model, qid=qid, cause=cause))
+        self._forecasters_dropped_count += 1
+
+    def _emit_forecaster_drop_telemetry(self) -> None:
+        """Emit the per-run ``FORECASTER_DROPS`` marker + a human per-model summary,
+        and WARN on any single model that dropped across MULTIPLE questions.
+
+        Attribution is CODE-derived (never model-self-reported): every entry was
+        stamped at a drop site with the model slug, the question id, and a
+        determinable cause. This turns the bare ``forecasters_dropped=N`` scalar
+        into "which model failed, how often, and why" answerable in one grep.
+
+        The systematic signal (a single model dropping on >=2 DISTINCT questions)
+        is a WARNING, not just a summary line: with ``MIN_FORECASTERS_TO_PUBLISH=1``
+        a model going bad silently degrades every forecast in the run while CI shows
+        one modest red mark, so it must be visible without grepping. It deliberately
+        does NOT change the exit code or block publishing (that is the operator's
+        call); ``alertable_count`` already reddens CI on ANY drop.
+        """
+        drops = self._forecaster_drops
+        # model -> cause -> count, plus the set of DISTINCT questions each model
+        # dropped on (the systematic-failure key).
+        detail: dict[str, dict[str, int]] = {}
+        questions_by_model: dict[str, set[int]] = defaultdict(set)
+        for drop in drops:
+            per_cause = detail.setdefault(drop.model, {})
+            per_cause[drop.cause] = per_cause.get(drop.cause, 0) + 1
+            if drop.qid is not None:
+                questions_by_model[drop.model].add(drop.qid)
+
+        systematic = sorted(model for model, qids in questions_by_model.items() if len(qids) >= 2)
+        systematic_field = ",".join(systematic) if systematic else "none"
+        # Compact JSON blob: robust to '/'-laden OpenRouter slugs (which defeat any
+        # delimiter-based encoding) and json.loads-able by residual analysis.
+        detail_json = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+        logger.info("FORECASTER_DROPS: total=%d systematic=%s detail=%s", len(drops), systematic_field, detail_json)
+
+        if not drops:
+            return
+
+        for model in sorted(detail):
+            cause_str = ",".join(f"{cause}:{count}" for cause, count in sorted(detail[model].items()))
+            logger.info("Forecaster drops by model: %s=%d [%s]", model, sum(detail[model].values()), cause_str)
+
+        for model in systematic:
+            cause_str = ",".join(f"{cause}:{count}" for cause, count in sorted(detail[model].items()))
+            qids = ",".join(str(qid) for qid in sorted(questions_by_model[model]))
+            logger.warning(
+                "SYSTEMATIC_FORECASTER_FAILURE: model=%s dropped_on_questions=%d qids=%s causes=%s — "
+                "one model failed across multiple questions this run (likely a refusal class or routing "
+                "problem, not a blip); investigate or consider pulling it from the roster.",
+                model,
+                len(questions_by_model[model]),
+                qids,
+                cause_str,
+            )
 
     async def _run_stacking(
         self,
@@ -488,7 +616,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         treat it identically. Tests can patch this method directly to inject
         a synthetic prediction list without spinning up real tasks.
         """
-        tasks = [asyncio.create_task(coro, name=f"forecaster:{idx}:q{qid_for_log}") for idx, coro in enumerate(coros)]
+        # Attribution map: coros are built from self._forecaster_llms IN ORDER (see
+        # _research_and_make_predictions), so coro idx aligns with that list. This
+        # ordering contract is what lets per-model drop telemetry name the model a
+        # cancelled/raised task belonged to. "unknown" only if the lists desync.
+        tasks: list[asyncio.Task[Any]] = []
+        task_model: dict[asyncio.Task[Any], str] = {}
+        for idx, coro in enumerate(coros):
+            task = asyncio.create_task(coro, name=f"forecaster:{idx}:q{qid_for_log}")
+            tasks.append(task)
+            task_model[task] = self._forecaster_llms[idx].model if idx < len(self._forecaster_llms) else "unknown"
         n_total = len(tasks)
         remaining = self._remaining_budget_seconds(per_q_start)
         wait_timeout = max(0.0, remaining)
@@ -498,7 +635,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 pending.cancel()
             # Give cancelled tasks a chance to clean up so we don't leak warnings.
             await asyncio.wait(pending_set, timeout=2.0)
-            self._forecasters_dropped_count += len(pending_set)
+            for pending in pending_set:
+                self._record_forecaster_drop(
+                    model=task_model.get(pending, "unknown"),
+                    qid=qid_for_log,
+                    cause=DROP_CAUSE_TIMEOUT_WALL_CLOCK,
+                )
             logger.warning(
                 "WALLCLOCK_ABORT: qid=%s elapsed=%.1fs forecasters_completed=%d/%d cancelled=%d remaining_budget=%.1fs",
                 qid_for_log,
@@ -527,7 +669,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 # at their raise site in _forecaster_with_soft_deadline, so
                 # exclude them here to avoid double-counting.
                 if not isinstance(exc, asyncio.TimeoutError):
-                    self._forecasters_dropped_count += 1
+                    self._record_forecaster_drop(
+                        model=task_model.get(task, "unknown"),
+                        qid=qid_for_log,
+                        cause=_classify_raised_drop_cause(exc),
+                    )
         exception_group: ExceptionGroup | None = (
             ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
         )
@@ -686,6 +832,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             if exception_group is not None:
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
+
+        # Contributor count for the FORECASTERS_USED marker, recorded HERE — the one
+        # point every branch below shares, so the stacked, single-forecaster, and
+        # base-combine paths agree on "forecasters that fed the published value" by
+        # construction. It cannot be recovered downstream: _finalize_stacked_prediction
+        # collapses `predictions` to a single aggregate, so counting the published
+        # collection reports 1 no matter how many forecasters contributed. Accumulated
+        # rather than assigned so research_reports_per_question > 1 keeps the count
+        # equal to the number of per-model summary bullets across all report sections.
+        self._contributing_forecasters[qid_for_log] += n_valid
 
         # Single-forecaster short-circuit. With MIN_FORECASTERS_TO_PUBLISH=1 a
         # question can survive on one forecaster, but the spread metrics
@@ -968,7 +1124,33 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         qid = question.id_of_question
         stacker_outcome = self._stacker_outcome.pop(qid, None) if qid is not None else None
-        return build_unified_explanation(base_text, question, self.aggregation_strategy, stacker_outcome)
+        # Ensemble-size disclosure: forecasters that CONTRIBUTED (== the number of
+        # per-model summary bullets) out of those CONFIGURED. Makes a degraded
+        # publish self-describing in the durable comment record, so residual
+        # analysis can tell a dropped model from a roster change (a missing bullet
+        # is otherwise ambiguous). Cause of any drop stays in run-log telemetry.
+        #
+        # The count comes from the fan-out (recorded per report in
+        # _research_and_make_predictions), NOT from the collections: on a stacked
+        # publish `predictions` holds the single aggregated prediction, so counting
+        # it would report 1/N on a healthy N-model run. The collection sum remains
+        # the fallback for callers that never ran our fan-out — the delegation to
+        # the parent implementation when no forecaster LLMs are configured.
+        recorded_used = self._contributing_forecasters.pop(qid, None) if qid is not None else None
+        n_used = (
+            recorded_used
+            if recorded_used is not None
+            else sum(len(collection.predictions) for collection in research_prediction_collections)
+        )
+        n_configured = len(self._forecaster_llms)
+        return build_unified_explanation(
+            base_text,
+            question,
+            self.aggregation_strategy,
+            stacker_outcome,
+            n_used=n_used,
+            n_configured=n_configured,
+        )
 
     async def _forecaster_with_soft_deadline(
         self,
@@ -1001,7 +1183,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - start
-            self._forecasters_dropped_count += 1
+            self._record_forecaster_drop(model=llm.model, qid=qid, cause=DROP_CAUSE_TIMEOUT_SOFT_DEADLINE)
             logger.warning(
                 "SOFT_DEADLINE: forecaster model=%s qid=%s exceeded %ds (elapsed=%.0fs); dropping this forecaster",
                 llm.model,

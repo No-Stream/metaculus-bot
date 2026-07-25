@@ -61,8 +61,9 @@ _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
 _URL_TRAILING_PUNCT = ".,;:)]}>\"'"
 _TRACKER_PARAM_PREFIXES = ("utm_",)
 _TRACKER_PARAM_NAMES = frozenset({"gclid", "fbclid", "mc_cid", "mc_eid", "ref", "ref_src", "igshid", "spm"})
-# All straight/curly quote glyphs and backticks collapse to one token so a
-# driver quote using curly quotes still matches straight-quoted source text.
+# All straight/curly quote glyphs and backticks are DELETED during normalization
+# so a driver quote wrapped in glyphs still matches unwrapped source text — both
+# sides run through _normalize_quote_text, so deletion is symmetric.
 _QUOTE_GLYPHS_RE = re.compile(r"[\"'‘’“”`]")
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -140,19 +141,70 @@ def _iter_normalized_urls(text: str) -> Iterator[str]:
 
 
 def _normalize_quote_text(text: str) -> str:
-    """Lowercase, collapse whitespace, and unify quote glyphs for substring matching."""
-    return _WHITESPACE_RE.sub(" ", _QUOTE_GLYPHS_RE.sub("'", text)).strip().lower()
+    """Lowercase, collapse whitespace, and DELETE quote glyphs for substring matching.
+
+    Deletion (not substitution) keeps the normalizer symmetric. The driver wraps
+    its ``quote`` field in glyphs by convention while source text usually is not
+    wrapped, so substituting a placeholder apostrophe left the quote with leading/
+    trailing apostrophes the source lacked and the substring test missed genuinely
+    verbatim content. Both the quote and the tool corpus run through here, so
+    deleting glyphs on both sides makes the wrapped and unwrapped forms converge.
+    """
+    return _WHITESPACE_RE.sub(" ", _QUOTE_GLYPHS_RE.sub("", text)).strip().lower()
+
+
+# Ellipsis boundary in a driver quote: the literal "..." (three-or-more dots) or
+# the Unicode ellipsis. The driver elides mid-quote ("<span A> ... <span B>"),
+# which no single contiguous substring test could satisfy.
+_ELLIPSIS_RE = re.compile(r"\.{3,}|…")
+# Minimum normalized length for an ellipsis-split span to be grounded on its own.
+# Below this a span is a bare token or punctuation run that appears in arbitrary
+# text, so trusting it per-span would rubber-stamp the check. Set to 10 rather
+# than the ~25 a prose-calibrated analysis suggested: real findings elide compact
+# TABLE CELLS ("Windows | 56.61%" is 16 normalized chars, "Linux | 4.36%" is 13),
+# which a 25-floor would drop — collapsing every stitched quote back to the
+# whole-quote fallback that a contiguous test can never satisfy, recreating the
+# dead-check symptom for the ellipsis subset. 10 sits above the single bare tokens
+# around those cells ("Windows"/"Unknown" are 7) so an isolated common word can't
+# ground a fabricated stitch, and below the real cell spans so genuine elisions
+# still verify per-span.
+_MIN_GROUNDING_SPAN_CHARS = 10
+# A sub-floor span carrying a digit is checked anyway rather than skipped. The
+# floor exists so a short span is not TRUSTED as positive evidence; it must not
+# mean a short span is IGNORED. Numbers are the whole risk: they are short, they
+# are what gets fabricated, and they are what a forecaster acts on. A quote
+# pairing a real long clause with an invented figure ("<real clause> ... 47.3%")
+# otherwise grounded cleanly on the clause alone (forge panel, reproduced by
+# execution). Short spans WITHOUT a digit stay unchecked — a bare connective
+# fragment appears in arbitrary text, so requiring it would only add noise.
+_DIGIT_RE = re.compile(r"\d")
 
 
 def _quote_is_grounded(quote: str, tool_content_normalized: str) -> bool:
-    """True when the finding's quote appears (normalized) in the tool contents.
+    """True when the finding's quote is grounded in the tool contents.
 
-    An empty quote is treated as grounded — there is nothing to verify.
+    An empty quote is treated as grounded — there is nothing to verify. The
+    driver elides mid-quote with an ellipsis, so the quote is split on ellipsis
+    boundaries and every span that carries evidentiary weight must appear in the
+    tool contents independently (a plain quote with no ellipsis is one span — the
+    whole thing). A span carries weight when it clears
+    ``_MIN_GROUNDING_SPAN_CHARS`` or contains a digit; the digit clause closes the
+    hole where a fabricated figure rode alongside a genuine long clause. When no
+    span carries weight — the quote is all short non-numeric fragments — the whole
+    normalized quote is tested as a substring so a short quote is never
+    auto-passed; only a truly empty quote passes for free.
     """
     normalized_quote = _normalize_quote_text(quote)
     if not normalized_quote:
         return True
-    return normalized_quote in tool_content_normalized
+    spans = [
+        span
+        for span in (part.strip() for part in _ELLIPSIS_RE.split(normalized_quote))
+        if len(span) >= _MIN_GROUNDING_SPAN_CHARS or _DIGIT_RE.search(span)
+    ]
+    if not spans:
+        return normalized_quote in tool_content_normalized
+    return all(span in tool_content_normalized for span in spans)
 
 
 class _FindingsValidation(NamedTuple):
@@ -1360,6 +1412,17 @@ async def _run_ghost_phase(
     llm_call: LlmCall,
     log_prefix: str,
 ) -> GhostForecast | None:
+    """Log the driver's post-research dry-run forecast (telemetry only, never published).
+
+    Interpretation guardrail (FUTURE.md "Score the archived gap-fill v2 ghost
+    forecasts"): the ghost is a SAME-MODEL (terra-low driver) counterfactual, NOT a
+    panel proxy. It measures whether the v2 findings alone, forecast by one cheap
+    model, land near truth — scored OFFLINE against resolution by
+    ``scripts/score_ghosts.py``. It is expected to diverge from the published
+    ensemble median (a single low-effort model is over-decisive by construction, the
+    literature's predicted failure), so ghost-vs-published divergence is NOT an alarm
+    signal and must not gate a run — score it against resolution, not the panel.
+    """
     state.messages.append({"role": "user", "content": ghost_prompt})
     try:
         response = await asyncio.wait_for(llm_call(state.messages, None), timeout=60.0)

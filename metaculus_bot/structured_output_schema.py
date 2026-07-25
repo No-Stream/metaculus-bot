@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -377,86 +378,131 @@ _FENCE_PATTERN = re.compile(
 )
 
 
-def extract_json_block(rationale_text: str) -> str | None:
-    """
-    Extract the LAST fenced JSON block from a rationale.
+def extract_json_block_candidates(rationale_text: str) -> list[str]:
+    """Fenced JSON-block bodies in SELECTION order (best candidate first).
 
-    Preference order:
+    Preference order (identical to ``extract_json_block``, now expressed as a
+    ranking rather than a single pick):
       1. Explicitly tagged ```json / ```JSON (case-insensitive, any whitespace).
       2. Untagged ``` fence whose body begins with `{`.
+    WITHIN each tier the LAST block by document position ranks first — the
+    prompt asks for the STRUCTURED FORECAST block last, so among equally-valid
+    blocks the last one is the intended forecast. Empty-bodied fences are
+    skipped.
 
-    Returns the trimmed body or None if nothing matches.
+    Callers that know the ``question_type`` (``parse_structured_block``) walk
+    this list and keep the first body that VALIDATES, so a trailing schema-recap
+    or example block that doesn't parse no longer shadows the real forecast
+    earlier in the rationale. The publish path (``value_extraction._run_ladder``)
+    walks the same order but also runs ``json_repair`` on each body before
+    dropping to the next, so a malformed-but-repairable final block outranks a
+    lower-ranked valid one.
     """
     if not rationale_text:
-        return None
+        return []
 
-    tagged_matches: list[str] = []
-    untagged_json_matches: list[str] = []
-
+    tagged: list[str] = []
+    untagged: list[str] = []
     for match in _FENCE_PATTERN.finditer(rationale_text):
         tag = match.group("tag").strip().lower()
         body = match.group("body").strip()
         if not body:
             continue
         if tag == "json":
-            tagged_matches.append(body)
+            tagged.append(body)
         elif tag == "" and body.lstrip().startswith("{"):
-            untagged_json_matches.append(body)
+            untagged.append(body)
+    # Last-by-position first within each tier; the tagged tier ranks ahead of
+    # the untagged one.
+    return [*reversed(tagged), *reversed(untagged)]
 
-    if tagged_matches:
-        return tagged_matches[-1]
-    if untagged_json_matches:
-        return untagged_json_matches[-1]
-    return None
+
+def extract_json_block(rationale_text: str) -> str | None:
+    """
+    Extract the single best fenced JSON block from a rationale, by POSITION.
+
+    Preference order:
+      1. Explicitly tagged ```json / ```JSON (case-insensitive, any whitespace).
+      2. Untagged ``` fence whose body begins with `{`.
+    Within a tier the LAST block by document position wins. Returns the trimmed
+    body or None if nothing matches.
+
+    This helper is schema-blind: it returns the best-positioned candidate
+    without checking that it parses. Callers that know the ``question_type``
+    should prefer ``parse_structured_block``, which walks ALL candidates
+    (``extract_json_block_candidates``) and keeps the first that actually
+    validates. This stays for callers that only need a block's raw text — e.g.
+    peeking at a self-declared ``question_type`` before the schema is known.
+    """
+    candidates = extract_json_block_candidates(rationale_text)
+    return candidates[0] if candidates else None
+
+
+def iter_balanced_braces(s: str) -> Iterator[str]:
+    """Yield each top-level balanced ``{...}`` block in ``s``, in document order.
+
+    String-literal-aware: braces inside JSON string literals are not counted,
+    and backslash escapes are respected so ``"\\""`` does not terminate a
+    string. This makes the scan safe on inputs like ``{"foo": "has a } brace"}``
+    which a naive brace-counter would truncate. After closing one block the scan
+    resumes AFTER it, so a rationale tail with several bare objects surfaces them
+    all — the caller (the value-extraction repair rung) repairs+validates each
+    and keeps the first that passes, rather than giving up on a junk leading
+    blob (the same iterate-to-valid selection the fenced path uses).
+    """
+    idx = 0
+    length = len(s)
+    while idx < length:
+        start_idx = s.find("{", idx)
+        if start_idx == -1:
+            return
+        depth = 0
+        in_string = False
+        escape_next = False
+        closed = False
+        i = start_idx
+        while i < length:
+            c = s[i]
+            if escape_next:
+                escape_next = False
+            elif in_string:
+                if c == "\\":
+                    escape_next = True
+                elif c == '"':
+                    in_string = False
+            elif c == '"':
+                in_string = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    yield s[start_idx : i + 1]
+                    closed = True
+                    break
+            i += 1
+        if not closed:
+            # Unbalanced from start_idx to end — no further balanced block can
+            # begin inside this run, so stop.
+            return
+        idx = i + 1
 
 
 def extract_first_balanced_braces(s: str) -> str | None:
     """Return the first balanced ``{...}`` block in ``s``, or None if none exists.
 
-    String-literal-aware: braces inside JSON string literals are not counted.
-    Respects backslash escapes so ``"\\""`` does not terminate a string. This
-    makes the helper safe on inputs like ``{"foo": "has a } brace"}`` which a
-    naive brace-counter would truncate.
-
-    A naive scan that counted every ``{`` / ``}`` would produce malformed
-    output on payloads where the LLM embeds literal braces inside string
-    values — a common failure mode we silently hit before adding this.
+    Thin wrapper over ``iter_balanced_braces`` (which yields every top-level
+    balanced block); this returns only the first. Kept for callers that want a
+    single blob — e.g. gap-list JSON salvage in ``research/targeted.py``.
     """
-    start_idx = s.find("{")
-    if start_idx == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape_next = False
-
-    for i in range(start_idx, len(s)):
-        c = s[i]
-        if escape_next:
-            escape_next = False
-            continue
-        if in_string:
-            if c == "\\":
-                escape_next = True
-            elif c == '"':
-                in_string = False
-            continue
-        if c == '"':
-            in_string = True
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return s[start_idx : i + 1]
-
-    return None
+    return next(iter_balanced_braces(s), None)
 
 
 def parse_structured_payload(
     raw_json: str,
     question_type: Literal["binary", "numeric", "multiple_choice"],
+    *,
+    log_failures: bool = True,
 ) -> StructuredBlock | None:
     """
     Validate a raw JSON payload string against the structured-block schemas.
@@ -468,42 +514,54 @@ def parse_structured_payload(
     telemetry strip-and-retry). Returns ``None`` on any failure; the calling
     ladder decides how to log and whether to fall through to the next rung.
 
+    ``log_failures`` gates the WARNING lines on the failure paths (bad size /
+    JSON / shape / question_type / validation). A caller probing several
+    candidate blocks for the first valid one passes ``log_failures=False`` so a
+    rejected-then-recovered candidate doesn't emit a scary WARNING as if
+    extraction failed; the telemetry-strip RECOVERY log is not gated, since it
+    reports on a block that IS returned. Default ``True`` keeps every direct
+    caller's logging unchanged.
+
     ``"discrete_count"`` is intentionally unsupported at runtime — see the
     module docstring.
     """
     if len(raw_json) > _MAX_STRUCTURED_BLOCK_BYTES:
-        logger.warning(
-            "Structured block exceeds size cap (%d bytes > %d); refusing to parse (question_type=%s)",
-            len(raw_json),
-            _MAX_STRUCTURED_BLOCK_BYTES,
-            question_type,
-        )
+        if log_failures:
+            logger.warning(
+                "Structured block exceeds size cap (%d bytes > %d); refusing to parse (question_type=%s)",
+                len(raw_json),
+                _MAX_STRUCTURED_BLOCK_BYTES,
+                question_type,
+            )
         return None
 
     try:
         payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        snippet = raw_json[:200].replace("\n", " ")
-        logger.warning(
-            "Malformed JSON in structured block (question_type=%s): %s. Snippet: %s", question_type, exc, snippet
-        )
+        if log_failures:
+            snippet = raw_json[:200].replace("\n", " ")
+            logger.warning(
+                "Malformed JSON in structured block (question_type=%s): %s. Snippet: %s", question_type, exc, snippet
+            )
         return None
 
     if not isinstance(payload, dict):
-        logger.warning(
-            "Structured block must decode to a JSON object, got %s (question_type=%s)",
-            type(payload).__name__,
-            question_type,
-        )
+        if log_failures:
+            logger.warning(
+                "Structured block must decode to a JSON object, got %s (question_type=%s)",
+                type(payload).__name__,
+                question_type,
+            )
         return None
 
     payload_qtype = payload.get("question_type")
     if payload_qtype is not None and payload_qtype != question_type:
-        logger.warning(
-            "question_type mismatch: arg=%s, payload=%s. Refusing to parse.",
-            question_type,
-            payload_qtype,
-        )
+        if log_failures:
+            logger.warning(
+                "question_type mismatch: arg=%s, payload=%s. Refusing to parse.",
+                question_type,
+                payload_qtype,
+            )
         return None
 
     # Inject the expected question_type if missing so the discriminator picks the right model.
@@ -547,11 +605,12 @@ def parse_structured_payload(
                     exc,
                 )
                 return retry  # type: ignore[return-value]
-        logger.warning(
-            "Structured block failed validation for question_type=%s: %s",
-            question_type,
-            exc,
-        )
+        if log_failures:
+            logger.warning(
+                "Structured block failed validation for question_type=%s: %s",
+                question_type,
+                exc,
+            )
         return None
 
 
@@ -562,18 +621,51 @@ def parse_structured_block(
     """
     Extract and validate a structured JSON block from a rationale.
 
-    Returns the parsed Pydantic model or None. None on:
-      - No fenced JSON block (logged at INFO)
-      - Malformed JSON (logged at WARNING)
-      - Pydantic validation error (logged at WARNING)
-      - question_type mismatch between argument and JSON payload (WARNING)
+    Selection is validity-aware: rather than validating only the last block by
+    position (which let a trailing schema-recap / example block shadow a valid
+    forecast earlier in the rationale), this walks candidates best-first
+    (``extract_json_block_candidates``) and keeps the FIRST that validates for
+    ``question_type``. Among valid blocks the last-by-position still wins (the
+    prompt asks for the forecast block last); tagged ```json blocks still
+    outrank untagged fences.
 
-    ``"discrete_count"`` is intentionally unsupported at runtime — see the
-    module docstring.
+    Returns the parsed Pydantic model or None. None on:
+      - No fenced JSON block at all (logged at INFO)
+      - No candidate validates (the last-tried candidate's WARNING surfaces the
+        reason — malformed JSON / validation / question_type mismatch — exactly
+        as before)
+
+    A candidate that failed but was recovered by a later valid one is NOT logged
+    as a WARNING; instead a single INFO records that trailing blocks were skipped
+    (a signal the prompt's block-last contract is eroding). ``"discrete_count"``
+    is intentionally unsupported at runtime — see the module docstring.
+
+    Selection here is STRICT-only, which is why the publish path does not use it:
+    ``value_extraction._run_ladder`` also repairs each candidate in place, so a
+    malformed final block beats a lower-ranked valid one and no superseded draft
+    gets published. Callers of this function read a block for telemetry or
+    analysis, where an unrepaired None is the honest answer.
     """
-    raw = extract_json_block(rationale_text)
-    if raw is None:
+    candidates = extract_json_block_candidates(rationale_text)
+    if not candidates:
         logger.info("No JSON block found in rationale for question_type=%s", question_type)
         return None
 
-    return parse_structured_payload(raw, question_type)
+    last_index = len(candidates) - 1
+    for index, candidate in enumerate(candidates):
+        # Log a failure only on the LAST candidate we try: earlier failures are
+        # silently skipped (a valid block may still follow), while the final
+        # failure's WARNING preserves the honest end-state signal. A single-block
+        # rationale (the common case) is index==last, so its logging is unchanged.
+        parsed = parse_structured_payload(candidate, question_type, log_failures=(index == last_index))
+        if parsed is not None:
+            if index > 0:
+                logger.info(
+                    "Structured-block selection skipped %d trailing block(s) that did not validate "
+                    "for question_type=%s before a usable one; the model may be emitting blocks after "
+                    "the forecast block (prompt block-last contract eroding).",
+                    index,
+                    question_type,
+                )
+            return parsed
+    return None

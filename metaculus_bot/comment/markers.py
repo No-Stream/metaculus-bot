@@ -123,6 +123,28 @@ CLAUSE_DIVERGENCE_MARKER_RE: re.Pattern[str] = re.compile(
 )
 
 
+# Ensemble-size disclosure marker. Injected into every published comment by
+# ``build_unified_explanation``. Records how many forecasters CONTRIBUTED (== the
+# number of ``*Forecaster N*`` summary bullets) out of how many were CONFIGURED
+# this run. Without it a comment carrying two bullets is ambiguous between a
+# 3-model ensemble where one model never answered (a drop) and a genuine 2-model
+# era (a roster change) — CLAUDE.md's "fewer than N bullets" gotcha. It rides the
+# preserved comment tail alongside the STACKER_OUTCOME markers, so it survives the
+# 150k middle-trim. Cause of any drop stays in the run-log FORECASTER_DROPS
+# telemetry (operational detail), not the public comment.
+FORECASTERS_USED_MARKER_PREFIX: str = "FORECASTERS_USED"
+
+FORECASTERS_USED_MARKER_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*FORECASTERS_USED=(\d+)/(\d+)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def format_forecasters_used_marker(n_used: int, n_configured: int) -> str:
+    """Render the ensemble-size marker: n contributed of N configured (``n/N``)."""
+    return f"<!-- {FORECASTERS_USED_MARKER_PREFIX}={n_used}/{n_configured} -->"
+
+
 def format_anchor_overshoot_marker(overshoot_pp: float) -> str:
     """Render the per-forecaster anchor-overshoot marker (signed, 1 decimal)."""
     return f"<!-- {ANCHOR_OVERSHOOT_MARKER_PREFIX}={overshoot_pp:+.1f} -->"
@@ -220,6 +242,12 @@ assert ANCHOR_OVERSHOOT_MARKER_RE.search(format_anchor_overshoot_marker(16.2)) i
 assert CLAUSE_DIVERGENCE_MARKER_RE.search(format_clause_divergence_marker(-4.0)) is not None, (
     "CLAUSE_DIVERGENCE_MARKER_RE does not match its own formatter output"
 )
+_forecasters_used_match = FORECASTERS_USED_MARKER_RE.search(format_forecasters_used_marker(2, 3))
+assert _forecasters_used_match is not None, "FORECASTERS_USED_MARKER_RE does not match its own formatter output"
+assert _forecasters_used_match.group(1) == "2" and _forecasters_used_match.group(2) == "3", (
+    f"FORECASTERS_USED_MARKER_RE captured {_forecasters_used_match.groups()!r}; expected ('2', '3')"
+)
+del _forecasters_used_match
 assert STACKER_META_ANALYSIS_HEADER.startswith("## "), (
     f"STACKER_META_ANALYSIS_HEADER must be a markdown H2 header, got {STACKER_META_ANALYSIS_HEADER!r}"
 )
@@ -252,4 +280,7 @@ __all__ = [
     "CLAUSE_DIVERGENCE_MARKER_RE",
     "format_anchor_overshoot_marker",
     "format_clause_divergence_marker",
+    "FORECASTERS_USED_MARKER_PREFIX",
+    "FORECASTERS_USED_MARKER_RE",
+    "format_forecasters_used_marker",
 ]

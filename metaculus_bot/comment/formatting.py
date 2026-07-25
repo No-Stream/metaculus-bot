@@ -24,6 +24,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
+    format_forecasters_used_marker,
 )
 from metaculus_bot.comment.trimming import trim_comment, trim_section
 from metaculus_bot.performance_analysis.parsing import (
@@ -60,20 +61,42 @@ def format_forecaster_rationales_section(base_text: str, report_number: int) -> 
     return trim_section(base_text, f"report_{report_number}_rationales")
 
 
+def _forecasters_used_suffix(n_used: int | None, n_configured: int | None) -> str:
+    """The FORECASTERS_USED marker line (with a leading newline) when both counts
+    are known, else ``""``.
+
+    Emitted on every comment whose caller knows the ensemble size (the production
+    ``_create_unified_explanation`` always does), so a comment with fewer than N
+    bullets is self-describing — a dropped model is distinguishable from a roster
+    change. Absent (rather than a fake ``0/0``) when a caller doesn't supply the
+    counts, matching how pre-marker comments read as "unknown".
+    """
+    if n_used is None or n_configured is None:
+        return ""
+    return f"\n{format_forecasters_used_marker(n_used, n_configured)}"
+
+
 def build_unified_explanation(
     base_text: str,
     question: object,
     aggregation_strategy: AggregationStrategy,
     stacker_outcome: str | None,
+    *,
+    n_used: int | None = None,
+    n_configured: int | None = None,
 ) -> str:
-    """Build the final Metaculus comment with stacker/tools markers appended.
+    """Build the final Metaculus comment with stacker/tools/ensemble markers appended.
 
-    For non-stacking strategies, just trims and returns. For STACKING /
-    CONDITIONAL_STACKING, appends STACKER_OUTCOME, legacy STACKED, and
-    TOOLS_USED markers.
+    For non-stacking strategies, trims and returns (plus the ensemble marker). For
+    STACKING / CONDITIONAL_STACKING, also appends STACKER_OUTCOME, legacy STACKED,
+    and TOOLS_USED markers. ``n_used`` / ``n_configured`` (contributed / configured
+    forecasters) are keyword-only and additive: when both are supplied a
+    FORECASTERS_USED marker rides the comment tail; when omitted the comment is
+    unchanged (back-compat with callers that don't track ensemble size).
     """
+    ensemble_suffix = _forecasters_used_suffix(n_used, n_configured)
     if aggregation_strategy not in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
-        return trim_comment(base_text)
+        return trim_comment(f"{base_text}{ensemble_suffix}")
 
     assert stacker_outcome is not None, (
         "stacker_outcome must be provided for STACKING/CONDITIONAL_STACKING strategies; "
@@ -106,7 +129,7 @@ def build_unified_explanation(
         qtype = None
 
     tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE
-    return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}\n")
+    return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}{ensemble_suffix}\n")
 
 
 __all__ = [

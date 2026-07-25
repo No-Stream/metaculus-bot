@@ -31,6 +31,7 @@ from metaculus_bot.performance_analysis.parsing import (
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
     parse_forecaster_model_map,
+    parse_forecasters_used_marker,
     parse_inferred_stacker_outcome,
     parse_per_base_model_forecasts,
     parse_per_model_forecasts,
@@ -100,6 +101,30 @@ class TestParseStackerOutcomeMarker:
 
     def test_whitespace_tolerant(self):
         assert parse_stacker_outcome_marker("<!--  STACKER_OUTCOME=fallback_llm  -->") == "fallback_llm"
+
+
+# ---------------------------------------------------------------------------
+# parse_forecasters_used_marker (ensemble-size disclosure)
+# ---------------------------------------------------------------------------
+
+
+class TestParseForecastersUsedMarker:
+    def test_degraded_ensemble(self):
+        # (used, configured) — 2 of 3 contributed: a dropped model, NOT a roster change.
+        assert parse_forecasters_used_marker("...\n<!-- FORECASTERS_USED=2/3 -->\n") == (2, 3)
+
+    def test_full_ensemble(self):
+        assert parse_forecasters_used_marker("...\n<!-- FORECASTERS_USED=3/3 -->\n") == (3, 3)
+
+    def test_single_forecaster(self):
+        assert parse_forecasters_used_marker("...\n<!-- FORECASTERS_USED=1/3 -->\n") == (1, 3)
+
+    def test_absent_marker_returns_none(self):
+        # Old-era comments predate the marker: unknown ensemble size, not a lie.
+        assert parse_forecasters_used_marker("# SUMMARY\nNo marker here\n") is None
+
+    def test_whitespace_tolerant(self):
+        assert parse_forecasters_used_marker("<!--   FORECASTERS_USED=2/3   -->") == (2, 3)
 
 
 # ---------------------------------------------------------------------------

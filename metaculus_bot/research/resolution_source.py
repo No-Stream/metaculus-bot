@@ -60,6 +60,7 @@ from metaculus_bot.research.http_fetch import (
     build_session,
     read_body_capped,
 )
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
 
@@ -370,6 +371,31 @@ def _truncate_with_marker(text: str, cap: int, url: str) -> str:
         return text[:cap]
     body_budget = cap - len(marker)
     return text[:body_budget].rstrip() + marker
+
+
+def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
+    """Per-URL outcome map for provider diagnostics: ``{domain: "ok" | <FetchStatus>}``.
+
+    A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
+    diagnostics formatter recognizes); every other ``FetchStatus``
+    (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
+    ``ssrf_blocked``) is kept verbatim as the loss token so the reason survives into
+    the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N`` suffix
+    so no per-URL outcome is silently overwritten.
+    """
+    sources: dict[str, str] = {}
+    for r in results:
+        try:
+            key = urlparse(r.url).netloc or r.url
+        except ValueError:
+            key = r.url
+        if key in sources:
+            n = 2
+            while f"{key}#{n}" in sources:
+                n += 1
+            key = f"{key}#{n}"
+        sources[key] = "ok" if r.status == "success" else r.status
+    return sources
 
 
 def _render_fetch_failures(failures: list[FetchResult]) -> str:
@@ -844,11 +870,12 @@ def resolution_source_provider(is_benchmarking: bool = False) -> ResearchCallabl
                 f"resolution_source: {n_fail}/{len(results)} urls unfetched "
                 f"(js_wall/blocked — candidates for a future Tier-2 LLM fetch)",
             )
-        record_raw_research(
-            qid=getattr(question, "id_of_question", None),
-            provider="resolution_source",
-            payload=results,
-        )
+        qid = getattr(question, "id_of_question", None)
+        record_raw_research(qid=qid, provider="resolution_source", payload=results)
+        # Per-URL outcome map for the diagnostics block: even when the provider
+        # returns a non-empty notice (all URLs failed → status `ok`), this surfaces
+        # WHICH sources were lost so the block doesn't read as fully healthy.
+        record_provider_detail(qid, "resolution_source", {"sources": _fetch_result_sources(results)})
         return format_resolution_sections(results, datetime.now(timezone.utc))
 
     return _fetch
