@@ -6,8 +6,10 @@ from typing import Any
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
     OAI_ANTH_OPENROUTER_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
+    credit_alerts_active,
     gemini_use_donated_openrouter_key,
 )
 
@@ -127,6 +129,28 @@ def reset_generic_key_fallback_count() -> None:
     _generic_key_fallback_count = 0
 
 
+# Module-level counter for the CREDIT-caused (402 / payment required / insufficient
+# credit) SUBSET of donated->personal fallbacks — the same subset relationship
+# ``_donated_404_fallback_count`` has to the generic total, so it is likewise NOT
+# added to ``alertable`` on its own. cli.py subtracts it from the generic total
+# while credit alerting is suppressed (constants.credit_alerts_active), because an
+# empty donated key is an expected condition during that window rather than
+# breakage; after the resume date the subtraction stops and behavior is exactly
+# what it was before. Every other cause (401/404/429/guardrail) stays alertable.
+_credit_key_fallback_count: int = 0
+
+
+def get_credit_key_fallback_count() -> int:
+    """Read the module-level counter for credit-caused donated->personal fallbacks."""
+    return _credit_key_fallback_count
+
+
+def reset_credit_key_fallback_count() -> None:
+    """Reset the counter to zero. Used by tests; not for production code."""
+    global _credit_key_fallback_count
+    _credit_key_fallback_count = 0
+
+
 # Providers covered by the Metaculus-donated OpenRouter key
 # (``OAI_ANTH_OPENROUTER_KEY``). The donated key has server-side allowed-
 # providers preferences locked to this set. Models routed through any other
@@ -199,6 +223,28 @@ def should_route_via_donated_key(model: str) -> bool:
     return True
 
 
+def _is_credit_message(lowercased_msg: str) -> bool:
+    """Whether an already-lowercased error message reads as "this key is out of money".
+
+    Single source of truth for the credit-cause classification: the retry
+    decision in ``should_retry_with_general_key`` and the credit-subset counter
+    in ``FallbackOpenRouterLlm.invoke`` both go through here, so a text-cue edit
+    can't make the two disagree about which fallbacks were credit-caused.
+    """
+    return (
+        "402" in lowercased_msg
+        or "payment required" in lowercased_msg
+        or "insufficient credit" in lowercased_msg
+        or "out of credits" in lowercased_msg
+        or "insufficient funds" in lowercased_msg
+    )
+
+
+def is_credit_caused_error(exc: Exception) -> bool:
+    """Whether ``exc`` is a credit shortfall (402 / payment required / insufficient credit)."""
+    return _is_credit_message(str(exc).lower())
+
+
 def should_retry_with_general_key(exc: Exception) -> bool:
     """
     Decide whether a failure likely indicates a key-scoped issue where falling back is appropriate.
@@ -251,13 +297,7 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # Positive signals: credentials/credits
     if "401" in msg or "unauthorized" in msg or "invalid api key" in msg or "disabled api key" in msg:
         return True
-    if (
-        "402" in msg
-        or "payment required" in msg
-        or "insufficient credit" in msg
-        or "out of credits" in msg
-        or "insufficient funds" in msg
-    ):
+    if _is_credit_message(msg):
         return True
     # Donated-key allowed-providers quirk: the donated key has server-side
     # provider preferences; a model only available via a non-allowed provider
@@ -297,6 +337,21 @@ def _is_donated_404(exc: Exception) -> bool:
     401/402 (those are credit/key issues, not the allowed-providers quirk).
     """
     return "no allowed providers" in str(exc).lower()
+
+
+def _fallback_alert_note(exc: Exception) -> str:
+    """The "what happens to the exit code" clause of the paid-fallback WARNING.
+
+    A credit-caused fallback during the suppression window does NOT redden CI
+    (see ``constants.credit_alerts_active``), so saying it will would mislead
+    whoever greps this line. Every other cause still exits non-zero.
+    """
+    if is_credit_caused_error(exc) and not credit_alerts_active():
+        return (
+            "Cause is a credit shortfall, so it is NOT counted as alertable until "
+            f"{CREDIT_ALERT_RESUME_DATE.isoformat()} (operator is self-funding the season)."
+        )
+    return "Run will complete, then exit non-zero to alert."
 
 
 class FallbackOpenRouterLlm(GeneralLlm):
@@ -340,6 +395,12 @@ class FallbackOpenRouterLlm(GeneralLlm):
                 # fallback here.
                 global _generic_key_fallback_count
                 _generic_key_fallback_count += 1
+                if is_credit_caused_error(e):
+                    # Credit-caused subset: the donated wallet is empty. Counted
+                    # separately so cli.py can drop it from ``alertable`` during the
+                    # dated suppression window without touching any other cause.
+                    global _credit_key_fallback_count
+                    _credit_key_fallback_count += 1
                 if _is_donated_404(e):
                     global _donated_404_fallback_count
                     _donated_404_fallback_count += 1
@@ -356,8 +417,9 @@ class FallbackOpenRouterLlm(GeneralLlm):
                     logger.warning(
                         "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=%s, so this "
                         "call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
-                        "Run will complete, then exit non-zero to alert. error=%s: %s",
+                        "%s error=%s: %s",
                         self.model,
+                        _fallback_alert_note(e),
                         type(e).__name__,
                         e,
                     )

@@ -18,6 +18,7 @@ import pytest
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
 
 
 @pytest.fixture
@@ -561,6 +562,71 @@ class TestProviderDiagnosticsCapture:
         assert results[0].error_type is None
         assert results[0].error_message is None
         assert results[0].details == {}
+
+    @pytest.mark.asyncio
+    async def test_provider_detail_drained_into_result(self, mock_llm, question):
+        """A provider's recorded per-source detail is drained into its ProviderResult.
+
+        This is the seam that makes partial degradation visible: the provider knows
+        its per-source outcome but can only return a str, so it records to the
+        (qid, provider) registry and _run_one pops it into details."""
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+
+        async def provider(q):  # noqa: ASYNC910 - simple test provider
+            record_provider_detail(
+                q.id_of_question,
+                "prediction_market",
+                {"sources": {"kalshi": "dropped(size_cap)", "polymarket": "ok(2)"}},
+            )
+            return "prediction market snapshot prose"
+
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "prediction_market")])
+
+        assert results[0].status == "ok"
+        assert results[0].details == {"sources": {"kalshi": "dropped(size_cap)", "polymarket": "ok(2)"}}
+        # Registry drained — nothing leaks into a subsequent same-key call.
+        assert pop_provider_detail(question.id_of_question, "prediction_market") == {}
+
+    @pytest.mark.asyncio
+    async def test_registry_drained_even_when_provider_errors(self, mock_llm, question):
+        """If a provider records detail then raises, _run_one still drains the registry
+        (so it can't leak into a later call) — the errored result carries the error, not details."""
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+
+        async def provider(q):  # noqa: ASYNC910 - simple test provider
+            record_provider_detail(q.id_of_question, "resolution_source", {"sources": {"a.gov": "blocked"}})
+            raise RuntimeError("boom after recording")
+
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "resolution_source")])
+
+        assert results[0].status == "errored"
+        assert pop_provider_detail(question.id_of_question, "resolution_source") == {}
+
+    @pytest.mark.asyncio
+    async def test_partial_loss_reaches_comment_block_not_research_text(self, mock_llm, question):
+        """The partial-loss signal rides the stashed diagnostics block (comment path) only —
+        it must never reach the forecaster-facing research text. The diagnostics seam that
+        withholds the whole block from research holds for the per-source detail too."""
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+
+        async def provider(q):  # noqa: ASYNC910 - simple test provider
+            record_provider_detail(
+                q.id_of_question,
+                "prediction_market",
+                {"sources": {"kalshi": "dropped(size_cap)", "polymarket": "ok(1)"}},
+            )
+            return "prediction market snapshot prose"
+
+        with patch.object(orch, "_select_research_providers", return_value=[(provider, "prediction_market")]):
+            research = await orch.run_research(question)
+
+        # Forecasters never see the degradation marker.
+        assert "lost=" not in research
+        assert "dropped(size_cap)" not in research
+        # But it IS in the stashed comment block, visible at a glance.
+        block = orch.pop_provider_diagnostics(question.id_of_question)
+        assert "kalshi:dropped(size_cap)" in block
+        assert "sources=1/2" in block
 
     @pytest.mark.asyncio
     async def test_status_empty_for_blank_provider(self, mock_llm, question):

@@ -340,6 +340,29 @@ def _render_fetch_outcome(url: str, text: str, links: list[str], method: str, st
     return ToolOutcome(content_markdown=window, links=links, method=method, truncated=truncated)
 
 
+_NO_CONTENT_FETCH_MSG = (
+    "No readable content: {url} returned HTTP 200 but produced no extractable text — "
+    "neither the plain fetch nor the headless-browser render read anything (JavaScript "
+    "wall, consent/anti-bot gate, or a genuinely empty page). Nothing from this URL was "
+    "read; do NOT cite it as a fetched source. Try read_document(url, ask) for a targeted "
+    "extraction, or find another source."
+)
+
+
+def _empty_fetch_outcome(url: str) -> ToolOutcome:
+    """Outcome for a 200-OK page the ladder could not read (zero extractable text).
+
+    Distinct ``status``/``method`` of ``"empty"`` — never ``"ok"``/``"plain"`` — so the
+    loop's tier stamping (which grants "fetched" only on a ``status == "ok"``,
+    fetched-class-method outcome; see ``loop._harvest_verification_tiers``) can never
+    mark an unread page authoritative. Two deterministic guards, not one: the non-"ok"
+    status AND the unmapped method. Deliberately NOT cached — caching the placeholder
+    would let a later paginated fetch serve it back as ``method == "cache"`` (a
+    fetched-tier method) and re-launder the tier.
+    """
+    return ToolOutcome(content_markdown=_NO_CONTENT_FETCH_MSG.format(url=url), method="empty", status="empty")
+
+
 def _warn_playwright_unavailable_once(exc: BaseException) -> None:
     global _PLAYWRIGHT_WARNED
     if _PLAYWRIGHT_WARNED:
@@ -563,9 +586,21 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                             extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
                             text = extracted or ""
                             links = _extract_links_from_html(html, current_url)
-                            should_render = not text.strip() or len(text.strip()) < _FETCH_MIN_CONTENT_CHARS
                             if not text.strip():
-                                text = "Plain fetch returned no extractable text."
+                                # No extractable text on a 200 OK (JS wall, consent
+                                # gate, empty body). A distinct "empty" status keeps
+                                # the ladder escalating to the rendered rung while
+                                # barring this outcome from the status=="ok" tier
+                                # grant — an unread page must never be "fetched".
+                                return PlainFetchResult(
+                                    status="empty",
+                                    method="plain",
+                                    text="Plain fetch returned no extractable text.",
+                                    links=links,
+                                    url=current_url,
+                                    content_type=content_type or None,
+                                    escalate_rendered=True,
+                                )
                             return PlainFetchResult(
                                 status="ok",
                                 method="plain",
@@ -573,11 +608,21 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
                                 links=links,
                                 url=current_url,
                                 content_type=content_type or None,
-                                escalate_rendered=should_render,
+                                escalate_rendered=len(text.strip()) < _FETCH_MIN_CONTENT_CHARS,
                             )
 
                         if any(token in content_type for token in _TEXTUAL_CONTENT_TYPE_TOKENS) or not content_type:
                             text = html.strip()
+                            if not text:
+                                return PlainFetchResult(
+                                    status="empty",
+                                    method="plain",
+                                    text="Plain fetch returned no extractable text.",
+                                    links=[],
+                                    url=current_url,
+                                    content_type=content_type or None,
+                                    escalate_rendered=True,
+                                )
                             return PlainFetchResult(
                                 status="ok",
                                 method="plain",
@@ -694,6 +739,9 @@ async def _resolve_pinned_host(url: str) -> tuple[str, str] | None:
 
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     try:
+        from playwright.async_api import (
+            Error as PlaywrightError,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
         from playwright.async_api import async_playwright  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
         _warn_playwright_unavailable_once(exc)
@@ -739,10 +787,23 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
                 # Chromium's connect), so their rebinding TOCTOU is a documented residual
                 # — a filtering forward proxy would close it, deferred as its own change.
                 async def _guard_route(route: Any, request: Any) -> None:
-                    if await resolution_source.is_public_http_url(request.url):
-                        await route.continue_()
-                    else:
-                        await route.abort("blockedbyclient")
+                    try:
+                        if await resolution_source.is_public_http_url(request.url):
+                            await route.continue_()
+                        else:
+                            await route.abort("blockedbyclient")
+                    except PlaywrightError as exc:
+                        # A request can still be in flight when the page/context tears
+                        # down (typically after a goto timeout): continue_/abort then
+                        # races the close and raises TargetClosedError in this detached
+                        # event-listener task — the unhandled-error storm seen
+                        # 2026-07-25. Swallow it: a closed target has no live socket, so
+                        # an abort that "fails" because the target is already gone still
+                        # lets nothing through — the SSRF guarantee is unaffected.
+                        # unroute_all in the finally is the primary drain; this is the
+                        # residual-race backstop. Only Playwright's own Error is caught,
+                        # so a genuine bug (a Python exception) still propagates.
+                        logger.debug("agentic route guard race during teardown: %s", exc)
 
                 await context.route("**/*", _guard_route)
                 page = await context.new_page()
@@ -778,6 +839,21 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
                         content_type=content_type or None,
                     )
                 finally:
+                    # Drain in-flight route handlers BEFORE teardown. Without this, a
+                    # request still in flight when we close (common after a goto
+                    # timeout) fires _guard_route against the closing context and raises
+                    # TargetClosedError in a detached event listener — the unhandled
+                    # traceback storm seen 2026-07-25 that buries real fetch failures in
+                    # the logs. unroute_all(ignoreErrors) removes the handlers and
+                    # silently swallows any still mid-flight (Playwright's own remedy for
+                    # this exact message). SSRF is unaffected: the guard already ran for
+                    # every request dialed while the page was live, and a request racing
+                    # teardown has no live target to exfiltrate through. Guarded so a
+                    # teardown-race error here can't skip context/browser close (leak).
+                    try:
+                        await context.unroute_all(behavior="ignoreErrors")
+                    except PlaywrightError as exc:
+                        logger.debug("agentic rendered fetch unroute_all race: %s", exc)
                     await context.close()
                     await browser.close()
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
@@ -857,19 +933,25 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
         # driver keeps its "handled automatically" contract without spending a
         # second tool call. read_document stays separately exposed for directed asks.
         return await read_document(plain.url, _generic_document_ask(question_topic))
-    if plain.status != "ok":
+    if plain.status not in ("ok", "empty"):
         return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
-    if not plain.escalate_rendered:
+    if plain.status == "ok" and not plain.escalate_rendered:
         return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
 
     rendered = await _try_rendered_fetch(plain.url)
-    if rendered is None:
+    if rendered is not None:
+        if rendered.method == "document_needed":
+            return await read_document(rendered.url, _generic_document_ask(question_topic))
+        if rendered.status == "ok" and rendered.text:
+            return _render_fetch_outcome(url, rendered.text, rendered.links, "rendered", start_char)
+    # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
+    # plain ONLY when the plain fetch actually read (thin-but-real) content; a plain
+    # fetch that produced nothing has no content to hand back and must not be
+    # laundered as a successful "plain"/"ok" retrieval (the companiesmarketcap.com
+    # js-wall failure: an unread page stamped `fetched` and superseded the briefing).
+    if plain.status == "ok":
         return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
-    if rendered.method == "document_needed":
-        return await read_document(rendered.url, _generic_document_ask(question_topic))
-    if rendered.status == "ok" and rendered.text:
-        return _render_fetch_outcome(url, rendered.text, rendered.links, "rendered", start_char)
-    return _render_fetch_outcome(url, plain.text, plain.links, "plain", start_char)
+    return _empty_fetch_outcome(plain.url)
 
 
 async def read_document(url: str, ask: str) -> ToolOutcome:

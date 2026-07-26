@@ -11,16 +11,19 @@ from forecasting_tools import MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
     TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
     check_tournament_dates,
+    credit_alerts_active,
     env_flag_enabled,
 )
 from metaculus_bot.credit_telemetry import CreditTelemetry
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
+    get_credit_key_fallback_count,
     get_donated_404_fallback_count,
     get_generic_key_fallback_count,
 )
@@ -197,29 +200,58 @@ def main() -> None:
     # personal key — but a call that should have hit the free donated key
     # billed to the operator instead, so the operator should investigate.
     # ``generic_fallback`` counts ALL fallback causes (401/402/429/guardrail/
-    # 404); ``donated_404`` is the allowed-providers-404 subset of that total,
-    # broken out for diagnostics. Add only ``generic_fallback`` to ``alertable``
-    # — adding ``donated_404`` too would double-count the 404 subset.
+    # 404); ``donated_404`` and ``credit_fallback`` are two disjoint subsets of
+    # that total, broken out for diagnostics. Add only ``generic_fallback`` to
+    # ``alertable`` — adding either subset too would double-count events already
+    # inside that total.
+    #
+    # Credit suppression (until CREDIT_ALERT_RESUME_DATE): the operator is
+    # self-funding the rest of the season, so an empty donated key is expected
+    # and its fallbacks are SUBTRACTED back out of the total. Every other cause
+    # keeps its full weight, because 401/404/429/guardrail each mean real
+    # breakage. Each event is still counted exactly once: generic adds it, and at
+    # most one subset subtracts it.
+    alerts_active = credit_alerts_active()
     generic_fallback = get_generic_key_fallback_count()
     donated_404 = get_donated_404_fallback_count()
-    alertable = bot_alertable + generic_fallback
+    credit_fallback = get_credit_key_fallback_count()
+    suppressed_credit_fallback = 0 if alerts_active else credit_fallback
+    alertable = bot_alertable + generic_fallback - suppressed_credit_fallback
     if alertable > 0:
+        suppression_note = (
+            ""
+            if alerts_active
+            else f" with {suppressed_credit_fallback} credit event(s) suppressed until "
+            f"{CREDIT_ALERT_RESUME_DATE.isoformat()}"
+        )
         logger.warning(
             "Run completed with %d alertable degradation event(s) "
-            "(bot=%d, personal_key_fallback=%d of which donated_404=%d); "
+            "(bot=%d, personal_key_fallback=%d of which donated_404=%d, credit=%d%s); "
             "exiting non-zero so CI marks this run red.",
             alertable,
             bot_alertable,
             generic_fallback,
             donated_404,
+            credit_fallback,
+            suppression_note,
         )
         sys.exit(1)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
     # already logged by credit_telemetry). The run completed and published
-    # normally; exiting non-zero here is purely the reminder-to-refill signal.
+    # normally; exiting non-zero here is purely the reminder-to-refill signal —
+    # and it is suppressed until CREDIT_ALERT_RESUME_DATE, since a drained
+    # donated key is the expected state while the operator self-funds. The INFO
+    # line keeps the log self-explanatory: a reader who sees the breach WARNING
+    # but a green run should not have to guess why.
     if donated_below_floor:
-        sys.exit(1)
+        if alerts_active:
+            sys.exit(1)
+        logger.info(
+            "Donated-key credit floor breached, but credit alerting is suppressed until %s "
+            "(operator is self-funding the rest of the season), so this run exits zero.",
+            CREDIT_ALERT_RESUME_DATE.isoformat(),
+        )
 
     # Post-submission deprecation tripwire. Runs LAST so submission has fully
     # completed (and so other alertable conditions exit first with their own

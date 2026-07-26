@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from metaculus_bot.config import load_environment
 
@@ -193,6 +193,20 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _date_env(name: str, default: date) -> date:
+    """Parse an ISO ``YYYY-MM-DD`` env var into a date, falling back on garbage."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "":
+        return default
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return default
+
+
 # AskNews provider safety limits (global, across all bots in-process)
 # Defaults are conservative for pro plans (1 RPS sustained, 5 RPS burst, 5 concurrency)
 ASKNEWS_MAX_CONCURRENCY: int = max(1, _int_env("ASKNEWS_MAX_CONCURRENCY", 1))
@@ -221,6 +235,33 @@ ASKNEWS_WALL_TIMEOUT: int = 300
 # The floor is meaningless for the personal key (no limit_remaining), so it is
 # only checked against the donated key. See metaculus_bot/credit_telemetry.py.
 OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1.0)
+
+# Dated suppression of the credit ALERTS (not the logs). The operator is funding
+# the rest of the season out of pocket, so an empty donated key is expected
+# rather than a defect, and the two paths that turn a credit shortfall into a
+# non-zero exit — the floor breach in cli.main and the credit-caused
+# donated->personal fallbacks folded into ``alertable`` — must not redden CI
+# until this date. The tournament closes on TOURNAMENT_END_DATE (2026-09-06);
+# alerting resumes a few days later so a stale suppression can't outlive the
+# season. Every CREDIT_* log line, including CREDIT_FLOOR_BREACH, keeps firing
+# throughout: only the exit status and the alertable arithmetic change.
+#
+# Non-credit fallback causes (401 invalid/disabled key, 404 no-allowed-providers,
+# 429 rate limit, guardrail/data-policy) stay fully alertable — each of those is
+# real breakage, not an expected empty wallet.
+CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 10))
+
+
+def credit_alerts_active(today: date | None = None) -> bool:
+    """Whether credit shortfalls should still exit non-zero.
+
+    False during the suppression window, True from ``CREDIT_ALERT_RESUME_DATE``
+    onward. ``today`` defaults to the system clock read at CALL time (not at
+    import), so a long-lived process crosses the resume date without a redeploy
+    and tests can inject a fixed date instead of depending on the wall clock.
+    """
+    return (today or date.today()) >= CREDIT_ALERT_RESUME_DATE
+
 
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection

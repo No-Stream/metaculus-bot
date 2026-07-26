@@ -64,7 +64,7 @@ QID_KIND_QUESTION_ID = "question_id"
 # is a raw ref (URL or bare id); ``summary`` is the ghost-forecast free-text summary;
 # ``forecast_json`` is the compact ghost-forecast JSON blob (kept verbatim for the
 # scorer to ``json.loads`` — coercion would mangle it).
-_RAW_FIELDS: frozenset[str] = frozenset({"question", "summary", "forecast_json"})
+_RAW_FIELDS: frozenset[str] = frozenset({"question", "summary", "forecast_json", "detail"})
 
 # Values that mean "no data" in the marker formats (``_fmt`` renders ``None`` as
 # "n/a"; ``question_id`` renders as "None"; a stray "null" is defensive).
@@ -238,6 +238,18 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # close_margin.py emits question.id_of_question
     ),
     MarkerSpec(
+        "forecaster_drops",
+        # Per-run ensemble-drop summary emitted by
+        # forecaster.py:_emit_forecaster_drop_telemetry. No per-question ref (it
+        # aggregates a whole run), so qid_kind stays None. ``detail`` is a compact
+        # model->cause->count JSON blob captured verbatim (it is in _RAW_FIELDS) so
+        # the '/'-laden OpenRouter slugs and nested counts survive; ``systematic`` is
+        # a comma-joined model list (or the "none" sentinel -> None).
+        re.compile(
+            r"FORECASTER_DROPS:\s*total=(?P<total>\S+)\s+systematic=(?P<systematic>\S+)\s+detail=(?P<detail>\{.*\})\s*$"
+        ),
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"
@@ -264,6 +276,15 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec("tools_used", re.compile(r"<!--\s*TOOLS_USED=(?P<value>true|false)\s*-->", re.IGNORECASE)),
+    # Ensemble-size disclosure (metaculus_bot/comment/markers.py). Like the other
+    # HTML-comment markers this lives in the published comment, not stdout — its
+    # durable consumer is performance_analysis.parsing; the spec is here so the
+    # run-log parser stays complete if a comment body is ever logged. ``used`` /
+    # ``configured`` are the contributed / configured forecaster counts.
+    MarkerSpec(
+        "forecasters_used",
+        re.compile(r"<!--\s*FORECASTERS_USED=(?P<used>\d+)/(?P<configured>\d+)\s*-->", re.IGNORECASE),
+    ),
     MarkerSpec(
         "anchor_overshoot_pp",
         re.compile(r"<!--\s*ANCHOR_OVERSHOOT_PP=(?P<pp>[+-]?\d+(?:\.\d+)?)\s*-->", re.IGNORECASE),

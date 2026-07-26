@@ -28,7 +28,7 @@ check that the two sides actually work in concert.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools import (
@@ -42,6 +42,7 @@ from forecasting_tools.data_models.forecast_report import ResearchWithPrediction
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.comment.markers import (
+    FORECASTERS_USED_MARKER_RE,
     STACKED_MARKER_FALSE,
     STACKED_MARKER_TRUE,
     STACKER_OUTCOME_FALLBACK_LLM,
@@ -51,7 +52,7 @@ from metaculus_bot.comment.markers import (
     STACKER_OUTCOME_SKIPPED,
     STACKER_OUTCOME_SKIPPED_CONFIG_OFF,
 )
-from metaculus_bot.performance_analysis.collector import _process_single_question
+from metaculus_bot.performance_analysis.collector import _process_post, _process_single_question
 from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_forecasts,
     parse_per_model_numeric_percentiles,
@@ -66,7 +67,7 @@ from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 # ---------------------------------------------------------------------------
 
 
-def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
+def _make_bot(strategy: AggregationStrategy, n_forecasters: int = 2) -> TemplateForecaster:
     """Create a TemplateForecaster with the minimal LLM config for the strategy.
 
     STACKING and CONDITIONAL_STACKING require a stacker LLM; CONDITIONAL_STACKING
@@ -76,7 +77,7 @@ def _make_bot(strategy: AggregationStrategy) -> TemplateForecaster:
     """
     test_llm = GeneralLlm(model="test-model", temperature=0.0)
     llms: dict[str, str | GeneralLlm | list[GeneralLlm]] = {
-        "forecasters": [test_llm, test_llm],
+        "forecasters": [test_llm] * n_forecasters,
         "stacker": test_llm,
         "analyzer": test_llm,
         "default": test_llm,
@@ -623,6 +624,229 @@ def _make_mc_q_dict(
     }
 
 
+class TestForecastersUsedDisclosure:
+    """The published comment must state the ensemble size actually used, so a
+    degraded publish (a dropped model) is distinguishable in the durable record
+    from a genuine roster change (both otherwise look like "fewer than N bullets").
+
+    Producer side: TemplateForecaster._create_unified_explanation reports the
+    contributor count recorded by _research_and_make_predictions, and n_configured
+    from the roster. Consumer side: _process_post parses the marker off the comment
+    and _process_single_question carries it onto the record for residual analysis.
+    """
+
+    def _bot(self):
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING)  # 2 forecasters configured
+        bot._stacker_outcome[12345] = "skipped"
+        return bot
+
+    async def _publish_via_pipeline(self, bot, question, prediction_values: list[float]):
+        """Run the real _research_and_make_predictions, then build the comment from
+        what it returned — the producer path end to end.
+
+        Everything outside ensemble-size bookkeeping is stubbed: research, the
+        forecaster fan-out (whose return value IS the surviving per-model
+        prediction list), crux extraction, targeted search, and the stacker
+        aggregate. Returns (collection, comment_text).
+        """
+        predictions = [
+            ReasonedPrediction(prediction_value=value, reasoning=f"Model: openrouter/provider/m{i}\nbody")
+            for i, value in enumerate(prediction_values)
+        ]
+        with (
+            patch.object(
+                bot, "_get_notepad", new=AsyncMock(return_value=MagicMock(total_research_reports_attempted=0))
+            ),
+            patch.object(bot, "run_research", new=AsyncMock(return_value="research body")),
+            patch.object(
+                bot,
+                "_forecaster_with_soft_deadline",
+                new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
+            ),
+            patch.object(
+                bot, "_gather_predictions_with_wall_clock", new=AsyncMock(return_value=(predictions, [], None))
+            ),
+            patch("metaculus_bot.forecaster.extract_disagreement_crux", new=AsyncMock(return_value="the crux")),
+            patch("metaculus_bot.forecaster.run_targeted_search", new=AsyncMock(return_value="targeted research")),
+            patch.object(bot, "_aggregate_predictions", new=AsyncMock(return_value=0.6)),
+        ):
+            collection = await bot._research_and_make_predictions(question)
+        # The real _aggregate_predictions sets this; it is mocked out above, and
+        # build_unified_explanation asserts on its presence under stacking.
+        bot._stacker_outcome.setdefault(question.id_of_question, "primary")
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            comment = bot._create_unified_explanation(question, [collection], 0.6, 0.01, 1.0)
+        return collection, comment
+
+    @pytest.mark.asyncio
+    async def test_stacked_publish_discloses_every_contributing_forecaster(self):
+        """The stacked path publishes ONE aggregated prediction, so counting the
+        returned collection reported FORECASTERS_USED=1/3 on a healthy three-model
+        run — manufacturing exactly the false degradation reading this marker exists
+        to rule out. The count must come from the fan-out, not the collection.
+        """
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING, n_forecasters=3)
+        q = _make_binary_question()
+        # Binary range 0.75 >> the 0.15 threshold, so stacking fires.
+        collection, comment = await self._publish_via_pipeline(bot, q, [0.10, 0.50, 0.85])
+
+        assert bot._conditional_stacking_triggered_count == 1, "precondition: stacking must have fired"
+        assert len(collection.predictions) == 1, "precondition: stacking collapses the ensemble to one aggregate"
+        match = FORECASTERS_USED_MARKER_RE.search(comment)
+        assert match is not None and match.groups() == ("3", "3")
+
+    @pytest.mark.asyncio
+    async def test_base_combine_publish_discloses_survivors_of_configured(self):
+        """Non-stacked path (spread at/below threshold): two survivors of three
+        configured must read 2/3, agreeing with the stacked path's meaning of
+        n_used.
+        """
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING, n_forecasters=3)
+        q = _make_binary_question()
+        collection, comment = await self._publish_via_pipeline(bot, q, [0.45, 0.55])
+
+        assert bot._conditional_stacking_skipped_count == 1, "precondition: stacking must have been skipped"
+        assert len(collection.predictions) == 2
+        match = FORECASTERS_USED_MARKER_RE.search(comment)
+        assert match is not None and match.groups() == ("2", "3")
+
+    @pytest.mark.asyncio
+    async def test_single_forecaster_short_circuit_discloses_one_of_configured(self):
+        """The n==1 short-circuit (skips spread + stacking) must also report the
+        fan-out count: 1 of 3, the genuinely degraded publish.
+        """
+        bot = _make_bot(AggregationStrategy.CONDITIONAL_STACKING, n_forecasters=3)
+        q = _make_binary_question()
+        collection, comment = await self._publish_via_pipeline(bot, q, [0.42])
+
+        assert len(collection.predictions) == 1
+        match = FORECASTERS_USED_MARKER_RE.search(comment)
+        assert match is not None and match.groups() == ("1", "3")
+
+    def _collection(self, n_predictions: int) -> ResearchWithPredictions:
+        return ResearchWithPredictions(
+            research_report="# RESEARCH\nbody",
+            summary_report="_summary_",
+            errors=[],
+            predictions=[
+                ReasonedPrediction(prediction_value=0.6, reasoning=f"Model: openrouter/provider/m{i}\nr")
+                for i in range(n_predictions)
+            ],
+        )
+
+    def test_degraded_publish_discloses_used_of_configured(self):
+        bot = self._bot()
+        q = _make_binary_question()
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [self._collection(1)], 0.6, 0.01, 1.0)
+        # 1 of 2 configured contributed — a dropped model, disclosed.
+        match = FORECASTERS_USED_MARKER_RE.search(out)
+        assert match is not None and match.groups() == ("1", "2")
+
+    def test_full_ensemble_discloses_all_used(self):
+        bot = self._bot()
+        q = _make_binary_question()
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [self._collection(2)], 0.6, 0.01, 1.0)
+        match = FORECASTERS_USED_MARKER_RE.search(out)
+        assert match is not None and match.groups() == ("2", "2")
+
+    def test_delegated_run_discloses_parent_fanout_width_not_zero(self):
+        """With no "forecasters" roster the bot delegates to the parent, whose
+        fan-out width is predictions_per_research_report. The configured count must
+        report that width — an empty roster previously published `3/0`, inverting
+        the used-under-configured invariant that residual analysis reads.
+        """
+        test_llm = GeneralLlm(model="test-model", temperature=0.0)
+        bot = TemplateForecaster(
+            research_reports_per_question=1,
+            predictions_per_research_report=3,
+            publish_reports_to_metaculus=False,
+            aggregation_strategy=AggregationStrategy.MEAN,
+            llms={"default": test_llm, "parser": test_llm, "researcher": test_llm, "summarizer": test_llm},  # type: ignore[arg-type]
+            is_benchmarking=True,
+        )
+        assert not bot._forecaster_llms, "precondition: this is the delegated path"
+        q = _make_binary_question()
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [self._collection(3)], 0.6, 0.01, 1.0)
+        match = FORECASTERS_USED_MARKER_RE.search(out)
+        assert match is not None and match.groups() == ("3", "3")
+
+    def test_record_carries_parsed_ensemble_size(self):
+        post = _make_post_data()
+        q = _make_binary_q_dict(forecast_values=[0.3, 0.7])
+        rec = _process_single_question(
+            post_id=post["id"],
+            title=post["title"],
+            q=q,
+            comment_text="# SUMMARY\nfoo\n<!-- FORECASTERS_USED=2/3 -->\n",
+            comment_id=5,
+            per_model={},
+            per_model_numeric_percentiles={},
+            was_stacked=None,
+            post_data=post,
+            forecasters_used=(2, 3),
+        )
+        assert rec is not None
+        assert rec["forecasters_used"] == 2
+        assert rec["forecasters_configured"] == 3
+
+    def test_process_post_parses_marker_off_the_comment_onto_the_record(self):
+        """The parse → pass → materialize chain, driven from the top.
+
+        The two tests below hand ``forecasters_used`` to _process_single_question
+        pre-parsed, so neither notices if _process_post stops parsing the marker.
+        This one starts from raw comment text, which is what a pull actually has.
+        """
+        post_data = {
+            "id": 771,
+            "title": "Will it happen?",
+            "projects": {"category": [{"name": "Politics"}]},
+            "question": {
+                "id": 551,
+                "type": "binary",
+                "resolution": "yes",
+                "my_forecasts": {"latest": {"forecast_values": [0.3, 0.7]}},
+                "scaling": {},
+                "open_lower_bound": False,
+                "open_upper_bound": False,
+                "title": "Will it happen?",
+                "nr_forecasters": 40,
+                "open_time": "2024-01-01T00:00:00Z",
+                "actual_resolve_time": "2024-06-01T00:00:00Z",
+                "scheduled_resolve_time": "2024-06-01T00:00:00Z",
+            },
+        }
+        comment_text = "## Report 1 Summary\n### Forecasts\n*Forecaster 1 (m1)*: 70.0%\n<!-- FORECASTERS_USED=2/3 -->\n"
+        comment_lookup = {771: {"id": 4242, "on_post": 771, "text": comment_text, "created_at": "2024-05-01T00:00:00Z"}}
+
+        records = _process_post(post_data, comment_lookup)
+
+        assert len(records) == 1
+        assert records[0]["forecasters_used"] == 2
+        assert records[0]["forecasters_configured"] == 3
+
+    def test_record_ensemble_size_none_when_marker_absent(self):
+        post = _make_post_data()
+        q = _make_binary_q_dict(forecast_values=[0.3, 0.7])
+        rec = _process_single_question(
+            post_id=post["id"],
+            title=post["title"],
+            q=q,
+            comment_text="# SUMMARY\nno marker\n",
+            comment_id=5,
+            per_model={},
+            per_model_numeric_percentiles={},
+            was_stacked=None,
+            post_data=post,
+            forecasters_used=None,
+        )
+        assert rec is not None
+        assert rec["forecasters_used"] is None
+        assert rec["forecasters_configured"] is None
+
+
 class TestCollectorProcessSingleQuestion:
     """Exercises metaculus_bot.performance_analysis.collector._process_single_question.
 
@@ -709,8 +933,6 @@ class TestCollectorProcessSingleQuestion:
         This is the load-bearing fix: previously only the first option line was
         captured, making MC residual analysis impossible.
         """
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         mc_comment_text = (
             "## Report 1 Summary\n"
             "### Forecasts\n"
@@ -764,8 +986,6 @@ class TestCollectorProcessSingleQuestion:
 
     def test_binary_question_per_model_unchanged_with_mc_fix(self):
         """Binary per_model_forecasts remains as raw strings (regression guard)."""
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         binary_comment_text = (
             "## Report 1 Summary\n"
             "### Forecasts\n"
@@ -938,9 +1158,6 @@ class TestPerBaseModelForecastsOnRecord:
     """
 
     def test_stacked_binary_populates_per_base_model_forecasts(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-        from metaculus_bot.stacking import combine_stacker_and_base_reasoning
-
         base_predictions = [
             ReasonedPrediction(
                 prediction_value=0.72,
@@ -991,8 +1208,6 @@ class TestPerBaseModelForecastsOnRecord:
         assert per_base["gemini-3.1-pro-preview"] == "75.0%"
 
     def test_non_stacked_binary_has_empty_per_base_model_forecasts(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         comment_text = (
             "## Report 1 Summary\n"
             "### Forecasts\n"
@@ -1020,9 +1235,6 @@ class TestPerBaseModelForecastsOnRecord:
         assert rec["per_base_model_forecasts"] == {}
 
     def test_stacked_mc_populates_per_base_model_option_dicts(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-        from metaculus_bot.stacking import combine_stacker_and_base_reasoning
-
         base_predictions = [
             ReasonedPrediction(
                 prediction_value=0.6,

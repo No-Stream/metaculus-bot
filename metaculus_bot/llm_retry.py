@@ -26,6 +26,22 @@ sub-second blips are.
 Composes with the existing ``allowed_tries=1`` configs (the inner tenacity is a
 no-op there) and with the stacker's cross-provider fallback design (a slow
 stall still falls through to the fallback model rather than being retried here).
+
+Zero-output exemption
+---------------------
+The elapsed gate has one carve-out. A SLOW failure that returned *no usable
+content* — an empty/whitespace HTTP body (litellm ``APIError`` "Unable to get
+json response") or an empty completion (forecasting-tools ``RuntimeError`` "LLM
+answer is an empty string") — is the single most valuable retry case: the prior
+attempt produced nothing, so a re-roll is cheap in EV. ``is_zero_output_failure``
+detects it and the loop re-rolls it ONCE, immediately (no backoff), bypassing the
+gate. This closed the 2026-07-25 gap where a forecaster's slow whitespace-body
+``APIError`` was never retried and the question published on 2 of 3 models. A
+genuine ``asyncio.TimeoutError`` is NOT zero-output (the model may have been
+mid-generation) so it stays gated. The exemption is ANDed with the retry
+predicate, so it only fires on the broad-predicate sites (forecasters, crux,
+summarizer); the transient-predicate sites (stacker, research) reject the
+zero-output types and are untouched.
 """
 
 import asyncio
@@ -107,13 +123,55 @@ def _is_transient_type(exc: BaseException) -> bool:
     return isinstance(exc, TRANSIENT_RETRY_EXCEPTIONS)
 
 
+# Message markers for the empty/whitespace-body case: litellm re-wraps a
+# JSONDecodeError on an unparseable HTTP body ("Unable to get json response -
+# Expecting value: ...") — the 2026-07-25 production failure where OpenRouter
+# returned a 200 with a whitespace-only body for claude-opus-4.8. Matched
+# case-insensitively on the message so a phrasing tweak across litellm versions
+# still catches the family. The "empty completion" case is handled by RuntimeError
+# type + "empty string" (forecasting-tools general_llm.py) in is_zero_output_failure.
+_ZERO_OUTPUT_BODY_MARKERS: tuple[str, ...] = (
+    "unable to get json response",  # litellm: raw_response.json() failed on empty/whitespace body
+    "empty model response",  # defensive: alternate no-content phrasing
+)
+
+
+def is_zero_output_failure(exc: BaseException) -> bool:
+    """True when a failure means the provider returned NO usable content.
+
+    Two concrete shapes, both "HTTP success but nothing usable" rather than a real
+    timeout or a structured refusal:
+
+    * litellm re-wraps a ``JSONDecodeError`` on an empty/whitespace response body as
+      an :class:`~litellm.exceptions.APIError` whose message contains "Unable to get
+      json response" (OpenRouter returned a 200 with nothing parseable — the
+      2026-07-25 case that dropped a forecaster).
+    * forecasting-tools raises ``RuntimeError("LLM answer is an empty string ...")``
+      (``general_llm.py``) when the body parsed but the completion string was empty.
+
+    A genuine ``asyncio.TimeoutError`` (the wall guard firing) is deliberately NOT
+    zero-output: the model may have been mid-generation when we cut it off, so
+    re-rolling it risks the submission deadline — the elapsed gate must keep blocking
+    it. This predicate only *exempts a slow failure from the elapsed gate*; it is
+    always ANDed with the site's retryability predicate in the retry loop, so a
+    permanent error (content-policy block, bad request) can never reach it, and the
+    transient-predicate sites (stacker, research providers) — which reject APIError /
+    RuntimeError by type — never fire the exemption.
+    """
+    message = str(exc).lower()
+    if isinstance(exc, litellm.exceptions.APIError) and any(marker in message for marker in _ZERO_OUTPUT_BODY_MARKERS):
+        return True
+    return isinstance(exc, RuntimeError) and "empty string" in message
+
+
 def is_broadly_retryable(exc: BaseException) -> bool:
     """Broad retry predicate: retry anything that is not clearly-permanent.
 
     Used by the ``allowed_tries>=2`` sites (forecasters, crux analyzer, AskNews
     summarizer) which legitimately benefit from retrying things the transient set
     excludes (empty-model-response ``RuntimeError``, a parser-ish hiccup). The 30s
-    elapsed gate in the shared loop still blocks slow failures regardless.
+    elapsed gate in the shared loop still blocks slow failures, except a slow
+    zero-output failure, which the loop re-rolls once (see ``is_zero_output_failure``).
 
     Two exclusion sets are NOT retried: ``PERMANENT_NO_RETRY_EXCEPTIONS`` (litellm
     permanent API errors) and ``PYTHON_BUG_NO_RETRY_EXCEPTIONS`` (code-defect types
@@ -135,15 +193,17 @@ async def invoke_with_transient_retry(
     """Invoke an async LLM call with an elapsed-gated retry + wall cap.
 
     Each attempt wraps ``make_awaitable()`` in ``asyncio.wait_for(..., wall_timeout)``
-    so the call is always bounded. On failure, the attempt is retried ONLY if it
-    is not the last attempt AND the failure is *fast* (its own duration is under
-    ``max_elapsed_s``) AND the ``predicate`` accepts the exception. Otherwise the
-    exception propagates unchanged.
+    so the call is always bounded. On failure, the attempt is retried (predicate
+    permitting, and if it is not the last attempt) in one of two ways: a *fast*
+    failure (own duration under ``max_elapsed_s``) runs the full backoff ladder; a
+    *slow zero-output* failure (``is_zero_output_failure``) is re-rolled exactly ONCE
+    with no backoff. Otherwise the exception propagates unchanged.
 
     The elapsed gate is the universal deadline-safety rule: a slow failure (e.g. a
     5-min reasoning attempt that then times out, or the wall guard's
-    ``asyncio.TimeoutError`` firing at ``wall_timeout``) is NEVER retried, no
-    matter the type or predicate.
+    ``asyncio.TimeoutError`` firing at ``wall_timeout``) is NEVER retried — the sole
+    exception being a slow *zero-output* failure, which produced no content and so
+    earns one immediate re-roll (bounded by ``wall_timeout``, capped at one).
 
     Args:
         make_awaitable: A ZERO-ARG FACTORY returning a FRESH awaitable each call.
@@ -169,6 +229,7 @@ async def invoke_with_transient_retry(
     """
     should_retry = predicate if predicate is not None else _is_transient_type
     total_attempts = len(backoffs) + 1
+    zero_output_reroll_used = False
     for attempt in range(total_attempts):
         start = time.monotonic()
         # The broad catch is the whole point: we must inspect ANY exception to
@@ -179,9 +240,29 @@ async def invoke_with_transient_retry(
         except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
             elapsed = time.monotonic() - start
             is_last = attempt == total_attempts - 1
-            is_fast_retryable = elapsed < max_elapsed_s and should_retry(exc)
-            if is_last or not is_fast_retryable:
+            retryable = should_retry(exc)
+            is_fast_retryable = retryable and elapsed < max_elapsed_s
+            # Zero-output exemption: a SLOW failure that returned no usable content
+            # (empty/whitespace body, empty completion) is re-rolled ONCE with no
+            # backoff, bypassing the elapsed gate. The previous attempt produced
+            # nothing, so a single re-roll is cheap in EV; capping at one and
+            # skipping the backoff keeps it from reintroducing the deadline risk the
+            # gate guards against (backoff only helps load/connection blips, never an
+            # empty body). Still ANDed with should_retry, so permanent errors and the
+            # transient-predicate sites (stacker, research) are untouched.
+            take_zero_output_reroll = (
+                retryable and not is_fast_retryable and not zero_output_reroll_used and is_zero_output_failure(exc)
+            )
+            if is_last or not (is_fast_retryable or take_zero_output_reroll):
                 raise
+            if take_zero_output_reroll:
+                zero_output_reroll_used = True
+                logger.warning(
+                    f"LLM_RETRY[{label}]: slow zero-output failure on attempt {attempt + 1}/{total_attempts} "
+                    f"({type(exc).__name__}, {elapsed=:.3f}s >= {max_elapsed_s}s); re-rolling once immediately, "
+                    f"no backoff — provider returned no usable content: {exc}"
+                )
+                continue
             backoff = backoffs[attempt]
             logger.warning(
                 f"LLM_RETRY[{label}]: fast retryable failure on attempt {attempt + 1}/{total_attempts} "

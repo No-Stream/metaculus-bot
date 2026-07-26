@@ -45,6 +45,7 @@ from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
     format_provider_diagnostics_block,
+    pop_provider_detail,
 )
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -119,6 +120,52 @@ class ResearchOrchestrator:
         # alarm (investigating that beats silently missing a dead feature). See
         # run_research for the three mutually-exclusive bump points.
         self.gap_fill_v2_error_count: int = 0
+
+    @property
+    def prediction_market_degraded_count(self) -> int:
+        """Per-run Kalshi /series fetch failures, read from the prediction-market
+        module counter and folded into the forecaster's alertable_count.
+
+        The prediction-market provider soft-fails internally (a dead Kalshi
+        series path still returns fuzzy-over-events matches), so this sub-path
+        failure never raises and never bumps timeout_count. Reading the module
+        counter here is the only way it reddens CI (the 2026-07-25 hole where
+        research_provider_timeouts=0 while the path was dead)."""
+        from metaculus_bot.research.prediction_market import (
+            kalshi_series_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        return kalshi_series_fetch_failures()
+
+    @property
+    def prediction_market_platform_failure_count(self) -> int:
+        """Per-run count of lost prediction-market platform fetches (one per venue
+        whose query/prefetch fan-out lost a sub-fetch, plus one per whole-provider
+        failure), read from the module counter and folded into alertable_count.
+
+        Operator decision 2026-07-25: alert on ANY platform failure, not only a total
+        blackout. The provider soft-fails every venue internally, so without this the
+        forecasters silently run on zero market data while CI stays green."""
+        from metaculus_bot.research.prediction_market import (
+            prediction_market_platform_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        return prediction_market_platform_failures()
+
+    def reset_run_degradation_counters(self) -> None:
+        """Zero per-run degradation counters at run start (called by
+        forecast_questions alongside reset_pchip_stats). The prediction-market
+        series and platform counters are module globals — resetting them here keeps
+        them clean per-run metrics instead of leaking across runs/tests that share a
+        process. The orchestrator's own instance counters are fresh per bot, so they
+        need no reset here."""
+        from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            reset_platform_degradation_counter,
+            reset_series_degradation_counter,
+        )
+
+        reset_series_degradation_counter()
+        reset_platform_degradation_counter()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)
@@ -438,6 +485,11 @@ class ResearchOrchestrator:
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, ProviderResult]:
             started = time.monotonic()
+            # A multi-source provider records its per-source outcome into the
+            # (qid, provider) registry during the call; drain it here so partial
+            # upstream loss (e.g. Kalshi dropped over the size cap) rides into
+            # ProviderResult.details instead of vanishing behind a healthy `ok`.
+            qid = getattr(question, "id_of_question", None)
             try:
                 used_fallback = False
                 if name == "asknews" and self._allow_research_fallback:
@@ -468,9 +520,14 @@ class ResearchOrchestrator:
                     status=status,
                     chars=len(raw) if has_output else 0,
                     latency_ms=latency_ms,
+                    details=pop_provider_detail(qid, name),
                 )
                 return (raw, result)
             except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
+                # Drain-and-discard any partial detail the provider recorded before
+                # raising: an errored result carries the error, not source detail,
+                # and a stale entry must not leak into a later same-key call.
+                pop_provider_detail(qid, name)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 if name == "asknews" and is_asknews_subscription_error(e):
                     status = "inactive"

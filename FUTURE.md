@@ -718,6 +718,21 @@ gated set collapsed:
 - **pillow / transformers / pydantic-settings — CLEARED.** The `[tool.uv]` override/exclude-
   dependencies workarounds were deleted from pyproject.toml at the bump; none resolve to a
   vulnerable version anymore.
+- **gitpython — EXCLUDED 2026-07-25.** It shipped five High argument-injection / unsafe-option /
+  env-expansion advisories at 3.1.52 across four releases in six days, arriving transitively as
+  streamlit ← forecasting-tools. Rather than track that treadmill, `[tool.uv]
+  exclude-dependencies = ["gitpython"]` drops it (with gitdb + smmap, 217 → 214 packages) — the same
+  mechanism and reasoning as the transformers exclusion in commit 836a5d0. It is unreachable for us:
+  an import tripwire over `import forecasting_tools` + `import metaculus_bot.forecaster` never loads
+  it, and streamlit's only use is a lazy `import git` inside
+  `app_session._handle_git_information_request`, served to a running streamlit server we never start
+  and swallowed into a debug log. **streamlit itself cannot be excluded** —
+  `forecasting_tools/__init__.py` imports `benchmark_displayer`, which imports streamlit at module
+  scope, so excluding it breaks every `import forecasting_tools` including `tests/conftest.py`.
+  Note a trap found while fixing this: an `exclude-newer-package` pin written only into `uv.lock`
+  does NOT survive re-resolution (any `uv lock --upgrade-package <anything>` silently reverted
+  gitpython to the vulnerable 3.1.52), so lock-only pins are not a durable CVE control. Re-evaluate
+  the exclusion at the next forecasting-tools bump.
 
 Re-audit at the next forecasting-tools or asknews bump (re-run `make audit`, prune resolved IDs). If
 one of the two accepted cryptography CVEs becomes actively exploited before asknews lifts its cap,

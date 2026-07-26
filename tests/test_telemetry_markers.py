@@ -104,7 +104,8 @@ CREDIT_SPEND_LINE = PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remainin
 CREDIT_SPEND_NA_LINE = PFX + "CREDIT_SPEND: key=personal run_delta_usd=n/a remaining=n/a"
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
-    "balance needs a top-up; run completed normally but will exit non-zero so CI flags it."
+    "balance needs a top-up; run completed normally. cli.main logs the resulting "
+    "exit decision (non-zero unless credit alerting is currently suppressed)."
 )
 
 _META = {
@@ -518,3 +519,56 @@ class TestParseLogText:
         assert "ghost_forecast" in stems
         assert "credit_balance" in stems
         assert len(stems) == len(MARKER_SPECS), "marker names must be unique (one file per type)"
+
+
+# Example lines copied from the emitting format string
+# (metaculus_bot/forecaster.py:_emit_forecaster_drop_telemetry) — the source of
+# truth, so a producer-side shape change breaks these loudly.
+FORECASTER_DROPS_LINE = (
+    PFX + "FORECASTER_DROPS: total=3 systematic=openrouter/anthropic/claude-opus-4.8 "
+    'detail={"openrouter/anthropic/claude-opus-4.8":{"zero_output":2},'
+    '"openrouter/google/gemini-3.1-pro-preview":{"timeout_soft_deadline":1}}'
+)
+FORECASTER_DROPS_CLEAN_LINE = PFX + "FORECASTER_DROPS: total=0 systematic=none detail={}"
+
+
+class TestForecasterDrops:
+    def test_fields(self):
+        rec = _parse_one(FORECASTER_DROPS_LINE)
+        assert rec["marker"] == "forecaster_drops"
+        assert rec["total"] == 3
+        # A '/'-laden OpenRouter slug survives the systematic field intact.
+        assert rec["systematic"] == "openrouter/anthropic/claude-opus-4.8"
+        # Per-run summary: no per-question ref, so no qid space is stamped.
+        assert "qid" not in rec
+        assert rec["qid_kind"] is None if "qid_kind" in rec else True
+
+    def test_detail_json_round_trips(self):
+        rec = _parse_one(FORECASTER_DROPS_LINE)
+        # detail stays a raw string (never coerced) so residual analysis can json.loads it;
+        # the nested model->cause->count survives slugs with slashes and dots.
+        assert json.loads(rec["detail"]) == {
+            "openrouter/anthropic/claude-opus-4.8": {"zero_output": 2},
+            "openrouter/google/gemini-3.1-pro-preview": {"timeout_soft_deadline": 1},
+        }
+
+    def test_clean_run_line_parses_with_zero_total(self):
+        rec = _parse_one(FORECASTER_DROPS_CLEAN_LINE)
+        assert rec["total"] == 0
+        assert rec["systematic"] is None  # "none" sentinel coerces to None
+        assert json.loads(rec["detail"]) == {}
+
+
+# The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
+# published comment (metaculus_bot/comment/markers.py); its durable home is the
+# comment, but the run-log parser carries a spec too (same as STACKER_OUTCOME /
+# TOOLS_USED) so it stays complete if a comment body is ever logged.
+FORECASTERS_USED_LINE = PFX + "<!-- FORECASTERS_USED=2/3 -->"
+
+
+class TestForecastersUsed:
+    def test_fields(self):
+        rec = _parse_one(FORECASTERS_USED_LINE)
+        assert rec["marker"] == "forecasters_used"
+        assert rec["used"] == 2
+        assert rec["configured"] == 3

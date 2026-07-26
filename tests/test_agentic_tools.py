@@ -8,9 +8,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as _PlaywrightError
 
 from metaculus_bot.research.agentic import tools as agentic_tools
-from metaculus_bot.research.agentic.loop import _tool_schemas
+from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
 
 
 class _FakeResponse:
@@ -687,6 +688,9 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
         async def route(self, pattern: str, handler) -> None:
             return None
 
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
+            return None
+
         async def new_page(self) -> FakePage:
             return FakePage()
 
@@ -716,7 +720,9 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
             return None
 
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
@@ -736,6 +742,129 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     assert plain_result.status == "ok"
     assert rendered_result is not None and rendered_result.method == "rendered"
     assert events.index("plain_read_finished") < events.index("rendered_started")
+
+
+@pytest.mark.asyncio
+async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-07-25 teardown fix. Three things must hold together:
+    1. the SSRF route guard still ABORTS a disallowed URL and CONTINUES an
+       allowed one on a live page (the guard is the SSRF boundary — never weaken);
+    2. a route callback racing context teardown (continue_/abort raising a
+       closed-target Playwright error) is swallowed, not re-raised as an
+       unhandled event-listener error (the log storm);
+    3. teardown drains handlers via unroute_all(behavior="ignoreErrors") before
+       closing, and context/browser are still closed.
+    """
+
+    # A closed-target error is a subclass of Playwright's public Error (exactly
+    # like the real TargetClosedError) — built locally so the test doesn't lean
+    # on the private import path the storm's traceback came from.
+    class _RacingClosedError(_PlaywrightError):
+        pass
+
+    async def _is_public(url: str) -> bool:
+        return "evil" not in url
+
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", _is_public)
+    monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="body text " * 60)
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    captured: dict[str, Any] = {}
+
+    class FakeRoute:
+        def __init__(self, *, raise_on_action: bool = False) -> None:
+            self.aborted: str | None = None
+            self.continued = False
+            self._raise = raise_on_action
+
+        async def continue_(self) -> None:
+            if self._raise:
+                raise _RacingClosedError("Route.continue: Target page, context or browser has been closed")
+            self.continued = True
+
+        async def abort(self, code: str | None = None) -> None:
+            if self._raise:
+                raise _RacingClosedError("Route.abort: Target page, context or browser has been closed")
+            self.aborted = code
+
+    class FakePage:
+        async def goto(self, url: str, *, wait_until: str, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(headers={"content-type": "text/html"})
+
+        async def content(self) -> str:
+            return "<html><body><p>rendered body</p></body></html>"
+
+    class FakeContext:
+        async def route(self, pattern: str, handler) -> None:
+            captured["guard"] = handler
+
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
+            captured["unroute_behavior"] = behavior
+
+        async def new_page(self) -> FakePage:
+            return FakePage()
+
+        async def close(self) -> None:
+            captured["context_closed"] = True
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            captured["browser_closed"] = True
+
+    class FakeChromium:
+        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
+            return FakeBrowser()
+
+    class FakePlaywrightManager:
+        chromium = FakeChromium()
+
+        async def __aenter__(self) -> "FakePlaywrightManager":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
+    )
+
+    result = await agentic_tools._try_rendered_fetch("https://example.com/page")
+    assert result is not None and result.method == "rendered"
+
+    # Teardown drained the handlers before close (Playwright's remedy for the storm).
+    assert captured["unroute_behavior"] == "ignoreErrors"
+    assert captured.get("context_closed") is True
+    assert captured.get("browser_closed") is True
+
+    guard = captured["guard"]
+
+    # SSRF guard intact: disallowed URL is aborted, allowed URL is continued.
+    disallowed = FakeRoute()
+    await guard(disallowed, SimpleNamespace(url="http://evil.internal/imds"))
+    assert disallowed.aborted == "blockedbyclient"
+    assert disallowed.continued is False
+
+    allowed = FakeRoute()
+    await guard(allowed, SimpleNamespace(url="https://example.com/subresource"))
+    assert allowed.continued is True
+    assert allowed.aborted is None
+
+    # Teardown race: continue_/abort raising a closed-target error must be
+    # swallowed, not re-raised (no unhandled event-listener storm).
+    racing_allowed = FakeRoute(raise_on_action=True)
+    await guard(racing_allowed, SimpleNamespace(url="https://example.com/late"))
+    racing_blocked = FakeRoute(raise_on_action=True)
+    await guard(racing_blocked, SimpleNamespace(url="http://evil.internal/late"))
 
 
 @pytest.mark.asyncio
@@ -771,6 +900,262 @@ async def test_fetch_playwright_missing_degrades_to_plain(monkeypatch: pytest.Mo
     assert outcome.content_markdown == "plain body"
 
 
+# ---------------------------------------------------------------------------
+# No-content fetch outcome (empty-page laundering fix). A 200 OK whose page
+# yields ZERO extractable text is NOT a successful fetch: it must carry a
+# distinct non-"ok" status so the loop's tier stamping can never mark an unread
+# page "fetched" (the companiesmarketcap.com js-wall failure, 2026-07-25).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extracted", [None, "", "   \n  \t "])
+@pytest.mark.asyncio
+async def test_fetch_plain_empty_extraction_returns_empty_status(
+    extracted: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 200-OK HTML page that extracts to nothing (or only whitespace) must
+    report status="empty", not "ok" — while still flagging escalation so the
+    ladder tries the rendered rung next."""
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=extracted)
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    result = await agentic_tools._fetch_plain("https://example.com/js-wall")
+
+    assert result.status == "empty"
+    assert result.escalate_rendered is True
+    assert "no extractable text" in result.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A short-but-real extraction is genuinely read content: status stays "ok"
+    (fetched-tierable) even though it's below the escalation floor. Thin != empty
+    — demoting real short sources would harm legitimate official statements."""
+    session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(
+        agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body><p>hi</p></body></html>")
+    )
+    monkeypatch.setattr(
+        "metaculus_bot.research.resolution_source._extract_main_text",
+        MagicMock(return_value="Short but real official statement."),
+    )
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    result = await agentic_tools._fetch_plain("https://example.com/short")
+
+    assert result.status == "ok"
+    assert result.escalate_rendered is True  # thin -> escalate, but the content is real
+    assert result.text == "Short but real official statement."
+
+
+@pytest.mark.asyncio
+async def test_fetch_plain_redirect_to_empty_page_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A redirect chain that terminates on a 200-OK empty page is still empty —
+    the final hop, not the redirect, decides the outcome."""
+    session = _FakeSession(
+        _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
+        _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+    )
+    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
+    monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    result = await agentic_tools._fetch_plain("https://example.com/start")
+
+    assert result.status == "empty"
+    assert result.url == "https://example.com/final"
+
+
+@pytest.mark.asyncio
+async def test_fetch_empty_plain_failed_render_returns_empty_not_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The core fix: an empty plain fetch whose rendered rung is unavailable must
+    NOT be laundered back into a plain/ok success. It returns a distinct "empty"
+    outcome, legible to the driver, that no tier map can promote to "fetched"."""
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="empty",
+                method="plain",
+                text="Plain fetch returned no extractable text.",
+                links=[],
+                url="https://companiesmarketcap.com/berkshire-hathaway/marketcap/",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+
+    outcome = await agentic_tools.fetch("https://companiesmarketcap.com/berkshire-hathaway/marketcap/")
+
+    assert outcome.status == "empty"
+    assert outcome.method == "empty"
+    assert _method_to_tier(outcome.method) is None
+    # Legible to a probabilistic consumer: it must read as "nothing was read",
+    # not as a thin-but-valid page it can confabulate around.
+    assert "was read" in outcome.content_markdown.lower()
+    # Never cached: a cached placeholder would resurface as method="cache" (a
+    # fetched-tier method) on a later paginated fetch and re-launder the tier.
+    assert "https://companiesmarketcap.com/berkshire-hathaway/marketcap/" not in agentic_tools._FETCH_TEXT_CACHE
+
+
+@pytest.mark.asyncio
+async def test_fetch_empty_plain_and_empty_render_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exact prod scenario: plain extracts nothing AND the rendered rung runs
+    but also extracts nothing (status="error", empty text). The outcome stays
+    "empty" rather than falling back to the empty plain placeholder as ok."""
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="empty",
+                method="plain",
+                text="Plain fetch returned no extractable text.",
+                links=[],
+                url="https://example.com/page",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agentic_tools,
+        "_try_rendered_fetch",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="error", method="rendered", text="", links=[], url="https://example.com/page"
+            )
+        ),
+    )
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.status == "empty"
+    assert _method_to_tier(outcome.method) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_empty_plain_still_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty plain fetch must NOT short-circuit: the ladder still runs the
+    rendered rung, and a successful render is returned as a real fetched outcome."""
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="empty",
+                method="plain",
+                text="Plain fetch returned no extractable text.",
+                links=[],
+                url="https://example.com/page",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    rendered = AsyncMock(
+        return_value=SimpleNamespace(
+            status="ok", method="rendered", text="real rendered content", links=[], url="https://example.com/page"
+        )
+    )
+    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+
+    outcome = await agentic_tools.fetch("https://example.com/page")
+
+    assert outcome.status == "ok"
+    assert outcome.method == "rendered"
+    assert outcome.content_markdown == "real rendered content"
+    rendered.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_empty_plain_still_escalates_to_read_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty plain fetch must still permit escalation to read_document when the
+    rendered rung discovers a document (PDF/image) behind the URL."""
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="empty",
+                method="plain",
+                text="Plain fetch returned no extractable text.",
+                links=[],
+                url="https://example.com/report",
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agentic_tools,
+        "_try_rendered_fetch",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="ok", method="document_needed", text="doc hint", links=[], url="https://example.com/report"
+            )
+        ),
+    )
+    read_document = AsyncMock(
+        return_value=agentic_tools.ToolOutcome(content_markdown="Extracted doc content.", method="document")
+    )
+    monkeypatch.setattr(agentic_tools, "read_document", read_document)
+
+    outcome = await agentic_tools.fetch("https://example.com/report")
+
+    assert outcome.method == "document"
+    assert outcome.content_markdown == "Extracted doc content."
+    read_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_empty_fetch_cannot_earn_fetched_tier_but_real_fetch_can(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end tier check through the loop's real stamping helper: a finding
+    whose source URL only ever produced an empty fetch earns NO tier (so a
+    discrepancy on it can't supersede the briefing), while a genuinely read page
+    earns "fetched". This is the load-bearing invariant."""
+    url = "https://companiesmarketcap.com/berkshire-hathaway/marketcap/"
+    monkeypatch.setattr(
+        agentic_tools,
+        "_fetch_plain",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="empty",
+                method="plain",
+                text="Plain fetch returned no extractable text.",
+                links=[],
+                url=url,
+                escalate_rendered=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+
+    empty_outcome = await agentic_tools.fetch(url)
+    empty_tiers = _harvest_verification_tiers("fetch", {"url": url}, empty_outcome)
+    assert empty_tiers == {}
+
+    real_outcome = agentic_tools.ToolOutcome(content_markdown="Berkshire market cap is ...", method="plain")
+    real_tiers = _harvest_verification_tiers("fetch", {"url": url}, real_outcome)
+    assert real_tiers == {"https://companiesmarketcap.com/berkshire-hathaway/marketcap": "fetched"}
+
+
+def test_empty_method_maps_to_no_tier() -> None:
+    """Belt-and-suspenders: even if a future edit passed status=="ok" through, the
+    "empty" method itself maps to no tier — the guard is doubly deterministic."""
+    assert _method_to_tier("empty") is None
+    assert _method_to_tier("plain") == "fetched"
+
+
 @pytest.mark.asyncio
 async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.MonkeyPatch) -> None:
     semaphore_entries: list[str] = []
@@ -797,6 +1182,9 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     class FakeContext:
         async def route(self, pattern: str, handler) -> None:
             routes.append(pattern)
+
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
+            return None
 
         async def new_page(self) -> FakePage:
             return FakePage()
@@ -828,13 +1216,19 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
             return None
 
     monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    # Patch our own fresh global semaphore (bound in THIS test's loop) rather than
+    # leaning on the autouse fixture + import order — asyncio.Semaphore binds to the
+    # running loop on first await, so a stale cross-file binding would raise here.
+    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: RecordingSemaphore())
     monkeypatch.setattr(
         "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -873,6 +1267,9 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
 
     class FakeContext:
         async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
             return None
 
         async def new_page(self) -> FakePage:
@@ -920,7 +1317,9 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     tasks = [
@@ -985,6 +1384,9 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
         async def route(self, pattern: str, handler) -> None:
             guard_holder.append(handler)
 
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
+            return None
+
         async def new_page(self) -> FakePage:
             return FakePage()
 
@@ -1015,6 +1417,9 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
         return "169.254.169.254" not in url
 
     monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=("example.com", "93.184.216.34")))
+    # Self-sufficient global semaphore bound in this test's loop (see the sibling
+    # rendered-fetch test) — avoids a cross-file stale-loop-binding RuntimeError.
+    monkeypatch.setattr(agentic_tools, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
     monkeypatch.setattr(
@@ -1022,7 +1427,9 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
@@ -1157,7 +1564,9 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     monkeypatch.setattr(agentic_tools, "_resolve_pinned_host", AsyncMock(return_value=None))
     monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
@@ -1181,6 +1590,9 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
 
     class FakeContext:
         async def route(self, pattern: str, handler) -> None:
+            return None
+
+        async def unroute_all(self, *, behavior: str | None = None) -> None:
             return None
 
         async def new_page(self) -> FakePage:
@@ -1217,7 +1629,9 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
     monkeypatch.setitem(
-        sys.modules, "playwright.async_api", SimpleNamespace(async_playwright=lambda: FakePlaywrightManager())
+        sys.modules,
+        "playwright.async_api",
+        SimpleNamespace(async_playwright=lambda: FakePlaywrightManager(), Error=_PlaywrightError),
     )
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")

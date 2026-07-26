@@ -13,6 +13,7 @@ import requests
 
 from metaculus_bot.config import load_environment
 from metaculus_bot.performance_analysis.parsing import (
+    parse_forecasters_used_marker,
     parse_inferred_stacker_outcome,
     parse_per_base_model_forecasts,
     parse_per_model_forecasts,
@@ -200,6 +201,11 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
     else:
         stacker_outcome, stacker_outcome_source = None, "none"
+    # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
+    # marker is present, else None (older comments predate it). Lets era-bucketing
+    # tell a degraded publish (a model dropped) from a genuine roster change —
+    # CLAUDE.md's "fewer than N bullets" ambiguity.
+    forecasters_used = parse_forecasters_used_marker(comment_text) if comment_text else None
 
     # Cross-signal sanity: a stacked comment should expose at least one
     # per-model entry via the rationale parsers. If the marker says stacked
@@ -235,6 +241,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             stacker_outcome=stacker_outcome,
             stacker_outcome_source=stacker_outcome_source,
             per_base_model_forecasts=per_base_model_forecasts,
+            forecasters_used=forecasters_used,
         )
         if record is not None:
             records.append(record)
@@ -256,6 +263,7 @@ def _process_single_question(
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
     per_base_model_forecasts: dict[str, str | dict[str, float]] | None = None,
+    forecasters_used: tuple[int, int] | None = None,
 ) -> dict | None:
     """Process a single question dict into a scored record."""
     question_id = q.get("id")
@@ -345,6 +353,14 @@ def _process_single_question(
         # skips; earlier comments collapse both into "skipped".
         "stacker_outcome": stacker_outcome,
         "stacker_outcome_source": stacker_outcome_source,
+        # Bot ensemble size from the FORECASTERS_USED comment marker (distinct
+        # from metadata.nr_forecasters, which is the Metaculus CROWD count):
+        # forecasters that contributed to the published aggregate (== per-model
+        # bullet count) and the roster size that run. Both None on comments that
+        # predate the marker. forecasters_used < forecasters_configured flags a
+        # degraded publish — a dropped model, not a roster change.
+        "forecasters_used": forecasters_used[0] if forecasters_used is not None else None,
+        "forecasters_configured": forecasters_used[1] if forecasters_used is not None else None,
         "scaling": scaling,
         "open_lower_bound": open_lower,
         "open_upper_bound": open_upper,

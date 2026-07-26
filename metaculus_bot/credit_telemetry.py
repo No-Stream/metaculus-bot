@@ -9,7 +9,11 @@ lines are durably grep-able per run; no extra artifact plumbing is needed.
 The end-of-run check also reports whether the DONATED key's remaining balance
 (``limit_remaining``) fell below ``OPENROUTER_CREDIT_FLOOR_USD``. cli.main uses
 that to exit non-zero AFTER all forecasting/publishing completes — a
-reminder-to-refill signal, never an abort.
+reminder-to-refill signal, never an abort — and only while credit alerting is
+active (``constants.credit_alerts_active``; suppressed until
+``CREDIT_ALERT_RESUME_DATE`` while the operator self-funds the season). The
+suppression is purely an exit-status decision made in cli.main: this module
+always reports the breach and always logs ``CREDIT_FLOOR_BREACH``.
 
 Field semantics (verified against live /auth/key pulls, 2026-07-17): ``usage``
 counts only spend billed as native OpenRouter credits. Spend routed through
@@ -169,7 +173,8 @@ class CreditTelemetry:
             if alias == "donated" and snapshot.remaining_usd is not None and snapshot.remaining_usd < self._floor_usd:
                 logger.warning(
                     "CREDIT_FLOOR_BREACH: key=donated remaining=%s floor=%s — donated OpenRouter "
-                    "balance needs a top-up; run completed normally but will exit non-zero so CI flags it.",
+                    "balance needs a top-up; run completed normally. cli.main logs the resulting "
+                    "exit decision (non-zero unless credit alerting is currently suppressed).",
                     _fmt(snapshot.remaining_usd),
                     _fmt(self._floor_usd),
                 )

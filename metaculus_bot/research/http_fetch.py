@@ -157,3 +157,23 @@ async def read_body_capped(resp: Any, *, max_bytes: int, label: str) -> bytes | 
             return None
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# Enough to carry an upstream JSON error object or the title of an HTML error page.
+ERROR_SNIPPET_BYTES: int = 2048
+
+
+async def read_body_snippet(resp: Any, *, max_bytes: int = ERROR_SNIPPET_BYTES) -> str:
+    """Decode at most ``max_bytes`` of a body, for a log line on a non-200.
+
+    ``resp.text()`` reads and DECOMPRESSES the whole body before the caller slices
+    it, so a CDN 429/502 serving a multi-megabyte HTML error page (or a gzip bomb)
+    defeats the very memory ceiling the callers enforce on their success path.
+    Reads bounded chunks and stops, leaving the rest of the body unread.
+    """
+    buf = bytearray()
+    async for chunk in resp.content.iter_chunked(max_bytes):
+        buf += chunk
+        if len(buf) >= max_bytes:
+            break
+    return bytes(buf[:max_bytes]).decode("utf-8", errors="replace")

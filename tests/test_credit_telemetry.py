@@ -10,18 +10,23 @@ needs real keys. Pins:
 - the donated-key floor check (below → True, at/above → False),
 - fetch failures → WARNING + never trip the floor (unknown ≠ low),
 - the personal key's missing ``limit_remaining`` (uncapped) rendering as n/a
-  and never tripping the floor even when its usage is huge.
+  and never tripping the floor even when its usage is huge,
+- the dated credit-alert suppression predicate (``credit_alerts_active``), which
+  gates only the EXIT status in cli.main — the telemetry here is window-agnostic
+  and keeps reporting a breach either way.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, _date_env, credit_alerts_active
 from metaculus_bot.credit_telemetry import CreditTelemetry, _fetch_snapshot
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"
@@ -151,6 +156,69 @@ class TestRunDeltaSource:
 
         messages = [record.getMessage() for record in caplog.records]
         assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=n/a" in messages
+
+
+class TestCreditAlertSuppressionWindow:
+    """The dated suppression of credit ALERTING (not of any log line).
+
+    The operator is self-funding the rest of the season, so a drained donated key
+    must not redden CI until ``CREDIT_ALERT_RESUME_DATE``. Every ``today`` here is
+    injected, so these tests keep asserting the same thing after the real date
+    passes 2026-09-10.
+    """
+
+    def test_resume_date_is_2026_09_10(self) -> None:
+        """The hardcoded default is the contract; the env var is only an override."""
+        assert CREDIT_ALERT_RESUME_DATE == date(2026, 9, 10)
+
+    def test_inactive_before_resume_date(self) -> None:
+        assert credit_alerts_active(date(2026, 7, 25)) is False
+        assert credit_alerts_active(date(2026, 9, 9)) is False
+
+    def test_active_on_and_after_resume_date(self) -> None:
+        """Resume day itself counts as active — the window is closed-on-the-right."""
+        assert credit_alerts_active(date(2026, 9, 10)) is True
+        assert credit_alerts_active(date(2026, 9, 11)) is True
+        assert credit_alerts_active(date(2027, 1, 1)) is True
+
+    def test_resume_date_is_after_tournament_close(self) -> None:
+        """The suppression must not outlive the season it exists for."""
+        from metaculus_bot.constants import TOURNAMENT_END_DATE  # noqa: PLC0415
+
+        assert CREDIT_ALERT_RESUME_DATE > date.fromisoformat(TOURNAMENT_END_DATE)
+
+    def test_today_defaults_to_system_clock_at_call_time(self) -> None:
+        """No argument → same answer as passing today's real date explicitly."""
+        assert credit_alerts_active() == credit_alerts_active(date.today())
+
+    def test_env_override_parses_iso_date(self, monkeypatch) -> None:
+        monkeypatch.setenv("_TEST_RESUME_DATE_XYZ", "2026-10-01")
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 10, 1)
+
+    @pytest.mark.parametrize("bad", ["", "   ", "not-a-date", "2026-13-01", "09/10/2026"])
+    def test_env_override_falls_back_on_garbage(self, monkeypatch, bad) -> None:
+        monkeypatch.setenv("_TEST_RESUME_DATE_XYZ", bad)
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 9, 10)
+
+    def test_env_unset_uses_default(self, monkeypatch) -> None:
+        monkeypatch.delenv("_TEST_RESUME_DATE_XYZ", raising=False)
+        assert _date_env("_TEST_RESUME_DATE_XYZ", date(2026, 9, 10)) == date(2026, 9, 10)
+
+    def test_telemetry_still_reports_breach_during_suppression(self, monkeypatch, caplog) -> None:
+        """Suppression lives in cli.main, not here: the telemetry keeps returning
+        True and keeps emitting the CREDIT_FLOOR_BREACH WARNING regardless of the
+        window, so the run log never loses the fact that the wallet is empty.
+        """
+        assert credit_alerts_active(date(2026, 7, 25)) is False
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(5.0, 1.0), _payload(0.25, 6.0)]}
+        telemetry = CreditTelemetry(floor_usd=1.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is True
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("CREDIT_FLOOR_BREACH: key=donated remaining=0.25 floor=1.00" in msg for msg in warnings)
 
 
 class TestFloorCheck:

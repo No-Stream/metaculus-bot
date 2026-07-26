@@ -27,9 +27,11 @@ import pytest
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.http_fetch import FilteringResolver
+from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_source import (
     FetchResult,
     _fetch_one,
+    _fetch_result_sources,
     extract_source_urls,
     fetch_resolution_sources,
     format_resolution_sections,
@@ -829,6 +831,58 @@ class TestResolutionSourceProvider:
         provider = resolution_source_provider(is_benchmarking=True)
         out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
         assert out == ""
+
+    async def test_records_partial_fetch_detail_for_diagnostics(self, article_html, monkeypatch):
+        """A partial fetch (one URL ok, one blocked) records a per-source token map so the
+        diagnostics line can surface the loss even though the provider status stays `ok`."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {
+                "https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html"),
+                "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
+            }
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
+        await resolution_source_provider(is_benchmarking=False)(q)
+
+        sources = pop_provider_detail(q.id_of_question, "resolution_source")["sources"]
+        assert sources["www.bls.gov"] == "ok"  # a fetched URL normalizes to "ok"
+        assert sources["cbp.gov"] == "blocked"  # the failure keeps its FetchStatus token
+
+    async def test_records_all_ok_detail_when_every_url_fetches(self, article_html, monkeypatch):
+        """A fully-healthy fetch records every source as `ok` — the formatter renders no
+        degradation suffix, so a clean resolution_source reads unchanged."""
+        monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
+        session = FakeSession(
+            {"https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html")}
+        )
+        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+
+        q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading.")
+        await resolution_source_provider(is_benchmarking=False)(q)
+
+        assert pop_provider_detail(q.id_of_question, "resolution_source")["sources"] == {"www.bls.gov": "ok"}
+
+    def test_duplicate_domains_keep_both_outcomes(self):
+        """Two URLs on the SAME domain are common (a stats site's index + data page).
+        The source map is keyed by domain, so without the `#N` suffix the second URL's
+        outcome silently overwrites the first — a blocked page would vanish behind a
+        sibling that fetched fine, and the diagnostics line would read healthy."""
+        results = [
+            FetchResult(url="https://www.bls.gov/cpi/", status="success", text="x", http_status=200, content_type=None),
+            FetchResult(url="https://www.bls.gov/ppi/", status="blocked", text="", http_status=403, content_type=None),
+            FetchResult(url="https://www.bls.gov/ces/", status="js_wall", text="", http_status=200, content_type=None),
+        ]
+
+        sources = _fetch_result_sources(results)
+
+        assert len(sources) == 3, f"one outcome was overwritten: {sources}"
+        assert sorted(sources.values()) == ["blocked", "js_wall", "ok"]
+        assert sources["www.bls.gov"] == "ok"
+        assert sources["www.bls.gov#2"] == "blocked"
+        assert sources["www.bls.gov#3"] == "js_wall"
 
 
 # ---------------------------------------------------------------------------

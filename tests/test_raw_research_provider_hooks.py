@@ -124,7 +124,7 @@ async def test_gemini_search_emits_raw_response_with_qid(monkeypatch: pytest.Mon
 async def test_prediction_market_emits_raw_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PREDICTION_MARKETS_ENABLED", "true")
 
-    snapshot = SimpleNamespace(matches=[])
+    snapshot = SimpleNamespace(matches=[], sources={})
 
     with (
         patch("metaculus_bot.research.prediction_market.fetch_market_snapshot", AsyncMock(return_value=snapshot)),

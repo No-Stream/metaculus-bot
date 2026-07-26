@@ -12,6 +12,8 @@ import pytest
 from metaculus_bot.research.provider_diagnostics import (
     ProviderResult,
     format_provider_diagnostics_block,
+    pop_provider_detail,
+    record_provider_detail,
 )
 
 
@@ -89,3 +91,186 @@ class TestFormatProviderDiagnosticsBlock:
         block = format_provider_diagnostics_block(results)
         assert "- asknews: inactive | 0 chars | 120 ms" in block
         assert "- asknews: fallback | 842 chars | 5012 ms" in block
+
+
+def _line_for(block: str, name: str) -> str:
+    return next(line for line in block.splitlines() if line.startswith(f"- {name}:"))
+
+
+class TestPartialDegradationRendering:
+    """A multi-source provider that lost an upstream source must not render identically
+    to one that got everything. The partial-loss suffix appears ONLY when a source failed,
+    so healthy lines stay byte-identical to the pre-existing format (archive/comment stable)."""
+
+    def test_kalshi_dropped_renders_partial_signal_not_bare_ok(self) -> None:
+        """The confirmed 2026-07-25 case: prediction_market is `ok` (Polymarket/Manifold
+        contributed) but Kalshi's series catalogue was dropped over the size cap."""
+        results = [
+            ProviderResult(
+                name="prediction_market",
+                status="ok",
+                chars=3067,
+                latency_ms=2836,
+                details={
+                    "sources": {
+                        "polymarket": "ok(2)",
+                        "kalshi": "dropped(size_cap)",
+                        "manifold": "ok(1)",
+                        "predictit": "none",
+                    }
+                },
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "prediction_market")
+
+        # Still carries the base fields.
+        assert line.startswith("- prediction_market: ok | 3067 chars | 2836 ms")
+        # The dropped source is visible at a glance, with its reason.
+        assert "kalshi:dropped(size_cap)" in line
+        # 2 of 4 platforms contributed matches.
+        assert "sources=2/4" in line
+        # Contributing / benign-empty platforms are NOT listed as lost.
+        lost_segment = line.split("lost=", 1)[1]
+        assert "polymarket" not in lost_segment
+        assert "manifold" not in lost_segment
+        assert "predictit" not in lost_segment  # `none` = queried, no match — benign, not a loss
+
+    def test_healthy_multi_source_has_no_degradation_suffix(self) -> None:
+        """Every source contributed → line is byte-identical to a provider with no details."""
+        healthy = ProviderResult(
+            name="prediction_market",
+            status="ok",
+            chars=3067,
+            latency_ms=2836,
+            details={"sources": {"polymarket": "ok(2)", "kalshi": "ok(1)", "manifold": "ok(3)"}},
+        )
+        no_details = ProviderResult(name="prediction_market", status="ok", chars=3067, latency_ms=2836)
+
+        healthy_line = _line_for(format_provider_diagnostics_block([healthy]), "prediction_market")
+        plain_line = _line_for(format_provider_diagnostics_block([no_details]), "prediction_market")
+
+        assert healthy_line == plain_line
+        assert "lost=" not in healthy_line
+        assert healthy_line.count("|") == 2  # chars, ms — no extra segments
+
+    def test_benign_empty_only_is_not_degradation(self) -> None:
+        """A provider whose every queried source simply had no match (all `none`) is healthy —
+        no source FAILED, so no degradation suffix."""
+        results = [
+            ProviderResult(
+                name="prediction_market",
+                status="empty",
+                chars=0,
+                latency_ms=1500,
+                details={"sources": {"polymarket": "none", "kalshi": "none"}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "prediction_market")
+        assert "lost=" not in line
+
+    def test_all_sources_lost_renders_zero_contributed(self) -> None:
+        """resolution_source with its one URL blocked: status `ok` (it emits a notice), but
+        0/1 fetched — the partial signal must still fire so it doesn't read as healthy."""
+        results = [
+            ProviderResult(
+                name="resolution_source",
+                status="ok",
+                chars=142,
+                latency_ms=5011,
+                details={"sources": {"cbp.gov": "blocked"}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "resolution_source")
+        assert "sources=0/1" in line
+        assert "cbp.gov:blocked" in line
+
+    def test_multiple_lost_sources_all_listed(self) -> None:
+        results = [
+            ProviderResult(
+                name="resolution_source",
+                status="ok",
+                chars=900,
+                latency_ms=4000,
+                details={"sources": {"a.gov": "ok", "b.org": "js_wall", "c.com": "blocked"}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "resolution_source")
+        # A fetched URL is normalized to "ok"; js_wall/blocked are losses.
+        assert "sources=1/3" in line
+        assert "b.org:js_wall" in line
+        assert "c.com:blocked" in line
+
+    def test_many_lost_sources_are_capped_with_an_overflow_count(self) -> None:
+        """A provider can lose more sources than the one-liner should carry (resolution_source
+        takes up to 5 URLs, financial_data an unbounded ticker list). Past the render cap the
+        rest must collapse to a `+N more` count, so the total loss stays visible without the
+        line growing without bound."""
+        lost = {f"src{i}.com": "blocked" for i in range(11)}
+        results = [
+            ProviderResult(
+                name="resolution_source",
+                status="ok",
+                chars=900,
+                latency_ms=4000,
+                details={"sources": {"good.gov": "ok", **lost}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "resolution_source")
+
+        assert "sources=1/12" in line  # the true totals are unaffected by the render cap
+        lost_segment = line.split("lost=", 1)[1]
+        assert lost_segment.count(":blocked") == 8  # only the cap's worth is spelled out
+        assert "+3 more" in lost_segment  # ...and the remainder is counted, not dropped
+
+    def test_long_reason_token_is_bounded(self) -> None:
+        """A pathologically long token must not blow up the compact one-line format."""
+        results = [
+            ProviderResult(
+                name="resolution_source",
+                status="ok",
+                chars=10,
+                latency_ms=10,
+                details={"sources": {"x.com": "error(" + "z" * 500 + ")"}},
+            )
+        ]
+        line = _line_for(format_provider_diagnostics_block(results), "resolution_source")
+        # Bounded well under the raw 500-char token.
+        assert len(line) < 200
+
+    def test_details_without_sources_key_is_ignored(self) -> None:
+        """A details dict that carries no `sources` map renders no suffix (forward-compat)."""
+        results = [ProviderResult(name="financial_data", status="ok", chars=50, latency_ms=30, details={"foo": "bar"})]
+        line = _line_for(format_provider_diagnostics_block(results), "financial_data")
+        assert line == "- financial_data: ok | 50 chars | 30 ms"
+
+
+class TestProviderDetailRegistry:
+    """The seam that carries a provider's per-source outcome from the provider (which knows
+    it) to the orchestrator's _run_one (which builds the ProviderResult). Keyed by
+    (qid, provider); record-once / pop-once, mirroring the record_raw_research sink pattern."""
+
+    def test_record_then_pop_round_trips(self) -> None:
+        detail = {"sources": {"polymarket": "ok(2)", "kalshi": "dropped(size_cap)"}}
+        record_provider_detail(4242, "prediction_market", detail)
+        assert pop_provider_detail(4242, "prediction_market") == detail
+
+    def test_pop_clears_the_entry(self) -> None:
+        record_provider_detail(4243, "resolution_source", {"sources": {"a.gov": "blocked"}})
+        assert pop_provider_detail(4243, "resolution_source") != {}
+        # Second pop is empty — the entry was drained, so it can't leak into a later call.
+        assert pop_provider_detail(4243, "resolution_source") == {}
+
+    def test_pop_absent_returns_empty_dict(self) -> None:
+        assert pop_provider_detail(999999, "nonexistent") == {}
+
+    def test_keyed_by_qid_and_provider(self) -> None:
+        record_provider_detail(4244, "prediction_market", {"sources": {"p": "ok"}})
+        record_provider_detail(4244, "resolution_source", {"sources": {"u": "blocked"}})
+        # Distinct provider on the same qid does not collide.
+        assert pop_provider_detail(4244, "prediction_market") == {"sources": {"p": "ok"}}
+        assert pop_provider_detail(4244, "resolution_source") == {"sources": {"u": "blocked"}}
+
+    def test_none_qid_is_a_noop(self) -> None:
+        # Mirrors the record_raw_research / comment-diagnostics qid=None handling: skip.
+        record_provider_detail(None, "prediction_market", {"sources": {"p": "ok"}})
+        assert pop_provider_detail(None, "prediction_market") == {}

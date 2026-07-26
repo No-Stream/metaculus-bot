@@ -36,10 +36,104 @@ class ProviderResult:
     latency_ms: int
     error_type: str | None = None
     error_message: str | None = None
-    # Reserved for provider-INTERNAL detail (financial tickers/FRED series,
-    # prediction-market per-platform match counts, gap-fill gaps). Empty in
-    # Phase 1; tasks #6/#7 populate it.
+    # Provider-INTERNAL detail, surfaced so PARTIAL degradation is visible: a
+    # multi-source provider (prediction_market's 4 venues, resolution_source's N
+    # URLs, financial_data's tickers/FRED series) that returns usable output while
+    # silently losing an upstream source otherwise reads as a healthy ``ok``.
+    # Populated by the providers via :func:`record_provider_detail` and drained
+    # into here by the orchestrator's ``_run_one``. Convention: ``details["sources"]``
+    # is an ordered ``{source_name: token}`` map; a token starting with ``"ok"``
+    # contributed, ``"none"`` was queried-but-empty (benign), anything else is a
+    # loss (``"dropped(size_cap)"`` / ``"blocked"`` / ``"js_wall"`` / ``"error(...)"`` /
+    # ``"empty"``). ``asdict(r)`` serializes this straight into the research archive.
     details: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Per-source token classification (the partial-degradation convention)
+# ---------------------------------------------------------------------------
+
+# A ``details["sources"]`` token that starts with one of these is NOT a loss:
+# ``ok`` / ``ok(N)`` contributed output; ``none`` was queried successfully but
+# had no match (a normal, benign outcome — e.g. no relevant prediction market
+# exists). Every other token (``dropped(...)`` / ``blocked`` / ``js_wall`` /
+# ``error(...)`` / ``empty`` / ``timeout`` / ...) means the source was attempted
+# and FAILED — that is the degradation the diagnostics line must surface.
+_SOURCE_NON_LOSS_PREFIXES: tuple[str, ...] = ("ok", "none")
+
+# Compact-line hygiene: bound a single reason token and the number of losses
+# rendered so a pathological provider payload can't blow up the one-liner.
+_LOST_TOKEN_MAX_CHARS: int = 40
+_MAX_LOST_SOURCES_RENDERED: int = 8
+
+
+def _is_lost_source(token: str) -> bool:
+    """A source token signals a lost/failed upstream (not contributed, not benign-empty)."""
+    return not token.startswith(_SOURCE_NON_LOSS_PREFIXES)
+
+
+def _partial_loss_suffix(details: dict) -> str:
+    """Render the ``| sources=<ok>/<total> | lost=<a:tok,b:tok>`` segment, or "".
+
+    Empty unless ``details["sources"]`` is a non-empty map with at least one LOST
+    source — so a fully-healthy multi-source provider (and any provider with no
+    ``sources`` detail) renders byte-identically to the base line, keeping the
+    archive/comment format stable.
+    """
+    sources = details.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        return ""
+    lost = {name: token for name, token in sources.items() if isinstance(token, str) and _is_lost_source(token)}
+    if not lost:
+        return ""
+    contributed = sum(1 for token in sources.values() if isinstance(token, str) and token.startswith("ok"))
+    total = len(sources)
+    rendered = [
+        f"{name}:{token[:_LOST_TOKEN_MAX_CHARS]}" for name, token in list(lost.items())[:_MAX_LOST_SOURCES_RENDERED]
+    ]
+    if len(lost) > _MAX_LOST_SOURCES_RENDERED:
+        rendered.append(f"+{len(lost) - _MAX_LOST_SOURCES_RENDERED} more")
+    return f" | sources={contributed}/{total} | lost={','.join(rendered)}"
+
+
+# ---------------------------------------------------------------------------
+# Per-(qid, provider) detail registry — the provider -> orchestrator seam
+# ---------------------------------------------------------------------------
+#
+# A multi-source provider knows its per-source outcome internally, but the
+# ``ResearchCallable`` contract only lets it return a ``str``, so that structured
+# detail can't ride the return value. This module-level registry is the seam:
+# the provider records once via :func:`record_provider_detail`; the orchestrator's
+# ``_run_one`` pops it once via :func:`pop_provider_detail` and attaches it to the
+# ``ProviderResult``. It mirrors the ``research.raw_log.record_raw_research`` sink
+# (a module function providers call, keyed by qid+provider). Keying on
+# (qid, provider) makes it safe under the orchestrator's parallel ``_run_one``
+# fan-out: each coroutine writes its own key inside the provider call and pops the
+# same key immediately after, so writes happen-before their matching pop and
+# distinct providers/questions never collide.
+_PROVIDER_DETAIL_REGISTRY: dict[tuple[int, str], dict] = {}
+
+
+def record_provider_detail(qid: int | None, provider: str, detail: dict) -> None:
+    """Record a provider's per-source ``detail`` for ``_run_one`` to drain.
+
+    No-op when ``qid`` is ``None`` (matches the raw-log / comment-diagnostics
+    handling — a question with no id can't be keyed or joined downstream).
+    """
+    if qid is None:
+        return
+    _PROVIDER_DETAIL_REGISTRY[(qid, provider)] = detail
+
+
+def pop_provider_detail(qid: int | None, provider: str) -> dict:
+    """Return-and-clear the recorded detail for ``(qid, provider)``, or ``{}``.
+
+    Popping (not peeking) keeps the registry from growing across a batch and
+    stops a stale entry from leaking into a later same-key call.
+    """
+    if qid is None:
+        return {}
+    return _PROVIDER_DETAIL_REGISTRY.pop((qid, provider), {})
 
 
 # Statuses that count as "this provider contributed usable research". ``ok`` =
@@ -53,6 +147,7 @@ def _format_one(result: ProviderResult) -> str:
     line = f"- {result.name}: {result.status} | {result.chars} chars | {result.latency_ms} ms"
     if result.status == "errored" and result.error_type is not None:
         line += f" | {result.error_type}"
+    line += _partial_loss_suffix(result.details)
     return line
 
 

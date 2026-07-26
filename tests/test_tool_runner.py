@@ -850,9 +850,13 @@ Probability: 25%"""
                 forecaster_id="m",
             )
         assert result == ""
-        # DEBUG log (not WARNING) for no-block case.
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert not any("JSON" in r.message for r in warning_records)
+        # DEBUG log (not WARNING) for no-block case. Scoped to our own loggers:
+        # caplog.records spans every logger that propagates to root, so a third-party
+        # WARNING that happens to mention JSON would otherwise fail this.
+        our_warnings = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
+        ]
+        assert not any("JSON" in r.getMessage() for r in our_warnings), [r.getMessage() for r in our_warnings]
 
 
 # ---------------------------------------------------------------------------

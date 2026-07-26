@@ -6,9 +6,19 @@ floor (``OPENROUTER_CREDIT_FLOOR_USD``).
 
 The fallback counter folded into ``alertable`` is ``_generic_key_fallback_count``
 — it counts EVERY donated->personal fallback (all causes: 401/402/429/guardrail/
-404). ``_donated_404_fallback_count`` is the allowed-providers-404 subset, broken
-out in the log line for diagnostics but NOT separately added to ``alertable``
-(that would double-count the 404 events already inside the generic total).
+404). ``_donated_404_fallback_count`` (allowed-providers 404) and
+``_credit_key_fallback_count`` (402 / insufficient credit) are two disjoint
+subsets of that total, broken out in the log line for diagnostics but NOT
+separately added to ``alertable`` (that would double-count events already inside
+the generic total).
+
+Credit alerting is suppressed until ``CREDIT_ALERT_RESUME_DATE`` (2026-09-10)
+because the operator is self-funding the rest of the season, so a drained donated
+key is expected rather than broken. During the window the floor breach does not
+exit non-zero and the credit-caused fallbacks are subtracted back out of
+``alertable``; every other fallback cause (401 / 404 / 429 / guardrail) keeps its
+full weight. Tests inject the window state via ``credit_alerts_active`` rather
+than the wall clock, so they keep testing both sides after the real date passes.
 
 Publication already happened inside ``forecast_on_tournament`` by the time cli
 checks alertable state; the non-zero exit is purely so GitHub Actions marks
@@ -23,30 +33,45 @@ import logging
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from metaculus_bot.cli import main as cli_main
+from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, credit_alerts_active
 from metaculus_bot.fallback_openrouter import (
+    reset_credit_key_fallback_count,
     reset_donated_404_fallback_count,
     reset_generic_key_fallback_count,
 )
+
+# Dates on either side of the suppression boundary. Injected instead of read from
+# the clock so these tests keep exercising both branches forever.
+DURING_SUPPRESSION = date(2026, 7, 25)
+ON_RESUME_DATE = CREDIT_ALERT_RESUME_DATE
+AFTER_RESUME_DATE = date(2026, 10, 1)
 
 
 @pytest.fixture(autouse=True)
 def _reset_fallback_counters() -> None:
     """The fallback counters are process-global (module state in
-    fallback_openrouter). Reset both between tests so cross-test pollution
+    fallback_openrouter). Reset all three between tests so cross-test pollution
     can't silently turn an "alertable=0" path into "alertable=1" because a
     prior test bumped a counter.
     """
     reset_generic_key_fallback_count()
     reset_donated_404_fallback_count()
+    reset_credit_key_fallback_count()
 
 
 @contextmanager
-def _cli_main_test_mode(alertable_count: int, *, donated_below_floor: bool = False) -> Iterator[MagicMock]:
+def _cli_main_test_mode(
+    alertable_count: int,
+    *,
+    donated_below_floor: bool = False,
+    today: date | None = None,
+) -> Iterator[MagicMock]:
     """Run ``cli.main`` with all external dependencies stubbed; yields the
     CreditTelemetry stub for call assertions.
 
@@ -57,6 +82,11 @@ def _cli_main_test_mode(alertable_count: int, *, donated_below_floor: bool = Fal
     (a local ``.env`` would otherwise supply real keys); its floor-check
     result is controlled via ``donated_below_floor``. sys.argv is pinned to
     test_questions mode and restored afterwards.
+
+    ``today`` pins the credit-suppression window: cli reads it through
+    ``credit_alerts_active``, which we re-bind to evaluate against the injected
+    date. ``None`` leaves the real system clock in place (the production path),
+    which is what the tests that don't care about credit state want.
     """
     stub_bot = MagicMock()
     stub_bot.alertable_count = alertable_count
@@ -66,10 +96,18 @@ def _cli_main_test_mode(alertable_count: int, *, donated_below_floor: bool = Fal
     stub_telemetry = MagicMock()
     stub_telemetry.log_end_and_check_floor.return_value = donated_below_floor
 
+    # Re-bind cli's own reference so only the injected date decides the window;
+    # patching with the real function when today is None keeps one `with` shape.
+    pinned_clock = patch(
+        "metaculus_bot.cli.credit_alerts_active",
+        credit_alerts_active if today is None else lambda: credit_alerts_active(today),
+    )
+
     argv_backup = sys.argv
     sys.argv = ["cli", "--mode", "test_questions"]
     try:
         with (
+            pinned_clock,
             # TemplateForecaster(...) call returns our stub
             patch("metaculus_bot.cli.TemplateForecaster", return_value=stub_bot),
             # MetaculusApi.get_question_by_url returns a dummy question object; we
@@ -200,11 +238,15 @@ class TestCliCreditFloor:
     tested in test_credit_telemetry.py; these tests pin the cli wiring — that
     the boolean returned by ``log_end_and_check_floor`` drives the exit code,
     and that both telemetry phases run even when forecasting crashes.
+
+    The breach→exit link is now gated on the credit-alert window, so every test
+    that asserts an exit pins ``today`` on or past the resume date. The
+    suppressed side lives in ``TestCliCreditAlertSuppression``.
     """
 
     def test_below_floor_triggers_sys_exit_1(self) -> None:
         """Donated balance below floor → run completes, then SystemExit(1)."""
-        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True) as telemetry:
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE) as telemetry:
             with pytest.raises(SystemExit) as exc_info:
                 cli_main()
             assert exc_info.value.code == 1
@@ -213,7 +255,7 @@ class TestCliCreditFloor:
 
     def test_above_floor_returns_normally(self) -> None:
         """Healthy balance → telemetry logs both phases, no SystemExit."""
-        with _cli_main_test_mode(alertable_count=0, donated_below_floor=False) as telemetry:
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=False, today=AFTER_RESUME_DATE) as telemetry:
             cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
@@ -222,7 +264,7 @@ class TestCliCreditFloor:
         """The end-of-run fetch is in a finally: a crashed run still logs its
         spend (the original exception propagates, not a floor SystemExit).
         """
-        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True) as telemetry:
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE) as telemetry:
             with patch(
                 "metaculus_bot.cli.asyncio.run",
                 side_effect=RuntimeError("forecasting blew up"),
@@ -231,3 +273,187 @@ class TestCliCreditFloor:
                     cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
+
+
+class TestCliCreditAlertSuppression:
+    """The dated credit-alert suppression, both paths.
+
+    Path 1 is the floor breach; path 2 is the credit-caused donated->personal
+    fallback folded into ``alertable``. Both must stop reddening CI until
+    ``CREDIT_ALERT_RESUME_DATE``, and both must behave exactly as before once the
+    date passes. Nothing about the logs changes — only the exit status and the
+    alertable arithmetic.
+    """
+
+    def test_floor_breach_during_suppression_does_not_exit(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Path 1, suppressed: the run finishes green, and the log explains why
+        so a reader who greps CREDIT_FLOOR_BREACH isn't left guessing.
+        """
+        with (
+            _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=DURING_SUPPRESSION) as telemetry,
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+        ):
+            # Must NOT raise SystemExit.
+            cli_main()
+            telemetry.log_end_and_check_floor.assert_called_once()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+
+    def test_floor_breach_on_resume_date_exits_non_zero(self) -> None:
+        """The window is closed-on-the-right: the resume day itself alerts."""
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=ON_RESUME_DATE):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+
+    def test_floor_breach_after_resume_date_exits_non_zero(self) -> None:
+        with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+
+    def test_credit_fallback_during_suppression_does_not_exit(self) -> None:
+        """Path 2, suppressed: a 402 fallback bumps both the generic total and the
+        credit subset (mirroring the wrapper), and the subtraction takes
+        ``alertable`` back to 0 — the empty-wallet case the operator exempted.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        fb_module._credit_key_fallback_count = 1
+        try:
+            with _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION):
+                # Must NOT raise SystemExit.
+                cli_main()
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
+
+    def test_credit_fallback_after_resume_date_exits_non_zero(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Same state, past the resume date → the pre-suppression behavior, and the
+        summary drops the suppression clause rather than reporting "0 suppressed
+        until <a date in the past>".
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        fb_module._credit_key_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=AFTER_RESUME_DATE),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+                messages = [record.getMessage() for record in caplog.records]
+                assert any("with 1 alertable" in msg for msg in messages), messages
+                assert any("credit=1);" in msg for msg in messages), messages
+                assert not any("suppressed until" in msg for msg in messages), messages
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
+
+    @pytest.mark.parametrize("cause", ["401", "429"])
+    def test_non_credit_fallback_still_alertable_during_suppression(
+        self, cause: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The regression that matters most: the suppression must not swallow real
+        breakage. A 401 (invalid/disabled key) or 429 (rate limit) bumps only the
+        generic counter, so nothing is subtracted and the run still exits non-zero.
+
+        ``cause`` is only a label — both errors land in the same counter; the
+        wrapper-side classification is pinned in test_fallback_openrouter.py.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+                assert any("with 1 alertable" in record.getMessage() for record in caplog.records), (
+                    f"{cause}: expected 'with 1 alertable'; got {[r.getMessage() for r in caplog.records]}"
+                )
+        finally:
+            fb_module._generic_key_fallback_count = 0
+
+    def test_donated_404_still_alertable_and_counted_once_during_suppression(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The double-counting trap. A 404 fallback bumps the generic total and the
+        404 subset; the credit subset stays 0, so nothing is subtracted and
+        ``alertable`` is exactly 1 — not 0 (over-subtracted) and not 2 (added
+        twice). The rendered count in the WARNING is the only way to see this.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        fb_module._donated_404_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+                assert any("with 1 alertable" in record.getMessage() for record in caplog.records), (
+                    f"expected 'with 1 alertable'; got {[r.getMessage() for r in caplog.records]}"
+                )
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._donated_404_fallback_count = 0
+
+    def test_mixed_causes_subtract_only_the_credit_share(self, caplog: pytest.LogCaptureFixture) -> None:
+        """One 402 plus one 404 in the same run: generic=2, credit=1, donated_404=1.
+        Only the credit event is exempt, so alertable is 1 and the run still exits
+        non-zero on the 404's account.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 2
+        fb_module._credit_key_fallback_count = 1
+        fb_module._donated_404_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+                messages = [record.getMessage() for record in caplog.records]
+                assert any("with 1 alertable" in msg for msg in messages), messages
+                # The breakdown stays informative: both subsets and the suppressed
+                # share are rendered for whoever greps this line.
+                assert any("donated_404=1, credit=1 with 1 credit event(s) suppressed" in msg for msg in messages), (
+                    messages
+                )
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
+            fb_module._donated_404_fallback_count = 0
+
+    def test_bot_alertable_survives_credit_suppression(self) -> None:
+        """The subtraction is scoped to the credit subset — a bot-side degradation
+        (forecaster drop, stacker fallback) still exits non-zero mid-window even
+        if a credit fallback happened in the same run.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        fb_module._credit_key_fallback_count = 1
+        try:
+            with _cli_main_test_mode(alertable_count=3, today=DURING_SUPPRESSION):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0

@@ -4,7 +4,7 @@ Forecaster (and stacker) LLMs emit their forecast exactly once: a fenced
 ```json STRUCTURED FORECAST block as the LAST thing in the rationale. This
 module extracts the value with a four-rung ladder:
 
-1. **block** — deterministic fenced-block parse (``parse_structured_block``:
+1. **block** — deterministic fenced-block parse (``parse_structured_payload``:
    json.loads + Pydantic validation).
 2. **repair** — deterministic JSON repair (``json_repair``) of a malformed
    fenced block, or a balanced-braces scan of the rationale tail when no
@@ -14,6 +14,14 @@ module extracts the value with a four-rung ladder:
    the strict post-rung validation, not trust.
 4. raise ``ValueExtractionError`` — the caller drops/soft-fails the
    forecaster, exactly as parser failures propagated before the ladder.
+
+The two deterministic rungs run CANDIDATE-major, not rung-major: for each
+candidate in selection order (position-last first, since the prompt asks for
+the block last) BOTH the strict parse and the repair are tried before a
+lower-ranked candidate is considered. Rung-major ordering would publish a
+superseded draft — a valid earlier block would satisfy rung 1, so a malformed
+final block would never reach the repairer. ``rung`` on the returned outcome
+names whichever mechanism produced the value, so the telemetry is unchanged.
 
 Every successful extraction emits one ``EXTRACTION_RUNG`` INFO line (this
 telemetry supersedes the deleted shadow-divergence comparison): watch for
@@ -48,9 +56,8 @@ from metaculus_bot.structured_output_schema import (
     MultipleChoiceStructured,
     NumericStructured,
     StructuredBlock,
-    extract_first_balanced_braces,
-    extract_json_block,
-    parse_structured_block,
+    extract_json_block_candidates,
+    iter_balanced_braces,
     parse_structured_payload,
 )
 from metaculus_bot.structured_parse import parse_structured
@@ -79,6 +86,14 @@ class ExtractionOutcome(Generic[T]):
     block_present: bool
 
 
+@dataclass
+class _DeterministicHit(Generic[T]):
+    """A value recovered from ONE candidate body, plus the rung that produced it."""
+
+    value: T
+    rung: Rung
+
+
 def _log_extraction(
     qtype: QuestionTypeStr,
     rung: Rung,
@@ -96,6 +111,72 @@ def _log_extraction(
     )
 
 
+def _try_candidate(
+    candidate: str,
+    *,
+    qtype: QuestionTypeStr,
+    convert_block: Callable[[StructuredBlock], T],
+    validate: Callable[[T], T],
+    try_strict: bool,
+    label: str,
+    failures: list[str],
+    question_id: int | None,
+) -> _DeterministicHit[T] | None:
+    """Strict-parse then ``json_repair`` ONE candidate body; None when neither yields a value.
+
+    Both deterministic mechanisms hit the same candidate before the caller moves
+    on, so a malformed block that is plausibly the model's final answer gets
+    repaired instead of losing to a lower-ranked valid one.
+
+    ``try_strict=False`` for unfenced tail blobs: there is no block to have
+    parsed, so they are reported as ``rung="repair"`` even when the blob happens
+    to be well-formed JSON.
+
+    Candidates are probed with ``log_failures=False``: any single one may be a
+    junk recap that a lower-ranked candidate recovers from, so the reasons are
+    accumulated into ``failures`` (surfaced by the rung-3 log or the ladder
+    error) rather than each emitting its own WARNING.
+    """
+    if try_strict:
+        strict = parse_structured_payload(candidate, qtype, log_failures=False)
+        if strict is not None:
+            try:
+                return _DeterministicHit(value=validate(convert_block(strict)), rung="block")
+            except (ValueError, TypeError) as exc:
+                # Schema-valid but unusable — e.g. a numeric block carrying only
+                # the three percentiles the schema demands, not the 13 the
+                # pipeline needs. json_repair cannot change already-valid JSON,
+                # so this candidate is spent and the caller falls back.
+                failures.append(f"block: {label}: {exc}")
+                return None
+
+    if len(candidate) > _MAX_STRUCTURED_BLOCK_BYTES:
+        failures.append(f"repair: {label}: exceeds size cap; refusing to repair")
+        return None
+    repaired = repair_json(candidate)
+    if not (isinstance(repaired, str) and repaired.strip()):
+        failures.append(f"repair: {label}: json_repair produced no usable output")
+        return None
+    payload_model = parse_structured_payload(repaired, qtype, log_failures=False)
+    if payload_model is None:
+        failures.append(f"repair: {label}: repaired JSON failed schema validation")
+        return None
+    try:
+        value = validate(convert_block(payload_model))
+    except (ValueError, TypeError) as exc:
+        failures.append(f"repair: {label}: {exc}")
+        return None
+    if repaired != candidate:
+        logger.info(
+            "json_repair modified candidate for qtype=%s question=%s (len %d -> %d)",
+            qtype,
+            question_id,
+            len(candidate),
+            len(repaired),
+        )
+    return _DeterministicHit(value=value, rung="repair")
+
+
 async def _run_ladder(
     *,
     text: str,
@@ -108,66 +189,64 @@ async def _run_ladder(
 ) -> ExtractionOutcome[T]:
     """Shared rung driver. ``convert_block``/``validate`` raise ValueError to fail a rung."""
     failures: list[str] = []
-    block_body = extract_json_block(text)
-    block_present = block_body is not None
+    fenced = extract_json_block_candidates(text)
+    block_present = bool(fenced)
 
-    # --- Rung 1: deterministic block parse -------------------------------
-    block = parse_structured_block(text, qtype)
-    if block is not None:
-        try:
-            value = validate(convert_block(block))
-        except (ValueError, TypeError) as exc:
-            failures.append(f"block: {exc}")
-        else:
-            _log_extraction(qtype, "block", block_present, question_id, model_name)
-            return ExtractionOutcome(value=value, rung="block", block_present=block_present)
+    # --- Rungs 1+2: deterministic walk over candidates, best-first ---------
+    # Selection order comes from extract_json_block_candidates: tagged ```json
+    # before untagged fences, and WITHIN a tier the last block by position first,
+    # because the prompt asks for the STRUCTURED FORECAST block last. Position is
+    # the primary signal; validity — strict OR repaired — only breaks ties.
+    #
+    # Each candidate is offered to BOTH deterministic mechanisms before the next
+    # one is tried (see _try_candidate). Running them as separate passes over the
+    # whole list published superseded drafts: a valid earlier draft block
+    # satisfied the strict pass, so a malformed final block never reached the
+    # repairer that exists to fix exactly that (a trailing comma).
+    walk: list[tuple[str, bool]]
+    if block_present:
+        walk = [(candidate, True) for candidate in fenced]
     else:
-        failures.append("block: no schema-valid fenced JSON block")
+        logger.info("No fenced JSON block in rationale for qtype=%s question=%s", qtype, question_id)
+        failures.append("block: no fenced JSON block")
+        # No fence survived: rescue bare JSON objects from the rationale tail,
+        # LAST first for the same position primacy. Repair-only — calling these
+        # rung="block" would contradict block_present=False.
+        tail_blobs = list(iter_balanced_braces(text[-_TAIL_SCAN_CHARS:]))
+        if not tail_blobs:
+            failures.append("repair: no candidate JSON in rationale tail")
+        walk = [(blob, False) for blob in reversed(tail_blobs)]
 
-    # --- Rung 2: deterministic JSON repair --------------------------------
-    # Only useful when rung 1 could not even produce a model: if the block
-    # parsed to a schema-valid model but conversion/validation failed (e.g. a
-    # partial percentile set), repairing already-valid JSON is a no-op — skip
-    # straight to the LLM rung. Size-cap violations stay fatal: never feed a
-    # >200KB payload to the repairer.
-    repair_candidate: str | None = None
-    if block is None:
-        if block_body is not None:
-            if len(block_body) <= _MAX_STRUCTURED_BLOCK_BYTES:
-                repair_candidate = block_body
-            else:
-                failures.append("repair: block exceeds size cap; refusing to repair")
-        else:
-            repair_candidate = extract_first_balanced_braces(text[-_TAIL_SCAN_CHARS:])
-            if repair_candidate is None:
-                failures.append("repair: no candidate JSON in rationale tail")
-    else:
-        failures.append("repair: skipped (block was schema-valid; repair cannot change it)")
-
-    if repair_candidate is not None:
-        repaired = repair_json(repair_candidate)
-        if isinstance(repaired, str) and repaired.strip():
-            if repaired != repair_candidate:
-                logger.info(
-                    "json_repair modified candidate for qtype=%s question=%s (len %d -> %d)",
-                    qtype,
-                    question_id,
-                    len(repair_candidate),
-                    len(repaired),
-                )
-            payload_model = parse_structured_payload(repaired, qtype)
-            if payload_model is not None:
-                try:
-                    value = validate(convert_block(payload_model))
-                except (ValueError, TypeError) as exc:
-                    failures.append(f"repair: {exc}")
-                else:
-                    _log_extraction(qtype, "repair", block_present, question_id, model_name)
-                    return ExtractionOutcome(value=value, rung="repair", block_present=block_present)
-            else:
-                failures.append("repair: repaired JSON failed schema validation")
-        else:
-            failures.append("repair: json_repair produced no usable output")
+    for rank, (candidate, try_strict) in enumerate(walk):
+        hit = _try_candidate(
+            candidate,
+            qtype=qtype,
+            convert_block=convert_block,
+            validate=validate,
+            try_strict=try_strict,
+            label=f"candidate {rank + 1}/{len(walk)}",
+            failures=failures,
+            question_id=question_id,
+        )
+        if hit is None:
+            continue
+        if rank > 0:
+            # The value did NOT come from the position-last candidate, so it may
+            # not be the model's final answer (the observed case is a trailing
+            # schema-example block, which is benign — hence INFO, not WARNING).
+            # Watch this alongside EXTRACTION_RUNG: a rise means the prompt's
+            # block-last contract is eroding.
+            logger.info(
+                "BLOCK_FALLBACK: question=%s model=%s qtype=%s skipped=%d rung=%s reasons=%s",
+                question_id,
+                model_name,
+                qtype,
+                rank,
+                hit.rung,
+                " | ".join(failures),
+            )
+        _log_extraction(qtype, hit.rung, block_present, question_id, model_name)
+        return ExtractionOutcome(value=hit.value, rung=hit.rung, block_present=block_present)
 
     # --- Rung 3: LLM parser salvage ---------------------------------------
     try:
