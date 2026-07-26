@@ -104,7 +104,8 @@ CREDIT_SPEND_LINE = PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remainin
 CREDIT_SPEND_NA_LINE = PFX + "CREDIT_SPEND: key=personal run_delta_usd=n/a remaining=n/a"
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
-    "balance needs a top-up; run completed normally but will exit non-zero so CI flags it."
+    "balance needs a top-up; run completed normally. cli.main logs the resulting "
+    "exit decision (non-zero unless credit alerting is currently suppressed)."
 )
 
 _META = {

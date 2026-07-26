@@ -443,7 +443,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d, gap_fill_v2_errors=%d, prediction_market_degraded=%d",
+            "research_provider_timeouts=%d, gap_fill_v2_errors=%d, prediction_market_degraded=%d, "
+            "prediction_market_platform_failures=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
@@ -452,6 +453,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self._research_provider_timeout_count,
             self._gap_fill_v2_error_count,
             self._prediction_market_degraded_count,
+            self._prediction_market_platform_failure_count,
         )
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
@@ -471,6 +473,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @property
     def _prediction_market_degraded_count(self) -> int:
         return self._research.prediction_market_degraded_count
+
+    @property
+    def _prediction_market_platform_failure_count(self) -> int:
+        return self._research.prediction_market_platform_failure_count
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -497,6 +503,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._research_provider_timeout_count
             + self._gap_fill_v2_error_count
             + self._prediction_market_degraded_count
+            + self._prediction_market_platform_failure_count
         )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
@@ -1136,13 +1143,19 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # it would report 1/N on a healthy N-model run. The collection sum remains
         # the fallback for callers that never ran our fan-out — the delegation to
         # the parent implementation when no forecaster LLMs are configured.
+        #
+        # On that same delegated path the roster is empty, so the configured count
+        # falls back to predictions_per_research_report — the width the parent
+        # actually fans out over. llm_setup keeps the two equal whenever a roster IS
+        # set, so this only ever differs on delegation, and the parent asserts the
+        # value is > 0, so the denominator can never be 0.
         recorded_used = self._contributing_forecasters.pop(qid, None) if qid is not None else None
         n_used = (
             recorded_used
             if recorded_used is not None
             else sum(len(collection.predictions) for collection in research_prediction_collections)
         )
-        n_configured = len(self._forecaster_llms)
+        n_configured = len(self._forecaster_llms) or self.predictions_per_research_report
         return build_unified_explanation(
             base_text,
             question,

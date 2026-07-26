@@ -56,6 +56,24 @@ dev = [
     "h5py>=3.16.0",
 ]
 
+[tool.uv]
+exclude-dependencies = [
+    # gitpython arrives only as streamlit <- forecasting-tools, and nothing we run
+    # imports it: streamlit's sole use is a lazy `import git` inside
+    # app_session._handle_git_information_request, reached only by a browser message
+    # to a running streamlit server (which we never start) and swallowed into a debug
+    # log. Verified unreachable via an import tripwire over `import forecasting_tools`
+    # + `import metaculus_bot.forecaster`, and the suite passes with git absent.
+    # It shipped 5 High argument-injection advisories at 3.1.52 across 4 releases in
+    # 6 days, so excluding it drops the CVE class instead of tracking that treadmill.
+    # streamlit itself must STAY: forecasting_tools/__init__.py imports
+    # benchmark_displayer, which imports streamlit at module scope, so excluding
+    # streamlit breaks every `import forecasting_tools` (including tests/conftest.py).
+    # Same mechanism/rationale as commit 836a5d0 (transformers). Re-evaluate at the
+    # next forecasting-tools bump.
+    "gitpython",
+]
+
 [build-system]
 requires = ["uv_build>=0.9,<0.12"]
 build-backend = "uv_build"

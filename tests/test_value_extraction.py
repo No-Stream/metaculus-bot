@@ -287,7 +287,12 @@ class TestFinalBlockPrecedence:
         assert fallback[0].levelno == logging.INFO
         assert "skipped=1" in fallback[0].getMessage()
         # A recovered forecast is never announced as a failure, at either layer.
-        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+        # Scoped to our own loggers: caplog.records spans every logger that propagates
+        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        our_warnings = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
+        ]
+        assert not our_warnings, [r.getMessage() for r in our_warnings]
 
     @pytest.mark.asyncio
     async def test_schema_valid_but_unusable_final_block_yields_to_earlier_valid(self) -> None:

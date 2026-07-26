@@ -751,6 +751,28 @@ class TestForecastersUsedDisclosure:
         match = FORECASTERS_USED_MARKER_RE.search(out)
         assert match is not None and match.groups() == ("2", "2")
 
+    def test_delegated_run_discloses_parent_fanout_width_not_zero(self):
+        """With no "forecasters" roster the bot delegates to the parent, whose
+        fan-out width is predictions_per_research_report. The configured count must
+        report that width — an empty roster previously published `3/0`, inverting
+        the used-under-configured invariant that residual analysis reads.
+        """
+        test_llm = GeneralLlm(model="test-model", temperature=0.0)
+        bot = TemplateForecaster(
+            research_reports_per_question=1,
+            predictions_per_research_report=3,
+            publish_reports_to_metaculus=False,
+            aggregation_strategy=AggregationStrategy.MEAN,
+            llms={"default": test_llm, "parser": test_llm, "researcher": test_llm, "summarizer": test_llm},  # type: ignore[arg-type]
+            is_benchmarking=True,
+        )
+        assert not bot._forecaster_llms, "precondition: this is the delegated path"
+        q = _make_binary_question()
+        with patch.object(ForecastBot, "_create_unified_explanation", return_value=_BASE_EXPLANATION):
+            out = bot._create_unified_explanation(q, [self._collection(3)], 0.6, 0.01, 1.0)
+        match = FORECASTERS_USED_MARKER_RE.search(out)
+        assert match is not None and match.groups() == ("3", "3")
+
     def test_record_carries_parsed_ensemble_size(self):
         post = _make_post_data()
         q = _make_binary_q_dict(forecast_values=[0.3, 0.7])

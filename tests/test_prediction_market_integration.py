@@ -84,7 +84,7 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
 
     async with aiohttp.ClientSession() as session:
         try:
-            events = await _kalshi_prefetch_events(session, event_limit=500, page_sleep_s=1.0)
+            events, _tally = await _kalshi_prefetch_events(session, event_limit=500, page_sleep_s=1.0)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Kalshi prefetch transient error: {e}")
 

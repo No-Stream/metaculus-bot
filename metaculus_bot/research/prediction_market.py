@@ -198,11 +198,48 @@ class MarketMatch:
 class MarketSnapshot:
     matches: list[MarketMatch] = field(default_factory=list)
     # Per-source outcome tokens ({source_name: token}) for the provider-diagnostics
-    # line: the 4 platforms plus `kalshi_series` (the entity-index fetch). A token
-    # starting with "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)",
-    # "error(...)") is a LOST source. Lets partial degradation — a live platform
-    # while a sub-source silently died — surface per-question. See provider_diagnostics.
+    # line: the 4 platforms, plus `kalshi_series` (the entity-index fetch), plus
+    # `keywords` / `snapshot` on the whole-provider failure paths (keyword extraction
+    # produced nothing; the snapshot timed out or blew up). A token starting with
+    # "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)", "error(...)",
+    # "partial(1/2)") is a LOST source. `none` means every sub-fetch SUCCEEDED and
+    # matched nothing — an outage must never land there, or the published line reads
+    # healthy through a blackout. See provider_diagnostics.
     sources: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchTally:
+    """How many of a platform's HTTP sub-fetches came back vs. were lost.
+
+    Carried alongside the matches because an upstream outage and a genuine no-match
+    both arrive as an empty match list; without these counts the diagnostics token
+    cannot tell them apart (see `_platform_source_token`). The unit is one sub-fetch
+    at each platform's natural granularity: a keyword query for Polymarket/Manifold,
+    a page for the Kalshi events prefetch, the single dump for PredictIt.
+    """
+
+    ok: int = 0
+    failed: int = 0
+
+    def __add__(self, other: _FetchTally) -> _FetchTally:
+        return _FetchTally(self.ok + other.ok, self.failed + other.failed)
+
+
+def _platform_source_token(matches: list[MarketMatch], tally: _FetchTally) -> str:
+    """Classify one platform's outcome as an `ok(N)` / `none` / loss source token.
+
+    `none` is reserved for "every sub-fetch succeeded and nothing matched" — the one
+    benign empty outcome `provider_diagnostics._is_lost_source` does not flag. So a
+    lost sub-fetch has to produce a loss token even when other sub-fetches returned
+    matches: otherwise a total outage reads as a healthy `none`, and a platform that
+    lost one of two queries reads as a clean `ok(N)`.
+    """
+    if tally.failed:
+        if tally.ok == 0:
+            return "error(all_queries_failed)"
+        return f"partial({tally.ok}/{tally.ok + tally.failed})"
+    return f"ok({len(matches)})" if matches else "none"
 
 
 def _liquidity_label(m: MarketMatch) -> str:
@@ -284,14 +321,43 @@ def reset_series_degradation_counter() -> None:
     _KALSHI_SERIES_FETCH_FAILURES = 0
 
 
+# Per-run count of LOST prediction-market platform fetches: one per platform whose
+# status token came out a loss (`error(all_queries_failed)` / `partial(...)` / an
+# escaped transport error), plus one per whole-provider failure (snapshot timeout,
+# outer-except, keyword extraction producing nothing). Operator decision 2026-07-25:
+# alert on ANY platform failure rather than only a total blackout — maximum
+# sensitivity, accepting that one flaky venue can redden most runs. The provider
+# soft-fails internally, so like the series counter this is the only path by which a
+# venue outage reaches CI. Module-level like the caches => accumulates per run.
+_PLATFORM_FETCH_FAILURES: int = 0
+
+
+def _bump_platform_failures() -> None:
+    global _PLATFORM_FETCH_FAILURES
+    _PLATFORM_FETCH_FAILURES += 1
+
+
+def prediction_market_platform_failures() -> int:
+    """Per-run count of lost prediction-market platform fetches (folded into alertable_count)."""
+    return _PLATFORM_FETCH_FAILURES
+
+
+def reset_platform_degradation_counter() -> None:
+    """Zero the platform-degradation counter at run start (see
+    `reset_series_degradation_counter` for why module-scoped counters need this)."""
+    global _PLATFORM_FETCH_FAILURES
+    _PLATFORM_FETCH_FAILURES = 0
+
+
 def _reset_session_caches() -> None:
     """Clear all per-session caches. Called between tests and at session start."""
-    global _KALSHI_SERIES_FETCH_FAILURES
+    global _KALSHI_SERIES_FETCH_FAILURES, _PLATFORM_FETCH_FAILURES
     _KALSHI_CACHE.clear()
     _PREDICTIT_CACHE.clear()
     _KEYWORD_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
     _KALSHI_SERIES_FETCH_FAILURES = 0
+    _PLATFORM_FETCH_FAILURES = 0
 
 
 def _get_session() -> aiohttp.ClientSession:
@@ -655,7 +721,14 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
     return out
 
 
-async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
+async def _polymarket_search(session: Any, query: str) -> list[MarketMatch] | None:
+    """Search Polymarket for one query. ``None`` when the fetch itself failed.
+
+    The None-vs-`[]` split is load-bearing: retry-exhausted 503s/429s (the dominant
+    outage shape) would otherwise arrive at the caller as an ordinary empty result
+    and be published as a benign `none`. `[]` means the search succeeded and parsed
+    to nothing.
+    """
     payload = await _http_get_with_backoff(
         session,
         POLYMARKET_SEARCH_URL,
@@ -664,7 +737,7 @@ async def _polymarket_search(session: Any, query: str) -> list[MarketMatch]:
         label=f"Polymarket q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
-        return []
+        return None
     return _parse_polymarket_matches(payload, query=query)
 
 
@@ -765,7 +838,9 @@ def _parse_manifold_matches(payload: Any, query: str = "") -> list[MarketMatch]:
     return out
 
 
-async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
+async def _manifold_search(session: Any, query: str) -> list[MarketMatch] | None:
+    """Search Manifold for one query. ``None`` when the fetch itself failed
+    (same contract as `_polymarket_search`); `[]` when it parsed to nothing."""
     payload = await _http_get_with_backoff(
         session,
         MANIFOLD_SEARCH_URL,
@@ -775,7 +850,7 @@ async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
         label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     if payload is None:
-        return []
+        return None
     return _parse_manifold_matches(payload, query=query)
 
 
@@ -786,24 +861,35 @@ async def _manifold_search(session: Any, query: str) -> list[MarketMatch]:
 
 async def _kalshi_prefetch_events(
     session: Any, event_limit: int = KALSHI_PREFETCH_EVENT_LIMIT, page_sleep_s: float = 1.0
-) -> list[dict]:
-    """Paginate through open Kalshi events. Returns (possibly empty) list on error.
+) -> tuple[list[dict], _FetchTally]:
+    """Paginate through open Kalshi events. Returns the events plus a per-page tally.
 
     Uses the `/events?with_nested_markets=true` endpoint NOT `/markets` --
     per G0, `/markets` is dominated by sports-parlay 'MVE' rows.
 
+    The tally counts pages, so the caller can tell a total outage (no page came
+    back) from an empty catalogue, and a truncated dump (some pages lost) from a
+    complete one. A cache hit reports zero fetches — cached data is a success, not a
+    degradation.
+
     Cache is updated INCREMENTALLY after each successful page so a cancelled
-    prefetch still warms whatever pages completed.
+    prefetch still warms whatever pages completed. The FINAL write only happens on a
+    clean pagination exit (cursor exhausted, or the event limit reached): writing it
+    unconditionally pinned an error-truncated — often empty — list for the whole 6h
+    TTL, so one transient blip on the first question starved every later question in
+    the run.
     """
     cached = _KALSHI_CACHE.get("events")
     if cached is not None:
         ts, events = cached
         if (time.monotonic() - ts) < KALSHI_CACHE_TTL_S:
-            return events  # noqa: ASYNC910
+            return events, _FetchTally()  # noqa: ASYNC910
 
     params = {"status": "open", "limit": "200", "with_nested_markets": "true"}
     all_events: list[dict] = []
     cursor: str | None = None
+    pages_ok = 0
+    clean_exit = True
 
     while len(all_events) < event_limit:
         p = dict(params)
@@ -813,21 +899,27 @@ async def _kalshi_prefetch_events(
             async with session.get(KALSHI_EVENTS_URL, params=p, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 429:
                     logger.warning("Kalshi 429 during prefetch; stopping pagination early")
+                    clean_exit = False
                     break
                 if resp.status != 200:
                     snippet = await read_body_snippet(resp)
                     logger.warning(f"Kalshi prefetch HTTP {resp.status}: {snippet}")
+                    clean_exit = False
                     break
                 data = await _read_json_capped(resp, "Kalshi prefetch")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Kalshi prefetch transient error: {e}")
+            clean_exit = False
             break
 
         if data is None or not isinstance(data, dict):
+            clean_exit = False
             break
         batch = data.get("events") or []
         if not isinstance(batch, list):
+            clean_exit = False
             break
+        pages_ok += 1
         all_events.extend([ev for ev in batch if isinstance(ev, dict)])
         # Incremental cache write: a cancelled prefetch warms whatever pages
         # made it through so the next call picks up where we left off.
@@ -838,8 +930,9 @@ async def _kalshi_prefetch_events(
         if page_sleep_s > 0:
             await asyncio.sleep(page_sleep_s)
 
-    _KALSHI_CACHE["events"] = (time.monotonic(), all_events)
-    return all_events  # noqa: ASYNC910
+    if clean_exit:
+        _KALSHI_CACHE["events"] = (time.monotonic(), all_events)
+    return all_events, _FetchTally(pages_ok, 0 if clean_exit else 1)  # noqa: ASYNC910
 
 
 def _kalshi_search_local(
@@ -1176,10 +1269,12 @@ async def _kalshi_prefetch_series(session: Any, *, outcome_sink: dict[str, str] 
     return series  # noqa: ASYNC910
 
 
-async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[dict]:
+async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[dict] | None:
     """Fetch a single series' open events (with nested markets), cached ~6h per ticker.
 
-    Returns the same event-dict shape `_kalshi_search_local` already parses.
+    Returns the same event-dict shape `_kalshi_search_local` already parses, or
+    ``None`` when the fetch failed upstream (same contract as the other leaf
+    fetchers, so the caller's tally sees the loss).
     """
     cache_key = f"events:{series_ticker}"
     cached = _KALSHI_CACHE.get(cache_key)
@@ -1195,6 +1290,8 @@ async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[di
         max_attempts=2,
         label=f"Kalshi events series={series_ticker}",
     )
+    if payload is None:
+        return None  # noqa: ASYNC910
     if not isinstance(payload, dict):
         return []  # noqa: ASYNC910
     events = payload.get("events")
@@ -1207,7 +1304,7 @@ async def _kalshi_events_for_series(session: Any, series_ticker: str) -> list[di
 
 async def _kalshi_entity_matches(
     session: Any, question: Any, queries: list[str], *, top_k: int, outcome_sink: dict[str, str] | None = None
-) -> list[MarketMatch]:
+) -> tuple[list[MarketMatch], _FetchTally]:
     """Entity-targeted Kalshi retrieval, additive to the fuzzy-over-prefetch pass.
 
     Extracts salient title entities, matches them against the series list, fetches those
@@ -1216,35 +1313,46 @@ async def _kalshi_entity_matches(
     text does not). Closes the recall hole where the exact-title market is absent from / drowned
     in the capped prefetch dump. Soft-fails to [] at every boundary.
 
+    The returned tally covers the per-series event fetches only; a lost series INDEX
+    is reported separately under the ``kalshi_series`` token, so counting it here too
+    would double-report it.
+
     ``outcome_sink`` is forwarded to `_kalshi_prefetch_series` to record the series-index
     source outcome for the provider-diagnostics line.
     """
     entities = _extract_title_entities(question)
     if not entities:
-        return []
+        return [], _FetchTally()
     series = await _kalshi_prefetch_series(session, outcome_sink=outcome_sink)
     if not series:
-        return []
+        return [], _FetchTally()
     tickers = _match_entities_to_series(entities, series)
     if not tickers:
-        return []
+        return [], _FetchTally()
 
     event_lists = await asyncio.gather(
         *[_kalshi_events_for_series(session, t) for t in tickers], return_exceptions=True
     )
     events: list[dict] = []
+    fetches_ok = 0
+    fetches_failed = 0
     for r in event_lists:
         if isinstance(r, list):
             events.extend(r)
+            fetches_ok += 1
         elif isinstance(r, Exception):
             logger.warning(f"Kalshi entity events fetch raised: {r}")
+            fetches_failed += 1
+        else:
+            fetches_failed += 1
+    tally = _FetchTally(fetches_ok, fetches_failed)
     if not events:
-        return []
+        return [], tally
 
     matches: list[MarketMatch] = []
     for q in list(queries) + entities:
         matches.extend(_kalshi_search_local(events, q, top_k=top_k))
-    return matches
+    return matches, tally
 
 
 # ---------------------------------------------------------------------------
@@ -1252,12 +1360,16 @@ async def _kalshi_entity_matches(
 # ---------------------------------------------------------------------------
 
 
-async def _predictit_prefetch(session: Any) -> list[dict]:
-    """Fetch the full PredictIt market dump. Returns (possibly empty) list on error.
+async def _predictit_prefetch(session: Any) -> list[dict] | None:
+    """Fetch the full PredictIt market dump. ``None`` when the fetch itself failed.
 
     PredictIt exposes a single unpaginated `/marketdata/all/` endpoint (no auth,
     no query param), so we fetch once, cache for ~6h, and fuzzy-match client-side
     (mirrors the Kalshi prefetch-and-local-match pattern).
+
+    Same None-vs-`[]` contract as the other leaf fetchers: ``None`` is an upstream
+    failure the caller must report as a lost source, `[]` is a successful fetch that
+    yielded no usable markets.
     """
     cached = _PREDICTIT_CACHE.get("markets")
     if cached is not None:
@@ -1272,9 +1384,10 @@ async def _predictit_prefetch(session: Any) -> list[dict]:
         max_attempts=2,
         label="PredictIt prefetch",
     )
+    if payload is None:
+        return None  # noqa: ASYNC910
     if not isinstance(payload, dict):
-        if payload is not None:
-            logger.warning("PredictIt returned non-dict payload")
+        logger.warning("PredictIt returned non-dict payload")
         return []  # noqa: ASYNC910
 
     markets = payload.get("markets")
@@ -1451,14 +1564,21 @@ async def fetch_market_snapshot(
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"Prediction-market snapshot TIMEOUT after {timeout}s for qid={qid}")
-                return MarketSnapshot(matches=[])  # noqa: ASYNC910
-    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
+                # A whole-provider failure needs its own loss token: with an empty
+                # `sources` map the diagnostics line renders no suffix at all, so a
+                # dead snapshot is indistinguishable from one that was never asked for.
+                # It also counts toward alertable_count — losing all four venues at
+                # once is strictly worse than losing one, which already alerts.
+                _bump_platform_failures()
+                return MarketSnapshot(matches=[], sources={"snapshot": "error(timeout)"})  # noqa: ASYNC910
+    except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except
         # Outer safety net; should not normally fire -- investigate if seen.
         # Re-raise after logging would defeat the soft-fail contract that the
         # rest of the bot depends on, so we swallow + log here. Inner narrow
         # handlers in platform helpers cover the common paths.
         logger.warning("Prediction-market snapshot FAILED (soft-fail returning empty)", exc_info=True)
-        return MarketSnapshot(matches=[])  # noqa: ASYNC910
+        _bump_platform_failures()
+        return MarketSnapshot(matches=[], sources={"snapshot": f"error({type(e).__name__})"})  # noqa: ASYNC910
 
     if cache_key is not None:
         _SNAPSHOT_CACHE[cache_key] = snapshot
@@ -1481,8 +1601,12 @@ async def _fetch_market_snapshot_impl(
     extractor = KeywordExtractor(strategy=strategy)
     queries = await extractor.extract(question)
     if not queries:
-        logger.info("Keyword extraction produced no queries; returning empty snapshot")
-        return MarketSnapshot(matches=[])
+        # No queries means keyword extraction came back empty (its LLM soft-fails to
+        # ""), which silences all four platforms — a lost source, not a no-match, so
+        # it gets both a loss token and an alertable bump.
+        logger.warning("Keyword extraction produced no queries; returning empty snapshot (alertable)")
+        _bump_platform_failures()
+        return MarketSnapshot(matches=[], sources={"keywords": "error(no_queries)"})
 
     all_matches: list[MarketMatch] = []
     # Per-source outcome tokens for the provider-diagnostics line. The platform loop
@@ -1491,43 +1615,47 @@ async def _fetch_market_snapshot_impl(
     # asyncio => distinct keys, no race.
     sources: dict[str, str] = {}
 
-    async def _poly_for_all_queries() -> list[MarketMatch]:
+    # Each closure returns its matches plus a _FetchTally, so an upstream outage that
+    # reaches here as an empty match list is still distinguishable from a genuine
+    # no-match (see _platform_source_token).
+    async def _poly_for_all_queries() -> tuple[list[MarketMatch], _FetchTally]:
         tasks = [_polymarket_search(session, q) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return _flatten_results(results, "polymarket")
 
-    async def _manifold_for_all_queries() -> list[MarketMatch]:
+    async def _manifold_for_all_queries() -> tuple[list[MarketMatch], _FetchTally]:
         mf_queries = extractor.queries_for_platform(question, queries, "manifold")
         tasks = [_manifold_search(session, q) for q in mf_queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return _flatten_results(results, "manifold")
 
-    async def _kalshi_for_all_queries() -> list[MarketMatch]:
+    async def _kalshi_for_all_queries() -> tuple[list[MarketMatch], _FetchTally]:
         # Inner narrow handlers in _kalshi_prefetch_events are exhaustive
         # (ClientError, TimeoutError, ValueError, TypeError). No outer catch
         # here -- anything escaping is a programming bug we want loud.
-        events = await _kalshi_prefetch_events(session, event_limit=KALSHI_PREFETCH_EVENT_LIMIT)
+        events, prefetch_tally = await _kalshi_prefetch_events(session, event_limit=KALSHI_PREFETCH_EVENT_LIMIT)
         merged: list[MarketMatch] = []
         for q in queries:
             merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
         # Entity-targeted retrieval on top of fuzzy-over-prefetch: pulls the series/events
         # matching salient title entities (e.g. an exact ESPY / BET-Awards market) that the
         # capped prefetch dump misses. Additive; soft-fails to [] internally.
-        merged.extend(
-            await _kalshi_entity_matches(
-                session, question, queries, top_k=max_matches_per_platform + 2, outcome_sink=sources
-            )
+        entity_matches, entity_tally = await _kalshi_entity_matches(
+            session, question, queries, top_k=max_matches_per_platform + 2, outcome_sink=sources
         )
-        return merged
+        merged.extend(entity_matches)
+        return merged, prefetch_tally + entity_tally
 
-    async def _predictit_for_all_queries() -> list[MarketMatch]:
+    async def _predictit_for_all_queries() -> tuple[list[MarketMatch], _FetchTally]:
         # Prefetch the full market dump once, then fuzzy-match each query locally
         # (mirrors the Kalshi prefetch-and-local-match pattern).
         markets = await _predictit_prefetch(session)
+        if markets is None:
+            return [], _FetchTally(failed=1)
         merged: list[MarketMatch] = []
         for q in queries:
             merged.extend(_predictit_search_local(markets, q, top_k=max_matches_per_platform + 2))
-        return merged
+        return merged, _FetchTally(ok=1)
 
     platform_tasks: list[tuple[str, asyncio.Task]] = []
     if "polymarket" in platforms:
@@ -1539,10 +1667,12 @@ async def _fetch_market_snapshot_impl(
     if "predictit" in platforms:
         platform_tasks.append(("predictit", asyncio.create_task(_predictit_for_all_queries())))
 
+    lost_platforms: list[str] = []
     for platform, task in platform_tasks:
         try:
-            matches = await task
-            sources[platform] = f"ok({len(matches)})" if matches else "none"
+            matches, tally = await task
+            sources[platform] = _platform_source_token(matches, tally)
+            platform_lost = tally.failed > 0
         except (aiohttp.ClientError, OSError, RuntimeError) as e:
             # Inner platform helpers each call asyncio.gather(..., return_exceptions=True)
             # so coroutines don't propagate. This narrow catch covers residual
@@ -1550,7 +1680,16 @@ async def _fetch_market_snapshot_impl(
             logger.warning(f"Platform {platform} failed (soft-fail): {type(e).__name__}: {e}")
             matches = []
             sources[platform] = f"error({type(e).__name__})"
+            platform_lost = True
+        if platform_lost:
+            lost_platforms.append(f"{platform}={sources[platform]}")
+            _bump_platform_failures()
         all_matches.extend(matches)
+
+    if lost_platforms:
+        # One WARN naming every degraded venue: this counter reddens CI, and a red
+        # run whose cause isn't named in the log is what teaches people to ignore alerts.
+        logger.warning(f"Prediction-market platforms degraded (alertable): {', '.join(lost_platforms)}")
 
     # Dedup within-platform by market_url (or title fallback), cap per platform.
     by_platform: dict[str, list[MarketMatch]] = {"polymarket": [], "kalshi": [], "manifold": [], "predictit": []}
@@ -1583,15 +1722,26 @@ async def _fetch_market_snapshot_impl(
     return MarketSnapshot(matches=combined, sources=sources)
 
 
-def _flatten_results(results: list[Any], platform: str) -> list[MarketMatch]:
+def _flatten_results(results: list[Any], platform: str) -> tuple[list[MarketMatch], _FetchTally]:
+    """Flatten per-query search results and tally how many sub-queries were lost.
+
+    A leaf search signals upstream failure with ``None`` and a successful-but-empty
+    parse with `[]`, so anything that isn't a list — a raised task or a ``None`` —
+    counts as a lost sub-query rather than being logged and discarded.
+    """
     out: list[MarketMatch] = []
+    queries_ok = 0
+    queries_failed = 0
     for r in results:
-        if isinstance(r, Exception):
-            logger.warning(f"{platform} query task raised: {r}")
-            continue
         if isinstance(r, list):
             out.extend(r)
-    return out
+            queries_ok += 1
+        elif isinstance(r, Exception):
+            logger.warning(f"{platform} query task raised: {r}")
+            queries_failed += 1
+        else:
+            queries_failed += 1
+    return out, _FetchTally(queries_ok, queries_failed)
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,7 @@ CRPS and is no better than median on binary.
 | `PLATT_CALIBRATION_ENABLED` | off | unset | Post-hoc logistic recalibration of the final published probability |
 | `GEMINI_USE_DONATED_OPENROUTER_KEY` | on | `true` | Route OpenRouter Gemini calls through the donated key with personal fallback |
 | `OPENROUTER_CREDIT_FLOOR_USD` | `1.0` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
+| `OPENROUTER_CREDIT_ALERT_RESUME_DATE` | `2026-09-10` | unset (uses default) | Date the credit alerts start reddening CI again; before it, credit shortfalls log but exit zero |
 
 ## GitHub Actions workflows
 
@@ -209,15 +210,50 @@ stderr), so per-run spend is durably grep-able:
 - `CREDIT_SPEND: key=... run_delta_usd=... remaining=...` at end of run.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD` (default $1,
-  `constants.py:216`).
+  `constants.py`).
 
 A floor breach does not abort the run. Forecasting and publishing complete
-normally, then `cli.py` exits non-zero so the GitHub Actions check turns red as
-a reminder to top up the donated key. The floor is only checked against the
-donated key (the personal key reports no `limit_remaining`). Per-run spend
-prefers the `limit_remaining` drop because the donated key routes nearly all
-spend through BYOK provider integrations, which leaves the plain `usage` field
-frozen while real money burns.
+normally, and outside the suppression window below `cli.py` then exits non-zero
+so the GitHub Actions check turns red as a reminder to top up the donated key.
+The floor is only checked against the donated key (the personal key reports no
+`limit_remaining`). Per-run spend prefers the `limit_remaining` drop because the
+donated key routes nearly all spend through BYOK provider integrations, which
+leaves the plain `usage` field frozen while real money burns.
+
+### Credit alerting is suppressed until 2026-09-10
+
+The operator is funding the rest of the season out of pocket, so an empty donated
+key is the expected state rather than a defect. Until
+`CREDIT_ALERT_RESUME_DATE` (`2026-09-10` in `constants.py`, a few days after the
+tournament closes on `TOURNAMENT_END_DATE`), credit shortfalls no longer redden
+CI. Two paths are gated, because either one alone would keep the check red:
+
+1. The floor breach. `cli.py` skips the `sys.exit(1)` and logs an INFO line
+   saying the breach was observed but alerting is suppressed until the resume
+   date.
+2. The credit-caused donated-to-personal key fallbacks. When the donated key
+   actually runs dry it returns 402 / insufficient credit, which is a
+   fallback-worthy key-scoped error, and each fallback normally counts toward
+   `alertable`. `fallback_openrouter.py` now tracks those credit-caused
+   fallbacks in `_credit_key_fallback_count`, a subset of the all-causes
+   `_generic_key_fallback_count`, and `cli.py` subtracts the subset back out
+   while alerting is suppressed.
+
+Non-credit fallback causes still alert in full, since each means real breakage
+rather than an empty wallet: 401 invalid or disabled key, 404 "no allowed
+providers", 429 rate limit, and the guardrail / data-policy block. Bot-side
+degradation (forecaster drops, stacker fallbacks, research timeouts) is
+untouched by the suppression.
+
+Nothing is silenced. Every `CREDIT_*` marker line, `CREDIT_FLOOR_BREACH`
+included, and every `PAID PERSONAL-KEY FALLBACK` warning fires exactly as
+before; only the process exit status and the `alertable` arithmetic change. The
+end-of-run summary renders the breakdown, including how many credit events were
+suppressed and until when. The window is read from the system clock at call
+time, so alerting resumes on the resume date with no redeploy, and behavior from
+that date on is what it was before the suppression. `credit_alerts_active()` in
+`constants.py` takes an optional `today` so tests pin both sides of the
+boundary.
 
 Balances outside a run:
 
@@ -311,10 +347,14 @@ artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
   `GHOST_FORECAST` line logs the loop's private dry-run forecast for telemetry
   only; it is never published.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_FLOOR_BREACH` — credit telemetry,
-  described above.
+  described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
+  suppression window, so seeing one on a green run is expected until 2026-09-10;
+  the adjacent INFO line names the resume date.
 
 A run can also exit non-zero for degradation alerts (forecaster drops, personal-
 key fallbacks, model deprecations) even when every question that met the
 minimum-forecaster threshold was published. The non-zero exit is the CI red-check
-signal to investigate; it does not mean publishing failed. See `cli.py:182-219`
-for the exact conditions.
+signal to investigate; it does not mean publishing failed. Credit-caused
+shortfalls are exempt until 2026-09-10 (see the suppression section above); every
+other cause still alerts. See the alert block near the end of `cli.py` for the
+exact conditions.

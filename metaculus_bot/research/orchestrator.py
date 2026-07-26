@@ -137,18 +137,35 @@ class ResearchOrchestrator:
 
         return kalshi_series_fetch_failures()
 
+    @property
+    def prediction_market_platform_failure_count(self) -> int:
+        """Per-run count of lost prediction-market platform fetches (one per venue
+        whose query/prefetch fan-out lost a sub-fetch, plus one per whole-provider
+        failure), read from the module counter and folded into alertable_count.
+
+        Operator decision 2026-07-25: alert on ANY platform failure, not only a total
+        blackout. The provider soft-fails every venue internally, so without this the
+        forecasters silently run on zero market data while CI stays green."""
+        from metaculus_bot.research.prediction_market import (
+            prediction_market_platform_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        return prediction_market_platform_failures()
+
     def reset_run_degradation_counters(self) -> None:
         """Zero per-run degradation counters at run start (called by
         forecast_questions alongside reset_pchip_stats). The prediction-market
-        series counter is a module global — resetting it here keeps it a clean
-        per-run metric instead of leaking across runs/tests that share a process.
-        The orchestrator's own instance counters are fresh per bot, so they need
-        no reset here."""
-        from metaculus_bot.research.prediction_market import (
-            reset_series_degradation_counter,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        series and platform counters are module globals — resetting them here keeps
+        them clean per-run metrics instead of leaking across runs/tests that share a
+        process. The orchestrator's own instance counters are fresh per bot, so they
+        need no reset here."""
+        from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            reset_platform_degradation_counter,
+            reset_series_degradation_counter,
         )
 
         reset_series_degradation_counter()
+        reset_platform_degradation_counter()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)

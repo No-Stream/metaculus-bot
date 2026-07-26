@@ -57,6 +57,7 @@ from metaculus_bot.research.prediction_market import (
     format_snapshot_for_research,
     prediction_market_provider,
 )
+from metaculus_bot.research.provider_diagnostics import _partial_loss_suffix, pop_provider_detail
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +348,7 @@ class TestPolymarket:
         session = FakeSession({"https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload)})
         matches = await _polymarket_search(session, "Starship orbit 2026")
 
+        assert matches is not None  # a successful search never signals failure
         assert len(matches) == 2
         top = matches[0]
         assert top.platform == "polymarket"
@@ -369,6 +371,7 @@ class TestPolymarket:
 
         session = FakeSession({"https://gamma-api.polymarket.com/public-search": FakeResponse(200, polymarket_payload)})
         matches = await _polymarket_search(session, "Starship orbit 2026")
+        assert matches is not None
 
         # The query "Starship orbit 2026" is a strong token-set-ratio match
         # against the top market title; confidence must be well above 0.0.
@@ -397,7 +400,9 @@ class TestPolymarket:
         monkeypatch.setattr(pmp.asyncio, "sleep", _no_sleep)
 
         matches = await pmp._polymarket_search(session, "anything")
-        assert matches == []
+        # None, not []: retry exhaustion is an upstream LOSS, and the caller has to be
+        # able to tell it from a search that succeeded and matched nothing.
+        assert matches is None
         # Should have retried a bounded number of times (>=2, <= 5)
         assert 2 <= call_count["n"] <= 5
         # And at least one backoff sleep
@@ -438,8 +443,9 @@ class TestKalshi:
         session = FakeSession(
             {"https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(200, kalshi_events_payload)}
         )
-        events = await _kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
+        events, tally = await _kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
         assert len(events) == 2
+        assert (tally.ok, tally.failed) == (1, 0)
 
         matches = _kalshi_search_local(events, "Starship orbit 2026", top_k=3, min_score=30.0)
         assert len(matches) >= 1
@@ -459,8 +465,12 @@ class TestKalshi:
     async def test_prefetch_handles_http_error(self, caplog):
         session = FakeSession({"https://api.elections.kalshi.com/trade-api/v2/events": FakeResponse(500, text="boom")})
         with caplog.at_level(logging.WARNING):
-            events = await _kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
+            events, tally = await _kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
         assert events == []
+        # The tally carries the loss so the caller doesn't publish the outage as `none`.
+        assert (tally.ok, tally.failed) == (0, 1)
+        # And a failed prefetch must NOT poison the 6h cache with its empty list.
+        assert "events" not in pmp._KALSHI_CACHE
 
     @pytest.mark.asyncio
     async def test_prefetch_writes_cache_incrementally(self):
@@ -494,10 +504,12 @@ class TestKalshi:
 
         pmp._reset_session_caches()
         session = FakeSession({"https://api.elections.kalshi.com/trade-api/v2/events": [handler, handler]})
-        events = await pmp._kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
+        events, tally = await pmp._kalshi_prefetch_events(session, event_limit=100, page_sleep_s=0.0)
 
         # Returned list should have 2 events from page 1 (page 2 broke early).
         assert len(events) == 2
+        # One page landed, one was lost -> a partial fetch, not a clean one.
+        assert (tally.ok, tally.failed) == (1, 1)
         # And the cache contained page 1 events BEFORE page 2 was attempted.
         assert len(captured_cache_after_page_one) == 1
         assert len(captured_cache_after_page_one[0]) == 2
@@ -514,6 +526,7 @@ class TestManifold:
         session = FakeSession({"https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload)})
         matches = await _manifold_search(session, "Starship orbit July 2026")
 
+        assert matches is not None  # a successful search never signals failure
         assert len(matches) == 1
         m = matches[0]
         assert m.platform == "manifold"
@@ -541,6 +554,7 @@ class TestManifold:
         session = FakeSession({"https://api.manifold.markets/v0/search-markets": FakeResponse(200, manifold_payload)})
         matches = await _manifold_search(session, "Starship orbit July 2026")
 
+        assert matches is not None
         assert len(matches) == 1
         # Title is "Will Starship reach orbit before July 2026?" — strong overlap.
         assert matches[0].match_confidence > 0.5
@@ -613,6 +627,7 @@ class TestPredictIt:
     async def test_prefetch_and_local_fuzzy_match(self, predictit_payload):
         session = FakeSession({"https://www.predictit.org/api/marketdata/all/": FakeResponse(200, predictit_payload)})
         markets = await _predictit_prefetch(session)
+        assert markets is not None  # a successful prefetch never signals failure
         assert len(markets) == 2
 
         matches = _predictit_search_local(markets, "Starship orbit 2026", top_k=3, min_score=30.0)
@@ -957,6 +972,10 @@ class TestFetchMarketSnapshot:
                 snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=0.05)
 
         assert snapshot.matches == []
+        # Soft-fail, but not SILENT: a dead whole snapshot carries a loss token and
+        # reddens CI, where an empty `sources` map rendered no diagnostics suffix.
+        assert snapshot.sources == {"snapshot": "error(timeout)"}
+        assert pmp.prediction_market_platform_failures() == 1
 
     @pytest.mark.asyncio
     async def test_orchestrator_soft_fails_on_any_platform_error(self, mock_question, manifold_payload, caplog):
@@ -1541,7 +1560,7 @@ class TestKalshiEntityRetrieval:
         assert not any("espy" in m.market_title.lower() for m in fuzzy_only)
 
         # Entity retrieval surfaces the exact ESPY market via /series -> /events?series_ticker.
-        entity_matches = await _kalshi_entity_matches(session, q, [query], top_k=5)
+        entity_matches, _tally = await _kalshi_entity_matches(session, q, [query], top_k=5)
         assert any("espy" in m.market_title.lower() for m in entity_matches)
         assert all(m.platform == "kalshi" for m in entity_matches)
 
@@ -1557,8 +1576,10 @@ class TestKalshiEntityRetrieval:
             ),
         }
         session = FakeSession(handlers)
-        matches = await _kalshi_entity_matches(session, q, ["athlete"], top_k=5)
+        matches, tally = await _kalshi_entity_matches(session, q, ["athlete"], top_k=5)
         assert matches == []
+        # No series matched -> no event fetch was attempted, so nothing is lost either.
+        assert (tally.ok, tally.failed) == (0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1833,18 +1854,48 @@ class TestKalshiSeriesStreaming:
         pmp._bump_kalshi_series_failure()
         assert orch.prediction_market_degraded_count == 2
 
+    @pytest.mark.asyncio
+    async def test_platform_failure_counter_folds_into_orchestrator(self):
+        """Wiring for the platform-failure counter: same path as the series counter —
+        module global -> ResearchOrchestrator -> the forecaster's alertable_count. The
+        two counters stay SEPARATE so a red run says which degradation fired."""
+        from metaculus_bot.research.orchestrator import (
+            ResearchOrchestrator,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        orch = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+        assert orch.prediction_market_platform_failure_count == 0
+        pmp._bump_platform_failures()
+        assert orch.prediction_market_platform_failure_count == 1
+        assert orch.prediction_market_degraded_count == 0  # no cross-talk
+
+        orch.reset_run_degradation_counters()
+        assert orch.prediction_market_platform_failure_count == 0
+
 
 class TestSnapshotSourceDiagnostics:
     """Per-source outcome tokens on MarketSnapshot.sources, drained by the
     orchestrator into the provider-diagnostics line so PARTIAL degradation (a live
     platform while the Kalshi series index silently died) is visible per-question."""
 
+    _POLY_URL = "https://gamma-api.polymarket.com/public-search"
+    _MANIFOLD_URL = "https://api.manifold.markets/v0/search-markets"
+    _KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
+    _PREDICTIT_URL = "https://www.predictit.org/api/marketdata/all/"
+
+    # Every venue live, every venue empty — the benign baseline the loss tests deviate from.
     _HANDLERS_BASE = {
-        "https://gamma-api.polymarket.com/public-search": {"events": [], "markets": []},
-        "https://api.manifold.markets/v0/search-markets": [],
-        "https://api.elections.kalshi.com/trade-api/v2/events": {"events": [], "cursor": ""},
-        "https://www.predictit.org/api/marketdata/all/": {"markets": []},
+        _POLY_URL: {"events": [], "markets": []},
+        _MANIFOLD_URL: [],
+        _KALSHI_EVENTS_URL: {"events": [], "cursor": ""},
+        _PREDICTIT_URL: {"markets": []},
     }
+
+    @pytest.fixture(autouse=True)
+    def _no_retry_backoff(self, monkeypatch):
+        """These tests drive 503 retry-exhaustion paths; the real 0.5s backoff between
+        attempts would dominate their runtime."""
+        monkeypatch.setattr(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0)
 
     def _handlers(self, series_payload: dict) -> dict:
         h = {url: FakeResponse(200, payload) for url, payload in self._HANDLERS_BASE.items()}
@@ -1875,9 +1926,6 @@ class TestSnapshotSourceDiagnostics:
         assert set(snapshot.sources) == {"polymarket", "manifold", "kalshi", "predictit", "kalshi_series"}
         assert snapshot.sources["kalshi_series"] == "ok(1)"
         # No lost source -> the diagnostics suffix stays empty (byte-identical to a healthy line).
-        from metaculus_bot.research.provider_diagnostics import (
-            _partial_loss_suffix,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
 
         assert _partial_loss_suffix({"sources": snapshot.sources}) == ""
 
@@ -1895,9 +1943,6 @@ class TestSnapshotSourceDiagnostics:
             snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
 
         assert snapshot.sources["kalshi_series"] == "dropped(size_cap)"
-        from metaculus_bot.research.provider_diagnostics import (
-            _partial_loss_suffix,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
 
         suffix = _partial_loss_suffix({"sources": snapshot.sources})
         assert "lost=kalshi_series:dropped(size_cap)" in suffix
@@ -1916,9 +1961,141 @@ class TestSnapshotSourceDiagnostics:
             provider = pmp.prediction_market_provider()
             await provider(mock_question)
 
-        from metaculus_bot.research.provider_diagnostics import (
-            pop_provider_detail,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
         detail = pop_provider_detail(mock_question.id_of_question, "prediction_market")
         assert detail.get("sources", {}).get("kalshi_series") == "dropped(size_cap)"
+
+    @pytest.mark.asyncio
+    async def test_platform_outage_is_a_loss_and_healthy_platforms_still_land(self, mock_question, manifold_payload):
+        """A 503'd venue reads as a LOSS, never as `none`. The other half of the
+        contract still holds: the healthy venues' matches come through unaffected."""
+        handlers = self._handlers({"series": []})
+        handlers[self._POLY_URL] = FakeResponse(503, text="service unavailable")
+        handlers[self._MANIFOLD_URL] = FakeResponse(200, manifold_payload)
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources["polymarket"] == "error(all_queries_failed)"
+        assert "lost=polymarket:" in _partial_loss_suffix({"sources": snapshot.sources})
+        # Soft-fail preserved: Manifold's match is still in the snapshot.
+        assert "manifold" in {m.platform for m in snapshot.matches}
+        assert snapshot.sources["manifold"].startswith("ok(")
+        # Operator decision 2026-07-25: ANY platform failure reddens CI, so one dead
+        # venue among three healthy ones is already alertable.
+        assert pmp.prediction_market_platform_failures() == 1
+
+    @pytest.mark.asyncio
+    async def test_total_blackout_reads_as_lost_even_with_a_warm_series_cache(self, mock_question):
+        """The worst case that motivated the fix: every venue is down, but Kalshi's 6h
+        series cache is warm from an earlier question, so the series index reports a
+        healthy `ok(1)`. Every platform token still has to be a loss — otherwise the
+        published diagnostics line reads actively healthy through a total blackout."""
+        pmp._KALSHI_CACHE["series"] = (
+            time.monotonic(),
+            [{"ticker": "KXSPACEX", "title": "SpaceX launches", "tags": ["spacex"]}],
+        )
+        handlers = {url: FakeResponse(503, text="service unavailable") for url in self._HANDLERS_BASE}
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources["kalshi_series"] == "ok(1)"  # the stale-cache trap
+        suffix = _partial_loss_suffix({"sources": snapshot.sources})
+        for platform in ("polymarket", "manifold", "kalshi", "predictit"):
+            assert snapshot.sources[platform] == "error(all_queries_failed)", platform
+            assert f"{platform}:error(all_queries_failed)" in suffix, platform
+        # One alertable bump per lost venue — four, not one.
+        assert pmp.prediction_market_platform_failures() == 4
+
+    @pytest.mark.asyncio
+    async def test_all_live_but_empty_stays_benign_none(self, mock_question):
+        """Regression guard for the other direction: four live venues that simply have
+        no matching market must ALL read `none` with an empty suffix, so the widened
+        token vocabulary never cries outage on a healthy no-match question."""
+        handlers = self._handlers({"series": []})
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources == {
+            "polymarket": "none",
+            "manifold": "none",
+            "kalshi": "none",
+            "predictit": "none",
+            "kalshi_series": "none",
+        }
+        assert _partial_loss_suffix({"sources": snapshot.sources}) == ""
+        # The load-bearing half of the alerting guard: a genuine no-match must never
+        # redden CI, however sensitive the outage alert is.
+        assert pmp.prediction_market_platform_failures() == 0
+
+    @pytest.mark.asyncio
+    async def test_one_lost_query_of_two_reads_as_partial(self, mock_question, manifold_payload):
+        """Manifold runs two queries (the LLM query plus the extra S2 natural-language
+        one). Losing one of them used to publish a clean `ok(N)` off the survivor."""
+        handlers = self._handlers({"series": []})
+
+        def _manifold_handler(params: dict[str, Any]) -> FakeResponse:
+            # The S2 query is the raw question text; the LLM query is the short one.
+            if "reach orbit" in (params.get("term") or ""):
+                return FakeResponse(503, text="service unavailable")
+            return FakeResponse(200, manifold_payload)
+
+        handlers[self._MANIFOLD_URL] = _manifold_handler
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources["manifold"] == "partial(1/2)"
+        assert "lost=manifold:partial(1/2)" in _partial_loss_suffix({"sources": snapshot.sources})
+        # The surviving query's match still lands.
+        assert "manifold" in {m.platform for m in snapshot.matches}
+        # A partial loss is a loss: it alerts even though matches came back.
+        assert pmp.prediction_market_platform_failures() == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_kalshi_prefetch_does_not_poison_the_next_question(self, mock_question, kalshi_events_payload):
+        """Question 1's Kalshi prefetch 503s, question 2's succeeds. The failed prefetch
+        must not have cached its empty list for the full 6h TTL, or one transient blip
+        starves every later question in the run behind a stale `none`."""
+        calls = {"n": 0}
+
+        def _events_handler(_params: dict[str, Any]) -> FakeResponse:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return FakeResponse(503, text="service unavailable")
+            return FakeResponse(200, kalshi_events_payload)
+
+        handlers = self._handlers({"series": []})
+        handlers[self._KALSHI_EVENTS_URL] = _events_handler
+
+        second_question = MagicMock()
+        second_question.id_of_question = 54321
+        second_question.question_text = mock_question.question_text
+        second_question.title = mock_question.title
+        second_question.resolution_criteria = mock_question.resolution_criteria
+        second_question.scheduled_resolution_time = None
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            first = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+            second = await pmp.fetch_market_snapshot(second_question, timeout=5.0)
+
+        assert first.sources["kalshi"] == "error(all_queries_failed)"
+        assert "kalshi" not in {m.platform for m in first.matches}
+        assert second.sources["kalshi"].startswith("ok(")
+        assert "kalshi" in {m.platform for m in second.matches}

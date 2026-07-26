@@ -1126,7 +1126,12 @@ class TestParseStructuredBlock:
         assert any(
             record.levelno == logging.INFO and "No JSON block found" in record.message for record in caplog.records
         )
-        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+        # Scoped to our own loggers: caplog.records spans every logger that propagates
+        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        our_warnings = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
+        ]
+        assert not our_warnings, [r.getMessage() for r in our_warnings]
 
     def test_malformed_json_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         rationale = "```json\n{this is not valid json\n```"
@@ -1300,7 +1305,12 @@ class TestValidityAwareBlockSelection:
         # A skipped-then-recovered trailing block is an INFO signal (the prompt
         # contract eroding), never a scary WARNING — extraction succeeded.
         assert any(record.levelno == logging.INFO and "skip" in record.message.lower() for record in caplog.records)
-        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+        # Scoped to our own loggers: caplog.records spans every logger that propagates
+        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        our_warnings = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
+        ]
+        assert not our_warnings, [r.getMessage() for r in our_warnings]
 
     def test_truncated_closed_final_block_skipped_for_valid(self) -> None:
         # Model hit its token limit mid-block but the fence still closed: the

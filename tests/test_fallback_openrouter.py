@@ -1,11 +1,21 @@
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 
+from metaculus_bot import fallback_openrouter
+from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE
 from metaculus_bot.fallback_openrouter import (
     DONATED_KEY_PROVIDERS,
     FallbackOpenRouterLlm,
     build_llm_with_openrouter_fallback,
+    get_credit_key_fallback_count,
+    get_donated_404_fallback_count,
+    get_generic_key_fallback_count,
+    is_credit_caused_error,
+    reset_credit_key_fallback_count,
+    reset_donated_404_fallback_count,
+    reset_generic_key_fallback_count,
     should_retry_with_general_key,
     should_route_via_donated_key,
 )
@@ -227,30 +237,174 @@ class TestFallbackOpenRouterLlm:
             await llm.invoke("hi")
 
 
+class TestCreditCauseClassification:
+    """``is_credit_caused_error`` is the ONE place the "empty wallet" text cues
+    live: ``should_retry_with_general_key`` and the credit-subset counter both go
+    through it, so the retry decision and the counter can't drift apart.
+
+    Only these messages are exempt from alerting during the suppression window
+    (see ``constants.credit_alerts_active``) — everything else keeps reddening CI.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "HTTP 402 Payment Required",
+            "payment required",
+            "insufficient credit on key",
+            "out of credits",
+            "insufficient funds",
+            "402 Payment Required: insufficient credit",
+        ],
+    )
+    def test_credit_messages_classified_as_credit_caused(self, message: str) -> None:
+        assert is_credit_caused_error(Exception(message)) is True
+        # Same messages must still trigger the fallback itself — the exemption
+        # changes accounting, never routing.
+        assert should_retry_with_general_key(Exception(message)) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "401 Unauthorized",
+            "invalid API key",
+            "disabled api key",
+            "404 No allowed providers are available for the selected model.",
+            "429 Too Many Requests",
+            "Rate limit exceeded",
+            "matching your guardrail restrictions",
+            "data policy",
+            "403 Forbidden moderation",
+            "503 Service Unavailable",
+        ],
+    )
+    def test_non_credit_messages_not_classified_as_credit_caused(self, message: str) -> None:
+        """The regression that matters: real breakage must never be exempted."""
+        assert is_credit_caused_error(Exception(message)) is False
+
+
+class TestPaidFallbackWarningExitClause:
+    """The paid-fallback WARNING must not promise a red CI run it won't deliver.
+
+    ``credit_alerts_active`` is monkeypatched (rather than waiting on the wall
+    clock) so both branches stay covered before and after 2026-09-10.
+    """
+
+    def test_credit_cause_during_suppression_says_not_alertable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(fallback_openrouter, "credit_alerts_active", lambda: False)
+        note = fallback_openrouter._fallback_alert_note(Exception("HTTP 402 Payment Required"))
+        assert "NOT counted as alertable" in note
+        assert CREDIT_ALERT_RESUME_DATE.isoformat() in note
+
+    def test_credit_cause_after_resume_says_exit_non_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(fallback_openrouter, "credit_alerts_active", lambda: True)
+        note = fallback_openrouter._fallback_alert_note(Exception("HTTP 402 Payment Required"))
+        assert note == "Run will complete, then exit non-zero to alert."
+
+    def test_non_credit_cause_always_says_exit_non_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Even mid-suppression, a 401 still promises the red run it will cause."""
+        monkeypatch.setattr(fallback_openrouter, "credit_alerts_active", lambda: False)
+        note = fallback_openrouter._fallback_alert_note(Exception("401 Unauthorized"))
+        assert note == "Run will complete, then exit non-zero to alert."
+
+
 class TestFallbackCounters:
     """Every donated->personal fallback must be counted + logged loudly so silent
     personal-key spend can't accumulate. ``_generic_key_fallback_count`` counts ALL
-    fallback causes; ``_donated_404_fallback_count`` is the allowed-providers-404
-    subset. cli.py folds the generic counter into its non-zero-exit alert.
+    fallback causes; ``_donated_404_fallback_count`` (allowed-providers 404) and
+    ``_credit_key_fallback_count`` (402/insufficient-credit) are two disjoint
+    subsets of that total. cli.py folds the generic counter into its non-zero-exit
+    alert and subtracts the credit subset while credit alerting is suppressed.
     """
 
     def setup_method(self) -> None:
-        from metaculus_bot.fallback_openrouter import (
-            reset_donated_404_fallback_count,
-            reset_generic_key_fallback_count,
-        )
-
         reset_generic_key_fallback_count()
         reset_donated_404_fallback_count()
+        reset_credit_key_fallback_count()
 
     def teardown_method(self) -> None:
-        from metaculus_bot.fallback_openrouter import (
-            reset_donated_404_fallback_count,
-            reset_generic_key_fallback_count,
-        )
-
         reset_generic_key_fallback_count()
         reset_donated_404_fallback_count()
+        reset_credit_key_fallback_count()
+
+    @pytest.mark.asyncio
+    async def test_credit_fallback_bumps_credit_subset_and_still_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 402 fallback bumps the generic total AND the credit subset, and still
+        logs the loud PAID PERSONAL-KEY FALLBACK warning. The suppression only
+        removes the event from cli's alertable arithmetic — never from the logs.
+        """
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.6-sol",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("HTTP 402 Payment Required: insufficient credit")),
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.fallback_openrouter"):
+            assert await llm.invoke("hi") == "ok"
+
+        assert get_generic_key_fallback_count() == 1
+        assert get_credit_key_fallback_count() == 1
+        assert get_donated_404_fallback_count() == 0
+        assert any("PAID PERSONAL-KEY FALLBACK" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "401 Unauthorized: invalid api key",
+            "429 Too Many Requests: rate limit exceeded",
+        ],
+    )
+    async def test_non_credit_fallback_leaves_credit_subset_at_zero(
+        self, monkeypatch: pytest.MonkeyPatch, message: str
+    ) -> None:
+        """401 / 429 bump only the generic total. If either leaked into the credit
+        subset, cli would subtract it and a genuinely broken key would ship green.
+        """
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/anthropic/claude-opus-4.8",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_primary", AsyncMock(side_effect=Exception(message)))
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
+
+        assert await llm.invoke("hi") == "ok"
+        assert get_generic_key_fallback_count() == 1
+        assert get_credit_key_fallback_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_donated_404_leaves_credit_subset_at_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The two subsets are disjoint: a 404 belongs to the 404 subset only, so
+        cli's single subtraction can't double-discount it.
+        """
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.4",
+            primary_api_key="special",
+            secondary_api_key="general",
+            temperature=0,
+        )
+        monkeypatch.setattr(
+            llm,
+            "_invoke_once_using_primary",
+            AsyncMock(side_effect=Exception("404 No allowed providers are available for the selected model.")),
+        )
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
+
+        assert await llm.invoke("hi") == "ok"
+        assert get_generic_key_fallback_count() == 1
+        assert get_donated_404_fallback_count() == 1
+        assert get_credit_key_fallback_count() == 0
 
     @pytest.mark.asyncio
     async def test_generic_fallback_bumps_counter_and_logs_every_time(
@@ -258,11 +412,6 @@ class TestFallbackCounters:
     ) -> None:
         """A 401/402 (non-404) fallback bumps ONLY the generic counter, not the 404 subset,
         and logs a WARNING on EVERY fallback (no once-per-instance suppression)."""
-        from metaculus_bot.fallback_openrouter import (
-            get_donated_404_fallback_count,
-            get_generic_key_fallback_count,
-        )
-
         llm = FallbackOpenRouterLlm(
             model="openrouter/anthropic/claude-opus-4.8",
             primary_api_key="special",
@@ -275,8 +424,6 @@ class TestFallbackCounters:
             AsyncMock(side_effect=Exception("HTTP 402 Payment Required: insufficient credit")),
         )
         monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
-
-        import logging
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.fallback_openrouter"):
             assert await llm.invoke("hi") == "ok"
@@ -295,11 +442,6 @@ class TestFallbackCounters:
     ) -> None:
         """A 404 'no allowed providers' fallback bumps BOTH the generic total and the 404 subset
         (a 404 fallback is still a personal-key fallback)."""
-        from metaculus_bot.fallback_openrouter import (
-            get_donated_404_fallback_count,
-            get_generic_key_fallback_count,
-        )
-
         llm = FallbackOpenRouterLlm(
             model="openrouter/openai/gpt-5.4",
             primary_api_key="special",
@@ -312,8 +454,6 @@ class TestFallbackCounters:
             AsyncMock(side_effect=Exception("404 No allowed providers are available for the selected model.")),
         )
         monkeypatch.setattr(llm, "_invoke_once_using_secondary", AsyncMock(return_value="ok"))
-
-        import logging
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.fallback_openrouter"):
             assert await llm.invoke("hi") == "ok"

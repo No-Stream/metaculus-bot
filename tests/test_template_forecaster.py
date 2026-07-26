@@ -865,7 +865,11 @@ def test_emit_drop_telemetry_clean_run_emits_zero_marker_no_warning(mock_general
     assert "total=0" in marker
     assert "systematic=none" in marker
     assert not any(line.startswith("Forecaster drops by model:") for line in caplog.messages)
-    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+    # Scoped to our own loggers: caplog.records spans every logger that propagates to
+    # root, so a third-party WARNING (forecasting-tools' missing-METACULUS_TOKEN notice
+    # on CI) would otherwise fail an assertion that is about OUR code staying quiet.
+    our_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")]
+    assert not our_warnings, [r.getMessage() for r in our_warnings]
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +878,7 @@ def test_emit_drop_telemetry_clean_run_emits_zero_marker_no_warning(mock_general
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all eight degradation counters. Using distinct powers of 2
+    """Property must sum all nine degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -898,8 +902,12 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # module's per-run global — so stub the accessor the property imports rather
     # than bumping the counter 128 times.
     monkeypatch.setattr(prediction_market, "kalshi_series_fetch_failures", lambda: 128)
+    # Same shape for the platform-failure counter (operator decision 2026-07-25: any
+    # prediction-market venue losing a fetch reddens CI), so a dropped or
+    # double-counted ninth term shows up in the sum.
+    monkeypatch.setattr(prediction_market, "prediction_market_platform_failures", lambda: 256)
 
-    assert bot.alertable_count == 255
+    assert bot.alertable_count == 511
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -918,8 +926,9 @@ def test_alertable_count_zero_by_default(mock_general_llm):
 
 @pytest.mark.asyncio
 async def test_forecast_questions_resets_prediction_market_counter(mock_general_llm):
-    """The Kalshi series-failure counter lives at module scope (the provider is a
-    stateless callable), so forecast_questions must zero it at run start.
+    """Both prediction-market failure counters (Kalshi series index, platform fetches)
+    live at module scope because the provider is a stateless callable, so
+    forecast_questions must zero them at run start.
 
     Without the reset a previous run's — or a previous test's — failures leak into
     this run's alertable_count, reddening CI for degradation that already happened
@@ -935,14 +944,20 @@ async def test_forecast_questions_resets_prediction_market_counter(mock_general_
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     prediction_market._bump_kalshi_series_failure()
+    prediction_market._bump_platform_failures()
     assert prediction_market.kalshi_series_fetch_failures() == 1
+    assert prediction_market.prediction_market_platform_failures() == 1
+    # Live module bumps (not stubbed accessors) reach alertable_count...
+    assert bot.alertable_count == 2
     try:
         await bot.forecast_questions([])
 
         assert prediction_market.kalshi_series_fetch_failures() == 0
+        assert prediction_market.prediction_market_platform_failures() == 0
         assert bot.alertable_count == 0
     finally:
         prediction_market.reset_series_degradation_counter()
+        prediction_market.reset_platform_degradation_counter()
 
 
 def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:
