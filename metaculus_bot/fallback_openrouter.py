@@ -320,25 +320,34 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
     return str(code) in lowercased_msg
 
 
-def _is_credit_failure(exc: Exception, reported_status: int | None, lowercased_msg: str) -> bool:
+def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
     """Status-aware view of :func:`_is_credit_message` for the routing decision.
 
-    ``_is_credit_message`` treats a bare "402" as weak evidence and vetoes it on
-    moderation wording. A reported status is stronger evidence than wording: on any
-    status other than 402 the bare digits cannot be a status at all, so only the
-    explicit phrases may classify. That still catches the spend-cap 403 ("Key limit
-    exceeded"), which must keep falling back, while closing the case the word cues
-    cannot see — a policy-refusal body that echoes a prompt containing "402" but never
-    uses the word "moderation", "forbidden", or "flagged".
+    Same precedence as ``_is_credit_message``, with the status the provider REPORTED
+    standing in for the bare-digit cue that function has to settle for:
 
-    Statusless exceptions defer to ``_is_credit_message`` unchanged, keeping it the
-    single source of truth for text-only classification.
+    1. An explicit credit phrase wins outright. It is unambiguous English, unlike
+       "Forbidden", which is generic HTTP boilerplate a drained-key 403 body can carry —
+       letting a moderation word veto "Key limit exceeded" would strand the ensemble on
+       the dead key, the exact failure this exists to fix.
+    2. Otherwise moderation wording vetoes. A refusal body replays up to ~100 characters
+       of our own prompt, so where wording and status disagree we take the conservative
+       branch rather than bill the paid key for a call that will refuse again.
+    3. Otherwise the reported status decides, and only a 402 is a credit shortfall.
+
+    The status never acts alone: it is consulted last, after both text signals, and a
+    statusless exception defers wholly to ``_is_credit_message`` so that stays the single
+    source of truth for text-only classification. Nothing here reads a live balance —
+    ``status_code`` is an int already on the exception. The ``/auth/key`` probe belongs to
+    ``is_suppressible_credit_error`` and the ALERTING decision, never to routing.
     """
     if reported_status is None:
         return _is_credit_message(lowercased_msg)
-    if reported_status == 402:
+    if any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES):
         return True
-    return any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES)
+    if any(cue in lowercased_msg for cue in _MODERATION_CUES):
+        return False
+    return reported_status == 402
 
 
 def is_credit_caused_error(exc: Exception) -> bool:
@@ -352,7 +361,7 @@ def is_credit_caused_error(exc: Exception) -> bool:
     back to the paid key without being credit-classified — reddening CI on exactly
     the expected empty wallet the suppression window exists for.
     """
-    return _is_credit_failure(exc, _llm_status_code(exc), str(exc).lower())
+    return _is_credit_failure(_llm_status_code(exc), str(exc).lower())
 
 
 def is_suppressible_credit_error(exc: Exception) -> bool:
@@ -452,7 +461,7 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # Positive signals: credentials/credits
     if _is_status(status, 401, msg) or any(cue in msg for cue in _BAD_CREDENTIAL_TEXT_CUES):
         return True
-    if _is_credit_failure(exc, status, msg):
+    if _is_credit_failure(status, msg):
         return True
     # Donated-key allowed-providers quirk: the donated key has server-side
     # provider preferences; a model only available via a non-allowed provider

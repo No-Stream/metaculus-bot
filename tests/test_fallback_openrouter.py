@@ -1057,3 +1057,65 @@ class TestStatusCodeClassification:
         assert should_retry_with_general_key(Exception("429 Too Many Requests")) is True
         assert should_retry_with_general_key(Exception("403 Forbidden moderation")) is False
         assert should_retry_with_general_key(Exception("502 Bad Gateway")) is False
+
+
+class TestCreditClassificationPrecedence:
+    """Explicit credit wording > moderation wording > the reported status.
+
+    The three signals disagree in real bodies, so their precedence is the whole design:
+
+    * Explicit phrases outrank everything. A drained-key 403 must fall back, and its body
+      can legitimately carry HTTP boilerplate like "Forbidden" — letting a generic
+      moderation WORD veto "Key limit exceeded" would resurrect the exact bug this whole
+      change exists to fix.
+    * Moderation wording outranks the status. A refusal body replays up to ~100 chars of
+      our own prompt, so it can contain any digits at all; where wording and status
+      disagree, take the conservative branch and do not bill the paid key.
+    * The status decides only what is left, replacing the bare-digit cue that
+      ``_is_credit_message`` has to fall back on when no status was reported.
+    """
+
+    @staticmethod
+    def _api_error(status: int, message: str) -> Exception:
+        from litellm.exceptions import APIError
+
+        return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
+
+    def test_moderation_403_echoing_prompt_402_is_not_credit(self) -> None:
+        """403 whose ``flagged_input`` replays a prompt containing "402" → not credit.
+
+        The forecasting prompt is full of dollar figures and bill numbers, so this is the
+        realistic shape of the poisoning case.
+        """
+        body = (
+            "APIError: OpenrouterException - "
+            '{"error":{"message":"Blocked","metadata":{"reasons":["policy"],'
+            '"flagged_input":"...HR 402 authorizes $402 million in FY2026..."},"code":403}}'
+        )
+        exc = self._api_error(403, body)
+        assert is_credit_caused_error(exc) is False
+        assert should_retry_with_general_key(exc) is False
+
+    def test_moderation_wording_outranks_a_402_status(self) -> None:
+        """Where the status says 402 but the wording says refusal, take the safe branch.
+
+        Trusting the status here would bill the personal key for a call that refuses
+        again, and would credit-classify a real content block — exempting it from CI
+        alerting for the whole suppression window.
+        """
+        body = 'APIError: OpenrouterException - {"error":{"message":"flagged for moderation","code":402}}'
+        exc = self._api_error(402, body)
+        assert is_credit_caused_error(exc) is False
+        assert should_retry_with_general_key(exc) is False
+
+    def test_explicit_credit_wording_outranks_http_forbidden_boilerplate(self) -> None:
+        """A drained-key 403 rendered as "403 Forbidden" still falls back.
+
+        Regression guard on the precedence order: "forbidden" is a moderation CUE, so if
+        the veto were allowed to outrank the explicit phrase, the production dry-key
+        failure would stop falling back and the ensemble would strand on the dead key.
+        """
+        body = "APIError: OpenrouterException - 403 Forbidden: Key limit exceeded (total limit)."
+        exc = self._api_error(403, body)
+        assert is_credit_caused_error(exc) is True
+        assert should_retry_with_general_key(exc) is True
