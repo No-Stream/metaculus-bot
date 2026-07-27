@@ -129,8 +129,9 @@ Both gap-fill passes run in prod as of 2026-07-17. Each soft-fails to an empty
 string on any error, and both are suppressed under `is_benchmarking=True`. v2's
 driver model and reasoning effort come from `GAP_FILL_V2_DRIVER_MODEL` /
 `GAP_FILL_V2_DRIVER_EFFORT`; its wall deadline is `GAP_FILL_V2_WALL_DEADLINE` and
-its tool-call budget is `GAP_FILL_V2_MAX_TOOL_CALLS`. All four are defined in
-`constants.py`, which is the only place their values are worth reading.
+its tool-call budget is `GAP_FILL_V2_MAX_TOOL_CALLS`. Every `GAP_FILL_V2_*`
+setting is defined in `constants.py`, which is the only place their values are
+worth reading; `docs/agentic_gap_fill.md` has the full env-var table.
 
 ### Stacking
 
@@ -442,6 +443,15 @@ Only `drained` is subtracted from `alertable`. A probe that errors or times out
 classifies as `unknown` and stays red, so a broken probe can never silently turn
 a red run green.
 
+The probe is what the *ambiguous* spend-cap 403 needs, so it is the only path that
+pays for one. A documented 402 or plain insufficient-credit response says the
+wallet is empty and nothing else, so `is_suppressible_credit_error` suppresses that
+family before reaching the probe at all — deliberately, since it predates the
+discriminator and an unreachable `/auth/key` must not change long-standing
+behavior. Read the table above as the verdict on a spend-cap 403 specifically, not
+on every credit failure (`test_documented_402_needs_no_probe` in
+`tests/test_fallback_openrouter.py` pins the carve-out).
+
 `DONATED_KEY_PROBE_TIMEOUT_S` bounds the probe, but read what shape of promise
 that is: httpx applies a bare float **per network operation** — connect, read,
 write and pool each get the full budget independently — so it is not a cap on
@@ -612,10 +622,15 @@ both test workflows). Grep these for the telemetry markers:
   `numeric/diagnostics.py`.
 - `GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=...
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
-  wall_s=... findings=... pending_leads=... lint_rejections=...` — one summary
-  line per gap-fill v2 loop, emitted by `_log_completion` in
-  `research/agentic/loop.py`. A companion `GHOST_FORECAST` line logs the loop's
-  private dry-run forecast for telemetry only; it is never published.
+  wall_s=... findings=... pending_leads=... lint_rejections=...
+  provenance_rejections=... quote_mismatch_warnings=... plan_gaps=...
+  plan_skipped=... conclude_gate_rejections=... error=...` — one summary line per
+  gap-fill v2 loop, emitted by `_log_completion` in `research/agentic/loop.py`.
+  `error=` is what separates a step-zero crash from an idle run; both otherwise
+  emit `steps=0 tool_calls=0 findings=0`. Companion `GHOST_PRE` /
+  `GHOST_PRE_JSON` and `GHOST_FORECAST` / `GHOST_FORECAST_JSON` lines log the
+  loop's pre- and post-research private forecasts for telemetry only; neither is
+  ever published. `docs/agentic_gap_fill.md` reads the fields in full.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_FLOOR_BREACH` — credit telemetry,
   described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
   suppression window, so seeing one on a green run is expected until 2026-09-10;

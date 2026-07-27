@@ -196,31 +196,39 @@ the panel and never published. It exists so the run logs carry a signal of what
 a forecast built purely on v2's research would have looked like, which is useful
 for evaluating driver quality. The ghost phase runs only when the driver
 concluded explicitly (not when the deadline cut it off) and is bounded by its own
-`asyncio.wait_for` in `loop.py`, so a slow ghost call can't eat into the run. The
-parsed result is logged as a `GHOST_FORECAST` marker.
+`asyncio.wait_for` in `loop.py`, so a slow ghost call can't eat into the run.
+
+`_run_ghost_phase` logs the parsed result twice: a lossy human-readable
+`GHOST_FORECAST` line kept byte-identical for the already-harvested archive, and
+an additive `GHOST_FORECAST_JSON` line carrying the complete forecast (every
+percentile, not just the median) so `scripts/score_ghosts.py` can score numeric
+ghosts. The JSON line is suppressed when no structured block parsed. The turn-one
+plan emits the same pair as `GHOST_PRE` / `GHOST_PRE_JSON`
+(`_set_research_plan_tool`) from the driver's pre-research dry run, so the
+pre-versus-post delta measures whether v2's own research moved its own view.
 
 ## The bounds
 
 The loop is anytime: it always emits whatever it has banked, even when it runs
-out of budget. Three limits bound it (defaults in `constants.py`, overridable by
-the matching env vars):
+out of budget. Three limits bound it:
 
-- **Wall deadline** `GAP_FILL_V2_WALL_DEADLINE`. A hard ceiling on the whole
-  loop, enforced by an outer `asyncio.wait_for`. It sits inside v1's worst-case
-  timing envelope, so running v2 concurrently with v1 adds no research-phase
-  wall-clock.
-- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS`. Parallel calls each count
-  against this cap. Steps, not calls, are where latency lives, so batching is
-  encouraged.
-- **Max steps** = 20 (`LoopConfig.max_steps` default; the seam doesn't override
-  it). A step is one driver turn.
+- **Wall deadline** `GAP_FILL_V2_WALL_DEADLINE` (`constants.py`, env-overridable).
+  A hard ceiling on the whole loop, enforced by an outer `asyncio.wait_for`. It
+  sits inside v1's worst-case timing envelope, so running v2 concurrently with v1
+  adds no research-phase wall-clock.
+- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` (`constants.py`,
+  env-overridable). Parallel calls each count against this cap. Steps, not calls,
+  are where latency lives, so batching is encouraged.
+- **Max steps** — `LoopConfig.max_steps`, which the seam doesn't override, so
+  this one lives on the dataclass rather than in `constants.py` and takes no env
+  var. A step is one driver turn.
 
 There is also a **conclude threshold** `GAP_FILL_V2_CONCLUDE_THRESHOLD`. Once
-fewer than that many seconds remain, or the tool-call cap is hit, the loop
-stops offering the research tools and exposes only `record_findings` and
-`conclude`, which forces the driver to wrap up inside the wall deadline. A
-budget line is appended to every tool result so the driver always knows how much
-room it has left.
+fewer than that many seconds remain, or the tool-call cap is hit, `_tool_schemas`
+stops offering the research tools and exposes only the internal ones
+(`_INTERNAL_TOOL_NAMES`), which forces the driver to wrap up inside the wall
+deadline. A budget line is appended to every tool result so the driver always
+knows how much room it has left.
 
 The loop also does light stuck-detection: an exact-duplicate tool call (same
 tool, same normalized arguments) bumps a `dup_tool_calls` counter and gets a
@@ -262,15 +270,21 @@ Every run that reaches the loop emits one INFO line to the run logs
 (`loop.py` `_log_completion`):
 
 ```
-GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=... rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=... wall_s=... findings=... pending_leads=... lint_rejections=...
+GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=... rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=... wall_s=... findings=... pending_leads=... lint_rejections=... provenance_rejections=... quote_mismatch_warnings=... plan_gaps=... plan_skipped=... conclude_gate_rejections=... error=...
 ```
 
 `searches` sums `search_news` and `search_web`; `rendered` counts fetches that
 went all the way to the headless-Chromium rung; `reads` counts `read_document`
 calls; `concluded_early` is true when the driver called `conclude` before the
-deadline. This marker is grep-able in the durable `run_logs/` artifacts every
-workflow tees, so the driver can be vibe-evaluated after the fact without
-pulling any research-archive JSON.
+deadline. `error` carries the `repr` of whatever tripped the loop's catch-all
+soft-fail and is `None` on both a healthy run and a deadline hit, which makes it
+the one field that separates a step-zero crash from an idle run — the two emit
+otherwise byte-identical `steps=0 tool_calls=0 findings=0` lines. Everything from
+`provenance_rejections` onward postdates the original marker, so
+`scripts/telemetry/markers.py` wraps that tail in optional regex groups and still
+harvests pre-branch archived logs that end at `lint_rejections`. This marker is
+grep-able in the durable `run_logs/` artifacts every workflow tees, so the driver
+can be vibe-evaluated after the fact without pulling any research-archive JSON.
 
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
 actually ran, the orchestrator captures `{transcript, telemetry}` through it and

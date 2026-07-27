@@ -355,7 +355,8 @@ A bounded agentic tool loop run by a driver LLM (`GAP_FILL_V2_DRIVER_MODEL` at
 `GAP_FILL_V2_ENABLED`. The driver is briefed with the forecaster prompt, privately
 dry-runs a forecast to find things worth filling or verifying, then iterates over
 four tools (news search, web search, fetch, document read) under a wall deadline
-(`GAP_FILL_V2_WALL_DEADLINE`) and a tool-call budget. It appends a
+(`GAP_FILL_V2_WALL_DEADLINE`) and a tool-call budget
+(`GAP_FILL_V2_MAX_TOOL_CALLS`). It appends a
 citation-only findings artifact under `## Agentic Research Findings`, leading with
 a corrections-to-the-briefing block. Like the other leakage-sensitive providers,
 it is benchmarking-guarded off. See `docs/agentic_gap_fill.md` for the full
