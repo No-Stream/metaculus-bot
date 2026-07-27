@@ -76,7 +76,7 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  4. MIN-FORECASTERS GUARD                        │
-        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (2) valid │
+        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (1) valid │
         │  → skip this question, keep the batch going.     │
         └────────────────────────────────────────────────┘
                                  │
@@ -139,7 +139,7 @@ questions. The N coroutines are gathered under the shared wall-clock budget by
 `_gather_predictions_with_wall_clock` (`forecaster.py:430`), which cancels any
 forecaster still pending at the deadline and counts the drop.
 
-The ensemble is six forecaster LLMs balanced across providers. The exact roster
+The ensemble is three forecaster LLMs, one per vendor. The exact roster
 rotates often, so **read `metaculus_bot/llm_configs.py` for the current list** rather
 than trusting any names written here. Support models (summarizer, parser, stacker,
 disagreement analyzer) live in the same file.
@@ -152,10 +152,18 @@ bound/step constraints.
 
 ### 4. Min-forecasters guard
 
-If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 2, `constants.py:487`) forecasters
+If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 1, `constants.py:575`) forecasters
 returned a valid prediction, the ensemble is too degraded to trust. The question is
 skipped and a counter bumps for end-of-run alerting, but the rest of the batch and all
-other publications continue (`forecaster.py:638`).
+other publications continue (`forecaster.py:853`).
+
+At the current threshold of 1, a lone survivor publishes: the median of one forecast is
+that forecast. Because the spread metrics in `spread_metrics.py` require at least two
+predictions and raise otherwise, `_research_and_make_predictions` short-circuits the
+n == 1 case before spread computation and stacking and hands the single prediction
+straight to the aggregator (see the comment at `forecaster.py:874`). Exception-driven
+drops still bump the degradation counters, so a run thinned to one model reddens CI
+rather than silently withholding the question.
 
 ### 5. Aggregation: CONDITIONAL_STACKING
 
