@@ -121,14 +121,15 @@ primary, each independently gated.
 
 | Flag | Code default | Prod value | What it gates |
 |---|---|---|---|
-| `GAP_FILL_ENABLED` | off | `true` | v1 gap-fill: analyzer finds up to 5 factual gaps, parallel native searches resolve each |
+| `GAP_FILL_ENABLED` | off | `true` | v1 gap-fill: analyzer finds up to `GAP_FILL_MAX_GAPS` factual gaps, parallel native searches resolve each |
 | `GAP_FILL_V2_ENABLED` | off | `true` | v2 agentic research loop (`research/agentic/`); runs concurrently with v1 during the overlap window |
 
 Both gap-fill passes run in prod as of 2026-07-17. Each soft-fails to an empty
 string on any error, and both are suppressed under `is_benchmarking=True`. v2's
-driver model and effort default to `gpt-5.6-terra` at `effort=low`
-(`GAP_FILL_V2_DRIVER_MODEL` / `GAP_FILL_V2_DRIVER_EFFORT`); its wall deadline is
-540s and it caps at 30 tool calls (`constants.py:524-529`).
+driver model and reasoning effort come from `GAP_FILL_V2_DRIVER_MODEL` /
+`GAP_FILL_V2_DRIVER_EFFORT`; its wall deadline is `GAP_FILL_V2_WALL_DEADLINE` and
+its tool-call budget is `GAP_FILL_V2_MAX_TOOL_CALLS`. All four are defined in
+`constants.py`, which is the only place their values are worth reading.
 
 ### Stacking
 
@@ -301,20 +302,21 @@ Only `drained` is subtracted from `alertable`. A probe that errors or times out
 classifies as `unknown` and stays red, so a broken probe can never silently turn
 a red run green.
 
-Its 5s `DONATED_KEY_PROBE_TIMEOUT_S` is a **per-network-operation** budget, not a
-bound on elapsed time: httpx applies a bare float to connect / read / write /
-pool independently, so a server trickling bytes slower than the read timeout
-resets the clock on every chunk (measured against a local 0.5s-per-byte
-trickler, a `timeout=1.0` GET took 10.2s to return 20 bytes). The hard total cap
-lives at the one latency-sensitive call site: `record_donated_key_fallback` runs
-the probe on `asyncio.to_thread` under `asyncio.wait_for(...,
-timeout=DONATED_KEY_PROBE_TIMEOUT_S)`, so the awaiting coroutine gives up after
-5s regardless of how long the socket takes. `wait_for` doesn't kill the worker
-thread, so a trickling probe can outlive that cap — it just does so orphaned,
-holding a socket and (under the probe's lock) writing the cache, while the
-fallback proceeds. Callers outside that path (the CLI, the start/end telemetry)
-run outside the forecasting window and take the per-operation budget only. The
-state is logged as
+`DONATED_KEY_PROBE_TIMEOUT_S` bounds the probe, but read what shape of promise
+that is: httpx applies a bare float **per network operation** — connect, read,
+write and pool each get the full budget independently — so it is not a cap on
+elapsed time. A server trickling bytes slower than the read timeout resets the
+clock on every chunk, and a probe can run many multiples of the nominal budget
+(measured against a local trickling server, a one-second timeout took ten
+seconds to return twenty bytes). The hard total cap therefore lives at the one
+latency-sensitive call site rather than in the timeout: on the fallback path
+`record_donated_key_fallback` runs the probe on `asyncio.to_thread` under an
+`asyncio.wait_for`, so the awaiting coroutine gives up on schedule however long
+the socket takes. `wait_for` doesn't kill the worker thread, so a trickling probe
+outlives that cap — orphaned, holding a socket and (under the probe's lock)
+writing the cache — while the fallback proceeds without it. Callers outside that
+path (the CLI, the start/end telemetry) run outside the forecasting window and
+take the per-operation budget only. The state is logged as
 `DONATED_KEY_STATE: state=<state>` (INFO for `drained`, WARNING for everything
 else) and is echoed in the end-of-run summary as `donated_key=<state>` whenever a
 probe actually ran.
@@ -361,9 +363,11 @@ substring match therefore read an ordinary moderation refusal as an empty wallet
 real moderation block from alerting. Everything after a prompt-echo marker is now
 stripped before any word cue reads the body, and the bare digits are only trusted
 when nothing in what remains looks like a moderation refusal. Word cues only,
-deliberately: a genuine 402 links to a key hash that has roughly a 1.5% (1 in 67)
-chance of containing the substring `403`, and reading that as moderation would
-break the long-standing 402 fallback.
+deliberately: a genuine 402 links to a key hash with a small but non-negligible
+chance of containing the substring `403` somewhere in it, and reading that as
+moderation would break the long-standing 402 fallback. The odds are derived (and
+pinned as bands) by `test_key_hash_status_collision_is_small_but_nonnegligible`
+in `tests/test_llm_retry.py`, which is the only place that arithmetic lives.
 
 Nothing is silenced. Every `CREDIT_*` marker line, `CREDIT_FLOOR_BREACH`
 included, and every `PAID PERSONAL-KEY FALLBACK` warning fires exactly as

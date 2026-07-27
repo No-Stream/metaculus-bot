@@ -957,8 +957,9 @@ class TestStatusCodeClassification:
     """Numeric routing reads the reported ``status_code``, not digits in the message.
 
     litellm formats the message as ``APIError: {provider} - {raw body}``. An OpenRouter
-    body carries a 64-hex key hash (two independent Monte Carlo estimates put the odds
-    of it containing one of 401/402/403/429/502/503 at ~8.7%) and, on a moderation
+    body carries a 64-hex key hash with a small but non-negligible chance of containing
+    one of 401/402/403/429/502/503 (derived exactly by
+    ``test_key_hash_status_collision_is_small_but_nonnegligible``) and, on a moderation
     refusal, up to ~100 characters of OUR OWN PROMPT in ``flagged_input``. Grepping that
     text for status digits reads coincidences as statuses in both directions: a
     coincidental "429" makes a moderation 403 fall back and bill the personal key for a
@@ -1009,8 +1010,9 @@ class TestStatusCodeClassification:
     def test_key_hash_digits_do_not_trigger_fallback(self) -> None:
         """A 403 whose key hash happens to contain "429" must not read as a rate limit.
 
-        ~8.7% of key rotations produce a hash like this. The current donated hash
-        contains none of the six statuses, which is luck, not design.
+        A non-negligible fraction of key rotations produce a hash like this (see
+        ``test_key_hash_status_collision_is_small_but_nonnegligible``). The current donated
+        hash contains none of the six statuses, which is luck, not design.
         """
         body = (
             'APIError: OpenrouterException - {"error":{"message":"Blocked by content policy. '

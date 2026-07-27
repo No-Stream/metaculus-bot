@@ -202,9 +202,11 @@ def llm_status_code(exc: BaseException) -> int | None:
 
     Callers read this int rather than grepping the message for digits. litellm formats
     the message as ``f"APIError: {provider} - {body}"`` and an OpenRouter body embeds a
-    64-hex key hash (~8.7% chance of containing one of 401/402/403/429/502/503) plus, on
-    a moderation refusal, up to ~100 chars of our own prompt in ``flagged_input`` —
-    either can make a number appear that was never a status. AskNews is the deliberate
+    64-hex key hash with a small but non-negligible chance of containing one of
+    401/402/403/429/502/503 (derived in
+    ``test_key_hash_status_collision_is_small_but_nonnegligible``) plus, on a moderation
+    refusal, up to ~100 chars of our own prompt in ``flagged_input`` — either can make a
+    number appear that was never a status. AskNews is the deliberate
     exception: its SDK raises its own ``asknews_sdk.errors`` classes carrying a ``.code``
     (429000 / 403011) and never subclasses ``openai.APIError``, so this returns ``None``
     for them and a text match is the honest primitive there.

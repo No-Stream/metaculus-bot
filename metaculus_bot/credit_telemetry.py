@@ -239,16 +239,16 @@ class DonatedKeyState(StrEnum):
     UNKNOWN = "unknown"  # probe could not answer (no key configured, endpoint error, odd payload)
 
 
-# Short by design: this probe can fire mid-run, so it must not be able to stall a
-# forecast. The shared ``fetch_auth_key`` default (15s) is fine for the CLI and the
-# start/end telemetry, which run outside the forecasting window.
+# Shorter than ``AUTH_KEY_REQUEST_TIMEOUT_S`` by design: this probe can fire mid-run, so it
+# must not be able to stall a forecast. The shared ``fetch_auth_key`` default is fine for
+# the CLI and the start/end telemetry, which run outside the forecasting window.
 #
-# Read as 5s PER NETWORK OPERATION, not as a bound on total elapsed time. httpx applies a
-# bare float to connect / read / write / pool independently, so a server trickling bytes
-# slower than the read timeout resets the clock on every chunk — measured against a local
-# 0.5s-per-byte trickler, a ``timeout=1.0`` GET took 10.2s to return 20 bytes. The hard
-# total cap lives at the latency-sensitive call site
-# (``fallback_openrouter.record_donated_key_fallback`` wraps the probe in
+# Read as PER NETWORK OPERATION, not as a bound on total elapsed time. httpx applies a bare
+# float to connect / read / write / pool independently, so a server trickling bytes slower
+# than the read timeout resets the clock on every chunk and the call can run many multiples
+# of this budget (measured against a local trickling server, a one-second timeout took ten
+# seconds to return twenty bytes). The hard total cap lives at the latency-sensitive call
+# site (``fallback_openrouter.record_donated_key_fallback`` wraps the probe in
 # ``asyncio.wait_for``), because that is the only hop where the promise has to hold.
 DONATED_KEY_PROBE_TIMEOUT_S: float = 5.0
 

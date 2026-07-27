@@ -718,9 +718,66 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
 # carries and treats the deterministic client-error statuses as permanent. Substring
 # matching numbers against the message is NOT viable here: litellm builds the message
 # as f"APIError: {provider} - {body}", and the OpenRouter body embeds both a 64-hex
-# key hash (~8.7% chance of containing one of 401/402/403/429/502/503) and, on a
-# moderation refusal, up to ~100 chars of our own prompt in ``flagged_input``.
+# key hash and, on a moderation refusal, up to ~100 chars of our own prompt in
+# ``flagged_input`` — either can make a status-shaped number appear that was never a
+# status. How likely the key hash alone is to do that is derived by
+# ``test_key_hash_status_collision_is_small_but_nonnegligible`` below, which is the
+# only place that arithmetic is written down.
 # ---------------------------------------------------------------------------
+
+# The status substrings a message-scanning classifier would look for. Not a code
+# constant: the point is what a reader of the raw body might match on.
+_STATUS_SUBSTRINGS: tuple[str, ...] = ("401", "402", "403", "429", "502", "503")
+_KEY_HASH_LEN = 64
+_HEX_ALPHABET = "0123456789abcdef"
+
+
+def _p_hash_contains(patterns: tuple[str, ...], length: int = _KEY_HASH_LEN) -> float:
+    """Exact P(a uniform random hex string of ``length`` contains any of ``patterns``).
+
+    DP over "the last two characters seen", which is sufficient state because every
+    pattern is three characters long. Exact rather than a Poisson/independence
+    approximation, and it handles the overlaps between patterns ("402" and "403" share
+    the prefix "40") that a naive 1-(1-p)^n would get wrong.
+    """
+    assert all(len(p) == 3 for p in patterns), "state is the last 2 chars, so patterns must be length 3"
+    # Probability mass per suffix state; absorbed (matched) mass leaves the system.
+    states: dict[str, float] = {"": 1.0}
+    step = 1.0 / len(_HEX_ALPHABET)
+    for _ in range(length):
+        nxt: dict[str, float] = {}
+        for suffix, mass in states.items():
+            for char in _HEX_ALPHABET:
+                window = suffix + char
+                if window in patterns:
+                    continue  # matched, so this path is absorbed
+                nxt[window[-2:]] = nxt.get(window[-2:], 0.0) + mass * step
+        states = nxt
+    return 1.0 - sum(states.values())
+
+
+def test_key_hash_status_collision_is_small_but_nonnegligible() -> None:
+    """Why reading status digits out of the message body is unsafe, derived not asserted.
+
+    Every classifier in this repo that could have matched status digits in prose instead
+    reads ``llm_status_code``. The justification is that an OpenRouter body carries a
+    64-hex key hash whose characters are status-shaped often enough to matter. This pins
+    that claim as arithmetic so it can't drift into folklore, and deliberately asserts
+    BANDS rather than exact figures — the design only depends on the order of magnitude.
+    """
+    single = _p_hash_contains(("403",))
+    # Order 1%: far too likely to dismiss, given the cost is stranding the ensemble on a
+    # dry key, and far too unlikely to be caught by eyeballing one live key hash.
+    assert 0.01 < single < 0.02
+
+    any_status = _p_hash_contains(_STATUS_SUBSTRINGS)
+    # Order 10% across the six statuses a message scanner might match — roughly one key
+    # rotation in twelve produces a hash that lies about its own status.
+    assert 0.05 < any_status < 0.15
+
+    # Six near-disjoint chances, so the union lands near (but below) six times one.
+    assert 5.0 * single < any_status < 6.0 * single
+
 
 # Verbatim from the 2026-07-26 06:45 UTC production run (run_log_facts.md): the donated
 # key at $0.00 of its $850 cap. Note what it does NOT contain — "credit", "insufficient",

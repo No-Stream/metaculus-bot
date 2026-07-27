@@ -199,9 +199,9 @@ the matching env vars):
   whole loop, enforced by an outer `asyncio.wait_for`. It sits inside v1's
   worst-case timing envelope, so running v2 concurrently with v1 adds no
   research-phase wall-clock.
-- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` = 30. Parallel calls each
-  count against this cap. Steps, not calls, are where latency lives, so batching
-  is encouraged.
+- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS`. Parallel calls each count
+  against this cap. Steps, not calls, are where latency lives, so batching is
+  encouraged.
 - **Max steps** = 20 (`LoopConfig.max_steps` default; the seam doesn't override
   it). A step is one driver turn.
 
@@ -289,16 +289,19 @@ All flags are read in `constants.py`. The enable flag uses the standard
 `env_flag_enabled` helper, so it is off unless explicitly set to
 `true`/`1`/`yes`.
 
-| Env var | Default | What it controls |
-| --- | --- | --- |
-| `GAP_FILL_V2_ENABLED` | off | Master switch. On in all four workflow yamls since 2026-07-17. |
-| `GAP_FILL_V2_DRIVER_MODEL` | `openai/gpt-5.6-terra` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
-| `GAP_FILL_V2_DRIVER_EFFORT` | `low` | Driver reasoning effort. |
-| `GAP_FILL_V2_READER_MODEL` | `gemini-3.5-flash` | The `read_document` backend model on the native google-genai path. |
-| `GAP_FILL_V2_MAX_TOOL_CALLS` | 30 | Tool-call budget. |
-| `GAP_FILL_V2_WALL_DEADLINE` | 540.0 | Hard wall for the whole loop, in seconds. |
-| `GAP_FILL_V2_CONCLUDE_THRESHOLD` | 90.0 | Seconds-remaining threshold below which only `conclude` is offered. |
-| `GAP_FILL_V2_MIN_CONTENT_CHARS` | 500 | Extracted-char floor below which `fetch` escalates plain HTTP to headless Chromium. |
+Defaults are deliberately not reproduced here — read them off the definitions in
+`constants.py`, which is the only copy that cannot go stale.
+
+| Env var | What it controls |
+| --- | --- |
+| `GAP_FILL_V2_ENABLED` | Master switch. Off unless set; on in all four workflow yamls since 2026-07-17. |
+| `GAP_FILL_V2_DRIVER_MODEL` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
+| `GAP_FILL_V2_DRIVER_EFFORT` | Driver reasoning effort. |
+| `GAP_FILL_V2_READER_MODEL` | The `read_document` backend model on the native google-genai path. |
+| `GAP_FILL_V2_MAX_TOOL_CALLS` | Tool-call budget. |
+| `GAP_FILL_V2_WALL_DEADLINE` | Hard wall for the whole loop, in seconds. |
+| `GAP_FILL_V2_CONCLUDE_THRESHOLD` | Seconds-remaining threshold below which only `conclude` is offered. |
+| `GAP_FILL_V2_MIN_CONTENT_CHARS` | Extracted-char floor below which `fetch` escalates plain HTTP to headless Chromium. |
 
 The driver and reader run on separate credentials. The driver goes through
 litellm/OpenRouter with donated-key-first routing (all eval candidates were

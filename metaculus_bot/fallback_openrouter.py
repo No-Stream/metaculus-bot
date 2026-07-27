@@ -300,10 +300,11 @@ _GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
 # empty wallet — billing the personal key for a call that will refuse again AND
 # exempting a real moderation block from alerting.
 #
-# Word cues only, deliberately: a genuine 402 links to a key hash that has roughly a
-# 1.5% chance (1 in 67) of containing the substring "403", and reading that as moderation
-# would break the long-standing 402 fallback. The ~8.7% / 1-in-11 figure quoted elsewhere
-# is for ANY of the six statuses at once — six times this one, so don't reuse it here.
+# Word cues only, deliberately: a genuine 402 links to a key hash with a small but
+# non-negligible chance of containing the substring "403", and reading that as moderation
+# would break the long-standing 402 fallback. Odds derived in
+# ``test_key_hash_status_collision_is_small_but_nonnegligible``; note it pins TWO bands —
+# one status alone, and any of the six at once — and the six-status one does not apply here.
 _MODERATION_CUES: tuple[str, ...] = ("moderation", "forbidden", "flagged_input", "flagged for")
 
 
@@ -332,9 +333,10 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
 
     When the provider reported a status, that integer is the ONLY numeric evidence
     consulted. The message is not: litellm formats it as ``APIError: {provider} - {raw
-    body}``, and an OpenRouter body carries a 64-hex key hash (~8.7% chance of
-    containing one of 401/402/403/429/502/503) plus, on a moderation refusal, up to
-    ~100 characters of our own prompt in ``flagged_input``. Matching digits there reads
+    body}``, and an OpenRouter body carries a 64-hex key hash that has a small but
+    non-negligible chance of containing one of 401/402/403/429/502/503 (derived in
+    ``test_key_hash_status_collision_is_small_but_nonnegligible``) plus, on a moderation
+    refusal, up to ~100 characters of our own prompt in ``flagged_input``. Matching digits there reads
     coincidences as statuses in both directions — a stray "429" sends a moderation 403
     to the paid key for a call that will refuse again.
 
@@ -590,8 +592,9 @@ async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     # deadlines. Probing first also keeps the accounting below free of any await.
     # Bounded because ``DONATED_KEY_PROBE_TIMEOUT_S`` is a PER-OPERATION httpx timeout, not
     # a cap on elapsed time: a server trickling bytes slower than the read timeout resets
-    # the clock on every chunk (measured: a ``timeout=1.0`` GET against a 0.5s-per-byte
-    # trickler took 10.2s). This call sits BEFORE ``_invoke_once_using_secondary``, so that
+    # the clock on every chunk, so the probe can run many multiples of it (measured against
+    # a local trickling server, a one-second timeout took ten seconds to return twenty
+    # bytes). This call sits BEFORE ``_invoke_once_using_secondary``, so that
     # latency delays the recovery call itself even though routing was already decided
     # textually — and a degraded-but-alive OpenRouter control plane is exactly what
     # co-occurs with a spend-cap 403. ``wait_for`` unblocks us without killing the worker
