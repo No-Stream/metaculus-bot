@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from metaculus_bot import fallback_openrouter
 from metaculus_bot.research.agentic import llm as agentic_llm
 from metaculus_bot.research.agentic.types import LoopConfig
 
@@ -135,6 +136,73 @@ class TestKeyRouting:
         first, second = acompletion.await_args_list
         assert first.kwargs["api_key"] == _DONATED
         assert second.kwargs["api_key"] == _PERSONAL
+
+    @pytest.mark.asyncio
+    async def test_fallback_is_counted_and_logged_like_the_wrapper(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The v2 fallback must feed the same accounting as ``FallbackOpenRouterLlm``.
+
+        gap-fill v2 runs on every question in all four prod workflows, so this
+        hand-rolled donated→personal retry was the highest-volume uninstrumented
+        personal-key spend path: no counter, no ``PAID PERSONAL-KEY FALLBACK`` WARN,
+        no contribution to the end-of-run summary. After 2026-09-10 a v2-only
+        fallback that should redden CI would silently not.
+        """
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: True)
+        acompletion.side_effect = [RuntimeError("401 unauthorized: invalid api key"), {"ok": True}]
+        fallback_openrouter.reset_generic_key_fallback_count()
+        fallback_openrouter.reset_credit_key_fallback_count()
+
+        call = agentic_llm.build_default_llm_call(_config())
+        with caplog.at_level("WARNING", logger="metaculus_bot.fallback_openrouter"):
+            await call(_messages(), None)
+
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
+        # A 401 is not a credit shortfall, so the suppression subset stays empty:
+        # generic adds once, at most one subset subtracts (CLAUDE.md invariant).
+        assert fallback_openrouter.get_credit_key_fallback_count() == 0
+        assert any("PAID PERSONAL-KEY FALLBACK" in message for message in caplog.messages)
+        assert any("openrouter/openai/gpt-5.6-luna" in message for message in caplog.messages)
+
+    @pytest.mark.asyncio
+    async def test_credit_caused_fallback_counted_in_both_scalars_exactly_once(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Credit-caused fallbacks are a strict SUBSET of the generic total: generic
+        adds the event, the credit subset subtracts it back out during the suppression
+        window. Double-counting either side breaks cli.py's alertable arithmetic."""
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: True)
+        acompletion.side_effect = [RuntimeError("402 payment required: insufficient credits"), {"ok": True}]
+        fallback_openrouter.reset_generic_key_fallback_count()
+        fallback_openrouter.reset_credit_key_fallback_count()
+
+        call = agentic_llm.build_default_llm_call(_config())
+        await call(_messages(), None)
+
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
+        assert fallback_openrouter.get_credit_key_fallback_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_means_no_counter_bump(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejected fallback bills nothing to the personal key, so it must not count."""
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: False)
+        acompletion.side_effect = RuntimeError("403 forbidden: moderation")
+        fallback_openrouter.reset_generic_key_fallback_count()
+
+        call = agentic_llm.build_default_llm_call(_config())
+        with pytest.raises(RuntimeError):
+            await call(_messages(), None)
+
+        assert fallback_openrouter.get_generic_key_fallback_count() == 0
 
     @pytest.mark.asyncio
     async def test_no_fallback_when_classifier_rejects(

@@ -7,7 +7,11 @@ from typing import Any
 from litellm import acompletion
 
 from metaculus_bot.constants import OAI_ANTH_OPENROUTER_KEY_ENV, OPENROUTER_API_KEY_ENV
-from metaculus_bot.fallback_openrouter import should_retry_with_general_key, should_route_via_donated_key
+from metaculus_bot.fallback_openrouter import (
+    record_donated_key_fallback,
+    should_retry_with_general_key,
+    should_route_via_donated_key,
+)
 from metaculus_bot.research.agentic.types import LoopConfig
 
 LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
@@ -61,10 +65,19 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # classifier re-raises non-key-scoped errors
                 if not should_retry_with_general_key(exc):
                     raise
+                # Same accounting as FallbackOpenRouterLlm.invoke: counted once in the
+                # generic total (plus at most one subset) and logged as a PAID
+                # PERSONAL-KEY FALLBACK. Without this the highest-volume donated-key
+                # path in the bot — v2 runs on every question in all four prod
+                # workflows — failed over to the paid key completely silently.
+                record_donated_key_fallback(model, exc)
                 return await _call_once(messages, tools_json, personal_key)
 
         api_key = donated_key if should_route_via_donated_key(model) and donated_key else personal_key
-        # TODO(unify-fallback-routing): share a raw-litellm retry wrapper with fallback_openrouter.py if this grows.
+        # The counted/logged fallback DECISION is now shared with fallback_openrouter
+        # (record_donated_key_fallback). Only the transport differs: this path calls
+        # raw litellm.acompletion for tool-loop support, where the wrapper goes
+        # through GeneralLlm. Share the transport too if this grows a retry ladder.
         return await _call_once(messages, tools_json, api_key)
 
     return _call
