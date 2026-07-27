@@ -16,8 +16,9 @@ The fix
 -------
 ``invoke_with_transient_retry`` retries ONLY *fast* transient failures and NEVER
 retries *slow* ones. The elapsed-time gate is the load-bearing safety
-constraint: retrying a real multi-minute stall 3× would be catastrophic. A
-failure is retried only when BOTH its type is in ``TRANSIENT_RETRY_EXCEPTIONS``
+constraint: retrying a real multi-minute stall through the backoff ladder would
+be catastrophic. A failure is retried only when BOTH its type is in
+``TRANSIENT_RETRY_EXCEPTIONS``
 AND it surfaced in under ``max_elapsed_s`` seconds. A wall-clock
 ``asyncio.TimeoutError`` (fires at ``wall_timeout`` ≫ ``max_elapsed_s``) and a
 genuine 120s ``litellm.Timeout`` are therefore never retried — only the
@@ -74,7 +75,8 @@ TRANSIENT_RETRY_EXCEPTIONS: tuple[type[BaseException], ...] = (
 # ContentPolicyViolationError / ContextWindowExceededError subclass BadRequestError
 # but are listed explicitly for clarity. Everything else (empty-model-response,
 # generic parser hiccup, transient blips, asyncio.TimeoutError-by-type) is
-# broadly retryable — but the 30s elapsed gate still blocks slow failures.
+# broadly retryable — but the ``TRANSIENT_RETRY_MAX_ELAPSED_S`` gate still blocks
+# slow failures.
 PERMANENT_NO_RETRY_EXCEPTIONS: tuple[type[BaseException], ...] = (
     litellm.exceptions.AuthenticationError,
     litellm.exceptions.BadRequestError,
@@ -113,10 +115,10 @@ PYTHON_BUG_NO_RETRY_EXCEPTIONS: tuple[type[BaseException], ...] = (
 # of the tree, matching nothing in ``PERMANENT_NO_RETRY_EXCEPTIONS``.
 # (``PermissionDeniedError`` is listed there and reads as though it covers 403, but it
 # subclasses a different openai branch that litellm never raises for OpenRouter, so it
-# contributes no real coverage.) In the 2026-07-26 run that let a drained-donated-key
-# 403 — deterministic, 35ms — pass the 30s elapsed gate, which only screens SLOW
-# failures, and the AskNews summarizer burned the full 1s/10s/30s ladder against a key
-# that could not succeed. Mostly redundant for 400/401/404/422 (already typed
+# contributes no real coverage.) In the 2026-07-26 run a drained-donated-key 403 —
+# deterministic, 35ms — passed the elapsed gate, which only screens SLOW failures, and
+# the AskNews summarizer burned the full ``DEFAULT_TRANSIENT_BACKOFFS`` ladder against a
+# key that could not succeed. Mostly redundant for 400/401/404/422 (already typed
 # permanent above); 402 and 403 are the statuses this actually adds.
 # Every status listed here also becomes non-retryable for a ZERO-OUTPUT body arriving
 # at it: ``is_zero_output_failure`` recognizes those by message marker and reads no
@@ -128,10 +130,10 @@ NON_RETRYABLE_HTTP_STATUS_CODES: frozenset[int] = frozenset({400, 401, 402, 403,
 
 # Universal deadline-safety rule (Round-2): a failure whose own attempt took
 # longer than this (seconds) is treated as SLOW and NEVER retried, regardless of
-# exception type or predicate. A 5-min reasoning attempt that then times out must
-# not spawn another call — that would miss the question submission deadline. 30s
-# sits above any genuine transient blip and far below every real per-call timeout
-# in the bot (120 / 300 / 360 / 420 / 480 / 500s), cleanly separating the regimes.
+# exception type or predicate. A multi-minute reasoning attempt that then times out
+# must not spawn another call — that would miss the question submission deadline.
+# This gate sits above any genuine transient blip and well below even the shortest
+# per-call timeout in the bot, cleanly separating the two regimes.
 TRANSIENT_RETRY_MAX_ELAPSED_S: float = 30.0
 
 # Backoff (seconds) before each retry. len(backoffs) retries ⇒ len(backoffs)+1
@@ -227,7 +229,7 @@ def is_broadly_retryable(exc: BaseException) -> bool:
 
     Used by the ``allowed_tries>=2`` sites (forecasters, crux analyzer, AskNews
     summarizer) which legitimately benefit from retrying things the transient set
-    excludes (empty-model-response ``RuntimeError``, a parser-ish hiccup). The 30s
+    excludes (empty-model-response ``RuntimeError``, a parser-ish hiccup). The
     elapsed gate in the shared loop still blocks slow failures, except a slow
     zero-output failure, which the loop re-rolls once (see ``is_zero_output_failure``).
 
@@ -236,7 +238,8 @@ def is_broadly_retryable(exc: BaseException) -> bool:
     under-cover it), ``PERMANENT_NO_RETRY_EXCEPTIONS`` (litellm permanent API errors)
     and ``PYTHON_BUG_NO_RETRY_EXCEPTIONS`` (code-defect types like
     TypeError/AttributeError) — the last so a bug fails fast with a clean traceback
-    instead of being retried 3× during debugging (CLAUDE.md §2 fail-fast).
+    instead of being retried through the backoff ladder during debugging
+    (CLAUDE.md §2 fail-fast).
     """
     if _is_deterministic_client_error(exc):
         return False
@@ -351,7 +354,7 @@ async def invoke_with_broad_retry(
     ``predicate=is_broadly_retryable`` — same shared loop, gate, backoff, and wall
     cap. For the ``allowed_tries>=2`` sites (forecasters, crux analyzer, AskNews
     summarizer) set to ``allowed_tries=1`` so this gated wrapper is their SOLE
-    retry layer, imposing the universal "no retry after 30s" rule that
+    retry layer, imposing the universal "never retry a slow failure" rule that
     forecasting-tools' un-gated tenacity cannot.
     """
     return await invoke_with_transient_retry(

@@ -52,9 +52,9 @@ ACCEPTABLE_QUANTS = [
 ]
 
 # Per-instance allowed_tries=1 override (Round-2): forecaster .invoke is wrapped
-# in the broad, 30s-elapsed-gated retry (forecaster_runners.py) so we can impose
-# the universal "no retry after 30s" deadline-safety rule that forecasting-tools'
-# un-gated tenacity cannot. Spread per-instance (NOT by mutating
+# in the broad retry gated on TRANSIENT_RETRY_MAX_ELAPSED_S (forecaster_runners.py)
+# so we can impose the universal "never retry a slow failure" deadline-safety rule
+# that forecasting-tools' un-gated tenacity cannot. Spread per-instance (NOT by mutating
 # REASONING_MODEL_CONFIG) so PARSER_LLM / STACKER configs are untouched.
 _FORECASTER_CONFIG = {**REASONING_MODEL_CONFIG, "allowed_tries": 1}
 
@@ -91,9 +91,9 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     ),
     # Anthropic slot. 2026-07-15: enabled:True (provider-default adaptive thinking)
     # -> explicit effort=xhigh. Anthropic also exposes "max" one tier above xhigh —
-    # held back deliberately for latency (FORECASTER_SOFT_DEADLINE=600s; unbounded
-    # adaptive thinking caused silent 600s soft-deadline stalls on the retired
-    # opus-4.6 slot, e.g. Q14333 on 2026-05-07).
+    # held back deliberately for latency: unbounded adaptive thinking caused silent
+    # FORECASTER_SOFT_DEADLINE stalls on the retired opus-4.6 slot, e.g. Q14333 on
+    # 2026-05-07.
     build_llm_with_openrouter_fallback(
         model="openrouter/anthropic/claude-opus-4.8",
         reasoning={"effort": "xhigh"},
@@ -135,8 +135,8 @@ FORECASTER_MODEL_NAMES: list[str] = [_forecaster_display_name(llm) for llm in FO
 # were prompt-era (mini summarizer + missing no-forecast rule), not model-tier.
 # Terra: −43% cost, ~50s vs ~118s wall. Effort stays low (latency).
 # allowed_tries=1 (Round-2): the summarizer invoke is wrapped in the broad,
-# 30s-gated retry (orchestrator._summarize_asknews) to impose the universal
-# "no retry after 30s" deadline rule. Per-instance override so PARSER_LLM (which
+# elapsed-gated retry (orchestrator._summarize_asknews) to impose the universal
+# "never retry a slow failure" deadline rule. Per-instance override so PARSER_LLM (which
 # also uses UTILITY_MODEL_CONFIG) keeps its allowed_tries=3.
 SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-terra",
@@ -161,10 +161,10 @@ RESEARCHER_LLM = SUMMARIZER_LLM
 
 # Stacker meta-model for conditional stacking (invoked only on high-disagreement questions).
 #
-# allowed_tries=1: a single 8-minute attempt with no retries. The outer
-# STACKER_SOFT_DEADLINE (500s) catches wholly stuck calls; on failure we fall
-# back to STACKER_FALLBACK_LLM rather than burning another 16 min of retries
-# against the same Anthropic API that just stalled. Retrying against the same
+# allowed_tries=1: a single attempt at REASONING_MODEL_CONFIG's timeout, no
+# retries. The outer STACKER_SOFT_DEADLINE catches wholly stuck calls; on failure
+# we fall back to STACKER_FALLBACK_LLM rather than burning two more full-timeout
+# attempts against the same Anthropic API that just stalled. Retrying against the same
 # provider after a stall rarely succeeds (we're almost certainly re-rolling a
 # dice with the same distribution), and the budget is better spent on a
 # different-provider fallback.
@@ -176,7 +176,7 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     # thinking, not a max_tokens budget. Live-verified OpenRouter effort enum:
     # none/minimal/low/medium/high/xhigh/max. effort=xhigh matches the opus-4.8
     # forecaster slot; "max" (one tier above xhigh) is deliberately held back for
-    # latency — the stacker runs under STACKER_SOFT_DEADLINE (500s).
+    # latency — the stacker runs under STACKER_SOFT_DEADLINE.
     "openrouter/anthropic/claude-opus-4.8",
     reasoning={"effort": "xhigh"},
     extra_body={"verbosity": "high"},
@@ -189,7 +189,7 @@ STACKER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # stall doesn't take both attempts down. Tighter timeout and single try since
 # we're already running late on the critical path by the time this fires.
 # Stays at high (not xhigh) for that same reason — the 2026-07-15 xhigh bump
-# covers the primary stacker and forecaster slots, not this 300s-budget path.
+# covers the primary stacker and forecaster slots, not this tighter-budget path.
 STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-sol",
     reasoning={"effort": "high"},
@@ -200,7 +200,7 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # Keyword extraction is capability-saturated; mini is the cheapest capable tier.
 # Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
 # gpt-5.4-mini reasoning=low burns 128-512 tokens on invisible reasoning before
-# emitting any visible response, so max_tokens=800 is load-bearing.
+# emitting any visible response, so the max_tokens set below is load-bearing.
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
@@ -209,7 +209,7 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # allowed_tries=1: the call is wrapped in the elapsed-gated retry
 # (prediction_market.KeywordExtractor._run_llm), so that wrapper is the SOLE retry
 # layer. Left unpinned this inherited forecasting-tools' default of 2 with an
-# UN-GATED random.uniform(5, 10) tenacity sleep — a third of the 30s
+# UN-GATED random.uniform(5, 10) tenacity sleep — a large slice of
 # PREDICTION_MARKET_TIMEOUT spent sleeping blind, which is exactly what llm_retry
 # exists to eliminate.
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
@@ -224,14 +224,14 @@ PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
 
 # Tier-B auxiliary: read-and-synthesize work that needs taste but not deep
 # reasoning. Identifies the crux of forecaster disagreement; output text seeds
-# the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE (180s);
+# the targeted-search query downstream. Runs under CRUX_SOFT_DEADLINE;
 # effort deliberately low since 2026-05-20 for latency — the tier was upgraded
 # instead (smarter-model-at-lower-effort beats more effort on a smaller model).
 # 2026-07-17: sol→terra per the role audit; terra 2nd (sol 3rd) at −49% cost;
 # the role fires rarely (stacking disabled in prod).
 # allowed_tries=1 (Round-2): the crux-analyzer invoke is wrapped in the broad,
-# 30s-gated retry (targeted.extract_disagreement_crux) to impose the universal
-# "no retry after 30s" deadline rule on the conditional-stacking critical path.
+# elapsed-gated retry (targeted.extract_disagreement_crux) to impose the universal
+# "never retry a slow failure" deadline rule on the conditional-stacking critical path.
 # Per-instance override so PARSER_LLM keeps its allowed_tries=3.
 DISAGREEMENT_ANALYZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-terra",

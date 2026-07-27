@@ -246,9 +246,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # _handle_errors_in__run_individual_question: it raises when
             # len(predictions) < expected_total_predictions * required_successful_predictions.
             # expected_total_predictions == predictions_per_research_report, which
-            # prepare_llm_config sets to len(forecaster_llms) (3 in prod). At the
-            # 0.5 default the gate would reject a single-survivor publish (1 < 3*0.5),
-            # contradicting MIN_FORECASTERS_TO_PUBLISH=1. Pin it to 0.0 so OUR
+            # prepare_llm_config sets to the configured roster width. At the 0.5
+            # default the gate would reject a single-survivor publish on any roster
+            # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
             # min_forecasters_to_publish guard (above) stays the sole arbiter of
             # whether a degraded ensemble still publishes.
             required_successful_predictions=0.0,
@@ -548,10 +548,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         into "which model failed, how often, and why" answerable in one grep.
 
         The systematic signal (a single model dropping on >=2 DISTINCT questions)
-        is a WARNING, not just a summary line: with ``MIN_FORECASTERS_TO_PUBLISH=1``
-        a model going bad silently degrades every forecast in the run while CI shows
-        one modest red mark, so it must be visible without grepping. It deliberately
-        does NOT change the exit code or block publishing (that is the operator's
+        is a WARNING, not just a summary line: at the current
+        ``MIN_FORECASTERS_TO_PUBLISH`` floor a model going bad silently degrades every
+        forecast in the run while CI shows one modest red mark, so it must be visible
+        without grepping. It deliberately does NOT change the exit code or block
+        publishing (that is the operator's
         call); ``alertable_count`` already reddens CI on ANY drop.
         """
         drops = self._forecaster_drops
@@ -621,8 +622,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         ``start_time`` is captured at the top of ``_research_and_make_predictions``
         and represents this question's processing-start tick. Compared against
-        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` (58:30 of the 60-min Metaculus close
-        window).
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE``, which sits just inside the 60-min
+        Metaculus close window.
         """
         return PER_QUESTION_WALL_CLOCK_DEADLINE - (time.time() - start_time)
 
@@ -871,7 +872,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # equal to the number of per-model summary bullets across all report sections.
         self._contributing_forecasters[qid_for_log] += n_valid
 
-        # Single-forecaster short-circuit. With MIN_FORECASTERS_TO_PUBLISH=1 a
+        # Single-forecaster short-circuit. When MIN_FORECASTERS_TO_PUBLISH permits it, a
         # question can survive on one forecaster, but the spread metrics
         # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
         # >=2 predictions and raise otherwise, and stacking a lone base model is
@@ -905,18 +906,19 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Stacking budget gate. If we've burned through the per-Q wall-clock
         # budget (e.g. research stalled, fan-out used most of the budget),
         # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
-        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET (90s) floor leaves
-        # headroom for sustained slowness on a single POST. The 160s worst case
-        # (4 POSTs * 20s * (1 + 1 retry)) requires multi-POST stalling, which
-        # is recovered by skip_stacking_for_budget already.
+        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET floor leaves
+        # headroom for sustained slowness on a single POST. The full worst case
+        # (both POSTs stalling for PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1))
+        # requires multi-POST stalling, which is recovered by
+        # skip_stacking_for_budget already.
         skip_stacking_for_budget = (
             self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
             and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
         )
         if skip_stacking_for_budget:
             # F15: the base-combine re-entry uses MEAN under STACKING and
-            # MEDIAN under CONDITIONAL_STACKING (see base_combine_strategy in
-            # aggregation_pipeline.py:226-231). The marker must match the
+            # MEDIAN under CONDITIONAL_STACKING (see ``base_combine_strategy`` in
+            # aggregation_pipeline.py). The marker must match the
             # actual aggregation method so residual analysis cuts bucket the
             # two paths correctly.
             budget_skip_outcome = (
@@ -992,9 +994,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
                 # 1. Extract the crux of disagreement under a soft deadline.
-                # Without the wait_for the call's worst case is litellm timeout
-                # (300s) * allowed_tries (3) ≈ 15 min on the critical path; the
-                # CRUX_SOFT_DEADLINE caps that at 180s.
+                # Without the wait_for the only bound is the analyzer LLM's own
+                # litellm timeout (UTILITY_MODEL_CONFIG in llm_configs.py), which
+                # is looser than CRUX_SOFT_DEADLINE on this critical path.
                 base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
                 try:
                     crux = await asyncio.wait_for(
@@ -1200,8 +1202,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """Run a single forecaster with FORECASTER_SOFT_DEADLINE.
 
         Why the deadline: a single stuck forecaster used to be able to hold a
-        question for litellm_timeout(480s) * allowed_tries(3) ≈ 24 min. This
-        caps each forecaster at FORECASTER_SOFT_DEADLINE (10 min).
+        question for REASONING_MODEL_CONFIG's litellm timeout times its
+        allowed_tries. This caps each forecaster at FORECASTER_SOFT_DEADLINE.
 
         On timeout: bumps _forecasters_dropped_count, logs a loud WARNING
         identifying the model + question, and re-raises TimeoutError so the

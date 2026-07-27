@@ -221,11 +221,11 @@ ASKNEWS_BACKOFF_SECS: float = max(0.0, _float_env("ASKNEWS_BACKOFF_SECS", 2.0))
 # hang is otherwise unbounded; this backstops that case so a stuck AskNews call
 # can't hold the whole research phase hostage.
 #
-# Sizing: each phase (hot + historical) sleeps 10.1s before its first call and
-# applies backoff `2.0 * (10 + 3**attempt)` on 429/rate-limit retries — attempt
-# 2 ≈ 38s, attempt 3 ≈ 74s. With 3 tries per phase the retry worst case is
-# ~110s hot + ~110s historical + ~30s API time ≈ 250s, so 300s leaves ~20%
-# headroom above the normal retry envelope while still bounding a genuine hang.
+# Sizing: each phase (hot + historical) sleeps before its first call and applies
+# backoff `ASKNEWS_BACKOFF_SECS * (10 + 3**attempt)` on 429/rate-limit retries, up
+# to ASKNEWS_MAX_TRIES attempts per phase (see research/providers.py). This wall
+# sits above that whole two-phase retry envelope plus API time, with headroom,
+# while still bounding a genuine hang.
 ASKNEWS_WALL_TIMEOUT: int = 300
 
 # --- OpenRouter credit telemetry ---
@@ -341,8 +341,9 @@ NATIVE_SEARCH_TIMEOUT: int = (
     360  # 2026-05-17: raised 240→360 alongside gpt-5.5 medium-effort migration; see comparison_v3.md
 )
 # Wall-clock backstop for the native-search provider. NATIVE_SEARCH_TIMEOUT
-# above is the litellm per-HTTP-request timeout; it resets across retries
-# (allowed_tries default 3 ⇒ worst case ~18 min) and was observed defeated
+# above is the litellm per-HTTP-request timeout; it resets across retries, so an
+# un-pinned allowed_tries multiplies it (build_native_search_llm pins
+# allowed_tries=1 for exactly that reason) and it was observed defeated
 # entirely on 2026-05-20 by an OpenRouter response that dripped ~700 lines of
 # whitespace keep-alive bytes over 8m37s before closing with malformed JSON.
 # asyncio.wait_for around llm.invoke gives us a hard wall-clock cap regardless
@@ -356,8 +357,8 @@ NATIVE_SEARCH_REASONING_EFFORT_ENV: str = "NATIVE_SEARCH_REASONING_EFFORT"
 # 2026-05-20: dropped medium→low after the OpenRouter whitespace-stream incident
 # that consumed 8m37s on a single call. v3 bench (comparison_v3.md) measured
 # effort=low at ~50s vs effort=medium at ~230s, so low gives ~4.5× faster
-# wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT (420s)
-# / NATIVE_SEARCH_TIMEOUT (360s). The quality cost of low is now absorbed by
+# wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT
+# / NATIVE_SEARCH_TIMEOUT. The quality cost of low is now absorbed by
 # the model-tier upgrade above (smarter model at lower effort). Override via
 # NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs medium back. Note:
 # this default applies ONLY to the native-search provider —
@@ -383,8 +384,8 @@ PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER: str = f"openrouter/{PERPLEXITY_RESEARC
 # Wall-clock cap for the two Perplexity call sites. Both previously had NO wall bound
 # at all — unlike native search and resolution-source, neither was ever migrated to
 # the gated retry wrapper, so a stalled reasoning-tier call could run as long as
-# litellm let it. Sized between GEMINI_SEARCH_TIMEOUT (360) and the research phase's
-# own budget: generous enough for a reasoning search, bounded enough that a stall
+# litellm let it. Sized between GEMINI_SEARCH_TIMEOUT and the research phase's own
+# budget: generous enough for a reasoning search, bounded enough that a stall
 # can't dominate the phase.
 PERPLEXITY_WALL_TIMEOUT: float = 300.0
 
@@ -448,7 +449,8 @@ GEMINI_SEARCH_TIMEOUT: int = 360
 # with first-pass research alone if any stage errors out.
 GAP_FILL_ENABLED_ENV: str = "GAP_FILL_ENABLED"
 # Non-grounded gap-listing: reads the first-pass research and emits a JSON list
-# of up to GAP_FILL_MAX_GAPS factual gaps, under a tight 135s wall cap that
+# of up to GAP_FILL_MAX_GAPS factual gaps, under the tight
+# GAP_FILL_ANALYZER_WALL_TIMEOUT cap, which
 # soft-fails silently on breach — terra-low is the latency-safe choice; the
 # task is decomposition, not deep judgment. Grounded search resolution still
 # uses google-genai directly via gemini_search_provider — that path needs the
@@ -469,8 +471,8 @@ GAP_FILL_ANALYZER_TIMEOUT: int = 120
 # Wall-clock backstop for the analyzer call. Slight headroom over
 # GAP_FILL_ANALYZER_TIMEOUT so the cleaner per-request error from litellm fires
 # first when possible (auth failure, model-not-found, etc.) — same pattern as
-# NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT (60s headroom). Without
-# this, asyncio.wait_for and the litellm request timeout fire at the exact
+# NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT. Without this,
+# asyncio.wait_for and the litellm request timeout fire at the exact
 # same second and we lose the descriptive error message.
 GAP_FILL_ANALYZER_WALL_TIMEOUT: int = 135
 # Skip gap-fill when the first-pass research blob has less than this many
@@ -480,15 +482,16 @@ GAP_FILL_MIN_RESEARCH_CHARS: int = 200
 # 2026-06-25: migrated the per-gap RESOLVER off direct-Google grounded Gemini
 # (google-genai, personal GOOGLE_API_KEY) to OpenAI native web search via
 # OpenRouter, which bills the Metaculus-donated key. The resolver fanned out up
-# to GAP_FILL_MAX_GAPS parallel grounded calls per question — a 5x cost
+# to GAP_FILL_MAX_GAPS parallel grounded calls per question — a per-gap cost
 # multiplier on the personal Google bill, the dominant unwanted spend. The
 # single first-pass grounded Gemini call stays on google-genai (operator is fine
 # paying for 1 call/question, and it uses url_context which OpenRouter can't
 # replicate). No "openrouter/" prefix here — build_native_search_llm adds it.
 #
 # Agentic single-gap web research whose source-trust judgment lands directly in
-# every forecaster prompt. The workers run in parallel under a 420s cap (latency
-# = slowest call, not sum), so effort stays LOW. 2026-07-20: sol → terra. terra
+# every forecaster prompt. The workers run in parallel under
+# NATIVE_SEARCH_WALL_TIMEOUT (latency = slowest call, not sum), so effort stays
+# LOW. 2026-07-20: sol → terra. terra
 # was preferred or within-noise vs sol across all three 2026-07 blind role audits
 # at ~40-50% lower cost, and these searches are ~44% of research spend (17 calls
 # in the 2026-07-19 run) — the single biggest research line item, so the cost cut
@@ -524,14 +527,15 @@ GAP_FILL_V2_DRIVER_EFFORT: str = os.getenv("GAP_FILL_V2_DRIVER_EFFORT") or "low"
 # directed-reading rung.
 GAP_FILL_V2_READER_MODEL: str = os.getenv("GAP_FILL_V2_READER_MODEL") or "gemini-3.5-flash"
 # Parallel tool calls each count against the cap; steps are where latency
-# lives, so batching is encouraged rather than rationed. Raised 20 -> 30 with
-# the W2 ambition floor (2026-07-21): v2 runs 41-60s of the 540s deadline, so
-# the headroom is free — the satisficing problem was ambition, not budget, and
-# with the conclude-gate floor in place the extra slots let the driver dig
+# lives, so batching is encouraged rather than rationed. Raised with the W2
+# ambition floor (2026-07-21): v2 runs 41-60s of the GAP_FILL_V2_WALL_DEADLINE
+# budget, so the headroom is free — the satisficing problem was ambition, not
+# budget, and with the conclude-gate floor in place the extra slots let the driver dig
 # deeper on the few decision-relevant gaps instead of stopping early.
 GAP_FILL_V2_MAX_TOOL_CALLS: int = _int_env("GAP_FILL_V2_MAX_TOOL_CALLS", 30)
-# Hard wall for the whole loop — inside v1's worst-case envelope (analyzer
-# 135s + resolver wave 420s ≈ 555s), so running v2 concurrently with v1 adds
+# Hard wall for the whole loop — inside v1's worst-case envelope
+# (GAP_FILL_ANALYZER_WALL_TIMEOUT then the resolver wave under
+# NATIVE_SEARCH_WALL_TIMEOUT), so running v2 concurrently with v1 adds
 # no research-phase wall-clock. The loop is anytime: hitting the deadline
 # emits banked findings, never "".
 GAP_FILL_V2_WALL_DEADLINE: float = _float_env("GAP_FILL_V2_WALL_DEADLINE", 540.0)
@@ -572,18 +576,19 @@ MAX_FINANCIAL_IDENTIFIERS: int = 12
 # --- Soft deadlines to keep batch wall-clock inside the tournament cron window ---
 # Per-forecaster outer deadline wrapped via asyncio.wait_for around each
 # _make_prediction call. A single stuck forecaster used to be able to hold a
-# question for timeout(480s) * allowed_tries(3) ≈ 24 min; this caps that
-# worst case at 10 min, at which point the forecaster is dropped with a loud
-# WARNING and the other models carry the ensemble.
+# question for REASONING_MODEL_CONFIG's litellm timeout times its allowed_tries
+# (llm_configs.py); this caps that worst case, at which point the forecaster is
+# dropped with a loud WARNING and the other models carry the ensemble.
 FORECASTER_SOFT_DEADLINE: int = 600
 
 # Minimum number of successful base forecasters required to publish a question.
 # Below this, the question is skipped entirely rather than publishing a weak
 # ensemble.
 #
-# 2026-07-20: lowered to 1 (was 3 → 2 → 1 over the day). At n=3, min=3 tolerates
-# ZERO drops, min=2 tolerates one, min=1 accepts publishing on a single surviving
-# forecaster. The operator accepts a single-forecaster publish: median-of-1 = the
+# 2026-07-20: lowered to 1 (was 3 → 2 → 1 over the day). A threshold equal to the
+# roster width tolerates ZERO drops, each step below it tolerates one more, and 1
+# accepts publishing on a single surviving forecaster.
+# The operator accepts a single-forecaster publish: median-of-1 = the
 # forecast itself, and exception-driven drops stay CI-visible (counted as
 # degradation since 687e113), so a degraded run — even one thinned to a lone
 # model — still reddens CI rather than silently withholding the question.
@@ -592,15 +597,16 @@ FORECASTER_SOFT_DEADLINE: int = 600
 # otherwise; see the single-forecaster guard in _research_and_make_predictions.
 MIN_FORECASTERS_TO_PUBLISH: int = 1
 
-# Per-question wall-clock cutoff (58:30 of the 60-min Metaculus close window).
-# At deadline, in-flight forecasters are cancelled; we base-combine whatever
-# completed (>=MIN_FORECASTERS_TO_PUBLISH) and submit. Remainder budget reserves
-# time for stacker-skip + publish (with 20s POST timeouts + 1 retry).
+# Per-question wall-clock cutoff, sized just inside the 60-min Metaculus close
+# window. At deadline, in-flight forecasters are cancelled; we base-combine
+# whatever completed (>=MIN_FORECASTERS_TO_PUBLISH) and submit. Remainder budget reserves
+# time for stacker-skip + publish (see PUBLISH_POST_TIMEOUT / PUBLISH_POST_RETRIES).
 PER_QUESTION_WALL_CLOCK_DEADLINE: int = 3510
 
 # Below this remaining-budget threshold, skip stacking and force fallback_median
-# aggregation. Reserves enough time for publish hardening (20s POST timeout + 1
-# retry across two POSTs = 80s worst case) plus headroom.
+# aggregation. Sized to clear the publish-hardening worst case — the prediction
+# POST plus the comment POST, each up to
+# PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1) — plus headroom.
 WALL_CLOCK_STACKING_MIN_BUDGET: int = 90
 
 # Per-publish-POST timeout (post_binary/numeric/mc + post_question_comment).
@@ -633,9 +639,10 @@ FETCH_GET_RETRIES: int = 2
 FETCH_GET_BACKOFF_BASE: float = 10.0
 FETCH_GET_BACKOFF_JITTER: float = 3.0
 
-# Stacker soft deadline. Set slightly above the stacker LLM's litellm timeout
-# (480s) so the model's own timeout fires first with a clean exception when
-# possible; this wait_for is a final belt-and-suspenders backstop for a wholly
+# Stacker soft deadline. Set slightly above the stacker LLM's own litellm timeout
+# (REASONING_MODEL_CONFIG in llm_configs.py) so the model's timeout fires first
+# with a clean exception when possible;
+# this wait_for is a final belt-and-suspenders backstop for a wholly
 # stuck call. Stacker is configured with allowed_tries=1 in llm_configs.py so
 # we only get one try before falling back.
 STACKER_SOFT_DEADLINE: int = 500
@@ -645,15 +652,17 @@ STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 
 # Per-question soft deadline for the disagreement-crux extractor
 # (DISAGREEMENT_ANALYZER_LLM, llm_configs.py).
-# Caps the unbounded worst case on the conditional-stacking critical path: without
-# this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
+# Caps the worst case on the conditional-stacking critical path: the analyzer's own
+# bound is UTILITY_MODEL_CONFIG's litellm timeout per attempt, which is looser than
+# this, so without the wrapper a stalled call runs well past the crux's usefulness.
 CRUX_SOFT_DEADLINE: int = 180
 
 # Wall-clock cap for the AskNews summarizer invoke. The summarizer is set
-# allowed_tries=1 (llm_configs.py) and wrapped in the broad 30s-gated retry, which
-# previously had no wall guard at all. Matches the summarizer's litellm per-request
-# timeout (UTILITY_MODEL_CONFIG timeout=300) so the per-attempt cap aligns
-# with the underlying request budget; on breach the summarizer soft-fails to the
+# allowed_tries=1 (llm_configs.py) and wrapped in the broad elapsed-gated retry,
+# which previously had no wall guard at all. Matches the summarizer's litellm
+# per-request timeout (UTILITY_MODEL_CONFIG in llm_configs.py) so the per-attempt
+# cap aligns with the underlying request budget;
+# on breach the summarizer soft-fails to the
 # raw AskNews articles rather than hanging the question.
 SUMMARIZER_WALL_TIMEOUT: int = 300
 
@@ -757,8 +766,9 @@ MARKET_RELEVANCE_CONF_MIN: float = 0.50
 # vintages at as_of for revising series.
 TS_ANCHOR_ENABLED_ENV: str = "TS_ANCHOR_ENABLED"
 # Chart-image side-channel: when on (and TS_ANCHOR_ENABLED is also on), the
-# provider renders an 800x400 PNG of the anchor (series + P10-P90 band) for
-# single-level questions and stashes it per-qid; the forecaster passes it to
+# provider renders a PNG of the anchor (series + P10-P90 band, sized in
+# research/ts_chart.py) for single-level questions
+# and stashes it per-qid; the forecaster passes it to
 # each base model as a vision message. OFF everywhere until the text-vs-image
 # A/B (FUTURE.md "TS anchor chart image"). Independent of TS_ANCHOR_ENABLED so
 # the text anchor can ship before the (costlier, unvalidated) image does.
