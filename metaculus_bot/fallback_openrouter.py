@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sys
@@ -527,7 +528,7 @@ def _fallback_alert_note(*, suppressible: bool) -> str:
     return "Run will complete, then exit non-zero to alert."
 
 
-def record_donated_key_fallback(model: str, exc: Exception) -> None:
+async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     """Count and log ONE donated -> personal-key fallback that is about to happen.
 
     The shared accounting seam for every donated-first call path: the
@@ -550,19 +551,30 @@ def record_donated_key_fallback(model: str, exc: Exception) -> None:
     subtracts" without drift. Call this only when the fallback will actually be
     attempted — a rejected fallback bills nothing and must not count.
 
-    Blocking note: on the spend-cap 403 path this reaches
-    ``is_suppressible_credit_error``, which probes ``/auth/key`` synchronously. Both
-    callers are async, so that briefly blocks the event loop — bounded by
-    ``DONATED_KEY_PROBE_TIMEOUT_S`` (5s) and paid at most once per process, on a
-    path that has already lost an LLM call.
+    Async because the probe below must leave the event loop; the counting must not.
     """
+    # Only the EXPECTED drained-donated-key subset is exempt from alerting. A key that
+    # was revoked or re-capped to zero produces identical "Key limit exceeded" text, so
+    # this asks OpenRouter rather than trusting the cue — otherwise the suppression
+    # window would have hidden genuine breakage for six weeks.
+    #
+    # Threaded because on the spend-cap 403 path it reaches
+    # ``credit_telemetry.classify_donated_key_state``, which does blocking httpx. Called
+    # inline from these coroutines it stalled EVERY concurrently in-flight forecaster and
+    # research task for up to ``DONATED_KEY_PROBE_TIMEOUT_S`` (5s), not just the call that
+    # hit the 403, eating into per-question soft deadlines. Probing first also keeps the
+    # accounting below free of any await.
+    suppressible = await asyncio.to_thread(is_suppressible_credit_error, exc)
+
+    # NO await from here down, so the whole accounting block runs to completion on the
+    # event loop. That is load-bearing, not incidental: ``+=`` on a module global compiles
+    # to LOAD_GLOBAL / INPLACE_ADD / STORE_GLOBAL and is interruptible between bytecodes,
+    # so threading this function as a whole (rather than just the probe) would let N
+    # forecasters failing on one dry key — the exact 2026-07-26 shape — race the
+    # increment, undercount the generic total, and take a degraded run GREEN. That is the
+    # failure this whole change exists to prevent.
     global _generic_key_fallback_count
     _generic_key_fallback_count += 1
-    # Only the EXPECTED drained-donated-key subset is exempt from alerting. A key
-    # that was revoked or re-capped to zero produces identical "Key limit exceeded"
-    # text, so this asks OpenRouter rather than trusting the cue — otherwise the
-    # suppression window would have hidden genuine breakage for six weeks.
-    suppressible = is_suppressible_credit_error(exc)
     if suppressible:
         global _credit_key_fallback_count
         _credit_key_fallback_count += 1
@@ -622,13 +634,13 @@ class FallbackOpenRouterLlm(GeneralLlm):
             # log is clearer with the slug.
             _record_deprecation_if_matched(self.model, str(e))
             if self._secondary_llm is not None and should_retry_with_general_key(e):
-                record_donated_key_fallback(self.model, e)
-                # ASYNC120: a checkpoint inside `except` can drop the active
-                # exception if the task is cancelled mid-await. That's the
+                # ASYNC120 (both awaits): a checkpoint inside `except` can drop the
+                # active exception if the task is cancelled mid-await. That's the
                 # correct behavior here — on success we return the secondary's
                 # output; on cancellation the secondary is cancelled too. The
                 # primary's exception is intentionally discarded because the
                 # caller asked for a fallback, not a re-raise.
+                await record_donated_key_fallback(self.model, e)  # noqa: ASYNC120
                 return await self._invoke_once_using_secondary(prompt, system_prompt)  # noqa: ASYNC120
             raise
 

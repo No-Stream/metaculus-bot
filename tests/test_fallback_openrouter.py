@@ -1,5 +1,5 @@
 import logging
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from litellm.exceptions import APIError, RateLimitError
@@ -1127,3 +1127,89 @@ class TestCreditClassificationPrecedence:
         exc = self._api_error(403, body)
         assert is_credit_caused_error(exc) is True
         assert should_retry_with_general_key(exc) is True
+
+
+class TestFallbackAccountingConcurrency:
+    """``record_donated_key_fallback`` must not stall the loop, and must not lose counts.
+
+    The spend-cap 403 path reaches ``is_suppressible_credit_error``, which probes
+    ``/auth/key`` over blocking httpx. Called straight from a coroutine that stalls EVERY
+    concurrently in-flight forecaster and research task for up to
+    ``DONATED_KEY_PROBE_TIMEOUT_S``, not just the call that hit the 403, eating into
+    per-question soft deadlines.
+
+    The fix threads the PROBE only. The counting has to stay on the event loop: the three
+    module counters are mutated with ``+=``, which compiles to LOAD_GLOBAL / INPLACE_ADD /
+    STORE_GLOBAL and is interruptible between bytecodes. Moving the whole function to a
+    worker (``asyncio.to_thread(record_donated_key_fallback, ...)``) would let N
+    forecasters failing on one dry key — the exact 2026-07-26 shape — race the increment,
+    undercount ``_generic_key_fallback_count``, and take a degraded run GREEN. That is the
+    failure this whole change exists to prevent, so it gets its own test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_counters(self):
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        reset_donated_404_fallback_count()
+        # The probe caches per process, so without this the test asserts against the
+        # cached path and passes vacuously — the stall is only reachable on the FIRST
+        # spend-cap 403 of a run.
+        reset_donated_key_state_cache()
+        yield
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        reset_donated_404_fallback_count()
+        reset_donated_key_state_cache()
+
+    @pytest.mark.asyncio
+    async def test_blocking_probe_does_not_stall_the_event_loop(self) -> None:
+        """A slow probe must not prevent other tasks from making progress."""
+        import asyncio
+        import time
+
+        ticks: list[int] = []
+
+        async def _ticker() -> None:
+            for _ in range(40):
+                await asyncio.sleep(0.005)
+                ticks.append(1)
+
+        def _slow_probe() -> DonatedKeyState:
+            time.sleep(0.2)
+            return DonatedKeyState.DRAINED
+
+        with patch.object(fallback_openrouter, "classify_donated_key_state", _slow_probe):
+            ticker = asyncio.create_task(_ticker())
+            await fallback_openrouter.record_donated_key_fallback(
+                "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
+            )
+            progressed_during_probe = len(ticks)
+            ticker.cancel()
+
+        # Blocking the loop for 0.2s would leave the ticker at zero; threaded, it gets
+        # ~40 chances. A low bar keeps this robust on a loaded machine.
+        assert progressed_during_probe >= 2, f"event loop appears blocked ({progressed_during_probe=})"
+        assert get_credit_key_fallback_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fallbacks_lose_no_counts(self) -> None:
+        """N forecasters failing on one dry key must count exactly N.
+
+        Guards the trap in the fix itself: the accounting has to run on the event loop.
+        """
+        import asyncio
+
+        def _drained() -> DonatedKeyState:
+            return DonatedKeyState.DRAINED
+
+        with patch.object(fallback_openrouter, "classify_donated_key_state", _drained):
+            await asyncio.gather(
+                *(
+                    fallback_openrouter.record_donated_key_fallback(f"model-{i}", Exception(PRODUCTION_KEY_LIMIT_403))
+                    for i in range(50)
+                )
+            )
+
+        assert get_generic_key_fallback_count() == 50
+        assert get_credit_key_fallback_count() == 50
