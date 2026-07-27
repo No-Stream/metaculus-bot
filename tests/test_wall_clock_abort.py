@@ -439,25 +439,28 @@ def test_publish_hardening_unwraps_upstream_retry_so_it_is_the_single_layer(monk
     assert inner_calls["n"] != outer_attempts * upstream_attempts, "double-retry stack present"
 
 
-def test_publish_hardening_injects_socket_timeout(monkeypatch):
-    """F17 regression: a hung requests.post must be bounded by injected ``timeout=``.
+def test_publish_hardening_forces_socket_timeout(monkeypatch):
+    """F17 regression: a hung requests.post must be bounded by a forced ``timeout=``.
 
     Without the request-side socket timeout, ``Future.cancel()`` is a no-op once
     the worker thread is inside ``requests.post``, so a hung POST silently runs
-    until the underlying socket times out (no caller-side bound). With the fix,
-    the wrapper monkey-patches ``requests.post`` on the metaculus_client module to
-    force ``timeout=PUBLISH_POST_TIMEOUT`` (overriding upstream's own timeout so
-    the socket closes in step with the caller-side Future cap).
+    until the underlying socket times out (no caller-side bound). So hardening
+    patches ``requests.post`` on the metaculus_client module to force
+    ``timeout=PUBLISH_POST_TIMEOUT``, OVERRIDING upstream's own 30s timeout so the
+    socket closes in step with the caller-side Future cap.
 
-    This test verifies that the injection happens by capturing kwargs passed to
-    a fake ``requests.post``.
+    The override is installed ONCE by ``apply_publish_hardening`` and left in
+    place, matching ``fetch_hardening``'s GET twin. It used to be a per-call
+    context manager, which was only correct under strict LIFO nesting — and the
+    timeout-and-retry path violates that by construction, since ``future.cancel()``
+    returns False on a running future, so a timed-out orphan and its retry are
+    both inside the context manager at once. The leak is covered directly in
+    ``tests/test_publish_hardening_concurrency.py``; here we pin the behavior that
+    matters to a POST: the tighter timeout wins over the one upstream supplies.
     """
     from forecasting_tools.helpers import metaculus_client as ft_metaculus_client
 
     from metaculus_bot import publish_hardening
-
-    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_TIMEOUT", 0.5)
-    monkeypatch.setattr("metaculus_bot.publish_hardening.PUBLISH_POST_RETRIES", 0)
 
     captured_kwargs: list[dict] = []
 
@@ -475,37 +478,42 @@ def test_publish_hardening_injects_socket_timeout(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(ft_metaculus_client.requests, "post", fake_post)
+    publish_hardening._install_post_timeout_override(0.5)
+    try:
+        # Call the way MetaculusClient's internals do on 0.2.92: WITH its own
+        # timeout=self.timeout (30s). Ours must override it, not defer to it.
+        ft_metaculus_client.requests.post(
+            "https://www.metaculus.com/api/questions/forecast/", json={"k": "v"}, timeout=30
+        )
+        # A non-Metaculus POST must keep its own timeout: metaculus_client.requests IS
+        # the global requests module, so an unscoped permanent override would also
+        # re-time exa_py / litellm / huggingface POSTs (see the helper's docstring).
+        ft_metaculus_client.requests.post("https://api.exa.ai/search", json={"k": "v"}, timeout=120)
+    finally:
+        monkeypatch.undo()
 
-    # Build a minimal "post"-like fn that calls requests.post on the patched
-    # module, the same way MetaculusClient's internals do.
-    def caller_that_uses_module_requests(*args, **kwargs):
-        return ft_metaculus_client.requests.post("http://example.invalid", json={"k": "v"})
-
-    wrapped = publish_hardening._wrap_with_timeout_retry("fake", caller_that_uses_module_requests)
-    wrapped()
-
-    assert len(captured_kwargs) == 1
+    assert len(captured_kwargs) == 2
     assert captured_kwargs[0].get("timeout") == 0.5, (
-        f"timeout kwarg should have been injected by _inject_socket_timeout; got {captured_kwargs[0]}"
+        f"the tighter publish timeout must OVERRIDE upstream's own; got {captured_kwargs[0]}"
     )
-
-    # And after the wrapper exits, requests.post must be restored to fake_post
-    # (NOT the timeout-injecting wrapper). Verify by calling directly without
-    # a timeout kwarg and confirming none was injected.
-    captured_kwargs.clear()
-    ft_metaculus_client.requests.post("http://example.invalid", json={"k": "v"})
-    assert "timeout" not in captured_kwargs[0], (
-        f"timeout injection should NOT leak past the wrapper; got {captured_kwargs[0]}"
+    assert captured_kwargs[1].get("timeout") == 120, (
+        f"a non-Metaculus POST must keep its own timeout; got {captured_kwargs[1]}"
     )
 
 
 def test_publish_hardening_bounds_hung_request_via_socket_timeout(monkeypatch):
-    """F17: a requests.post that hangs forever must be bounded by injected timeout.
+    """F17: a requests.post that hangs forever must be bounded by the forced timeout.
 
     Simulates a server-stalled POST by having fake_post raise requests.Timeout
-    when the timeout kwarg is passed (the real behavior of urllib3 when the
-    socket timeout fires). Without F17, no timeout is passed and the call
-    would hang. With F17, the wrapper raises after the timeout-induced error.
+    when the timeout kwarg is present (the real behavior of urllib3 when the
+    socket timeout fires) and hang otherwise. Without the forced timeout no bound
+    reaches the socket, ``Future.cancel()`` is a no-op on the running worker, and
+    the POST runs until the server gives up; with it, the wrapper surfaces the
+    timeout-induced error promptly.
+
+    The forced timeout is now installed once by ``apply_publish_hardening`` rather
+    than per call (see ``_install_post_timeout_override``), so this drives the
+    install and then the wrapper, in the order production does.
     """
     from forecasting_tools.helpers import metaculus_client as ft_metaculus_client
 
@@ -516,24 +524,29 @@ def test_publish_hardening_bounds_hung_request_via_socket_timeout(monkeypatch):
 
     def fake_hung_post(*args, **kwargs):
         # urllib3 / requests raises requests.Timeout when the socket-level
-        # timeout fires. Simulate that here, gated on the injected kwarg.
+        # timeout fires. Simulate that here, gated on the forced kwarg.
         if "timeout" in kwargs:
             raise requests.Timeout("simulated socket timeout")
-        # If no timeout is passed, simulate an unbounded hang. Sleep longer
-        # than any reasonable test would tolerate — if F17 were broken this
-        # branch would be reached and the test would fail by timeout.
+        # With no timeout, simulate an unbounded hang. Sleep longer than any
+        # reasonable test would tolerate — if the override were broken this branch
+        # would be reached and the elapsed assertion below would fail.
         time.sleep(60)
 
+    real_post = ft_metaculus_client.requests.post
     monkeypatch.setattr(ft_metaculus_client.requests, "post", fake_hung_post)
+    publish_hardening._install_post_timeout_override(0.5)
 
     def caller(*args, **kwargs):
-        return ft_metaculus_client.requests.post("http://example.invalid", json={})
+        return ft_metaculus_client.requests.post("https://www.metaculus.com/api/questions/forecast/", json={})
 
     wrapped = publish_hardening._wrap_with_timeout_retry("fake", caller)
     start = time.monotonic()
-    with pytest.raises(requests.Timeout):
-        wrapped()
+    try:
+        with pytest.raises(requests.Timeout):
+            wrapped()
+    finally:
+        ft_metaculus_client.requests.post = real_post
     elapsed = time.monotonic() - start
-    # Must complete promptly (well under PUBLISH_POST_TIMEOUT + 1s); the
-    # injected timeout makes fake_hung_post raise immediately.
-    assert elapsed < 1.5, f"hung-post test took {elapsed:.2f}s, indicating socket timeout NOT injected"
+    # Must complete promptly (well under PUBLISH_POST_TIMEOUT + 1s); the forced
+    # timeout makes fake_hung_post raise immediately.
+    assert elapsed < 1.5, f"hung-post test took {elapsed:.2f}s, indicating socket timeout NOT forced"
