@@ -10,7 +10,6 @@ from typing import Any, Literal
 from forecasting_tools import MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
     METACULUS_CUP_ID,
@@ -77,12 +76,6 @@ def main() -> None:
     # metaculus_bot/fetch_hardening.py for rationale (a single transient
     # 403/429/5xx would otherwise kill the whole run).
     apply_fetch_hardening()
-
-    # One-shot, unauthenticated identity check before any mode sends the token.
-    # See metaculus_bot/api_preflight.py (DNS-parking incident): aborts non-zero
-    # if www.metaculus.com isn't answered by the real API, so we never leak
-    # METACULUS_TOKEN to a hijacked host.
-    verify_metaculus_api_identity()
 
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(

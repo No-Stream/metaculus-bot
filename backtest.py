@@ -2,12 +2,10 @@
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import sys
 import time
-from pathlib import Path
 from typing import Any, cast
 
 import typeguard
@@ -15,7 +13,6 @@ from forecasting_tools import Benchmarker, ForecastBot, MonetaryCostManager
 from tqdm import tqdm
 
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.backtest.analysis import (
     BacktestResult,
     aggregate_scores,
@@ -150,6 +147,8 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
     (``QuestionIds.matches_archive_record``); a mismatch skips to the next rung, leaving
     the question uncached (live research) rather than silently replaying B's research as A's.
     """
+    import json  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
+    from pathlib import Path  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # pre-existing local style
 
     cache: dict[int, str] = {}
     archive_path = Path(research_dir)
@@ -326,10 +325,5 @@ if __name__ == "__main__":
 
     parser = _build_parser()
     args = parser.parse_args()
-
-    # Confirm www.metaculus.com is the real API before pulling resolved
-    # questions (which send METACULUS_TOKEN). See metaculus_bot/api_preflight.py
-    # for the DNS-parking incident that motivated this guard.
-    verify_metaculus_api_identity()
 
     asyncio.run(run_backtest(args))

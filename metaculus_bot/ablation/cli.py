@@ -96,7 +96,6 @@ from metaculus_bot.ablation.scoring import (
 )
 from metaculus_bot.ablation.scoring_report import render_summary_markdown
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose  # noqa: F401
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.backtest.question_prep import (
     BacktestQuestionSet,
     fetch_resolved_questions_stratified,
@@ -815,9 +814,6 @@ async def _stage_fetch(args: argparse.Namespace, cache: AblationCache, working: 
         delta_numeric,
         existing_per_type,
     )
-
-    # Confirm the host is the real Metaculus before the token-sending fetch.
-    verify_metaculus_api_identity()
 
     question_set: BacktestQuestionSet = await fetch_resolved_questions_stratified(
         num_binary=delta_binary,

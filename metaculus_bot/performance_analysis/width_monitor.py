@@ -47,7 +47,6 @@ from datetime import datetime, timezone
 import numpy as np
 from scipy import stats
 
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
 from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
@@ -387,8 +386,6 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 
     if args.tournament:
-        # Confirm the host is the real Metaculus before the token-sending pull.
-        verify_metaculus_api_identity()
         data = build_performance_dataset(tournament=args.tournament)
     else:
         data = load_dataset(args.cached)

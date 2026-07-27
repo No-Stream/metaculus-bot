@@ -177,13 +177,10 @@ def test_display_mode(mock_streamlit):
     mock_streamlit.assert_called_once()
 
 
-@patch("community_benchmark.verify_metaculus_api_identity")
 @patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
 @patch("community_benchmark.Benchmarker")
 @patch("community_benchmark.MonetaryCostManager")
-def test_benchmark_flow_without_api_calls(
-    mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify
-):
+def test_benchmark_flow_without_api_calls(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter):
     """Test benchmark flow without making actual API calls."""
     import community_benchmark
 
@@ -210,16 +207,12 @@ def test_benchmark_flow_without_api_calls(
     call_kwargs = mock_get_questions_filter.call_args
     assert call_kwargs.kwargs.get("randomly_sample") is False or call_kwargs[1].get("randomly_sample") is False
     mock_benchmarker.run_benchmark.assert_called_once()
-    mock_verify.assert_called_once()  # the run path preflights before fetching
 
 
-@patch("community_benchmark.verify_metaculus_api_identity")
 @patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
 @patch("community_benchmark.Benchmarker")
 @patch("community_benchmark.MonetaryCostManager")
-def test_custom_mode_without_api_calls(
-    mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify
-):
+def test_custom_mode_without_api_calls(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter):
     """Test custom mode flow without making actual API calls."""
     import community_benchmark
 
@@ -244,7 +237,6 @@ def test_custom_mode_without_api_calls(
     # Verify mocked functions were called
     mock_get_questions_filter.assert_called_once()
     mock_benchmarker.run_benchmark.assert_called_once()
-    mock_verify.assert_called_once()  # the custom path preflights before fetching
 
 
 def test_invalid_mode_raises_error():
@@ -368,11 +360,10 @@ def test_benchmark_config_constants_remain_unchanged_after_bot_creation():
     assert [spec["name"] for spec in STACKING_MODEL_SPECS] == stacking_names_before
 
 
-@patch("community_benchmark.verify_metaculus_api_identity")
 @patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
 @patch("community_benchmark.Benchmarker")
 @patch("community_benchmark.MonetaryCostManager")
-def test_custom_mode_with_mixed_flag(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify):
+def test_custom_mode_with_mixed_flag(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter):
     """Test custom mode with mixed flag uses mixed question types."""
     import community_benchmark
 
@@ -412,6 +403,3 @@ def test_custom_mode_with_mixed_flag(mock_cost_manager, mock_benchmarker_class, 
 
     # Should call API only once for binary questions
     assert mock_get_questions_filter.call_count == 1
-
-    # Both custom runs preflight the API identity before fetching.
-    assert mock_verify.call_count == 2

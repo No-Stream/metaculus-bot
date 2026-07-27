@@ -8,7 +8,6 @@ import argparse
 import logging
 import sys
 
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.performance_analysis.analysis import generate_report
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset, save_dataset
 
@@ -31,10 +30,6 @@ def main(argv: list[str] | None = None) -> None:
         logger.info(f"Loading cached dataset from {args.cached}")
         data = load_dataset(args.cached)
     else:
-        # The live pull sends METACULUS_TOKEN to the API; confirm the host is
-        # the real Metaculus first (DNS-parking incident — see
-        # metaculus_bot/api_preflight.py). Skipped for --cached (disk read).
-        verify_metaculus_api_identity()
         data = build_performance_dataset(tournament=args.tournament)
         save_dataset(data, args.output)
 

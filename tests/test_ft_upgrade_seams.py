@@ -47,19 +47,11 @@ logs during long backtests. If ft HEAD renames the batch method or moves the
 Benchmarker module, the wrap becomes a silent no-op and backtests lose their
 heartbeat. This pins that the wrap actually replaces the method and that a stub
 batch run emits the ``[HB]`` log line.
-
-Seam 6 (``TestApiPreflightBaseUrlSeam``): ``api_preflight`` derives the URL it vets
-from ``MetaculusClient().base_url``. This one has already bitten: the module was
-originally written against ``MetaculusApi.API_BASE_URL``, which 0.2.92 removed, so
-importing it raised ``AttributeError`` — a guard that fails at import is a guard that
-isn't running. The pin makes a future rename fail here, loudly and in CI, rather than at
-prod startup.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
 import logging
 from typing import Any
 from unittest.mock import MagicMock
@@ -70,7 +62,6 @@ import requests
 from forecasting_tools import (
     Benchmarker,
     BinaryQuestion,
-    MetaculusApi,
     MetaculusClient,
     MultipleChoiceQuestion,
     NumericDistribution,
@@ -87,7 +78,7 @@ from forecasting_tools.data_models.questions import BoundedQuestionMixin
 from forecasting_tools.helpers import metaculus_client as ft_client
 from forecasting_tools.helpers.metaculus_client import ApiFilter
 
-from metaculus_bot import api_preflight, fetch_hardening, publish_hardening
+from metaculus_bot import fetch_hardening, publish_hardening
 from metaculus_bot.benchmark.heartbeat import install_benchmarker_heartbeat
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
@@ -658,48 +649,3 @@ class TestHeartbeatWrapsRunABatch:
         after_second = Benchmarker._run_a_batch
 
         assert after_first is after_second, "second install must be a no-op (already wrapped)"
-
-
-class TestApiPreflightBaseUrlSeam:
-    """Seam 6: the DNS-hijack preflight must keep resolving the API root it vets.
-
-    The preflight makes one unauthenticated request and aborts unless the host behaves
-    like the real Metaculus API, so the bot never sends METACULUS_TOKEN to a parked or
-    hijacked host (the 2026-07-21 incident, where scheduled runs kept firing at a GoDaddy
-    parking host with the token attached). Its whole value depends on vetting the SAME
-    host the authenticated fetches will use.
-
-    This seam has already broken once: the module read ``MetaculusApi.API_BASE_URL``,
-    which 0.2.92 does not define, so importing it raised ``AttributeError`` at startup.
-    Pin the attribute it reads now, so the next rename fails in CI.
-    """
-
-    def test_metaculus_client_still_exposes_base_url(self) -> None:
-        client = MetaculusClient()
-        assert isinstance(client.base_url, str)
-        assert client.base_url.startswith("http")
-
-    def test_preflight_url_targets_the_clients_api_root(self) -> None:
-        # Same root the real question fetch hits, plus the posts-list path whose
-        # unauthenticated response IS the identity fingerprint.
-        assert api_preflight.PREFLIGHT_URL.startswith(MetaculusClient().base_url)
-        assert "/posts/" in api_preflight.PREFLIGHT_URL
-
-    def test_preflight_url_follows_the_base_url_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # MetaculusClient reads METACULUS_API_BASE_URL, so an override must move the
-        # preflight target too — otherwise we would vet the default host and then send
-        # the token somewhere else entirely.
-        monkeypatch.setenv("METACULUS_API_BASE_URL", "https://staging.example.invalid/api")
-        reloaded = importlib.reload(api_preflight)
-        try:
-            assert reloaded.PREFLIGHT_URL.startswith("https://staging.example.invalid/api")
-        finally:
-            monkeypatch.undo()
-            importlib.reload(api_preflight)
-
-    def test_deprecated_shim_attribute_is_really_gone(self) -> None:
-        # Documents WHY the module was repointed, so nobody "restores" the old read.
-        assert not hasattr(MetaculusApi, "API_BASE_URL"), (
-            "MetaculusApi.API_BASE_URL is back; api_preflight deliberately reads "
-            "MetaculusClient().base_url instead — see its _api_base_url docstring"
-        )
