@@ -240,10 +240,14 @@ def should_route_via_donated_key(model: str) -> bool:
 # whole suppression window.
 KEY_LIMIT_EXCEEDED_CUE = "key limit exceeded"
 
-# Unambiguous "this key is out of money" wording. Safe to match anywhere in the
-# message — these are English phrases, not status digits.
-_EXPLICIT_CREDIT_PHRASES: tuple[str, ...] = (
-    KEY_LIMIT_EXCEEDED_CUE,
+# "Out of money" wording that is ORDINARY ENGLISH, so a forecasting prompt can contain
+# it innocently — "declared insolvent for insufficient funds", "the ransom demand states
+# payment required". Since a moderation body replays our prompt (see _MODERATION_CUES),
+# these are trusted only when nothing says the body is a refusal. Split out from
+# KEY_LIMIT_EXCEEDED_CUE by SPECIFICITY, not by category: that phrase is OpenRouter's own
+# spend-cap wording and will not appear in a question about an election, so it outranks
+# the veto; these four cannot be given that power.
+_GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
     "payment required",
     "insufficient credit",
     "out of credits",
@@ -271,12 +275,22 @@ def _is_credit_message(lowercased_msg: str) -> bool:
     decision in ``should_retry_with_general_key`` and the credit-subset counter
     in ``FallbackOpenRouterLlm.invoke`` both go through here, so a text-cue edit
     can't make the two disagree about which fallbacks were credit-caused.
+
+    Three tiers, ordered by how hard each cue is to fake by accident:
+
+    1. The spend-cap phrase is OpenRouter's own wording and beats everything. It has to:
+       a drained key rendered as "403 Forbidden: Key limit exceeded" carries a moderation
+       cue ("forbidden" is also generic HTTP boilerplate), and gating the phrase behind
+       the veto would stop that falling back and strand the ensemble on the dead key.
+    2. Otherwise a moderation cue vetoes, because everything below is forgeable by a
+       replayed prompt.
+    3. Otherwise ordinary credit English or a bare "402" classifies.
     """
-    if any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES):
+    if KEY_LIMIT_EXCEEDED_CUE in lowercased_msg:
         return True
-    # Bare status digits are the weak cue — trust them only when nothing says the
-    # body is a moderation refusal replaying our own prompt text back at us.
-    return "402" in lowercased_msg and not any(cue in lowercased_msg for cue in _MODERATION_CUES)
+    if any(cue in lowercased_msg for cue in _MODERATION_CUES):
+        return False
+    return "402" in lowercased_msg or any(phrase in lowercased_msg for phrase in _GENERIC_CREDIT_PHRASES)
 
 
 # Textual cues that stay live regardless of the reported status: English wording, not
@@ -285,6 +299,18 @@ def _is_credit_message(lowercased_msg: str) -> bool:
 # caller) and a provider that words the failure without a recognizable status.
 _RATE_LIMIT_TEXT_CUES: tuple[str, ...] = ("too many requests", "rate limit", "rate-limited upstream")
 _BAD_CREDENTIAL_TEXT_CUES: tuple[str, ...] = ("unauthorized", "invalid api key", "disabled api key")
+
+# Blocks that are scoped to the KEY'S ROUTING rather than to the request, so the personal
+# key genuinely can serve the same call. Two donated-key quirks: server-side
+# allowed-providers preferences ("no allowed providers"), and the Metaculus
+# data-collection guardrail that excludes OpenAI's native-search endpoint ("No endpoints
+# available matching your guardrail restrictions and data policy") — see FUTURE.md
+# "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block".
+#
+# Classified by TEXT on purpose, and checked on every status including 403. OpenRouter
+# returns these as 404, the same status as a plain missing model, which must NOT fall
+# back — so the status alone cannot tell the two apart.
+_ROUTE_SCOPED_TEXT_CUES: tuple[str, ...] = ("no allowed providers", "guardrail", "data policy")
 
 
 def _llm_status_code(exc: Exception) -> int | None:
@@ -324,25 +350,28 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
 def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
     """Status-aware view of :func:`_is_credit_message` for the routing decision.
 
-    Two signals classify a failure whose status the provider actually reported: a 402,
-    and explicit credit wording. Either alone is sufficient.
+    Exactly two signals classify a failure whose status the provider reported, and either
+    alone is sufficient:
 
-    * **402 is unambiguous.** "Payment Required" has no second meaning, and OpenRouter
-      reports refusals as 403, so a reported 402 outranks any English word that happens
-      to sit in the body. The failure asymmetry agrees: reading a real 402 as a refusal
-      strands the ensemble on a dry key, the production bug this exists to fix, while
-      reading a hypothetical 402-shaped refusal as credit costs one paid call that
-      refuses again.
-    * **Explicit wording catches the spend-cap 403**, which OpenRouter returns as "Key
-      limit exceeded" despite documenting credit exhaustion as 402. That body can also
-      carry generic HTTP "Forbidden" boilerplate, so the wording must win there too.
+    * **A reported 402.** "Payment Required" has no second meaning, and OpenRouter reports
+      refusals as 403, so the status outranks any English word that happens to sit in the
+      body. The failure asymmetry agrees: reading a real 402 as a refusal strands the
+      ensemble on a dry key, the production bug this exists to fix, while reading a
+      hypothetical 402-shaped refusal as credit costs one paid call that refuses again.
+    * **The spend-cap phrase**, which is how OpenRouter reports a drained per-key budget
+      despite documenting credit exhaustion as 402.
 
-    No moderation veto is needed here, and adding one would be dead code: with the status
-    in hand, a moderation 403 is rejected because 403 is not 402 and carries no credit
-    phrase — the poisoning case is closed by READING the status rather than by vetoing on
-    words. The veto still earns its place in ``_is_credit_message``, which has only bare
-    digits to go on; a statusless exception defers wholly to that function, keeping it the
-    single source of truth for text-only classification.
+    Deliberately NOT the rest of ``_GENERIC_CREDIT_PHRASES``: those only ever accompany a
+    402, which the first arm already covers, and they are ordinary English that a replayed
+    prompt can contain ("insolvent for insufficient funds"). Matching them here is what let
+    a moderation 403 bill the paid key and be exempted from alerting.
+
+    No moderation veto is needed with a status in hand, and adding one would be dead code:
+    a moderation 403 is rejected because 403 is not 402 and carries no spend-cap phrase —
+    the echo is closed by READING the status rather than by vetoing on words. The veto
+    still earns its place in ``_is_credit_message``, which has only text to go on; a
+    statusless exception defers wholly to that function, keeping it the single source of
+    truth for text-only classification.
 
     Nothing here reads a live balance — ``status_code`` is an int already on the
     exception. The ``/auth/key`` probe belongs to ``is_suppressible_credit_error`` and the
@@ -350,7 +379,7 @@ def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool
     """
     if reported_status is None:
         return _is_credit_message(lowercased_msg)
-    return reported_status == 402 or any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES)
+    return reported_status == 402 or KEY_LIMIT_EXCEEDED_CUE in lowercased_msg
 
 
 def is_credit_caused_error(exc: Exception) -> bool:
@@ -456,6 +485,17 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # which then classify on message text exactly as they always have.
     status = _llm_status_code(exc)
 
+    # A REPORTED 403 is decided here, ahead of every text cue, because the body is the
+    # least trustworthy input we have on this path: an OpenRouter moderation 403 carries
+    # ``flagged_input``, up to ~100 characters of OUR OWN PROMPT replayed back. A
+    # forecasting question can say "insufficient funds", "payment required", "rate limit",
+    # or "unauthorized" for entirely ordinary reasons, and each of those would otherwise
+    # send a content block to the paid key for a call it will refuse just the same.
+    # OpenRouter uses 403 for refusals, so only two shapes deserve a key swap: the
+    # spend-cap phrase, and a route-scoped block the personal key genuinely can route.
+    if status == 403:
+        return KEY_LIMIT_EXCEEDED_CUE in msg or any(cue in msg for cue in _ROUTE_SCOPED_TEXT_CUES)
+
     # Belt-and-suspenders detection for 429 edge cases where litellm doesn't raise the
     # typed exception (e.g., class drift, non-standard wrapping).
     if _is_status(status, 429, msg) or any(cue in msg for cue in _RATE_LIMIT_TEXT_CUES):
@@ -466,23 +506,7 @@ def should_retry_with_general_key(exc: Exception) -> bool:
         return True
     if _is_credit_failure(status, msg):
         return True
-    # Donated-key allowed-providers quirk: the donated key has server-side
-    # provider preferences; a model only available via a non-allowed provider
-    # returns 404 with "no allowed providers". The general key has no such
-    # restriction and routes the same model fine.
-    if "no allowed providers" in msg:
-        return True
-    # Donated-key data-policy / guardrail block (added 2026-05-17 during native
-    # search migration). When OpenAI native search is invoked on the donated
-    # key, OpenRouter returns 404 with text like:
-    #   "No endpoints available matching your guardrail restrictions and data
-    #   policy. Configure: https://openrouter.ai/settings/privacy"
-    # The donated key has data-collection guardrails set by Metaculus that
-    # exclude OpenAI's native-search endpoint. The personal key has no such
-    # restriction. Treat as key-scoped so callers fall through to the
-    # secondary key automatically — see FUTURE.md "Resolve
-    # OAI_ANTH_OPENROUTER_KEY data-policy block".
-    if "guardrail" in msg or "data policy" in msg:
+    if any(cue in msg for cue in _ROUTE_SCOPED_TEXT_CUES):
         return True
 
     # Negative signals: do not swap keys for these. Reached only after the credit

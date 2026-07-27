@@ -1213,3 +1213,111 @@ class TestFallbackAccountingConcurrency:
 
         assert get_generic_key_fallback_count() == 50
         assert get_credit_key_fallback_count() == 50
+
+
+class TestPromptEchoCreditPhrases:
+    """A refusal body replays our own prompt, so ordinary credit ENGLISH can echo too.
+
+    Closing the "402" digit echo was only half the hole. litellm formats the message as
+    ``APIError: {provider} - {raw body}`` and an OpenRouter moderation 403 body carries
+    ``flagged_input``: up to ~100 characters of the prompt we sent. A forecasting prompt
+    can say "insufficient funds" or "payment required" for entirely ordinary reasons, and
+    those are matched anywhere in the message — so a content block was billing the paid
+    key AND being exempted from alerting as an expected empty wallet.
+
+    The split is by SPECIFICITY, not by category. "Key limit exceeded" is OpenRouter's own
+    spend-cap wording and will not show up in a question about an election; the other four
+    phrases are ordinary English. So the spend-cap cue outranks the moderation veto and the
+    generic phrases sit under it.
+    """
+
+    @staticmethod
+    def _api_error(status: int, message: str) -> Exception:
+        from litellm.exceptions import APIError
+
+        return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
+
+    @staticmethod
+    def _moderation_body(flagged_input: str) -> str:
+        return (
+            "litellm.APIError: APIError: OpenrouterException - "
+            '{"error":{"message":"Your input was flagged for the following reasons: violence",'
+            '"code":403,"metadata":{"reasons":["violence"],'
+            f'"flagged_input":"{flagged_input}"}}}}'
+        )
+
+    @pytest.mark.parametrize(
+        "flagged_input",
+        [
+            "Will Bank X be declared insolvent for insufficient funds after the bombing?",
+            "Will the ransom demand state payment required by Friday?",
+            "Will the treasury report insufficient credit in the reserve facility?",
+            "Will the vault be out of credits before the siege ends?",
+        ],
+    )
+    def test_moderation_403_echoing_credit_english_is_not_credit(self, flagged_input: str) -> None:
+        """The reported 403 must beat an ordinary credit phrase replayed from our prompt."""
+        exc = self._api_error(403, self._moderation_body(flagged_input))
+        assert should_retry_with_general_key(exc) is False
+        assert is_credit_caused_error(exc) is False
+
+    @pytest.mark.parametrize(
+        "flagged_input",
+        [
+            "Will the Fed raise the rate limit on reserve accounts before Aug 18?",
+            "Will the unauthorized withdrawal be reported before the audit?",
+        ],
+    )
+    def test_moderation_403_echoing_key_scoped_english_does_not_fall_back(self, flagged_input: str) -> None:
+        """Rate-limit and credential wording in a replayed prompt must not force a key swap.
+
+        These stayed non-credit even before the fix, but they still flipped ROUTING to
+        True — billing the personal key for a call the paid key will also refuse.
+        """
+        exc = self._api_error(403, self._moderation_body(flagged_input))
+        assert should_retry_with_general_key(exc) is False
+
+    def test_statusless_moderation_echo_is_not_credit_or_suppressible(self) -> None:
+        """The statusless spelling is the worst case, so it gets its own guard.
+
+        With no ``status_code`` there is no status to fall back on, and
+        ``is_suppressible_credit_error`` short-circuits to True before ever consulting the
+        ``/auth/key`` probe — so a content block was exempted from alerting without the
+        drained-vs-revoked discriminator ever running.
+        """
+        body = self._moderation_body("Will Bank X be declared insolvent for insufficient funds?")
+        exc = Exception(body)
+        assert should_retry_with_general_key(exc) is False
+        assert is_credit_caused_error(exc) is False
+        assert is_suppressible_credit_error(exc) is False
+
+    def test_statusless_spend_cap_beats_forbidden_boilerplate(self) -> None:
+        """REGRESSION GUARD: the spend-cap cue outranks the veto, statusless included.
+
+        "forbidden" is a moderation cue AND generic HTTP boilerplate. Gating the spend-cap
+        phrase behind the veto — the obvious way to fix the echo hole — would make a
+        drained key rendered as "403 Forbidden: Key limit exceeded" stop falling back and
+        strand the ensemble on the dead key. That is the production bug, re-created by the
+        fix for a smaller one, and the statusless spelling is how the run log rendered it.
+        """
+        for body in (
+            "litellm.APIError: 403 Forbidden: Key limit exceeded (total limit).",
+            PRODUCTION_KEY_LIMIT_403,
+        ):
+            exc = Exception(body)
+            assert should_retry_with_general_key(exc) is True, body
+            assert is_credit_caused_error(exc) is True, body
+
+    def test_route_scoped_block_still_falls_back_on_a_403(self) -> None:
+        """A guardrail / allowed-providers block keeps its escape hatch on any status.
+
+        Deciding 403 early must not swallow these: they are the one class of non-credit
+        403 the personal key genuinely CAN route, and the donated-key data-policy block is
+        why OpenAI native search works at all.
+        """
+        guardrail = (
+            "No endpoints available matching your guardrail restrictions and data policy. "
+            "Configure: https://openrouter.ai/settings/privacy"
+        )
+        assert should_retry_with_general_key(self._api_error(403, guardrail)) is True
+        assert should_retry_with_general_key(self._api_error(403, "No allowed providers are available")) is True
