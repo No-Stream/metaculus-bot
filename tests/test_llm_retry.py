@@ -18,16 +18,20 @@ no bare ``async def`` helpers for flake8-async to complain about.
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm.exceptions as litellm_exc
 import pytest
+import requests
 
+from metaculus_bot import fetch_hardening
 from metaculus_bot.llm_retry import (
     DEFAULT_TRANSIENT_BACKOFFS,
+    NON_RETRYABLE_HTTP_STATUS_CODES,
     TRANSIENT_RETRY_MAX_ELAPSED_S,
     invoke_with_broad_retry,
     invoke_with_transient_retry,
+    is_broadly_retryable,
 )
 
 # A wall_timeout comfortably larger than any simulated call duration in these
@@ -602,5 +606,144 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
     with patch("metaculus_bot.llm_retry.time.monotonic", clock):
         with pytest.raises(litellm_exc.APIError):
             await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
+
+    assert awaitable.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic-4xx non-retry (2026-07-26 fix).
+#
+# The donated OpenRouter key hit its spend cap and OpenRouter answered every call
+# with HTTP 403 "Key limit exceeded (total limit)" in ~35ms. litellm has no 403
+# branch in _map_openrouter_exception, so it arrives as a BARE APIError — the root
+# of the litellm/openai tree, matching nothing in PERMANENT_NO_RETRY_EXCEPTIONS.
+# (PermissionDeniedError is in that list and reads as though it covers 403, but it
+# subclasses a different openai branch and litellm never raises it for OpenRouter,
+# so it gave zero coverage.) The broad predicate therefore called it retryable, and
+# because it failed in 0.035s the 30s elapsed gate — designed to block SLOW failures
+# — waved it through: the AskNews summarizer burned ~42s on the 1s/10s/30s ladder
+# and two forecasters each did a 3-attempt dance, all against a key that was dry the
+# entire run.
+#
+# The fix reads the authoritative ``status_code`` int that every litellm exception
+# carries and treats the deterministic client-error statuses as permanent. Substring
+# matching numbers against the message is NOT viable here: litellm builds the message
+# as f"APIError: {provider} - {body}", and the OpenRouter body embeds both a 64-hex
+# key hash (~8.8% chance of containing one of 401/402/403/429/502/503) and, on a
+# moderation refusal, up to ~100 chars of our own prompt in ``flagged_input``.
+# ---------------------------------------------------------------------------
+
+# Verbatim from the 2026-07-26 06:45 UTC production run (run_log_facts.md): the
+# donated key at $0.00 of its $850 cap. Note what it does NOT contain — "credit",
+# "insufficient", "balance", or "402" — and that the only "403" is the JSON code
+# field, which is exactly why classification must read status_code, not the text.
+_PROD_KEY_LIMIT_MESSAGE = (
+    "litellm.APIError: APIError: OpenrouterException - "
+    '{"error":{"message":"Key limit exceeded (total limit). Manage it using '
+    "https://openrouter.ai/workspaces/default/keys/"
+    '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
+)
+
+
+def _api_error_with_status(status: int, message: str = "boom") -> litellm_exc.APIError:
+    """Build a bare litellm APIError carrying ``status``, the shape OpenRouter 403s take."""
+    return litellm_exc.APIError(
+        status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol"
+    )
+
+
+@pytest.mark.parametrize("status", sorted(NON_RETRYABLE_HTTP_STATUS_CODES))
+def test_broad_predicate_rejects_deterministic_client_statuses(status: int) -> None:
+    """A bare APIError carrying a hard 4xx is permanent — re-rolling it cannot change it.
+
+    402 and 403 are the ones that actually move: 400/401/404/422 already map to typed
+    permanent litellm classes, so the status rule is close to a no-op for them.
+    """
+    assert is_broadly_retryable(_api_error_with_status(status)) is False
+
+
+def test_broad_predicate_rejects_production_key_limit_403() -> None:
+    """The verbatim 2026-07-26 dry-donated-key 403 is permanent, not a transient blip."""
+    assert is_broadly_retryable(_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE)) is False
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_broad_predicate_still_retries_server_and_rate_limit_statuses(status: int) -> None:
+    """5xx and 429 stay retryable — those genuinely can succeed on a re-roll."""
+    assert is_broadly_retryable(_api_error_with_status(status)) is True
+
+
+def test_broad_predicate_retries_zero_output_statuses() -> None:
+    """Regression guard on the zero-output carve-out (2026-07-25 fix).
+
+    The whitespace-body APIError takes its status from the raw response: 200 in the
+    production case, 500 in the repo fixture. Neither may appear in the non-retryable
+    set, or the carve-out that recovered a dropped forecaster silently dies.
+    """
+    assert 200 not in NON_RETRYABLE_HTTP_STATUS_CODES
+    assert 500 not in NON_RETRYABLE_HTTP_STATUS_CODES
+    assert is_broadly_retryable(_api_error_with_status(200, _PROD_WHITESPACE_BODY_MESSAGE)) is True
+    assert is_broadly_retryable(_api_error(_PROD_WHITESPACE_BODY_MESSAGE)) is True
+
+
+def test_broad_predicate_ignores_status_on_non_llm_exceptions() -> None:
+    """The status rule is scoped to the litellm/openai exception tree.
+
+    ``requests``-shaped HTTP errors carry their status on ``.response``, not on the
+    exception, and this repo deliberately treats a CDN/WAF 403 on the Metaculus
+    question-list endpoint as RETRYABLE (the 2026-05-19 incident — see
+    ``fetch_hardening._is_retryable`` and its tests). "403 is permanent" is a claim
+    about LLM provider calls only, so nothing outside that tree may be reclassified.
+    """
+    cdn_403 = requests.HTTPError("403 Client Error")
+    cdn_403.response = MagicMock(spec=requests.Response)
+    cdn_403.response.status_code = 403
+
+    assert fetch_hardening._is_retryable(cdn_403) is True
+    assert is_broadly_retryable(cdn_403) is True
+
+
+def test_broad_predicate_falls_back_to_type_check_without_status() -> None:
+    """A plain Exception whose text mentions 403 keeps its old classification.
+
+    Nothing textual was added: the rule reads the status attribute or nothing at all.
+    A statusless exception still flows through the type deny-list exactly as before.
+    """
+    assert is_broadly_retryable(Exception("403 Forbidden")) is True
+    assert is_broadly_retryable(ValueError("402 payment required")) is True
+
+
+@pytest.mark.asyncio
+async def test_production_403_consumes_one_attempt_with_no_backoff(_no_real_sleep: AsyncMock) -> None:
+    """The wall-clock fix: the production 403 costs ONE attempt, not four.
+
+    Before this change the summarizer ran attempts 1-4 and slept the full
+    1s/10s/30s ladder (~42s of dead wall clock, log 06:46:01-06:46:43) against a key
+    that could not succeed. Asserting attempt count + zero sleeps rather than real
+    elapsed time keeps the test deterministic.
+    """
+    awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE))
+
+    with pytest.raises(litellm_exc.APIError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="asknews_summarizer")
+
+    assert awaitable.await_count == 1
+    _no_real_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slow_403_is_not_rescued_by_the_zero_output_exemption() -> None:
+    """A hard 403 can never reach the zero-output re-roll, even worded like one.
+
+    The exemption is ANDed with the retry predicate, so making the status permanent
+    closes the path outright — a defense against a provider that returns an
+    unparseable body *and* a client-error status.
+    """
+    awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_WHITESPACE_BODY_MESSAGE))
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with pytest.raises(litellm_exc.APIError):
+            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
 
     assert awaitable.await_count == 1
