@@ -14,18 +14,20 @@ combine them into one prediction and publish it as a comment on Metaculus.
 
 Three files form the startup chain:
 
-- `main.py` — a six-line shim. It re-exports `TemplateForecaster` (for anything that
+- `main.py` — a thin shim. It re-exports `TemplateForecaster` (for anything that
   imports it) and, when run directly, calls `cli.main()`.
 - `metaculus_bot/cli.py` — the command-line entry point. It parses `--mode`
   (`tournament`, `minibench`, `metaculus_cup`, `quarterly_cup`, `test_questions`),
   builds the LLM roster dict from `llm_configs.py`, constructs a `TemplateForecaster`
   with `aggregation_strategy=CONDITIONAL_STACKING`, and runs the mode-specific
   forecast loop. It also wires credit telemetry and decides the process exit code:
-  the run exits non-zero when any degradation counter fired (dropped forecasters,
-  stacker fallbacks, research timeouts) or the donated OpenRouter key dropped below
-  the refill floor. Credit-caused alerts are suppressed until 2026-09-10 while the
-  operator self-funds the season — see "Credit alerting is suppressed" in
-  `docs/operations.md`. See `main` in `cli.py`.
+  the run exits non-zero when any degradation counter fired (`alertable_count` on
+  `TemplateForecaster` sums them: dropped forecasters, questions that failed to
+  publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
+  v2 errors, and prediction-market degradation) or the donated OpenRouter key
+  dropped below the refill floor. Credit-caused alerts are suppressed until
+  2026-09-10 while the operator self-funds the season — see "Credit alerting is
+  suppressed" in `docs/operations.md`. See `main` in `cli.py`.
 - `metaculus_bot/forecaster.py` — the bot itself. `TemplateForecaster` subclasses the
   framework's `ForecastBot` and owns the per-question pipeline. The method to read
   first is `_research_and_make_predictions`.
@@ -38,7 +40,7 @@ question that clears the min-forecasters guard is already on Metaculus by the ti
 
 Everything below runs once per question inside `_research_and_make_predictions`,
 under a shared per-question wall-clock budget (`PER_QUESTION_WALL_CLOCK_DEADLINE`,
-3510s — about 58.5 minutes of the 60-minute Metaculus close window). Research,
+sized to finish just inside the 60-minute Metaculus close window). Research,
 forecaster fan-out, aggregation, and publish all draw from that one budget.
 
 ```
@@ -68,15 +70,15 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  3. FORECASTER FAN-OUT                           │
-        │  N forecaster LLMs run in parallel, each under   │
-        │  a 10-min soft deadline. Type-specific runner    │
-        │  per question (binary / MC / numeric).           │
+        │  N forecaster LLMs run in parallel, each capped  │
+        │  by FORECASTER_SOFT_DEADLINE. Type-specific      │
+        │  runner per question (binary / MC / numeric).    │
         └────────────────────────────────────────────────┘
                                  │  N reasoned predictions
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  4. MIN-FORECASTERS GUARD                        │
-        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (1) valid │
+        │  Fewer than MIN_FORECASTERS_TO_PUBLISH valid     │
         │  → skip this question, keep the batch going.     │
         └────────────────────────────────────────────────┘
                                  │
@@ -147,7 +149,8 @@ disagreement analyzer) live in the same file.
 
 Each forecaster emits its answer inside a fenced ```json STRUCTURED FORECAST block,
 which is parsed by a deterministic extraction ladder (`value_extraction.py`). Numeric
-questions produce 13 percentiles that get turned into a 201-point PCHIP CDF. See
+questions produce the canonical percentile set (`STANDARD_PERCENTILES` in
+`numeric/config.py`), turned into a PCHIP CDF on the `PCHIP_CDF_POINTS` grid. See
 [numeric_pipeline.md](numeric_pipeline.md) for the percentile-to-CDF machinery and its
 bound/step constraints.
 
