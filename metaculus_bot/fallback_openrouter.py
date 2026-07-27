@@ -19,6 +19,40 @@ from metaculus_bot.credit_telemetry import DonatedKeyState, classify_donated_key
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+# Where a provider's error message stops being the PROVIDER'S words and starts being
+# OURS. Two carriers, both verified: an OpenRouter moderation 403 body replays up to ~100
+# characters of the prompt as ``flagged_input``, and forecasting-tools' empty-completion
+# guard raises ``RuntimeError("LLM answer is an empty string. The model was ... and the
+# prompt was: <up to 2000 chars>")``.
+_PROMPT_ECHO_MARKERS: tuple[str, ...] = ("and the prompt was:", "flagged_input", "flagged input")
+
+
+def _without_prompt_echo(lowercased_msg: str) -> str:
+    """Drop the tail that follows the first prompt-echo marker.
+
+    Everything past a marker is text WE sent, so it must not classify anything. Measured
+    against the 963-bundle research archive, our own prompts contain "402" in 13.0% of
+    bundles, "guardrail" in 1.9%, "unauthorized" in 4.7% and "deprecated" in 0.1% — so
+    without this, a benign zero-output blip on a question about a $402M revenue target
+    billed the personal key, counted as an expected empty wallet, and took a degraded run
+    green.
+
+    The marker itself is KEPT: ``flagged_input`` is OpenRouter's own field name and one of
+    ``_MODERATION_CUES``, so cutting at the marker rather than after it would disarm the
+    veto on the very bodies this exists to defend against.
+
+    Only TEXT cues read the truncated string. The reported ``status_code`` is an int on
+    the exception and cannot be echoed, so ``_is_status`` / ``_llm_status_code`` keep
+    reading the full message.
+    """
+    cut = len(lowercased_msg)
+    for marker in _PROMPT_ECHO_MARKERS:
+        found_at = lowercased_msg.find(marker)
+        if found_at != -1:
+            cut = min(cut, found_at + len(marker))
+    return lowercased_msg[:cut]
+
+
 def _record_deprecation_if_matched(model: str, error_msg: str) -> bool:
     """Append to ``_DEPRECATION_ALERTS`` iff the error message looks like a model deprecation.
 
@@ -29,7 +63,7 @@ def _record_deprecation_if_matched(model: str, error_msg: str) -> bool:
     providers (Grok native search), etc. Idempotent within a single recording —
     every distinct error string adds an entry; cli.py only checks ``len > 0``.
     """
-    msg_lower = error_msg.lower()
+    msg_lower = _without_prompt_echo(error_msg.lower())
     if any(pattern in msg_lower for pattern in _DEPRECATION_PATTERNS):
         _DEPRECATION_ALERTS.append((model, error_msg))
         return True
@@ -268,31 +302,6 @@ _GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
 _MODERATION_CUES: tuple[str, ...] = ("moderation", "forbidden", "flagged_input", "flagged for")
 
 
-def _is_credit_message(lowercased_msg: str) -> bool:
-    """Whether an already-lowercased error message reads as "this key is out of money".
-
-    Single source of truth for the credit-cause classification: the retry
-    decision in ``should_retry_with_general_key`` and the credit-subset counter
-    in ``FallbackOpenRouterLlm.invoke`` both go through here, so a text-cue edit
-    can't make the two disagree about which fallbacks were credit-caused.
-
-    Three tiers, ordered by how hard each cue is to fake by accident:
-
-    1. The spend-cap phrase is OpenRouter's own wording and beats everything. It has to:
-       a drained key rendered as "403 Forbidden: Key limit exceeded" carries a moderation
-       cue ("forbidden" is also generic HTTP boilerplate), and gating the phrase behind
-       the veto would stop that falling back and strand the ensemble on the dead key.
-    2. Otherwise a moderation cue vetoes, because everything below is forgeable by a
-       replayed prompt.
-    3. Otherwise ordinary credit English or a bare "402" classifies.
-    """
-    if KEY_LIMIT_EXCEEDED_CUE in lowercased_msg:
-        return True
-    if any(cue in lowercased_msg for cue in _MODERATION_CUES):
-        return False
-    return "402" in lowercased_msg or any(phrase in lowercased_msg for phrase in _GENERIC_CREDIT_PHRASES)
-
-
 # Textual cues that stay live regardless of the reported status: English wording, not
 # status digits, so they carry no key-hash / prompt-echo risk. They are what classifies
 # a statusless exception (a plain ``Exception("401 Unauthorized")``, a non-litellm
@@ -348,38 +357,41 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
 
 
 def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
-    """Status-aware view of :func:`_is_credit_message` for the routing decision.
+    """Whether this failure means "the key is out of money". The one credit arbiter.
 
-    Exactly two signals classify a failure whose status the provider reported, and either
-    alone is sufficient:
+    ``should_retry_with_general_key`` (routing) and ``is_credit_caused_error`` → the
+    credit-subset counter in ``record_donated_key_fallback`` (alerting) both reach the
+    answer through here, so a cue edit cannot make them disagree.
 
-    * **A reported 402.** "Payment Required" has no second meaning, and OpenRouter reports
-      refusals as 403, so the status outranks any English word that happens to sit in the
-      body. The failure asymmetry agrees: reading a real 402 as a refusal strands the
-      ensemble on a dry key, the production bug this exists to fix, while reading a
-      hypothetical 402-shaped refusal as credit costs one paid call that refuses again.
-    * **The spend-cap phrase**, which is how OpenRouter reports a drained per-key budget
-      despite documenting credit exhaustion as 402.
+    Three guards, in an order the real bodies force:
 
-    Deliberately NOT the rest of ``_GENERIC_CREDIT_PHRASES``: those only ever accompany a
-    402, which the first arm already covers, and they are ordinary English that a replayed
-    prompt can contain ("insolvent for insufficient funds"). Matching them here is what let
-    a moderation 403 bill the paid key and be exempted from alerting.
+    1. **The spend-cap phrase wins outright.** It is OpenRouter's own wording for a
+       drained per-key budget (which it reports as 403, not the 402 its docs promise) and
+       will not turn up in a question about an election. It has to outrank the veto below:
+       the production body renders as "403 Forbidden: Key limit exceeded", and "forbidden"
+       is both a moderation cue and generic HTTP boilerplate, so gating the phrase behind
+       the veto would stop the dry key falling back and strand the ensemble on it.
+    2. **Otherwise a reported status decides alone.** 402 is "Payment Required" and has no
+       second meaning, while OpenRouter words refusals as 403, so the int outranks any
+       English in the body. The failure asymmetry agrees: reading a real 402 as a refusal
+       strands the ensemble on a dry key — the production bug — whereas reading a
+       hypothetical 402-shaped refusal as credit costs one paid call that refuses again.
+    3. **With no status, moderation wording vetoes, then ordinary credit English or a bare
+       "402" classifies.** Everything in that last tier is forgeable by a replayed prompt,
+       which is why it sits below the veto and reads only ``_without_prompt_echo``.
 
-    No moderation veto is needed with a status in hand, and adding one would be dead code:
-    a moderation 403 is rejected because 403 is not 402 and carries no spend-cap phrase —
-    the echo is closed by READING the status rather than by vetoing on words. The veto
-    still earns its place in ``_is_credit_message``, which has only text to go on; a
-    statusless exception defers wholly to that function, keeping it the single source of
-    truth for text-only classification.
-
-    Nothing here reads a live balance — ``status_code`` is an int already on the
-    exception. The ``/auth/key`` probe belongs to ``is_suppressible_credit_error`` and the
-    ALERTING decision, never to routing.
+    Nothing here reads a live balance — ``status_code`` is an int already on the exception.
+    The ``/auth/key`` probe belongs to ``is_suppressible_credit_error`` and the ALERTING
+    decision, never to routing.
     """
-    if reported_status is None:
-        return _is_credit_message(lowercased_msg)
-    return reported_status == 402 or KEY_LIMIT_EXCEEDED_CUE in lowercased_msg
+    provider_text = _without_prompt_echo(lowercased_msg)
+    if KEY_LIMIT_EXCEEDED_CUE in provider_text:
+        return True
+    if reported_status is not None:
+        return reported_status == 402
+    if any(cue in provider_text for cue in _MODERATION_CUES):
+        return False
+    return "402" in provider_text or any(phrase in provider_text for phrase in _GENERIC_CREDIT_PHRASES)
 
 
 def is_credit_caused_error(exc: Exception) -> bool:
@@ -418,7 +430,7 @@ def is_suppressible_credit_error(exc: Exception) -> bool:
     """
     if not is_credit_caused_error(exc):
         return False
-    if KEY_LIMIT_EXCEEDED_CUE not in str(exc).lower():
+    if KEY_LIMIT_EXCEEDED_CUE not in _without_prompt_echo(str(exc).lower()):
         return True
     return classify_donated_key_state() is DonatedKeyState.DRAINED
 
@@ -484,6 +496,11 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # Authoritative for every NUMERIC branch below; None for statusless exceptions,
     # which then classify on message text exactly as they always have.
     status = _llm_status_code(exc)
+    # Everything after a prompt-echo marker is text WE sent, so no WORD cue may read it.
+    # The digit fallbacks inside ``_is_status`` still see the whole message: they only
+    # engage when no status was reported, and shortening their input there would change
+    # long-standing behavior for plain ``Exception("401 Unauthorized")`` callers.
+    provider_text = _without_prompt_echo(msg)
 
     # A REPORTED 403 is decided here, ahead of every text cue, because the body is the
     # least trustworthy input we have on this path: an OpenRouter moderation 403 carries
@@ -494,32 +511,26 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     # OpenRouter uses 403 for refusals, so only two shapes deserve a key swap: the
     # spend-cap phrase, and a route-scoped block the personal key genuinely can route.
     if status == 403:
-        return KEY_LIMIT_EXCEEDED_CUE in msg or any(cue in msg for cue in _ROUTE_SCOPED_TEXT_CUES)
+        return KEY_LIMIT_EXCEEDED_CUE in provider_text or any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES)
 
     # Belt-and-suspenders detection for 429 edge cases where litellm doesn't raise the
     # typed exception (e.g., class drift, non-standard wrapping).
-    if _is_status(status, 429, msg) or any(cue in msg for cue in _RATE_LIMIT_TEXT_CUES):
+    if _is_status(status, 429, msg) or any(cue in provider_text for cue in _RATE_LIMIT_TEXT_CUES):
         return True
 
     # Positive signals: credentials/credits
-    if _is_status(status, 401, msg) or any(cue in msg for cue in _BAD_CREDENTIAL_TEXT_CUES):
+    if _is_status(status, 401, msg) or any(cue in provider_text for cue in _BAD_CREDENTIAL_TEXT_CUES):
         return True
     if _is_credit_failure(status, msg):
         return True
-    if any(cue in msg for cue in _ROUTE_SCOPED_TEXT_CUES):
+    if any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES):
         return True
 
-    # Negative signals: do not swap keys for these. Reached only after the credit
-    # check above, so a spend-cap 403 has already fallen back by here and what
-    # remains is a genuine content/permission refusal the paid key would also get.
-    if _is_status(status, 403, msg) or any(cue in msg for cue in _MODERATION_CUES):
-        return False
-    if _is_status(status, 502, msg) or "bad gateway" in msg:
-        return False
-    if _is_status(status, 503, msg) or "service unavailable" in msg:
-        return False
-
-    # Default: be conservative and do not fallback when unsure
+    # Default: keep the key. What reaches here is everything a swap cannot help —
+    # moderation and permission refusals (both keys refuse the same prompt), 502/503
+    # upstream outages, and a plain missing-model 404. The explicit negative blocks this
+    # replaced were unreachable in the reported-status regime, because the 403 return
+    # above and the positive branches had already claimed every status they named.
     return False
 
 

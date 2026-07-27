@@ -1323,6 +1323,135 @@ class TestPromptEchoCreditPhrases:
         assert should_retry_with_general_key(self._api_error(403, "No allowed providers are available")) is True
 
 
+class TestStatuslessPromptEcho:
+    """The other prompt-echo carrier: an exception that reports no HTTP status at all.
+
+    Closing the echo hole for bodies that REPORT a status left the statusless door open,
+    and the realistic carrier is not a moderation refusal at all — it is
+    forecasting-tools' empty-completion guard, which raises
+    ``RuntimeError(f"LLM answer is an empty string. The model was {model} and the prompt
+    was: {prompt}")`` with up to 2000 characters of the prompt verbatim
+    (``general_llm.py``). A forecasting prompt says "402" about 13% of the time (measured
+    over the 963-bundle research archive) and "insufficient funds" whenever the question
+    is about a bank.
+
+    With nothing after the echo marked as ours, a benign zero-output blip billed the
+    personal key, was classified credit-caused, and — because the 402 family skips the
+    ``/auth/key`` probe — was SUBTRACTED from cli's ``alertable``, taking a degraded run
+    green without the drained-vs-revoked discriminator ever running.
+    """
+
+    @staticmethod
+    def _zero_output(prompt: str) -> RuntimeError:
+        """forecasting-tools' empty-completion RuntimeError, verbatim in shape."""
+        return RuntimeError(
+            f"LLM answer is an empty string. The model was openrouter/openai/gpt-5.6-terra and the prompt was: {prompt}"
+        )
+
+    @pytest.fixture(autouse=True)
+    def _probe_would_be_observable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make any ``/auth/key`` probe fail loudly, so a case that reaches it can't pass.
+
+        A configured donated key is load-bearing: without one the probe short-circuits to
+        UNKNOWN before touching ``fetch_auth_key``, and every assertion below would hold
+        for the wrong reason.
+        """
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "sk-fake-donated")
+        reset_donated_key_state_cache()
+        monkeypatch.setattr(
+            fallback_openrouter,
+            "classify_donated_key_state",
+            MagicMock(side_effect=AssertionError("the probe must not be reached for a prompt echo")),
+        )
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "Will revenue top $402M before Aug 18 2026?",
+            "Will Bank X be declared insolvent for insufficient funds?",
+            "Will the ransom demand state payment required by Friday?",
+            "Will the vault be out of credits before the siege ends?",
+        ],
+    )
+    def test_zero_output_echoing_credit_wording_is_not_credit(self, prompt: str) -> None:
+        exc = self._zero_output(prompt)
+        assert should_retry_with_general_key(exc) is False
+        assert is_credit_caused_error(exc) is False
+        assert is_suppressible_credit_error(exc) is False
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "Will the EU adopt a stricter data policy in 2026?",
+            "Will OpenAI ship stricter guardrails before Aug 18 2026?",
+            "Will the unauthorized withdrawal be reported before the audit?",
+        ],
+    )
+    def test_zero_output_echoing_route_or_credential_wording_does_not_fall_back(self, prompt: str) -> None:
+        """These never reached the credit counter, but they did force a wasted paid call.
+
+        A zero-output blip is not key-scoped — the personal key would return the same
+        empty completion — so swapping keys buys nothing and bills the operator.
+        """
+        assert should_retry_with_general_key(self._zero_output(prompt)) is False
+
+    def test_typed_403_echoing_guardrail_wording_does_not_fall_back(self) -> None:
+        """``_ROUTE_SCOPED_TEXT_CUES`` had no moderation veto and matched at every status.
+
+        So a moderation 403 whose ``flagged_input`` replays a question ABOUT guardrails
+        read as the donated key's data-policy block and swapped to the paid key for a call
+        it will refuse just the same.
+        """
+        body = (
+            "litellm.APIError: APIError: OpenrouterException - "
+            '{"error":{"message":"Your input was flagged for the following reasons: violence",'
+            '"code":403,"metadata":{"reasons":["violence"],'
+            '"flagged_input":"Will OpenAI ship stricter guardrails before Aug 18 2026?"}}}'
+        )
+        exc = APIError(status_code=403, message=body, llm_provider="openrouter", model="openai/gpt-5.6-sol")
+        assert should_retry_with_general_key(exc) is False
+
+    def test_zero_output_echoing_deprecated_records_no_deprecation_alert(self) -> None:
+        """The echo also reached the deprecation tripwire, whose only consequence is exit 1.
+
+        A question about a deprecated standard turned a benign empty completion into
+        ``MODEL DEPRECATION DETECTED ... model=<unknown>`` and a red run.
+        """
+        fallback_openrouter.clear_deprecation_alerts()
+        try:
+            should_retry_with_general_key(self._zero_output("Will the deprecated standard be retired in 2026?"))
+            assert fallback_openrouter._DEPRECATION_ALERTS == []
+        finally:
+            fallback_openrouter.clear_deprecation_alerts()
+
+    def test_real_deprecation_still_records(self) -> None:
+        """Positive control: provider wording sits BEFORE any echo marker, so it survives."""
+        fallback_openrouter.clear_deprecation_alerts()
+        try:
+            msg = (
+                "Grok 4.1 Fast is deprecated. xAI recommends switching to Grok 4.3. "
+                "The model was x-ai/grok-4.1-fast and the prompt was: Will inflation fall?"
+            )
+            assert fallback_openrouter._record_deprecation_if_matched("x-ai/grok-4.1-fast", msg) is True
+            assert len(fallback_openrouter._DEPRECATION_ALERTS) == 1
+        finally:
+            fallback_openrouter.clear_deprecation_alerts()
+
+    def test_real_spend_cap_403_still_classifies_as_credit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Positive control, and the one that matters: truncation must not disarm the fix.
+
+        OpenRouter's own spend-cap wording precedes any echo marker, so the drained-key
+        403 keeps falling back and keeps being credit-classified.
+        """
+        monkeypatch.setattr(
+            fallback_openrouter, "classify_donated_key_state", MagicMock(return_value=DonatedKeyState.DRAINED)
+        )
+        exc = Exception(PRODUCTION_KEY_LIMIT_403)
+        assert should_retry_with_general_key(exc) is True
+        assert is_credit_caused_error(exc) is True
+        assert is_suppressible_credit_error(exc) is True
+
+
 class TestProbeFailureCannotVetoRouting:
     """An unanswerable ``/auth/key`` probe must never abort the fallback it is annotating.
 
