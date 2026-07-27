@@ -716,6 +716,71 @@ class TestAgainstRealHistoricalData:
         assert checked >= 50, f"expected to exercise dozens of real comments, only hit {checked}"
 
 
+class TestAgainstCheckedInMiniComments:
+    """The CI floor for the real-comment trim replay above.
+
+    ``TestAgainstRealHistoricalData`` reads ``scratch/analysis_2026-04/`` — a
+    gitignored local pull — so it skips entirely in CI and the trim/parser
+    round-trip it guards goes unenforced on every PR. This class replays the same
+    invariants over the checked-in miniature
+    (``tests/data/performance_comments_mini.jsonl``, one record per distinct
+    comment shape, built by ``scripts/derive_mini_comment_fixture.py``).
+
+    The miniature comments are small by construction, so the no-op-trim assertion
+    is trivially true for them and is not repeated here. What DOES transfer is the
+    inflation replay: inflating a real comment's research section past the limit
+    and trimming it exercises the same section-budget and block-trim code paths
+    regardless of the seed comment's original size.
+    """
+
+    def _load_mini_comments(self) -> list[str]:
+        from pathlib import (
+            Path,  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # matches this file's local style
+        )
+
+        path = Path(__file__).parent / "data" / "performance_comments_mini.jsonl"
+        with path.open() as f:
+            records = [json.loads(line) for line in f if line.strip()]
+        return [rec["comment_text"] for rec in records if isinstance(rec.get("comment_text"), str)]
+
+    def test_inflated_mini_comments_hold_invariant_and_parse(self) -> None:
+        from metaculus_bot.performance_analysis.parsing import (
+            parse_per_model_forecasts,
+            parse_stacked_marker,
+        )
+
+        comments = self._load_mini_comments()
+        assert comments, "precondition: checked-in miniature must contain comments"
+
+        marker = "### Research Summary"
+        checked = 0
+        for original in comments:
+            idx = original.find(marker)
+            if idx < 0:
+                continue
+            original_forecasts = parse_per_model_forecasts(original)
+            if not original_forecasts:
+                continue
+            original_stacked = parse_stacked_marker(original)
+
+            inflated = (
+                original[: idx + len(marker)] + "\n" + ("filler_token " * 15_000) + "\n" + original[idx + len(marker) :]
+            )
+            assert len(inflated) > COMMENT_CHAR_LIMIT, "precondition: inflated must overflow"
+
+            trimmed = trim_comment(inflated)
+
+            assert len(trimmed) <= COMMENT_CHAR_LIMIT, f"trim exceeded limit ({len(trimmed)})"
+            assert trimmed.lstrip().startswith("#"), "validator invariant violated on a real comment"
+            assert parse_per_model_forecasts(trimmed) == original_forecasts
+            assert parse_stacked_marker(trimmed) == original_stacked
+            checked += 1
+
+        # Every shape carrying the marker plus parseable bullets; a drop here means
+        # the miniature narrowed or the trim stopped round-tripping.
+        assert checked >= 10, f"expected the miniature's marker-bearing comments, only hit {checked}"
+
+
 # ---------------------------------------------------------------------------
 # Per-section budgets + block-aware FORECASTS trim (Model:-line preservation)
 #

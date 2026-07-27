@@ -45,6 +45,10 @@ from metaculus_bot.performance_analysis.parsing import (
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
+# Imported (not re-implemented) so the shape the fixture was DERIVED under and the
+# shape the test RE-CHECKS can never drift into two different definitions.
+from scripts.derive_mini_comment_fixture import comment_shape
+
 # ---------------------------------------------------------------------------
 # parse_stacked_marker
 # ---------------------------------------------------------------------------
@@ -847,7 +851,20 @@ class TestStackedCommentEndToEnd:
 # ---------------------------------------------------------------------------
 
 
+# Big local performance pull. Gitignored, untracked, and rewritten by every
+# ``spring-aib-2026`` collector run, so it is absent in CI and its contents shift
+# between local runs. It stays the BROAD sweep (283 records, every era) but can
+# never be the only cohort — see ``_MINI_FIXTURE_PATH``.
 _PERF_DATA_PATH = Path(__file__).parent.parent / "scratch" / "performance_data.json"
+
+# Checked-in miniature: one record per distinct comment shape, distilled from the
+# big pull by ``scripts/derive_mini_comment_fixture.py`` under a hard invariant —
+# every public per-model parser returns identical output on the miniature and on
+# its full-size source. This is the DETERMINISTIC CI floor for the same
+# assertions, so the attribution guard runs on every PR instead of only for
+# whoever happens to have pulled the big file. ``.jsonl`` (not ``.json``)
+# because ``.gitignore`` carries a repo-wide ``*.json`` rule with no negations.
+_MINI_FIXTURE_PATH = Path(__file__).parent / "data" / "performance_comments_mini.jsonl"
 
 # Independent oracle for "does this comment carry a recoverable Model: line for
 # forecaster index N". Deliberately NOT reusing the production
@@ -880,20 +897,18 @@ def _oracle_recoverable_indices(comment: str) -> set[int]:
     }
 
 
-@pytest.mark.skipif(not _PERF_DATA_PATH.exists(), reason="performance_data.json not checked in")
-class TestRealDataRegression:
-    """Parse stored Metaculus comments and check attributions against real models.
+class _RealCommentAttributionChecks:
+    """Attribution assertions run against a cohort of real archived comments.
 
-    Uses whatever roster the checked-in fixture was collected under. This test
-    does not assume a specific set of models — it just asserts that every
-    forecast whose model name is RECOVERABLE from the comment text comes back
-    named, never index-anonymized `Forecaster N`.
+    Subclasses supply ``records``. Both the checked-in miniature (deterministic,
+    runs in CI) and the big local pull (broad, local-only) inherit the SAME
+    assertions, so the two cohorts can't drift apart — a rule that holds only for
+    the local sweep would be a rule CI never enforces.
+
+    The checks make no assumption about which roster produced the comments. They
+    assert only that every forecast whose model name is RECOVERABLE from the
+    comment text comes back named, never index-anonymized `Forecaster N`.
     """
-
-    @pytest.fixture(scope="class")
-    def records(self):
-        with open(_PERF_DATA_PATH) as f:
-            return json.load(f)
 
     def test_records_with_a_recoverable_model_name_parse_to_it(self, records):
         # A `Forecaster N` key is only a parser bug when the comment actually
@@ -969,6 +984,76 @@ class TestRealDataRegression:
                 f"post {rec['post_id']} was treated as unattributable but contains a Model: "
                 "line the oracle did not match — refresh the oracle or the exemption"
             )
+
+
+class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
+    """The CI floor: same attribution checks, on the checked-in miniature.
+
+    Not skipif-gated — the fixture is committed, so these run on every PR. If the
+    file is ever lost, the failure is a loud missing-file error rather than a
+    silent skip, which is the whole point of this class existing.
+    """
+
+    @pytest.fixture(scope="class")
+    def records(self):
+        with _MINI_FIXTURE_PATH.open() as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_fixture_covers_every_shape_the_parsers_branch_on(self, records):
+        # The miniature is only a meaningful floor if it still spans the comment
+        # shapes the parsers treat differently. Each record carries the shape it
+        # was selected for; assert the set is intact and duplicate-free so a
+        # careless hand-edit or a stale regeneration can't quietly narrow
+        # coverage to, say, only well-formed modern comments.
+        shapes = [tuple(rec["_shape"]) for rec in records]
+        assert len(shapes) == len(set(shapes)), f"duplicate shapes in miniature: {shapes}"
+        attribution_states = {shape[0] for shape in shapes}
+        assert attribution_states == {"map", "nomap"}, (
+            f"miniature must cover both attributable and unattributable comments, got {attribution_states}"
+        )
+        assert {shape[1] for shape in shapes} == {"trim", "intact"}, "miniature must cover trimmed and intact comments"
+        assert {shape[2] for shape in shapes} == {"res", "nores"}, (
+            "miniature must cover comments with and without the ### Research Summary boundary marker"
+        )
+        assert {shape[4] for shape in shapes} == {"named", "anon"}, (
+            "miniature must cover both fully-named and anonymized-fallback comments"
+        )
+        # Every question type the pipeline publishes, so a type-specific parser
+        # regression can't hide behind a binary-only fixture.
+        assert {rec["type"] for rec in records} == {"binary", "numeric", "discrete", "multiple_choice"}
+
+    def test_miniature_still_matches_its_recorded_shape(self, records):
+        # Guards the fixture against edits that change what a record exercises.
+        # `_shape` is metadata written at derivation time; recomputing it from the
+        # comment text catches a hand-edited comment whose label no longer fits.
+        for rec in records:
+            recomputed = comment_shape(rec)
+            assert list(recomputed) == rec["_shape"], (
+                f"post {rec['post_id']} no longer matches its recorded shape: "
+                f"{rec['_shape']} -> {list(recomputed)}; regenerate with "
+                "scripts/derive_mini_comment_fixture.py"
+            )
+
+
+@pytest.mark.skipif(not _PERF_DATA_PATH.exists(), reason="big local performance pull not present")
+class TestRealDataRegression(_RealCommentAttributionChecks):
+    """The broad local sweep: same checks across all 283 records, every era.
+
+    Local-only by nature (the pull is gitignored and rewritten by the collector).
+    Kept because breadth catches shapes the miniature hasn't been taught yet;
+    ``TestMiniFixtureAttribution`` is what guarantees the checks run at all.
+    """
+
+    @pytest.fixture(scope="class")
+    def records(self):
+        # Re-check existence rather than trusting the class-level skipif: that
+        # predicate is evaluated once at COLLECTION, and the collector rewrites
+        # this file in place, so a pull landing mid-run would turn a skip into a
+        # FileNotFoundError at setup.
+        if not _PERF_DATA_PATH.exists():
+            pytest.skip("big local performance pull disappeared between collection and setup")
+        with open(_PERF_DATA_PATH) as f:
+            return json.load(f)
 
     def test_known_sample_post_matches_expected_models(self, records):
         # post 42631 (Oscar winner question) is in the March cohort — sampled
