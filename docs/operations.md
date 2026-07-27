@@ -74,8 +74,11 @@ Diagnosing auth errors: an OpenRouter 401/402 on an OpenAI or Anthropic call
 means suspect the donated key first (it's always tried first for those
 providers). A 401/402 on Grok, Qwen, or Perplexity is always the personal key
 (the donated key 404s on those). A `google-genai` 401 or quota error is always
-`GOOGLE_API_KEY`. A `403 moderation` or `429 rate limit` is not a key problem;
-the wrapper deliberately does not fall back on those.
+`GOOGLE_API_KEY`. A `403` splits two ways: one whose body says
+`Key limit exceeded` is a drained spend cap and DOES fall back to the personal
+key, while any other `403 moderation` does not (both keys would refuse the same
+prompt). A `429 rate limit` is not a key defect but does fall back, since BYOK
+quotas are per-key. See "What a dry donated key actually returns" below.
 
 ## Environment flags
 
@@ -231,11 +234,9 @@ CI. Two paths are gated, because either one alone would keep the check red:
 1. The floor breach. `cli.py` skips the `sys.exit(1)` and logs an INFO line
    saying the breach was observed but alerting is suppressed until the resume
    date.
-2. The credit-caused donated-to-personal key fallbacks. When the donated key
-   actually runs dry it returns 402 / insufficient credit, which is a
-   fallback-worthy key-scoped error, and each fallback normally counts toward
-   `alertable`. `fallback_openrouter.py` now tracks those credit-caused
-   fallbacks in `_credit_key_fallback_count`, a subset of the all-causes
+2. The credit-caused donated-to-personal key fallbacks. Each fallback normally
+   counts toward `alertable`. `fallback_openrouter.py` tracks the suppressible
+   subset in `_credit_key_fallback_count`, a subset of the all-causes
    `_generic_key_fallback_count`, and `cli.py` subtracts the subset back out
    while alerting is suppressed.
 
@@ -244,6 +245,66 @@ rather than an empty wallet: 401 invalid or disabled key, 404 "no allowed
 providers", 429 rate limit, and the guardrail / data-policy block. Bot-side
 degradation (forecaster drops, stacker fallbacks, research timeouts) is
 untouched by the suppression.
+
+### What a dry donated key actually returns (and the drained-vs-revoked probe)
+
+A breached per-key spend cap does **not** come back as the 402 OpenRouter's
+error docs describe. It comes back as HTTP **403** with the message
+`Key limit exceeded (total limit)`, and litellm has no 403 branch for
+OpenRouter, so it always surfaces as a bare `litellm.APIError` whose body
+carries a `"code":403` field. On 2026-07-26 that cost a tournament run two of
+three forecasters, native search, the AskNews summarizer, the financial-data
+classifier, prediction-market keyword extraction, and both gap-fill passes: the
+wrapper's negative rule vetoed any message containing "403" (written for content
+moderation, where both keys really would refuse), so the operator's funded
+personal key was never tried. `_is_credit_message` now matches the phrase
+`key limit exceeded`, which flips both the fallback decision and the credit
+classification through the single shared helper.
+
+The cue has to be the full phrase. `limit exceeded` alone is a substring of
+`rate limit exceeded: free-models-per-day`, so the short form would classify
+every 429 as an empty wallet and silently exempt real rate-limit breakage from
+alerting for the whole suppression window.
+
+Text alone cannot tell a genuinely **drained** key from one Metaculus
+**revoked** or **re-capped to zero** — all three produce that same 403 — and the
+operator wants opposite CI colors for them. So on the first spend-cap failure of
+a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
+`/auth/key` endpoint once (5s timeout, verdict cached for the process) and
+classifies:
+
+| `/auth/key` says | State | Alerting |
+| --- | --- | --- |
+| 200, cap > 0, nothing remaining | `drained` | suppressed — the expected empty wallet |
+| 200, cap == 0 | `zeroed` | **red** — Metaculus cut us off, never an "empty wallet" |
+| 401 / 404 | `revoked` | **red** — key is gone, not empty |
+| 200, money remaining | `funded` | **red** — the failure was not about credit |
+| probe failed, or no donated key configured | `unknown` | **red** — fail safe |
+
+Only `drained` is subtracted from `alertable`. A probe that errors or times out
+classifies as `unknown` and stays red, so a broken probe can never silently turn
+a red run green. The state is logged as
+`DONATED_KEY_STATE: state=<state>` (INFO for `drained`, WARNING for everything
+else) and is echoed in the end-of-run summary as `donated_key=<state>` whenever a
+probe actually ran.
+
+Fallback **routing** stays purely textual and is deliberately not gated on the
+probe: OpenRouter caches these balance figures, so a stale read reporting
+`funded` must never be able to strand the ensemble on a dry key — that is the
+exact failure this change exists to fix. The probe governs the alerting decision
+only.
+
+One related hardening rides along. OpenRouter moderation 403 bodies include
+`flagged_input`, up to ~100 characters of our own prompt replayed back, and a
+forecasting prompt full of dollar figures and bill numbers can easily contain the
+token `402`. A bare `402` substring match therefore read an ordinary moderation
+refusal as an empty wallet — billing the personal key for a call that would
+refuse again, and exempting a real moderation block from alerting. The bare
+digits are now only trusted when nothing in the body looks like a moderation
+refusal (`moderation`, `forbidden`, `flagged_input`, `flagged for`). Word cues
+only, deliberately: a genuine 402 links to a key hash that has roughly a 1-in-11
+chance of containing the substring `403`, and reading that as moderation would
+break the long-standing 402 fallback.
 
 Nothing is silenced. Every `CREDIT_*` marker line, `CREDIT_FLOOR_BREACH`
 included, and every `PAID PERSONAL-KEY FALLBACK` warning fires exactly as

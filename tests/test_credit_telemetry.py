@@ -13,28 +13,45 @@ needs real keys. Pins:
   and never tripping the floor even when its usage is huge,
 - the dated credit-alert suppression predicate (``credit_alerts_active``), which
   gates only the EXIT status in cli.main — the telemetry here is window-agnostic
-  and keeps reporting a breach either way.
+  and keeps reporting a breach either way,
+- the drained-vs-revoked donated-key discriminator (``classify_donated_key_state``),
+  which decides whether a credit-shaped failure is the EXPECTED empty wallet
+  (suppressible) or real breakage (must stay red).
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import date
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, _date_env, credit_alerts_active
-from metaculus_bot.credit_telemetry import CreditTelemetry, _fetch_snapshot
+from metaculus_bot.credit_telemetry import (
+    DONATED_KEY_PROBE_TIMEOUT_S,
+    CreditTelemetry,
+    DonatedKeyState,
+    _fetch_snapshot,
+    classify_donated_key_state,
+    get_probed_donated_key_state,
+    reset_donated_key_state_cache,
+)
 
 DONATED_KEY = "sk-or-v1-DONATEDsecretAB12"
 PERSONAL_KEY = "sk-or-v1-PERSONALsecretCD34"
 
 
-def _payload(limit_remaining: float | None, usage: float | None) -> dict[str, Any]:
-    return {"label": "test", "limit_remaining": limit_remaining, "usage": usage}
+def _payload(limit_remaining: float | None, usage: float | None, limit: float | None = None) -> dict[str, Any]:
+    return {"label": "test", "limit": limit, "limit_remaining": limit_remaining, "usage": usage}
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://openrouter.ai/api/v1/auth/key")
+    return httpx.HTTPStatusError(str(status), request=request, response=httpx.Response(status, request=request))
 
 
 def _set_keys(
@@ -54,7 +71,8 @@ def _patch_fetch(responses_by_key: dict[str, list[Any]]):
     Successive calls for the same key consume successive entries (start, end).
     """
 
-    def fake_fetch(api_key: str) -> dict[str, Any]:
+    def fake_fetch(api_key: str, *, timeout: float | None = None) -> dict[str, Any]:
+        del timeout  # callers vary it (the mid-run probe uses a shorter one); irrelevant here
         item = responses_by_key[api_key].pop(0)
         if isinstance(item, Exception):
             raise item
@@ -343,3 +361,173 @@ class TestMalformedButOkPayload:
         assert snapshot is None
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any("key=donated phase=start fetch failed (AttributeError)" in msg for msg in warnings)
+
+
+class TestDonatedKeyStateProbe:
+    """The drained-vs-revoked discriminator.
+
+    A dry donated key and a revoked one both surface as the same HTTP 403
+    "Key limit exceeded (total limit)" text, but the operator wants opposite CI
+    colors: a genuinely drained key is the expected state while they self-fund the
+    season (green), while a revoked key or one Metaculus re-capped to zero is real
+    breakage (red). Text cannot tell those apart, so we ask OpenRouter's free,
+    read-only ``/auth/key`` endpoint.
+
+    Every failure mode classifies as UNKNOWN, and UNKNOWN is NOT suppressible, so
+    a broken or slow probe can never silently green a run.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_probe_cache(self) -> Iterator[None]:
+        reset_donated_key_state_cache()
+        yield
+        reset_donated_key_state_cache()
+
+    def test_drained_key_classifies_as_drained(self, monkeypatch) -> None:
+        """The live production shape: $850 cap, nothing left (OpenRouter clamps
+        ``limit_remaining`` at 0 even when the true arithmetic is negative).
+        """
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
+            assert classify_donated_key_state() is DonatedKeyState.DRAINED
+
+    def test_negative_remaining_still_drained(self, monkeypatch) -> None:
+        """Defensive: if OpenRouter ever stops clamping, over-spend is still drained."""
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(-0.81, 4.39, limit=850.0)]}):
+            assert classify_donated_key_state() is DonatedKeyState.DRAINED
+
+    def test_zero_cap_classifies_as_zeroed_not_drained(self, monkeypatch) -> None:
+        """A key re-capped to $0 never had an allocation to spend, so this is
+        Metaculus cutting us off — real breakage, and it must NOT be suppressed.
+        """
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=0.0)]}):
+            assert classify_donated_key_state() is DonatedKeyState.ZEROED
+
+    def test_funded_key_classifies_as_funded(self, monkeypatch) -> None:
+        """Money remaining means the 403 was not about money at all."""
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(12.50, 4.39, limit=850.0)]}):
+            assert classify_donated_key_state() is DonatedKeyState.FUNDED
+
+    @pytest.mark.parametrize("status", [401, 404])
+    def test_revoked_or_missing_key_classifies_as_revoked(self, monkeypatch, status: int) -> None:
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_http_status_error(status)]}):
+            assert classify_donated_key_state() is DonatedKeyState.REVOKED
+
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    def test_other_http_status_classifies_as_unknown(self, monkeypatch, status: int) -> None:
+        """A throttled or broken endpoint tells us nothing about the wallet."""
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_http_status_error(status)]}):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
+    def test_network_error_classifies_as_unknown(self, monkeypatch) -> None:
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [httpx.ReadTimeout("slow")]}):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
+    @pytest.mark.parametrize("bad_data", [None, [1, 2, 3], "unexpected", 42])
+    def test_malformed_payload_classifies_as_unknown(self, monkeypatch, bad_data) -> None:
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [bad_data]}):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
+    def test_uncapped_key_classifies_as_unknown(self, monkeypatch) -> None:
+        """No cap means no cap to exceed; we can't call it drained, so stay red."""
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(None, 23.60, limit=None)]}):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
+    def test_missing_env_var_classifies_as_unknown_without_any_fetch(self, monkeypatch) -> None:
+        """No donated key configured → no HTTP at all. This is also what keeps the
+        probe hermetic in tests that don't stub it: the suite's network guard is
+        never even reached.
+        """
+        _set_keys(monkeypatch, donated=None, personal=None)
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key") as fetch:
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+        fetch.assert_not_called()
+
+    def test_verdict_is_cached_for_the_run(self, monkeypatch) -> None:
+        """Probe once per run, not once per failed call — a run that loses every
+        donated-key call must not fire one HTTP request per failure.
+        """
+        _set_keys(monkeypatch, personal=None)
+        fetch = MagicMock(return_value=_payload(0.0, 4.39, limit=850.0))
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", fetch):
+            assert classify_donated_key_state() is DonatedKeyState.DRAINED
+            assert classify_donated_key_state() is DonatedKeyState.DRAINED
+            assert classify_donated_key_state() is DonatedKeyState.DRAINED
+        assert fetch.call_count == 1
+
+    def test_failed_probe_is_also_cached(self, monkeypatch) -> None:
+        """Caching UNKNOWN matters as much as caching a verdict: without it, a dead
+        endpoint costs one timeout per failed LLM call.
+        """
+        _set_keys(monkeypatch, personal=None)
+        fetch = MagicMock(side_effect=httpx.ReadTimeout("slow"))
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", fetch):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+        assert fetch.call_count == 1
+
+    def test_probe_uses_a_short_timeout(self, monkeypatch) -> None:
+        """The probe can run mid-run, so it must not be able to stall a forecast.
+        The shared ``fetch_auth_key`` default (15s) is too long for that path.
+        """
+        assert DONATED_KEY_PROBE_TIMEOUT_S <= 5.0
+        _set_keys(monkeypatch, personal=None)
+        fetch = MagicMock(return_value=_payload(0.0, 4.39, limit=850.0))
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", fetch):
+            classify_donated_key_state()
+        assert fetch.call_args.kwargs["timeout"] == DONATED_KEY_PROBE_TIMEOUT_S
+
+    def test_probed_state_is_none_until_the_probe_runs(self, monkeypatch) -> None:
+        """cli renders the verdict only when it was actually established, so
+        "never probed" must be distinguishable from every real verdict.
+        """
+        assert get_probed_donated_key_state() is None
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
+            classify_donated_key_state()
+        assert get_probed_donated_key_state() is DonatedKeyState.DRAINED
+
+    def test_reset_clears_the_cache(self, monkeypatch) -> None:
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
+            classify_donated_key_state()
+        reset_donated_key_state_cache()
+        assert get_probed_donated_key_state() is None
+
+    @pytest.mark.parametrize(
+        "responses, expected_state",
+        [
+            ({DONATED_KEY: [_http_status_error(401)]}, "revoked"),
+            ({DONATED_KEY: [_payload(0.0, 4.39, limit=0.0)]}, "zeroed"),
+        ],
+    )
+    def test_breakage_states_log_a_warning(self, monkeypatch, caplog, responses, expected_state: str) -> None:
+        """A revoked or zeroed donated key is the one outcome the operator has to
+        act on, so it gets a WARNING rather than only an exit code.
+        """
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch(responses), caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            classify_donated_key_state()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(f"DONATED_KEY_STATE: state={expected_state}" in msg for msg in warnings), warnings
+
+    def test_drained_state_logs_at_info_not_warning(self, monkeypatch, caplog) -> None:
+        """A drained key is expected during the self-funding window; logging it as a
+        WARNING would train the operator to ignore the marker that matters.
+        """
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(0.0, 4.39, limit=850.0)]}):
+            with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+                classify_donated_key_state()
+
+        assert any("DONATED_KEY_STATE: state=drained" in r.getMessage() for r in caplog.records)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

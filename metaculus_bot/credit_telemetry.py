@@ -26,6 +26,12 @@ total spend on a limit-bearing key. Per-run spend therefore comes from the
 as the fallback for uncapped keys (personal: ``limit_remaining`` is null and
 spend does land in ``usage``).
 
+This module also owns the DRAINED-vs-REVOKED discriminator
+(``classify_donated_key_state``) that ``fallback_openrouter`` consults when a
+donated-key call fails with OpenRouter's spend-cap 403. Same endpoint, same
+parser, so the "how much is left on the donated key" question has one
+implementation.
+
 Telemetry must never fail or block a run: every fetch error is logged as a
 WARNING and treated as "unknown", and unknown never triggers the floor exit.
 """
@@ -35,12 +41,13 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import httpx
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS, fetch_auth_key
-from metaculus_bot.constants import OPENROUTER_CREDIT_FLOOR_USD
+from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, OPENROUTER_CREDIT_FLOOR_USD
 
 logger = logging.getLogger(__name__)
 
@@ -180,3 +187,127 @@ class CreditTelemetry:
                 )
                 donated_below_floor = True
         return donated_below_floor
+
+
+# --- Drained-vs-revoked discriminator for the donated key -------------------
+#
+# OpenRouter reports a breached per-key spend cap as HTTP 403 with the text
+# "Key limit exceeded (total limit)", and reports a revoked key as HTTP 401 on
+# an LLM call. But a key that Metaculus RE-CAPPED TO ZERO produces the exact
+# same 403 text as a key that simply spent its whole allocation, and the
+# operator wants opposite CI colors for those: a genuinely drained key is the
+# expected state while they self-fund the season (green), a zeroed or revoked
+# one is real breakage (red). No amount of text matching can separate them, so
+# we ask the free, read-only /auth/key endpoint what the cap actually looks
+# like. See ``fallback_openrouter.is_suppressible_credit_error``.
+
+
+class DonatedKeyState(StrEnum):
+    """What ``/auth/key`` says about the donated key, in alerting terms.
+
+    Only ``DRAINED`` is the expected empty wallet. Every other state means the
+    "expected empty wallet" explanation does NOT hold, so the run stays alertable
+    — including ``UNKNOWN``, which is how every probe failure classifies. Failing
+    safe matters more here than being informative: a broken probe must never be
+    able to silently turn a red run green.
+    """
+
+    DRAINED = "drained"  # positive cap, nothing left — spent its allocation
+    ZEROED = "zeroed"  # cap itself is 0 — Metaculus cut us off, never an "empty wallet"
+    REVOKED = "revoked"  # key rejected (401/404) — gone, not empty
+    FUNDED = "funded"  # money remains, so the failure was not about credit at all
+    UNKNOWN = "unknown"  # probe could not answer (no key configured, endpoint error, odd payload)
+
+
+# Short by design: this probe can fire mid-run, so it must not be able to stall a
+# forecast. The shared ``fetch_auth_key`` default (15s) is fine for the CLI and the
+# start/end telemetry, which run outside the forecasting window.
+DONATED_KEY_PROBE_TIMEOUT_S: float = 5.0
+
+# One probe per process. A run that loses every donated-key call would otherwise
+# fire one HTTP request per failure, and caching failures matters as much as caching
+# verdicts (a dead endpoint would otherwise cost one timeout per failed call).
+# ``None`` means "never probed", which cli renders differently from any verdict.
+_probed_donated_key_state: DonatedKeyState | None = None
+
+
+def get_probed_donated_key_state() -> DonatedKeyState | None:
+    """The cached verdict, or ``None`` if nothing this run needed to probe."""
+    return _probed_donated_key_state
+
+
+def reset_donated_key_state_cache() -> None:
+    """Clear the cached verdict. Used by tests; not for production code."""
+    global _probed_donated_key_state
+    _probed_donated_key_state = None
+
+
+def _probe_donated_key_state() -> DonatedKeyState:
+    """One ``/auth/key`` read on the donated key, classified. Never raises."""
+    env_var, _ = KEY_SPECS["donated"]
+    api_key = os.getenv(env_var)
+    if not api_key:
+        # No donated key configured, so there is no donated wallet to be empty.
+        # Returning early also keeps this probe free of network I/O in tests that
+        # don't stub it.
+        return DonatedKeyState.UNKNOWN
+    try:
+        data = fetch_auth_key(api_key, timeout=DONATED_KEY_PROBE_TIMEOUT_S)
+        # Read the fields INSIDE the try for the same reason ``_fetch_snapshot``
+        # does: a 200 whose body carries a non-mapping ``data`` makes ``.get``
+        # raise AttributeError, and that must degrade to UNKNOWN like any other
+        # inconclusive answer.
+        limit_usd = _as_float(data.get("limit"))
+        remaining_usd = _as_float(data.get("limit_remaining"))
+    except httpx.HTTPStatusError as exc:
+        # 401 = key rejected, 404 = key no longer exists. Anything else (429 on the
+        # balance endpoint, a 5xx) tells us nothing about the wallet.
+        if exc.response.status_code in (401, 404):
+            return DonatedKeyState.REVOKED
+        return DonatedKeyState.UNKNOWN
+    except (httpx.HTTPError, ValueError, KeyError, AttributeError):
+        return DonatedKeyState.UNKNOWN
+
+    if limit_usd is None or remaining_usd is None:
+        # An uncapped key has no cap to exceed, so a spend-cap failure on one is
+        # unexplained rather than expected.
+        return DonatedKeyState.UNKNOWN
+    if limit_usd <= 0:
+        return DonatedKeyState.ZEROED
+    if remaining_usd > 0:
+        return DonatedKeyState.FUNDED
+    # OpenRouter clamps ``limit_remaining`` at 0 even when the true arithmetic is
+    # negative (live: limit=850, usage=4.39, byok_usage=846.42 → reported 0.00), so
+    # ``<= 0`` rather than ``== 0``.
+    return DonatedKeyState.DRAINED
+
+
+def classify_donated_key_state() -> DonatedKeyState:
+    """Whether the donated key is genuinely drained, or broken in some other way.
+
+    Blocking HTTP, so callers on the event loop should hand this to a thread. Runs
+    at most once per process; every subsequent call reads the cache.
+    """
+    global _probed_donated_key_state
+    if _probed_donated_key_state is not None:
+        return _probed_donated_key_state
+
+    state = _probe_donated_key_state()
+    _probed_donated_key_state = state
+    if state is DonatedKeyState.DRAINED:
+        logger.info(
+            "DONATED_KEY_STATE: state=%s — the donated OpenRouter key spent its whole allocation "
+            "with the cap itself intact. Expected while the operator self-funds the season, so "
+            "credit-caused personal-key fallbacks are exempt from alerting until %s.",
+            state.value,
+            CREDIT_ALERT_RESUME_DATE.isoformat(),
+        )
+    else:
+        logger.warning(
+            "DONATED_KEY_STATE: state=%s — a credit-shaped donated-key failure that is NOT an "
+            "expected drained wallet (zeroed = cap set to 0, revoked = key rejected, funded = the "
+            "key still has money so the failure was not about credit, unknown = the probe could "
+            "not answer). Personal-key fallbacks stay alertable, so this run will exit non-zero.",
+            state.value,
+        )
+    return state

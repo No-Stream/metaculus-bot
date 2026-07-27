@@ -20,7 +20,7 @@ from metaculus_bot.constants import (
     credit_alerts_active,
     env_flag_enabled,
 )
-from metaculus_bot.credit_telemetry import CreditTelemetry
+from metaculus_bot.credit_telemetry import CreditTelemetry, get_probed_donated_key_state
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_credit_key_fallback_count,
@@ -211,6 +211,12 @@ def main() -> None:
     # keeps its full weight, because 401/404/429/guardrail each mean real
     # breakage. Each event is still counted exactly once: generic adds it, and at
     # most one subset subtracts it.
+    #
+    # ``credit_fallback`` counts only the SUPPRESSIBLE credit subset — the
+    # donated key genuinely drained. A key that was revoked or re-capped to zero
+    # returns the same "Key limit exceeded" text but is classified separately by
+    # ``fallback_openrouter.is_suppressible_credit_error`` (which probes
+    # /auth/key), so it stays inside the generic total and keeps this run red.
     alerts_active = credit_alerts_active()
     generic_fallback = get_generic_key_fallback_count()
     donated_404 = get_donated_404_fallback_count()
@@ -224,9 +230,14 @@ def main() -> None:
             else f" with {suppressed_credit_fallback} credit event(s) suppressed until "
             f"{CREDIT_ALERT_RESUME_DATE.isoformat()}"
         )
+        # Only rendered when a spend-cap failure actually made the wrapper probe the
+        # donated key. Omitted otherwise, because "unknown" would read as a failed
+        # probe rather than "no run this shape ever needed one".
+        probed_donated_key_state = get_probed_donated_key_state()
+        donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
         logger.warning(
             "Run completed with %d alertable degradation event(s) "
-            "(bot=%d, personal_key_fallback=%d of which donated_404=%d, credit=%d%s); "
+            "(bot=%d, personal_key_fallback=%d of which donated_404=%d, credit=%d%s%s); "
             "exiting non-zero so CI marks this run red.",
             alertable,
             bot_alertable,
@@ -234,6 +245,7 @@ def main() -> None:
             donated_404,
             credit_fallback,
             suppression_note,
+            donated_key_note,
         )
         sys.exit(1)
 
