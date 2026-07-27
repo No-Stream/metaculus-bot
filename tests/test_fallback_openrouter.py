@@ -2,7 +2,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from litellm.exceptions import APIError
+from litellm.exceptions import APIError, RateLimitError
 
 from metaculus_bot import fallback_openrouter
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE
@@ -427,6 +427,28 @@ class TestCreditSuppressibility:
         probe = self._pin_state(monkeypatch, DonatedKeyState.DRAINED)
         assert is_suppressible_credit_error(Exception(message)) is False
         probe.assert_not_called()
+
+    def test_reported_429_echoing_402_is_not_exempted_from_alerting(self) -> None:
+        """A rate limit must stay alertable even when the body echoes "402".
+
+        The mirror image of the terse-402 case, and the more dangerous direction. A
+        reported 429 whose replayed prompt contains "402" and no moderation word
+        routes correctly on the status — but while the classification was text-only
+        it read the bare digits as an empty wallet, so a genuine rate-limit fallback
+        was subtracted from ``alertable`` for the whole suppression window. Same
+        failure the synthesis predicted for a too-short credit cue, reached through
+        the numeric door instead.
+        """
+        body = (
+            "OpenrouterException - "
+            '{"error":{"message":"Rate limited","code":429,'
+            '"metadata":{"input":"Will the $402 billion package pass before Aug 18 2026?"}}}'
+        )
+        exc = RateLimitError(message=body, model="openrouter/openai/gpt-5.6-sol", llm_provider="openrouter")
+        assert "402" in str(exc)  # the poisoning cue is present
+        assert should_retry_with_general_key(exc) is True  # 429 is key-scoped: still falls back
+        assert is_credit_caused_error(exc) is False
+        assert is_suppressible_credit_error(exc) is False
 
     def test_terse_reported_402_is_credit_classified_like_it_routes(self) -> None:
         """Routing and alerting must answer "was this about money?" identically.
