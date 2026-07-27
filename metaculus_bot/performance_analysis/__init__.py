@@ -13,6 +13,7 @@ from metaculus_bot.performance_analysis.analysis import (
     no_bias_check,
     numeric_pit_analysis,
     per_model_binary_scores,
+    per_model_cohort,
     stacking_effectiveness,
 )
 from metaculus_bot.performance_analysis.audit import (
@@ -34,8 +35,10 @@ from metaculus_bot.performance_analysis.collector import (
 )
 from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
+    anonymous_model_key,
     detect_historical_stacker_signature,
     extract_model_display_name_from_reasoning,
+    is_anonymous_model_key,
     parse_forecaster_model_map,
     parse_inferred_stacker_outcome,
     parse_per_model_forecasts,
@@ -64,6 +67,7 @@ from metaculus_bot.performance_analysis.stacker_detection import (
 __all__ = [
     "DetectorVerdict",
     "annotate_forecaster_bullets_with_models",
+    "anonymous_model_key",
     "binary_log_score",
     "binary_summary",
     "brier_score",
@@ -85,6 +89,7 @@ __all__ = [
     "get_stacker_outcome_field",
     "has_stacker_body_marker",
     "has_was_stacked_flag",
+    "is_anonymous_model_key",
     "load_combined_dataset",
     "load_dataset",
     "mc_log_score",
@@ -101,6 +106,7 @@ __all__ = [
     "parse_stacked_marker",
     "parse_stacker_outcome_marker",
     "per_model_binary_scores",
+    "per_model_cohort",
     "rank_our_models_by_accuracy",
     "save_dataset",
     "select_cohort",
