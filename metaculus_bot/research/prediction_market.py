@@ -54,14 +54,17 @@ from rapidfuzz import fuzz
 from metaculus_bot.constants import (
     MARKET_RELEVANCE_CONF_MIN,
     MARKET_RELEVANCE_OVERLAP_MIN,
+    PREDICTION_MARKET_KEYWORD_BACKOFFS,
     PREDICTION_MARKET_KEYWORD_STRATEGY_ENV,
     PREDICTION_MARKET_KEYWORD_STRATEGY_VALID,
+    PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
     PREDICTION_MARKET_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     env_flag_enabled,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
+from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.http_fetch import build_session, read_body_capped, read_body_snippet
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -292,7 +295,7 @@ _SNAPSHOT_CACHE: dict[tuple[int, str], MarketSnapshot] = {}
 # entity-recall path; when it dies (HTTP/transport/parse error, or the generous
 # safety ceiling) the provider still returns fuzzy-over-events matches, so the
 # failure is otherwise INVISIBLE — no counter, status="ok" (the 2026-07-25
-# observability hole: research_provider_timeouts=0 while the path was dead).
+# observability hole: research_provider_failures=0 while the path was dead).
 # The orchestrator folds this into alertable_count, so a series path that's dead
 # every question reddens CI instead of vanishing. A one-off transient bumps it
 # once (an accepted rare false alarm, mirroring gap_fill_v2_error_count).
@@ -321,43 +324,49 @@ def reset_series_degradation_counter() -> None:
     _KALSHI_SERIES_FETCH_FAILURES = 0
 
 
-# Per-run count of LOST prediction-market platform fetches: one per platform whose
-# status token came out a loss (`error(all_queries_failed)` / `partial(...)` / an
-# escaped transport error), plus one per whole-provider failure (snapshot timeout,
-# outer-except, keyword extraction producing nothing). Operator decision 2026-07-25:
-# alert on ANY platform failure rather than only a total blackout — maximum
-# sensitivity, accepting that one flaky venue can redden most runs. The provider
-# soft-fails internally, so like the series counter this is the only path by which a
-# venue outage reaches CI. Module-level like the caches => accumulates per run.
-_PLATFORM_FETCH_FAILURES: int = 0
+# Per-run count of LOST prediction-market SOURCES: one per platform whose status
+# token came out a loss (`error(all_queries_failed)` / `partial(...)` / an escaped
+# transport error), one per whole-provider failure (snapshot timeout, outer-except),
+# and one when keyword extraction produces nothing. That last cause is why the name
+# is "source losses" rather than "platform failures" (renamed 2026-07-26): a dead
+# keyword extractor silences all four venues without any venue failing, and the old
+# name read as "a venue went down". The two causes are distinguished per-source in
+# `MarketSnapshot.sources` (`keywords:error(no_queries)` vs `polymarket:error(...)`),
+# which rides both the published comment and the schema-v2 research archive.
+# Operator decision 2026-07-25: alert on ANY source loss rather than only a total
+# blackout — maximum sensitivity, accepting that one flaky venue can redden most
+# runs. The provider soft-fails internally, so like the series counter this is the
+# only path by which an outage reaches CI. Module-level like the caches =>
+# accumulates per run.
+_SOURCE_LOSSES: int = 0
 
 
-def _bump_platform_failures() -> None:
-    global _PLATFORM_FETCH_FAILURES
-    _PLATFORM_FETCH_FAILURES += 1
+def _bump_source_loss() -> None:
+    global _SOURCE_LOSSES
+    _SOURCE_LOSSES += 1
 
 
-def prediction_market_platform_failures() -> int:
-    """Per-run count of lost prediction-market platform fetches (folded into alertable_count)."""
-    return _PLATFORM_FETCH_FAILURES
+def prediction_market_source_losses() -> int:
+    """Per-run count of lost prediction-market sources (folded into alertable_count)."""
+    return _SOURCE_LOSSES
 
 
-def reset_platform_degradation_counter() -> None:
-    """Zero the platform-degradation counter at run start (see
+def reset_source_loss_counter() -> None:
+    """Zero the source-loss counter at run start (see
     `reset_series_degradation_counter` for why module-scoped counters need this)."""
-    global _PLATFORM_FETCH_FAILURES
-    _PLATFORM_FETCH_FAILURES = 0
+    global _SOURCE_LOSSES
+    _SOURCE_LOSSES = 0
 
 
 def _reset_session_caches() -> None:
     """Clear all per-session caches. Called between tests and at session start."""
-    global _KALSHI_SERIES_FETCH_FAILURES, _PLATFORM_FETCH_FAILURES
+    global _KALSHI_SERIES_FETCH_FAILURES, _SOURCE_LOSSES
     _KALSHI_CACHE.clear()
     _PREDICTIT_CACHE.clear()
     _KEYWORD_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
     _KALSHI_SERIES_FETCH_FAILURES = 0
-    _PLATFORM_FETCH_FAILURES = 0
+    _SOURCE_LOSSES = 0
 
 
 def _get_session() -> aiohttp.ClientSession:
@@ -474,7 +483,18 @@ class KeywordExtractor:
         # transient LLM errors -- those soft-fall to "" so the snapshot still runs.
         llm = build_llm_with_openrouter_fallback(**PREDICTION_MARKET_KEYWORD_LLM_CONFIG)
         try:
-            content = await llm.invoke(prompt)
+            # The config pins allowed_tries=1, so this wrapper is the only retry
+            # layer: it gives the call its own wall cap (previously the snapshot-level
+            # wait_for was the sole bound, and a stalled extractor took the whole
+            # snapshot down with it) and replaces forecasting-tools' un-gated
+            # random.uniform(5, 10) tenacity sleep with one bounded, elapsed-gated
+            # backoff that never fires on a deterministic client error.
+            content = await invoke_with_transient_retry(
+                lambda: llm.invoke(prompt),
+                wall_timeout=PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
+                label="prediction_market_keywords",
+                backoffs=PREDICTION_MARKET_KEYWORD_BACKOFFS,
+            )
         except (litellm.exceptions.APIError, asyncio.TimeoutError, RuntimeError):
             logger.warning("Keyword extraction LLM call failed", exc_info=True)
             return ""  # noqa: ASYNC910
@@ -1569,7 +1589,7 @@ async def fetch_market_snapshot(
                 # dead snapshot is indistinguishable from one that was never asked for.
                 # It also counts toward alertable_count — losing all four venues at
                 # once is strictly worse than losing one, which already alerts.
-                _bump_platform_failures()
+                _bump_source_loss()
                 return MarketSnapshot(matches=[], sources={"snapshot": "error(timeout)"})  # noqa: ASYNC910
     except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except
         # Outer safety net; should not normally fire -- investigate if seen.
@@ -1577,7 +1597,7 @@ async def fetch_market_snapshot(
         # rest of the bot depends on, so we swallow + log here. Inner narrow
         # handlers in platform helpers cover the common paths.
         logger.warning("Prediction-market snapshot FAILED (soft-fail returning empty)", exc_info=True)
-        _bump_platform_failures()
+        _bump_source_loss()
         return MarketSnapshot(matches=[], sources={"snapshot": f"error({type(e).__name__})"})  # noqa: ASYNC910
 
     if cache_key is not None:
@@ -1604,8 +1624,11 @@ async def _fetch_market_snapshot_impl(
         # No queries means keyword extraction came back empty (its LLM soft-fails to
         # ""), which silences all four platforms — a lost source, not a no-match, so
         # it gets both a loss token and an alertable bump.
-        logger.warning("Keyword extraction produced no queries; returning empty snapshot (alertable)")
-        _bump_platform_failures()
+        logger.warning(
+            "Keyword extraction produced no queries (extractor LLM soft-failed); returning empty snapshot "
+            "(alertable). NO venue was queried, so this is a keywords source loss, not a venue outage."
+        )
+        _bump_source_loss()
         return MarketSnapshot(matches=[], sources={"keywords": "error(no_queries)"})
 
     all_matches: list[MarketMatch] = []
@@ -1683,7 +1706,7 @@ async def _fetch_market_snapshot_impl(
             platform_lost = True
         if platform_lost:
             lost_platforms.append(f"{platform}={sources[platform]}")
-            _bump_platform_failures()
+            _bump_source_loss()
         all_matches.extend(matches)
 
     if lost_platforms:

@@ -34,8 +34,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import aiohttp
+import litellm.exceptions
 import pytest
 
+from metaculus_bot.constants import PREDICTION_MARKET_TIMEOUT
+from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.research import prediction_market as pmp
 from metaculus_bot.research.http_fetch import ERROR_SNIPPET_BYTES
 from metaculus_bot.research.prediction_market import (
@@ -821,6 +824,81 @@ class TestKeywordExtractor:
         assert call_count["n"] == 0
         assert any("Starship" in q for q in queries)
 
+    def test_config_pins_allowed_tries_to_one(self):
+        """The keyword LLM must not carry forecasting-tools' own retry budget.
+
+        Left unpinned it inherits ``allowed_tries=2`` with an UN-GATED
+        ``random.uniform(5, 10)`` tenacity sleep — the exact un-gated retry
+        ``llm_retry`` exists to replace, and a 5-10s blind sleep is a third of the
+        30s ``PREDICTION_MARKET_TIMEOUT`` the whole snapshot runs under. Pinning to 1
+        makes the gated wrapper the SOLE retry layer.
+        """
+        assert PREDICTION_MARKET_KEYWORD_LLM_CONFIG["allowed_tries"] == 1
+
+    @pytest.mark.asyncio
+    async def test_extract_routes_through_gated_retry_wrapper(self, mock_question):
+        """Keyword extraction goes through ``invoke_with_transient_retry``.
+
+        Asserts the wrapper is actually in the call path (label + bounded backoffs),
+        not merely imported.
+        """
+        captured: list[dict] = []
+
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "starship orbit"  # noqa: ASYNC910
+
+        async def _spy(make_awaitable, **kwargs):  # type: ignore[no-untyped-def]
+            captured.append(kwargs)
+            return await make_awaitable()
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", FakeLlm),
+            patch.object(pmp, "invoke_with_transient_retry", _spy),
+        ):
+            queries = await pmp.KeywordExtractor(strategy="s4_s5_union").extract(mock_question)
+
+        assert queries
+        assert len(captured) == 2  # S4 + S5 each wrapped
+        assert all(kw["label"] == "prediction_market_keywords" for kw in captured)
+        # Backoffs must stay inside the snapshot budget: the default 1s/10s/30s
+        # ladder alone exceeds PREDICTION_MARKET_TIMEOUT.
+        assert all(sum(kw["backoffs"]) < PREDICTION_MARKET_TIMEOUT for kw in captured)
+        assert all(kw["wall_timeout"] <= PREDICTION_MARKET_TIMEOUT for kw in captured)
+
+    @pytest.mark.asyncio
+    async def test_extract_does_not_retry_a_hard_403(self, mock_question):
+        """A drained-key 403 costs the extractor ONE attempt per call site, not two.
+
+        The 2026-07-26 run logged two keyword failures 1s apart, each having already
+        burned an ungated ~7s tenacity sleep on a deterministic rejection. With the
+        status-aware predicate the wrapper gives up immediately and the extractor
+        soft-fails to "" as designed.
+        """
+        attempts = {"n": 0}
+
+        class DeadLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                attempts["n"] += 1
+                raise litellm.exceptions.APIError(
+                    status_code=403,
+                    message='{"error":{"message":"Key limit exceeded (total limit).","code":403}}',
+                    llm_provider="openrouter",
+                    model="openai/gpt-5.4-mini",
+                )
+
+        with patch.object(pmp, "build_llm_with_openrouter_fallback", DeadLlm):
+            queries = await pmp.KeywordExtractor(strategy="s4_s5_union").extract(mock_question)
+
+        assert queries == []
+        assert attempts["n"] == 2  # one attempt each for S4 and S5, no retries
+
 
 # ---------------------------------------------------------------------------
 # fetch_market_snapshot orchestrator tests
@@ -975,7 +1053,7 @@ class TestFetchMarketSnapshot:
         # Soft-fail, but not SILENT: a dead whole snapshot carries a loss token and
         # reddens CI, where an empty `sources` map rendered no diagnostics suffix.
         assert snapshot.sources == {"snapshot": "error(timeout)"}
-        assert pmp.prediction_market_platform_failures() == 1
+        assert pmp.prediction_market_source_losses() == 1
 
     @pytest.mark.asyncio
     async def test_orchestrator_soft_fails_on_any_platform_error(self, mock_question, manifold_payload, caplog):
@@ -1855,8 +1933,8 @@ class TestKalshiSeriesStreaming:
         assert orch.prediction_market_degraded_count == 2
 
     @pytest.mark.asyncio
-    async def test_platform_failure_counter_folds_into_orchestrator(self):
-        """Wiring for the platform-failure counter: same path as the series counter —
+    async def test_source_loss_counter_folds_into_orchestrator(self):
+        """Wiring for the source-loss counter: same path as the series counter —
         module global -> ResearchOrchestrator -> the forecaster's alertable_count. The
         two counters stay SEPARATE so a red run says which degradation fired."""
         from metaculus_bot.research.orchestrator import (
@@ -1864,13 +1942,13 @@ class TestKalshiSeriesStreaming:
         )
 
         orch = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
-        assert orch.prediction_market_platform_failure_count == 0
-        pmp._bump_platform_failures()
-        assert orch.prediction_market_platform_failure_count == 1
+        assert orch.prediction_market_source_loss_count == 0
+        pmp._bump_source_loss()
+        assert orch.prediction_market_source_loss_count == 1
         assert orch.prediction_market_degraded_count == 0  # no cross-talk
 
         orch.reset_run_degradation_counters()
-        assert orch.prediction_market_platform_failure_count == 0
+        assert orch.prediction_market_source_loss_count == 0
 
 
 class TestSnapshotSourceDiagnostics:
@@ -1965,6 +2043,39 @@ class TestSnapshotSourceDiagnostics:
         assert detail.get("sources", {}).get("kalshi_series") == "dropped(size_cap)"
 
     @pytest.mark.asyncio
+    async def test_dead_keyword_extractor_is_a_keywords_loss_not_a_venue_loss(self, monkeypatch, mock_question):
+        """A dead keyword extractor silences all four venues without any venue failing.
+
+        2026-07-26: the extractor's LLM took a 403 and the run reported
+        ``prediction_market_platform_failures=1``, which reads as "a venue went down"
+        when no venue was ever queried. The scalar is now named for what it counts (a
+        lost SOURCE), and the per-source token — durable in both the published comment
+        and the schema-v2 archive — is what distinguishes the two causes.
+        """
+        handlers = self._handlers({"series": []})
+
+        class DeadLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return ""  # noqa: ASYNC910  # extractor soft-fails to "" on any LLM error
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", DeadLlm),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.matches == []
+        # The cause is durable per-source: exactly the keywords token, no venue tokens
+        # (nothing was queried), so no reader can mistake this for a venue outage.
+        assert snapshot.sources == {"keywords": "error(no_queries)"}
+        assert "lost=keywords:error(no_queries)" in _partial_loss_suffix({"sources": snapshot.sources})
+        # One lost source, counted once, in the correctly-named scalar.
+        assert pmp.prediction_market_source_losses() == 1
+
+    @pytest.mark.asyncio
     async def test_platform_outage_is_a_loss_and_healthy_platforms_still_land(self, mock_question, manifold_payload):
         """A 503'd venue reads as a LOSS, never as `none`. The other half of the
         contract still holds: the healthy venues' matches come through unaffected."""
@@ -1985,7 +2096,7 @@ class TestSnapshotSourceDiagnostics:
         assert snapshot.sources["manifold"].startswith("ok(")
         # Operator decision 2026-07-25: ANY platform failure reddens CI, so one dead
         # venue among three healthy ones is already alertable.
-        assert pmp.prediction_market_platform_failures() == 1
+        assert pmp.prediction_market_source_losses() == 1
 
     @pytest.mark.asyncio
     async def test_total_blackout_reads_as_lost_even_with_a_warm_series_cache(self, mock_question):
@@ -2011,7 +2122,7 @@ class TestSnapshotSourceDiagnostics:
             assert snapshot.sources[platform] == "error(all_queries_failed)", platform
             assert f"{platform}:error(all_queries_failed)" in suffix, platform
         # One alertable bump per lost venue — four, not one.
-        assert pmp.prediction_market_platform_failures() == 4
+        assert pmp.prediction_market_source_losses() == 4
 
     @pytest.mark.asyncio
     async def test_all_live_but_empty_stays_benign_none(self, mock_question):
@@ -2036,7 +2147,7 @@ class TestSnapshotSourceDiagnostics:
         assert _partial_loss_suffix({"sources": snapshot.sources}) == ""
         # The load-bearing half of the alerting guard: a genuine no-match must never
         # redden CI, however sensitive the outage alert is.
-        assert pmp.prediction_market_platform_failures() == 0
+        assert pmp.prediction_market_source_losses() == 0
 
     @pytest.mark.asyncio
     async def test_one_lost_query_of_two_reads_as_partial(self, mock_question, manifold_payload):
@@ -2063,7 +2174,7 @@ class TestSnapshotSourceDiagnostics:
         # The surviving query's match still lands.
         assert "manifold" in {m.platform for m in snapshot.matches}
         # A partial loss is a loss: it alerts even though matches came back.
-        assert pmp.prediction_market_platform_failures() == 1
+        assert pmp.prediction_market_source_losses() == 1
 
     @pytest.mark.asyncio
     async def test_failed_kalshi_prefetch_does_not_poison_the_next_question(self, mock_question, kalshi_events_payload):
