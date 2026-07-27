@@ -109,7 +109,7 @@ selection, gating, and the shared-vs-personal API-key routing.
 ### 2. Gap-fill (two passes)
 
 After the first-pass bundle is assembled, two gap-fill passes run concurrently in one
-`asyncio.gather` (`orchestrator.py:144`), so the research phase costs `max(v1, v2)`
+`asyncio.gather` inside `run_research` (`orchestrator.py`), so the research phase costs `max(v1, v2)`
 in wall-clock, not the sum:
 
 - **v1** (`research/targeted.py`): an analyzer LLM reads the bundle, names up to a few
@@ -126,20 +126,21 @@ tools, and telemetry.
 
 The orchestrator also builds a provider-diagnostics block that is deliberately
 withheld from the forecaster-facing text (so it never pollutes prompts) but is
-re-attached to the published comment later. This is the "diagnostics seam" you'll see
-referenced in `forecaster.py:571`.
+re-attached to the published comment later. This is the "diagnostics seam": the
+orchestrator's `pop_provider_diagnostics`, which `_research_and_make_predictions` in
+`forecaster.py` drains once the research phase is done.
 
 ### 3. Forecaster fan-out
 
-Each forecaster LLM runs through `_forecaster_with_soft_deadline` (`forecaster.py:869`),
-which caps a single model at `FORECASTER_SOFT_DEADLINE` (600s / 10 min) so one stuck
+Each forecaster LLM runs through `_forecaster_with_soft_deadline` (`forecaster.py`),
+which caps a single model at `FORECASTER_SOFT_DEADLINE` so one stuck
 model can't hold the whole question. `_make_prediction` dispatches to the
 type-specific runner (`forecaster_runners.py`) for binary, multiple-choice, or numeric
 questions. The N coroutines are gathered under the shared wall-clock budget by
-`_gather_predictions_with_wall_clock` (`forecaster.py:430`), which cancels any
+`_gather_predictions_with_wall_clock` (`forecaster.py`), which cancels any
 forecaster still pending at the deadline and counts the drop.
 
-The ensemble is three forecaster LLMs, one per vendor. The exact roster
+The ensemble is a handful of forecaster LLMs, one per vendor. The exact roster
 rotates often, so **read `metaculus_bot/llm_configs.py` for the current list** rather
 than trusting any names written here. Support models (summarizer, parser, stacker,
 disagreement analyzer) live in the same file.

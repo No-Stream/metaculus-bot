@@ -321,13 +321,12 @@ addendum; v2's section appends after v1's.
 Two stages, gated by `GAP_FILL_ENABLED` (and skipped when the first-pass bundle is
 shorter than `GAP_FILL_MIN_RESEARCH_CHARS = 200`):
 
-1. A non-grounded analyzer LLM (`GAP_FILL_ANALYZER_MODEL = openrouter/openai/gpt-5.6-terra`,
-   low effort) reads the first-pass research and emits a JSON list of up to
-   `GAP_FILL_MAX_GAPS = 5` factual gaps.
+1. A non-grounded analyzer LLM (`GAP_FILL_ANALYZER_MODEL`, low effort) reads the
+   first-pass research and emits a JSON list of up to `GAP_FILL_MAX_GAPS` factual
+   gaps.
 2. Each gap is resolved by a parallel OpenAI native web search
-   (`GAP_FILL_RESOLVER_MODEL = openai/gpt-5.6-sol`, low effort, via OpenRouter on
-   the donated key). Because the searches run in parallel, latency is the slowest
-   call, not the sum.
+   (`GAP_FILL_RESOLVER_MODEL`, low effort, via OpenRouter on the donated key).
+   Because the searches run in parallel, latency is the slowest call, not the sum.
 
 The resolver migrated off direct-Google grounding on 2026-06-25, which is why
 `GOOGLE_API_KEY` is no longer required for gap-fill. The whole pass never raises —

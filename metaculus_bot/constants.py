@@ -358,11 +358,11 @@ NATIVE_SEARCH_REASONING_EFFORT_ENV: str = "NATIVE_SEARCH_REASONING_EFFORT"
 # effort=low at ~50s vs effort=medium at ~230s, so low gives ~4.5× faster
 # wall-clock and far more headroom under NATIVE_SEARCH_WALL_TIMEOUT (420s)
 # / NATIVE_SEARCH_TIMEOUT (360s). The quality cost of low is now absorbed by
-# the tier upgrade to gpt-5.6-sol (smarter model at lower effort). Override via
+# the model-tier upgrade above (smarter model at lower effort). Override via
 # NATIVE_SEARCH_REASONING_EFFORT env if a workflow needs medium back. Note:
 # this default applies ONLY to the native-search provider —
-# DISAGREEMENT_ANALYZER_LLM is also at low (llm_configs.py), all forecasters
-# stay at high.
+# DISAGREEMENT_ANALYZER_LLM is also at low (llm_configs.py), while the
+# forecaster slots set their own effort per-instance in llm_configs.py.
 NATIVE_SEARCH_REASONING_EFFORT_DEFAULT: str = "low"
 NATIVE_SEARCH_VERBOSITY_ENV: str = "NATIVE_SEARCH_VERBOSITY"
 NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
@@ -625,7 +625,8 @@ STACKER_SOFT_DEADLINE: int = 500
 # late on the critical path by the time the fallback fires.
 STACKER_FALLBACK_SOFT_DEADLINE: int = 300
 
-# Per-question soft deadline for the disagreement-crux extractor (gpt-5.6-sol low effort).
+# Per-question soft deadline for the disagreement-crux extractor
+# (DISAGREEMENT_ANALYZER_LLM, llm_configs.py).
 # Caps the unbounded worst case on the conditional-stacking critical path: without
 # this wrapper the analyzer can stall for timeout(300s) * allowed_tries(3) ≈ 15 min.
 CRUX_SOFT_DEADLINE: int = 180
