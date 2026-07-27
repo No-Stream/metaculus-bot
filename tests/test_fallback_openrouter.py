@@ -1,4 +1,5 @@
 import logging
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,6 +35,14 @@ PRODUCTION_KEY_LIMIT_403 = (
     "https://openrouter.ai/workspaces/default/keys/"
     '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
 )
+
+
+def _api_error(status: int, message: str) -> APIError:
+    """A litellm ``APIError`` that REPORTS ``status``, the shape every OpenRouter failure
+    arrives in. The reported int is what the classification reads; the message is the
+    untrusted half (key hash, replayed prompt), so tests vary it freely."""
+    return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
+
 
 # A realistic OpenRouter moderation 403. The body carries `reasons` and
 # `flagged_input` (up to ~100 chars of OUR OWN PROMPT replayed back), which is why
@@ -459,7 +468,7 @@ class TestCreditSuppressibility:
         did NOT count as credit-caused, so the run reddened CI on precisely the
         expected empty wallet the suppression window exists for.
         """
-        exc = APIError(status_code=402, message="wallet empty", llm_provider="openrouter", model="openai/gpt-5.6-sol")
+        exc = _api_error(402, "wallet empty")
         assert "402" not in str(exc)  # the gap only exists because the digits are absent
         assert should_retry_with_general_key(exc) is True
         assert is_credit_caused_error(exc) is True
@@ -966,18 +975,11 @@ class TestStatusCodeClassification:
     the substring cues stay live — see ``TestPredicates`` for those.
     """
 
-    @staticmethod
-    def _api_error(status: int, message: str) -> Exception:
-        from litellm.exceptions import APIError
-
-        return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
-
-    # A 403 body from the drained donated key, key hash included verbatim.
-    _DRAINED = (
-        'APIError: OpenrouterException - {"error":{"message":"Key limit exceeded (total limit). '
-        "Manage it using https://openrouter.ai/workspaces/default/keys/"
-        '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
-    )
+    # The production 403 body as litellm renders it inside a typed exception: the same
+    # bytes, minus the prefix litellm adds when stringifying. Derived rather than
+    # re-pasted so exploring a new case in one place can't leave the other asserting the
+    # old shape (neither ``_is_status`` nor ``_llm_status_code`` ever sees the prefix).
+    _DRAINED = PRODUCTION_KEY_LIMIT_403.removeprefix("litellm.APIError: ")
 
     def test_spend_cap_403_still_falls_back(self) -> None:
         """The load-bearing ordering: a DRAINED-key 403 is credit-caused, so it falls back.
@@ -985,12 +987,12 @@ class TestStatusCodeClassification:
         The credit check runs upstream of the 403 veto; making the veto status-based must
         not let it overtake that.
         """
-        assert should_retry_with_general_key(self._api_error(403, self._DRAINED)) is True
+        assert should_retry_with_general_key(_api_error(403, self._DRAINED)) is True
 
     def test_moderation_403_does_not_fall_back(self) -> None:
         """A genuine moderation 403 still refuses to swap keys — both keys would refuse."""
         body = 'APIError: OpenrouterException - {"error":{"message":"Blocked by moderation","code":403}}'
-        assert should_retry_with_general_key(self._api_error(403, body)) is False
+        assert should_retry_with_general_key(_api_error(403, body)) is False
 
     def test_prompt_echo_402_does_not_read_as_credit(self) -> None:
         """A moderation 403 replaying a prompt containing "402" is not an empty wallet.
@@ -1006,7 +1008,7 @@ class TestStatusCodeClassification:
             '"metadata":{"reasons":["policy"],"flagged input":"...HR 402 authorizes $402 million..."},'
             '"code":403}}'
         )
-        exc = self._api_error(403, body)
+        exc = _api_error(403, body)
         assert should_retry_with_general_key(exc) is False
 
     def test_key_hash_digits_do_not_trigger_fallback(self) -> None:
@@ -1019,18 +1021,18 @@ class TestStatusCodeClassification:
             'APIError: OpenrouterException - {"error":{"message":"Blocked by content policy. '
             'Key: https://openrouter.ai/keys/a429b502c401d9f3","code":403}}'
         )
-        assert should_retry_with_general_key(self._api_error(403, body)) is False
+        assert should_retry_with_general_key(_api_error(403, body)) is False
 
     def test_status_detected_when_message_has_no_digits(self) -> None:
         """Detection no longer depends on the provider spelling the status in prose."""
-        assert should_retry_with_general_key(self._api_error(429, "upstream is busy right now")) is True
-        assert should_retry_with_general_key(self._api_error(401, "bad credentials")) is True
-        assert should_retry_with_general_key(self._api_error(402, "wallet empty")) is True
+        assert should_retry_with_general_key(_api_error(429, "upstream is busy right now")) is True
+        assert should_retry_with_general_key(_api_error(401, "bad credentials")) is True
+        assert should_retry_with_general_key(_api_error(402, "wallet empty")) is True
 
     def test_infrastructure_statuses_still_refuse_fallback(self) -> None:
         """5xx are infrastructure, not key-scoped — swapping keys cannot help."""
-        assert should_retry_with_general_key(self._api_error(502, "upstream died")) is False
-        assert should_retry_with_general_key(self._api_error(503, "upstream unavailable")) is False
+        assert should_retry_with_general_key(_api_error(502, "upstream died")) is False
+        assert should_retry_with_general_key(_api_error(503, "upstream unavailable")) is False
 
     def test_route_scoped_404_text_cues_survive(self) -> None:
         """The 404 family is classified by TEXT, and must stay that way.
@@ -1041,9 +1043,9 @@ class TestStatusCodeClassification:
         """
         allowed = "404 No allowed providers are available for the selected model."
         guardrail = "404 No endpoints available matching your guardrail restrictions and data policy."
-        assert should_retry_with_general_key(self._api_error(404, allowed)) is True
-        assert should_retry_with_general_key(self._api_error(404, guardrail)) is True
-        assert should_retry_with_general_key(self._api_error(404, "model not found")) is False
+        assert should_retry_with_general_key(_api_error(404, allowed)) is True
+        assert should_retry_with_general_key(_api_error(404, guardrail)) is True
+        assert should_retry_with_general_key(_api_error(404, "model not found")) is False
 
     def test_non_llm_exception_keeps_textual_classification(self) -> None:
         """A statusless exception is classified exactly as before (regression guard).
@@ -1075,12 +1077,6 @@ class TestCreditClassificationPrecedence:
       ``_is_credit_message`` has to fall back on when no status was reported.
     """
 
-    @staticmethod
-    def _api_error(status: int, message: str) -> Exception:
-        from litellm.exceptions import APIError
-
-        return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
-
     def test_moderation_403_echoing_prompt_402_is_not_credit(self) -> None:
         """403 whose ``flagged_input`` replays a prompt containing "402" → not credit.
 
@@ -1092,7 +1088,7 @@ class TestCreditClassificationPrecedence:
             '{"error":{"message":"Blocked","metadata":{"reasons":["policy"],'
             '"flagged_input":"...HR 402 authorizes $402 million in FY2026..."},"code":403}}'
         )
-        exc = self._api_error(403, body)
+        exc = _api_error(403, body)
         assert is_credit_caused_error(exc) is False
         assert should_retry_with_general_key(exc) is False
 
@@ -1109,12 +1105,12 @@ class TestCreditClassificationPrecedence:
         The moderation veto still governs 403, which is the genuinely ambiguous status.
         """
         balance = "APIError: OpenrouterException - Forbidden: account balance too low"
-        exc = self._api_error(402, balance)
+        exc = _api_error(402, balance)
         assert is_credit_caused_error(exc) is True
         assert should_retry_with_general_key(exc) is True
 
         flagged = 'APIError: OpenrouterException - {"error":{"message":"flagged for moderation","code":402}}'
-        assert is_credit_caused_error(self._api_error(402, flagged)) is True
+        assert is_credit_caused_error(_api_error(402, flagged)) is True
 
     def test_explicit_credit_wording_outranks_http_forbidden_boilerplate(self) -> None:
         """A drained-key 403 rendered as "403 Forbidden" still falls back.
@@ -1124,7 +1120,7 @@ class TestCreditClassificationPrecedence:
         failure would stop falling back and the ensemble would strand on the dead key.
         """
         body = "APIError: OpenrouterException - 403 Forbidden: Key limit exceeded (total limit)."
-        exc = self._api_error(403, body)
+        exc = _api_error(403, body)
         assert is_credit_caused_error(exc) is True
         assert should_retry_with_general_key(exc) is True
 
@@ -1232,12 +1228,6 @@ class TestPromptEchoCreditPhrases:
     """
 
     @staticmethod
-    def _api_error(status: int, message: str) -> Exception:
-        from litellm.exceptions import APIError
-
-        return APIError(status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol")
-
-    @staticmethod
     def _moderation_body(flagged_input: str) -> str:
         return (
             "litellm.APIError: APIError: OpenrouterException - "
@@ -1257,7 +1247,7 @@ class TestPromptEchoCreditPhrases:
     )
     def test_moderation_403_echoing_credit_english_is_not_credit(self, flagged_input: str) -> None:
         """The reported 403 must beat an ordinary credit phrase replayed from our prompt."""
-        exc = self._api_error(403, self._moderation_body(flagged_input))
+        exc = _api_error(403, self._moderation_body(flagged_input))
         assert should_retry_with_general_key(exc) is False
         assert is_credit_caused_error(exc) is False
 
@@ -1274,7 +1264,7 @@ class TestPromptEchoCreditPhrases:
         These stayed non-credit even before the fix, but they still flipped ROUTING to
         True — billing the personal key for a call the paid key will also refuse.
         """
-        exc = self._api_error(403, self._moderation_body(flagged_input))
+        exc = _api_error(403, self._moderation_body(flagged_input))
         assert should_retry_with_general_key(exc) is False
 
     def test_statusless_moderation_echo_is_not_credit_or_suppressible(self) -> None:
@@ -1319,8 +1309,8 @@ class TestPromptEchoCreditPhrases:
             "No endpoints available matching your guardrail restrictions and data policy. "
             "Configure: https://openrouter.ai/settings/privacy"
         )
-        assert should_retry_with_general_key(self._api_error(403, guardrail)) is True
-        assert should_retry_with_general_key(self._api_error(403, "No allowed providers are available")) is True
+        assert should_retry_with_general_key(_api_error(403, guardrail)) is True
+        assert should_retry_with_general_key(_api_error(403, "No allowed providers are available")) is True
 
 
 class TestStatuslessPromptEcho:
@@ -1408,7 +1398,7 @@ class TestStatuslessPromptEcho:
             '"code":403,"metadata":{"reasons":["violence"],'
             '"flagged_input":"Will OpenAI ship stricter guardrails before Aug 18 2026?"}}}'
         )
-        exc = APIError(status_code=403, message=body, llm_provider="openrouter", model="openai/gpt-5.6-sol")
+        exc = _api_error(403, body)
         assert should_retry_with_general_key(exc) is False
 
     def test_zero_output_echoing_deprecated_records_no_deprecation_alert(self) -> None:
@@ -1452,33 +1442,141 @@ class TestStatuslessPromptEcho:
         assert is_suppressible_credit_error(exc) is True
 
 
+class TestProbeCannotOutlastItsBudget:
+    """The probe's promised 5s bound has to be a bound on TOTAL time, not per-operation.
+
+    ``DONATED_KEY_PROBE_TIMEOUT_S`` is forwarded to httpx as a bare float, which sets each
+    operation's timeout independently and does not cap elapsed time — a server trickling
+    bytes slower than the read timeout resets the clock on every chunk (measured: a
+    ``timeout=1.0`` GET against a 0.5s-per-byte trickler took 10.2s). This lands on the
+    RECOVERY path: ``record_donated_key_fallback`` is awaited before
+    ``_invoke_once_using_secondary``, so probe latency delays the personal-key call even
+    though routing was already decided textually. A degraded-but-not-dead OpenRouter
+    control plane is exactly what co-occurs with a spend-cap 403, and the tight-budget
+    callers are the ones this reaches: prediction-market keyword extraction has a 15s wall
+    cap, the financial classifier 30s.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self, monkeypatch: pytest.MonkeyPatch):
+        reset_donated_key_state_cache()
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        monkeypatch.setattr(fallback_openrouter, "DONATED_KEY_PROBE_TIMEOUT_S", 0.2)
+        yield
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        reset_donated_key_state_cache()
+
+    @pytest.mark.asyncio
+    async def test_slow_probe_is_abandoned_at_the_cap_and_stays_alertable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A probe that outlasts the cap must not hold the fallback, and must not suppress.
+
+        Timing out is an inconclusive answer, so it degrades exactly like UNKNOWN: counted,
+        not subtracted from ``alertable``.
+        """
+
+        def never_answers() -> DonatedKeyState:
+            time.sleep(5.0)  # far past the patched cap; the wait_for must not wait for it
+            return DonatedKeyState.DRAINED
+
+        monkeypatch.setattr(fallback_openrouter, "classify_donated_key_state", never_answers)
+
+        started = time.monotonic()
+        await fallback_openrouter.record_donated_key_fallback(
+            "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, f"probe held the fallback for {elapsed:.1f}s despite a 0.2s cap"
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
+        assert fallback_openrouter.get_credit_key_fallback_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_answering_inside_the_cap_still_suppresses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Positive control: the cap must not disarm suppression for a probe that answers."""
+        monkeypatch.setattr(
+            fallback_openrouter, "classify_donated_key_state", MagicMock(return_value=DonatedKeyState.DRAINED)
+        )
+        await fallback_openrouter.record_donated_key_fallback(
+            "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
+        )
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
+        assert fallback_openrouter.get_credit_key_fallback_count() == 1
+
+
 class TestProbeFailureCannotVetoRouting:
     """An unanswerable ``/auth/key`` probe must never abort the fallback it is annotating.
 
-    ``_probe_donated_key_state`` is documented "Never raises" but only catches
-    ``(httpx.HTTPError, ValueError, KeyError, AttributeError)``. A ``RuntimeError`` (this
-    repo's own autouse network guard raises exactly that), a ``FileNotFoundError`` from a
-    bad ``SSL_CERT_FILE``, or a ``MemoryError`` escapes it. Because the probe runs BEFORE
-    ``_invoke_once_using_secondary``, an escape stranded the ensemble on the dry donated
+    The probe promises "never raises", and now catches broadly enough to keep that promise.
+    ``record_donated_key_fallback`` guards its call anyway, because the promise is not
+    something routing should have to trust: the probe runs BEFORE
+    ``_invoke_once_using_secondary``, so an escape stranded the ensemble on the dry donated
     key with the funded personal key untried — the 2026-07-26 incident reached through the
     exception path rather than a stale balance read. The routing decision is already final
     and purely textual by the time this runs, so alerting bookkeeping must not gate it.
+
+    Both cases patch ``classify_donated_key_state`` rather than ``fetch_auth_key``. That is
+    the seam the guard defends, and it is env-independent: the probe short-circuits to
+    UNKNOWN before touching ``fetch_auth_key`` when no donated key is configured, and CI
+    injects no OpenRouter secrets, so a ``fetch_auth_key`` patch would make these assertions
+    hold for the wrong reason there while passing locally off the repo's ``.env``.
     """
 
-    @pytest.mark.parametrize("boom", [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")])
-    @pytest.mark.asyncio
-    async def test_probe_exception_leaves_the_fallback_intact_and_alertable(self, boom: BaseException) -> None:
-        from metaculus_bot import credit_telemetry
+    _BOOMS = [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")]
 
-        credit_telemetry.reset_donated_key_state_cache()
+    @pytest.fixture(autouse=True)
+    def _clean_counters(self, monkeypatch: pytest.MonkeyPatch):
+        reset_donated_key_state_cache()
         reset_generic_key_fallback_count()
         reset_credit_key_fallback_count()
-        with patch.object(credit_telemetry, "fetch_auth_key", side_effect=boom):
-            await fallback_openrouter.record_donated_key_fallback(
-                "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
-            )
+        yield
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        reset_donated_key_state_cache()
+
+    @pytest.mark.parametrize("boom", _BOOMS)
+    @pytest.mark.asyncio
+    async def test_probe_exception_leaves_the_event_counted_and_alertable(
+        self, monkeypatch: pytest.MonkeyPatch, boom: BaseException
+    ) -> None:
+        monkeypatch.setattr(fallback_openrouter, "classify_donated_key_state", MagicMock(side_effect=boom))
+        await fallback_openrouter.record_donated_key_fallback(
+            "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
+        )
 
         # Counted, so the personal-key spend is visible...
         assert fallback_openrouter.get_generic_key_fallback_count() == 1
         # ...and NOT subtracted from alertable, because the probe never answered.
+        assert fallback_openrouter.get_credit_key_fallback_count() == 0
+
+    @pytest.mark.parametrize("boom", _BOOMS)
+    @pytest.mark.asyncio
+    async def test_personal_key_call_still_happens_when_the_probe_raises(
+        self, monkeypatch: pytest.MonkeyPatch, boom: BaseException
+    ) -> None:
+        """The headline behavior, end to end: the funded key is still tried.
+
+        The counter assertions above call ``record_donated_key_fallback`` directly, so they
+        cannot see whether the wrapper went on to invoke the secondary — which is the whole
+        point of the guard, and the exact thing the incident lost.
+        """
+        monkeypatch.setattr(fallback_openrouter, "classify_donated_key_state", MagicMock(side_effect=boom))
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.6-sol",
+            primary_api_key="donated",
+            secondary_api_key="personal",
+            temperature=0,
+        )
+        monkeypatch.setattr(
+            llm, "_invoke_once_using_primary", AsyncMock(side_effect=Exception(PRODUCTION_KEY_LIMIT_403))
+        )
+        secondary = AsyncMock(return_value="fallback_ok")
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", secondary)
+
+        assert await llm.invoke("hi") == "fallback_ok"
+        secondary.assert_awaited_once()
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
         assert fallback_openrouter.get_credit_key_fallback_count() == 0

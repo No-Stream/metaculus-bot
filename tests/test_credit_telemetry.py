@@ -330,8 +330,7 @@ class TestFetchFailureHandling:
 
     def test_http_status_error_is_caught(self, monkeypatch, caplog) -> None:
         _set_keys(monkeypatch, personal=None)
-        request = httpx.Request("GET", "https://openrouter.ai/api/v1/auth/key")
-        error = httpx.HTTPStatusError("401", request=request, response=httpx.Response(401, request=request))
+        error = _http_status_error(401)
         responses = {DONATED_KEY: [error, error]}
         telemetry = CreditTelemetry(floor_usd=50.0)
         with _patch_fetch(responses), caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):

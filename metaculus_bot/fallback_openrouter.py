@@ -14,7 +14,11 @@ from metaculus_bot.constants import (
     credit_alerts_active,
     gemini_use_donated_openrouter_key,
 )
-from metaculus_bot.credit_telemetry import DonatedKeyState, classify_donated_key_state
+from metaculus_bot.credit_telemetry import (
+    DONATED_KEY_PROBE_TIMEOUT_S,
+    DonatedKeyState,
+    classify_donated_key_state,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -296,9 +300,10 @@ _GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
 # empty wallet — billing the personal key for a call that will refuse again AND
 # exempting a real moderation block from alerting.
 #
-# Word cues only, deliberately: a genuine 402 links to a key hash that has roughly
-# a 1-in-11 chance of containing the substring "403", and reading that as moderation
-# would break the long-standing 402 fallback.
+# Word cues only, deliberately: a genuine 402 links to a key hash that has roughly a
+# 1.5% chance (1 in 66) of containing the substring "403", and reading that as moderation
+# would break the long-standing 402 fallback. The ~8.8% / 1-in-11 figure quoted elsewhere
+# is for ANY of the six statuses at once — six times this one, so don't reuse it here.
 _MODERATION_CUES: tuple[str, ...] = ("moderation", "forbidden", "flagged_input", "flagged for")
 
 
@@ -596,30 +601,39 @@ async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     # Threaded because on the spend-cap 403 path it reaches
     # ``credit_telemetry.classify_donated_key_state``, which does blocking httpx. Called
     # inline from these coroutines it stalled EVERY concurrently in-flight forecaster and
-    # research task for up to ``DONATED_KEY_PROBE_TIMEOUT_S`` (5s), not just the call that
-    # hit the 403, eating into per-question soft deadlines. Probing first also keeps the
-    # accounting below free of any await.
-    # Guarded because the probe's "never raises" contract only covers
-    # ``(httpx.HTTPError, ValueError, KeyError, AttributeError)``. A RuntimeError (this
-    # repo's own autouse network guard raises exactly that), a FileNotFoundError from a
-    # bad ``SSL_CERT_FILE``, or a MemoryError escapes it — and because this call sits
-    # BEFORE ``_invoke_once_using_secondary``, an escape aborted the fallback and left
-    # the funded personal key untried. That is the production incident this whole change
-    # exists to fix, reached through the exception path instead of a stale balance read.
-    # Alerting bookkeeping must never be able to veto routing, so an unanswerable probe
-    # degrades to "not suppressible" (stay alertable) exactly like UNKNOWN does.
+    # research task, not just the call that hit the 403, eating into per-question soft
+    # deadlines. Probing first also keeps the accounting below free of any await.
+    # Bounded because ``DONATED_KEY_PROBE_TIMEOUT_S`` is a PER-OPERATION httpx timeout, not
+    # a cap on elapsed time: a server trickling bytes slower than the read timeout resets
+    # the clock on every chunk (measured: a ``timeout=1.0`` GET against a 0.5s-per-byte
+    # trickler took 10.2s). This call sits BEFORE ``_invoke_once_using_secondary``, so that
+    # latency delays the recovery call itself even though routing was already decided
+    # textually — and a degraded-but-alive OpenRouter control plane is exactly what
+    # co-occurs with a spend-cap 403. ``wait_for`` unblocks us without killing the worker
+    # thread, which is fine: the orphan only holds a socket and (under the probe's lock)
+    # writes the cache.
+    #
+    # Guarded because ANY failure in alerting bookkeeping must leave routing untouched. The
+    # probe promises "never raises" and now catches broadly enough to keep that promise, but
+    # an escape here aborted the fallback and left the funded personal key untried — the
+    # production incident reached through the exception path instead of a stale balance read.
+    # A timeout is likewise inconclusive, so both degrade to "not suppressible" (stay
+    # alertable) exactly like UNKNOWN does.
     try:
-        suppressible = await asyncio.to_thread(is_suppressible_credit_error, exc)
+        suppressible = await asyncio.wait_for(
+            asyncio.to_thread(is_suppressible_credit_error, exc), timeout=DONATED_KEY_PROBE_TIMEOUT_S
+        )
     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
         # Deliberately swallowed rather than re-raised, against the usual fail-fast rule:
         # re-raising here is the bug being fixed. This is bookkeeping for a decision that
         # was already made textually, so ANY failure in it must leave routing untouched.
         # The event is still loud (exception logged with traceback) and still alertable.
         logger.exception(
-            "DONATED_KEY_PROBE_FAILED: model=%s — the /auth/key probe raised outside its documented "
-            "contract, so this fallback stays ALERTABLE. The personal-key call proceeds regardless; "
+            "DONATED_KEY_PROBE_FAILED: model=%s — the /auth/key probe raised or outlasted its %.1fs "
+            "budget, so this fallback stays ALERTABLE. The personal-key call proceeds regardless; "
             "alerting bookkeeping must not gate recovery.",
             model,
+            DONATED_KEY_PROBE_TIMEOUT_S,
         )
         suppressible = False
 
