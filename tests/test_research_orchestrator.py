@@ -647,6 +647,34 @@ class TestIntegrationWithTemplateForecaster:
         bot._research.provider_failure_count = 5
         assert bot._research_provider_failure_count == 5
 
+    @pytest.mark.asyncio
+    async def test_summarizer_soft_fail_reaches_bot_alertable_count(self, question):
+        """End-to-end wiring for the summarizer counter: a real soft-fail inside the
+        orchestrator has to reach the number cli.py exits on."""
+        from main import TemplateForecaster
+        from metaculus_bot.aggregation_strategies import AggregationStrategy
+
+        sentinel = GeneralLlm(model="test/sentinel", temperature=0.0)
+        bot = TemplateForecaster(
+            llms={"default": sentinel, "parser": sentinel, "researcher": sentinel, "summarizer": sentinel},
+            aggregation_strategy=AggregationStrategy.MEAN,
+        )
+        assert bot.alertable_count == 0
+
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                bot._research._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                side_effect=asyncio.TimeoutError("summarizer timed out"),
+            ),
+        ):
+            await bot._research._summarize_asknews(question, "raw asknews articles")
+
+        assert bot._summarizer_failure_count == 1
+        assert bot.alertable_count == 1
+
 
 class TestProviderDiagnosticsCapture:
     """Per-provider observability: _run_providers_parallel returns a ProviderResult list
