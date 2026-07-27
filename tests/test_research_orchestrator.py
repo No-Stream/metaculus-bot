@@ -6,7 +6,7 @@ Verifies that the orchestrator:
 3. Runs gap-fill when enabled
 4. Combines parallel provider results with headers
 5. Falls back gracefully on provider failure
-6. Exposes timeout_count for alerting
+6. Exposes provider_failure_count for alerting
 """
 
 import asyncio
@@ -17,8 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.research.orchestrator import ResearchOrchestrator
-from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
+from metaculus_bot.research.orchestrator import SUMMARIZER_SOFT_FAIL_BANNER, ResearchOrchestrator
+from metaculus_bot.research.provider_diagnostics import (
+    format_provider_diagnostics_block,
+    pop_provider_detail,
+    record_provider_detail,
+)
 
 
 @pytest.fixture
@@ -127,8 +131,15 @@ class TestRunResearch:
         mock_gap_fill.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_timeout_count_incremented_on_provider_failure(self, orchestrator, question):
-        failing = AsyncMock(side_effect=RuntimeError("timeout"))
+    async def test_provider_failure_count_incremented_on_non_timeout_failure(self, orchestrator, question):
+        """The counter means "provider failures", NOT timeouts.
+
+        The 2026-07-26 run reported ``research_provider_timeouts=1`` for a hard 403
+        that failed in 137ms, while the provider-diagnostics line in the same log
+        correctly said ``errored | APIError``. The generic failure branch never
+        inspected the exception type, so the identifier was always a misnomer.
+        """
+        failing = AsyncMock(side_effect=RuntimeError('APIError: {"code":403} Key limit exceeded (total limit)'))
         working = AsyncMock(return_value="ok")
 
         with patch.object(
@@ -138,8 +149,23 @@ class TestRunResearch:
         ):
             result = await orchestrator.run_research(question)
 
-        assert orchestrator.timeout_count == 1
+        assert orchestrator.provider_failure_count == 1
         assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_count_also_counts_genuine_timeouts(self, orchestrator, question):
+        """A real timeout is a provider failure too — the rename widens the name, not the set."""
+        failing = AsyncMock(side_effect=asyncio.TimeoutError())
+        working = AsyncMock(return_value="ok")
+
+        with patch.object(
+            orchestrator,
+            "_select_research_providers",
+            return_value=[(failing, "native_search"), (working, "custom")],
+        ):
+            await orchestrator.run_research(question)
+
+        assert orchestrator.provider_failure_count == 1
 
 
 class TestAskNewsSummarization:
@@ -223,7 +249,8 @@ class TestAskNewsSummarization:
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
-        assert result == "raw asknews articles"
+        assert "raw asknews articles" in result
+        assert SUMMARIZER_SOFT_FAIL_BANNER in result
 
     @pytest.mark.asyncio
     async def test_non_transient_summarizer_error_propagates(self, orchestrator, question):
@@ -288,8 +315,87 @@ class TestAskNewsSummarization:
         ):
             result = await orchestrator._summarize_asknews(question, "raw asknews articles")
 
-        assert result == "raw asknews articles"
+        assert "raw asknews articles" in result
+        assert SUMMARIZER_SOFT_FAIL_BANNER in result
         assert invoke.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_soft_fail_banners_the_bundle_and_counts(self, orchestrator, question):
+        """A summarizer soft-fail must be VISIBLE to the forecaster and to CI.
+
+        The 2026-07-26 run shipped 12 raw unsummarized AskNews articles with none of
+        the 2026-07-18 audit rules applied (per-article relevance gate, recency-first
+        ordering, supersession arithmetic, evidence-age opener, [PRE-WINDOW] labeling)
+        and nothing anywhere said so: no counter, and AskNews still reported
+        ``status=ok`` because provider status is computed from POST-summarizer text.
+        """
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                orchestrator._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                side_effect=asyncio.TimeoutError("summarizer timed out"),
+            ),
+        ):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert orchestrator.summarizer_failure_count == 1
+        # Banner leads the section so it is read before the ungated articles.
+        assert result.startswith(SUMMARIZER_SOFT_FAIL_BANNER)
+        assert "raw asknews articles" in result
+        # Not a markdown h1/h2: _demote_inner_headings would shift it and the
+        # framework's section renormalization would mangle the provider header.
+        assert not result.lstrip().startswith("#")
+
+    @pytest.mark.asyncio
+    async def test_blank_summary_also_banners_and_counts(self, orchestrator, question):
+        """A blank summary degrades the briefing exactly as an exception does."""
+        with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="   "):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert orchestrator.summarizer_failure_count == 1
+        assert SUMMARIZER_SOFT_FAIL_BANNER in result
+        assert "raw asknews articles" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_summary_has_no_banner_and_no_count(self, orchestrator, question):
+        with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock, return_value="briefing"):
+            result = await orchestrator._summarize_asknews(question, "raw asknews articles")
+
+        assert result == "briefing"
+        assert orchestrator.summarizer_failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_research_does_not_count_as_summarizer_failure(self, orchestrator, question):
+        """No articles to summarize is not a summarizer failure — nothing was lost."""
+        with patch.object(orchestrator._summarizer_llm, "invoke", new_callable=AsyncMock):
+            await orchestrator._summarize_asknews(question, "   ")
+
+        assert orchestrator.summarizer_failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_soft_fail_surfaces_as_asknews_source_loss_in_diagnostics(self, mock_llm, question):
+        """AskNews reads ``ok`` (post-summarizer text is non-empty), so the loss has to
+        ride the per-source details seam or it stays invisible in comment + archive."""
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        asknews = AsyncMock(return_value="raw asknews articles")
+
+        with (
+            patch("metaculus_bot.llm_retry.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                orch._summarizer_llm,
+                "invoke",
+                new_callable=AsyncMock,
+                side_effect=asyncio.TimeoutError("summarizer timed out"),
+            ),
+        ):
+            _, results, _ = await orch._run_providers_parallel(question, [(asknews, "asknews")])
+
+        assert results[0].status == "ok"
+        assert results[0].details["sources"]["summarizer"].startswith("error(")
+        rendered = format_provider_diagnostics_block(results)
+        assert "lost=summarizer:error(" in rendered
 
     @pytest.mark.asyncio
     async def test_only_asknews_is_summarized(self, orchestrator, question):
@@ -528,8 +634,8 @@ class TestIntegrationWithTemplateForecaster:
         result = await bot.run_research(question)
         assert result == "patched result"
 
-    def test_timeout_count_exposed_via_bot(self, question):
-        """Bot exposes timeout count from the orchestrator for alerting."""
+    def test_provider_failure_count_exposed_via_bot(self, question):
+        """Bot exposes the provider-failure count from the orchestrator for alerting."""
         from main import TemplateForecaster
         from metaculus_bot.aggregation_strategies import AggregationStrategy
 
@@ -538,8 +644,8 @@ class TestIntegrationWithTemplateForecaster:
             llms={"default": sentinel, "parser": sentinel, "researcher": sentinel, "summarizer": sentinel},
             aggregation_strategy=AggregationStrategy.MEAN,
         )
-        bot._research.timeout_count = 5
-        assert bot._research_provider_timeout_count == 5
+        bot._research.provider_failure_count = 5
+        assert bot._research_provider_failure_count == 5
 
 
 class TestProviderDiagnosticsCapture:
@@ -650,7 +756,7 @@ class TestProviderDiagnosticsCapture:
         assert results[0].error_type == "RuntimeError"
         assert results[0].error_message is not None
         assert "boom" in results[0].error_message
-        assert orch.timeout_count == 1
+        assert orch.provider_failure_count == 1
 
     @pytest.mark.asyncio
     async def test_status_inactive_for_asknews_subscription_error(self, mock_llm, question):
@@ -667,7 +773,7 @@ class TestProviderDiagnosticsCapture:
         assert results[0].chars == 0
         assert results[0].error_type == "ForbiddenError"
         # Off-season is expected, not an alertable failure.
-        assert orch.timeout_count == 0
+        assert orch.provider_failure_count == 0
 
     @pytest.mark.asyncio
     async def test_status_fallback_when_asknews_falls_back_to_prose(self, mock_llm, question, monkeypatch):

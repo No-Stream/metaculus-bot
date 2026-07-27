@@ -219,6 +219,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         self._conditional_stacking_triggered_count: int = 0
         self._conditional_stacking_skipped_count: int = 0
+        # Skips from the single-forecaster short-circuit, kept in their own bucket so
+        # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
+        # "skipped_config_off" out of "skipped"). Before 2026-07-26 that branch
+        # returned above BOTH increment sites, so a run could log
+        # "SKIPPED: single forecaster survived" per question and then "skipped=0".
+        self._conditional_stacking_skipped_single_forecaster_count: int = 0
         self._conditional_stacking_crux_failures: int = 0
         self._conditional_stacking_search_failures: int = 0
 
@@ -429,9 +435,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
             logger.info(
-                "Conditional stacking summary: triggered=%d, skipped=%d, crux_failures=%d, search_failures=%d",
+                "Conditional stacking summary: triggered=%d, skipped=%d, "
+                "skipped_single_forecaster=%d, crux_failures=%d, search_failures=%d",
                 self._conditional_stacking_triggered_count,
                 self._conditional_stacking_skipped_count,
+                self._conditional_stacking_skipped_single_forecaster_count,
                 self._conditional_stacking_crux_failures,
                 self._conditional_stacking_search_failures,
             )
@@ -443,17 +451,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d, gap_fill_v2_errors=%d, prediction_market_degraded=%d, "
-            "prediction_market_platform_failures=%d",
+            "research_provider_failures=%d, summarizer_failures=%d, gap_fill_v2_errors=%d, "
+            "prediction_market_degraded=%d, prediction_market_source_losses=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
             self._stacker_fallback_used_count,
             self._stacker_fallback_failed_count,
-            self._research_provider_timeout_count,
+            self._research_provider_failure_count,
+            self._summarizer_failure_count,
             self._gap_fill_v2_error_count,
             self._prediction_market_degraded_count,
-            self._prediction_market_platform_failure_count,
+            self._prediction_market_source_loss_count,
         )
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
@@ -463,20 +472,28 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return results
 
     @property
-    def _research_provider_timeout_count(self) -> int:
-        return self._research.timeout_count
+    def _research_provider_failure_count(self) -> int:
+        return self._research.provider_failure_count
 
-    @_research_provider_timeout_count.setter
-    def _research_provider_timeout_count(self, value: int) -> None:
-        self._research.timeout_count = value
+    @_research_provider_failure_count.setter
+    def _research_provider_failure_count(self, value: int) -> None:
+        self._research.provider_failure_count = value
+
+    @property
+    def _summarizer_failure_count(self) -> int:
+        return self._research.summarizer_failure_count
+
+    @_summarizer_failure_count.setter
+    def _summarizer_failure_count(self, value: int) -> None:
+        self._research.summarizer_failure_count = value
 
     @property
     def _prediction_market_degraded_count(self) -> int:
         return self._research.prediction_market_degraded_count
 
     @property
-    def _prediction_market_platform_failure_count(self) -> int:
-        return self._research.prediction_market_platform_failure_count
+    def _prediction_market_source_loss_count(self) -> int:
+        return self._research.prediction_market_source_loss_count
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -493,6 +510,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         Consumed by cli.py to decide whether to sys.exit(1) after all
         publications complete. Any individual non-zero counter is enough to
         trip the alert; the sum is just a convenient single number.
+
+        The conditional-stacking counters are deliberately absent: a triggered or
+        skipped stacker is normal operation, not degradation.
         """
         return (
             self._forecasters_dropped_count
@@ -500,10 +520,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._stacker_primary_failed_count
             + self._stacker_fallback_used_count
             + self._stacker_fallback_failed_count
-            + self._research_provider_timeout_count
+            + self._research_provider_failure_count
+            + self._summarizer_failure_count
             + self._gap_fill_v2_error_count
             + self._prediction_market_degraded_count
-            + self._prediction_market_platform_failure_count
+            + self._prediction_market_source_loss_count
         )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
@@ -858,13 +879,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # stacking entirely and hand the single prediction to the parent
         # aggregator, whose _base_combine returns it as-is (snap-to-integers
         # applied for discrete numerics). Placed before the budget gate and the
-        # per-strategy branches so it short-circuits every stacking path. The
-        # _stacker_outcome marker is "skipped" (stacking was skipped, non-stacked
-        # aggregation); the distinct log line records the single-forecaster reason.
+        # per-strategy branches so it short-circuits every stacking path — which is
+        # also why this branch has to bump its OWN skip counter: the two increment
+        # sites below are unreachable from here.  The _stacker_outcome marker is
+        # "skipped" (stacking was skipped, non-stacked aggregation); the distinct log
+        # line and counter record the single-forecaster reason.
         if n_valid == 1 and self.aggregation_strategy in (
             AggregationStrategy.STACKING,
             AggregationStrategy.CONDITIONAL_STACKING,
         ):
+            self._conditional_stacking_skipped_single_forecaster_count += 1
             logger.info(
                 "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
                 "skipping spread + stacking, aggregating the lone prediction",

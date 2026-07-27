@@ -46,6 +46,7 @@ from metaculus_bot.research.provider_diagnostics import (
     ProviderResult,
     format_provider_diagnostics_block,
     pop_provider_detail,
+    record_provider_detail,
 )
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -69,6 +70,23 @@ _SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 _LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
+
+# Prepended to the AskNews section when the summarizer soft-fails, so the raw
+# articles are never mistaken for a screened analyst briefing. The 2026-07-18
+# AskNews audit made five properties load-bearing (see asknews_summarizer_prompt):
+# a hard per-article relevance gate, recency-first ordering, supersession
+# arithmetic, an evidence-age opener, and proportional length. The raw path has
+# NONE of them, leads with the Historical section, and loses the [PRE-WINDOW]
+# labeling that FUTURE.md credits with saving multiple questions. Deliberately NOT
+# a markdown heading: _demote_inner_headings would shift an h1/h2 and the
+# framework's section renormalization would mangle the provider header.
+SUMMARIZER_SOFT_FAIL_BANNER = (
+    "> **⚠ RAW UNSCREENED ARTICLES — the analyst-briefing pass failed for this question.**\n"
+    "> No per-article relevance gate ran, ordering is the raw feed's (oldest-first, "
+    "historical before recent), and no [PRE-WINDOW] labels were applied. Date every "
+    "fact yourself, check each article against the resolution criteria before using "
+    "it, and treat pre-open events as unable to satisfy the criteria on their own."
+)
 
 
 def _demote_inner_headings(text: str) -> str:
@@ -110,9 +128,23 @@ class ResearchOrchestrator:
         # returns forecaster-clean text; TemplateForecaster pops the block via
         # pop_provider_diagnostics when assembling the published comment.
         self._comment_diagnostics: dict[int, str] = {}
-        self.timeout_count: int = 0
+        # Per-run count of research-provider calls that FAILED — any exception, not
+        # just timeouts (the generic failure branch in _run_one never inspected the
+        # exception type). Named ``timeout_count`` until 2026-07-26, when a 137ms
+        # hard 403 was reported as ``research_provider_timeouts=1`` while the
+        # provider-diagnostics line in the same log correctly said
+        # ``errored | APIError``. Excludes the expected off-season AskNews
+        # subscription error, which reports status="inactive" and is not alertable.
+        self.provider_failure_count: int = 0
+        # Per-run count of AskNews summarizer soft-fails (transient LLM error or
+        # blank output), each of which ships raw unscreened articles in place of the
+        # analyst briefing. Alertable by operator decision 2026-07-26 on quality
+        # grounds: provider status is computed from POST-summarizer text, so a
+        # permanently dead summarizer otherwise degrades every briefing while
+        # AskNews keeps reporting status="ok".
+        self.summarizer_failure_count: int = 0
         # Genuine gap-fill-v2 CRASHES (not idle "driver found nothing" runs, not
-        # deadline hits). Mirrors timeout_count: surfaced to the forecaster as
+        # deadline hits). Mirrors provider_failure_count: surfaced to the forecaster as
         # _gap_fill_v2_error_count and folded into alertable_count so a dead v2
         # feature reddens CI. A dead-on-arrival bug (the fastapi eager-import
         # defect) bumps this on EVERY question -> CI reddens immediately; a
@@ -128,9 +160,9 @@ class ResearchOrchestrator:
 
         The prediction-market provider soft-fails internally (a dead Kalshi
         series path still returns fuzzy-over-events matches), so this sub-path
-        failure never raises and never bumps timeout_count. Reading the module
-        counter here is the only way it reddens CI (the 2026-07-25 hole where
-        research_provider_timeouts=0 while the path was dead)."""
+        failure never raises and never bumps provider_failure_count. Reading the
+        module counter here is the only way it reddens CI (the 2026-07-25 hole where
+        research_provider_failures=0 while the path was dead)."""
         from metaculus_bot.research.prediction_market import (
             kalshi_series_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
@@ -138,34 +170,44 @@ class ResearchOrchestrator:
         return kalshi_series_fetch_failures()
 
     @property
-    def prediction_market_platform_failure_count(self) -> int:
-        """Per-run count of lost prediction-market platform fetches (one per venue
-        whose query/prefetch fan-out lost a sub-fetch, plus one per whole-provider
-        failure), read from the module counter and folded into alertable_count.
+    def prediction_market_source_loss_count(self) -> int:
+        """Per-run count of LOST prediction-market sources, read from the module
+        counter and folded into alertable_count.
 
-        Operator decision 2026-07-25: alert on ANY platform failure, not only a total
+        A "source" is anything the snapshot depends on: one per venue whose
+        query/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
+        one when the keyword extractor produces nothing (which silences all four
+        venues without any venue failing). Named ``platform_failures`` until
+        2026-07-26, when a dead keyword extractor reported
+        ``prediction_market_platform_failures=1`` — reading as "a venue went down"
+        when no venue was ever queried. The distinguishing detail is durable
+        per-source in ``MarketSnapshot.sources`` (``keywords:error(no_queries)`` vs
+        ``polymarket:error(...)``), which rides the published comment and the
+        schema-v2 research archive; this scalar deliberately stays one number.
+
+        Operator decision 2026-07-25: alert on ANY source loss, not only a total
         blackout. The provider soft-fails every venue internally, so without this the
         forecasters silently run on zero market data while CI stays green."""
         from metaculus_bot.research.prediction_market import (
-            prediction_market_platform_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            prediction_market_source_losses,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
 
-        return prediction_market_platform_failures()
+        return prediction_market_source_losses()
 
     def reset_run_degradation_counters(self) -> None:
         """Zero per-run degradation counters at run start (called by
         forecast_questions alongside reset_pchip_stats). The prediction-market
-        series and platform counters are module globals — resetting them here keeps
+        series and source-loss counters are module globals — resetting them here keeps
         them clean per-run metrics instead of leaking across runs/tests that share a
         process. The orchestrator's own instance counters are fresh per bot, so they
         need no reset here."""
         from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-            reset_platform_degradation_counter,
             reset_series_degradation_counter,
+            reset_source_loss_counter,
         )
 
         reset_series_degradation_counter()
-        reset_platform_degradation_counter()
+        reset_source_loss_counter()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)
@@ -335,12 +377,31 @@ class ResearchOrchestrator:
             return ""
         return self._comment_diagnostics.pop(qid, "")
 
+    def _degraded_to_raw_articles(self, question: MetaculusQuestion, research: str, reason: str) -> str:
+        """Return the raw articles under a visible banner, counting the soft-fail.
+
+        Three destinations, because the loss was invisible in all three before
+        2026-07-26: the forecaster sees the banner in its research bundle, CI sees
+        ``summarizer_failures`` in the end-of-run degradation line, and the published
+        comment / research archive see a ``summarizer`` source loss on the AskNews
+        diagnostics line (whose ``status`` is computed from POST-summarizer text and
+        therefore still reads ``ok``).
+        """
+        self.summarizer_failure_count += 1
+        record_provider_detail(
+            getattr(question, "id_of_question", None),
+            "asknews",
+            {"sources": {"summarizer": f"error({reason})"}},
+        )
+        return f"{SUMMARIZER_SOFT_FAIL_BANNER}\n\n{research}"
+
     async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
         """Compress raw AskNews article markdown into an analyst briefing.
 
         Only AskNews output flows here — it's the one provider that returns raw
         article text rather than LLM-written prose. Soft-fails to the raw input
-        so a summarizer hiccup never drops the news entirely.
+        (under a banner, see _degraded_to_raw_articles) so a summarizer hiccup never
+        drops the news entirely.
         """
         if not research.strip():
             return research
@@ -369,11 +430,14 @@ class ResearchOrchestrator:
                 label="asknews_summarizer",
             )
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
-            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
-            return research
+            logger.warning(
+                "AskNews summarization failed (%s); using raw articles under a degradation banner",
+                type(exc).__name__,
+            )
+            return self._degraded_to_raw_articles(question, research, type(exc).__name__)
         if not summary.strip():
-            logger.warning("AskNews summarization returned blank output; using raw articles")
-            return research
+            logger.warning("AskNews summarization returned blank output; using raw articles under a banner")
+            return self._degraded_to_raw_articles(question, research, "blank_output")
         return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
@@ -539,7 +603,7 @@ class ResearchOrchestrator:
                     )
                 else:
                     status = "errored"
-                    self.timeout_count += 1
+                    self.provider_failure_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                     from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                         _record_deprecation_if_matched,

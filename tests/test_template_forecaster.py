@@ -878,7 +878,7 @@ def test_emit_drop_telemetry_clean_run_emits_zero_marker_no_warning(mock_general
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all nine degradation counters. Using distinct powers of 2
+    """Property must sum all ten degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -896,18 +896,64 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     bot._stacker_primary_failed_count = 4
     bot._stacker_fallback_used_count = 8
     bot._stacker_fallback_failed_count = 16
-    bot._research_provider_timeout_count = 32
+    bot._research_provider_failure_count = 32
     bot._gap_fill_v2_error_count = 64
     # prediction_market_degraded is read-only — it reads the prediction-market
     # module's per-run global — so stub the accessor the property imports rather
     # than bumping the counter 128 times.
     monkeypatch.setattr(prediction_market, "kalshi_series_fetch_failures", lambda: 128)
-    # Same shape for the platform-failure counter (operator decision 2026-07-25: any
-    # prediction-market venue losing a fetch reddens CI), so a dropped or
+    # Same shape for the source-loss counter (operator decision 2026-07-25: any
+    # prediction-market source losing a fetch reddens CI), so a dropped or
     # double-counted ninth term shows up in the sum.
-    monkeypatch.setattr(prediction_market, "prediction_market_platform_failures", lambda: 256)
+    monkeypatch.setattr(prediction_market, "prediction_market_source_losses", lambda: 256)
+    # Tenth term: a dead AskNews summarizer silently ships raw ungated articles on
+    # every question (operator approved alerting on it, 2026-07-26).
+    bot._summarizer_failure_count = 512
 
-    assert bot.alertable_count == 511
+    assert bot.alertable_count == 1023
+
+
+@pytest.mark.asyncio
+async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
+    """The two end-of-run summary lines are what a future debugger reads first, so
+    their keys have to name what they actually count.
+
+    2026-07-26 shipped two lies in one run: ``research_provider_timeouts=1``
+    described a hard 403 that failed in 137ms, and ``skipped=0`` contradicted a
+    "single forecaster survived" skip logged seven seconds earlier.
+    """
+    from metaculus_bot.aggregation_strategies import AggregationStrategy
+
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "stacker": mock_general_llm,
+        "analyzer": mock_general_llm,
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(
+        llms=llms_config,
+        min_forecasters_to_publish=1,
+        aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+    )
+    bot._research_provider_failure_count = 3
+    bot._summarizer_failure_count = 1
+    bot._conditional_stacking_skipped_single_forecaster_count = 2
+
+    with caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"):
+        await bot.forecast_questions([])
+
+    degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
+    assert "research_provider_failures=3" in degradation
+    assert "research_provider_timeouts" not in degradation
+    assert "summarizer_failures=1" in degradation
+    assert "prediction_market_source_losses=0" in degradation
+    assert "prediction_market_platform_failures" not in degradation
+
+    stacking = next(line for line in caplog.messages if line.startswith("Conditional stacking summary:"))
+    assert "skipped_single_forecaster=2" in stacking
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -926,7 +972,7 @@ def test_alertable_count_zero_by_default(mock_general_llm):
 
 @pytest.mark.asyncio
 async def test_forecast_questions_resets_prediction_market_counter(mock_general_llm):
-    """Both prediction-market failure counters (Kalshi series index, platform fetches)
+    """Both prediction-market failure counters (Kalshi series index, source losses)
     live at module scope because the provider is a stateless callable, so
     forecast_questions must zero them at run start.
 
@@ -944,20 +990,20 @@ async def test_forecast_questions_resets_prediction_market_counter(mock_general_
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
     prediction_market._bump_kalshi_series_failure()
-    prediction_market._bump_platform_failures()
+    prediction_market._bump_source_loss()
     assert prediction_market.kalshi_series_fetch_failures() == 1
-    assert prediction_market.prediction_market_platform_failures() == 1
+    assert prediction_market.prediction_market_source_losses() == 1
     # Live module bumps (not stubbed accessors) reach alertable_count...
     assert bot.alertable_count == 2
     try:
         await bot.forecast_questions([])
 
         assert prediction_market.kalshi_series_fetch_failures() == 0
-        assert prediction_market.prediction_market_platform_failures() == 0
+        assert prediction_market.prediction_market_source_losses() == 0
         assert bot.alertable_count == 0
     finally:
         prediction_market.reset_series_degradation_counter()
-        prediction_market.reset_platform_degradation_counter()
+        prediction_market.reset_source_loss_counter()
 
 
 def _bot_with_one_forecaster(mock_general_llm) -> TemplateForecaster:

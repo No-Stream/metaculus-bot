@@ -448,7 +448,7 @@ class TestAskNewsSubscriptionErrorHandling:
 
     The provider loop must silence only the exact subscription-inactive
     signature (class-name + message match) — every other asknews failure must
-    bump timeout_count so CI surfaces it.
+    bump provider_failure_count so CI surfaces it.
     """
 
     @pytest.mark.asyncio
@@ -476,7 +476,9 @@ class TestAskNewsSubscriptionErrorHandling:
             result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == "", "Failed provider yields empty result."
-        assert orch.timeout_count == 0, "Off-season subscription-inactive must NOT count as an alertable failure."
+        assert orch.provider_failure_count == 0, (
+            "Off-season subscription-inactive must NOT count as an alertable failure."
+        )
         info_records = [r for r in caplog.records if r.levelno == logging.INFO and "asknews" in r.getMessage().lower()]
         warning_records = [
             r for r in caplog.records if r.levelno == logging.WARNING and "asknews" in r.getMessage().lower()
@@ -505,6 +507,6 @@ class TestAskNewsSubscriptionErrorHandling:
             result, _, _ = await orch._run_providers_parallel(_make_q("test question"), [(asknews_provider, "asknews")])
 
         assert result == ""
-        assert orch.timeout_count == 1
+        assert orch.provider_failure_count == 1
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("asknews" in r.getMessage().lower() for r in warning_records)

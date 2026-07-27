@@ -1238,6 +1238,9 @@ class TestConditionalStackingSkipLogMessage:
         assert "threshold=0.150" in message
         assert str(question.id_of_question) in message
         assert bot._conditional_stacking_skipped_count == 1
+        # No regression from the new single-survivor bucket: a config-off skip is
+        # still a plain skip, counted only in the original bucket.
+        assert bot._conditional_stacking_skipped_single_forecaster_count == 0
 
     @pytest.mark.asyncio
     async def test_low_spread_skip_keeps_le_threshold_wording(self, monkeypatch, caplog):
@@ -1325,6 +1328,15 @@ class TestSingleForecasterShortCircuit:
         assert str(question.id_of_question) in skip_logs[0]
         assert bot._stacker_outcome[question.id_of_question] == "skipped"
         assert question.id_of_question in bot._pipeline.expected_base_combines
+
+        # The run-level summary must agree with the per-question log line above.
+        # This short-circuit returns BEFORE both increment sites, so the 2026-07-26
+        # run logged "SKIPPED: single forecaster survived" and then "skipped=0" seven
+        # seconds later. Counted into its own bucket so the two skip reasons
+        # (single-survivor vs. spread-at-or-below-threshold) stay separable.
+        assert bot._conditional_stacking_skipped_single_forecaster_count == 1
+        assert bot._conditional_stacking_skipped_count == 0
+        assert bot._conditional_stacking_triggered_count == 0
 
     @pytest.mark.asyncio
     async def test_two_of_three_dropped_counts_degradation_and_publishes(self):
