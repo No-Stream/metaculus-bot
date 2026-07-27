@@ -250,6 +250,50 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "degradation_counters",
+        # The per-run summary that DECIDES CI COLOR (cli.py exits non-zero on a
+        # positive alertable_count), emitted by forecaster.py's forecast_questions.
+        # No per-question ref — it aggregates a whole run — so qid_kind stays None.
+        #
+        # The trailing keys are OPTIONAL-group wrapped for the same reason as
+        # gap_fill_v2 above: replace-by-run re-harvesting replays pre-rename logs
+        # (``research_provider_timeouts``, no ``summarizer_failures``,
+        # ``prediction_market_platform_failures`` as the tail), and a mandatory tail
+        # would drop each of those records wholesale instead of harvesting the
+        # counters it does carry. The rename pairs are alternations so one group name
+        # can't cover both spellings; missing groups coerce to None, which reads as
+        # "this era didn't emit it" rather than a measured zero.
+        re.compile(
+            r"Degradation counters:\s*forecasters_dropped=(?P<forecasters_dropped>\S+?),"
+            r"\s*questions_failed_to_publish=(?P<questions_failed_to_publish>\S+?),"
+            r"\s*stacker_primary_failed=(?P<stacker_primary_failed>\S+?),"
+            r"\s*stacker_fallback_used=(?P<stacker_fallback_used>\S+?),"
+            r"\s*stacker_fallback_failed=(?P<stacker_fallback_failed>\S+?),"
+            r"\s*(?:research_provider_failures=(?P<research_provider_failures>\S+?)"
+            r"|research_provider_timeouts=(?P<research_provider_timeouts>\S+?)),"
+            r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
+            r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
+            r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
+            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+)"
+            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+)))?"
+            r"\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "gemini_ungrounded_suppressed",
+        # Gemini grounded-search suppression (research/gemini_search.py
+        # _format_grounded_response): google_search returned no grounding chunks and
+        # no url_context read succeeded, so the section is dropped as ungrounded
+        # parametric output. The orchestrator then records status="empty", which is
+        # NOT alertable and bumps no counter — so this WARN is the only signal, and
+        # without a spec the suppression rate was unmeasurable from the archive.
+        re.compile(
+            r"GEMINI_UNGROUNDED_SUPPRESSED:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
+            r"\s+queries=(?P<queries>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"

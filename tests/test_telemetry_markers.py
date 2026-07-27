@@ -572,3 +572,92 @@ class TestForecastersUsed:
         assert rec["marker"] == "forecasters_used"
         assert rec["used"] == 2
         assert rec["configured"] == 3
+
+
+# The per-run degradation summary — the single line that decides CI color, since
+# cli.py exits non-zero whenever alertable_count is positive. Copied from the
+# format string in metaculus_bot/forecaster.py (forecast_questions), the source of
+# truth. Without a spec here the archive held no record of the counter that reddens
+# every run: the 2026-07-26 research_provider_timeouts -> research_provider_failures
+# rename would have been invisible to a replay.
+DEGRADATION_COUNTERS_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4"
+)
+# Pre-rename shape (research_provider_timeouts, no summarizer_failures, and
+# prediction_market_platform_failures as the trailing key). Replace-by-run
+# re-harvesting replays these old logs, so the trailing keys are optional-group
+# wrapped — a mandatory tail would drop every pre-rename record wholesale rather
+# than harvesting the counters it does carry (same rationale as gap_fill_v2).
+DEGRADATION_COUNTERS_LEGACY_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=0, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_timeouts=5, gap_fill_v2_errors=0, prediction_market_degraded=1"
+)
+
+
+class TestDegradationCounters:
+    def test_all_ten_current_keys_parse(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["forecasters_dropped"] == 2
+        assert rec["questions_failed_to_publish"] == 0
+        assert rec["stacker_primary_failed"] == 0
+        assert rec["stacker_fallback_used"] == 0
+        assert rec["stacker_fallback_failed"] == 0
+        assert rec["research_provider_failures"] == 1
+        assert rec["summarizer_failures"] == 3
+        assert rec["gap_fill_v2_errors"] == 0
+        assert rec["prediction_market_degraded"] == 0
+        assert rec["prediction_market_source_losses"] == 4
+
+    def test_per_run_summary_carries_no_question_ref(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_LINE)
+        # Aggregates a whole run, so there is no id space to stamp.
+        assert "qid" not in rec
+
+    def test_pre_rename_line_still_harvests_its_leading_counters(self):
+        # The pre-rename keys it shares with today's line must still come through;
+        # the renamed/added ones are absent rather than dropping the whole record.
+        rec = _parse_one(DEGRADATION_COUNTERS_LEGACY_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["forecasters_dropped"] == 0
+        assert rec["stacker_fallback_failed"] == 0
+        assert rec["research_provider_timeouts"] == 5
+        assert rec["gap_fill_v2_errors"] == 0
+        assert rec["prediction_market_degraded"] == 1
+        # Keys that did not exist pre-rename coerce to None, not 0 — absent must not
+        # read as "measured zero" in the archive.
+        assert rec["research_provider_failures"] is None
+        assert rec["summarizer_failures"] is None
+        assert rec["prediction_market_source_losses"] is None
+
+
+# Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py
+# _format_grounded_response). The section is suppressed and "" returned, which the
+# orchestrator records as status="empty" — not alertable and not otherwise counted,
+# so the archive is the only way to measure how often grounding silently produced
+# nothing.
+GEMINI_UNGROUNDED_LINE = PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=38195 model=gemini-3.5-flash queries=3"
+
+
+class TestGeminiUngroundedSuppressed:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_UNGROUNDED_LINE)
+        assert rec["marker"] == "gemini_ungrounded_suppressed"
+        assert rec["model"] == "gemini-3.5-flash"
+        assert rec["queries"] == 3
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_UNGROUNDED_LINE)
+        # gemini_search.py passes question.id_of_question, not the post id.
+        assert rec["qid"] == 38195
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        # qid is Optional at the call site; "None" renders into the line verbatim.
+        rec = _parse_one(PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=None model=gemini-3.5-flash queries=0")
+        assert rec["qid"] is None
+        assert rec["queries"] == 0
