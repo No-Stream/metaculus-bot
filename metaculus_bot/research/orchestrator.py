@@ -130,12 +130,9 @@ class ResearchOrchestrator:
         # pop_provider_diagnostics when assembling the published comment.
         self._comment_diagnostics: dict[int, str] = {}
         # Per-run count of research-provider calls that FAILED — any exception, not
-        # just timeouts (the generic failure branch in _run_one never inspected the
-        # exception type). Named ``timeout_count`` until 2026-07-26, when a 137ms
-        # hard 403 was reported as ``research_provider_timeouts=1`` while the
-        # provider-diagnostics line in the same log correctly said
-        # ``errored | APIError``. Excludes the expected off-season AskNews
-        # subscription error, which reports status="inactive" and is not alertable.
+        # just timeouts (the generic failure branch in _run_one never inspects the
+        # exception type). Excludes the expected off-season AskNews subscription
+        # error, which reports status="inactive" and is not alertable.
         self.provider_failure_count: int = 0
         # Per-run count of AskNews summarizer soft-fails (transient LLM error or
         # blank output), each of which ships raw unscreened articles in place of the
@@ -178,10 +175,9 @@ class ResearchOrchestrator:
         A "source" is anything the snapshot depends on: one per venue whose
         query/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
         one when the keyword extractor produces nothing (which silences all four
-        venues without any venue failing). Named ``platform_failures`` until
-        2026-07-26, when a dead keyword extractor reported
-        ``prediction_market_platform_failures=1`` — reading as "a venue went down"
-        when no venue was ever queried. The distinguishing detail is durable
+        venues without any venue failing). That last cause is why this counts
+        sources rather than venues — a dead extractor loses every venue's data
+        without any venue going down. The distinguishing detail is durable
         per-source in ``MarketSnapshot.sources`` (``keywords:error(no_queries)`` vs
         ``polymarket:error(...)``), which rides the published comment and the
         schema-v2 research archive; this scalar deliberately stays one number.
@@ -460,7 +456,13 @@ class ResearchOrchestrator:
         provider, provider_name = choose_provider_with_name(
             self._default_llm,
             exa_callback=self._call_exa_smart_searcher,
-            perplexity_callback=self._call_perplexity,
+            # Each rung gets the vendor its env var pays for. Binding the bare
+            # ``_call_perplexity`` here would hand priority 3 the method's
+            # OpenRouter-first default — deliberate on the AskNews-fallback path
+            # (_attempt_research_fallback prefers the cheap route), wrong here,
+            # where it collapses the ladder's two Perplexity rungs into one and
+            # passes api_key=None whenever only PERPLEXITY_API_KEY is set.
+            perplexity_callback=self._call_perplexity_direct,
             openrouter_callback=self._call_perplexity_openrouter,
             is_benchmarking=self._is_benchmarking,
         )
@@ -746,6 +748,9 @@ class ResearchOrchestrator:
 
     async def _call_perplexity_openrouter(self, question: MetaculusQuestion) -> str:
         return await self._call_perplexity(question, use_open_router=True)
+
+    async def _call_perplexity_direct(self, question: MetaculusQuestion) -> str:
+        return await self._call_perplexity(question, use_open_router=False)
 
     async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question

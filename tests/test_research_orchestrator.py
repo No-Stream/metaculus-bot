@@ -519,6 +519,50 @@ class TestProviderSelection:
         names = [n for _, n in providers]
         assert "resolution_source" not in names
 
+    @pytest.mark.parametrize(
+        ("present_key", "expected_name", "expect_openrouter_slug"),
+        [
+            ("PERPLEXITY_API_KEY", "perplexity", False),
+            ("OPENROUTER_API_KEY", "openrouter", True),
+        ],
+    )
+    async def test_perplexity_rungs_route_to_their_own_vendor(
+        self, mock_llm, question, monkeypatch, present_key, expected_name, expect_openrouter_slug
+    ):
+        """The two Perplexity rungs of the priority ladder must not collapse into one.
+
+        Priority 3 is direct Perplexity (billed to PERPLEXITY_API_KEY); priority 4 is
+        Perplexity via OpenRouter (billed to OPENROUTER_API_KEY). The orchestrator
+        injects one bound method as both selector callbacks, so a default argument on
+        that method decides which vendor each rung actually reaches — and with only
+        PERPLEXITY_API_KEY set, routing to OpenRouter passes api_key=None and the rung
+        is broken outright, not merely mis-billed.
+        """
+        for env_var in (
+            "ASKNEWS_CLIENT_ID",
+            "ASKNEWS_SECRET",
+            "EXA_API_KEY",
+            "PERPLEXITY_API_KEY",
+            "OPENROUTER_API_KEY",
+            "RESEARCH_PROVIDER",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setenv(present_key, "fake-key")
+
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm)
+        provider, provider_name = orch._select_research_provider()
+        assert provider_name == expected_name
+
+        built = MagicMock()
+        built.invoke = AsyncMock(return_value="perplexity prose")
+        with patch("metaculus_bot.research.orchestrator.GeneralLlm", return_value=built) as general_llm:
+            assert await provider(question) == "perplexity prose"
+
+        model_slug = general_llm.call_args.kwargs["model"]
+        assert model_slug.startswith("openrouter/") is expect_openrouter_slug, model_slug
+        # An OpenRouter route needs a key; the direct route must not smuggle one in.
+        assert (general_llm.call_args.kwargs["api_key"] is not None) is expect_openrouter_slug
+
     def test_resolution_source_body_composes_with_header_and_demoted_headings(self):
         """Body written by the resolution_source provider composes with the
         orchestrator header machinery: h2 provider header sits above the body,
