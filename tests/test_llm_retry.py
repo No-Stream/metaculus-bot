@@ -28,7 +28,9 @@ from metaculus_bot import fetch_hardening
 from metaculus_bot.llm_retry import (
     DEFAULT_TRANSIENT_BACKOFFS,
     NON_RETRYABLE_HTTP_STATUS_CODES,
+    TRANSIENT_RETRY_EXCEPTIONS,
     TRANSIENT_RETRY_MAX_ELAPSED_S,
+    _is_transient_type,
     invoke_with_broad_retry,
     invoke_with_transient_retry,
     is_broadly_retryable,
@@ -667,10 +669,32 @@ def test_broad_predicate_rejects_production_key_limit_403() -> None:
     assert is_broadly_retryable(_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE)) is False
 
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
 def test_broad_predicate_still_retries_server_and_rate_limit_statuses(status: int) -> None:
-    """5xx and 429 stay retryable — those genuinely can succeed on a re-roll."""
+    """5xx, 429 and 408 stay retryable — those genuinely can succeed on a re-roll."""
     assert is_broadly_retryable(_api_error_with_status(status)) is True
+
+
+def test_transient_types_are_never_reclassified_as_permanent() -> None:
+    """Guard against generalizing the rule to "all 4xx are permanent".
+
+    ``litellm.Timeout`` carries status 408 — a 4xx — and is the ORIGINAL reason this
+    module exists (an instant 0.001s Timeout during a concurrent async burst that lost
+    all work at allowed_tries=1). Widening NON_RETRYABLE_HTTP_STATUS_CODES to the whole
+    4xx range would silently kill that, so pin every transient type as retryable.
+    """
+    transient = (
+        _timeout(),
+        litellm_exc.APIConnectionError(message="conn", model="m", llm_provider="openrouter"),
+        litellm_exc.InternalServerError(message="500", model="m", llm_provider="openrouter"),
+        litellm_exc.ServiceUnavailableError(message="503", model="m", llm_provider="openrouter"),
+    )
+    # Every configured transient type is represented above, so widening the type set
+    # without extending this guard fails here rather than silently going uncovered.
+    assert {type(exc) for exc in transient} == set(TRANSIENT_RETRY_EXCEPTIONS)
+    for exc in transient:
+        assert is_broadly_retryable(exc) is True, f"{type(exc).__name__} must stay retryable"
+        assert _is_transient_type(exc) is True, f"{type(exc).__name__} must stay transient"
 
 
 def test_broad_predicate_retries_zero_output_statuses() -> None:
