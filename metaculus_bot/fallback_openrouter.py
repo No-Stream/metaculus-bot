@@ -323,31 +323,33 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
 def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
     """Status-aware view of :func:`_is_credit_message` for the routing decision.
 
-    Same precedence as ``_is_credit_message``, with the status the provider REPORTED
-    standing in for the bare-digit cue that function has to settle for:
+    Two signals classify a failure whose status the provider actually reported: a 402,
+    and explicit credit wording. Either alone is sufficient.
 
-    1. An explicit credit phrase wins outright. It is unambiguous English, unlike
-       "Forbidden", which is generic HTTP boilerplate a drained-key 403 body can carry —
-       letting a moderation word veto "Key limit exceeded" would strand the ensemble on
-       the dead key, the exact failure this exists to fix.
-    2. Otherwise moderation wording vetoes. A refusal body replays up to ~100 characters
-       of our own prompt, so where wording and status disagree we take the conservative
-       branch rather than bill the paid key for a call that will refuse again.
-    3. Otherwise the reported status decides, and only a 402 is a credit shortfall.
+    * **402 is unambiguous.** "Payment Required" has no second meaning, and OpenRouter
+      reports refusals as 403, so a reported 402 outranks any English word that happens
+      to sit in the body. The failure asymmetry agrees: reading a real 402 as a refusal
+      strands the ensemble on a dry key, the production bug this exists to fix, while
+      reading a hypothetical 402-shaped refusal as credit costs one paid call that
+      refuses again.
+    * **Explicit wording catches the spend-cap 403**, which OpenRouter returns as "Key
+      limit exceeded" despite documenting credit exhaustion as 402. That body can also
+      carry generic HTTP "Forbidden" boilerplate, so the wording must win there too.
 
-    The status never acts alone: it is consulted last, after both text signals, and a
-    statusless exception defers wholly to ``_is_credit_message`` so that stays the single
-    source of truth for text-only classification. Nothing here reads a live balance —
-    ``status_code`` is an int already on the exception. The ``/auth/key`` probe belongs to
-    ``is_suppressible_credit_error`` and the ALERTING decision, never to routing.
+    No moderation veto is needed here, and adding one would be dead code: with the status
+    in hand, a moderation 403 is rejected because 403 is not 402 and carries no credit
+    phrase — the poisoning case is closed by READING the status rather than by vetoing on
+    words. The veto still earns its place in ``_is_credit_message``, which has only bare
+    digits to go on; a statusless exception defers wholly to that function, keeping it the
+    single source of truth for text-only classification.
+
+    Nothing here reads a live balance — ``status_code`` is an int already on the
+    exception. The ``/auth/key`` probe belongs to ``is_suppressible_credit_error`` and the
+    ALERTING decision, never to routing.
     """
     if reported_status is None:
         return _is_credit_message(lowercased_msg)
-    if any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES):
-        return True
-    if any(cue in lowercased_msg for cue in _MODERATION_CUES):
-        return False
-    return reported_status == 402
+    return reported_status == 402 or any(phrase in lowercased_msg for phrase in _EXPLICIT_CREDIT_PHRASES)
 
 
 def is_credit_caused_error(exc: Exception) -> bool:

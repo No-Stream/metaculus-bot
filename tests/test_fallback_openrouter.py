@@ -1096,17 +1096,25 @@ class TestCreditClassificationPrecedence:
         assert is_credit_caused_error(exc) is False
         assert should_retry_with_general_key(exc) is False
 
-    def test_moderation_wording_outranks_a_402_status(self) -> None:
-        """Where the status says 402 but the wording says refusal, take the safe branch.
+    def test_reported_402_outranks_moderation_wording(self) -> None:
+        """A reported 402 is credit-caused even when the body carries a moderation word.
 
-        Trusting the status here would bill the personal key for a call that refuses
-        again, and would credit-classify a real content block — exempting it from CI
-        alerting for the whole suppression window.
+        402 IS "Payment Required" — the status has no other meaning, and OpenRouter
+        reports refusals as 403. So a reported 402 is stronger evidence about money than
+        an incidental English word in the body, and the failure asymmetry agrees: reading
+        a real 402 as a refusal strands the ensemble on a dry key (the production bug),
+        while reading a hypothetical 402-shaped refusal as credit costs one paid call
+        that refuses again.
+
+        The moderation veto still governs 403, which is the genuinely ambiguous status.
         """
-        body = 'APIError: OpenrouterException - {"error":{"message":"flagged for moderation","code":402}}'
-        exc = self._api_error(402, body)
-        assert is_credit_caused_error(exc) is False
-        assert should_retry_with_general_key(exc) is False
+        balance = "APIError: OpenrouterException - Forbidden: account balance too low"
+        exc = self._api_error(402, balance)
+        assert is_credit_caused_error(exc) is True
+        assert should_retry_with_general_key(exc) is True
+
+        flagged = 'APIError: OpenrouterException - {"error":{"message":"flagged for moderation","code":402}}'
+        assert is_credit_caused_error(self._api_error(402, flagged)) is True
 
     def test_explicit_credit_wording_outranks_http_forbidden_boilerplate(self) -> None:
         """A drained-key 403 rendered as "403 Forbidden" still falls back.
