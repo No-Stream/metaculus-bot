@@ -278,6 +278,20 @@ three-dollar smoke run still goes through the operator. When a paid run is the
 only way to verify a change, the right move is to name the exact command, price
 it, and stop there.
 
+What the gate forbids is an agent *deciding* to spend. An explicit instruction is
+the approval: told to fire a run already discussed, an agent should run it and not
+re-ask. That approval is per-run. One go-ahead is not standing authorization for
+the next run, or for re-running the same one after further changes.
+
+Paid runs are a final pre-merge check rather than part of the verification loop.
+The one-question smoke test below exists to be fired once, deliberately, when a
+change is otherwise finished and about to merge. Its small per-run cost is the
+trap: an agent that treats it as a normal check-my-work step fires it several
+times in a session and spends real money for no added signal, since the run tells
+it nothing the free gates did not. The loop is `make test`, `make lint`, and
+`make typecheck`, with unit and integration coverage as the proof of correctness.
+The paid run is the operator's last step.
+
 ### Paid and externally visible
 
 - `uv run python main.py` / `make run` in any live mode (`tournament`,

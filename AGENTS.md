@@ -20,6 +20,21 @@ is no clean-gates exemption and no "small enough to skip asking" threshold: a
 $2-3 run still goes through the operator. The rule holds even when a paid run is
 the only way to verify the work, in which case say so and stop.
 
+**What the gate forbids is an agent DECIDING to spend.** An explicit instruction
+from the operator IS the approval: when they say to fire a run already discussed
+("fire off the benchmark run we agreed to"), run it and don't re-ask. Approval is
+per-run and doesn't carry forward — one "go" is not standing authorization for the
+next run, nor for re-running the same one after further changes.
+
+**Paid runs are a final pre-merge check, not part of the verification loop.** The
+smoke test exists to be fired ONCE, deliberately, when a change is otherwise
+finished and about to merge. Its small per-run cost is exactly the trap: an agent
+that folds it into a normal check-my-work loop fires it several times a session
+and spends real money for no added signal. The free gates are the loop —
+`make test`, `make lint`, `make typecheck` — and unit or integration coverage is
+how an agent earns confidence. A paid run is the operator's last step, not an
+agent's reassurance.
+
 Paid / external-effecting — ask before each:
 
 - `uv run python main.py` / `make run` in any live mode (`--mode test_questions`,
