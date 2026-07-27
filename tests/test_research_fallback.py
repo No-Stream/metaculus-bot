@@ -1,10 +1,13 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm.exceptions
 import pytest
 from forecasting_tools import GeneralLlm
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.constants import PERPLEXITY_WALL_TIMEOUT
+from metaculus_bot.research import orchestrator, providers
 
 
 @pytest.fixture
@@ -77,3 +80,92 @@ async def test_run_research_returns_empty_when_all_providers_fail(monkeypatch, q
     assert "- asknews: errored | 0 chars |" in block
     assert "RuntimeError" in block
     assert failing_provider.await_count == 1
+
+
+class TestPerplexityRetryHardening:
+    """Both Perplexity call sites own their retry budget instead of inheriting one.
+
+    Dormant in production — AskNews wins the provider priority ladder, so these only
+    run when AskNews credentials are absent or its call fails — but they carry the same
+    defect the 2026-07-26 dry-key run exposed elsewhere: a plain ``GeneralLlm`` with no
+    ``allowed_tries`` inherits forecasting-tools' default of 2 with an UN-GATED
+    ``random.uniform(5, 10)`` tenacity sleep, so a deterministic rejection still costs a
+    blind multi-second sleep. Pinning ``allowed_tries=1`` and routing through
+    ``invoke_with_transient_retry`` makes the elapsed-gated wrapper the sole retry layer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_provider_factory_site_pins_tries_and_wraps(self, question):
+        captured: dict = {}
+
+        def _capture_llm(**kwargs):
+            captured["llm_kwargs"] = kwargs
+            llm = MagicMock()
+            llm.invoke = AsyncMock(return_value="perplexity prose")
+            return llm
+
+        async def _spy(make_awaitable, **kwargs):
+            captured["retry_kwargs"] = kwargs
+            return await make_awaitable()
+
+        with (
+            patch.object(providers, "GeneralLlm", _capture_llm),
+            patch.object(providers, "invoke_with_transient_retry", _spy),
+        ):
+            out = await providers._perplexity_provider()(question)
+
+        assert out == "perplexity prose"
+        assert captured["llm_kwargs"]["allowed_tries"] == 1
+        assert captured["retry_kwargs"]["label"] == "perplexity_research"
+        assert captured["retry_kwargs"]["wall_timeout"] == PERPLEXITY_WALL_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_site_pins_tries_and_wraps(self, question, base_llms):
+        bot = TemplateForecaster(llms=base_llms, aggregation_strategy=AggregationStrategy.MEAN)
+        captured: dict = {}
+
+        def _capture_llm(**kwargs):
+            captured["llm_kwargs"] = kwargs
+            llm = MagicMock()
+            llm.invoke = AsyncMock(return_value="perplexity prose")
+            return llm
+
+        async def _spy(make_awaitable, **kwargs):
+            captured["retry_kwargs"] = kwargs
+            return await make_awaitable()
+
+        with (
+            patch.object(orchestrator, "GeneralLlm", _capture_llm),
+            patch.object(orchestrator, "invoke_with_transient_retry", _spy),
+        ):
+            out = await bot._research._call_perplexity(question.question_text)
+
+        assert out == "perplexity prose"
+        assert captured["llm_kwargs"]["allowed_tries"] == 1
+        assert captured["retry_kwargs"]["label"] == "perplexity_research"
+        assert captured["retry_kwargs"]["wall_timeout"] == PERPLEXITY_WALL_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_hard_403_costs_one_attempt(self, question):
+        """A drained-key 403 is terminal here too — no ladder, no blind sleep."""
+        attempts = {"n": 0}
+
+        def _dead_llm(**_kwargs):
+            async def _invoke(_prompt):
+                attempts["n"] += 1
+                raise litellm.exceptions.APIError(
+                    status_code=403,
+                    message='{"error":{"message":"Key limit exceeded (total limit).","code":403}}',
+                    llm_provider="openrouter",
+                    model="perplexity/sonar-pro",
+                )
+
+            llm = MagicMock()
+            llm.invoke = _invoke
+            return llm
+
+        with patch.object(providers, "GeneralLlm", _dead_llm):
+            with pytest.raises(litellm.exceptions.APIError):
+                await providers._perplexity_provider()(question)
+
+        assert attempts["n"] == 1

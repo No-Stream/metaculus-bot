@@ -33,6 +33,7 @@ from metaculus_bot.constants import (
     EXA_API_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -324,7 +325,10 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. No top_p.
-        model = GeneralLlm(model=model_name, temperature=None)
+        # allowed_tries=1 hands the retry budget to the gated wrapper below; left
+        # unpinned it inherited forecasting-tools' default of 2 with an un-gated
+        # random.uniform(5, 10) tenacity sleep.
+        model = GeneralLlm(model=model_name, temperature=None, allowed_tries=1)
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             "" if is_benchmarking else "In addition to news, consider all relevant prediction markets.\n"
@@ -336,7 +340,11 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
             "Do not produce forecasts yourself. Provide data for the superforecaster.\n\n"
             f"Question:\n{question.question_text}"
         )
-        return await model.invoke(prompt)
+        return await invoke_with_transient_retry(
+            lambda: model.invoke(prompt),
+            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
+            label="perplexity_research",
+        )
 
     return _fetch
 

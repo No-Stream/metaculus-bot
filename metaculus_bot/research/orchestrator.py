@@ -33,13 +33,14 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_MODEL_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_WALL_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
     SUMMARIZER_WALL_TIMEOUT,
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.llm_retry import invoke_with_broad_retry
+from metaculus_bot.llm_retry import invoke_with_broad_retry, invoke_with_transient_retry
 from metaculus_bot.prompts import TS_ANCHOR_SECTION_HEADER, asknews_summarizer_prompt
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
@@ -732,8 +733,16 @@ class ResearchOrchestrator:
             # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
+            # allowed_tries=1 hands the retry budget to the gated wrapper below; left
+            # unpinned it inherited forecasting-tools' default of 2 with an un-gated
+            # random.uniform(5, 10) tenacity sleep.
+            allowed_tries=1,
         )
-        return await model.invoke(prompt)
+        return await invoke_with_transient_retry(
+            lambda: model.invoke(prompt),
+            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
+            label="perplexity_research",
+        )
 
     async def _call_perplexity_openrouter(self, question: MetaculusQuestion) -> str:
         return await self._call_perplexity(question, use_open_router=True)

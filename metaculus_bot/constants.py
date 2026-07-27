@@ -370,6 +370,16 @@ NATIVE_SEARCH_VERBOSITY_DEFAULT: str = "low"
 NATIVE_SEARCH_MAX_RESULTS: int = 20
 NATIVE_SEARCH_CONTEXT_SIZE: str = "high"  # "low", "medium", "high"
 
+# --- Perplexity (fallback research provider; dormant while AskNews wins the ladder) ---
+# Wall-clock cap for the two Perplexity call sites (research/providers.py's provider
+# factory and the orchestrator's AskNews-failure fallback). Both previously had NO
+# wall bound at all — unlike native search and resolution-source, neither was ever
+# migrated to the gated retry wrapper, so a stalled sonar-reasoning-pro call could run
+# as long as litellm let it. Sized between GEMINI_SEARCH_TIMEOUT (360) and the
+# research phase's own budget: generous enough for a reasoning search, bounded enough
+# that a stall can't dominate the phase.
+PERPLEXITY_WALL_TIMEOUT: float = 300.0
+
 # --- Resolution-Source Fetcher (Tier 1) ---
 # Char caps below apply to RAW fetched content only (policy: raw passthrough is
 # capped; LLM-emitted research is never truncated).
@@ -679,6 +689,17 @@ PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 # alongside other research providers, so increasing this does not add
 # wall-clock time to the overall research phase.
 PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "30.0"))
+
+# Per-attempt wall cap and backoff ladder for the keyword-extraction LLM call, which
+# is the FIRST stage of the snapshot above. Before these existed the call's only
+# bound was the snapshot-level wait_for, so a stalled extractor killed the whole
+# snapshot instead of just itself, and its retries came from forecasting-tools'
+# un-gated ``random.uniform(5, 10)`` tenacity sleep. Both values must leave room for
+# the platform fan-out inside PREDICTION_MARKET_TIMEOUT: one 1s backoff (2 attempts,
+# matching the effective budget the un-gated tenacity gave) rather than the shared
+# 1s/10s/30s default, whose sleeps alone exceed the snapshot budget.
+PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT: float = 15.0
+PREDICTION_MARKET_KEYWORD_BACKOFFS: tuple[float, ...] = (1.0,)
 
 # Keyword-extraction strategy for matching Metaculus questions to market
 # listings. Default ``s4_s5_union`` is the empirical best on a 15-question

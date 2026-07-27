@@ -206,12 +206,19 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
 # temperature=None defers reasoning models to provider defaults; redundant on
 # ft 0.2.92 (GeneralLlm ctor default is already None). top_p left unset.
+# allowed_tries=1: the call is wrapped in the elapsed-gated retry
+# (prediction_market.KeywordExtractor._run_llm), so that wrapper is the SOLE retry
+# layer. Left unpinned this inherited forecasting-tools' default of 2 with an
+# UN-GATED random.uniform(5, 10) tenacity sleep — a third of the 30s
+# PREDICTION_MARKET_TIMEOUT spent sleeping blind, which is exactly what llm_retry
+# exists to eliminate.
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.4-mini",
     "temperature": None,
     "max_tokens": 800,
     "reasoning_effort": "low",
     "timeout": 60,
+    "allowed_tries": 1,
 }
 
 
