@@ -260,8 +260,11 @@ def clamp_and_renormalize_mc(
     Delegates the math to ``clamp_and_renormalize_probs`` so the drift-free clamp is a
     single source shared with every pre-construction clamp site. Renormalization can no
     longer push a floored option back below the floor (the ``0.984 + 8x0.002`` case), so
-    every option is guaranteed to land in [MC_PROB_MIN, MC_PROB_MAX] with the list summing
-    to 1.0. Returns the same `PredictedOptionList` for convenience.
+    every option lands in [MC_PROB_MIN, MC_PROB_MAX] with the list summing to 1.0 —
+    **provided ``n * MC_PROB_MIN < 1.0``** (n <= 100 at the 0.01 floor). Above that no
+    in-bounds sum-1 solution exists and the delegate returns sub-floor values by necessity;
+    see ``clamp_and_renormalize_probs`` for the full contract and the ft-validator
+    consequences. Returns the same `PredictedOptionList` for convenience.
     """
     clamped = clamp_and_renormalize_probs([option.probability for option in predicted_option_list.predicted_options])
     for option, probability in zip(predicted_option_list.predicted_options, clamped):

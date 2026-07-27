@@ -52,7 +52,7 @@ from forecasting_tools.data_models.multiple_choice_report import (
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy, combine_multiple_choice_predictions
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
-from metaculus_bot.mc_processing import build_mc_prediction
+from metaculus_bot.mc_processing import build_mc_prediction, clamp_and_renormalize_probs
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import extract_mc
@@ -231,3 +231,69 @@ class TestRawSubFloorConstructionRaisesOn0292:
         )
         dominant_prob = next(o.probability for o in pol.predicted_options if o.option_name == "Dominant")
         assert dominant_prob > 0.9, f"dominant option should stay dominant; got {dominant_prob}"
+
+
+class TestFloorFeasibilityBoundary:
+    """Pin where ``clamp_and_renormalize_probs``'s in-bounds guarantee actually stops.
+
+    Both its docstring and ``clamp_and_renormalize_mc``'s used to promise in-bounds sum-1
+    output unconditionally. That is arithmetically impossible past ``n * MC_PROB_MIN >=
+    1.0``: 101 options each at least 0.01 already exceed 1. These pin the real contract so
+    a future reader trusts the boundary rather than the old blanket claim, and so a change
+    to MC_PROB_MIN or to the degenerate branch surfaces here.
+
+    None of this is reachable on today's Metaculus ballots (option counts are far below
+    100); it is documented because the docstrings are what a caller reads.
+    """
+
+    def test_guarantee_holds_at_the_feasibility_limit(self) -> None:
+        # n=100 at a 0.01 floor is exactly feasible (100 * 0.01 == 1.0 is the degenerate
+        # branch's trigger, but a uniform ballot lands exactly ON the floor), so the
+        # boundary for uniform input is n > 100, not n >= 100.
+        out = clamp_and_renormalize_probs([1 / 100] * 100)
+        assert sum(out) == pytest.approx(1.0)
+        for probability in out:
+            assert MC_PROB_MIN <= probability <= MC_PROB_MAX
+
+    def test_beyond_the_limit_returns_sub_floor_values_by_necessity(self) -> None:
+        # 200 uniform options: no in-bounds sum-1 solution exists, so the honest output is
+        # sub-floor rather than a sum that isn't 1. Pin the value so the contract is
+        # concrete.
+        out = clamp_and_renormalize_probs([1 / 200] * 200)
+        assert sum(out) == pytest.approx(1.0)
+        assert all(probability == pytest.approx(0.005) for probability in out)
+        assert min(out) < MC_PROB_MIN, "past the feasibility limit the floor cannot be honored"
+
+    def test_uniform_high_cardinality_still_constructs(self) -> None:
+        # ft clamps 0.005 -> 0.01 then renormalizes straight back to 0.005: a zero net
+        # move, so its >0.05 guard does not fire. This is why sub-floor output alone is
+        # not a publish-time failure.
+        out = clamp_and_renormalize_probs([1 / 200] * 200)
+        pol = PredictedOptionList(
+            predicted_options=[PredictedOption(option_name=f"o{i}", probability=p) for i, p in enumerate(out)]
+        )
+        assert len(pol.predicted_options) == 200
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param([0.9] + [0.1 / 199] * 199, id="200-options-one-dominant"),
+            pytest.param([0.5, 0.3] + [0.2 / 118] * 118, id="120-options-two-dominant"),
+        ],
+    )
+    def test_high_cardinality_plus_concentration_is_what_ft_rejects(self, raw: list[float]) -> None:
+        """The publish-time loss needs BOTH high cardinality and a dominant option.
+
+        Documented as a known, unreachable-in-practice limit rather than fixed, because it
+        cannot be fixed from our side: ft clamps to its own hard-coded 0.01 no matter what
+        floor we use, so relaxing ours changes nothing about how far it moves the dominant
+        option (measured — at n=200 ft accepts a top option only up to ~0.06, and no choice
+        of our floor lifts that ceiling). Any real fix would have to cap cardinality or
+        reshape the forecast, neither of which belongs in a clamp helper.
+        """
+        out = clamp_and_renormalize_probs(raw)
+        assert sum(out) == pytest.approx(1.0), "we still return a sum-1 list"
+        with pytest.raises(ValueError, match="differs from original probability"):
+            PredictedOptionList(
+                predicted_options=[PredictedOption(option_name=f"o{i}", probability=p) for i, p in enumerate(out)]
+            )
