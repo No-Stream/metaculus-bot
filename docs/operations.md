@@ -74,11 +74,22 @@ Diagnosing auth errors: an OpenRouter 401/402 on an OpenAI or Anthropic call
 means suspect the donated key first (it's always tried first for those
 providers). A 401/402 on Grok, Qwen, or Perplexity is always the personal key
 (the donated key 404s on those). A `google-genai` 401 or quota error is always
-`GOOGLE_API_KEY`. A `403` splits two ways: one whose body says
-`Key limit exceeded` is a drained spend cap and DOES fall back to the personal
-key, while any other `403 moderation` does not (both keys would refuse the same
-prompt). A `429 rate limit` is not a key defect but does fall back, since BYOK
-quotas are per-key. See "What a dry donated key actually returns" below.
+`GOOGLE_API_KEY`. A `403` splits three ways:
+
+- Body says `Key limit exceeded` — a drained spend cap. Falls back to the
+  personal key and is credit-classified, whatever status came with it.
+- Body says `no allowed providers`, `guardrail`, or `data policy` — scoped to
+  the donated key's routing, so the personal key genuinely can serve the call.
+  Falls back, but is NOT credit-classified.
+- Anything else — a moderation or permission refusal. Does not fall back, since
+  both keys would refuse the same prompt. Those two phrasings are the only ways
+  out of this branch, so it holds even when the body happens to contain ordinary
+  credit English like "insufficient funds": on a reported 403 the body is the
+  least trustworthy input we have (see the `flagged_input` prompt replay below),
+  and credit wording there classifies as neither credit nor a key issue.
+
+A `429 rate limit` is not a key defect but does fall back, since BYOK quotas are
+per-key. See "What a dry donated key actually returns" below.
 
 ## Environment flags
 
@@ -257,9 +268,9 @@ three forecasters, native search, the AskNews summarizer, the financial-data
 classifier, prediction-market keyword extraction, and both gap-fill passes: the
 wrapper's negative rule vetoed any message containing "403" (written for content
 moderation, where both keys really would refuse), so the operator's funded
-personal key was never tried. `_is_credit_message` now matches the phrase
+personal key was never tried. The classifier now matches the phrase
 `key limit exceeded`, which flips both the fallback decision and the credit
-classification through the single shared helper.
+classification through the single shared helper (`_is_credit_failure`).
 
 The cue has to be the full phrase. `limit exceeded` alone is a substring of
 `rate limit exceeded: free-models-per-day`, so the short form would classify
@@ -288,21 +299,49 @@ a red run green. The state is logged as
 else) and is echoed in the end-of-run summary as `donated_key=<state>` whenever a
 probe actually ran.
 
-Fallback **routing** stays purely textual and is deliberately not gated on the
-probe: OpenRouter caches these balance figures, so a stale read reporting
-`funded` must never be able to strand the ensemble on a dry key — that is the
-exact failure this change exists to fix. The probe governs the alerting decision
-only.
+Fallback **routing** reads the status the provider reported
+(`llm_retry.llm_status_code`, an int already on the exception) and never a live
+balance. A reported 403 falls back only on the spend-cap phrase or route-scoped
+wording; a reported 402 always falls back; an exception carrying no status falls
+back on text alone. The
+`/auth/key` probe is consulted for alerting only (`is_suppressible_credit_error`),
+so a stale or cached read reporting `funded` can never strand the ensemble on a
+dry key — that is the exact failure this change exists to fix.
 
-One related hardening rides along. OpenRouter moderation 403 bodies include
-`flagged_input`, up to ~100 characters of our own prompt replayed back, and a
-forecasting prompt full of dollar figures and bill numbers can easily contain the
-token `402`. A bare `402` substring match therefore read an ordinary moderation
-refusal as an empty wallet — billing the personal key for a call that would
-refuse again, and exempting a real moderation block from alerting. The bare
-digits are now only trusted when nothing in the body looks like a moderation
-refusal (`moderation`, `forbidden`, `flagged_input`, `flagged for`). Word cues
-only, deliberately: a genuine 402 links to a key hash that has roughly a 1-in-11
+Two related hardenings ride along, both about how little the body can be trusted.
+
+First, "was this about money?" has exactly one arbiter, `_is_credit_failure`
+(`fallback_openrouter.py:349`, whose docstring is the canonical version of this),
+which both the routing decision and the alerting counter reach through. It reads
+three tiers in a fixed order:
+
+1. The spend-cap phrase `key limit exceeded` outranks everything, including the
+   moderation veto below, and fires on any status or none. The production body
+   renders as `403 Forbidden: Key limit exceeded`, and `forbidden` is both a
+   moderation cue and generic HTTP boilerplate, so gating the phrase behind the
+   veto would keep the dry key from falling back all over again.
+2. Otherwise, a reported status decides alone: credit means exactly 402. So a
+   reported 402 outranks moderation wording — `APIError(status_code=402,
+   message="Blocked by moderation policy")` both falls back and is
+   credit-classified — and credit English on any other reported status does not
+   classify.
+3. With no status reported, moderation wording (`moderation`, `forbidden`,
+   `flagged_input`, `flagged for`) vetoes; failing that, a bare `402` or one of
+   `payment required` / `insufficient credit` / `out of credits` /
+   `insufficient funds` classifies.
+
+That last ordering is why `insufficient credit` alone classifies as credit while
+`blocked by moderation: insufficient credit` does not.
+
+Second, OpenRouter moderation 403 bodies include `flagged_input`, up to ~100
+characters of our own prompt replayed back, and a forecasting prompt full of
+dollar figures and bill numbers can easily contain the token `402`. A bare `402`
+substring match therefore read an ordinary moderation refusal as an empty wallet
+— billing the personal key for a call that would refuse again, and exempting a
+real moderation block from alerting. Everything after a prompt-echo marker is now
+stripped before any word cue reads the body, and the bare digits are only trusted
+when nothing in what remains looks like a moderation refusal. Word cues only,
+deliberately: a genuine 402 links to a key hash that has roughly a 1.5% (1-in-66)
 chance of containing the substring `403`, and reading that as moderation would
 break the long-standing 402 fallback.
 
@@ -381,10 +420,16 @@ uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
 ```
 
-Before either analysis, run `make sync_research` (also read-only and free) so
-the per-provider research artifacts in `backtests/research_archive/latest/` are
-fresh. GHA artifacts expire at 90 days, so this local archive is the only
-durable copy; `scripts/research_sync/` has a weekly launchd job.
+Before either analysis, run `make sync_all` (also read-only and free) so the
+local archives are fresh: the per-provider research archive
+(`backtests/research_archive/latest/`), the run-log telemetry archive
+(`backtests/telemetry_archive/`), and the raw research-provider payload archive
+(`backtests/research_archive/raw/`). Use `sync_all` rather than one of the
+narrower `sync_*` targets — it is a single download pass over the union of
+artifact families, so it is cheaper than running them in sequence, and GHA
+artifacts expire at 90 days, which makes anything a partial pull skipped
+permanently unrecoverable. The weekly launchd job in `scripts/research_sync/` is
+wired to `sync_all` for the same reason.
 
 ## Reading run logs
 
