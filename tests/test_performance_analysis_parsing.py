@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -848,6 +849,36 @@ class TestStackedCommentEndToEnd:
 
 _PERF_DATA_PATH = Path(__file__).parent.parent / "scratch" / "performance_data.json"
 
+# Independent oracle for "does this comment carry a recoverable Model: line for
+# forecaster index N". Deliberately NOT reusing the production
+# ``_R1_MODEL_RE`` / ``parse_forecaster_model_map``: the whole point is to catch
+# a regression *in* that regex, and an oracle built from it would move in
+# lockstep and see nothing. Written instead from the documented comment format
+# (``## R1: Forecaster N Reasoning`` immediately followed by ``Model: <path>``,
+# injected by ``forecaster.TemplateForecaster._make_prediction``). Verified to
+# agree with the production map on all 283 archived records at the time of
+# writing, so a future divergence is signal, not noise.
+_ORACLE_R1_MODEL_RE = re.compile(
+    r"^[ \t]*##[ \t]+R1:[ \t]+Forecaster[ \t]+(\d+)[ \t]+Reasoning[ \t]*\r?\n[ \t]*Model:[ \t]*(\S[^\n]*)$",
+    re.MULTILINE,
+)
+
+_ANONYMIZED_KEY_RE = re.compile(r"Forecaster (\d+)")
+
+
+def _oracle_recoverable_indices(comment: str) -> set[int]:
+    """Forecaster indices whose model name is present in ``comment``.
+
+    An index in this set MUST come back from the parser as a real model name —
+    the attribution source is right there in the text. An index absent from it
+    is structurally unattributable and correctly falls back to ``Forecaster N``.
+    """
+    return {
+        int(match.group(1))
+        for match in _ORACLE_R1_MODEL_RE.finditer(comment)
+        if match.group(2).strip().rsplit("/", 1)[-1].strip()
+    }
+
 
 @pytest.mark.skipif(not _PERF_DATA_PATH.exists(), reason="performance_data.json not checked in")
 class TestRealDataRegression:
@@ -855,8 +886,8 @@ class TestRealDataRegression:
 
     Uses whatever roster the checked-in fixture was collected under. This test
     does not assume a specific set of models — it just asserts that every
-    parsed record's per-model keys look like real model names, not
-    index-anonymized `Forecaster N`.
+    forecast whose model name is RECOVERABLE from the comment text comes back
+    named, never index-anonymized `Forecaster N`.
     """
 
     @pytest.fixture(scope="class")
@@ -864,16 +895,27 @@ class TestRealDataRegression:
         with open(_PERF_DATA_PATH) as f:
             return json.load(f)
 
-    def test_most_march_records_parse_to_named_models(self, records):
-        # Some comments hit the Metaculus comment char limit and get trimmed
-        # mid-rationale, erasing a Model: line. Anonymized fallback is the
-        # CORRECT behavior in those cases — better than silently mislabeling.
-        # We require >=90% of records to parse cleanly; the remainder must be
-        # accounted for by trim-induced missing Model: lines, not a parser
-        # regression.
+    def test_records_with_a_recoverable_model_name_parse_to_it(self, records):
+        # A `Forecaster N` key is only a parser bug when the comment actually
+        # contains that index's `Model:` line. Two archived cohorts legitimately
+        # lack one and MUST fall back to the anonymized key:
+        #
+        #  * comments trimmed at the Metaculus char limit, which can erase a
+        #    `Model:` line mid-rationale;
+        #  * the 2026-04-04..04-13 stacking-era cohort, where a fired stacker
+        #    published its aggregate via a `ReasonedPrediction` constructed
+        #    directly in `_aggregate_predictions` — bypassing the
+        #    `Model: {llm.model}` prefix that `_make_prediction` adds to every
+        #    per-forecaster rationale. Those comments carry no `Model:` line
+        #    anywhere, so no parser can name them.
+        #
+        # Keying on per-index recoverability instead of either cohort marker
+        # makes the assertion both stricter and era-agnostic: it now flags a
+        # dropped attribution even inside a trimmed comment, which the old
+        # "not trimmed" proxy waved through.
         total = 0
         fully_parsed = 0
-        trimmed_bad = []
+        unattributable = []
         parser_bad = []
         for rec in records:
             comment = rec.get("comment_text") or ""
@@ -881,17 +923,52 @@ class TestRealDataRegression:
                 continue
             total += 1
             parsed = parse_per_model_forecasts(comment)
-            bad_keys = [k for k in parsed if k.startswith("Forecaster ")]
-            if not bad_keys:
+            recoverable = _oracle_recoverable_indices(comment)
+            anonymized = [k for k in parsed if k.startswith("Forecaster ")]
+            dropped = [
+                key
+                for key in anonymized
+                if (match := _ANONYMIZED_KEY_RE.fullmatch(key)) and int(match.group(1)) in recoverable
+            ]
+            if not anonymized:
                 fully_parsed += 1
-            elif "[... trimmed for length]" in comment:
-                trimmed_bad.append(rec["post_id"])
+            elif dropped:
+                parser_bad.append((rec["post_id"], dropped))
             else:
-                parser_bad.append((rec["post_id"], bad_keys))
-        assert not parser_bad, f"Non-trim-related parse failures: {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
-        assert fully_parsed / total >= 0.90, (
-            f"Only {fully_parsed}/{total} records parsed cleanly ({len(trimmed_bad)} due to comment trimming)"
+                unattributable.append(rec["post_id"])
+        assert not parser_bad, (
+            f"Parser anonymized a forecast whose Model: line is present in the comment: {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
         )
+        # Coverage floor over the records that HAVE an attribution source, so a
+        # shift in the unattributable cohort's size can't mask a real drop.
+        attributable = total - len(unattributable)
+        assert attributable > 0, "No records carry an attribution source; fixture is unusable"
+        assert fully_parsed / attributable >= 0.90, (
+            f"Only {fully_parsed}/{attributable} attributable records parsed cleanly "
+            f"({len(unattributable)} of {total} records carry no Model: line at all)"
+        )
+
+    def test_stacking_era_cohort_is_structurally_unattributable(self, records):
+        # Guards the premise of the exemption above: the 2026-04 stacking-era
+        # comments are unattributable because the text carries NO `Model:` line,
+        # not because the parser gave up. If a future fixture refresh brings in
+        # comments that do carry one, this fails and the exemption gets re-derived
+        # rather than silently swallowing a real regression.
+        for rec in records:
+            comment = rec.get("comment_text") or ""
+            if not comment:
+                continue
+            parsed = parse_per_model_forecasts(comment)
+            if not [k for k in parsed if k.startswith("Forecaster ")]:
+                continue
+            if _oracle_recoverable_indices(comment):
+                # Has a source for SOME index; the per-index assertion above owns
+                # whether the specific anonymized index was recoverable.
+                continue
+            assert "Model:" not in comment, (
+                f"post {rec['post_id']} was treated as unattributable but contains a Model: "
+                "line the oracle did not match — refresh the oracle or the exemption"
+            )
 
     def test_known_sample_post_matches_expected_models(self, records):
         # post 42631 (Oscar winner question) is in the March cohort — sampled
