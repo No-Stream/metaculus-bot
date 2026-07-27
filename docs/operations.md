@@ -6,7 +6,7 @@ flags, the GitHub Actions workflows, cost discipline, and the telemetry you can
 grep after a run.
 
 For a code-level map of the pipeline, read `AGENTS.md` at the repo root. This
-doc points at code with `file:line` references so you can click through.
+doc points at code by file and symbol name, so `rg <symbol>` takes you there.
 
 ## Setup
 
@@ -93,7 +93,7 @@ per-key. See "What a dry donated key actually returns" below.
 
 ## Environment flags
 
-Flags are read at call time via `env_flag_enabled` (`constants.py:136`), which
+Flags are read at call time via `env_flag_enabled` in `constants.py`, which
 treats `true`/`1`/`yes` as on and `false`/`0`/`no` as off (case-insensitive).
 When a flag is unset it takes the code default shown below. The four workflow
 YAMLs set these explicitly, so the "prod value" column is what actually runs in
@@ -139,7 +139,7 @@ its tool-call budget is `GAP_FILL_V2_MAX_TOOL_CALLS`. All four are defined in
 | `MC_STACKING_ENABLED` | off | `false` | Stacker LLM on multiple-choice questions |
 | `NUMERIC_STACKING_ENABLED` | off | `false` | Stacker LLM on numeric questions |
 
-The aggregation strategy is `CONDITIONAL_STACKING` (set in `cli.py:120`), but
+The aggregation strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`), but
 all three stacking flags are `false` in every workflow, so prod effectively runs
 MEDIAN aggregation. The stacker chain stays live for backtests and ablation. The
 disable is evidence-backed: an n=88 ablation found the stacker hurts numeric
@@ -214,9 +214,9 @@ rough cost and let the operator decide.
 ## Credit telemetry and the refill floor
 
 Every run logs OpenRouter balances for both keys at start and end, and computes
-per-run spend. The code is `metaculus_bot/credit_telemetry.py`, wired into
-`cli.py:130`; balances come from the `/auth/key` endpoint via
-`check_openrouter_credits.py`.
+per-run spend. The code is `metaculus_bot/credit_telemetry.py`, whose
+`CreditTelemetry` is wired into `cli.py`'s `main`; balances come from the
+`/auth/key` endpoint via `check_openrouter_credits.py`.
 
 Marker lines land in the `run_logs/` artifact (all four workflows tee stdout +
 stderr), so per-run spend is durably grep-able:
@@ -333,7 +333,7 @@ dry key — that is the exact failure this change exists to fix.
 Two related hardenings ride along, both about how little the body can be trusted.
 
 First, "was this about money?" has exactly one arbiter, `_is_credit_failure`
-(`fallback_openrouter.py:349`, whose docstring is the canonical version of this),
+(in `fallback_openrouter.py`, whose docstring is the canonical version of this),
 which both the routing decision and the alerting counter reach through. It reads
 three tiers in a fixed order:
 
@@ -464,7 +464,7 @@ artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
 - `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...`
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
-  structured block). Emitted in `value_extraction.py:90`.
+  structured block). Emitted by `_log_extraction` in `value_extraction.py`.
 - `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
   forecaster piled 10%+ of its mass on the terminal displayed bin of an
   open-bound numeric question without declaring any percentile beyond the edge.
@@ -473,9 +473,9 @@ artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
 - `GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=...
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
   wall_s=... findings=... pending_leads=... lint_rejections=...` — one summary
-  line per gap-fill v2 loop (`research/agentic/loop.py:468`). A companion
-  `GHOST_FORECAST` line logs the loop's private dry-run forecast for telemetry
-  only; it is never published.
+  line per gap-fill v2 loop, emitted by `_log_completion` in
+  `research/agentic/loop.py`. A companion `GHOST_FORECAST` line logs the loop's
+  private dry-run forecast for telemetry only; it is never published.
 - `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_FLOOR_BREACH` — credit telemetry,
   described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
   suppression window, so seeing one on a green run is expected until 2026-09-10;

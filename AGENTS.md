@@ -57,9 +57,9 @@ Fork of the Metaculus starter template. Runs a multi-LLM ensemble with a meta-st
 
 Per question (`forecaster.py:_research_and_make_predictions`):
 
-1. **Research** — `run_research` (`forecaster.py:413`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`research/targeted.py` `run_gap_fill_pass`, `research/orchestrator.py:116`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.6-terra`, low effort, via OpenRouter on the donated key).
+1. **Research** — `run_research` (`forecaster.py`) fans out providers in parallel via `_select_research_providers` / `_run_providers_parallel`. Always-on **gap-fill second pass** (`run_gap_fill_pass` in `research/targeted.py`, called from `run_research` in `research/orchestrator.py`) identifies factual gaps and resolves them via parallel OpenAI native web searches (`gpt-5.6-terra`, low effort, via OpenRouter on the donated key).
 2. **Forecaster fan-out** — N forecaster LLMs run in parallel via `_forecaster_with_soft_deadline` (10-min cap each) → `_make_prediction` → type-specific runner (binary/MC/numeric).
-3. **Min-forecasters guard** (`forecaster.py:590`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` (currently 1) returned a valid prediction. A **single-forecaster short-circuit** just below the guard skips spread computation + stacking when exactly one forecaster survived (the `spread_metrics` helpers require ≥2 predictions and raise otherwise) and hands the lone prediction to the aggregator.
+3. **Min-forecasters guard** (in `_research_and_make_predictions`, `forecaster.py`) drops the question if fewer than `MIN_FORECASTERS_TO_PUBLISH` returned a valid prediction. A **single-forecaster short-circuit** just below the guard skips spread computation + stacking when exactly one forecaster survived (the `spread_metrics` helpers require ≥2 predictions and raise otherwise) and hands the lone prediction to the aggregator.
 4. **Aggregation** — see CONDITIONAL_STACKING below.
 
 ### Ensemble
@@ -77,18 +77,18 @@ Support models (also in `llm_configs.py`):
 
 ### CONDITIONAL_STACKING (default)
 
-`AggregationStrategy.CONDITIONAL_STACKING` (set in `metaculus_bot/cli.py:117`). Note: this describes the code default — stacking is currently DISABLED in prod, since all four prod workflow yamls set `BINARY_STACKING_ENABLED`/`MC_STACKING_ENABLED`/`NUMERIC_STACKING_ENABLED` to `'false'` (the chain stays live in backtests/ablation). Behavior:
+`AggregationStrategy.CONDITIONAL_STACKING` (set in `main`, `metaculus_bot/cli.py`). Note: this describes the code default — stacking is currently DISABLED in prod, since all four prod workflow yamls set `BINARY_STACKING_ENABLED`/`MC_STACKING_ENABLED`/`NUMERIC_STACKING_ENABLED` to `'false'` (the chain stays live in backtests/ablation). Behavior:
 
 - Compute spread across the N forecasters via `spread_metrics.compute_spread`.
-- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_base_combine`, `aggregation_pipeline.py:213`).
+- If spread ≤ threshold → return **MEDIAN** of raw per-model predictions (base-combine via `_base_combine`, `aggregation_pipeline.py`).
 - If spread > threshold → extract the **disagreement crux**, run **targeted search** (OpenAI native search via `gpt-5.6-terra` with `reasoning={"effort":"low"}` (env default) + `verbosity="low"`, 360s timeout), then invoke the **stacker LLM** with the full base-model reasonings + targeted research (`stacking.run_stacking_{binary,mc,numeric}`).
-- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`aggregation_pipeline.py:283-359`, `_stacking_aggregate`.)
+- Stacker fallback chain: primary `STACKER_LLM` under `STACKER_SOFT_DEADLINE` → `STACKER_FALLBACK_LLM` under `STACKER_FALLBACK_SOFT_DEADLINE` → MEDIAN. (`_stacking_aggregate`, `aggregation_pipeline.py`.)
 
-Thresholds (`metaculus_bot/constants.py:245-249`):
+Thresholds (all in `metaculus_bot/constants.py`):
 
-- Binary: probability range (max − min) ≥ **0.15**.
-- MC: max per-option spread ≥ **0.20**.
-- Numeric: normalized percentile spread ≥ **0.15**.
+- Binary: probability range (max − min) ≥ `CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD`.
+- MC: max per-option spread ≥ `CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD`.
+- Numeric: normalized percentile spread ≥ `CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD`.
 
 ### Clamps / bounds
 
@@ -125,17 +125,17 @@ Every successful extraction emits one `EXTRACTION_RUNG: question=... model=... q
 
 Discrete-integer snapping is decided separately by the C3 block-read in `forecaster_runners.run_numeric_forecast` — it reads `NumericStructured.outcome_type` directly before falling back to a parser LLM call for `OutcomeTypeResult`, and the ladder does not touch that path.
 
-**Ensemble aggregation** (`numeric/utils.py` `aggregate_numeric:140`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
+**Ensemble aggregation** (`aggregate_numeric` in `numeric/utils.py`): pointwise **in CDF space** — concatenate each model's 201-point CDF, groupby value, mean or median the probabilities, then `_postprocess_ensemble_cdf` re-pins endpoints, enforces monotonic + min-step, resamples via PCHIP for discrete questions. Not percentile-space averaging.
 
 ### Research providers
 
-Orchestration in `research/orchestrator.py:_select_research_providers:238`.
+Orchestration in `_select_research_providers` (`research/orchestrator.py`).
 
-**Primary provider** — exactly one, chosen by priority in `research/providers.py` `choose_provider_with_name:426`:
+**Primary provider** — exactly one, chosen by priority in `choose_provider_with_name` (`research/providers.py`):
 
-1. **AskNews** if `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set (the prod case): dual-phase search (HOT + HISTORICAL), rate-limited with retry/dedup (`research/providers.py:82-210`).
-2. **Exa.ai SmartSearcher** if `EXA_API_KEY` set (fallback when AskNews absent): generic rundown (`research/providers.py:263-281`).
-3. **Perplexity direct** if `PERPLEXITY_API_KEY` set: `research/providers.py:283-301`. Prompt explicitly requests prediction-market consideration unless benchmarking.
+1. **AskNews** if `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` are set (the prod case): dual-phase search (HOT + HISTORICAL), rate-limited with retry/dedup (`_asknews_provider`, `research/providers.py`).
+2. **Exa.ai SmartSearcher** if `EXA_API_KEY` set (fallback when AskNews absent): generic rundown (`_exa_provider`, `research/providers.py`).
+3. **Perplexity direct** if `PERPLEXITY_API_KEY` set: `_perplexity_provider` in `research/providers.py`. Prompt explicitly requests prediction-market consideration unless benchmarking.
 4. **Perplexity via OpenRouter** if `OPENROUTER_API_KEY` set: same function, `use_open_router=True`.
 5. Empty stub.
 
@@ -222,7 +222,7 @@ The bot uses several API keys; they fall into two buckets and the names don't al
 - Question types: `BinaryQuestion`, `NumericQuestion`, `MultipleChoiceQuestion`.
 - Prediction types: `ReasonedPrediction`, `BinaryPrediction`, etc.
 - Research helpers: `AskNewsSearcher`, `SmartSearcher`.
-- Numeric: `NumericDistribution`, `Percentile`. We subclass `NumericDistribution` as `PchipNumericDistribution` (`numeric/pchip_processing.py:217`) to override `get_cdf()` (the method ft 0.2.92's publish/aggregate paths call; `.cdf` is a deprecated property delegating to it) with our pre-computed 201-point PCHIP CDF; forecasting-tools' built-in CDF builder is only used on the fallback path.
+- Numeric: `NumericDistribution`, `Percentile`. We subclass `NumericDistribution` as `PchipNumericDistribution` (`numeric/pchip_processing.py`) to override `get_cdf()` (the method ft 0.2.92's publish/aggregate paths call; `.cdf` is a deprecated property delegating to it) with our pre-computed 201-point PCHIP CDF; forecasting-tools' built-in CDF builder is only used on the fallback path.
 
 ## Model configuration
 

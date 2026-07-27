@@ -12,22 +12,22 @@ under `metaculus_bot/research/`.
 ## The shape of a research run
 
 Every question goes through `ResearchOrchestrator.run_research`
-(`research/orchestrator.py:114`). The flow is:
+(`research/orchestrator.py`). The flow is:
 
 1. **Cache check.** In benchmarking runs the orchestrator caches research per
    question id so a replayed backtest doesn't re-pay for the same pull. Live runs
-   don't cache (`_lookup_research_cache`, `research/orchestrator.py:292`).
+   don't cache (`_lookup_research_cache`, `research/orchestrator.py`).
 2. **Provider selection.** `_select_research_providers`
-   (`research/orchestrator.py:317`) picks exactly one **primary** provider, then
+   (`research/orchestrator.py`) picks exactly one **primary** provider, then
    appends every enabled **add-on** provider. Each add-on is behind its own env
    flag, so the set that actually runs depends on configuration.
 3. **Parallel fan-out.** `_run_providers_parallel`
-   (`research/orchestrator.py:383`) runs all selected providers concurrently via
+   (`research/orchestrator.py`) runs all selected providers concurrently via
    `asyncio.gather`. One provider failing never kills the phase; the failure is
    recorded as a per-provider result and the rest proceed. Global concurrency is
-   bounded by a semaphore (`DEFAULT_MAX_CONCURRENT_RESEARCH = 6`).
+   bounded by a semaphore sized by `DEFAULT_MAX_CONCURRENT_RESEARCH`.
 4. **Assembly.** Each provider's output is prefixed with a fixed `##` section
-   header (`_provider_header`, `research/orchestrator.py:476`) and the sections
+   header (`_provider_header`, `research/orchestrator.py`) and the sections
    are joined with `---` rules. Any stray `#`/`##` heading inside a provider's
    body is demoted two levels so it never competes with the section headers.
 5. **Gap-fill.** Two second-pass gap-fill passes (v1 and v2) run concurrently on
@@ -43,7 +43,7 @@ ensemble reads verbatim.
 ## Primary provider: a priority ladder
 
 There is always exactly one primary provider, chosen by
-`choose_provider_with_name` (`research/providers.py:448`). It walks a fixed
+`choose_provider_with_name` (`research/providers.py`). It walks a fixed
 priority order and returns the first provider whose credentials are present:
 
 1. **AskNews** if `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET` are set. This is the
@@ -64,7 +64,7 @@ silently picking a different provider.
 ### AskNews fallback (primary-only)
 
 AskNews is the only primary that gets a runtime fallback. If the AskNews fetch
-raises, `_fetch_research_with_fallback` (`research/orchestrator.py:493`) tries a
+raises, `_fetch_research_with_fallback` (`research/orchestrator.py`) tries a
 prose provider instead, in a **different** order than the primary ladder:
 OpenRouter-Perplexity first (cheapest, prose-returning), then direct Perplexity,
 then Exa last (its `SmartSearcher` spins up its own multi-search loop, the most
@@ -72,7 +72,7 @@ expensive path). The primary ladder orders by index quality; this fallback list
 orders by cost, because it only ever fires after AskNews has already failed.
 
 One AskNews error is treated specially: a `403011` "subscription is not currently
-active" signature (`is_asknews_subscription_error`, `research/providers.py:92`) is
+active" signature (`is_asknews_subscription_error`, `research/providers.py`) is
 logged as `inactive` (an expected off-season state), not `errored`, so it doesn't
 inflate the timeout counter or look like a real failure in diagnostics.
 
@@ -81,7 +81,7 @@ inflate the timeout counter or look like a real failure in diagnostics.
 AskNews is the one provider that returns raw article text rather than
 LLM-written prose, so it has two distinct stages: fetch, then summarize.
 
-**Fetch** (`_asknews_provider`, `research/providers.py:106`) runs two phases
+**Fetch** (`_asknews_provider`, `research/providers.py`) runs two phases
 against the AskNews SDK:
 
 - **Phase 1 — HOT:** `strategy="latest news"`, 6 articles.
@@ -99,7 +99,7 @@ stuck AskNews call can't hold the whole phase hostage.
 The two article lists are formatted into two labeled sections — "Historical
 Context & Background" and "Recent Developments & Current News" — with within-list
 and cross-list URL deduplication (`_format_asknews_dual_sections`,
-`research/providers.py:241`). Dedup normalizes URLs first (drops tracking params,
+`research/providers.py`). Dedup normalizes URLs first (drops tracking params,
 `m.` mobile subdomains, `/amp` suffixes, fragments) so the same story from two
 feeds collapses to one entry.
 
@@ -110,7 +110,7 @@ a bad briefing to fetch-vs-summarize without paying for a fresh AskNews pull.
 ### AskNews summarizer (the analyst briefing)
 
 Raw AskNews articles are compressed into an analyst briefing by an LLM before any
-forecaster sees them (`_summarize_asknews`, `research/orchestrator.py:251`). The
+forecaster sees them (`_summarize_asknews`, `research/orchestrator.py`). The
 summarizer model is a low-effort utility slot defined in `llm_configs.py`
 (`SUMMARIZER_LLM`); it runs at `allowed_tries=1` and is wrapped in a 30s-gated
 broad retry with a wall cap (`SUMMARIZER_WALL_TIMEOUT = 300s`). If the summarizer
@@ -119,7 +119,7 @@ hits a transient LLM error or returns blank, the orchestrator soft-fails to the
 (a prompt-construction bug, a refactor's `AttributeError`) is allowed to
 propagate, because that's a real bug, not a degradation to tolerate.
 
-The prompt (`asknews_summarizer_prompt`, `prompts.py:251`) tells the model to
+The prompt (`asknews_summarizer_prompt`, `prompts.py`) tells the model to
 produce a comprehensive briefing that extracts every decision-relevant fact,
 number, quote, and expert opinion, dates each one, and separates facts from
 opinion. It also shares the source-provenance / trust-ladder vocabulary with the
@@ -161,10 +161,10 @@ all of these are on.
 
 OpenAI web search via OpenRouter's native web plugin
 (`_native_search_provider` / `build_native_search_llm`,
-`research/providers.py:327`). Default model `openai/gpt-5.6-terra`
-(`NATIVE_SEARCH_DEFAULT_MODEL`) at `reasoning={"effort":"low"}` and
-`verbosity="low"`, with a 360s per-request timeout (`NATIVE_SEARCH_TIMEOUT`) and a
-420s hard wall-clock cap (`NATIVE_SEARCH_WALL_TIMEOUT`). Model and effort are
+`research/providers.py`). The model is `NATIVE_SEARCH_DEFAULT_MODEL`, run at
+`reasoning={"effort":"low"}` and `verbosity="low"`, under a per-request timeout
+(`NATIVE_SEARCH_TIMEOUT`) and a hard wall-clock cap
+(`NATIVE_SEARCH_WALL_TIMEOUT`) set just above it. Model and effort are
 overridable via `NATIVE_SEARCH_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT` /
 `NATIVE_SEARCH_VERBOSITY`.
 
@@ -310,8 +310,9 @@ text anchor is on in production; the chart-image side-channel
 ## Gap-fill (two passes, both concurrent, both on in prod)
 
 After the primary + add-on bundle is assembled, two independent gap-fill passes
-run **concurrently** in one `asyncio.gather` (`research/orchestrator.py:144`), so
-the research-phase wall-clock is `max(v1, v2)`, not the sum. Each runs inside its
+run **concurrently** in one `asyncio.gather` inside `run_research`
+(`research/orchestrator.py`), so the research-phase wall-clock is `max(v1, v2)`,
+not the sum. Each runs inside its
 own try/except so a defect in one can never zero the other's output. Both consume
 the pre-gap-fill bundle, which means the v2 driver's brief does not see v1's
 addendum; v2's section appends after v1's.

@@ -25,10 +25,10 @@ Three files form the startup chain:
   stacker fallbacks, research timeouts) or the donated OpenRouter key dropped below
   the refill floor. Credit-caused alerts are suppressed until 2026-09-10 while the
   operator self-funds the season — see "Credit alerting is suppressed" in
-  `docs/operations.md`. See `cli.py:45` (`main`).
+  `docs/operations.md`. See `main` in `cli.py`.
 - `metaculus_bot/forecaster.py` — the bot itself. `TemplateForecaster` subclasses the
   framework's `ForecastBot` and owns the per-question pipeline. The method to read
-  first is `_research_and_make_predictions` (`forecaster.py:548`).
+  first is `_research_and_make_predictions`.
 
 Publication happens inside the framework's forecast loop, not in `cli.py`. Every
 question that clears the min-forecasters guard is already on Metaculus by the time
@@ -98,7 +98,7 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
 
 ### 1. Research fan-out
 
-`run_research` (`forecaster.py:414`) delegates to a `ResearchOrchestrator`
+`run_research` (`forecaster.py`) delegates to a `ResearchOrchestrator`
 (`research/orchestrator.py`). It picks one primary provider by priority (AskNews in
 prod, then Exa, then Perplexity, then a stub) and runs several additional providers
 alongside it in parallel, each behind its own env flag. AskNews returns raw article
@@ -153,22 +153,23 @@ bound/step constraints.
 
 ### 4. Min-forecasters guard
 
-If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 1, `constants.py:575`) forecasters
+If fewer than `MIN_FORECASTERS_TO_PUBLISH` (`constants.py`) forecasters
 returned a valid prediction, the ensemble is too degraded to trust. The question is
 skipped and a counter bumps for end-of-run alerting, but the rest of the batch and all
-other publications continue (`forecaster.py:853`).
+other publications continue. The guard lives in `_research_and_make_predictions`
+(`forecaster.py`).
 
-At the current threshold of 1, a lone survivor publishes: the median of one forecast is
+When the threshold is 1, a lone survivor publishes: the median of one forecast is
 that forecast. Because the spread metrics in `spread_metrics.py` require at least two
 predictions and raise otherwise, `_research_and_make_predictions` short-circuits the
 n == 1 case before spread computation and stacking and hands the single prediction
-straight to the aggregator (see the comment at `forecaster.py:874`). Exception-driven
-drops still bump the degradation counters, so a run thinned to one model reddens CI
-rather than silently withholding the question.
+straight to the aggregator. Exception-driven drops still bump the degradation
+counters, so a run thinned to one model reddens CI rather than silently withholding
+the question.
 
 ### 5. Aggregation: CONDITIONAL_STACKING
 
-The default strategy is `CONDITIONAL_STACKING` (`cli.py:120`). Conceptually:
+The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conceptually:
 
 - Compute the spread across the N forecasts (`spread_metrics.compute_spread`).
 - **Low spread**: return the MEDIAN of the raw per-model predictions.
@@ -177,19 +178,24 @@ The default strategy is `CONDITIONAL_STACKING` (`cli.py:120`). Conceptually:
   stacker LLM that rewrites the forecast. If the stacker fails, it falls back to a
   second stacker LLM, then to MEDIAN.
 
-Spread thresholds live in `constants.py`: binary 0.15, MC 0.20, numeric 0.15.
+Spread thresholds live in `constants.py`, one per question type:
+`CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD` (a probability range),
+`CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD` (a max per-option spread), and
+`CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD` (a normalized percentile spread).
 
 **Stacking is disabled in production.** All four workflow YAMLs set
 `BINARY_STACKING_ENABLED`, `MC_STACKING_ENABLED`, and `NUMERIC_STACKING_ENABLED` to
-`false`, so even when spread exceeds the threshold, the per-type gate bypasses the
-stacker and forces the MEDIAN path (`forecaster.py:689`). In effect, **prod runs
-MEDIAN of the raw forecasts.** The stacker chain stays fully wired and is exercised in
+`false`, so even when spread exceeds the threshold, the per-type gate in
+`_research_and_make_predictions` (`forecaster.py`) bypasses the stacker and forces the
+MEDIAN path. In effect, **prod runs MEDIAN of the raw forecasts.** The stacker chain
+stays fully wired and is exercised in
 backtests and ablation runs. The aggregation dispatch, base-combine, and stacker
 fallback ladder all live in `metaculus_bot/aggregation_pipeline.py`
 (`AggregationPipeline`). The conditional-stacking path runs the combined result
-through a Platt-calibration hook (`aggregation_pipeline.py:276`), but that hook is
-gated by `PLATT_CALIBRATION_ENABLED`, which is unset in every workflow, so in prod
-it is a passthrough (`post_processing.py:34`).
+through a Platt-calibration hook (`_apply_platt_calibration` in
+`aggregation_pipeline.py`), but that hook is gated by `PLATT_CALIBRATION_ENABLED`,
+which is unset in every workflow, so in prod `apply_platt_calibration`
+(`post_processing.py`) is a passthrough.
 
 ### 6. Published comment
 
