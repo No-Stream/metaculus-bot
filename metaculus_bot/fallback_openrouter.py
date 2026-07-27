@@ -4,7 +4,6 @@ import os
 import sys
 from typing import Any
 
-import openai
 from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import (
@@ -19,6 +18,7 @@ from metaculus_bot.credit_telemetry import (
     DonatedKeyState,
     classify_donated_key_state,
 )
+from metaculus_bot.llm_retry import llm_status_code
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def _without_prompt_echo(lowercased_msg: str) -> str:
     veto on the very bodies this exists to defend against.
 
     Only TEXT cues read the truncated string. The reported ``status_code`` is an int on
-    the exception and cannot be echoed, so ``_is_status`` / ``_llm_status_code`` keep
+    the exception and cannot be echoed, so ``_is_status`` / ``llm_status_code`` keep
     reading the full message.
     """
     cut = len(lowercased_msg)
@@ -327,21 +327,6 @@ _BAD_CREDENTIAL_TEXT_CUES: tuple[str, ...] = ("unauthorized", "invalid api key",
 _ROUTE_SCOPED_TEXT_CUES: tuple[str, ...] = ("no allowed providers", "guardrail", "data policy")
 
 
-def _llm_status_code(exc: Exception) -> int | None:
-    """The HTTP status the provider reported, or ``None`` when the exception carries none.
-
-    Scoped to ``openai.APIError`` — the common root of every litellm exception
-    (``litellm.exceptions.APIError.__mro__[1] is openai.APIError``) — so a same-named
-    attribute on some unrelated exception can never be read as a provider status.
-    ``requests``-shaped errors keep their status on ``.response`` and so report ``None``
-    here, which is what leaves the textual cues in charge for them.
-    """
-    if not isinstance(exc, openai.APIError):
-        return None
-    status = getattr(exc, "status_code", None)
-    return status if isinstance(status, int) else None
-
-
 def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> bool:
     """Whether the failure is HTTP ``code``, preferring the reported status over digits.
 
@@ -410,7 +395,7 @@ def is_credit_caused_error(exc: Exception) -> bool:
     back to the paid key without being credit-classified — reddening CI on exactly
     the expected empty wallet the suppression window exists for.
     """
-    return _is_credit_failure(_llm_status_code(exc), str(exc).lower())
+    return _is_credit_failure(llm_status_code(exc), str(exc).lower())
 
 
 def is_suppressible_credit_error(exc: Exception) -> bool:
@@ -470,7 +455,7 @@ def should_retry_with_general_key(exc: Exception) -> bool:
       paid key can fix and a model that simply does not exist.
 
     Numeric detection reads the status the provider reported
-    (``_llm_status_code`` / ``_is_status``), never digits in the message. litellm
+    (``llm_status_code`` / ``_is_status``), never digits in the message. litellm
     formats the message as ``APIError: {provider} - {raw body}``, and an OpenRouter
     body carries a 64-hex key hash plus, on a moderation refusal, up to ~100
     characters of our own prompt — either can contain a number that was never a
@@ -500,7 +485,7 @@ def should_retry_with_general_key(exc: Exception) -> bool:
     msg = msg_raw.lower()
     # Authoritative for every NUMERIC branch below; None for statusless exceptions,
     # which then classify on message text exactly as they always have.
-    status = _llm_status_code(exc)
+    status = llm_status_code(exc)
     # Everything after a prompt-echo marker is text WE sent, so no WORD cue may read it.
     # The digit fallbacks inside ``_is_status`` still see the whole message: they only
     # engage when no status was reported, and shortening their input there would change

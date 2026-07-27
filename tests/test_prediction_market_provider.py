@@ -868,6 +868,22 @@ class TestKeywordExtractor:
         # ladder alone exceeds PREDICTION_MARKET_TIMEOUT.
         assert all(sum(kw["backoffs"]) < PREDICTION_MARKET_TIMEOUT for kw in captured)
         assert all(kw["wall_timeout"] <= PREDICTION_MARKET_TIMEOUT for kw in captured)
+        # The real ceiling, which neither assertion above can see: ``wall_timeout`` is
+        # PER ATTEMPT, so the worst case is (attempts x wall) + sum(backoffs). At the
+        # original 15.0 that came to 2 x 15 + 1 = 31s against a 30s
+        # PREDICTION_MARKET_TIMEOUT, leaving -1s for the four-venue fan-out the budget
+        # exists to protect — yet both assertions above pass at 15.0 and at 12.0 alike,
+        # which is how the arithmetic bug survived them. Assert the product, and keep a
+        # floor for the fan-out so a future bump cannot silently reclaim it.
+        for kw in captured:
+            attempts = len(kw["backoffs"]) + 1
+            worst_case = attempts * kw["wall_timeout"] + sum(kw["backoffs"])
+            fan_out_margin = PREDICTION_MARKET_TIMEOUT - worst_case
+            assert fan_out_margin >= 5.0, (
+                f"keyword extraction can consume {worst_case}s of the {PREDICTION_MARKET_TIMEOUT}s "
+                f"snapshot budget ({attempts} attempts x {kw['wall_timeout']}s wall + "
+                f"{sum(kw['backoffs'])}s backoff), leaving {fan_out_margin}s for the venue fan-out"
+            )
 
     @pytest.mark.asyncio
     async def test_extract_does_not_retry_a_hard_403(self, mock_question):
