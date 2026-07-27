@@ -21,7 +21,10 @@ needs real keys. Pins:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from collections.abc import Iterator
 from datetime import date
 from typing import Any
@@ -260,6 +263,28 @@ class TestFloorCheck:
             telemetry.log_start()
             assert telemetry.log_end_and_check_floor() is False
 
+    def test_nan_remaining_is_unreported_not_above_floor(self, monkeypatch, caplog) -> None:
+        """A non-finite balance must read as "not reported", which silences no reminder.
+
+        ``nan < floor`` is False, so an unguarded NaN silently disabled the refill reminder
+        AND rendered ``run_delta_usd=nan`` in CREDIT_SPEND. Coercing it to None instead
+        makes both paths say "unknown", which is the truth.
+        """
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(5.0, 1.0), _payload(float("nan"), 6.0)]}
+        telemetry = CreditTelemetry(floor_usd=1.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is False
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_BALANCE: key=donated phase=end remaining=n/a usage=6.00" in messages
+        # "Not reported at one end" then routes the delta through the usage fallback, the
+        # same path a mid-run limit change takes — so the spend figure survives while the
+        # unusable balance renders as n/a.
+        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=n/a" in messages
+        assert "nan" not in "\n".join(messages)
+
     def test_personal_key_low_remaining_never_trips_floor(self, monkeypatch) -> None:
         """The floor applies to the DONATED key only — a personal key that
         somehow reports a tiny limit_remaining must not trip it.
@@ -316,6 +341,38 @@ class TestFetchFailureHandling:
         warnings = [r.getMessage() for r in caplog.records]
         assert any("phase=start fetch failed (HTTPStatusError)" in msg for msg in warnings)
         assert any("phase=end fetch failed (HTTPStatusError)" in msg for msg in warnings)
+
+    @pytest.mark.parametrize(
+        "boom",
+        [
+            FileNotFoundError("stale SSL_CERT_FILE"),
+            RuntimeError("network egress blocked by the suite guard"),
+            httpx.InvalidURL("not a url"),
+        ],
+    )
+    def test_unexpected_fetch_exception_never_escapes_telemetry(self, monkeypatch, caplog, boom) -> None:
+        """ "Telemetry must never fail or block a run" has to hold for EVERY exception type.
+
+        The narrow tuple ``(httpx.HTTPError, ValueError, KeyError, AttributeError)`` misses
+        real shapes: a stale ``SSL_CERT_FILE`` makes httpx raise ``FileNotFoundError``,
+        ``httpx.InvalidURL`` is not an ``httpx.HTTPError`` subclass, and this repo's own
+        autouse network guard raises ``RuntimeError``. ``log_end_and_check_floor`` is called
+        from a ``finally`` in cli.main, so an escape there replaces whatever the run was
+        already raising and destroys the whole end-of-run diagnostic surface — the report
+        summary, the alertable arithmetic, and the deprecation tripwire all run after it.
+        """
+        _set_keys(monkeypatch, personal=None)
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with (
+            patch("metaculus_bot.credit_telemetry.fetch_auth_key", side_effect=boom),
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"),
+        ):
+            telemetry.log_start()
+            assert telemetry.log_end_and_check_floor() is False
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(f"phase=start fetch failed ({type(boom).__name__})" in msg for msg in warnings), warnings
+        assert any(f"phase=end fetch failed ({type(boom).__name__})" in msg for msg in warnings), warnings
 
     def test_missing_env_vars_warn_and_skip(self, monkeypatch, caplog) -> None:
         _set_keys(monkeypatch, donated=None, personal=None)
@@ -435,6 +492,48 @@ class TestDonatedKeyStateProbe:
         with _patch_fetch({DONATED_KEY: [bad_data]}):
             assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
 
+    @pytest.mark.parametrize(
+        "limit, limit_remaining",
+        [
+            (850.0, float("nan")),
+            (float("nan"), 0.0),
+            (850.0, "NaN"),  # a JSON body can spell it as a string too
+            (float("inf"), float("inf")),
+            (float("-inf"), float("nan")),
+        ],
+    )
+    def test_non_finite_balance_classifies_as_unknown_not_drained(self, monkeypatch, limit, limit_remaining) -> None:
+        """A NaN or infinite balance must fail SAFE (unknown → red), not to DRAINED.
+
+        ``json.loads`` accepts bare ``NaN`` / ``Infinity`` as an extension, so a proxy or a
+        malformed upstream body can deliver one. Every float comparison against NaN is
+        False, so an unguarded ladder walked straight past ``limit <= 0`` and
+        ``remaining > 0`` into DRAINED — the one suppressible state — inverting the
+        module's documented fail-safe and letting a broken probe green a red run.
+        """
+        _set_keys(monkeypatch, personal=None)
+        with _patch_fetch({DONATED_KEY: [_payload(limit_remaining, 4.39, limit=limit)]}):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "boom",
+        [
+            FileNotFoundError("stale SSL_CERT_FILE"),
+            RuntimeError("network egress blocked by the suite guard"),
+            httpx.InvalidURL("not a url"),
+        ],
+    )
+    def test_probe_returns_unknown_for_any_exception_type(self, monkeypatch, boom) -> None:
+        """``_probe_donated_key_state`` promises "never raises", so it must catch anything.
+
+        The narrow tuple missed all three of these, and ``fallback_openrouter`` guards only
+        its own call site — the next caller would inherit the false contract. UNKNOWN is
+        also the right fail-safe: it keeps the run alertable.
+        """
+        _set_keys(monkeypatch, personal=None)
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", side_effect=boom):
+            assert classify_donated_key_state() is DonatedKeyState.UNKNOWN
+
     def test_uncapped_key_classifies_as_unknown(self, monkeypatch) -> None:
         """No cap means no cap to exceed; we can't call it drained, so stay red."""
         _set_keys(monkeypatch, personal=None)
@@ -484,6 +583,99 @@ class TestDonatedKeyStateProbe:
         with patch("metaculus_bot.credit_telemetry.fetch_auth_key", fetch):
             classify_donated_key_state()
         assert fetch.call_args.kwargs["timeout"] == DONATED_KEY_PROBE_TIMEOUT_S
+
+    def test_concurrent_callers_share_one_probe_and_one_verdict(self, monkeypatch) -> None:
+        """N donated-key failures arriving at once must produce ONE probe, ONE verdict.
+
+        The 2026-07-26 shape is N-simultaneous-failures-on-one-dry-key (~15 donated-key
+        calls per question), and every production caller reaches this through
+        ``asyncio.to_thread`` — so the cache is read and written from real worker threads.
+        An unsynchronized check-then-set fires one HTTP probe per failure, and the damage
+        is not the duplicate calls: each caller keeps ITS OWN probe result, so an
+        intermittently failing ``/auth/key`` splits one drained-key incident into some
+        suppressed and some alertable events. cli then computes a non-zero ``alertable``
+        and exits red on exactly the expected-drained-key condition the suppression window
+        exists for, while the end-of-run ``donated_key=`` note reports the last writer's
+        verdict and contradicts the exit.
+        """
+        _set_keys(monkeypatch, personal=None)
+        probe_threads: list[int] = []
+        record_lock = threading.Lock()
+
+        def slow_fetch(api_key: str, *, timeout: float | None = None) -> dict[str, Any]:
+            del api_key, timeout
+            with record_lock:
+                probe_threads.append(threading.get_ident())
+            time.sleep(0.2)  # long enough that unsynchronized callers overlap
+            return _payload(0.0, 4.39, limit=850.0)
+
+        fetch = MagicMock(side_effect=slow_fetch)
+
+        async def probe_concurrently() -> list[DonatedKeyState]:
+            return list(await asyncio.gather(*(asyncio.to_thread(classify_donated_key_state) for _ in range(12))))
+
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", fetch):
+            verdicts = asyncio.run(probe_concurrently())
+
+        assert fetch.call_count == 1, f"expected one probe, got {fetch.call_count} on {len(set(probe_threads))} threads"
+        assert verdicts == [DonatedKeyState.DRAINED] * 12
+
+    def test_intermittent_probe_failure_cannot_split_the_verdict(self, monkeypatch) -> None:
+        """One flaky probe must not make some concurrent callers disagree with the rest.
+
+        With the check-then-set unsynchronized, two of six probes raising produced four
+        suppressible events out of six generic ones, so cli's ``alertable`` came out
+        non-zero and the run went red on an expected empty wallet. Under the lock only the
+        first caller probes, so all six share whatever it found.
+        """
+        _set_keys(monkeypatch, personal=None)
+        call_count = 0
+        record_lock = threading.Lock()
+
+        def flaky_fetch(api_key: str, *, timeout: float | None = None) -> dict[str, Any]:
+            del api_key, timeout
+            nonlocal call_count
+            with record_lock:
+                call_count += 1
+                mine = call_count
+            time.sleep(0.2)
+            if mine <= 2:
+                raise ValueError("intermittent transport failure")
+            return _payload(0.0, 4.39, limit=850.0)
+
+        async def probe_concurrently() -> list[DonatedKeyState]:
+            return list(await asyncio.gather(*(asyncio.to_thread(classify_donated_key_state) for _ in range(6))))
+
+        with patch("metaculus_bot.credit_telemetry.fetch_auth_key", side_effect=flaky_fetch):
+            verdicts = asyncio.run(probe_concurrently())
+
+        assert len(set(verdicts)) == 1, f"concurrent callers disagreed: {verdicts}"
+        assert call_count == 1
+
+    def test_state_log_fires_once_across_concurrent_callers(self, monkeypatch, caplog) -> None:
+        """The DONATED_KEY_STATE line is emitted under the lock, so it can't duplicate.
+
+        Twelve copies of the same verdict in the run log would read as twelve separate
+        probes to whoever greps it.
+        """
+        _set_keys(monkeypatch, personal=None)
+
+        def slow_fetch(api_key: str, *, timeout: float | None = None) -> dict[str, Any]:
+            del api_key, timeout
+            time.sleep(0.2)
+            return _payload(0.0, 4.39, limit=850.0)
+
+        async def probe_concurrently() -> None:
+            await asyncio.gather(*(asyncio.to_thread(classify_donated_key_state) for _ in range(12)))
+
+        with (
+            patch("metaculus_bot.credit_telemetry.fetch_auth_key", side_effect=slow_fetch),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"),
+        ):
+            asyncio.run(probe_concurrently())
+
+        state_lines = [r for r in caplog.records if "DONATED_KEY_STATE:" in r.getMessage()]
+        assert len(state_lines) == 1, f"expected one state line, got {len(state_lines)}"
 
     def test_probed_state_is_none_until_the_probe_runs(self, monkeypatch) -> None:
         """cli renders the verdict only when it was actually established, so

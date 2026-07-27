@@ -39,7 +39,9 @@ WARNING and treated as "unknown", and unknown never triggers the floor exit.
 from __future__ import annotations
 
 import logging
+import math
 import os
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -62,12 +64,23 @@ class KeyBalanceSnapshot:
 
 
 def _as_float(value: Any) -> float | None:
+    """Coerce a reported balance field to a usable float, or ``None`` for "not reported".
+
+    Non-finite is rejected along with unparseable, and that is load-bearing rather than
+    tidy. ``json.loads`` accepts bare ``NaN`` / ``Infinity`` as an extension, every float
+    comparison against NaN is False, and the classification ladder below reads a chain of
+    such comparisons — so a NaN balance walked past ``limit <= 0`` and ``remaining > 0``
+    into DRAINED, the one state exempt from CI alerting. Failing to "not reported" routes
+    it to UNKNOWN instead, which stays red, and keeps a NaN out of the CREDIT_SPEND /
+    CREDIT_BALANCE marker lines where it would just be misinformation.
+    """
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _fmt(value: float | None) -> str:
@@ -92,11 +105,16 @@ def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) ->
 
 
 def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
-    """Fetch one key's balance; on any expected failure, warn and return None.
+    """Fetch one key's balance; on ANY failure, warn and return None.
 
-    A missing env var or endpoint hiccup must never fail the run (this is
-    telemetry), so we log and continue. AttributeError covers a payload that
-    isn't the expected dict shape.
+    A missing env var or endpoint hiccup must never fail the run (this is telemetry), so we
+    log and continue. The catch is deliberately total rather than a curated tuple: cli.main
+    calls ``log_end_and_check_floor`` from a ``finally``, so an escape there replaces
+    whatever the run was already raising and takes the whole end-of-run diagnostic surface
+    with it (report summary, alertable arithmetic, deprecation tripwire — all downstream).
+    A narrow tuple already missed three real shapes: ``FileNotFoundError`` from a stale
+    ``SSL_CERT_FILE``, ``httpx.InvalidURL`` (not an ``httpx.HTTPError`` subclass), and the
+    ``RuntimeError`` this repo's own autouse network guard raises.
     """
     env_var, _ = KEY_SPECS[alias]
     api_key = os.getenv(env_var)
@@ -116,7 +134,9 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
             remaining_usd=_as_float(data.get("limit_remaining")),
             usage_usd=_as_float(data.get("usage")),
         )
-    except (httpx.HTTPError, ValueError, KeyError, AttributeError) as exc:
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
+        # Broad by design, not defensiveness: the module contract is that telemetry cannot
+        # fail a run, and this sits under a cli.main ``finally``. See the docstring.
         logger.warning(
             "CREDIT_BALANCE: key=%s phase=%s fetch failed (%s); continuing without balance telemetry",
             alias,
@@ -224,11 +244,21 @@ class DonatedKeyState(StrEnum):
 # start/end telemetry, which run outside the forecasting window.
 DONATED_KEY_PROBE_TIMEOUT_S: float = 5.0
 
-# One probe per process. A run that loses every donated-key call would otherwise
-# fire one HTTP request per failure, and caching failures matters as much as caching
-# verdicts (a dead endpoint would otherwise cost one timeout per failed call).
-# ``None`` means "never probed", which cli renders differently from any verdict.
+# One probe per process, lock-guarded so concurrent callers share one verdict. A run that
+# loses every donated-key call would otherwise fire one HTTP request per failure, and
+# caching failures matters as much as caching verdicts (a dead endpoint would otherwise
+# cost one timeout per failed call). ``None`` means "never probed", which cli renders
+# differently from any verdict.
+#
+# ``threading``, not ``asyncio``: every production caller arrives on an
+# ``asyncio.to_thread`` worker (see ``fallback_openrouter.record_donated_key_fallback``),
+# so the contention is between real OS threads. The lock is what makes the ONE VERDICT
+# part true, which matters more than the one-request part — without it each caller keeps
+# its own probe result, so an intermittently failing ``/auth/key`` splits a single
+# drained-key incident into some suppressed and some alertable events, and cli then exits
+# red on the very condition the suppression window exists for.
 _probed_donated_key_state: DonatedKeyState | None = None
+_PROBE_LOCK = threading.Lock()
 
 
 def get_probed_donated_key_state() -> DonatedKeyState | None:
@@ -243,7 +273,13 @@ def reset_donated_key_state_cache() -> None:
 
 
 def _probe_donated_key_state() -> DonatedKeyState:
-    """One ``/auth/key`` read on the donated key, classified. Never raises."""
+    """One ``/auth/key`` read on the donated key, classified.
+
+    Returns UNKNOWN on any failure and logs the exception. UNKNOWN is the fail-safe
+    direction: it keeps the run alertable, so a probe that cannot answer never greens a red
+    run. ``fallback_openrouter`` guards its own call site too (an escape there would abort
+    the fallback it is annotating), but the contract has to hold here for the next caller.
+    """
     env_var, _ = KEY_SPECS["donated"]
     api_key = os.getenv(env_var)
     if not api_key:
@@ -265,7 +301,11 @@ def _probe_donated_key_state() -> DonatedKeyState:
         if exc.response.status_code in (401, 404):
             return DonatedKeyState.REVOKED
         return DonatedKeyState.UNKNOWN
-    except (httpx.HTTPError, ValueError, KeyError, AttributeError):
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
+        # Broad by design: see the docstring. A curated tuple already missed
+        # FileNotFoundError (stale SSL_CERT_FILE), httpx.InvalidURL (not an HTTPError
+        # subclass) and RuntimeError (the suite's network guard).
+        logger.exception("DONATED_KEY_STATE: /auth/key probe failed; classifying as unknown (stays alertable)")
         return DonatedKeyState.UNKNOWN
 
     if limit_usd is None or remaining_usd is None:
@@ -285,29 +325,40 @@ def _probe_donated_key_state() -> DonatedKeyState:
 def classify_donated_key_state() -> DonatedKeyState:
     """Whether the donated key is genuinely drained, or broken in some other way.
 
-    Blocking HTTP, so callers on the event loop should hand this to a thread. Runs
-    at most once per process; every subsequent call reads the cache.
+    Blocking HTTP, so callers on the event loop should hand this to a thread. Probes at
+    most once per process (lock-guarded, so concurrent callers share one verdict); every
+    subsequent call reads the cache.
     """
     global _probed_donated_key_state
-    if _probed_donated_key_state is not None:
-        return _probed_donated_key_state
+    cached = _probed_donated_key_state
+    if cached is not None:
+        return cached
 
-    state = _probe_donated_key_state()
-    _probed_donated_key_state = state
-    if state is DonatedKeyState.DRAINED:
-        logger.info(
-            "DONATED_KEY_STATE: state=%s — the donated OpenRouter key spent its whole allocation "
-            "with the cap itself intact. Expected while the operator self-funds the season, so "
-            "credit-caused personal-key fallbacks are exempt from alerting until %s.",
-            state.value,
-            CREDIT_ALERT_RESUME_DATE.isoformat(),
-        )
-    else:
-        logger.warning(
-            "DONATED_KEY_STATE: state=%s — a credit-shaped donated-key failure that is NOT an "
-            "expected drained wallet (zeroed = cap set to 0, revoked = key rejected, funded = the "
-            "key still has money so the failure was not about credit, unknown = the probe could "
-            "not answer). Personal-key fallbacks stay alertable, so this run will exit non-zero.",
-            state.value,
-        )
-    return state
+    with _PROBE_LOCK:
+        # Re-check inside the lock: a caller that queued behind the winner must take the
+        # winner's verdict rather than probe again with its own.
+        cached = _probed_donated_key_state
+        if cached is not None:
+            return cached
+
+        state = _probe_donated_key_state()
+        _probed_donated_key_state = state
+        # Logged inside the lock so the marker line appears exactly once per run — N copies
+        # of one verdict would read as N separate probes to whoever greps the run log.
+        if state is DonatedKeyState.DRAINED:
+            logger.info(
+                "DONATED_KEY_STATE: state=%s — the donated OpenRouter key spent its whole allocation "
+                "with the cap itself intact. Expected while the operator self-funds the season, so "
+                "credit-caused personal-key fallbacks are exempt from alerting until %s.",
+                state.value,
+                CREDIT_ALERT_RESUME_DATE.isoformat(),
+            )
+        else:
+            logger.warning(
+                "DONATED_KEY_STATE: state=%s — a credit-shaped donated-key failure that is NOT an "
+                "expected drained wallet (zeroed = cap set to 0, revoked = key rejected, funded = the "
+                "key still has money so the failure was not about credit, unknown = the probe could "
+                "not answer). Personal-key fallbacks stay alertable, so this run will exit non-zero.",
+                state.value,
+            )
+        return state
