@@ -41,7 +41,11 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.llm_retry import invoke_with_broad_retry, invoke_with_transient_retry
-from metaculus_bot.prompts import TS_ANCHOR_SECTION_HEADER, asknews_summarizer_prompt
+from metaculus_bot.prompts import (
+    SUMMARIZER_SOFT_FAIL_BANNER,
+    TS_ANCHOR_SECTION_HEADER,
+    asknews_summarizer_prompt,
+)
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
@@ -71,23 +75,6 @@ _SUMMARIZER_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 _LEADING_HEADING_RE = re.compile(r"^(#{1,2})(?=\s|$)", re.MULTILINE)
-
-# Prepended to the AskNews section when the summarizer soft-fails, so the raw
-# articles are never mistaken for a screened analyst briefing. The 2026-07-18
-# AskNews audit made five properties load-bearing (see asknews_summarizer_prompt):
-# a hard per-article relevance gate, recency-first ordering, supersession
-# arithmetic, an evidence-age opener, and proportional length. The raw path has
-# NONE of them, leads with the Historical section, and loses the [PRE-WINDOW]
-# labeling that FUTURE.md credits with saving multiple questions. Deliberately NOT
-# a markdown heading: _demote_inner_headings would shift an h1/h2 and the
-# framework's section renormalization would mangle the provider header.
-SUMMARIZER_SOFT_FAIL_BANNER = (
-    "> **⚠ RAW UNSCREENED ARTICLES — the analyst-briefing pass failed for this question.**\n"
-    "> No per-article relevance gate ran, ordering is the raw feed's (oldest-first, "
-    "historical before recent), and no [PRE-WINDOW] labels were applied. Date every "
-    "fact yourself, check each article against the resolution criteria before using "
-    "it, and treat pre-open events as unable to satisfy the criteria on their own."
-)
 
 
 def _demote_inner_headings(text: str) -> str:

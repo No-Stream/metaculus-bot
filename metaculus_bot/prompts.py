@@ -356,6 +356,26 @@ def asknews_summarizer_prompt(
     )
 
 
+# Prepended to the AskNews section when the summarizer soft-fails, so the raw
+# articles are never mistaken for a screened analyst briefing. The AskNews audit
+# made five properties of ``asknews_summarizer_prompt`` above load-bearing: a hard
+# per-article relevance gate, recency-first ordering, supersession arithmetic, an
+# evidence-age opener, and proportional length. The raw path has NONE of them, leads
+# with the Historical section, and loses the [PRE-WINDOW] labeling that FUTURE.md
+# credits with saving multiple questions — hence the instruction to date facts and
+# screen articles by hand, which is the same vocabulary the prompt defines, kept
+# beside it so the two cannot drift. Deliberately NOT a markdown heading:
+# ``_demote_inner_headings`` (orchestrator) would shift an h1/h2 and the framework's
+# section renormalization would then mangle the provider header.
+SUMMARIZER_SOFT_FAIL_BANNER = (
+    "> **⚠ RAW UNSCREENED ARTICLES — the analyst-briefing pass failed for this question.**\n"
+    "> No per-article relevance gate ran, ordering is the raw feed's (oldest-first, "
+    "historical before recent), and no [PRE-WINDOW] labels were applied. Date every "
+    "fact yourself, check each article against the resolution criteria before using "
+    "it, and treat pre-open events as unable to satisfy the criteria on their own."
+)
+
+
 # Source-provenance / motivation trust ladder, shared verbatim across the three
 # forecaster prompts (binary / MC / numeric). Reverse-engineering high-scoring
 # competitor bots showed they rank factual claims by proximity to the primary

@@ -17,7 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.research.orchestrator import SUMMARIZER_SOFT_FAIL_BANNER, ResearchOrchestrator
+from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
+from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import (
     format_provider_diagnostics_block,
     pop_provider_detail,
