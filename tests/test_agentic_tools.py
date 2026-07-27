@@ -362,9 +362,9 @@ async def test_asknews_search_subscription_inactive_raises_on_first_attempt(
     """403011 subscription-inactive is PERMANENT, so it costs exactly one attempt.
 
     It used to be exempted from the fast-fail alongside rate limits, which re-rolled a
-    call that can never succeed and burned 64s of backoff (26s + 38s) out of the 540s
-    GAP_FILL_V2_WALL_DEADLINE. The primary provider's ``_is_retryable`` never retried it;
-    this asserts the agentic path matches that policy.
+    call that can never succeed and burned the whole ``ASKNEWS_MAX_TRIES`` backoff ladder
+    out of GAP_FILL_V2_WALL_DEADLINE. The primary provider's ``_is_retryable`` never
+    retried it; this asserts the agentic path matches that policy.
     """
     subscription_exc = _FakeAskNewsForbiddenError("403011 - subscription is not currently active")
     assert research_providers.is_asknews_subscription_error(subscription_exc) is True

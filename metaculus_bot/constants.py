@@ -722,13 +722,13 @@ PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEO
 # is the FIRST stage of the snapshot above. Before these existed the call's only
 # bound was the snapshot-level wait_for, so a stalled extractor killed the whole
 # snapshot instead of just itself, and its retries came from forecasting-tools'
-# un-gated ``random.uniform(5, 10)`` tenacity sleep. One 1s backoff (2 attempts,
-# matching the effective budget the un-gated tenacity gave) rather than the shared
-# 1s/10s/30s default, whose sleeps alone exceed the snapshot budget.
-# The wall is PER ATTEMPT, so the ceiling both values must fit under is
-# (len(backoffs) + 1) * wall + sum(backoffs) = 25.0s, leaving 5.0s of the 30s
-# snapshot budget for the four-platform fan-out. Redo that arithmetic when changing
-# either value — tests/test_llm_retry.py pins it.
+# un-gated ``random.uniform(5, 10)`` tenacity sleep. A single short backoff (two
+# attempts, matching the effective budget the un-gated tenacity gave) rather than the
+# shared ``llm_retry.DEFAULT_TRANSIENT_BACKOFFS``, whose sleeps alone exceed the
+# snapshot budget. The wall is PER ATTEMPT, so the ceiling both values must fit under
+# is (len(backoffs) + 1) * wall + sum(backoffs), which has to stay below
+# PREDICTION_MARKET_TIMEOUT with room left for the four-platform fan-out. Redo that
+# arithmetic when changing either value — tests/test_llm_retry.py pins it.
 PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT: float = 12.0
 PREDICTION_MARKET_KEYWORD_BACKOFFS: tuple[float, ...] = (1.0,)
 

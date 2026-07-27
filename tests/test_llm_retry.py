@@ -709,10 +709,10 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
 # (PermissionDeniedError is in that list and reads as though it covers 403, but it
 # subclasses a different openai branch and litellm never raises it for OpenRouter,
 # so it gave zero coverage.) The broad predicate therefore called it retryable, and
-# because it failed in 0.035s the 30s elapsed gate — designed to block SLOW failures
-# — waved it through: the AskNews summarizer burned ~42s on the 1s/10s/30s ladder
-# and two forecasters each did a 3-attempt dance, all against a key that was dry the
-# entire run.
+# because it failed in 0.035s the TRANSIENT_RETRY_MAX_ELAPSED_S gate — designed to block
+# SLOW failures — waved it through: the AskNews summarizer burned ~42s on the full
+# DEFAULT_TRANSIENT_BACKOFFS ladder and two forecasters each did a 3-attempt dance, all
+# against a key that was dry the entire run.
 #
 # The fix reads the authoritative ``status_code`` int that every litellm exception
 # carries and treats the deterministic client-error statuses as permanent. Substring

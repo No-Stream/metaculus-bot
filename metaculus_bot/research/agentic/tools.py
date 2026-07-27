@@ -43,8 +43,8 @@ _READ_DOCUMENT_TIMEOUT_S = 60.0
 # Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
 # underlying socket is torn down before the loop's asyncio.wait_for fires — a
 # hung endpoint then frees its slot instead of pinning it to the wall deadline.
-_EXA_HTTP_TIMEOUT_S = 18.0  # search_web ToolSpec budget is 20s
-_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # read_document internal deadline is 60s (_READ_DOCUMENT_TIMEOUT_S)
+_EXA_HTTP_TIMEOUT_S = 18.0  # under search_web's ToolSpec timeout_s in build_gap_fill_tools
+_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # under _READ_DOCUMENT_TIMEOUT_S, read_document's own deadline
 _EXA_RETRY_DELAYS_S = (1.0, 4.0)
 _EXA_GLOBAL_SEMAPHORE = asyncio.Semaphore(4)
 # Process-global cap on concurrent headless Chromium launches. Module-level, so
@@ -407,8 +407,9 @@ async def _call_asknews_search(query: str) -> list[Any]:
                     # Transient-only retry, matching the primary provider's ``_is_retryable``
                     # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
                     # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
-                    # it burns 64s of backoff (2.0 * (10+3) then 2.0 * (10+9)) out of the 540s
-                    # GAP_FILL_V2_WALL_DEADLINE on a call that can never succeed.
+                    # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
+                    # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
+                    # below grows as 3**attempt) on a call that can never succeed.
                     if not _is_rate_limited_error(exc):
                         msg = str(exc).lower()
                         if "concurrency limit" not in msg:
@@ -1032,8 +1033,8 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             description=FETCH_DESCRIPTION,
             parameters=_FETCH_PARAMETERS,
             handler=_fetch_with_topic,
-            # 60s fetch budget + headroom for the rung-3 document auto-escalation
-            # (read_document's internal timeout is 60s).
+            # Sits above _READ_DOCUMENT_TIMEOUT_S so the rung-3 document
+            # auto-escalation has room to fire and return inside this budget.
             timeout_s=90,
         ),
         ToolSpec(
