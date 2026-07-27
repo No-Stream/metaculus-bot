@@ -1321,3 +1321,35 @@ class TestPromptEchoCreditPhrases:
         )
         assert should_retry_with_general_key(self._api_error(403, guardrail)) is True
         assert should_retry_with_general_key(self._api_error(403, "No allowed providers are available")) is True
+
+
+class TestProbeFailureCannotVetoRouting:
+    """An unanswerable ``/auth/key`` probe must never abort the fallback it is annotating.
+
+    ``_probe_donated_key_state`` is documented "Never raises" but only catches
+    ``(httpx.HTTPError, ValueError, KeyError, AttributeError)``. A ``RuntimeError`` (this
+    repo's own autouse network guard raises exactly that), a ``FileNotFoundError`` from a
+    bad ``SSL_CERT_FILE``, or a ``MemoryError`` escapes it. Because the probe runs BEFORE
+    ``_invoke_once_using_secondary``, an escape stranded the ensemble on the dry donated
+    key with the funded personal key untried — the 2026-07-26 incident reached through the
+    exception path rather than a stale balance read. The routing decision is already final
+    and purely textual by the time this runs, so alerting bookkeeping must not gate it.
+    """
+
+    @pytest.mark.parametrize("boom", [RuntimeError("transport wedged"), FileNotFoundError("bad SSL_CERT_FILE")])
+    @pytest.mark.asyncio
+    async def test_probe_exception_leaves_the_fallback_intact_and_alertable(self, boom: BaseException) -> None:
+        from metaculus_bot import credit_telemetry
+
+        credit_telemetry.reset_donated_key_state_cache()
+        reset_generic_key_fallback_count()
+        reset_credit_key_fallback_count()
+        with patch.object(credit_telemetry, "fetch_auth_key", side_effect=boom):
+            await fallback_openrouter.record_donated_key_fallback(
+                "openrouter/openai/gpt-5.6-sol", Exception(PRODUCTION_KEY_LIMIT_403)
+            )
+
+        # Counted, so the personal-key spend is visible...
+        assert fallback_openrouter.get_generic_key_fallback_count() == 1
+        # ...and NOT subtracted from alertable, because the probe never answered.
+        assert fallback_openrouter.get_credit_key_fallback_count() == 0

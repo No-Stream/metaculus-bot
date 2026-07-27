@@ -588,7 +588,29 @@ async def record_donated_key_fallback(model: str, exc: Exception) -> None:
     # research task for up to ``DONATED_KEY_PROBE_TIMEOUT_S`` (5s), not just the call that
     # hit the 403, eating into per-question soft deadlines. Probing first also keeps the
     # accounting below free of any await.
-    suppressible = await asyncio.to_thread(is_suppressible_credit_error, exc)
+    # Guarded because the probe's "never raises" contract only covers
+    # ``(httpx.HTTPError, ValueError, KeyError, AttributeError)``. A RuntimeError (this
+    # repo's own autouse network guard raises exactly that), a FileNotFoundError from a
+    # bad ``SSL_CERT_FILE``, or a MemoryError escapes it — and because this call sits
+    # BEFORE ``_invoke_once_using_secondary``, an escape aborted the fallback and left
+    # the funded personal key untried. That is the production incident this whole change
+    # exists to fix, reached through the exception path instead of a stale balance read.
+    # Alerting bookkeeping must never be able to veto routing, so an unanswerable probe
+    # degrades to "not suppressible" (stay alertable) exactly like UNKNOWN does.
+    try:
+        suppressible = await asyncio.to_thread(is_suppressible_credit_error, exc)
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
+        # Deliberately swallowed rather than re-raised, against the usual fail-fast rule:
+        # re-raising here is the bug being fixed. This is bookkeeping for a decision that
+        # was already made textually, so ANY failure in it must leave routing untouched.
+        # The event is still loud (exception logged with traceback) and still alertable.
+        logger.exception(
+            "DONATED_KEY_PROBE_FAILED: model=%s — the /auth/key probe raised outside its documented "
+            "contract, so this fallback stays ALERTABLE. The personal-key call proceeds regardless; "
+            "alerting bookkeeping must not gate recovery.",
+            model,
+        )
+        suppressible = False
 
     # NO await from here down, so the whole accounting block runs to completion on the
     # event loop. That is load-bearing, not incidental: ``+=`` on a module global compiles
