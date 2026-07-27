@@ -24,17 +24,12 @@ from metaculus_bot.fallback_openrouter import (
     should_route_via_donated_key,
 )
 
-# The verbatim OpenRouter response that cost the 2026-07-26 tournament run two of
-# three forecasters and most of the research stack. Copied character-for-character
-# from the run log: HTTP 403 (not the documented 402), the phrase "Key limit
-# exceeded (total limit)", a "code":403 field that the old negative rule matched on,
-# and a key hash that happens to contain none of 401/402/403/429.
-PRODUCTION_KEY_LIMIT_403 = (
-    "litellm.APIError: APIError: OpenrouterException - "
-    '{"error":{"message":"Key limit exceeded (total limit). Manage it using '
-    "https://openrouter.ai/workspaces/default/keys/"
-    '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
-)
+# The verbatim 2026-07-26 production 403 (HTTP 403 rather than the documented 402, the
+# phrase "Key limit exceeded (total limit)", a "code":403 field the old negative rule
+# matched on, and a key hash carrying none of 401/402/403/429). Shared from conftest so
+# every suite replaying it asserts against the same bytes — the constant's own comment
+# explains why that matters.
+from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 
 def _api_error(status: int, message: str) -> APIError:
@@ -963,7 +958,7 @@ class TestStatusCodeClassification:
 
     litellm formats the message as ``APIError: {provider} - {raw body}``. An OpenRouter
     body carries a 64-hex key hash (two independent Monte Carlo estimates put the odds
-    of it containing one of 401/402/403/429/502/503 at ~8.8%) and, on a moderation
+    of it containing one of 401/402/403/429/502/503 at ~8.7%) and, on a moderation
     refusal, up to ~100 characters of OUR OWN PROMPT in ``flagged_input``. Grepping that
     text for status digits reads coincidences as statuses in both directions: a
     coincidental "429" makes a moderation 403 fall back and bill the personal key for a
@@ -1014,7 +1009,7 @@ class TestStatusCodeClassification:
     def test_key_hash_digits_do_not_trigger_fallback(self) -> None:
         """A 403 whose key hash happens to contain "429" must not read as a rate limit.
 
-        ~8.8% of key rotations produce a hash like this. The current donated hash
+        ~8.7% of key rotations produce a hash like this. The current donated hash
         contains none of the six statuses, which is luck, not design.
         """
         body = (

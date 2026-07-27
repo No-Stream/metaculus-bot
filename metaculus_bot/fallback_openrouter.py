@@ -301,8 +301,8 @@ _GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
 # exempting a real moderation block from alerting.
 #
 # Word cues only, deliberately: a genuine 402 links to a key hash that has roughly a
-# 1.5% chance (1 in 66) of containing the substring "403", and reading that as moderation
-# would break the long-standing 402 fallback. The ~8.8% / 1-in-11 figure quoted elsewhere
+# 1.5% chance (1 in 67) of containing the substring "403", and reading that as moderation
+# would break the long-standing 402 fallback. The ~8.7% / 1-in-11 figure quoted elsewhere
 # is for ANY of the six statuses at once — six times this one, so don't reuse it here.
 _MODERATION_CUES: tuple[str, ...] = ("moderation", "forbidden", "flagged_input", "flagged for")
 
@@ -332,7 +332,7 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
 
     When the provider reported a status, that integer is the ONLY numeric evidence
     consulted. The message is not: litellm formats it as ``APIError: {provider} - {raw
-    body}``, and an OpenRouter body carries a 64-hex key hash (~8.8% chance of
+    body}``, and an OpenRouter body carries a 64-hex key hash (~8.7% chance of
     containing one of 401/402/403/429/502/503) plus, on a moderation refusal, up to
     ~100 characters of our own prompt in ``flagged_input``. Matching digits there reads
     coincidences as statuses in both directions — a stray "429" sends a moderation 403

@@ -98,6 +98,30 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
 
 
+# ---------------------------------------------------------------------------
+# Shared failure fixtures
+# ---------------------------------------------------------------------------
+
+# The verbatim OpenRouter response that cost the 2026-07-26 tournament run two of three
+# forecasters and most of the research stack. Copied character-for-character from the run
+# log (the donated key at $0.00 of its $850 cap): HTTP 403 rather than the 402 OpenRouter's
+# docs promise, the phrase "Key limit exceeded (total limit)", and a ``"code":403`` field in
+# the body — which is what the old negative rule matched on, vetoing the fallback and
+# leaving the funded personal key untried.
+#
+# Shared rather than copied per test file because the exact bytes are the assertion
+# substrate: tests reason about what this string does NOT contain ("credit",
+# "insufficient", "balance", "402") and about which status digits the 64-hex key hash
+# happens to carry (none of 401/402/403/429 — the only "403" is the JSON code field).
+# Divergent copies would quietly invalidate that reasoning.
+PRODUCTION_KEY_LIMIT_403 = (
+    "litellm.APIError: APIError: OpenrouterException - "
+    '{"error":{"message":"Key limit exceeded (total limit). Manage it using '
+    "https://openrouter.ai/workspaces/default/keys/"
+    '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
+)
+
+
 def make_mock_binary_question(qid: int = 1001) -> MagicMock:
     """Return a ``MagicMock(spec=BinaryQuestion)`` with standard fields populated."""
     q = MagicMock(spec=BinaryQuestion)

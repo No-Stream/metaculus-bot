@@ -83,6 +83,7 @@ from metaculus_bot.research.agentic import llm as agentic_llm
 from metaculus_bot.research.agentic.types import LoopConfig
 from metaculus_bot.research.providers import build_native_search_llm
 from metaculus_bot.structured_parse import PercentileListWrapper, _build_constrained_llm
+from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 # Our production reasoning-config shapes, pinned literally so a reader sees the
 # exact values and the tests stay non-vacuous even if the roster rotates.
@@ -428,15 +429,7 @@ class TestFallbackOpenRouterKeySwap:
         )
         calls = _install_acompletion(
             monkeypatch,
-            script=[
-                Exception(
-                    "litellm.APIError: APIError: OpenrouterException - "
-                    '{"error":{"message":"Key limit exceeded (total limit). Manage it using '
-                    "https://openrouter.ai/workspaces/default/keys/"
-                    '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
-                ),
-                "PERSONAL-KEY ANSWER",
-            ],
+            script=[Exception(PRODUCTION_KEY_LIMIT_403), "PERSONAL-KEY ANSWER"],
         )
 
         out = await llm.invoke("hi")

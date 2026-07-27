@@ -117,7 +117,7 @@ class GapAccountingEntry(BaseModel):
 class LoopConfig:
     model: str
     reasoning_effort: str = "medium"
-    max_tool_calls: int = 14
+    max_tool_calls: int = 30
     wall_deadline_s: float = 540.0
     conclude_threshold_s: float = 90.0
     max_result_chars: int = 8000

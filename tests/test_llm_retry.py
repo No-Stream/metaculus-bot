@@ -44,6 +44,7 @@ from metaculus_bot.llm_retry import (
     is_broadly_retryable,
     llm_status_code,
 )
+from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 # A wall_timeout comfortably larger than any simulated call duration in these
 # tests, so the helper's own asyncio.wait_for never fires unless we want it to.
@@ -717,20 +718,16 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
 # carries and treats the deterministic client-error statuses as permanent. Substring
 # matching numbers against the message is NOT viable here: litellm builds the message
 # as f"APIError: {provider} - {body}", and the OpenRouter body embeds both a 64-hex
-# key hash (~8.8% chance of containing one of 401/402/403/429/502/503) and, on a
+# key hash (~8.7% chance of containing one of 401/402/403/429/502/503) and, on a
 # moderation refusal, up to ~100 chars of our own prompt in ``flagged_input``.
 # ---------------------------------------------------------------------------
 
-# Verbatim from the 2026-07-26 06:45 UTC production run (run_log_facts.md): the
-# donated key at $0.00 of its $850 cap. Note what it does NOT contain — "credit",
-# "insufficient", "balance", or "402" — and that the only "403" is the JSON code
-# field, which is exactly why classification must read status_code, not the text.
-_PROD_KEY_LIMIT_MESSAGE = (
-    "litellm.APIError: APIError: OpenrouterException - "
-    '{"error":{"message":"Key limit exceeded (total limit). Manage it using '
-    "https://openrouter.ai/workspaces/default/keys/"
-    '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
-)
+# Verbatim from the 2026-07-26 06:45 UTC production run (run_log_facts.md): the donated
+# key at $0.00 of its $850 cap. Note what it does NOT contain — "credit", "insufficient",
+# "balance", or "402" — and that the only "403" is the JSON code field, which is exactly
+# why classification must read status_code, not the text. Shared from conftest so this
+# reasoning about the exact bytes stays true for every suite that replays it.
+_PROD_KEY_LIMIT_MESSAGE = PRODUCTION_KEY_LIMIT_403
 
 
 def _api_error_with_status(status: int, message: str = "boom") -> litellm_exc.APIError:

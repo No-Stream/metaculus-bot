@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright.async_api import Error as _PlaywrightError
 
+from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _method_to_tier, _tool_schemas
 
@@ -338,6 +339,38 @@ async def test_asknews_search_non_retryable_error_raises_immediately(monkeypatch
     sleep_mock = _patch_asknews_env(monkeypatch, search_news)
 
     with pytest.raises(RuntimeError, match="invalid credentials"):
+        await agentic_tools._call_asknews_search("query")
+
+    assert search_news.await_count == 1
+    assert sleep_mock.await_count == 0
+
+
+class _FakeAskNewsForbiddenError(Exception):
+    """Stand-in for ``asknews_sdk.errors.ForbiddenError`` — matched by class name."""
+
+
+# ``is_asknews_subscription_error`` keys on the class-name substring, so rename the
+# attribute to the SDK's real class name (same trick as tests/test_research_providers.py).
+_FakeAskNewsForbiddenError.__name__ = "ForbiddenError"
+
+
+@pytest.mark.asyncio
+async def test_asknews_search_subscription_inactive_raises_on_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """403011 subscription-inactive is PERMANENT, so it costs exactly one attempt.
+
+    It used to be exempted from the fast-fail alongside rate limits, which re-rolled a
+    call that can never succeed and burned 64s of backoff (26s + 38s) out of the 540s
+    GAP_FILL_V2_WALL_DEADLINE. The primary provider's ``_is_retryable`` never retried it;
+    this asserts the agentic path matches that policy.
+    """
+    subscription_exc = _FakeAskNewsForbiddenError("403011 - subscription is not currently active")
+    assert research_providers.is_asknews_subscription_error(subscription_exc) is True
+    search_news = AsyncMock(side_effect=subscription_exc)
+    sleep_mock = _patch_asknews_env(monkeypatch, search_news)
+
+    with pytest.raises(_FakeAskNewsForbiddenError, match="403011"):
         await agentic_tools._call_asknews_search("query")
 
     assert search_news.await_count == 1

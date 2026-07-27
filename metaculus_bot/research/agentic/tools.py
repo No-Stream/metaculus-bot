@@ -403,7 +403,12 @@ async def _call_asknews_search(query: str) -> list[Any]:
                     return list(response.as_dicts or [])
                 except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
                     last_exc = exc
-                    if not _is_rate_limited_error(exc) and not research_providers.is_asknews_subscription_error(exc):
+                    # Transient-only retry, matching the primary provider's ``_is_retryable``
+                    # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
+                    # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
+                    # it burns 64s of backoff (2.0 * (10+3) then 2.0 * (10+9)) out of the 540s
+                    # GAP_FILL_V2_WALL_DEADLINE on a call that can never succeed.
+                    if not _is_rate_limited_error(exc):
                         msg = str(exc).lower()
                         if "concurrency limit" not in msg:
                             raise

@@ -199,7 +199,7 @@ the matching env vars):
   whole loop, enforced by an outer `asyncio.wait_for`. It sits inside v1's
   worst-case timing envelope, so running v2 concurrently with v1 adds no
   research-phase wall-clock.
-- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` = 14. Parallel calls each
+- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` = 30. Parallel calls each
   count against this cap. Steps, not calls, are where latency lives, so batching
   is encouraged.
 - **Max steps** = 20 (`LoopConfig.max_steps` default; the seam doesn't override
@@ -295,7 +295,7 @@ All flags are read in `constants.py`. The enable flag uses the standard
 | `GAP_FILL_V2_DRIVER_MODEL` | `openai/gpt-5.6-terra` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
 | `GAP_FILL_V2_DRIVER_EFFORT` | `low` | Driver reasoning effort. |
 | `GAP_FILL_V2_READER_MODEL` | `gemini-3.5-flash` | The `read_document` backend model on the native google-genai path. |
-| `GAP_FILL_V2_MAX_TOOL_CALLS` | 14 | Tool-call budget. |
+| `GAP_FILL_V2_MAX_TOOL_CALLS` | 30 | Tool-call budget. |
 | `GAP_FILL_V2_WALL_DEADLINE` | 540.0 | Hard wall for the whole loop, in seconds. |
 | `GAP_FILL_V2_CONCLUDE_THRESHOLD` | 90.0 | Seconds-remaining threshold below which only `conclude` is offered. |
 | `GAP_FILL_V2_MIN_CONTENT_CHARS` | 500 | Extracted-char floor below which `fetch` escalates plain HTTP to headless Chromium. |

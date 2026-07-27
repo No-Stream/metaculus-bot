@@ -128,7 +128,7 @@ Both gap-fill passes run in prod as of 2026-07-17. Each soft-fails to an empty
 string on any error, and both are suppressed under `is_benchmarking=True`. v2's
 driver model and effort default to `gpt-5.6-terra` at `effort=low`
 (`GAP_FILL_V2_DRIVER_MODEL` / `GAP_FILL_V2_DRIVER_EFFORT`); its wall deadline is
-540s and it caps at 20 tool calls (`constants.py:405-444`).
+540s and it caps at 30 tool calls (`constants.py:524-529`).
 
 ### Stacking
 
@@ -246,10 +246,16 @@ CI. Two paths are gated, because either one alone would keep the check red:
    saying the breach was observed but alerting is suppressed until the resume
    date.
 2. The credit-caused donated-to-personal key fallbacks. Each fallback normally
-   counts toward `alertable`. `fallback_openrouter.py` tracks the suppressible
-   subset in `_credit_key_fallback_count`, a subset of the all-causes
-   `_generic_key_fallback_count`, and `cli.py` subtracts the subset back out
-   while alerting is suppressed.
+   counts toward `alertable`. `record_donated_key_fallback` tracks the
+   suppressible subset in `_credit_key_fallback_count`, a subset of the
+   all-causes `_generic_key_fallback_count`, and `cli.py` subtracts the subset
+   back out while alerting is suppressed. Every event is counted exactly once:
+   generic adds it, at most one subset subtracts it. That is why the whole
+   accounting block in `record_donated_key_fallback` has to contain no `await`
+   after the threaded probe — `+=` on a module global is interruptible between
+   bytecodes, so an await there would let N forecasters failing on one dry key
+   race the increment, undercount the generic total, and take a degraded run
+   green.
 
 Non-credit fallback causes still alert in full, since each means real breakage
 rather than an empty wallet: 401 invalid or disabled key, 404 "no allowed
@@ -281,8 +287,7 @@ Text alone cannot tell a genuinely **drained** key from one Metaculus
 **revoked** or **re-capped to zero** — all three produce that same 403 — and the
 operator wants opposite CI colors for them. So on the first spend-cap failure of
 a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
-`/auth/key` endpoint once (5s timeout, verdict cached for the process) and
-classifies:
+`/auth/key` endpoint once (verdict cached for the process) and classifies:
 
 | `/auth/key` says | State | Alerting |
 | --- | --- | --- |
@@ -294,7 +299,22 @@ classifies:
 
 Only `drained` is subtracted from `alertable`. A probe that errors or times out
 classifies as `unknown` and stays red, so a broken probe can never silently turn
-a red run green. The state is logged as
+a red run green.
+
+Its 5s `DONATED_KEY_PROBE_TIMEOUT_S` is a **per-network-operation** budget, not a
+bound on elapsed time: httpx applies a bare float to connect / read / write /
+pool independently, so a server trickling bytes slower than the read timeout
+resets the clock on every chunk (measured against a local 0.5s-per-byte
+trickler, a `timeout=1.0` GET took 10.2s to return 20 bytes). The hard total cap
+lives at the one latency-sensitive call site: `record_donated_key_fallback` runs
+the probe on `asyncio.to_thread` under `asyncio.wait_for(...,
+timeout=DONATED_KEY_PROBE_TIMEOUT_S)`, so the awaiting coroutine gives up after
+5s regardless of how long the socket takes. `wait_for` doesn't kill the worker
+thread, so a trickling probe can outlive that cap — it just does so orphaned,
+holding a socket and (under the probe's lock) writing the cache, while the
+fallback proceeds. Callers outside that path (the CLI, the start/end telemetry)
+run outside the forecasting window and take the per-operation budget only. The
+state is logged as
 `DONATED_KEY_STATE: state=<state>` (INFO for `drained`, WARNING for everything
 else) and is echoed in the end-of-run summary as `donated_key=<state>` whenever a
 probe actually ran.
@@ -341,7 +361,7 @@ substring match therefore read an ordinary moderation refusal as an empty wallet
 real moderation block from alerting. Everything after a prompt-echo marker is now
 stripped before any word cue reads the body, and the bare digits are only trusted
 when nothing in what remains looks like a moderation refusal. Word cues only,
-deliberately: a genuine 402 links to a key hash that has roughly a 1.5% (1-in-66)
+deliberately: a genuine 402 links to a key hash that has roughly a 1.5% (1 in 67)
 chance of containing the substring `403`, and reading that as moderation would
 break the long-standing 402 fallback.
 
