@@ -17,14 +17,22 @@ no bare ``async def`` helpers for flake8-async to complain about.
 """
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asknews_sdk.errors as asknews_errors
+import asknews_sdk.response as asknews_response
 import litellm.exceptions as litellm_exc
 import pytest
 import requests
 
 from metaculus_bot import fetch_hardening
+from metaculus_bot.constants import (
+    PREDICTION_MARKET_KEYWORD_BACKOFFS,
+    PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
+    PREDICTION_MARKET_TIMEOUT,
+)
 from metaculus_bot.llm_retry import (
     DEFAULT_TRANSIENT_BACKOFFS,
     NON_RETRYABLE_HTTP_STATUS_CODES,
@@ -34,6 +42,7 @@ from metaculus_bot.llm_retry import (
     invoke_with_broad_retry,
     invoke_with_transient_retry,
     is_broadly_retryable,
+    llm_status_code,
 )
 
 # A wall_timeout comfortably larger than any simulated call duration in these
@@ -292,6 +301,83 @@ def test_elapsed_gate_default_is_30s() -> None:
     every real per-call timeout (120/300/360/420/480/500s).
     """
     assert TRANSIENT_RETRY_MAX_ELAPSED_S == 30.0
+
+
+def test_wall_timeout_is_per_attempt_not_a_total_budget() -> None:
+    """Pin the semantics every caller's budget arithmetic depends on.
+
+    ``invoke_with_transient_retry`` starts a FRESH ``asyncio.wait_for(...,
+    wall_timeout)`` inside the attempt loop, so ``wall_timeout`` bounds each attempt
+    individually — the worst case for a call site is
+    ``(len(backoffs) + 1) * wall_timeout + sum(backoffs)``, NOT ``wall_timeout``.
+    Callers that size the value to fit inside an outer ``wait_for`` (see
+    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` against ``PREDICTION_MARKET_TIMEOUT``)
+    read it the other way round and silently overrun, so make the semantics explicit
+    here rather than leaving them implied by the loop body.
+
+    Two attempts each hitting the wall must therefore consume ~2x the wall, and the
+    per-attempt ``asyncio.TimeoutError`` must not be retried (it is a SLOW failure).
+    """
+    wall = 0.05
+    attempt_durations: list[float] = []
+
+    async def _hang() -> str:
+        started = time.monotonic()
+        try:
+            await _REAL_SLEEP(5)
+        finally:
+            attempt_durations.append(time.monotonic() - started)
+        return "never"
+
+    async def _run() -> None:
+        # A predicate that accepts asyncio.TimeoutError plus a gate above the wall
+        # forces the retry the production predicates deliberately refuse, which is
+        # what exposes the per-attempt (rather than total) nature of the cap.
+        with pytest.raises(asyncio.TimeoutError):
+            await invoke_with_transient_retry(
+                _hang,
+                wall_timeout=wall,
+                label="per_attempt_wall",
+                backoffs=(0.0,),
+                max_elapsed_s=_BIG_WALL,
+                predicate=lambda _exc: True,
+            )
+
+    asyncio.run(_run())
+
+    assert len(attempt_durations) == 2, "wall_timeout bounds each attempt, so both attempts must run"
+    assert sum(attempt_durations) >= wall * 1.5, (
+        f"two attempts must cost ~2x the wall, not one wall total: {attempt_durations=}"
+    )
+
+
+def test_prediction_market_keyword_retry_budget_fits_the_snapshot_timeout() -> None:
+    """The keyword extractor's WORST CASE must fit inside the snapshot budget.
+
+    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` is per-attempt (see the test above), so
+    the real ceiling is ``(len(backoffs) + 1) * wall + sum(backoffs)``. At 15.0s that
+    was 31.0s against a 30.0s ``PREDICTION_MARKET_TIMEOUT`` — the exact overrun the
+    per-attempt cap was added to prevent stayed reachable, without either attempt
+    hitting its own wall: a fast ``litellm.Timeout`` at ~14.9s is retryable and under
+    the 30s elapsed gate, then the 1s backoff, then a second attempt to the wall.
+    The snapshot-level ``wait_for`` then cancels all four venues and mis-attributes
+    the loss to ``snapshot`` rather than ``keywords``.
+
+    Asserting the product (not the two halves separately) is the point: ``sum(backoffs)
+    < T`` and ``wall <= T`` both held true at 31.0s.
+    """
+    worst_case = (len(PREDICTION_MARKET_KEYWORD_BACKOFFS) + 1) * PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT + sum(
+        PREDICTION_MARKET_KEYWORD_BACKOFFS
+    )
+
+    assert worst_case < PREDICTION_MARKET_TIMEOUT, (
+        f"keyword retry worst case {worst_case}s must fit inside the {PREDICTION_MARKET_TIMEOUT}s snapshot budget"
+    )
+    # Leave real room for the four-platform fan-out that runs after extraction, not
+    # merely a hair under the cap.
+    assert PREDICTION_MARKET_TIMEOUT - worst_case >= 5.0, (
+        "at least 5s of the snapshot budget must remain for the platform fan-out"
+    )
 
 
 # Broad-predicate retry (Round-2 change 3): for the allowed_tries>=2 sites
@@ -753,6 +839,53 @@ async def test_production_403_consumes_one_attempt_with_no_backoff(_no_real_slee
 
     assert awaitable.await_count == 1
     _no_real_sleep.assert_not_awaited()
+
+
+def test_llm_status_code_reads_the_reported_status() -> None:
+    """The shared numeric primitive returns the provider's own status, nothing else."""
+    assert llm_status_code(_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE)) == 403
+    assert llm_status_code(_api_error_with_status(402)) == 402
+
+
+def test_llm_status_code_is_none_outside_the_llm_exception_tree() -> None:
+    """Only ``openai.APIError`` descendants can report a status.
+
+    Two families depend on this returning ``None`` so their callers stay on text cues:
+    ``requests``-shaped errors (status lives on ``.response``, and a CDN/WAF 403 on the
+    Metaculus question-list endpoint must stay RETRYABLE per the 2026-05-19 incident),
+    and the AskNews SDK, whose ``asknews_sdk.errors`` classes carry a ``.code`` and do
+    not subclass ``openai.APIError`` at all.
+    """
+    cdn_403 = requests.HTTPError("403 Client Error")
+    cdn_403.response = MagicMock(spec=requests.Response)
+    cdn_403.response.status_code = 403
+
+    # The SDK stores the response verbatim without reading it, so a spec'd stand-in is
+    # enough to build the real exception type — what matters here is its class, not its
+    # payload. Built with the genuine SDK class rather than a look-alike so the test
+    # keeps passing only while AskNews really does stay outside the openai tree.
+    asknews_403 = asknews_errors.ForbiddenError(
+        MagicMock(spec=asknews_response.APIResponse), "Your subscription is not currently active", 403011
+    )
+
+    assert llm_status_code(cdn_403) is None
+    assert llm_status_code(Exception("403 Forbidden")) is None
+    assert llm_status_code(asknews_403) is None
+
+
+def test_llm_status_code_rejects_a_non_int_status() -> None:
+    """A string status is not numeric evidence — the narrowing keeps it out.
+
+    litellm normally sets an int, but the attribute is untyped and a provider-shaped
+    string ("403") must not be compared against the int frozenset, or membership
+    silently fails open on a status that IS a hard rejection.
+    """
+    exc = _api_error_with_status(403)
+    # setattr, not a direct assignment: the whole point is a value the annotation
+    # forbids, so both type checkers would flag the plain form.
+    setattr(exc, "status_code", "403")  # noqa: B010
+
+    assert llm_status_code(exc) is None
 
 
 @pytest.mark.asyncio

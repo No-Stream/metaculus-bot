@@ -125,7 +125,11 @@ def _asknews_provider() -> ResearchCallable:
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)
 
-        # Retry helper: only retry on known transient rate/concurrency errors
+        # Retry helper: only retry on known transient rate/concurrency errors.
+        # Text-matched on purpose, unlike the LLM paths that read ``llm_status_code``:
+        # the AskNews SDK raises its own ``asknews_sdk.errors`` classes carrying a
+        # ``.code`` (429000 / 429001 / 403011) and never subclasses ``openai.APIError``,
+        # so a status-based primitive reads None here and would disable this retry.
         def _is_retryable(err: Exception) -> bool:
             msg = str(err).lower()
             return ("429" in msg) or ("rate limit" in msg) or ("concurrency limit" in msg)

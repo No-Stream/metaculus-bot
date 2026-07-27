@@ -118,8 +118,12 @@ PYTHON_BUG_NO_RETRY_EXCEPTIONS: tuple[type[BaseException], ...] = (
 # failures, and the AskNews summarizer burned the full 1s/10s/30s ladder against a key
 # that could not succeed. Mostly redundant for 400/401/404/422 (already typed
 # permanent above); 402 and 403 are the statuses this actually adds.
-# 200 and 500 are deliberately ABSENT: the zero-output carve-out
-# (``is_zero_output_failure``) rides on those statuses and must stay retryable.
+# Every status listed here also becomes non-retryable for a ZERO-OUTPUT body arriving
+# at it: ``is_zero_output_failure`` recognizes those by message marker and reads no
+# status at all, so the carve-out is not status-protected — it survives only because
+# the two statuses it actually sees in practice, 200 and 500, are absent here. Keep
+# them absent, and weigh that cost before adding a status (a whitespace body served
+# with the new status stops being re-rolled).
 NON_RETRYABLE_HTTP_STATUS_CODES: frozenset[int] = frozenset({400, 401, 402, 403, 404, 422})
 
 # Universal deadline-safety rule (Round-2): a failure whose own attempt took
@@ -182,26 +186,38 @@ def is_zero_output_failure(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "empty string" in message
 
 
-def _is_deterministic_client_error(exc: BaseException) -> bool:
-    """Whether ``exc`` is an LLM API failure whose HTTP status makes a retry pointless.
+def llm_status_code(exc: BaseException) -> int | None:
+    """The HTTP status an LLM provider reported, or ``None`` when the exception carries none.
 
-    Scoped to ``openai.APIError``, the common root of every litellm exception
-    (``litellm.exceptions.APIError.__mro__[1] is openai.APIError``), so the rule
-    reaches LLM provider calls and nothing else. "403 is permanent" is NOT a general
-    truth in this repo: ``fetch_hardening`` deliberately RETRIES a CDN/WAF 403 on the
-    Metaculus question-list endpoint (the 2026-05-19 incident). Those are ``requests``
-    errors carrying their status on ``.response``, not on the exception itself, so they
-    fall outside both the isinstance scope and the attribute read.
+    Public so every classifier that needs a status reads the same primitive instead of
+    reimplementing the attribute read; today's caller is this module's retry predicate.
+    Scoped to ``openai.APIError``, the common root of every litellm
+    exception (``litellm.exceptions.APIError.__mro__[1] is openai.APIError``), so a
+    same-named attribute on some unrelated exception can never be read as a provider
+    status. ``requests``-shaped errors keep their status on ``.response`` and so report
+    ``None`` here, which is what leaves textual cues in charge for them — load-bearing,
+    because "403 is permanent" is NOT a general truth in this repo: ``fetch_hardening``
+    deliberately RETRIES a CDN/WAF 403 on the Metaculus question-list endpoint (the
+    2026-05-19 incident).
 
-    Reads the ``status_code`` int rather than grepping the message for digits. litellm
-    formats the message as ``f"APIError: {provider} - {body}"`` and an OpenRouter body
-    embeds a 64-hex key hash (~8.8% chance of containing one of 401/402/403/429/502/503)
-    plus, on a moderation refusal, up to ~100 chars of our own prompt in
-    ``flagged_input`` — either can make a number appear that was never a status.
+    Callers read this int rather than grepping the message for digits. litellm formats
+    the message as ``f"APIError: {provider} - {body}"`` and an OpenRouter body embeds a
+    64-hex key hash (~8.8% chance of containing one of 401/402/403/429/502/503) plus, on
+    a moderation refusal, up to ~100 chars of our own prompt in ``flagged_input`` —
+    either can make a number appear that was never a status. AskNews is the deliberate
+    exception: its SDK raises its own ``asknews_sdk.errors`` classes carrying a ``.code``
+    (429000 / 403011) and never subclasses ``openai.APIError``, so this returns ``None``
+    for them and a text match is the honest primitive there.
     """
     if not isinstance(exc, openai.APIError):
-        return False
-    return getattr(exc, "status_code", None) in NON_RETRYABLE_HTTP_STATUS_CODES
+        return None
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_deterministic_client_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is an LLM API failure whose HTTP status makes a retry pointless."""
+    return llm_status_code(exc) in NON_RETRYABLE_HTTP_STATUS_CODES
 
 
 def is_broadly_retryable(exc: BaseException) -> bool:
