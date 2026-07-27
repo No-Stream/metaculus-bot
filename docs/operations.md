@@ -96,7 +96,7 @@ per-key. See "What a dry donated key actually returns" below.
 
 Flags are read at call time via `env_flag_enabled` in `constants.py`, which
 treats `true`/`1`/`yes` as on and `false`/`0`/`no` as off (case-insensitive).
-When a flag is unset it takes the code default shown below. The four workflow
+When a flag is unset it takes the code default shown below. The bot workflow
 YAMLs set these explicitly, so the "prod value" column is what actually runs in
 CI.
 
@@ -159,7 +159,7 @@ CRPS and is no better than median on binary.
 
 ## GitHub Actions workflows
 
-Four workflows live in `.github/workflows/`. All four share the same setup
+Five bot workflows live in `.github/workflows/`. They share the same setup
 (checkout, `uv sync --no-dev --frozen`, install Playwright Chromium for gap-fill
 v2's rendered-fetch rung), the same env block, and a `timeout-minutes` job cap
 that is a backstop for a wedged run, not a normal duration. Each tees stdout and
@@ -172,45 +172,169 @@ retention.
 | `run_bot_on_minibench.yaml` | cron at :08/:38 hourly, plus manual | `minibench` | Forecasts the current MiniBench question set; publishes |
 | `run_bot_on_metaculus_cup.yaml` | cron 00:03 every 2 days, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (human + bot competition); publishes |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
+| `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
-All four skip already-forecasted questions (`skip_previously_forecasted_questions`)
-so a re-run never double-spends or re-publishes. The three scheduled workflows
-split their cron across offset entries because GitHub silently drops `*/N`
-schedules under runner load, and a `concurrency` group prevents overlapping
-runs of the same workflow.
+The three prod workflows are the only ones with a `schedule:` block; both test
+workflows are `workflow_dispatch` and never fire on their own.
+
+All five skip already-forecasted questions
+(`skip_previously_forecasted_questions`) except in `test_questions` mode, where
+`cli.py` deliberately turns that off so a re-run re-forecasts the same test
+question. The three scheduled workflows split their cron across offset entries
+because GitHub silently drops `*/N` schedules under runner load, and a
+`concurrency` group prevents overlapping runs of the same workflow.
+`test_bot_basic.yaml` has its own group, so a smoke run never contends with a
+full `test_bot` run.
 
 The prod workflows (tournament / minibench / cup) upload their artifact as
-`research-<run_id>` and include `research_outputs/`. `test_bot.yaml` uploads
+`research-<run_id>` and include `research_outputs/`. Both test workflows upload
 `logs-<run_id>` with only `run_logs/`, so the research-archive sync script never
-picks up test runs. `test_bot.yaml` also does not set `PERSIST_RESEARCH_ENABLED`.
+picks up test runs. Neither sets `PERSIST_RESEARCH_ENABLED`.
+
+`ci.yaml` is the pull-request check (lint + tests); the `gemini-*` and
+`claude.yml` workflows are repo automation unrelated to forecasting.
+
+### The one-question smoke test (`test_bot_basic.yaml`)
+
+This is the cheapest way to exercise the whole live pipeline end to end. It
+forecasts exactly one question — Q14333, "Age of Oldest Human as of 2100", a
+plain-continuous numeric — chosen because numeric carries the deepest
+type-specific pipeline and is the likeliest thing to break. Every research flag
+matches `test_bot.yaml`, so a run touches AskNews, native search, Gemini
+grounded search, financial data, both gap-fill passes, prediction markets, the
+resolution-source fetcher, and the time-series anchor. It runs in prod mode
+(`is_benchmarking=False`), which means it **publishes a comment to Metaculus**.
+
+Cost is about $2.60 per run at current config. That is real OpenRouter and
+research-API money plus a published comment, so firing it is the operator's
+call under the cost rule above. An agent may propose and price it; it does not
+dispatch it.
+
+The single question comes from `TEST_QUESTIONS_OVERRIDE` (the env var named by
+`TEST_QUESTIONS_OVERRIDE_ENV` in `constants.py`), which `cli.py`'s
+`test_questions` path reads as a whitespace- or comma-separated URL list. Unset,
+the same mode would forecast the full `EXAMPLE_QUESTIONS` set, which is what
+`test_bot.yaml` does.
+
+Firing it, from the Actions UI or the CLI:
+
+```bash
+gh workflow run test_bot_basic.yaml --repo No-Stream/metaculus-bot --ref <branch>
+```
+
+The workflow has no inputs, so the only choice is which ref to run. Two things
+about the plumbing are easy to get wrong.
+
+First, pass `--repo`. This checkout has two remotes — `origin` is the operator's
+fork `No-Stream/metaculus-bot`, `upstream` is the Metaculus template it was
+forked from — and no `gh` default repo is configured, so a bare
+`gh workflow run` or `gh workflow list` resolves against the *upstream* template
+and reports a workflow list that does not include this one.
+
+Second, and the yaml header calls this out: a `workflow_dispatch` workflow only
+appears in the Actions "Run workflow" UI once its file exists on the **default**
+branch. A brand-new dispatch-only workflow on a feature branch is invisible
+until it merges to `main`. That is already satisfied here — the file is on
+`origin/main` and `gh workflow list --repo No-Stream/metaculus-bot` shows "Test
+Bot Basic (1 numeric Q smoke)" as active — so the `--ref` argument can point at
+any branch you want to test.
+
+Afterward, the log is in the `logs-<run_id>` artifact (90-day retention),
+tee'd from `run_logs/` during the run. The `logs-` prefix is deliberate:
+`scripts/download_research.py` enumerates artifacts by
+`RESEARCH_ARTIFACT_PREFIX`, so a test run can never contaminate the research
+archive. Worth grepping in the downloaded log:
+
+- `PAID PERSONAL-KEY FALLBACK` (`fallback_openrouter.py`) — a call fell off the
+  donated key onto the operator's personal one.
+- `DONATED_KEY_STATE:` (`credit_telemetry.py`) — the `/auth/key` probe's verdict
+  on why a credit-shaped failure happened (`drained`, `zeroed`, `revoked`,
+  `funded`, `unknown`).
+- `CREDIT_BALANCE:` / `CREDIT_SPEND:` / `CREDIT_FLOOR_BREACH:` — the per-key
+  balances at start and end, the run's spend delta, and the refill warning.
+  `CREDIT_SPEND` is the actual answer to "what did this run cost."
+
+The general telemetry markers under "Reading run logs" below apply too; those
+are just the money-shaped ones.
 
 `ci.yaml` is the pull-request check (lint + tests); the `gemini-*` and
 `claude.yml` workflows are repo automation unrelated to forecasting.
 
 ## Cost discipline
 
-Any command that hits live LLM or research APIs spends real money and, for the
-run modes, publishes to Metaculus. Never launch one without operator approval,
-even after a clean build. This is a hard rule, documented at the top of
-`AGENTS.md`.
+Every credit spend goes through the operator. Anything that hits a live LLM or
+research API spends real money, and the run modes also publish comments to
+Metaculus, which is a visible external action that is hard to retract. Nothing
+in that class launches without the operator saying yes first. `AGENTS.md` at the
+repo root carries the terse agent-facing version of the same rule.
 
-Paid and externally-visible (approve before each):
+The gate is on the **spend**, not on the mechanism. It covers anything that
+causes a paid call no matter who or what finally makes it: a local `make`
+target, a GitHub Actions dispatch of a bot workflow, an edit that adds cron
+entries to a `schedule:` block, a flag change that raises per-run cost, or a
+one-off script that wraps any of those. There is no clean-gates exemption and no
+threshold below which a run is small enough to skip asking. A two- or
+three-dollar smoke run still goes through the operator. When a paid run is the
+only way to verify a change, the right move is to name the exact command, price
+it, and stop there.
 
-- `uv run python main.py` / `make run` in any live mode — spends API credits
-  and publishes to Metaculus.
-- `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends credits
-  on every forecaster and research call (no publish, but real money;
-  `_large` is 100 questions).
-- The ablation targets (`make ablation_*`) and anything invoking research
-  providers or the ensemble against real questions.
+### Paid and externally visible
 
-Free and safe (run freely): `make test`, `make lint`, `make format`,
-`make typecheck`, `make check_credits`, `make benchmark_display` (views old
-results), the performance-analysis and width-monitor tooling below, and any
-unit or integration test. The suite is self-contained and hits no paid APIs.
+- `uv run python main.py` / `make run` in any live mode (`tournament`,
+  `minibench`, `metaculus_cup`, `test_questions`) — spends credits and publishes
+  to Metaculus. `cli.py` builds the bot with `publish_reports_to_metaculus=True`
+  in every mode.
+- `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends on every
+  forecaster and research call, plus one `LEAKAGE_DETECTOR_MODEL` call per
+  question for the leakage screen. No publish (the benchmark config sets
+  `publish_reports_to_metaculus=False` and `is_benchmarking=True`), but real
+  money. The per-target question counts are the `--num-questions` values in the
+  Makefile.
+- `make backtest_with_cache` — the `--research-dir` flag replays archived
+  research instead of fetching it, so the research and leakage-screen calls go
+  away. The live ensemble still forecasts every question, so forecaster spend is
+  real. A question with no archived record falls back to live research and the
+  run logs a warning saying so.
+- `make ablation_qa_research` / `ablation_smoke` / `ablation_small` /
+  `ablation_medium` — real research plus forecaster spend.
+- `make benchmark_run_*` — deprecated, since `community_benchmark.py` baseline
+  scoring broke when Metaculus dropped `aggregations` from the list API, but the
+  `run` and `custom` modes still fan the real ensemble over real questions.
+  Prefer `make backtest_*`.
+- `make test_live` — the only test target that leaves the network. It pins a
+  `:free` OpenRouter model slug so the dollar figure is near zero, but the calls
+  are real and need a live key, so it still goes through the operator.
+- GitHub Actions runs of any bot workflow. A dispatched run spends exactly what
+  the same mode spends locally and publishes to Metaculus the same way. See the
+  workflow table above for triggers, and the smoke-test subsection there for the
+  one-question variant.
+- Any script that invokes a research provider or the ensemble against real
+  questions, including one an agent writes on the spot.
 
-When you need a paid run to verify something, surface the exact command and a
-rough cost and let the operator decide.
+### Free and safe
+
+- Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
+  `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
+  `make audit`, `make precommit*`.
+- Read-only Metaculus and GitHub-artifact pulls: `make sync_all` and its parts
+  (`sync_research`, `sync_telemetry`, `sync_raw_research`, the `download_*` and
+  `backfill_*` targets), the `performance_analysis` package and its width
+  monitor, `make score_ghosts`, and `make close_margin_watch`.
+- `make ablation_score` — `--stages score` hydrates every artifact off disk
+  (`_hydrate_working_set_from_cache`) and makes no provider call.
+- `make benchmark_display` — views saved benchmark results, no forecasting.
+- `make check_credits` — reads the `/auth/key` balance for both OpenRouter keys.
+
+The test suite is safe by construction, not by convention. The `e2e` marker
+means a full-pipeline test with mocked LLMs, and `tests/conftest.py` installs an
+autouse `_block_network_egress` fixture that raises on any AF_INET connect to a
+non-loopback host. `addopts` deselects only the `live` marker, which is the one
+suite that opts out of the egress guard because real calls are its whole point.
+So a plain `make test` cannot reach a paid API even if a new test tries to.
+
+`make score_ghosts ARGS="--tournament <slug>"` is worth calling out because
+"live pull" reads like spend: it is a Metaculus-only fetch through
+`build_performance_dataset`, with no LLM or research provider in the path.
 
 ## Credit telemetry and the refill floor
 
@@ -219,7 +343,7 @@ per-run spend. The code is `metaculus_bot/credit_telemetry.py`, whose
 `CreditTelemetry` is wired into `cli.py`'s `main`; balances come from the
 `/auth/key` endpoint via `check_openrouter_credits.py`.
 
-Marker lines land in the `run_logs/` artifact (all four workflows tee stdout +
+Marker lines land in the `run_logs/` artifact (every bot workflow tees stdout +
 stderr), so per-run spend is durably grep-able:
 
 - `CREDIT_BALANCE: key=<donated|personal> phase=<start|end> remaining=... usage=...`
@@ -461,7 +585,7 @@ wired to `sync_all` for the same reason.
 
 Each run tees to `run_logs/run_<run_id>_<timestamp>.log`, uploaded as a workflow
 artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
-`test_bot`). Grep these for the telemetry markers:
+both test workflows). Grep these for the telemetry markers:
 
 - `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...`
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage

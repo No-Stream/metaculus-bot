@@ -3,7 +3,7 @@
 General coding guidelines (style, testing, error handling, etc.) are in `~/.claude/CLAUDE.md`.
 This file covers **repo-specific** context only.
 
-## ⚠️ Cost discipline — never run a paid run without asking
+## ⚠️ Cost discipline — every credit spend goes through the operator
 
 **Any command that hits live LLM / research APIs spends real money (OpenRouter
 credits, AskNews, Exa, Perplexity, Google). NEVER launch one autonomously — ask
@@ -12,20 +12,70 @@ This is a hard gate, not a courtesy: a single broad run can burn meaningful
 credits, and `--mode test_questions` also **publishes comments to Metaculus**
 (a visible external action that pings nothing but is hard to retract).
 
-Paid / external-effecting commands (ask before each):
+**The gate is on the SPEND, not on the mechanism.** It covers anything that
+causes a paid call, whoever or whatever ultimately makes it — a local command, a
+GitHub Actions dispatch, an edit that flips a schedule, or a script that wraps
+any of those. An agent proposes and prices the run; the operator decides. There
+is no clean-gates exemption and no "small enough to skip asking" threshold: a
+$2-3 run still goes through the operator. The rule holds even when a paid run is
+the only way to verify the work, in which case say so and stop.
 
-- `python main.py` / `make run` in any live mode (`--mode test_questions`,
+Paid / external-effecting — ask before each:
+
+- `uv run python main.py` / `make run` in any live mode (`--mode test_questions`,
   `tournament`, `metaculus_cup`, `minibench`) — spends API credits AND publishes.
-- `make backtest_*` (`smoke`/`small`/`medium`/`large`) — spends API credits on
-  every forecaster + research call (no publish, but real money; `large`=100 Qs).
-- Anything invoking research providers or the ensemble against real questions.
+- `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends on every
+  forecaster + research call, plus the `LEAKAGE_DETECTOR_MODEL` screen. No
+  publish, but real money; the question counts are the `--num-questions` values
+  in the Makefile and scale with the target name.
+- `make backtest_with_cache` — `--research-dir` replays archived research instead
+  of fetching it (`_load_research_from_archive`, `backtest.py`), and the live
+  ensemble still forecasts every question, so forecaster spend is real. A
+  question with no archived record falls back to live research, which the run
+  logs as a warning.
+- `make ablation_*` (`qa_research`/`smoke`/`small`/`medium`) — real research +
+  forecaster spend. `ablation_score` is the free exception: `--stages score`
+  hydrates every artifact off disk and makes no provider call.
+- `make benchmark_run_*` — deprecated (`community_benchmark.py` baseline scoring
+  is broken), but the `run` / `custom` modes still fan the real ensemble over
+  real questions. Use `make backtest_*` instead; `make benchmark_display` is the
+  free view-only mode.
+- `make test_live` — the only suite that leaves the network. It pins a `:free`
+  OpenRouter slug, so dollar spend is near-zero, but the calls are real and need
+  a key. Ask anyway.
+- **GitHub Actions runs of any bot workflow**, which spend exactly as a local run
+  does and publish to Metaculus. `test_bot_basic.yaml` (one numeric question,
+  ~$2.60) and `test_bot.yaml` are `workflow_dispatch`-only, so they fire when
+  somebody chooses to fire them — that choice is the operator's. The three
+  `run_bot_on_*.yaml` prod workflows are additionally on `schedule:` crons.
+  Never dispatch one, and never edit a `schedule:` block or a research/model flag
+  in a way that adds runs or raises per-run cost, without the operator's say-so.
+  (`gh` needs `--repo No-Stream/metaculus-bot` here: `origin` is the fork,
+  `upstream` is the Metaculus template, and no default repo is set, so a bare
+  `gh workflow` command silently targets upstream. Dispatch mechanics for the
+  smoke test are in `docs/operations.md`.)
+- Anything invoking research providers or the ensemble against real questions,
+  including one-off scripts an agent writes to do so.
 
-Free / safe (run freely): `make test`, `make lint`, `make format`,
-`make check_credits`, `make benchmark_display` (views old results), and any
-unit/integration test — the suite is self-contained and hits no paid APIs.
+Free / safe — run freely:
+
+- Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
+  `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
+  `make audit`, `make precommit*`. The whole suite is self-contained: the `e2e`
+  marker means full-pipeline with MOCKED LLMs, and the autouse
+  `_block_network_egress` fixture (`tests/conftest.py`) raises on any non-loopback
+  connect, so no selected test can reach a paid API. `addopts` deselects only the
+  `live` marker.
+- Read-only Metaculus / artifact pulls: `make sync_all` and its parts
+  (`sync_research`, `sync_telemetry`, `sync_raw_research`, `download_*`,
+  `backfill_*`), the `performance_analysis` package, `make score_ghosts` (its
+  `--tournament` pull is Metaculus-only), `make close_margin_watch`,
+  `make ablation_score`, `make benchmark_display` (views old runs). These hit only
+  the Metaculus API and GitHub artifacts.
+- `make check_credits` — reads both OpenRouter key balances.
 
 When verification needs a paid run, surface the exact command + rough cost and
-let the user decide. Unit/integration coverage is the default proof of
+let the operator decide. Unit/integration coverage is the default proof of
 correctness; live runs are opt-in.
 
 ## Repo-Specific Overrides
@@ -265,6 +315,8 @@ The bot's published Metaculus comments are the durable per-model record: on non-
 - Old-era (May–June 2026) blocks carry retired tier-2 fields (`mixture_components`, `tails`, `distribution_family_hint`) or edge values (`concentration: 0.0`) that the strict `parse_structured_block` schemas reject wholesale — a tolerant raw-JSON fallback rung in `parsing.py` (strict block → prose regex → tolerant salvage, added 2026-07-15) recovers the declared values from block-only rationales that would otherwise vanish (the false "gemini missed 5/45" screening artifact).
 - Roster drift makes era-conditioning mandatory — see the era-bucketing paragraph below.
 - **Per-model cuts run on a filtered cohort, aggregates don't.** When no `Model:` line identifies a bullet, `parsing.py` keys it by position instead (`anonymous_model_key` → `Forecaster N`), and on a stacker-fired question that positional bucket holds the stacker's aggregate — so pooling it across questions produces a stacker-vs-base-model mixture posing as one model (measured: 50 such forecasts in the 2026-04 data). Every per-model cut in `analysis.py` (`per_model_binary_scores`, `stacking_effectiveness`, `disagreement_predicts_error`) therefore goes through `per_model_cohort`, which drops anonymous keys and drops records whose stacker is *confirmed* fired, logging both counts at INFO under `PER_MODEL_COHORT`. Only the confirmed verdict excludes: `likely_stacker` is a high-spread-plus-large-delta heuristic that also matches an ordinary MEAN-era aggregate, so honoring it would delete the high-disagreement questions those cuts exist to measure. Aggregate/overall calibration paths are deliberately untouched — they still count every record.
+
+**The attribution parsers are guarded on two cohorts, and only one of them runs in CI.** `tests/data/performance_comments_mini.jsonl` is a checked-in miniature — one real comment per distinct SHAPE (attributable vs not, trimmed vs intact, with vs without the `### Research Summary` boundary marker, named vs anonymized, all four question types), redacted down to the structural skeleton the parsers key on. It is the deterministic CI floor: `TestMiniFixtureAttribution` and `TestAgainstCheckedInMiniComments` are not skip-gated, so a parse or trim regression reddens every PR. The broad sweep over `scratch/performance_data.json` (283 records, every era) still runs locally and catches shapes the miniature hasn't been taught, but that file is gitignored and rewritten by each collector run, so it can never be the only guard — a parse regression hid behind exactly that gap until 2026-07-27. Regenerate the miniature with `uv run python scripts/derive_mini_comment_fixture.py` when a pull introduces a genuinely new shape; the derivation only admits a record whose miniature parses IDENTICALLY to its full-size source, and the shape-coverage test fails loudly if the set ever narrows.
 
 **Era-bucketing is mandatory for calibration claims.** Any calibration, aggregation, or bias claim computed on pooled resolved data is suspect until split by config/roster era (proxy: `source_tournament`, or `bot_comment_created_at` versus config-flip dates). Three separate conclusions have flipped under era-bucketing: the numeric "too wide" verdict (2026-06, pre-flip-only data), the "current pipeline too narrow" verdict (2026-07, softened then reversed as post-flip n grew), and the YES-side overconfidence finding (2026-07-08, which turned out to be spring-2026-era-local — fall was well-calibrated, and a pooled fit would have degraded fall out-of-sample). Bucket by major config/roster changes (model swaps, aggregation changes, widening flips, research-stage changes — e.g. 2026-07-17: gap-fill v2 enabled in prod, a new config era; same-era: native-search + crux-analyzer models sol→terra per blind role audit; 2026-07-20 saw two forecaster-roster changes the same day — first the fable-5 → opus-4.7 forecaster + opus-4.8 stacker swap, then the drop from 6 to the 3-member latest-per-vendor triple (gpt-5.6-sol / opus-4.8 / gemini-3.1-pro-preview), which supersedes the first as the current config-era boundary; a later same-day tweak — sol forecaster effort xhigh→high plus `MIN_FORECASTERS_TO_PUBLISH` 2→1 — is a config tweak WITHIN that triple era, not a new era, since roster membership is unchanged), NOT by every git hash — a small prompt tweak does not start a new era; a forecaster-roster or pipeline-behavior change does. Judgment call: "would this change plausibly shift the forecast distribution?" If unsure, run the analysis both ways. Fitted calibration layers (shrinks, clamps, haircuts) require a decisive out-of-sample era test before shipping (fit on eras 1..k-1, must improve era k), else they are drift bombs.
 
