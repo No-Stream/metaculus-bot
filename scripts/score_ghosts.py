@@ -438,10 +438,15 @@ def _load_records(perf_json: str | None, tournament: str | None) -> list[dict]:
         logger.info(f"Loaded {len(records)} records from {perf_json}")
         return records
     if tournament:
+        from metaculus_bot.api_preflight import (
+            verify_metaculus_api_identity,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: api_preflight pulls forecasting_tools; keep the scoring core decoupled
+        )
         from metaculus_bot.performance_analysis.collector import (
             build_performance_dataset,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import  # lazy: keep the pure scoring core decoupled from the collector's import chain
         )
 
+        # Confirm the host is the real Metaculus before the token-sending pull.
+        verify_metaculus_api_identity()
         logger.info(f"Building performance dataset from tournament '{tournament}' (read-only Metaculus pull)...")
         return build_performance_dataset(tournament=tournament)
     logger.warning("No --perf-json or --tournament given; reporting ghost inventory only (nothing to score against).")

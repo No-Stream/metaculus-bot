@@ -346,6 +346,10 @@ def _install_full_stack_mocks(
         "metaculus_bot.ablation.cli.fetch_resolved_questions_stratified",
         fetch_mock,
     )
+    # The fetch stage runs a real unauthenticated API-identity preflight before
+    # fetching; stub it so the ablation stack stays hermetic (its own behavior
+    # is covered in test_api_preflight.py).
+    monkeypatch.setattr("metaculus_bot.ablation.cli.verify_metaculus_api_identity", MagicMock())
 
     research_results = research_results or {}
 
@@ -5003,6 +5007,8 @@ class TestSchemaStrictness:
             "metaculus_bot.ablation.cli.fetch_resolved_questions_stratified",
             fetch_mock,
         )
+        # _stage_fetch preflights the API identity (real network) before fetching; stub it.
+        monkeypatch.setattr("metaculus_bot.ablation.cli.verify_metaculus_api_identity", MagicMock())
 
         cache = AblationCache(str(cache_dir))
         working = _WorkingSet()
