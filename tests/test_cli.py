@@ -446,7 +446,7 @@ class TestCliCreditAlertSuppression:
             fb_module._credit_key_fallback_count = 0
             fb_module._donated_404_fallback_count = 0
 
-    def test_drained_donated_key_alone_exits_zero(self) -> None:
+    def test_drained_donated_key_alone_exits_zero(self, caplog: pytest.LogCaptureFixture) -> None:
         """The full shape of the 2026-07-26 run, once the fix lands. Both credit
         paths fire together — every donated-key call fell back to the personal key
         AND the end-of-run balance is under the refill floor — and because the probe
@@ -454,6 +454,13 @@ class TestCliCreditAlertSuppression:
 
         This is the outcome the operator asked for: while they self-fund the season,
         an empty donated wallet is bookkeeping, not breakage.
+
+        Green is exactly the shape that most needs a written record, so the run must
+        still explain itself: the same breakdown the red path logs (rendered at INFO),
+        carrying the probe verdict, plus the floor-breach explanation. Without the
+        summary on this branch, the run this whole change set was built for — every
+        donated call falling back, so the credit subset cancels the entire generic
+        total — would leave no trace of either the degradation or the verdict.
         """
         import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
@@ -463,9 +470,20 @@ class TestCliCreditAlertSuppression:
             with (
                 _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=DURING_SUPPRESSION),
                 patch("metaculus_bot.cli.get_probed_donated_key_state", return_value=DonatedKeyState.DRAINED),
+                caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
             ):
                 # Must NOT raise SystemExit.
                 cli_main()
+
+            messages = [record.getMessage() for record in caplog.records]
+            summary = [msg for msg in messages if "alertable degradation event" in msg]
+            assert summary, messages
+            assert "with 0 alertable" in summary[0], summary
+            assert "personal_key_fallback=7" in summary[0], summary
+            assert "credit=7 with 7 credit event(s) suppressed until 2026-09-10" in summary[0], summary
+            assert "donated_key=drained" in summary[0], summary
+            # The floor-breach explanation is a separate concern and still lands.
+            assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
         finally:
             fb_module._generic_key_fallback_count = 0
             fb_module._credit_key_fallback_count = 0
@@ -499,9 +517,26 @@ class TestCliCreditAlertSuppression:
         finally:
             fb_module._generic_key_fallback_count = 0
 
-    def test_probe_verdict_is_rendered_on_suppressed_runs_too(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A green-but-degraded run is the easiest kind to misread later, so the
-        verdict rides the summary whenever the probe established one.
+    def test_clean_run_logs_no_degradation_summary(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The green-path summary is conditioned on a fallback having happened, not
+        on the exit status: a run where nothing degraded says nothing, so the line's
+        presence in a log remains a signal rather than boilerplate.
+        """
+        with (
+            _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+        ):
+            cli_main()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any("alertable degradation event" in msg for msg in messages), messages
+
+    def test_probe_verdict_is_rendered_on_partially_suppressed_red_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Partial suppression: two fallbacks, one of them credit-caused, so one
+        event survives the subtraction and the run is red. The verdict still rides
+        the summary — a reader has to be able to tell that the suppressed share was
+        exempted because the key was genuinely drained. (The fully-suppressed green
+        counterpart is ``test_drained_donated_key_alone_exits_zero``.)
         """
         import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
