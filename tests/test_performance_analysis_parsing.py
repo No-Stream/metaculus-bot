@@ -882,6 +882,14 @@ _ORACLE_R1_MODEL_RE = re.compile(
 
 _ANONYMIZED_KEY_RE = re.compile(r"Forecaster (\d+)")
 
+# The bare literal every summary bullet starts with. Used to tell "the parser
+# found nothing because there is nothing to find" (the trim removed the whole
+# `## Report 1 Summary / ### Forecasts` block) from "the parser found nothing
+# although bullets are right there" — the second is a regression, the first is
+# not. Deliberately a plain substring, not ``_FORECASTER_RE``: a regression IN
+# that regex is exactly what this has to stay sensitive to.
+_SUMMARY_BULLET_LITERAL = "*Forecaster"
+
 
 def _oracle_recoverable_indices(comment: str) -> set[int]:
     """Forecaster indices whose model name is present in ``comment``.
@@ -931,6 +939,7 @@ class _RealCommentAttributionChecks:
         total = 0
         fully_parsed = 0
         unattributable = []
+        no_bullets = []
         parser_bad = []
         for rec in records:
             comment = rec.get("comment_text") or ""
@@ -945,22 +954,38 @@ class _RealCommentAttributionChecks:
                 for key in anonymized
                 if (match := _ANONYMIZED_KEY_RE.fullmatch(key)) and int(match.group(1)) in recoverable
             ]
-            if not anonymized:
+            if not parsed:
+                # Parsed NOTHING. Counting this as "clean" (it has no anonymized
+                # keys, after all) would let a parser that returned {} for every
+                # comment pass at a 1.00 ratio — measured, on both cohorts. It is
+                # not a clean parse and it is not an attribution failure either;
+                # it gets its own bucket. Legitimate ONLY when the comment has no
+                # summary bullet to find; otherwise the parser missed one.
+                if _SUMMARY_BULLET_LITERAL in comment:
+                    parser_bad.append((rec["post_id"], ["<no forecasts parsed from a comment that has bullets>"]))
+                else:
+                    no_bullets.append(rec["post_id"])
+            elif not anonymized:
                 fully_parsed += 1
             elif dropped:
                 parser_bad.append((rec["post_id"], dropped))
             else:
                 unattributable.append(rec["post_id"])
         assert not parser_bad, (
-            f"Parser anonymized a forecast whose Model: line is present in the comment: {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
+            "Parser dropped a forecast it had the evidence to recover "
+            f"(anonymized despite a present Model: line, or found no bullets at all): {parser_bad[:10]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # error-message display truncation, not data subsampling
         )
         # Coverage floor over the records that HAVE an attribution source, so a
         # shift in the unattributable cohort's size can't mask a real drop.
-        attributable = total - len(unattributable)
+        # Bullet-less records are excluded from BOTH sides: they can't be parsed
+        # cleanly, so leaving them in the denominator alone would penalize the
+        # parser for a trim, and leaving them in the numerator was the hole above.
+        attributable = total - len(unattributable) - len(no_bullets)
         assert attributable > 0, "No records carry an attribution source; fixture is unusable"
         assert fully_parsed / attributable >= 0.90, (
             f"Only {fully_parsed}/{attributable} attributable records parsed cleanly "
-            f"({len(unattributable)} of {total} records carry no Model: line at all)"
+            f"({len(unattributable)} of {total} records carry no Model: line at all; "
+            f"{len(no_bullets)} carry no summary bullets at all)"
         )
 
     def test_stacking_era_cohort_is_structurally_unattributable(self, records):
@@ -1005,22 +1030,28 @@ class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
         # was selected for; assert the set is intact and duplicate-free so a
         # careless hand-edit or a stale regeneration can't quietly narrow
         # coverage to, say, only well-formed modern comments.
-        shapes = [tuple(rec["_shape"]) for rec in records]
-        assert len(shapes) == len(set(shapes)), f"duplicate shapes in miniature: {shapes}"
-        attribution_states = {shape[0] for shape in shapes}
-        assert attribution_states == {"map", "nomap"}, (
-            f"miniature must cover both attributable and unattributable comments, got {attribution_states}"
+        shapes = [rec["_shape"] for rec in records]
+        shape_keys = [tuple(sorted(shape.items())) for shape in shapes]
+        assert len(shape_keys) == len(set(shape_keys)), f"duplicate shapes in miniature: {shapes}"
+
+        # Axes are read BY NAME: positional access would silently check the wrong
+        # axis if ``comment_shape`` ever gained or reordered a field.
+        expected_values = {
+            "attribution": {"map", "nomap"},
+            "trim": {"trim", "intact"},
+            "boundary_marker": {"res", "nores"},
+            "naming": {"named", "anon"},
+            # Every question type the pipeline publishes, so a type-specific
+            # parser regression can't hide behind a binary-only fixture.
+            "question_type": {"binary", "numeric", "discrete", "multiple_choice"},
+        }
+        assert {axis for shape in shapes for axis in shape} == set(expected_values), (
+            "miniature shape axes do not match what this test knows how to check; "
+            "comment_shape changed — update expected_values"
         )
-        assert {shape[1] for shape in shapes} == {"trim", "intact"}, "miniature must cover trimmed and intact comments"
-        assert {shape[2] for shape in shapes} == {"res", "nores"}, (
-            "miniature must cover comments with and without the ### Research Summary boundary marker"
-        )
-        assert {shape[4] for shape in shapes} == {"named", "anon"}, (
-            "miniature must cover both fully-named and anonymized-fallback comments"
-        )
-        # Every question type the pipeline publishes, so a type-specific parser
-        # regression can't hide behind a binary-only fixture.
-        assert {rec["type"] for rec in records} == {"binary", "numeric", "discrete", "multiple_choice"}
+        for axis, expected in expected_values.items():
+            observed = {shape[axis] for shape in shapes}
+            assert observed == expected, f"miniature must cover every {axis} value: expected {expected}, got {observed}"
 
     def test_miniature_still_matches_its_recorded_shape(self, records):
         # Guards the fixture against edits that change what a record exercises.
@@ -1028,9 +1059,9 @@ class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
         # comment text catches a hand-edited comment whose label no longer fits.
         for rec in records:
             recomputed = comment_shape(rec)
-            assert list(recomputed) == rec["_shape"], (
+            assert recomputed == rec["_shape"], (
                 f"post {rec['post_id']} no longer matches its recorded shape: "
-                f"{rec['_shape']} -> {list(recomputed)}; regenerate with "
+                f"{rec['_shape']} -> {recomputed}; regenerate with "
                 "scripts/derive_mini_comment_fixture.py"
             )
 

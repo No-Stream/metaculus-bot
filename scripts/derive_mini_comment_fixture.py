@@ -184,17 +184,22 @@ def parser_outputs(comment: str) -> tuple[object, ...]:
     )
 
 
-def comment_shape(record: dict) -> tuple[str, ...]:
-    """Classify a record by the comment properties the parsers branch on."""
+def comment_shape(record: dict) -> dict[str, str]:
+    """Classify a record by the comment properties the parsers branch on.
+
+    Keyed by axis NAME rather than position: the shape is written into the fixture
+    and re-checked by the test suite, and positional access there would silently
+    check the wrong axis if this ever gained or reordered a field.
+    """
     comment = record["comment_text"]
     anonymized = [key for key in parse_per_model_forecasts(comment) if key.startswith("Forecaster ")]
-    return (
-        "map" if parse_forecaster_model_map(comment) else "nomap",
-        "trim" if TRIM_NOTICE in comment else "intact",
-        "res" if RESEARCH_SUMMARY_MARKER in comment else "nores",
-        str(record["type"]),
-        "anon" if anonymized else "named",
-    )
+    return {
+        "attribution": "map" if parse_forecaster_model_map(comment) else "nomap",
+        "trim": "trim" if TRIM_NOTICE in comment else "intact",
+        "boundary_marker": "res" if RESEARCH_SUMMARY_MARKER in comment else "nores",
+        "question_type": str(record["type"]),
+        "naming": "anon" if anonymized else "named",
+    }
 
 
 def build_fixture(records: list[dict]) -> list[dict]:
@@ -203,21 +208,22 @@ def build_fixture(records: list[dict]) -> list[dict]:
         (record for record in records if record.get("comment_text")),
         key=lambda record: record["post_id"],
     )
-    seen: set[tuple[str, ...]] = set()
-    skipped_unfaithful: Counter[tuple[str, ...]] = Counter()
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    skipped_unfaithful: Counter[tuple[tuple[str, str], ...]] = Counter()
     fixture: list[dict] = []
     for record in with_comments:
         shape = comment_shape(record)
-        if shape in seen:
+        shape_key = tuple(sorted(shape.items()))
+        if shape_key in seen:
             continue
         miniature = shrink_comment(record["comment_text"])
         if parser_outputs(miniature) != parser_outputs(record["comment_text"]):
-            skipped_unfaithful[shape] += 1
+            skipped_unfaithful[shape_key] += 1
             continue
-        seen.add(shape)
+        seen.add(shape_key)
         entry = {field: record.get(field) for field in _KEPT_FIELDS}
         entry["comment_text"] = miniature
-        entry["_shape"] = list(shape)
+        entry["_shape"] = shape
         fixture.append(entry)
 
     for shape, count in sorted(skipped_unfaithful.items()):
