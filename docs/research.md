@@ -49,9 +49,11 @@ priority order and returns the first provider whose credentials are present:
 1. **AskNews** if `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET` are set. This is the
    production case.
 2. **Exa.ai** (`SmartSearcher`) if `EXA_API_KEY` is set.
-3. **Perplexity direct** (`perplexity/sonar-pro`) if `PERPLEXITY_API_KEY` is set.
-4. **Perplexity via OpenRouter** (`openrouter/perplexity/sonar-reasoning-pro`) if
-   `OPENROUTER_API_KEY` is set.
+3. **Perplexity direct** if `PERPLEXITY_API_KEY` is set. Model:
+   `PERPLEXITY_RESEARCH_MODEL` (`constants.py`).
+4. **Perplexity via OpenRouter** if `OPENROUTER_API_KEY` is set. Same model,
+   prefixed for the OpenRouter route:
+   `PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER`.
 5. **Empty stub** if none of the above — research is just the add-on providers.
 
 In production the AskNews credentials are present, so Exa and the two Perplexity

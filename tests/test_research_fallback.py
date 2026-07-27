@@ -6,7 +6,11 @@ from forecasting_tools import GeneralLlm
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.constants import PERPLEXITY_WALL_TIMEOUT
+from metaculus_bot.constants import (
+    PERPLEXITY_RESEARCH_MODEL,
+    PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
+    PERPLEXITY_WALL_TIMEOUT,
+)
 from metaculus_bot.research import orchestrator, providers
 
 
@@ -157,7 +161,7 @@ class TestPerplexityRetryHardening:
                     status_code=403,
                     message='{"error":{"message":"Key limit exceeded (total limit).","code":403}}',
                     llm_provider="openrouter",
-                    model="perplexity/sonar-pro",
+                    model=PERPLEXITY_RESEARCH_MODEL,
                 )
 
             llm = MagicMock()
@@ -169,3 +173,72 @@ class TestPerplexityRetryHardening:
                 await providers._perplexity_provider()(question)
 
         assert attempts["n"] == 1
+
+
+class TestPerplexityModelIsOneConstant:
+    """Both Perplexity call sites must resolve to the SAME model.
+
+    They each carried their own literal until 2026-07-27 and silently drifted:
+    the provider factory was pinned to Perplexity's non-reasoning tier while the
+    orchestrator's AskNews-failure fallback used the reasoning tier, so which
+    model answered a research call depended on which code path got there. Both
+    now read ``PERPLEXITY_RESEARCH_MODEL`` from ``constants.py``; these tests
+    pin that so a future edit to one site can't re-open the gap.
+    """
+
+    @staticmethod
+    def _capture_llm(captured: dict):
+        def _factory(**kwargs):
+            captured["llm_kwargs"] = kwargs
+            llm = MagicMock()
+            llm.invoke = AsyncMock(return_value="perplexity prose")
+            return llm
+
+        return _factory
+
+    @staticmethod
+    async def _passthrough(make_awaitable, **_kwargs):
+        return await make_awaitable()
+
+    def test_openrouter_route_is_the_direct_slug_prefixed(self):
+        # One model, two routes: the OpenRouter form must be the direct slug with
+        # the ``openrouter/`` prefix that get_openrouter_api_key routes on, not an
+        # independently-chosen model.
+        assert PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER == f"openrouter/{PERPLEXITY_RESEARCH_MODEL}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("use_open_router", "expected_model"),
+        [
+            (False, PERPLEXITY_RESEARCH_MODEL),
+            (True, PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER),
+        ],
+    )
+    async def test_provider_factory_site_uses_the_constant(self, question, use_open_router, expected_model):
+        captured: dict = {}
+        with (
+            patch.object(providers, "GeneralLlm", self._capture_llm(captured)),
+            patch.object(providers, "invoke_with_transient_retry", self._passthrough),
+        ):
+            await providers._perplexity_provider(use_open_router=use_open_router)(question)
+
+        assert captured["llm_kwargs"]["model"] == expected_model
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("use_open_router", "expected_model"),
+        [
+            (False, PERPLEXITY_RESEARCH_MODEL),
+            (True, PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER),
+        ],
+    )
+    async def test_orchestrator_site_uses_the_constant(self, question, base_llms, use_open_router, expected_model):
+        bot = TemplateForecaster(llms=base_llms, aggregation_strategy=AggregationStrategy.MEAN)
+        captured: dict = {}
+        with (
+            patch.object(orchestrator, "GeneralLlm", self._capture_llm(captured)),
+            patch.object(orchestrator, "invoke_with_transient_retry", self._passthrough),
+        ):
+            await bot._research._call_perplexity(question.question_text, use_open_router=use_open_router)
+
+        assert captured["llm_kwargs"]["model"] == expected_model

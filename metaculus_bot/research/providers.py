@@ -33,6 +33,8 @@ from metaculus_bot.constants import (
     EXA_API_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_RESEARCH_MODEL,
+    PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
     PERPLEXITY_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
@@ -325,7 +327,7 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
-        model_name = "openrouter/perplexity/sonar-reasoning-pro" if use_open_router else "perplexity/sonar-pro"
+        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. No top_p.

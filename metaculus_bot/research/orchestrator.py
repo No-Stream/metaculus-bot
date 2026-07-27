@@ -33,6 +33,8 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_MODEL_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_RESEARCH_MODEL,
+    PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
     PERPLEXITY_WALL_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
@@ -748,10 +750,7 @@ class ResearchOrchestrator:
             {question_text}
             """
         )
-        if use_open_router:
-            model_name = "openrouter/perplexity/sonar-reasoning-pro"
-        else:
-            model_name = "perplexity/sonar-reasoning-pro"
+        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         model = GeneralLlm(
             model=model_name,
             # temperature=None defers to provider defaults; redundant on ft 0.2.92
