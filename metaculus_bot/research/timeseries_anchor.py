@@ -62,6 +62,7 @@ from metaculus_bot.research.ts_fetch import (
     FRED_NON_REVISING_SERIES,
     FetchError,
     SeriesSpec,
+    _reset_politeness_clock,
     _reset_series_cache,
     fetch_series,
 )
@@ -1103,10 +1104,15 @@ _session_charts: dict[int, str] = {}
 
 
 def _reset_session_caches() -> None:
-    """Clear the section + chart caches and the underlying series cache (tests + session start)."""
+    """Clear the section + chart caches, the series cache, and the fetch pacing clock.
+
+    The pacing clock rides along (tests + session start) so a fresh session's first fetch
+    isn't made to wait out the last one's interval.
+    """
     _SECTION_CACHE.clear()
     _session_charts.clear()
     _reset_series_cache()
+    _reset_politeness_clock()
 
 
 def _as_of_iso(as_of: datetime) -> str:

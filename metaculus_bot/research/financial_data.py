@@ -25,6 +25,7 @@ from metaculus_bot.constants import (
     FINANCIAL_YFINANCE_LOOKBACK_DAYS,
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
+    MAX_FINANCIAL_IDENTIFIERS,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
@@ -136,6 +137,65 @@ def _build_fred_reference_lines() -> str:
 def _dedupe_preserving_order(items: list[str]) -> list[str]:
     """Drop duplicates while keeping first-seen order (dict preserves insertion)."""
     return list(dict.fromkeys(items))
+
+
+def _cap_identifiers(
+    tickers: list[str],
+    fred_series: list[str],
+    extracted: dict[str, list[str]],
+) -> tuple[list[str], list[str]]:
+    """Bound the total fetch set to ``MAX_FINANCIAL_IDENTIFIERS``, dropping classifier IDs first.
+
+    Each identifier becomes its own ``asyncio.to_thread``, and the fan-out was
+    previously unbounded — one over-eager classification could queue arbitrarily many
+    blocking calls into the process-wide default executor that ts_fetch,
+    resolution_source, the agentic fetch ladder, and the /auth/key probe all share.
+    Queued tasks burn their ``wait_for`` budget without executing, so the damage lands on
+    unrelated providers and other questions.
+
+    Deliberately asymmetric about WHAT it drops: URL-EXTRACTED identifiers are kept
+    unconditionally, because they are the load-bearing guarantee that the source a
+    question actually resolves on is fetched even when the classifier misroutes (the
+    invariant the merged-set bail below rests on). Only classifier-added extras are
+    trimmed, from the tail, and the drop is logged so an over-eager classification is
+    visible rather than silent.
+    """
+    total = len(tickers) + len(fred_series)
+    if total <= MAX_FINANCIAL_IDENTIFIERS:
+        return (tickers, fred_series)
+
+    extracted_tickers = set(
+        extracted["tickers"]
+    )  # HARNESS-SCAN-EXEMPT-object-explosion: short id list, not a frame column
+    extracted_fred = set(
+        extracted["fred_series"]
+    )  # HARNESS-SCAN-EXEMPT-object-explosion: short id list, not a frame column
+    budget = MAX_FINANCIAL_IDENTIFIERS - len(extracted_tickers) - len(extracted_fred)
+    dropped: list[str] = []
+
+    def keep(identifiers: list[str], protected: set[str]) -> list[str]:
+        nonlocal budget
+        kept: list[str] = []
+        for identifier in identifiers:
+            if identifier in protected:
+                kept.append(identifier)  # extracted: never dropped
+            elif budget > 0:
+                kept.append(identifier)
+                budget -= 1
+            else:
+                dropped.append(identifier)
+        return kept
+
+    kept_tickers = keep(tickers, extracted_tickers)
+    kept_fred = keep(fred_series, extracted_fred)
+    logger.warning(
+        "financial_data: capped fetch set at %d identifiers (%d requested); dropped classifier-only "
+        "IDs %s. URL-extracted IDs are never dropped.",
+        MAX_FINANCIAL_IDENTIFIERS,
+        total,
+        dropped,
+    )
+    return (kept_tickers, kept_fred)
 
 
 def _sanitize_classifier_ids(items: list[str], char_re: re.Pattern[str], kind: str) -> list[str]:
@@ -593,6 +653,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         # resolving series is in the fetch set.
         tickers = _dedupe_preserving_order(classifier_tickers + extracted["tickers"])
         fred_series = _dedupe_preserving_order(classifier_fred + extracted["fred_series"])
+        tickers, fred_series = _cap_identifiers(tickers, fred_series, extracted)
 
         # The deterministic extraction is the load-bearing guarantee: even when the
         # classifier returns None (question read as non-financial) or misroutes, the

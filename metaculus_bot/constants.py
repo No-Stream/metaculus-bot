@@ -550,6 +550,16 @@ FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
 FINANCIAL_FRED_LOOKBACK_YEARS: int = 5
+# Cap on how many tickers + FRED series one question may fetch. The identifier list is
+# whatever an LLM classifier named plus whatever URL extraction found, and it was
+# previously unbounded: each identifier gets its own asyncio.to_thread, all of them
+# landing in the process-wide default executor that every other blocking call shares
+# (ts_fetch, resolution_source, the agentic fetch ladder, the /auth/key probe). Tasks
+# queued behind a saturated pool burn their wait_for budget without executing, so an
+# over-eager classification on one question degrades unrelated providers on others. 12 is
+# well above any plausible real question (the classifier prompt asks for the resolving
+# series, not a sector sweep) while bounding the worst case.
+MAX_FINANCIAL_IDENTIFIERS: int = 12
 
 # --- Soft deadlines to keep batch wall-clock inside the tournament cron window ---
 # Per-forecaster outer deadline wrapped via asyncio.wait_for around each

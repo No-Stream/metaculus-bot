@@ -1118,6 +1118,58 @@ class TestBenchmarkingDateCeiling:
         assert result == ""
         mock_yf.Ticker.assert_not_called()
 
+    def test_identifier_cap_drops_classifier_extras_and_keeps_extracted(self) -> None:
+        """Bound the per-question fan-out without ever dropping the resolving source.
+
+        Each identifier gets its own asyncio.to_thread, and the list was unbounded — it is
+        whatever an LLM named plus whatever URL extraction found. Those threads land in the
+        process-wide default executor shared with ts_fetch, resolution_source, the agentic
+        fetch ladder, and the /auth/key probe, and a task queued behind a full pool burns
+        its wait_for budget without running, so an over-eager classification on one
+        question degrades providers on others.
+
+        The cap is asymmetric on purpose: URL-EXTRACTED ids are the load-bearing guarantee
+        that the source a question actually resolves on gets fetched even when the
+        classifier misroutes, so only classifier-only extras are trimmed.
+        """
+        from metaculus_bot.constants import MAX_FINANCIAL_IDENTIFIERS
+        from metaculus_bot.research.financial_data import _cap_identifiers
+
+        extracted = {"tickers": ["AAPL"], "fred_series": ["UNRATE"]}
+        # Far more classifier ids than the cap, with the two extracted ones in the middle.
+        tickers = [f"TK{i}" for i in range(10)] + ["AAPL"] + [f"ZZ{i}" for i in range(10)]
+        fred_series = [f"FS{i}" for i in range(10)] + ["UNRATE"]
+
+        kept_tickers, kept_fred = _cap_identifiers(tickers, fred_series, extracted)
+
+        assert len(kept_tickers) + len(kept_fred) == MAX_FINANCIAL_IDENTIFIERS
+        assert "AAPL" in kept_tickers, "an extracted ticker must never be dropped"
+        assert "UNRATE" in kept_fred, "an extracted FRED series must never be dropped"
+        # Relative order preserved so rendered sections stay stable.
+        assert kept_tickers == [t for t in tickers if t in kept_tickers]
+        assert kept_fred == [f for f in fred_series if f in kept_fred]
+
+    def test_identifier_cap_is_a_no_op_under_the_limit(self) -> None:
+        from metaculus_bot.research.financial_data import _cap_identifiers
+
+        extracted = {"tickers": ["AAPL"], "fred_series": []}
+        kept_tickers, kept_fred = _cap_identifiers(["AAPL", "MSFT"], ["UNRATE"], extracted)
+        assert kept_tickers == ["AAPL", "MSFT"]
+        assert kept_fred == ["UNRATE"]
+
+    def test_identifier_cap_keeps_all_extracted_even_past_the_limit(self) -> None:
+        # Correctness beats the bound when they conflict: dropping a resolving source to
+        # honor a capacity cap would silently answer the wrong question.
+        from metaculus_bot.constants import MAX_FINANCIAL_IDENTIFIERS
+        from metaculus_bot.research.financial_data import _cap_identifiers
+
+        many = [f"EX{i}" for i in range(MAX_FINANCIAL_IDENTIFIERS + 5)]
+        extracted = {"tickers": many, "fred_series": []}
+        kept_tickers, kept_fred = _cap_identifiers([*many, "CLASSIFIER_EXTRA"], [], extracted)
+        assert kept_tickers == many, "every extracted id survives"
+        assert "CLASSIFIER_EXTRA" not in kept_tickers
+        assert kept_fred == []
+
     @pytest.mark.asyncio
     async def test_dead_classifier_records_a_loss_token_before_the_empty_early_return(self) -> None:
         """A dead classifier must not look like "no financial angle" on the diagnostics line.

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -57,7 +58,58 @@ CSV_HEADER_PREFIX = "observation_date,"
 # truth lives in constants (TS_ANCHOR_HTTP_TIMEOUT); mirrored here as the module
 # default so the fetch seam has no magic literal.
 HTTP_TIMEOUT_S = TS_ANCHOR_HTTP_TIMEOUT
+# Minimum spacing between OUTBOUND requests to FRED/ALFRED/Yahoo, process-wide.
 POLITENESS_SLEEP_S = 0.5
+
+_POLITENESS_LOCK = threading.Lock()
+_POLITENESS_LAST_CALL_TS: float = 0.0
+
+
+def _reset_politeness_clock() -> None:
+    """Clear the pacing clock so a test's first fetch doesn't wait on a previous test's."""
+    global _POLITENESS_LAST_CALL_TS
+    with _POLITENESS_LOCK:
+        _POLITENESS_LAST_CALL_TS = 0.0
+
+
+def _politeness_gate() -> None:
+    """Space consecutive outbound fetches by ``POLITENESS_SLEEP_S``, process-wide.
+
+    Replaces an unconditional ``time.sleep(POLITENESS_SLEEP_S)`` at the top of
+    ``_http_get``, which was strictly worse on both axes it was meant to serve.
+
+    It paced nothing under concurrency: ``fetch_series`` runs under
+    ``asyncio.to_thread`` from both the timeseries_anchor and financial_data providers,
+    so N concurrent fetches all slept in parallel and issued their requests within
+    milliseconds of each other (measured: 6 concurrent calls, inter-request gaps of
+    0.000-0.009s). The vendor saw an unspaced burst either way.
+
+    And it cost real capacity: every call held a worker in asyncio's shared default
+    executor for 0.5s doing nothing, against a TS_ANCHOR_TIMEOUT of 20s. That executor
+    is process-wide and unsized (18 workers here, but sized off the runner's CPU count),
+    shared with financial_data's uncapped per-ticker fan-out, resolution_source's
+    fetches, the agentic fetch ladder, and the /auth/key credit probe. A task waiting
+    for a free slot burns its ``wait_for`` budget without executing, so idle-sleeping
+    workers convert directly into timeouts elsewhere. TS_ANCHOR_ENABLED is 'true' in
+    all five workflow yamls, so this is on every question.
+
+    A real inter-request gap under a lock delivers the spacing the sleep only claimed to,
+    while occupying a worker for the wait only when a request genuinely needs to be
+    delayed. Kept synchronous (rather than an ``await asyncio.sleep``) because the seam
+    itself is sync and shared by two providers' ``to_thread`` calls; a thread lock is
+    what both can hold correctly.
+    """
+    global _POLITENESS_LAST_CALL_TS
+    if POLITENESS_SLEEP_S <= 0:
+        return
+    with _POLITENESS_LOCK:
+        now = time.monotonic()
+        wait = _POLITENESS_LAST_CALL_TS + POLITENESS_SLEEP_S - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _POLITENESS_LAST_CALL_TS = now
+
 
 # FRED series that genuinely do NOT revise (market prices / survey-level series):
 # these can be fetched from the plain fredgraph.csv safely. Everything else — every
@@ -228,8 +280,8 @@ def _fetch_yfinance_csv(spec: SeriesSpec, start: date, ceiling: date) -> bytes:
 
 
 def _http_get(url: str, params: dict[str, str]) -> bytes:
-    """Single HTTP seam: politeness sleep + browser UA + status check. Tests mock this."""
-    time.sleep(POLITENESS_SLEEP_S)
+    """Single HTTP seam: politeness pacing + browser UA + status check. Tests mock this."""
+    _politeness_gate()
     try:
         response = requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=HTTP_TIMEOUT_S)
     except requests.RequestException as exc:
