@@ -47,6 +47,12 @@ class ProviderResult:
     # loss (``"dropped(size_cap)"`` / ``"blocked"`` / ``"js_wall"`` / ``"error(...)"`` /
     # ``"empty"``). ``asdict(r)`` serializes this straight into the research archive.
     details: dict = field(default_factory=dict)
+    # On ``status == "fallback"``, the vendor that actually answered ("openrouter" /
+    # "perplexity" / "exa"). ``name`` deliberately keeps the PRIMARY's identity so the
+    # diagnostics line and ``providers_succeeded`` still read ``asknews: fallback``; this
+    # field is what lets the research SECTION HEADER name the real source, instead of
+    # labelling Perplexity prose as AskNews articles in the published comment and archive.
+    fallback_provider: str | None = None
 
 
 # ---------------------------------------------------------------------------

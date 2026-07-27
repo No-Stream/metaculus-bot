@@ -286,10 +286,19 @@ async def run_gap_fill_pass(
     ensures we never swallow a first-pass failure here.
     """
     gaps: list[dict[str, str]] = []
+    qid = getattr(question, "id_of_question", None)
     try:
         gaps = await _run_analyzer(question, first_pass_research, is_benchmarking=is_benchmarking)
     except _GAP_FILL_SOFT_FAIL_EXCEPTIONS as exc:
-        logger.warning(f"GapFill: analyzer failed ({type(exc).__name__}): {exc}")
+        # Greppable marker, not just prose: the analyzer GATES the entire pass, so its
+        # death silently zeroes one of the largest research spend lines and looks
+        # identical to a question that legitimately had no gaps. Gap-fill is not one of
+        # the orchestrator's _run_one providers, so it has no ProviderResult and no
+        # `lost=` token to render (a record_provider_detail entry under a "gap_fill" key
+        # would never be drained — verified — and would just accumulate in the registry).
+        # The run-log marker is the seam that exists for it; see
+        # scripts/telemetry/markers.py.
+        logger.warning(f"GAP_FILL_ANALYZER_FAILED: question={qid} error={type(exc).__name__} detail={exc}")
 
     if not gaps:
         # A soft-fail here is already an async no-op; give the scheduler a

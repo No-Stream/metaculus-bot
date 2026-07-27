@@ -20,6 +20,7 @@ from forecasting_tools import GeneralLlm
 from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import (
+    _is_lost_source,
     format_provider_diagnostics_block,
     pop_provider_detail,
     record_provider_detail,
@@ -866,6 +867,50 @@ class TestProviderDiagnosticsCapture:
         assert results[0].name == "asknews"
         assert results[0].chars == len("perplexity fallback prose")
         assert "perplexity fallback prose" in text
+
+    @pytest.mark.asyncio
+    async def test_fallback_records_a_loss_token_and_labels_the_real_source(self, mock_llm, question, monkeypatch):
+        """A vendor swap on the PRIMARY provider is degradation, and used to read as success.
+
+        It bumps no counter (the orchestrator caught the failure and produced output), so
+        provider_failure_count and alertable_count both stay flat and CI stays green. That
+        part is intended — this asserts the two things that were genuinely missing: a
+        per-source `lost=` token so the diagnostics line and schema-v2 archive show the
+        swap, and a section header naming the vendor that actually answered. The header
+        matters because the fallback skips the AskNews summarizer pass (the text is already
+        prose), so the briefing loses the relevance gate, [PRE-WINDOW] labeling, and
+        recency reordering — while being labelled "News Articles (AskNews)".
+        """
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=True)
+        asknews = AsyncMock(side_effect=RuntimeError("asknews down"))
+
+        with patch.object(orch, "_call_perplexity", new_callable=AsyncMock, return_value="perplexity fallback prose"):
+            text, results, _ = await orch._run_providers_parallel(question, [(asknews, "asknews")])
+
+        sources = results[0].details["sources"]
+        assert _is_lost_source(sources["asknews"]), f"the primary's failure must read as a LOST source; got {sources}"
+        assert "RuntimeError" in sources["asknews"]
+        assert sources["fallback"].startswith("ok"), "the fallback that answered is a contributing source"
+
+        # The vendor that answered, not the primary whose name the ProviderResult keeps.
+        assert results[0].fallback_provider == "openrouter"
+        assert "## Web Research (OpenRouter)" in text
+        assert "## News Articles (AskNews)" not in text, (
+            "Perplexity prose must not be labelled as AskNews articles in the comment or archive"
+        )
+        # Counters deliberately unchanged — see the docstring.
+        assert orch.provider_failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_provider_is_none_on_the_normal_path(self, mock_llm, question):
+        orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
+        provider = AsyncMock(return_value="native prose")
+
+        _, results, _ = await orch._run_providers_parallel(question, [(provider, "native_search")])
+
+        assert results[0].status == "ok"
+        assert results[0].fallback_provider is None
 
     @pytest.mark.asyncio
     async def test_one_result_per_provider_mixed_statuses(self, mock_llm, question):

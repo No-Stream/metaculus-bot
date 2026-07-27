@@ -305,6 +305,21 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(r"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)"),
     ),
     MarkerSpec(
+        "gap_fill_analyzer_failed",
+        # Gap-fill v1's analyzer (research/targeted.py run_gap_fill_pass) died, which
+        # GATES the whole pass — the addendum is silently "" and the run looks identical
+        # to a question that legitimately had no gaps. Gap-fill isn't one of the
+        # orchestrator's _run_one providers, so it has no ProviderResult and no `lost=`
+        # token; this marker is the only durable signal, and v1's searches are one of the
+        # largest research spend lines (~44%). ``detail`` captures greedily to end-of-line
+        # because it holds the exception's str.
+        re.compile(
+            r"GAP_FILL_ANALYZER_FAILED:\s*question=(?P<question>\S+)\s+error=(?P<error>\S+)"
+            r"(?:\s+detail=(?P<detail>.*))?$"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # targeted.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"

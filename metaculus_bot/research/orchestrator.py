@@ -545,11 +545,12 @@ class ResearchOrchestrator:
             # ProviderResult.details instead of vanishing behind a healthy `ok`.
             qid = getattr(question, "id_of_question", None)
             try:
-                used_fallback = False
+                fallback_provider: str | None = None
                 if name == "asknews" and self._allow_research_fallback:
-                    raw, used_fallback = await self._fetch_research_with_fallback(question, provider, name)
+                    raw, fallback_provider = await self._fetch_research_with_fallback(question, provider, name)
                 else:
                     raw = await provider(question)
+                used_fallback = fallback_provider is not None
                 # AskNews returns raw article markdown (no LLM prose); summarize it
                 # into an analyst briefing. Every other provider already emits
                 # LLM-written prose (native search, Gemini, Perplexity, Exa) or
@@ -575,6 +576,7 @@ class ResearchOrchestrator:
                     chars=len(raw) if has_output else 0,
                     latency_ms=latency_ms,
                     details=pop_provider_detail(qid, name),
+                    fallback_provider=fallback_provider,
                 )
                 return (raw, result)
             except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
@@ -618,7 +620,12 @@ class ResearchOrchestrator:
         for raw, provider_result in results:
             provider_results.append(provider_result)
             if raw and raw.strip():
-                header = self._provider_header(provider_result.name)
+                # Label the section with whoever actually produced the text. On a
+                # fallback that is NOT provider_result.name (which keeps the primary's
+                # identity for the diagnostics line) — rendering Perplexity prose under
+                # "## News Articles (AskNews)" mislabelled the source in the published
+                # comment and in the archive.
+                header = self._provider_header(provider_result.fallback_provider or provider_result.name)
                 combined_parts.append(f"{header}\n{_demote_inner_headings(raw)}")
 
         combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
@@ -646,24 +653,50 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
-    ) -> tuple[str, bool]:
-        """Return (research_text, used_fallback).
+    ) -> tuple[str, str | None]:
+        """Return ``(research_text, fallback_provider_name)``.
 
-        used_fallback is True when the primary (AskNews) failed and a prose
-        fallback provider (Perplexity/Exa) supplied the result instead — the
-        caller uses this to skip AskNews summarization on already-prose output.
+        ``fallback_provider_name`` is None on the normal path and otherwise names the
+        vendor that actually answered ("openrouter" / "perplexity" / "exa"). The caller
+        uses it for two things: to skip AskNews summarization on already-prose output, and
+        to label the research section with the source that produced it.
+
+        A vendor swap on the PRIMARY provider is real degradation, not a success: a
+        different index, a different recency profile, and — because the fallback is already
+        prose — no AskNews summarizer pass, so the briefing loses the per-article relevance
+        gate, [PRE-WINDOW] labeling, and recency reordering that the 2026-07-18 audit made
+        load-bearing. It used to bump no counter and record no detail, so it read as
+        healthy. We record a per-source loss token here so the diagnostics line and the
+        schema-v2 archive carry it. Deliberately NOT a new alertable counter: folding one
+        into alertable_count changes what CI treats as red, which is the operator's call.
         """
         try:
-            return (await provider(question), False)
+            return (await provider(question), None)
         except Exception as exc:
             if self._allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
-                fallback = await self._attempt_research_fallback(question.question_text)
-                if fallback is not None:
-                    return (fallback, True)
+                fallback_text, fallback_name = await self._attempt_research_fallback(question.question_text)
+                if fallback_text is not None:
+                    record_provider_detail(
+                        getattr(question, "id_of_question", None),
+                        provider_name,
+                        {
+                            "sources": {
+                                provider_name: f"error({type(exc).__name__})",
+                                "fallback": f"ok({fallback_name})",
+                            }
+                        },
+                    )
+                    return (fallback_text, fallback_name)
             raise
 
-    async def _attempt_research_fallback(self, question_text: str) -> str | None:
+    async def _attempt_research_fallback(self, question_text: str) -> tuple[str | None, str | None]:
+        """Return ``(research_text, provider_name)``, or ``(None, None)`` if no rung answered.
+
+        The provider name rides back so the caller can label the section with the vendor
+        that actually answered; rendering it as AskNews mislabeled the source in the
+        published comment and in the archive.
+        """
         # Ordering intentionally differs from the primary selector
         # (choose_provider_with_name: AskNews -> Exa -> Perplexity -> OpenRouter).
         # This fallback only fires when AskNews (always the primary in prod) has
@@ -673,19 +706,22 @@ class ResearchOrchestrator:
         # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
         # expensive path). The primary selector orders by index quality, not cost,
         # which is why the two lists diverge by design.
+        #
+        # The names returned here are the same keys ``_provider_header`` maps, so the
+        # section header follows the vendor automatically.
         try:
             if os.getenv(OPENROUTER_API_KEY_ENV):
                 logger.info("Falling back to openrouter/perplexity for research")
-                return await self._call_perplexity(question_text, use_open_router=True)
+                return (await self._call_perplexity(question_text, use_open_router=True), "openrouter")
             if os.getenv(PERPLEXITY_API_KEY_ENV):
                 logger.info("Falling back to Perplexity for research")
-                return await self._call_perplexity(question_text, use_open_router=False)
+                return (await self._call_perplexity(question_text, use_open_router=False), "perplexity")
             if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
-                return await self._call_exa_smart_searcher(question_text)
+                return (await self._call_exa_smart_searcher(question_text), "exa")
         except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
             logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
-        return None
+        return (None, None)
 
     async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question

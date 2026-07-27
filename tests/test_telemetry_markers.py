@@ -682,3 +682,32 @@ class TestAgenticDocumentUngroundedSuppressed:
         # line or the archive would double-count one of them.
         assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
         assert _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)["marker"] == "agentic_document_ungrounded_suppressed"
+
+
+# Gap-fill v1 analyzer death (metaculus_bot/research/targeted.py). The analyzer gates the whole
+# pass, so its failure zeroes the addendum and reads exactly like a question with no gaps —
+# and gap-fill has no ProviderResult to carry a `lost=` token, so this marker is the signal.
+GAP_FILL_ANALYZER_FAILED_LINE = (
+    PFX_WARN + "GAP_FILL_ANALYZER_FAILED: question=44912 error=APIError detail=404 model not found"
+)
+
+
+class TestGapFillAnalyzerFailed:
+    def test_fields(self):
+        rec = _parse_one(GAP_FILL_ANALYZER_FAILED_LINE)
+        assert rec["marker"] == "gap_fill_analyzer_failed"
+        assert rec["error"] == "APIError"
+        # detail holds the exception str, which contains spaces — it must capture to EOL.
+        assert rec["detail"] == "404 model not found"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GAP_FILL_ANALYZER_FAILED_LINE)
+        assert rec["qid"] == 44912
+        assert rec["qid_kind"] == "question_id"
+
+    def test_detail_is_optional(self):
+        # Keeps older lines (and any future terser form) parseable rather than dropped.
+        rec = _parse_one(PFX_WARN + "GAP_FILL_ANALYZER_FAILED: question=None error=TimeoutError")
+        assert rec["marker"] == "gap_fill_analyzer_failed"
+        assert rec["qid"] is None
+        assert rec["error"] == "TimeoutError"

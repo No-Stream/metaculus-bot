@@ -50,7 +50,9 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will Apple stock price exceed $200 by end of 2026?", mock_llm)
+        result, _error = await _classify_financial_question(
+            "Will Apple stock price exceed $200 by end of 2026?", mock_llm
+        )
 
         assert result is not None
         assert result["tickers"] == ["AAPL", "MSFT"]
@@ -63,7 +65,7 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will US unemployment rate exceed 5% in 2026?", mock_llm)
+        result, _error = await _classify_financial_question("Will US unemployment rate exceed 5% in 2026?", mock_llm)
 
         assert result is not None
         assert result["tickers"] == []
@@ -76,7 +78,7 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will the S&P 500 drop if the Fed raises rates?", mock_llm)
+        result, _error = await _classify_financial_question("Will the S&P 500 drop if the Fed raises rates?", mock_llm)
 
         assert result is not None
         assert result["tickers"] == ["^GSPC"]
@@ -89,20 +91,37 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
+        result, _error = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
 
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_llm_failure_returns_none(self) -> None:
+    async def test_llm_failure_returns_none_and_names_the_error(self) -> None:
         mock_llm = AsyncMock()
         mock_llm.invoke.side_effect = RuntimeError("LLM timeout")
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
+        result, error = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
         assert result is None
+        # A DEAD classifier and a non-financial question both return None. Without this
+        # second value the caller cannot tell them apart, so a model retirement (the
+        # 2026-05-15 grok 404 precedent), a schema change, or a quota reads as "no
+        # financial angle" forever.
+        assert error == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_non_financial_reports_no_error(self) -> None:
+        mock_llm = AsyncMock()
+        mock_llm.invoke.return_value = "FINANCIAL: NO\nTICKERS: NONE\nFRED_SERIES: NONE"
+
+        from metaculus_bot.research.financial_data import _classify_financial_question
+
+        result, error = await _classify_financial_question("Will it rain in London tomorrow?", mock_llm)
+
+        assert result is None
+        assert error is None, "a working classifier reading 'not financial' is not a failure"
 
     @pytest.mark.asyncio
     async def test_malformed_llm_response_returns_none(self) -> None:
@@ -111,7 +130,7 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
+        result, _error = await _classify_financial_question("Will Apple stock exceed $200?", mock_llm)
 
         assert result is None
 
@@ -123,7 +142,7 @@ class TestClassifyFinancialQuestion:
 
         from metaculus_bot.research.financial_data import _classify_financial_question
 
-        result = await _classify_financial_question("Will the economy improve?", mock_llm)
+        result, _error = await _classify_financial_question("Will the economy improve?", mock_llm)
 
         assert result is None
 
@@ -1098,6 +1117,40 @@ class TestBenchmarkingDateCeiling:
 
         assert result == ""
         mock_yf.Ticker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dead_classifier_records_a_loss_token_before_the_empty_early_return(self) -> None:
+        """A dead classifier must not look like "no financial angle" on the diagnostics line.
+
+        The classifier's ``except`` logs one WARNING and returns None; with no extracted
+        identifiers the provider then returns "" — and the per-identifier
+        ``record_provider_detail`` call lives AFTER that early return, so the failure used
+        to produce no diagnostics detail at all. That makes a model retirement, a schema
+        change, or a quota indistinguishable from a weather question.
+        """
+        from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
+
+        mock_llm = AsyncMock()
+        mock_llm.invoke.side_effect = RuntimeError("classifier model retired")
+
+        with (
+            patch("metaculus_bot.research.financial_data.build_llm_with_openrouter_fallback", return_value=mock_llm),
+            patch("metaculus_bot.research.financial_data.yfinance") as mock_yf,
+        ):
+            from metaculus_bot.research.financial_data import financial_data_provider
+
+            question = _make_q("Will it rain in London tomorrow?")
+            question.id_of_question = 4242
+            question.resolution_criteria = ""
+            question.fine_print = ""
+            provider = financial_data_provider()
+            result = await provider(question)
+
+        assert result == "", "no identifiers means no financial section, as before"
+        mock_yf.Ticker.assert_not_called()
+        sources = pop_provider_detail(4242, "financial_data")["sources"]
+        assert _is_lost_source(sources["classifier"]), f"a dead classifier must read as a LOST source; got {sources}"
+        assert "RuntimeError" in sources["classifier"]
 
     @pytest.mark.asyncio
     async def test_provider_default_is_live(self) -> None:
