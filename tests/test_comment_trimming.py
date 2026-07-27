@@ -28,6 +28,7 @@ from metaculus_bot.constants import (
     RESEARCH_SECTION_CHAR_LIMIT,
     SUMMARY_SECTION_CHAR_LIMIT,
 )
+from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
 # ---------------------------------------------------------------------------
@@ -295,6 +296,94 @@ def _build_sectioned_comment(
         f"{forecasts_body}\n"
         f"{trailing_markers}\n"
     )
+
+
+class TestSummarizerDisclosuresSurviveTrimming:
+    """Both halves of the summarizer-degradation disclosure must reach the reader.
+
+    Two trims act on the RESEARCH section with OPPOSITE polarity, and the two
+    disclosures sit at opposite ends of it, so before the pin each trim killed one:
+
+    * ``trim_section`` (research budget, ``preserve_header=True``) keeps header +
+      TAIL, discarding the ``⚠ RAW UNSCREENED ARTICLES`` banner that
+      ``_degraded_to_raw_articles`` PREPENDS to the AskNews body.
+    * ``trim_comment``'s ``research_first`` strategy keeps the FRONT of the research
+      body, discarding the APPENDED ``## Provider Diagnostics`` block — which is
+      where the ``summarizer:error(...)`` token lives.
+
+    Exposure is not hypothetical: 160 of 963 archived bundles already exceed the
+    research budget, and a summarizer soft-fail is itself what pushes a bundle over
+    (raw articles run longer than the briefing), so the banner was most likely
+    trimmed precisely on the questions where it fired. The durable machine-readable
+    record survives either way (the archive sink writes before any trimming, and the
+    per-source token has its own archive field); what was lost is the human-readable
+    disclosure on the published comment.
+    """
+
+    def test_banner_survives_an_overflowing_research_section(self) -> None:
+        # The banner sits INSIDE the body (the orchestrator prepends it to the AskNews
+        # provider's text, so an assembled bundle carries it after that provider's own
+        # header — not at the body's first byte), and the research trim keeps header +
+        # tail, so without the pin this is exactly the disclosure that gets dropped.
+        body = "\n".join(f"Article {i}: raw unscreened article text." for i in range(2_000))
+        section = "## Report 1 Research\n## News Articles (AskNews)\n" + SUMMARIZER_SOFT_FAIL_BANNER + f"\n\n{body}"
+        assert len(section) > RESEARCH_SECTION_CHAR_LIMIT, "precondition: section must overflow"
+
+        trimmed = trim_section(section, "report_1_research")
+
+        assert len(trimmed) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert "RAW UNSCREENED ARTICLES" in trimmed, "the degradation banner must survive the research trim"
+        assert TRIM_NOTICE in trimmed
+        # The pin must not cost the section its header or its leading '#'.
+        assert trimmed.lstrip().startswith("#")
+        assert "## Report 1 Research" in trimmed
+
+    def test_banner_pinned_even_when_it_leads_the_body(self) -> None:
+        # The other placement: banner at the body's first byte (a bundle whose only
+        # provider is AskNews, so no provider header precedes it).
+        body = "\n".join(f"Article {i}: raw unscreened article text." for i in range(2_000))
+        section = f"## Report 1 Research\n{SUMMARIZER_SOFT_FAIL_BANNER}\n\n{body}"
+        assert len(section) > RESEARCH_SECTION_CHAR_LIMIT, "precondition: section must overflow"
+
+        trimmed = trim_section(section, "report_1_research")
+
+        assert len(trimmed) <= RESEARCH_SECTION_CHAR_LIMIT
+        assert "RAW UNSCREENED ARTICLES" in trimmed
+        assert trimmed.lstrip().startswith("#")
+
+    def test_untrimmed_research_section_is_byte_identical(self) -> None:
+        # The pin is a trim-time repair, not a rewrite: a section within budget must
+        # pass through untouched whether or not it carries a banner.
+        section = f"## Report 1 Research\n{SUMMARIZER_SOFT_FAIL_BANNER}\n\nshort body"
+        assert trim_section(section, "report_1_research") == section
+
+    def test_diagnostics_block_survives_the_research_first_comment_trim(self) -> None:
+        # research_first keeps the FRONT of the research body, so the appended
+        # diagnostics block — and the summarizer:error token that names WHICH source
+        # was lost — is what gets dropped here.
+        diagnostics = (
+            "---\n\n## Provider Diagnostics\n\n"
+            "- asknews: ok | 41000 chars | 8000 ms | sources=0/1 | lost=summarizer:error(TimeoutError)"
+        )
+        research = f"{SUMMARIZER_SOFT_FAIL_BANNER}\n\n" + ("research_token " * 30_000) + f"\n\n{diagnostics}"
+        comment = _build_sectioned_comment(
+            summary_body="*Forecaster 1*: 5.0%",
+            research_body=research,
+            forecasts_body="## R1: Forecaster 1 Reasoning\nModel: openrouter/openai/gpt-5.6-sol\nbody",
+        )
+        assert len(comment) > COMMENT_CHAR_LIMIT, "precondition: comment must overflow"
+
+        trimmed = trim_comment(comment)
+
+        assert len(trimmed) <= COMMENT_CHAR_LIMIT
+        assert trimmed.lstrip().startswith("#")
+        assert "## Provider Diagnostics" in trimmed, "the diagnostics block must survive the comment trim"
+        assert "summarizer:error(TimeoutError)" in trimmed, (
+            "the per-source token naming the lost source must survive — it is the half of the "
+            "disclosure that says WHICH source degraded"
+        )
+        # The banner already survived this strategy; it must keep doing so.
+        assert "RAW UNSCREENED ARTICLES" in trimmed
 
 
 class TestResearchFirstTrim:
