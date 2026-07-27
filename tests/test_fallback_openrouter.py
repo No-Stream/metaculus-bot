@@ -1577,3 +1577,54 @@ class TestProbeFailureCannotVetoRouting:
         secondary.assert_awaited_once()
         assert fallback_openrouter.get_generic_key_fallback_count() == 1
         assert fallback_openrouter.get_credit_key_fallback_count() == 0
+
+
+class TestStatuslessDigitEchoIsNotAStatus:
+    """A statusless failure must not read OUR OWN prompt's digits as an HTTP status.
+
+    ``4a1dd1f`` closed this for the credit cues but left ``_is_status``'s digit fallback
+    reading the untruncated message, so the same hole stayed open at every other status.
+    forecasting-tools' empty-completion guard raises
+    ``RuntimeError("LLM answer is an empty string. ... and the prompt was: <up to 2000 chars>")``,
+    and a question about a bill numbered 429 or 401 then routed to the operator's paid key
+    for a call that returns empty again. Frequency in the 989-bundle research archive:
+    "429" in 10.2% of prompts, "401" in 13.8% — the same order as the 13.0% for "402" that
+    justified the original truncation.
+    """
+
+    _ZERO_OUTPUT = "LLM answer is an empty string. The model was openrouter/openai/gpt-5.6-sol and the prompt was: {q}"
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Will S.429 (the Fentanyl Act) become law before 2027?",
+            "Will H.R.401 pass the Senate before 2027?",
+            "Will the 403 Forbidden error rate exceed 1% next quarter?",
+            "Will the 502 bus route be extended before 2027?",
+        ],
+    )
+    def test_prompt_echoed_status_digits_do_not_trigger_a_key_swap(self, question: str) -> None:
+        exc = RuntimeError(self._ZERO_OUTPUT.format(q=question))
+        assert should_retry_with_general_key(exc) is False, question
+        assert is_credit_caused_error(exc) is False, question
+
+    @pytest.mark.parametrize(
+        ("message", "falls_back"),
+        [
+            ("401 unauthorized", True),
+            ("429 too many requests", True),
+            ("403 forbidden", False),
+            ("502 bad gateway", False),
+        ],
+    )
+    def test_plain_status_strings_survive_echo_stripping(self, message: str, falls_back: bool) -> None:
+        """The carve-out this fix removed was unnecessary, and this pins why.
+
+        ``_without_prompt_echo`` cuts only at an echo marker. These strings carry none, so
+        they pass through byte-identical and the statusless callers that predate the
+        prompt-echo work classify exactly as they always have — including the two that
+        correctly do NOT swap keys: a bare 403 is a moderation refusal both keys would
+        repeat, and a 502 is an upstream outage that is not key-scoped.
+        """
+        assert fallback_openrouter._without_prompt_echo(message) == message
+        assert should_retry_with_general_key(Exception(message)) is falls_back, message

@@ -340,12 +340,24 @@ def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> b
     coincidences as statuses in both directions — a stray "429" sends a moderation 403
     to the paid key for a call that will refuse again.
 
-    With no status reported, fall back to the substring so plain
-    ``Exception("401 Unauthorized")`` callers classify exactly as they always have.
+    With no status reported, fall back to the substring — but on the ECHO-STRIPPED
+    message, not the raw one. Without that, the digit fallback reopened at every status
+    the exact hole the prompt-echo truncation closed for the credit cues: a
+    forecasting-tools empty-completion ``RuntimeError`` replays up to 2000 characters of
+    our prompt, so a question about "S.429 (the Fentanyl Act)" or a bill numbered 401 read
+    as a rate limit or a bad credential and billed the paid key for a call that would
+    return empty again. Measured against the 989-bundle research archive: "429" appears in
+    10.2% of our own prompts and "401" in 13.8%, comparable to the 13.0% for "402" that
+    motivated the original truncation.
+
+    Truncating here costs the plain-``Exception`` callers nothing, which is why the earlier
+    carve-out was unnecessary: ``_without_prompt_echo`` only cuts at an echo marker, and
+    strings like "401 unauthorized" or "429 too many requests" carry none, so they pass
+    through byte-identical (pinned in ``test_plain_status_strings_survive_echo_stripping``).
     """
     if reported_status is not None:
         return reported_status == code
-    return str(code) in lowercased_msg
+    return str(code) in _without_prompt_echo(lowercased_msg)
 
 
 def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
