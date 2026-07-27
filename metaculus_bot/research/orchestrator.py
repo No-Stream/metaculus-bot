@@ -215,10 +215,10 @@ class ResearchOrchestrator:
 
             # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
             # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
-            # is max(v1, v2), not the sum — v2's 540s deadline fits inside v1's
-            # worst-case envelope only under this parallelism). Consequence: the
-            # v2 driver's brief sees the bundle WITHOUT v1's addendum. v2's
-            # section appends after v1's.
+            # is max(v1, v2), not the sum — v2's GAP_FILL_V2_WALL_DEADLINE fits
+            # inside v1's worst-case envelope only under this parallelism).
+            # Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
+            # addendum. v2's section appends after v1's.
             gap_fill_v1_active = (
                 env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
             )
@@ -405,11 +405,12 @@ class ResearchOrchestrator:
             research=research,
         )
         try:
-            # Broad, 30s-gated retry (SUMMARIZER_LLM is allowed_tries=1 in
-            # llm_configs.py): recovers a fast blip / empty-response while obeying
-            # the universal "no retry after 30s" deadline rule. Adds the wall-clock
-            # cap this call previously lacked. A slow/permanent failure still
-            # propagates to the soft-fail below (raw AskNews articles).
+            # Broad retry under the TRANSIENT_RETRY_MAX_ELAPSED_S elapsed gate
+            # (SUMMARIZER_LLM is allowed_tries=1 in llm_configs.py): recovers a fast
+            # blip / empty-response while obeying the universal "don't retry a slow
+            # failure" deadline rule. Adds the wall-clock cap this call previously
+            # lacked. A slow/permanent failure still propagates to the soft-fail
+            # below (raw AskNews articles).
             summary = await invoke_with_broad_retry(
                 lambda: self._summarizer_llm.invoke(prompt),
                 wall_timeout=SUMMARIZER_WALL_TIMEOUT,

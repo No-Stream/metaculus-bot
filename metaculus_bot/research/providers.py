@@ -403,8 +403,10 @@ def build_native_search_llm(
         # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
         # 2026-05-20 incident) won't be cured by retrying the same call, and
         # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
-        # bounding the budget. With allowed_tries=1 + wait_for(420s), worst
-        # case is ~7 min instead of timeout(360s) * default_tries(3) ~18 min.
+        # bounding the budget. With allowed_tries=1 the worst case is one
+        # NATIVE_SEARCH_WALL_TIMEOUT window instead of forecasting-tools'
+        # default ``allowed_tries`` multiplied by NATIVE_SEARCH_TIMEOUT (which
+        # resets per HTTP request).
         allowed_tries=1,
         plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
@@ -557,7 +559,7 @@ def choose_provider_with_name(
 
 
 # OpenAI native search tags every citation URL with `?utm_source=openai`; it is
-# pure tracking noise fanned into 6 forecaster prompts + the published comment.
+# pure tracking noise fanned into every forecaster prompt + the published comment.
 # Match the param wherever it sits in the query string, capturing the leading
 # separator and an optional trailing `&` so removal keeps the query well-formed.
 _UTM_SOURCE_OPENAI_RE = re.compile(r"([?&])utm_source=openai\b(&)?")

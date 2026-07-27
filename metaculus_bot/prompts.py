@@ -9,9 +9,33 @@ from forecasting_tools import (
     clean_indents,
 )
 
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
 from metaculus_bot.numeric.utils import nominal_bounds
 from metaculus_bot.time_utils import _as_utc
+
+# Width of a rendered percentile label at minimum: "0." plus two decimals, so P10
+# reads "0.10" rather than "0.1".
+_PERCENTILE_LABEL_MIN_WIDTH = 4
+
+
+def _percentile_label(percentile: float) -> str:
+    """Render one percentile as the decimal label the numeric prompts enumerate.
+
+    Yields "0.01" / "0.025" / "0.10": trailing zeros trimmed, then padded back to
+    ``_PERCENTILE_LABEL_MIN_WIDTH``. Distinct from
+    ``numeric.config.STANDARD_PERCENTILES_CSV``, which renders the same set on the
+    percent scale ("1,2.5,...") for validation-error text — the prompts need the
+    decimal scale because these labels ARE the ``declared_percentiles`` JSON keys.
+    """
+    return f"{percentile:.10f}".rstrip("0").ljust(_PERCENTILE_LABEL_MIN_WIDTH, "0")
+
+
+# The canonical percentile set as the prompts enumerate it. Derived from
+# STANDARD_PERCENTILES so a change to the set can never leave a prompt asking
+# forecasters for percentiles the pipeline rejects.
+_STANDARD_PERCENTILES_DECIMAL_CSV = ", ".join(_percentile_label(p) for p in STANDARD_PERCENTILES)
+_LOWEST_PERCENTILE_LABEL = _percentile_label(STANDARD_PERCENTILES[0])
+_HIGHEST_PERCENTILE_LABEL = _percentile_label(STANDARD_PERCENTILES[-1])
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
@@ -997,9 +1021,8 @@ def numeric_prompt(
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
-        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
-        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
 
         ```json
         {{
@@ -1014,9 +1037,8 @@ def numeric_prompt(
 
         Notes:
         - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
-          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
-          salvaged.
+          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
+          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
@@ -1258,7 +1280,9 @@ def stacking_numeric_prompt(
         ── Units & Bounds ─────────────────────────────────────
         • Base unit for output values: {question.unit_of_measure or "base unit"}
         • Displayed range (base units): [{nom_lower}, {nom_upper}]
-        • All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
+        • All {
+            EXPECTED_PERCENTILE_COUNT
+        } percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──
@@ -1275,8 +1299,9 @@ def stacking_numeric_prompt(
         ── Multiple Expert Analyses ──
         Each base-model analysis above carries its final forecast inside a fenced
         ```json STRUCTURED FORECAST block at its tail (field `declared_percentiles`,
-        an object keyed by the 13 standard percentiles as decimals from 0.01 through
-        0.99, with values in the base unit; plus `outcome_type`). Read those blocks
+        an object keyed by the {EXPECTED_PERCENTILE_COUNT} standard percentiles as decimals from {
+            _LOWEST_PERCENTILE_LABEL
+        } through {_HIGHEST_PERCENTILE_LABEL}, with values in the base unit; plus `outcome_type`). Read those blocks
         to get each model's declared distribution, and read the surrounding reasoning
         to weight the analysis.
         {predictions_text}
@@ -1321,9 +1346,8 @@ def stacking_numeric_prompt(
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-        Schema (`declared_percentiles` is REQUIRED and MUST contain all 13 standard
-        percentiles — 0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90,
-        0.95, 0.975, 0.99; `outcome_type` is REQUIRED):
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
 
         ```json
         {{
@@ -1338,9 +1362,8 @@ def stacking_numeric_prompt(
 
         Notes:
         - The `declared_percentiles` block is the ONLY source of your forecast — it
-          MUST contain all 13 standard percentiles (0.01, 0.025, 0.05, 0.10, 0.20,
-          0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99); a partial set cannot be
-          salvaged.
+          MUST contain all {EXPECTED_PERCENTILE_COUNT} standard percentiles
+          ({_STANDARD_PERCENTILES_DECIMAL_CSV}); a partial set cannot be salvaged.
         - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
           equal); floating-point numbers in the base unit; no scientific notation.
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a

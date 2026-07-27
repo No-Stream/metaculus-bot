@@ -72,8 +72,9 @@ QuestionTypeStr = Literal["binary", "numeric", "multiple_choice"]
 # block is prompted to be the LAST output, so a lost fence still leaves the
 # payload within the final few KB.
 _TAIL_SCAN_CHARS = 4000
-# Float tolerance when matching parsed percentile keys against the canonical
-# 13-set (guards against 0.1 vs 0.10000000001 drift from JSON round-trips).
+# Float tolerance when matching parsed percentile keys against
+# ``STANDARD_PERCENTILES`` (guards against 0.1 vs 0.10000000001 drift from JSON
+# round-trips).
 _PERCENTILE_KEY_TOLERANCE = 1e-6
 
 
@@ -144,9 +145,10 @@ def _try_candidate(
                 return _DeterministicHit(value=validate(convert_block(strict)), rung="block")
             except (ValueError, TypeError) as exc:
                 # Schema-valid but unusable — e.g. a numeric block carrying only
-                # the three percentiles the schema demands, not the 13 the
-                # pipeline needs. json_repair cannot change already-valid JSON,
-                # so this candidate is spent and the caller falls back.
+                # ``_REQUIRED_NUMERIC_PERCENTILES`` (the schema's floor), not the
+                # full ``STANDARD_PERCENTILES`` set the pipeline needs.
+                # json_repair cannot change already-valid JSON, so this
+                # candidate is spent and the caller falls back.
                 failures.append(f"block: {label}: {exc}")
                 return None
 
@@ -334,7 +336,7 @@ def _numeric_from_block(block: StructuredBlock) -> list[Percentile]:
 
 
 def _validate_numeric(percentiles: list[Percentile]) -> list[Percentile]:
-    """Require ALL 13 standard percentiles; return exactly the canonical 13, never padded."""
+    """Require every ``STANDARD_PERCENTILES`` entry; return exactly that set, never padded."""
     matched: dict[float, Percentile] = {}
     for standard in STANDARD_PERCENTILES:
         for p in percentiles:
@@ -357,7 +359,7 @@ async def extract_numeric(
     question_id: int | None = None,
     model_name: str = "",
 ) -> ExtractionOutcome[list[Percentile]]:
-    """Extract the 13 standard percentiles (caller feeds them to ``sanitize_percentiles``).
+    """Extract the ``STANDARD_PERCENTILES`` set (caller feeds it to ``sanitize_percentiles``).
 
     ``prompt_notes`` should be ``build_parse_notes(question)`` so the rung-3
     parser keeps today's bound-aware extraction instructions.
