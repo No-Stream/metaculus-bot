@@ -20,17 +20,38 @@
         <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/run_sync.sh</string>
     </array>
 
-    <!-- Weekly: Sundays at 03:00 local. launchd runs a missed job at next wake,
-         so this is laptop-friendly (no need for the Mac to be awake at 03:00). -->
+    <!-- TWO wakes a week (Sun + Wed 03:00 local), not one. launchd runs a job missed
+         while asleep at the next wake, which is exactly when Wi-Fi has not
+         re-associated — every scheduled run from 2026-06-28 to 2026-07-26 died on that
+         race. run_sync.sh now waits up to 5 min for the network, and this second wake
+         is the backstop for the case it still can't get online: a bad wake then costs
+         half a week rather than the whole one. Both wakes are idempotent (every archive
+         build is replace-by-run), so the extra run is free apart from GitHub API reads. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key>
-        <integer>0</integer>
-        <key>Hour</key>
-        <integer>3</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>0</integer>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Don't let launchd relaunch the job in a tight loop after a non-zero exit (which
+         run_sync.sh now returns on failure — see report_failure). 1 hour is long enough
+         that a transient network outage gets a genuine retry without hammering. -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
 
     <!-- launchd's own stdout/stderr for the job (separate from run_sync.sh's dated
          logfiles). Useful for diagnosing a job that never starts. -->
