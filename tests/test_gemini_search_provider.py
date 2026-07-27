@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.genai import types as genai_types
 
+from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
+
 
 def _make_q(text: str) -> MagicMock:
     """Build a minimal MetaculusQuestion-shaped mock for the new ResearchCallable
@@ -486,18 +488,51 @@ async def test_zero_grounding_chunks_suppresses_ungrounded_text(
     assert "queries=30" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_ungrounded_suppression_records_a_provider_loss_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suppression must be visible where degradation is read, not only in the WARN.
+
+    Suppressing correctly still costs the whole Google research leg, and the loss used to
+    be invisible in all three places the diagnostics convention teaches you to look: no
+    counter moves (the provider didn't raise, so ``provider_failure_count`` stays 0 and
+    ``alertable_count`` stays flat), no ``record_provider_detail`` call, and the resulting
+    ``""`` maps to ProviderResult status ``empty`` — byte-identical to a healthy Gemini
+    call that legitimately found nothing. If grounding degrades persistently (AI Studio
+    prepaid exhaustion, an SDK contract shift), every forecast in the season loses the
+    Google leg behind a normal-looking diagnostics line. So the suppression now records a
+    per-source loss token, mirroring ``_degraded_to_raw_articles`` for the summarizer.
+    """
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    response = _make_response("Ungrounded prose.", chunks=None, supports=None, web_search_queries=["q"])
+    fake_client = _make_client_with_response(response)
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import invoke_gemini_grounded
+
+        out = await invoke_gemini_grounded("prompt", qid=38195)
+
+    assert out == ""
+    detail = pop_provider_detail(38195, "gemini_search")
+    token = detail["sources"]["grounding"]
+    # _is_lost_source treats anything not starting with "ok"/"none" as a loss, which is
+    # what renders the `lost=grounding:...` segment on the diagnostics line and in the
+    # schema-v2 archive.
+    assert _is_lost_source(token), f"the recorded token must read as a LOST source; got {token!r}"
+    assert "ungrounded" in token
+
+
 # ---------------------------------------------------------------------------
-# url_context telemetry: _extract_url_context_telemetry
+# url_context telemetry: extract_url_context_telemetry
 # ---------------------------------------------------------------------------
 
 
 def test_url_context_telemetry_empty_when_metadata_absent() -> None:
     """No candidates / no url_context_metadata yield reported=False; an empty url_metadata list
     yields reported=True (the tool fired but fetched nothing). All cases give zero counts + empty list."""
-    from metaculus_bot.research.gemini_search import _extract_url_context_telemetry
+    from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
     def extract(response: object) -> tuple[bool, int, int, list[tuple[str, str]]]:
-        return _extract_url_context_telemetry(cast(genai_types.GenerateContentResponse, response))
+        return extract_url_context_telemetry(cast(genai_types.GenerateContentResponse, response))
 
     # No url_context signal at all → reported=False.
     assert extract(SimpleNamespace(text="x", candidates=[])) == (False, 0, 0, [])
@@ -514,7 +549,7 @@ def test_url_context_telemetry_parses_success_and_error() -> None:
     Proves both counts and the (status_name, url) list, and that the status is coerced
     defensively whether it arrives as an enum-with-.name or a plain string.
     """
-    from metaculus_bot.research.gemini_search import _extract_url_context_telemetry
+    from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
     url_metadata = [
         CannedUrlMeta(
@@ -528,7 +563,7 @@ def test_url_context_telemetry_parses_success_and_error() -> None:
     ]
     response = cast(genai_types.GenerateContentResponse, _make_response("body", url_metadata=url_metadata))
 
-    reported, n_total, n_success, entries = _extract_url_context_telemetry(response)
+    reported, n_total, n_success, entries = extract_url_context_telemetry(response)
 
     assert reported is True
     assert n_total == 2
@@ -545,7 +580,7 @@ def test_url_context_telemetry_coerces_none_valued_fields() -> None:
     as Optional (extra='forbid'), so a None-valued entry is the genuine degenerate case the SDK can
     emit; it is counted, not silently skipped.
     """
-    from metaculus_bot.research.gemini_search import _extract_url_context_telemetry
+    from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
     degenerate = genai_types.UrlMetadata(retrieved_url=None, url_retrieval_status=None)
     good = CannedUrlMeta(
@@ -554,7 +589,7 @@ def test_url_context_telemetry_coerces_none_valued_fields() -> None:
     )
     response = cast(genai_types.GenerateContentResponse, _make_response("body", url_metadata=[degenerate, good]))
 
-    reported, n_total, n_success, entries = _extract_url_context_telemetry(response)
+    reported, n_total, n_success, entries = extract_url_context_telemetry(response)
 
     assert reported is True
     assert n_total == 2

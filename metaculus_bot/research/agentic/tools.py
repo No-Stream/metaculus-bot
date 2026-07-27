@@ -30,6 +30,7 @@ from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS, MAX_REDIRECTS, REDIRECT_STATUSES, read_body_capped
+from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -874,7 +875,15 @@ def _build_document_prompt(ask: str) -> str:
     )
 
 
-def _run_document_read_sync(url: str, ask: str) -> str:
+def _run_document_read_sync(url: str, ask: str) -> tuple[str, int]:
+    """Read ``url`` via Gemini url_context. Returns ``(text, n_url_retrievals_that_succeeded)``.
+
+    The retrieval count is returned, not discarded, because the text alone cannot tell a
+    real document read from a fluent answer out of parametric memory — Gemini produces
+    both happily, and ``read_document`` grants the highest verification tier the artifact
+    renderer has. Same reader the grounded-search provider uses for the same reason (see
+    ``research/url_context_telemetry``).
+    """
     from google import genai  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
     from google.genai import types as genai_types  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
@@ -893,7 +902,8 @@ def _run_document_read_sync(url: str, ask: str) -> str:
         contents=f"{_build_document_prompt(ask)}\n\nURL: {url}",
         config=config,
     )
-    return _stringify(getattr(response, "text", "")) or ""
+    _, _, n_url_success, _ = extract_url_context_telemetry(response)
+    return (_stringify(getattr(response, "text", "")) or "", n_url_success)
 
 
 async def search_news(query: str) -> ToolOutcome:
@@ -960,16 +970,39 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
 
 
 async def read_document(url: str, ask: str) -> ToolOutcome:
+    """Read a document via Gemini url_context, granting the ``fetched`` tier only on a real read.
+
+    ``method="document"`` maps to the ``fetched`` tier (``loop._METHOD_TO_TIER``), which is
+    the highest authority the artifact renderer has: only a ``fetched`` discrepancy enters
+    the SUPERSEDE block that tells every forecaster to override the briefing. So a
+    fluent-but-ungrounded answer here is the Q38195 failure mode with a bigger blast
+    radius, and the quote check can't catch it — it is deliberately WARN-only for this
+    tool (paraphrase and ellipsis-joined quotes make a hard gate too false-positive-prone).
+
+    Hence the retrieval-count guard below, mirroring the grounded-chunk floor
+    ``gemini_search`` already applies: zero successful url_context retrievals withholds the
+    tier exactly like the empty-text guard does, rather than laundering parametric recall
+    as a primary-source read.
+    """
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
     try:
-        text = await asyncio.wait_for(
+        text, n_url_success = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask), timeout=_READ_DOCUMENT_TIMEOUT_S
         )
     except asyncio.TimeoutError:
         return _format_fetch_error("Document read timed out.", method="document")
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")
+    if n_url_success == 0:
+        # Greppable, mirroring gemini_search's GEMINI_UNGROUNDED_SUPPRESSED so the rate is
+        # measurable from the archived run logs.
+        logger.warning(f"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url={url}")
+        return _format_fetch_error(
+            f"Document read retrieved no URL content: Gemini's url_context tool fetched nothing from {url}, "
+            "so any answer would be unsourced recall rather than a read of the document.",
+            method="document",
+        )
     return ToolOutcome(content_markdown=text, method="document")
 
 

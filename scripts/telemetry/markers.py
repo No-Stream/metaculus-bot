@@ -294,6 +294,17 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
     ),
     MarkerSpec(
+        "agentic_document_ungrounded_suppressed",
+        # The read_document twin of the marker above (research/agentic/tools.py
+        # read_document): Gemini's url_context tool retrieved nothing, so the answer would
+        # be unsourced recall and the "fetched" verification tier is withheld. Worth
+        # measuring separately because a "fetched" document discrepancy is the only kind
+        # that enters the artifact's SUPERSEDE block, i.e. the one that tells every
+        # forecaster to override the briefing. Carries no question id — read_document is a
+        # per-URL tool with no question in scope — so the URL is the only field.
+        re.compile(r"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)"),
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"

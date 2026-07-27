@@ -661,3 +661,24 @@ class TestGeminiUngroundedSuppressed:
         rec = _parse_one(PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=None model=gemini-3.5-flash queries=0")
         assert rec["qid"] is None
         assert rec["queries"] == 0
+
+
+# read_document's twin of the WARN above (metaculus_bot/research/agentic/tools.py): Gemini's
+# url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
+# parametric-recall answer the authority to supersede the briefing for every forecaster.
+AGENTIC_DOCUMENT_UNGROUNDED_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf"
+)
+
+
+class TestAgenticDocumentUngroundedSuppressed:
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)
+        assert rec["marker"] == "agentic_document_ungrounded_suppressed"
+        assert rec["url"] == "https://example.com/filing.pdf"
+
+    def test_does_not_collide_with_the_gemini_search_marker(self):
+        # Both markers end in UNGROUNDED_SUPPRESSED; each spec must claim only its own
+        # line or the archive would double-count one of them.
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+        assert _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)["marker"] == "agentic_document_ungrounded_suppressed"
