@@ -57,10 +57,11 @@ Gemini has two separate routes, which is the other easy thing to confuse:
 
 - **OpenRouter Gemini** (forecaster / stacker / summarizer slots) routes
   donated-key-first with personal-key fallback, controlled by
-  `GEMINI_USE_DONATED_OPENROUTER_KEY` (default `true`). One model,
-  `gemini-3.1-pro-preview`, is pinned to the personal key via a blocklist in
-  `fallback_openrouter.py` (no donated attempt), so a credit error on a Pro call
-  is always a personal-key issue.
+  `GEMINI_USE_DONATED_OPENROUTER_KEY` (default `true`). The Gemini Pro
+  forecaster slot is pinned to the personal key by the
+  `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist in `fallback_openrouter.py` (no
+  donated attempt), so a credit error on a Pro call is always a personal-key
+  issue.
 - **Gemini grounded search** (`research/gemini_search.py`) always uses the
   personal `GOOGLE_API_KEY`. The donated toggle does not touch it.
 
@@ -103,7 +104,7 @@ CI.
 
 | Flag | Code default | Prod value | What it gates |
 |---|---|---|---|
-| `NATIVE_SEARCH_ENABLED` | off | `true` | OpenAI native web search (`gpt-5.6-terra`, low effort, via OpenRouter) running in parallel with the primary provider |
+| `NATIVE_SEARCH_ENABLED` | off | `true` | OpenAI native web search via OpenRouter (model and reasoning effort from `NATIVE_SEARCH_DEFAULT_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT`), running in parallel with the primary provider |
 | `GEMINI_SEARCH_ENABLED` | off | `true` | First-party Google grounded search via the `google-genai` SDK |
 | `FINANCIAL_DATA_ENABLED` | off | `true` | yfinance + FRED data for questions an LLM classifier tags as financial |
 | `PREDICTION_MARKETS_ENABLED` | off | `true` | Polymarket / Kalshi / Manifold / PredictIt snapshot (suppressed under `is_benchmarking=True`) |
@@ -153,15 +154,15 @@ CRPS and is no better than median on binary.
 | `PERSIST_RESEARCH_ENABLED` | off | `true` (prod runs; off in test_bot) | Writes per-question research to JSONL for offline backtest replay |
 | `PLATT_CALIBRATION_ENABLED` | off | unset | Post-hoc logistic recalibration of the final published probability |
 | `GEMINI_USE_DONATED_OPENROUTER_KEY` | on | `true` | Route OpenRouter Gemini calls through the donated key with personal fallback |
-| `OPENROUTER_CREDIT_FLOOR_USD` | `1.0` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
+| `OPENROUTER_CREDIT_FLOOR_USD` | see `constants.py` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
 | `OPENROUTER_CREDIT_ALERT_RESUME_DATE` | `2026-09-10` | unset (uses default) | Date the credit alerts start reddening CI again; before it, credit shortfalls log but exit zero |
 
 ## GitHub Actions workflows
 
 Four workflows live in `.github/workflows/`. All four share the same setup
 (checkout, `uv sync --no-dev --frozen`, install Playwright Chromium for gap-fill
-v2's rendered-fetch rung), the same env block, and a 300-minute job timeout that
-is a backstop for a wedged run, not a normal duration. Each tees stdout and
+v2's rendered-fetch rung), the same env block, and a `timeout-minutes` job cap
+that is a backstop for a wedged run, not a normal duration. Each tees stdout and
 stderr to a `run_logs/` file and uploads it as an artifact with 90-day
 retention.
 
@@ -224,8 +225,8 @@ stderr), so per-run spend is durably grep-able:
 - `CREDIT_BALANCE: key=<donated|personal> phase=<start|end> remaining=... usage=...`
 - `CREDIT_SPEND: key=... run_delta_usd=... remaining=...` at end of run.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
-  key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD` (default $1,
-  `constants.py`).
+  key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
+  (`constants.py`).
 
 A floor breach does not abort the run. Forecasting and publishing complete
 normally, and outside the suppression window below `cli.py` then exits non-zero
@@ -261,8 +262,9 @@ CI. Two paths are gated, because either one alone would keep the check red:
 Non-credit fallback causes still alert in full, since each means real breakage
 rather than an empty wallet: 401 invalid or disabled key, 404 "no allowed
 providers", 429 rate limit, and the guardrail / data-policy block. Bot-side
-degradation (forecaster drops, stacker fallbacks, research timeouts) is
-untouched by the suppression.
+degradation is untouched by the suppression too: every counter in the
+`Degradation counters:` summary still alerts in full (they are enumerated under
+"Reading run logs" below).
 
 ### What a dry donated key actually returns (and the drained-vs-revoked probe)
 
@@ -426,9 +428,9 @@ it is not subject to the cost gate.
 uv run python -m metaculus_bot.performance_analysis --tournament <slug> --output <path>
 ```
 
-The `--tournament` default is `spring-aib-2026`, so pass the current slug
-explicitly. Pass `--cached <path>` to re-analyze a saved dataset without
-re-fetching.
+The `--tournament` default is `DEFAULT_TOURNAMENT` (`performance_analysis/cli.py`)
+and lags the live season, so pass the current slug explicitly. Pass
+`--cached <path>` to re-analyze a saved dataset without re-fetching.
 
 The width monitor (`performance_analysis/width_monitor.py`) tracks how wide the
 published numeric distributions are and how well that width is calibrated, split
@@ -466,10 +468,10 @@ artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
   structured block). Emitted by `_log_extraction` in `value_extraction.py`.
 - `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
-  forecaster piled 10%+ of its mass on the terminal displayed bin of an
-  open-bound numeric question without declaring any percentile beyond the edge.
-  `numeric/diagnostics.py`, threshold `OPEN_BOUND_PILING_THRESHOLD` in
-  `numeric/config.py`.
+  forecaster put enough mass on the terminal displayed bin of an open-bound
+  numeric question, without declaring any percentile beyond the edge, to trip
+  `OPEN_BOUND_PILING_THRESHOLD` (`numeric/config.py`). Emitted by
+  `numeric/diagnostics.py`.
 - `GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=...
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
   wall_s=... findings=... pending_leads=... lint_rejections=...` — one summary
@@ -480,11 +482,24 @@ artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
   described above. `CREDIT_FLOOR_BREACH` keeps firing during the credit-alert
   suppression window, so seeing one on a green run is expected until 2026-09-10;
   the adjacent INFO line names the resume date.
+- `Degradation counters: forecasters_dropped=..., questions_failed_to_publish=...,
+  stacker_primary_failed=..., stacker_fallback_used=...,
+  stacker_fallback_failed=..., research_provider_failures=...,
+  summarizer_failures=..., gap_fill_v2_errors=...,
+  prediction_market_degraded=..., prediction_market_source_losses=...` — the
+  end-of-run summary from `forecaster.py`'s `forecast_questions`, and the line
+  that decides CI color: these are exactly the counters `alertable_count` sums, so
+  any one of them non-zero exits the run non-zero.
+  `research_provider_failures` counts any provider exception, not only timeouts —
+  it was named `research_provider_timeouts` until 2026-07-26, when
+  `prediction_market_platform_failures` also became
+  `prediction_market_source_losses`. `scripts/telemetry/markers.py` matches both
+  spellings, so archived pre-rename logs still harvest.
 
-A run can also exit non-zero for degradation alerts (forecaster drops, personal-
-key fallbacks, model deprecations) even when every question that met the
-minimum-forecaster threshold was published. The non-zero exit is the CI red-check
-signal to investigate; it does not mean publishing failed. Credit-caused
-shortfalls are exempt until 2026-09-10 (see the suppression section above); every
-other cause still alerts. See the alert block near the end of `cli.py` for the
-exact conditions.
+A run can also exit non-zero for degradation alerts — the counters above,
+personal-key fallbacks, or the model-deprecation tripwire — even when every
+question that met the minimum-forecaster threshold was published. The non-zero
+exit is the CI red-check signal to investigate; it does not mean publishing
+failed. Credit-caused shortfalls are exempt until 2026-09-10 (see the suppression
+section above); every other cause still alerts. See the alert block near the end
+of `cli.py` for the exact conditions.
