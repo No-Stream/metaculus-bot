@@ -15,6 +15,8 @@ from pathlib import Path
 
 import requests
 
+from metaculus_bot.api_preflight import verify_metaculus_api_identity
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.backfill_research_from_logs import detect_gap_fill, detect_providers  # noqa: E402
 
@@ -174,6 +176,10 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
     token = get_token()
+
+    # Confirm www.metaculus.com is the real API before sending the token
+    # (DNS-parking incident — see metaculus_bot/api_preflight.py).
+    verify_metaculus_api_identity()
 
     logger.info("Fetching bot comments from Metaculus API...")
     comments = fetch_all_comments(token)

@@ -128,6 +128,10 @@ def _cli_main_test_mode(
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates"),
+            # The API identity preflight makes a real unauthenticated GET to
+            # metaculus.com; stub it so these exit-status/telemetry tests stay
+            # hermetic (its own behavior is covered in test_api_preflight.py).
+            patch("metaculus_bot.cli.verify_metaculus_api_identity"),
             # Patch log_report_summary: a classmethod on TemplateForecaster that
             # iterates forecast_reports. Our stub returns []; patch the method
             # anyway to keep the test surface small.
