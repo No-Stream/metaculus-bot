@@ -84,18 +84,22 @@ AskNews is the one provider that returns raw article text rather than
 LLM-written prose, so it has two distinct stages: fetch, then summarize.
 
 **Fetch** (`_asknews_provider`, `research/providers.py`) runs two phases
-against the AskNews SDK:
+against the AskNews SDK, asking HISTORICAL for a larger article budget than HOT:
 
-- **Phase 1 — HOT:** `strategy="latest news"`, 6 articles.
-- **Phase 2 — HISTORICAL:** `strategy="news knowledge"`, 10 articles.
+- **Phase 1 — HOT:** `strategy="latest news"`.
+- **Phase 2 — HISTORICAL:** `strategy="news knowledge"`.
 
-Both phases share a retry budget (`ASKNEWS_MAX_TRIES = 3`) that only retries on
+Both phases share a retry budget (`ASKNEWS_MAX_TRIES`) that only retries on
 known-transient rate/concurrency errors (429, "rate limit", "concurrency
 limit"); anything else raises immediately. A process-wide semaphore
-(`ASKNEWS_MAX_CONCURRENCY = 1`) and an RPS gate (`ASKNEWS_MAX_RPS = 0.8`)
-throttle calls, plus fixed ~10s waits before each phase, because the API
-rate-limits aggressively even when we stay under our own limits. A hard
-wall-clock timeout (`ASKNEWS_WALL_TIMEOUT = 300s`) backstops a network hang so a
+(`ASKNEWS_MAX_CONCURRENCY`) and an RPS gate (`ASKNEWS_MAX_RPS`) throttle calls,
+plus a fixed wait before each phase (`WAIT_FOR_HOT_SEC` /
+`WAIT_FOR_HISTORICAL_SEC`, function-local in `_asknews_provider`), because the
+API rate-limits aggressively even when we stay under our own limits. All three
+throttles take env overrides, and the shipped `.env.template` deliberately sets a
+*lower* RPS than the `constants.py` default — the constant is the ceiling, not the
+operating point, so the two disagreeing is expected rather than a drift bug. A
+hard wall-clock timeout (`ASKNEWS_WALL_TIMEOUT`) backstops a network hang so a
 stuck AskNews call can't hold the whole phase hostage.
 
 The two article lists are formatted into two labeled sections — "Historical
@@ -114,10 +118,12 @@ a bad briefing to fetch-vs-summarize without paying for a fresh AskNews pull.
 Raw AskNews articles are compressed into an analyst briefing by an LLM before any
 forecaster sees them (`_summarize_asknews`, `research/orchestrator.py`). The
 summarizer model is a low-effort utility slot defined in `llm_configs.py`
-(`SUMMARIZER_LLM`); it runs at `allowed_tries=1` and is wrapped in a 30s-gated
-broad retry with a wall cap (`SUMMARIZER_WALL_TIMEOUT = 300s`). If the summarizer
-hits a transient LLM error or returns blank, the orchestrator soft-fails to the
-**raw** articles rather than dropping the news entirely. A non-transient error
+(`SUMMARIZER_LLM`); it runs at `allowed_tries=1` and is wrapped in an
+elapsed-gated broad retry (`invoke_with_broad_retry`, whose gate is
+`TRANSIENT_RETRY_MAX_ELAPSED_S` in `llm_retry.py`) with a wall cap
+(`SUMMARIZER_WALL_TIMEOUT`). If the summarizer hits a transient LLM error or returns
+blank, the orchestrator soft-fails to the **raw** articles rather than dropping the
+news entirely. A non-transient error
 (a prompt-construction bug, a refactor's `AttributeError`) is allowed to
 propagate, because that's a real bug, not a degradation to tolerate.
 
@@ -163,18 +169,19 @@ all of these are on.
 
 OpenAI web search via OpenRouter's native web plugin
 (`_native_search_provider` / `build_native_search_llm`,
-`research/providers.py`). The model is `NATIVE_SEARCH_DEFAULT_MODEL`, run at
-`reasoning={"effort":"low"}` and `verbosity="low"`, under a per-request timeout
+`research/providers.py`). The model is `NATIVE_SEARCH_DEFAULT_MODEL`, run at the
+reasoning effort and verbosity in `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` /
+`NATIVE_SEARCH_VERBOSITY_DEFAULT`, under a per-request timeout
 (`NATIVE_SEARCH_TIMEOUT`) and a hard wall-clock cap
-(`NATIVE_SEARCH_WALL_TIMEOUT`) set just above it. Model and effort are
+(`NATIVE_SEARCH_WALL_TIMEOUT`) set just above it. Model, effort, and verbosity are
 overridable via `NATIVE_SEARCH_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT` /
 `NATIVE_SEARCH_VERBOSITY`.
 
 The model is built at `allowed_tries=1` on purpose: an earlier incident
 (2026-05-20) had OpenRouter drip whitespace keep-alive bytes for over eight
 minutes before returning malformed JSON, and retrying that call just multiplies
-the wait. The wall-clock cap plus a single try bounds the worst case at ~7
-minutes. It routes through `build_llm_with_openrouter_fallback`, so it bills the
+the wait. `NATIVE_SEARCH_WALL_TIMEOUT` plus a single try is what bounds the worst case.
+It routes through `build_llm_with_openrouter_fallback`, so it bills the
 Metaculus-donated `OAI_ANTH_OPENROUTER_KEY` first and falls back to the personal
 `OPENROUTER_API_KEY` on credential/credit errors. The prompt is the shared
 `web_research_prompt` with markdown citations.
@@ -183,8 +190,8 @@ Metaculus-donated `OAI_ANTH_OPENROUTER_KEY` first and falls back to the personal
 
 Real first-party Google Search grounding via the `google-genai` SDK
 (`research/gemini_search.py`), NOT via OpenRouter. This adds a genuinely distinct
-search index to the ensemble. Default model `gemini-3-flash-preview`
-(`GEMINI_SEARCH_DEFAULT_MODEL`), 360s timeout (`GEMINI_SEARCH_TIMEOUT`). It
+search index to the ensemble. Model and request timeout come from
+`GEMINI_SEARCH_DEFAULT_MODEL` / `GEMINI_SEARCH_TIMEOUT` (`constants.py`). It
 enables both the `google_search` tool and the `url_context` tool, so the model
 can read specific URLs named in a question's fine print directly.
 
@@ -213,8 +220,10 @@ load-bearing guarantee: even if the classifier misreads the question, the series
 the question actually resolves on still fires. The two sets are merged
 (extraction is additive), then fetched in parallel:
 
-- **yfinance** for tickers: current price, period returns, 30-day annualized
-  volatility, 52-week range, recent closes, and (live only) fundamentals.
+- **yfinance** for tickers: current price, period returns, an annualized
+  volatility over the recent window (`FINANCIAL_YFINANCE_RECENT_DAYS`), a trailing
+  high/low range over the lookback window (`FINANCIAL_YFINANCE_LOOKBACK_DAYS`),
+  recent closes, and (live only) fundamentals.
 - **FRED** for economic series: latest/previous value, MoM and YoY change, recent
   observations.
 
@@ -232,8 +241,9 @@ A crowd-forecast cross-check (`research/prediction_market.py`). Fans out to four
 venues concurrently:
 
 - **Polymarket** (Gamma public-search, bounded retry on 403 IP rate limits).
-- **Kalshi** (no keyword endpoint — prefetch ~3k open events once per session,
-  cached ~6h, fuzzy-match client-side with rapidfuzz).
+- **Kalshi** (no keyword endpoint — prefetch open events once per session up to
+  `KALSHI_PREFETCH_EVENT_LIMIT`, cached for `KALSHI_CACHE_TTL_S`, fuzzy-match
+  client-side with rapidfuzz).
 - **Manifold** (search endpoint, plus an extra natural-language query since its
   search prefers that framing).
 - **PredictIt** (prefetch the full market dump, fuzzy-match locally, and pick the
@@ -271,7 +281,7 @@ It deterministically extracts URLs from resolution criteria + fine print (markdo
 links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),
 skip-filters URLs that add nothing or belong to another provider (Metaculus
 self-refs, FRED series owned by financial-data, Yahoo `/quote/` pages owned by
-yfinance), and caps at `RESOLUTION_SOURCE_MAX_URLS = 5` *after* the skip filter so
+yfinance), and caps at `RESOLUTION_SOURCE_MAX_URLS` *after* the skip filter so
 a run of leading self-refs doesn't starve the real sources. Fetches run in
 parallel with one-request-per-host politeness (a `Semaphore(1)` per netloc, keyed
 per redirect hop). Content is extracted with trafilatura (HTML), or read raw
@@ -282,8 +292,9 @@ It is **SSRF-hardened** because these URLs are user-authored and fetches run fro
 CI on AWS: a preflight `is_public_http_url` check rejects private / loopback /
 link-local / non-global IPs, userinfo tricks, and non-HTTP schemes, and a
 connect-time `FilteringResolver` (the actual DNS-rebinding boundary, not the
-preflight) re-checks every resolved IP. Redirects are followed manually with a
-hop cap, re-guarding each `Location`. Per-URL truncation appends a
+preflight) re-checks every resolved IP. Redirects are followed manually under the
+`MAX_REDIRECTS` hop cap (`research/http_fetch.py`, shared with the v2 agentic
+tools), re-guarding each `Location`. Per-URL truncation appends a
 `[truncated at N chars — full source at URL]` marker, and the section formatter
 appends `[N additional source(s) omitted — section budget]` when later sections
 are dropped for length. Unfetchable pages (`blocked` / `js_wall`) are retained in
@@ -322,13 +333,14 @@ addendum; v2's section appends after v1's.
 ### v1 — targeted gap-fill (`research/targeted.py` `run_gap_fill_pass`)
 
 Two stages, gated by `GAP_FILL_ENABLED` (and skipped when the first-pass bundle is
-shorter than `GAP_FILL_MIN_RESEARCH_CHARS = 200`):
+shorter than `GAP_FILL_MIN_RESEARCH_CHARS`):
 
 1. A non-grounded analyzer LLM (`GAP_FILL_ANALYZER_MODEL`, low effort) reads the
    first-pass research and emits a JSON list of up to `GAP_FILL_MAX_GAPS` factual
    gaps.
 2. Each gap is resolved by a parallel OpenAI native web search
-   (`GAP_FILL_RESOLVER_MODEL`, low effort, via OpenRouter on the donated key).
+   (`GAP_FILL_RESOLVER_MODEL` at `GAP_FILL_RESOLVER_REASONING_EFFORT`, via
+   OpenRouter on the donated key).
    Because the searches run in parallel, latency is the slowest call, not the sum.
 
 The resolver migrated off direct-Google grounding on 2026-06-25, which is why
@@ -338,12 +350,12 @@ it returns `""` on any error — and appends its results under
 
 ### v2 — agentic gap-fill (`research/agentic_gap_fill.py` `run_gap_fill_v2`)
 
-A bounded agentic tool loop run by a driver LLM
-(`GAP_FILL_V2_DRIVER_MODEL = openai/gpt-5.6-terra`, `effort=low`), gated by
+A bounded agentic tool loop run by a driver LLM (`GAP_FILL_V2_DRIVER_MODEL` at
+`GAP_FILL_V2_DRIVER_EFFORT`), gated by
 `GAP_FILL_V2_ENABLED`. The driver is briefed with the forecaster prompt, privately
 dry-runs a forecast to find things worth filling or verifying, then iterates over
 four tools (news search, web search, fetch, document read) under a wall deadline
-(`GAP_FILL_V2_WALL_DEADLINE = 540s`) and a tool-call budget. It appends a
+(`GAP_FILL_V2_WALL_DEADLINE`) and a tool-call budget. It appends a
 citation-only findings artifact under `## Agentic Research Findings`, leading with
 a corrections-to-the-briefing block. Like the other leakage-sensitive providers,
 it is benchmarking-guarded off. See `docs/agentic_gap_fill.md` for the full
@@ -360,8 +372,9 @@ and the published Metaculus comment (stashed per question id, popped by the
 forecaster at comment-build time via `pop_provider_diagnostics`).
 
 When a research sink is wired, each question's research is written for backtest
-replay by `ResearchPersistenceWriter` (`research/persistence.py`, schema version
-2). The record carries the assembled `research_text`, the per-provider
+replay by `ResearchPersistenceWriter` (`research/persistence.py`, at
+`RESEARCH_SCHEMA_VERSION`). The record carries the assembled `research_text`, the
+per-provider
 `provider_results` (the authoritative outcome list), derived
 `providers_attempted` / `providers_succeeded`, the `gap_fill_used` flag, and —
 when they exist — the v2 agentic trace (`gap_fill_v2`), the diagnostics block, and

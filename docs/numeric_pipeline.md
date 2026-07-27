@@ -1,15 +1,16 @@
 # Numeric forecasting and aggregation
 
 This is the reference for how the bot turns a numeric question into a probability
-distribution. It covers the full path: each forecaster declares 13 percentiles in
-plain text, the bot extracts and cleans them, builds a 201-point CDF that satisfies
-Metaculus' server-side constraints, aggregates across the ensemble in CDF space, and
-decides whether the ensemble disagrees enough to trigger conditional stacking. It also
-documents the time-series anchor research provider, which grounds numeric forecasts in
-the resolution series' own history.
+distribution. It covers the full path: each forecaster declares the standard percentile
+set in plain text, the bot extracts and cleans them, builds a 201-point CDF that
+satisfies Metaculus' server-side constraints, aggregates across the ensemble in CDF
+space, and decides whether the ensemble disagrees enough to trigger conditional
+stacking. It also documents the time-series anchor research provider, which grounds
+numeric forecasts in the resolution series' own history.
 
 Every model name, flag, and default here is verified against the code. Where a value
-lives in a constants file, the doc points at it so you can confirm it hasn't drifted.
+lives in a constants file this doc names the constant rather than restating its value,
+so read the constant for the current magnitude.
 
 ## What a numeric question looks like
 
@@ -20,18 +21,20 @@ beyond it. Some questions also carry a `zero_point` (log-scaled axis) and a `cdf
 that differs from 201 (a discrete question). All of these change how the CDF is built,
 so they thread through every stage below.
 
-## Step 1: forecasters declare 13 percentiles
+## Step 1: forecasters declare the standard percentiles
 
-Each forecaster is prompted to emit the 13 standard percentiles for its distribution
-(`STANDARD_PERCENTILES` in `numeric/config.py`):
+Each forecaster is prompted to emit the standard percentile set for its distribution.
+`STANDARD_PERCENTILES` in `numeric/config.py` owns the set, and
+`EXPECTED_PERCENTILE_COUNT` is derived from it with `len()` so the count can never
+disagree with the list. As shipped today the set is:
 
 ```
 1, 2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5, 99
 ```
 
-Stored internally as decimals in `[0, 1]` (0.01 through 0.99). The tail anchors P1 and
-P99 exist so a forecaster can express probability mass beyond an open bound: if you
-believe the outcome very likely exceeds an open upper bound, you place P50 and above
+Stored internally as decimals in `[0, 1]` rather than as 1-100 labels. The tail anchors
+P1 and P99 exist so a forecaster can express probability mass beyond an open bound: if
+you believe the outcome very likely exceeds an open upper bound, you place P50 and above
 outside the displayed range. The prompt (see `prompts.numeric_prompt` and the bound
 helper text from `bound_messages` in `numeric/utils.py`) tells forecasters exactly this
 and warns them not to pile percentiles against an open edge.
@@ -41,9 +44,9 @@ block, which the prompt requires to be the last thing in the response.
 
 ## Step 2: value extraction ladder
 
-`extract_numeric` in `value_extraction.py` pulls the 13 percentiles out of the model's
-free-text rationale. It runs a four-rung ladder, most deterministic first, and stops at
-the first rung that produces a valid result:
+`extract_numeric` in `value_extraction.py` pulls the declared percentiles out of the
+model's free-text rationale. It runs a four-rung ladder, most deterministic first, and
+stops at the first rung that produces a valid result:
 
 1. **block** — parse the fenced ```json block directly (`json.loads` plus Pydantic
    validation against `NumericStructured`). When the block carries a
@@ -59,9 +62,9 @@ the first rung that produces a valid result:
    soft-fails that forecaster.
 
 Post-rung validation is strict regardless of which rung produced the value
-(`_validate_numeric` in `value_extraction.py`): it requires all 13 canonical
-percentiles and returns exactly those 13, never padded. So even the LLM salvage rung
-cannot smuggle in a fabricated or partial set.
+(`_validate_numeric` in `value_extraction.py`): it requires every label in
+`STANDARD_PERCENTILES` and returns exactly that set, never padded. So even the LLM
+salvage rung cannot smuggle in a fabricated or partial set.
 
 Every successful extraction logs one line:
 
@@ -79,13 +82,14 @@ declare it. That vote is carried forward to the discrete-snap decision in Step 7
 
 ## Step 3: sanitize_percentiles
 
-`sanitize_percentiles` (`numeric/pipeline.py`) turns the raw 13 percentiles into a
-clean, strictly-increasing, in-bounds set. In order:
+`sanitize_percentiles` (`numeric/pipeline.py`) turns the raw declared percentiles into
+a clean, strictly-increasing, in-bounds set. In order:
 
-1. `filter_to_standard_percentiles` — keep only the 13 standard labels, drop extras and
+1. `filter_to_standard_percentiles` — keep only the standard labels, drop extras and
    duplicates.
-2. `validate_percentile_count_and_values` — assert the count and label set are exactly
-   the canonical 13 (`numeric/validation.py`).
+2. `validate_percentile_count_and_values` — assert the count and label set match
+   `EXPECTED_PERCENTILE_COUNT` / `STANDARD_PERCENTILES` exactly
+   (`numeric/validation.py`).
 3. `sort_percentiles_by_value` — order by percentile.
 4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`) — detect count-like (integer-
    adjacent) clusters and spread them, jitter exact duplicates, clamp values into the
@@ -104,13 +108,14 @@ logit for closed-closed questions, log transforms for one-sided questions, ident
 open-open). The stretch ramps from zero near the center to a maximum `k_tail` at the
 deepest tails.
 
-In production this is an identity pass. The defaults (`numeric/config.py`) are
-`TAIL_WIDEN_K_TAIL = 1.0` (no widening) and `TAIL_WIDEN_SPAN_FLOOR_GAMMA = 0.0` (no span
-floor). An empirical calibration on 43 resolved numerics found `k_tail=1.0` gave the
-best-calibrated tails, and `k_tail=1.25` moved away from ideal in every segment (see
+In production this is an identity pass: `TAIL_WIDEN_K_TAIL` and
+`TAIL_WIDEN_SPAN_FLOOR_GAMMA` (`numeric/config.py`) both default to their no-op
+settings, so nothing is widened and no span floor is enforced. That is why: an empirical
+calibration on 43 resolved numerics found `k_tail=1.0` gave the best-calibrated tails,
+and `k_tail=1.25` moved away from ideal in every segment (see
 `scratch_docs_and_planning/tail_widening_empirical_calibration.md`). Both knobs are
-still per-call configurable, and the function raises `ValueError` on `k_tail < 1.0`
-(narrowing is not implemented) or negative `span_floor_gamma`.
+still per-call configurable, and the function raises `ValueError` if asked to narrow
+rather than widen (narrowing is not implemented) or on a negative `span_floor_gamma`.
 
 ## Step 5: PCHIP 201-point CDF
 
@@ -132,15 +137,27 @@ The construction:
 
 ### Server-side constraints
 
-Metaculus validates `continuous_cdf` submissions (constants in `constants.py`,
-mirrored in `numeric/config.py`):
+Metaculus validates `continuous_cdf` submissions. The server formulas below are the
+upstream contract; the constants in `constants.py` mirror them, and those are what to
+read for the value we actually submit. `numeric/config.py` carries grid-scoped aliases
+(`MIN_CDF_PROB_STEP`, `MAX_CDF_PROB_STEP`) — note that only the max-step alias imports
+from `constants.py`; the min-step one restates the literal, so the two min-step
+constants have to be changed together.
 
-- **Length** = `cdf_size` (201 by default; `PCHIP_CDF_POINTS`).
-- **Min step** per bin `NUM_MIN_PROB_STEP = 5e-5` — no flat segments allowed. The
+- **Length** = `cdf_size`, whose standard-continuous default is `PCHIP_CDF_POINTS`.
+- **Min step** per bin `NUM_MIN_PROB_STEP` — no flat segments allowed. The
   server formula is `round(0.01 / N, 9)` where `N = cdf_size - 1`.
-- **Max step** per bin `NUM_MAX_STEP = 0.2` — a spikiness cap. Server formula
+- **Max step** per bin `NUM_MAX_STEP` — a spikiness cap. Server formula
   `0.2 * 200 / N`.
 - **Strictly increasing**, implied by min step > 0.
+
+`grid_step_constraints` (`numeric/config.py`) is what applies those formulas to a
+non-standard grid: the min step is floored at `MIN_CDF_PROB_STEP` so a fine grid never
+demands a step below the historical constant, and the max step is clamped at `1.0`
+(a probability step larger than that is vacuous). On the standard continuous grid it
+returns exactly `(MIN_CDF_PROB_STEP, MAX_CDF_PROB_STEP)`, so continuous questions are
+unaffected; a coarse discrete grid relaxes the max step upward, which is what lets a
+small-count distribution keep its mass concentrated on the low integers.
 
 `safe_cdf_bounds` (`numeric/pchip_cdf.py`) enforces the max-step rule by
 redistributing excess mass while preserving the total, then re-enforces min-step after
@@ -188,7 +205,9 @@ features.
 
 The result is wrapped in a `PchipNumericDistribution` (`pchip_processing.py`), a
 subclass of forecasting-tools' `NumericDistribution` whose `get_cdf()` override returns
-the pre-computed 201-point CDF instead of rebuilding it. The `_pchip_cdf_values` attribute
+the pre-computed 201-point CDF instead of rebuilding it. `get_cdf()` is the real
+override — the `.cdf` property is a deprecated shim that delegates to it, so overriding
+`.cdf` alone would miss the publish and aggregate paths. The `_pchip_cdf_values` attribute
 also acts as the marker that CDF validation should be skipped (the constraints were
 already enforced) and that discrete snapping can read the CDF back out.
 
@@ -213,11 +232,13 @@ aggregation.
 Before a per-model prediction is accepted, `detect_unit_mismatch`
 (`numeric/validation.py`) checks whether the declared values look off by orders of
 magnitude relative to the question range. It flags a mismatch when any of three ratios
-falls below its threshold:
+falls below its threshold — each threshold is a keyword argument on
+`detect_unit_mismatch`, so the signature is where the values live:
 
-- span between lowest and highest declared value, over the range (`< 1e-5`);
-- minimum adjacent step, over the range (`< 1e-8`);
-- maximum absolute value, over the range (`< 1e-5`).
+- span between lowest and highest declared value, over the range
+  (`span_ratio_threshold`);
+- minimum adjacent step, over the range (`min_step_ratio_threshold`);
+- maximum absolute value, over the range (`max_magnitude_ratio_threshold`).
 
 On a flagged mismatch, `run_numeric_forecast` (`forecaster_runners.py`) raises
 `UnitMismatchError` and withholds that forecaster's prediction rather than submitting a
