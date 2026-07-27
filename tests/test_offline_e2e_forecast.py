@@ -687,7 +687,7 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
 
     The load-bearing signals:
     - alertable_count == 0: the sum of all degradation counters (forecasters
-      dropped, publish failures, stacker fallbacks, research-provider timeouts,
+      dropped, publish failures, stacker fallbacks, research-provider failures,
       gap-fill v2 errors). The orchestrator SWALLOWS provider exceptions into
       status="errored" + a counter bump rather than re-raising, so a broken
       provider dep would otherwise pass silently — this is the tripwire for it.

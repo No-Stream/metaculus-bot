@@ -327,10 +327,9 @@ def reset_series_degradation_counter() -> None:
 # Per-run count of LOST prediction-market SOURCES: one per platform whose status
 # token came out a loss (`error(all_queries_failed)` / `partial(...)` / an escaped
 # transport error), one per whole-provider failure (snapshot timeout, outer-except),
-# and one when keyword extraction produces nothing. That last cause is why the name
-# is "source losses" rather than "platform failures" (renamed 2026-07-26): a dead
-# keyword extractor silences all four venues without any venue failing, and the old
-# name read as "a venue went down". The two causes are distinguished per-source in
+# and one when keyword extraction produces nothing. That last cause is why this
+# counts SOURCES rather than venues: a dead keyword extractor silences all four
+# venues without any venue failing. The two causes are distinguished per-source in
 # `MarketSnapshot.sources` (`keywords:error(no_queries)` vs `polymarket:error(...)`),
 # which rides both the published comment and the schema-v2 research archive.
 # Operator decision 2026-07-25: alert on ANY source loss rather than only a total

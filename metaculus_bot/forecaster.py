@@ -221,9 +221,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._conditional_stacking_skipped_count: int = 0
         # Skips from the single-forecaster short-circuit, kept in their own bucket so
         # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
-        # "skipped_config_off" out of "skipped"). Before 2026-07-26 that branch
-        # returned above BOTH increment sites, so a run could log
-        # "SKIPPED: single forecaster survived" per question and then "skipped=0".
+        # "skipped_config_off" out of "skipped"). That branch returns above both
+        # increment sites below, so it has to bump its own counter or the per-question
+        # "SKIPPED: single forecaster survived" logs would end the run at "skipped=0".
         self._conditional_stacking_skipped_single_forecaster_count: int = 0
         self._conditional_stacking_crux_failures: int = 0
         self._conditional_stacking_search_failures: int = 0
