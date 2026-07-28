@@ -37,7 +37,16 @@ paired personal-key runs: the within-run deltas summed to $3.31 against $5.66 of
 true lifetime-usage growth (58% captured), and 160 of 178 runs reported exactly
 $0.00. The missing $2.35 is fully accounted for by the gap between each run's
 ``phase=end`` usage and the NEXT run's ``phase=start`` usage — $3.31 + $2.35 =
-$5.66 exactly. The money is late, not lost.
+$5.66, exactly, to the cent. The money is late, not lost.
+
+The tightest version of the evidence, restricted to runs that DEMONSTRABLY spent:
+of the 25 paired runs carrying at least one ``extraction_rung`` record (a forecast
+provably happened, and ``gemini-3.1-pro-preview`` — the slot pinned to the
+personal key — produced one in all 25), 7 reported exactly $0.00. That is a 28%
+false-zero rate on runs that cannot have been free.
+``scripts/reconcile_credit_spend.py`` recovers a real figure for all 7
+($0.10-$0.32 each), which is the direct demonstration that the zeros are lag
+rather than absence.
 
 There is deliberately no wait-and-re-read here. The earliest CONFIRMED settlement
 in the archive is 153s after the end snapshot and the median is ~25 minutes, so a
