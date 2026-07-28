@@ -344,6 +344,10 @@ The bot's published Metaculus comments are the durable per-model record: on non-
 - **Coverage**: `make cov`. **Audit**: `make audit` (osv-scanner over `uv.lock`; requires `brew install osv-scanner` locally — CI runs it via `google/osv-scanner-action`).
 - **Test single file**: `uv run pytest tests/test_specific.py`.
 
+**The full suite must pass before anything is pushed, and CI green is the real gate — not a local green run.** `make precommit_install` installs both hook types: the ruff hooks on commit, plus a `pytest-full-suite` pre-push hook running the same `uv run --frozen pytest --cov=metaculus_bot` that `.github/workflows/ci.yaml` runs. Per-push rather than per-commit — the suite takes ~105s, too much friction on every commit but the right price on the thing reviewers see.
+
+**A local green run does not prove CI green.** A test that depends on the developer's environment — a hardcoded absolute path, the checkout location, `$HOME`, gitignored local data, installed local state — passes locally *by construction*, so no number of local runs can catch it and CI is the first place it can fail. `tests/test_research_sync_job.py` shipped exactly that: it asserted the launchd plist's `ProgramArguments` equalled a path derived from `__file__`, which holds only on the machine whose absolute path the plist hardcodes. Local was green every time; CI failed on the first push. So never assert an absolute path derived from the developer's environment — assert a repo-relative suffix (`Path.relative_to(_REPO_ROOT)`), or skip when the artifact is inherently machine-specific. And after pushing, **check the run** rather than assuming: `gh run list --repo No-Stream/metaculus-bot --branch <branch>`. `--repo` is required because no default repo is configured — `origin` is the fork, `upstream` is the Metaculus template.
+
 ### Checking OpenRouter credits
 
 The donated Metaculus OpenRouter key (`OAI_ANTH_OPENROUTER_KEY`) is shared and rate-limited; check burn-rate periodically:

@@ -50,8 +50,11 @@ audit:
 	osv-scanner scan --lockfile=uv.lock --config=osv-scanner.toml
 
 # Pre-commit helpers (use local cache to avoid readonly home cache)
+# Both hook types: the ruff hooks fire pre-commit, the full-suite hook fires
+# pre-push, and `pre-commit install` alone would install only the former.
 precommit_install:
 	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit install
+	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit install --hook-type pre-push
 
 precommit:
 	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run

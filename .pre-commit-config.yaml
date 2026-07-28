@@ -7,3 +7,18 @@ repos:
       - id: ruff-format
   # NOTE: a local `basedpyright` hook is added back once the codebase is
   # type-clean (Phase 4); enforcing it now would block all commits.
+
+  # The full suite, gated on push rather than commit: ~105s is too much friction
+  # per commit (agents commit often) but is the right price per push, which is
+  # where a red run first becomes a reviewer's problem. Same command CI runs, so
+  # a local pass and a CI pass cannot diverge on invocation. Needs
+  # `pre-commit install --hook-type pre-push` (done by `make precommit_install`).
+  - repo: local
+    hooks:
+      - id: pytest-full-suite
+        name: pytest (full suite, same command as CI)
+        entry: uv run --frozen pytest --cov=metaculus_bot
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
