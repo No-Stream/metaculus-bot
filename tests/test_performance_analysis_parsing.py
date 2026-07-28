@@ -46,8 +46,10 @@ from metaculus_bot.performance_analysis.parsing import (
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
 # Imported (not re-implemented) so the shape the fixture was DERIVED under and the
-# shape the test RE-CHECKS can never drift into two different definitions.
-from scripts.derive_mini_comment_fixture import comment_shape
+# shape the test RE-CHECKS can never drift into two different definitions. Same
+# reason for ``parser_outputs``: it is both the fixture's faithfulness invariant
+# and the exact expectation pinned below, so the two cannot cover different parsers.
+from scripts.derive_mini_comment_fixture import comment_shape, parser_outputs
 
 # ---------------------------------------------------------------------------
 # parse_stacked_marker
@@ -1011,6 +1013,428 @@ class _RealCommentAttributionChecks:
             )
 
 
+# Exact per-record parse expectations for the checked-in miniature, keyed by
+# ``post_id``. GENERATED — refresh with:
+#
+#     uv run python scripts/derive_mini_comment_fixture.py --emit-expectations
+#
+# Why exact values and not just the clean-parse ratio in
+# ``test_records_with_a_recoverable_model_name_parse_to_it``: that check passes at
+# a floor below 1.0, so over a twelve-record fixture it tolerates one silently
+# wrong record. Because the fixture is PINNED, the expectation here can instead be
+# the complete parse of every record, and one moved value fails. Both checks stay:
+# the ratio catches a broad collapse, this catches a single record.
+#
+# CHARACTERIZATION, not specification: every value below was produced by running
+# the real parsers over the fixture, so regenerating after a parser change will
+# happily bless that change. A diff here is a signal to READ the diff and confirm
+# each moved value is intended.
+#
+# Two entries look wrong and are not. ``parse_per_model_forecasts`` returns
+# whatever text follows the bullet's colon, and only binary questions put a
+# scalar there: multiple-choice bullets are followed by a newline and an option
+# list, so the value is that list's FIRST line (``- 0: 12.0%``), and numeric
+# bullets carry the literal ``Probability distribution:`` ahead of their
+# percentile lines. Pinning those strings pins real current behavior; the
+# per-type values a caller actually wants live in
+# ``parse_per_model_mc_option_probs`` and ``parse_per_model_numeric_percentiles``,
+# pinned alongside them.
+
+_EXPECTED_PARSES_BY_POST = {
+    41517: {
+        "parse_per_model_forecasts": {
+            "gpt-5.2": "- 0: 12.0%",
+            "gpt-5": "- 0: 10.0%",
+            "claude-opus-4.5": "- 0: 5.0%",
+            "gemini-3-flash-preview": "- 0: 5.0%",
+            "gemini-3-pro-preview": "- 0: 2.0%",
+        },
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "claude-opus-4.5",
+            4: "gemini-3-flash-preview",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {
+            "gpt-5.2": {"0": 0.12, "1": 0.3, "2": 0.38, "3+": 0.2},
+            "gpt-5": {"0": 0.1, "1": 0.56, "2": 0.26, "3+": 0.08},
+            "claude-opus-4.5": {"0": 0.05, "1": 0.33, "2": 0.42, "3+": 0.2},
+            "gemini-3-flash-preview": {"0": 0.05, "1": 0.28, "2": 0.46, "3+": 0.21},
+            "gemini-3-pro-preview": {"0": 0.02, "1": 0.5, "2": 0.3, "3+": 0.18},
+        },
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    41518: {
+        "parse_per_model_forecasts": {
+            "gpt-5.2": "28.0%",
+            "gpt-5": "20.0%",
+            "claude-opus-4.5": "15.0%",
+            "gemini-3-flash-preview": "28.0%",
+            "gemini-3-pro-preview": "12.0%",
+        },
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "claude-opus-4.5",
+            4: "gemini-3-flash-preview",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    41537: {
+        "parse_per_model_forecasts": {
+            "gpt-5.2": "Probability distribution:",
+            "gpt-5": "Probability distribution:",
+            "gemini-3-flash-preview": "Probability distribution:",
+            "gemini-3-pro-preview": "Probability distribution:",
+        },
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "gemini-3-flash-preview",
+            4: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {
+            "gpt-5.2": [
+                (2.5, 73000000000.0),
+                (5.0, 74000000000.0),
+                (10.0, 75500000000.0),
+                (20.0, 77500000000.0),
+                (40.0, 79300000000.0),
+                (50.0, 80200000000.0),
+                (60.0, 81000000000.0),
+                (80.0, 83000000000.0),
+                (90.0, 85000000000.0),
+                (95.0, 86800000000.0),
+                (97.5, 88000000000.0),
+            ],
+            "gpt-5": [
+                (2.5, 76800000000.0),
+                (5.0, 77400000000.0),
+                (10.0, 78000000000.0),
+                (20.0, 78800000000.0),
+                (40.0, 79800000000.0),
+                (50.0, 80300000000.0),
+                (60.0, 80800000000.0),
+                (80.0, 81800000000.0),
+                (90.0, 82500000000.0),
+                (95.0, 83100000000.0),
+                (97.5, 83700000000.0),
+            ],
+            "gemini-3-flash-preview": [
+                (2.5, 75200000000.0),
+                (5.0, 76800000000.0),
+                (10.0, 78100000000.0),
+                (20.0, 79200000000.0),
+                (40.0, 80250000000.0),
+                (50.0, 80700000000.0),
+                (60.0, 81150000000.0),
+                (80.0, 82400000000.0),
+                (90.0, 83600000000.0),
+                (95.0, 84800000000.0),
+                (97.5, 86500000000.0),
+            ],
+            "gemini-3-pro-preview": [
+                (2.5, 78500000000.0),
+                (5.0, 79200000000.0),
+                (10.0, 79800000000.0),
+                (20.0, 80500000000.0),
+                (40.0, 81400000000.0),
+                (50.0, 81800000000.0),
+                (60.0, 82300000000.0),
+                (80.0, 83400000000.0),
+                (90.0, 84200000000.0),
+                (95.0, 85000000000.0),
+                (97.5, 86200000000.0),
+            ],
+        },
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    41841: {
+        "parse_per_model_forecasts": {
+            "gpt-5.2": "Probability distribution:",
+            "gpt-5": "Probability distribution:",
+            "gemini-3-flash-preview": "Probability distribution:",
+            "gemini-3-pro-preview": "Probability distribution:",
+        },
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "gemini-3-flash-preview",
+            4: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {
+            "gpt-5.2": [
+                (2.5, 55.6),
+                (5.0, 56.8),
+                (10.0, 58.4),
+                (20.0, 60.6),
+                (40.0, 62.9),
+                (50.0, 64.0),
+                (60.0, 65.1),
+                (80.0, 67.2),
+                (90.0, 68.5),
+                (95.0, 69.3),
+                (97.5, 70.0),
+            ],
+            "gpt-5": [
+                (2.5, 56.5),
+                (5.0, 57.5),
+                (10.0, 58.5),
+                (20.0, 60.0),
+                (40.0, 62.0),
+                (50.0, 63.0),
+                (60.0, 64.0),
+                (80.0, 66.0),
+                (90.0, 67.2),
+                (95.0, 68.5),
+                (97.5, 69.8),
+            ],
+            "gemini-3-flash-preview": [
+                (2.5, 57.5),
+                (5.0, 58.8),
+                (10.0, 60.1),
+                (20.0, 61.8),
+                (40.0, 63.6),
+                (50.0, 64.4),
+                (60.0, 65.2),
+                (80.0, 66.9),
+                (90.0, 68.3),
+                (95.0, 69.4),
+                (97.5, 70.3),
+            ],
+            "gemini-3-pro-preview": [
+                (2.5, 56.5),
+                (5.0, 57.4),
+                (10.0, 58.6),
+                (20.0, 59.9),
+                (40.0, 61.5),
+                (50.0, 62.3),
+                (60.0, 63.1),
+                (80.0, 65.2),
+                (90.0, 66.8),
+                (95.0, 67.9),
+                (97.5, 68.8),
+            ],
+        },
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    41848: {
+        "parse_per_model_forecasts": {},
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "claude-opus-4.5",
+            4: "gemini-3-flash-preview",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    41871: {
+        "parse_per_model_forecasts": {},
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5",
+            3: "claude-opus-4.5",
+            4: "gemini-3-flash-preview",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {
+            "gpt-5.2": [
+                (2.5, 6100000000.0),
+                (5.0, 6200000000.0),
+                (10.0, 6400000000.0),
+                (20.0, 6700000000.0),
+                (40.0, 7000000000.0),
+                (50.0, 7200000000.0),
+                (60.0, 7350000000.0),
+                (80.0, 7650000000.0),
+                (90.0, 7800000000.0),
+                (95.0, 7900000000.0),
+                (97.5, 7970000000.0),
+            ],
+            "gpt-5": [
+                (2.5, 6250000000.0),
+                (5.0, 6350000000.0),
+                (10.0, 6475000000.0),
+                (20.0, 6625000000.0),
+                (40.0, 6825000000.0),
+                (50.0, 6950000000.0),
+                (60.0, 7075000000.0),
+                (80.0, 7300000000.0),
+                (90.0, 7475000000.0),
+                (95.0, 7600000000.0),
+                (97.5, 7725000000.0),
+            ],
+            "claude-opus-4.5": [
+                (2.5, 6100000000.0),
+                (5.0, 6200000000.0),
+                (10.0, 6350000000.0),
+                (20.0, 6550000000.0),
+                (40.0, 6850000000.0),
+                (50.0, 7050000000.0),
+                (60.0, 7200000000.0),
+                (80.0, 7450000000.0),
+                (90.0, 7650000000.0),
+                (95.0, 7800000000.0),
+                (97.5, 7950000000.0),
+            ],
+            "gemini-3-flash-preview": [
+                (2.5, 6150000000.0),
+                (5.0, 6300000000.0),
+                (10.0, 6500000000.0),
+                (20.0, 6750000000.0),
+                (40.0, 7000000000.0),
+                (50.0, 7100000000.0),
+                (60.0, 7200000000.0),
+                (80.0, 7450000000.0),
+                (90.0, 7650000000.0),
+                (95.0, 7800000000.0),
+                (97.5, 7950000000.0),
+            ],
+            "gemini-3-pro-preview": [
+                (2.5, 6250000000.0),
+                (5.0, 6450000000.0),
+                (10.0, 6600000000.0),
+                (20.0, 6800000000.0),
+                (40.0, 7050000000.0),
+                (50.0, 7150000000.0),
+                (60.0, 7250000000.0),
+                (80.0, 7550000000.0),
+                (90.0, 7750000000.0),
+                (95.0, 7900000000.0),
+                (97.5, 7980000000.0),
+            ],
+        },
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    42108: {
+        "parse_per_model_forecasts": {
+            "gpt-5.2": "37.0%",
+            "gpt-5.1": "42.0%",
+            "claude-4.6-opus": "35.0%",
+            "claude-opus-4.5": "38.0%",
+            "gemini-3-pro-preview": "55.0%",
+        },
+        "parse_forecaster_model_map": {
+            1: "gpt-5.2",
+            2: "gpt-5.1",
+            3: "claude-4.6-opus",
+            4: "claude-opus-4.5",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    42110: {
+        "parse_per_model_forecasts": {
+            "Forecaster 1": "- Maria Lazar: 10.0%",
+            "gpt-5.1": "- Maria Lazar: 9.0%",
+            "claude-4.6-opus": "- Maria Lazar: 4.0%",
+            "claude-opus-4.5": "- Maria Lazar: 9.0%",
+            "gemini-3-pro-preview": "- Maria Lazar: 6.0%",
+        },
+        "parse_forecaster_model_map": {
+            2: "gpt-5.1",
+            3: "claude-4.6-opus",
+            4: "claude-opus-4.5",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {
+            "Forecaster 1": {"Maria Lazar": 0.1, "Chris Taylor": 0.89, "Someone else": 0.01},
+            "gpt-5.1": {"Maria Lazar": 0.09, "Chris Taylor": 0.89, "Someone else": 0.02},
+            "claude-4.6-opus": {"Maria Lazar": 0.04, "Chris Taylor": 0.95, "Someone else": 0.01},
+            "claude-opus-4.5": {"Maria Lazar": 0.09, "Chris Taylor": 0.9, "Someone else": 0.01},
+            "gemini-3-pro-preview": {"Maria Lazar": 0.06, "Chris Taylor": 0.93, "Someone else": 0.01},
+        },
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    42113: {
+        "parse_per_model_forecasts": {
+            "Forecaster 1": "12.0%",
+            "gpt-5.1": "7.0%",
+            "claude-4.6-opus": "1.0%",
+            "claude-opus-4.5": "9.0%",
+            "gemini-3-pro-preview": "1.0%",
+        },
+        "parse_forecaster_model_map": {
+            2: "gpt-5.1",
+            3: "claude-4.6-opus",
+            4: "claude-opus-4.5",
+            5: "gemini-3-pro-preview",
+        },
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    43053: {
+        "parse_per_model_forecasts": {"Forecaster 1": "- Ismaïl Omar Guelleh officially declared winner: 92.0%"},
+        "parse_forecaster_model_map": {},
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {
+            "Forecaster 1": {
+                "Ismaïl Omar Guelleh officially declared winner": 0.92,
+                "Another candidate officially declared winner": 0.02,
+                "Vote held but no final official result before May 1": 0.02,
+                "Election postponed or cancelled": 0.04,
+            }
+        },
+        "parse_inferred_stacker_outcome": ("primary", "historical_body"),
+        "parse_stacked_marker": None,
+    },
+    43054: {
+        "parse_per_model_forecasts": {"Forecaster 1": "10.0%"},
+        "parse_forecaster_model_map": {},
+        "parse_per_model_numeric_percentiles": {},
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": (None, "none"),
+        "parse_stacked_marker": None,
+    },
+    43059: {
+        "parse_per_model_forecasts": {"Forecaster 1": "Probability distribution:"},
+        "parse_forecaster_model_map": {},
+        "parse_per_model_numeric_percentiles": {
+            "Forecaster 1": [
+                (2.5, 87.0),
+                (5.0, 95.0),
+                (10.0, 105.0),
+                (20.0, 119.0),
+                (40.0, 137.0),
+                (50.0, 146.0),
+                (60.0, 155.0),
+                (80.0, 172.0),
+                (90.0, 184.0),
+                (95.0, 193.0),
+                (97.5, 197.0),
+            ]
+        },
+        "parse_per_model_mc_option_probs": {},
+        "parse_inferred_stacker_outcome": ("primary", "historical_body"),
+        "parse_stacked_marker": None,
+    },
+}
+
+
 class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
     """The CI floor: same attribution checks, on the checked-in miniature.
 
@@ -1063,6 +1487,38 @@ class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
                 f"post {rec['post_id']} no longer matches its recorded shape: "
                 f"{rec['_shape']} -> {recomputed}; regenerate with "
                 "scripts/derive_mini_comment_fixture.py"
+            )
+
+    def test_expectation_table_covers_exactly_the_fixture(self, records):
+        # A record with no table entry must FAIL rather than go unchecked, and a
+        # table entry for a record the fixture no longer has is dead weight that
+        # hides a shrunken fixture. Compared as sets so both directions report.
+        assert {rec["post_id"] for rec in records} == set(_EXPECTED_PARSES_BY_POST), (
+            "expectation table and miniature disagree on which posts exist; regenerate with "
+            "scripts/derive_mini_comment_fixture.py --emit-expectations"
+        )
+
+    def test_each_record_parses_to_its_exact_expectation(self, records):
+        # The exact-value floor. Every OTHER check on this fixture is aggregate
+        # (a >=0.90 clean-parse ratio) or structural (shape coverage, shape
+        # consistency), and none of them says WHICH indices resolve to WHICH
+        # model names — so a single record silently losing a model, or reporting
+        # a perturbed probability, passes them all. Asserting the whole parse
+        # dict per record is what makes one wrong value a failure.
+        #
+        # Compares the full multi-parser mapping, not just
+        # ``parse_per_model_forecasts``: the fixture deliberately spans all four
+        # question types, and pinning only the binary-shaped parser would leave
+        # the numeric/MC/stacker-inference parsers on aggregate-only coverage —
+        # the same hole this closes. ``parser_outputs`` is imported rather than
+        # re-listed so the pinned set cannot drift from the set the fixture's
+        # faithfulness invariant was established under.
+        for rec in records:
+            post_id = rec["post_id"]
+            assert parser_outputs(rec["comment_text"]) == _EXPECTED_PARSES_BY_POST[post_id], (
+                f"post {post_id} no longer parses to its pinned expectation; if the change is "
+                "intended, review each moved value then regenerate with "
+                "scripts/derive_mini_comment_fixture.py --emit-expectations"
             )
 
 

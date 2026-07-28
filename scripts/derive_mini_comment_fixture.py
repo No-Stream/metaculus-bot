@@ -33,15 +33,20 @@ percentile/probability/option value lines, and fenced JSON blocks.
 Usage
 -----
     uv run python scripts/derive_mini_comment_fixture.py
+    uv run python scripts/derive_mini_comment_fixture.py --emit-expectations
 
-Re-run after a fixture pull introduces a genuinely new comment shape (the shape
-guard in the test suite fails loudly when the miniature stops covering one).
+Re-run the first form after a fixture pull introduces a genuinely new comment
+shape (the shape guard in the test suite fails loudly when the miniature stops
+covering one). The second form re-renders the test's exact per-record
+expectation table from the CHECKED-IN fixture, so it needs no local pull; see
+``render_expectations`` for what it emits and why the diff deserves a read.
 """
 
 import argparse
 import json
 import logging
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -61,6 +66,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 SOURCE_PATH: Path = REPO_ROOT / "scratch" / "performance_data.json"
 OUTPUT_PATH: Path = REPO_ROOT / "tests" / "data" / "performance_comments_mini.jsonl"
+
+# The test module that consumes ``--emit-expectations`` output, and the name it
+# binds the table to. Passed to the formatter as the stdin filename so the
+# emitted block is wrapped exactly as it will be once pasted in.
+TEST_MODULE_PATH: Path = REPO_ROOT / "tests" / "test_performance_analysis_parsing.py"
+EXPECTATIONS_VARIABLE: str = "_EXPECTED_PARSES_BY_POST"
 
 TRIM_NOTICE: str = "[... trimmed for length]"
 RESEARCH_SUMMARY_MARKER: str = "### Research Summary"
@@ -172,16 +183,23 @@ def shrink_comment(comment: str) -> str:
     return _TITLE_RE.sub(TITLE_STUB, shrunk)
 
 
-def parser_outputs(comment: str) -> tuple[object, ...]:
-    """Every public per-model parse of ``comment``, for the faithfulness check."""
-    return (
-        parse_per_model_forecasts(comment),
-        parse_forecaster_model_map(comment),
-        parse_per_model_numeric_percentiles(comment),
-        parse_per_model_mc_option_probs(comment),
-        parse_inferred_stacker_outcome(comment),
-        parse_stacked_marker(comment),
-    )
+def parser_outputs(comment: str) -> dict[str, object]:
+    """Every public per-model parse of ``comment``, keyed by parser name.
+
+    Two consumers: the faithfulness filter in ``build_fixture`` (miniature must
+    parse identically to its source) and ``render_expectations``, which writes
+    this same mapping into the test suite as the exact per-record expectation.
+    Keyed by NAME rather than position for the second consumer's sake — a tuple
+    would let a reordering here silently re-label every expectation in the test.
+    """
+    return {
+        "parse_per_model_forecasts": parse_per_model_forecasts(comment),
+        "parse_forecaster_model_map": parse_forecaster_model_map(comment),
+        "parse_per_model_numeric_percentiles": parse_per_model_numeric_percentiles(comment),
+        "parse_per_model_mc_option_probs": parse_per_model_mc_option_probs(comment),
+        "parse_inferred_stacker_outcome": parse_inferred_stacker_outcome(comment),
+        "parse_stacked_marker": parse_stacked_marker(comment),
+    }
 
 
 def comment_shape(record: dict) -> dict[str, str]:
@@ -231,11 +249,58 @@ def build_fixture(records: list[dict]) -> list[dict]:
     return sorted(fixture, key=lambda entry: entry["post_id"])
 
 
+def render_expectations(fixture: list[dict]) -> str:
+    """Render the test suite's exact per-record expectation table as Python source.
+
+    The values come from running the REAL parsers over ``fixture``, so this is a
+    CHARACTERIZATION of current behavior, not an independent specification. That
+    is the point (hand-transcribing twelve nested dicts is how typos become
+    "expected" values) and also the risk: regenerating after a parser change will
+    happily bless the change. A diff in the emitted table is a signal to READ the
+    diff and confirm each moved value is intended, never to rubber-stamp.
+    """
+    table = {entry["post_id"]: parser_outputs(entry["comment_text"]) for entry in fixture}
+    source = f"{EXPECTATIONS_VARIABLE} = {table!r}\n"
+    # Formatted by the repo's own formatter so the emitted block can be pasted in
+    # without a follow-up `make format` reflowing it into a different diff.
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--stdin-filename", str(TEST_MODULE_PATH), "-"],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return formatted.stdout
+
+
+def _load_fixture(path: Path) -> list[dict]:
+    with path.open() as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _emit_expectations(fixture_path: Path) -> None:
+    if not fixture_path.exists():
+        raise SystemExit(f"miniature fixture not found at {fixture_path}; derive it first (drop --emit-expectations)")
+    sys.stdout.write(render_expectations(_load_fixture(fixture_path)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=SOURCE_PATH, help="big local performance pull")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="miniature fixture to write")
+    parser.add_argument(
+        "--emit-expectations",
+        action="store_true",
+        help=(
+            f"print the test suite's {EXPECTATIONS_VARIABLE} table for the EXISTING miniature at --output "
+            "and exit, without touching the fixture or needing --source"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.emit_expectations:
+        _emit_expectations(args.output)
+        return
 
     if not args.source.exists():
         raise SystemExit(
