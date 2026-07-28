@@ -29,10 +29,21 @@ import requests
 
 from metaculus_bot import fetch_hardening
 from metaculus_bot.constants import (
+    CRUX_SOFT_DEADLINE,
+    FORECASTER_SOFT_DEADLINE,
+    METACULUS_CLOSE_WINDOW_SECONDS,
+    PER_QUESTION_WALL_CLOCK_DEADLINE,
     PREDICTION_MARKET_KEYWORD_BACKOFFS,
     PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
     PREDICTION_MARKET_TIMEOUT,
+    PUBLISH_POST_RETRIES,
+    PUBLISH_POST_TIMEOUT,
+    STACKER_FALLBACK_SOFT_DEADLINE,
+    STACKER_SOFT_DEADLINE,
+    SUMMARIZER_WALL_TIMEOUT,
+    WALL_CLOCK_STACKING_MIN_BUDGET,
 )
+from metaculus_bot.llm_configs import REASONING_MODEL_CONFIG, UTILITY_MODEL_CONFIG
 from metaculus_bot.llm_retry import (
     DEFAULT_TRANSIENT_BACKOFFS,
     NON_RETRYABLE_HTTP_STATUS_CODES,
@@ -378,6 +389,129 @@ def test_prediction_market_keyword_retry_budget_fits_the_snapshot_timeout() -> N
     # merely a hair under the cap.
     assert PREDICTION_MARKET_TIMEOUT - worst_case >= 5.0, (
         "at least 5s of the snapshot budget must remain for the platform fan-out"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Soft-deadline / model-timeout alignment
+#
+# Every soft deadline in constants.py is documented in terms of a timeout that
+# lives in llm_configs.py ("slightly above the stacker LLM's own litellm
+# timeout", "matches the summarizer's litellm per-request timeout", "the
+# analyzer's own bound ... is looser than this"). Those relationships are what
+# make each wrapper a backstop rather than the primary bound, and NOTHING
+# enforced them: the values sit in two files that change for unrelated reasons,
+# and the existing deadline tests all monkeypatch the constant to a fraction of a
+# second to test the wrapper's BEHAVIOR, which passes at any value. So a
+# llm_configs.py timeout bump silently inverts the intended ordering and the
+# soft deadline starts firing first, converting a clean provider timeout into an
+# opaque asyncio.TimeoutError. Pin the arithmetic the comments assert, in the
+# same spirit as the keyword-budget test above.
+# ---------------------------------------------------------------------------
+
+
+def test_stacker_soft_deadline_sits_above_the_reasoning_model_timeout() -> None:
+    """The stacker wrapper must be a backstop, not the primary bound.
+
+    ``STACKER_SOFT_DEADLINE``'s comment says it is set "slightly above the stacker
+    LLM's own litellm timeout ... so the model's timeout fires first with a clean
+    exception when possible". Inverted, every stalled stacker surfaces as an
+    ``asyncio.TimeoutError`` from the wrapper instead of the provider's own typed
+    error, and the fallback chain loses the reason it fired.
+    """
+    model_timeout = REASONING_MODEL_CONFIG["timeout"]
+    assert STACKER_SOFT_DEADLINE > model_timeout, (
+        f"STACKER_SOFT_DEADLINE={STACKER_SOFT_DEADLINE} must exceed the stacker's litellm "
+        f"timeout={model_timeout} so the model's own timeout fires first"
+    )
+    # "Slightly" above: a huge margin would mean a stuck call burns budget the
+    # fallback stacker needs. The fallback's own deadline is the natural scale.
+    assert STACKER_SOFT_DEADLINE - model_timeout <= STACKER_FALLBACK_SOFT_DEADLINE, (
+        "the backstop margin should stay small relative to the fallback's budget"
+    )
+
+
+def test_stacker_fallback_deadline_is_tighter_than_the_primary() -> None:
+    """The fallback fires late on the critical path, so it gets less time.
+
+    Documented at ``STACKER_FALLBACK_SOFT_DEADLINE``. If this ever inverted, a
+    failing primary followed by a slow fallback would eat the publish budget that
+    ``WALL_CLOCK_STACKING_MIN_BUDGET`` reserves.
+    """
+    assert STACKER_FALLBACK_SOFT_DEADLINE < STACKER_SOFT_DEADLINE
+
+
+def test_summarizer_wall_timeout_matches_the_utility_model_timeout() -> None:
+    """``SUMMARIZER_WALL_TIMEOUT`` is documented as matching its litellm budget.
+
+    The point of the equality is that the per-attempt cap and the underlying
+    request budget expire together, so a breach means the request really is stuck
+    rather than the wrapper being impatient.
+    """
+    assert SUMMARIZER_WALL_TIMEOUT == UTILITY_MODEL_CONFIG["timeout"], (
+        f"SUMMARIZER_WALL_TIMEOUT={SUMMARIZER_WALL_TIMEOUT} must equal the summarizer's "
+        f"litellm timeout={UTILITY_MODEL_CONFIG['timeout']}"
+    )
+
+
+def test_crux_soft_deadline_is_tighter_than_the_analyzer_model_timeout() -> None:
+    """The crux extractor is deliberately capped BELOW its model's own timeout.
+
+    Unlike the stacker, here the wrapper is meant to fire first: the comment says
+    the analyzer's own per-attempt bound "is looser than this, so without the
+    wrapper a stalled call runs well past the crux's usefulness". A crux that
+    arrives too late is worthless even if it arrives, so this one inverts the
+    backstop relationship on purpose — pin it so the intent survives.
+    """
+    assert CRUX_SOFT_DEADLINE < UTILITY_MODEL_CONFIG["timeout"], (
+        f"CRUX_SOFT_DEADLINE={CRUX_SOFT_DEADLINE} must undercut the analyzer's litellm "
+        f"timeout={UTILITY_MODEL_CONFIG['timeout']} so the wrapper bounds a stalled crux"
+    )
+
+
+def test_forecaster_soft_deadline_caps_the_model_retry_ladder() -> None:
+    """A single stuck forecaster must not be able to hold a question.
+
+    ``FORECASTER_SOFT_DEADLINE``'s comment describes the worst case it caps:
+    the reasoning model's litellm timeout times its ``allowed_tries``. If a config
+    bump ever made the ladder shorter than the deadline the wrapper would stop
+    being the binding constraint and the drop-with-a-WARNING path would go dead.
+    """
+    ladder_worst_case = REASONING_MODEL_CONFIG["timeout"] * REASONING_MODEL_CONFIG["allowed_tries"]
+    assert FORECASTER_SOFT_DEADLINE < ladder_worst_case, (
+        f"FORECASTER_SOFT_DEADLINE={FORECASTER_SOFT_DEADLINE} must cap the model's own "
+        f"{ladder_worst_case}s retry ladder, else the wrapper never binds"
+    )
+
+
+def test_per_question_deadline_reserves_exactly_the_publish_budget() -> None:
+    """The close-window remainder is sized to the stacking/publish reserve.
+
+    ``PER_QUESTION_WALL_CLOCK_DEADLINE`` is documented as sitting "just inside"
+    the hourly close window, and the leftover is what pays for stacker-skip plus
+    the two publish POSTs. The equality is deliberate, not incidental: reserving
+    LESS than ``WALL_CLOCK_STACKING_MIN_BUDGET`` would let a question run past its
+    own close window while still believing it had time to publish.
+    """
+    reserve = METACULUS_CLOSE_WINDOW_SECONDS - PER_QUESTION_WALL_CLOCK_DEADLINE
+    assert reserve >= WALL_CLOCK_STACKING_MIN_BUDGET, (
+        f"only {reserve}s of the {METACULUS_CLOSE_WINDOW_SECONDS}s close window is reserved, "
+        f"less than the {WALL_CLOCK_STACKING_MIN_BUDGET}s publish budget"
+    )
+
+
+def test_stacking_min_budget_clears_both_publish_posts() -> None:
+    """``WALL_CLOCK_STACKING_MIN_BUDGET`` must cover the publish worst case.
+
+    Two hardened POSTs (the prediction and the comment), each up to
+    ``PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)``. Documented at the
+    constant; unpinned until now, so a retry-count bump could have silently made
+    the reserve too small to publish inside.
+    """
+    publish_worst_case = 2 * PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)
+    assert WALL_CLOCK_STACKING_MIN_BUDGET > publish_worst_case, (
+        f"WALL_CLOCK_STACKING_MIN_BUDGET={WALL_CLOCK_STACKING_MIN_BUDGET} must exceed the "
+        f"{publish_worst_case}s two-POST publish worst case"
     )
 
 

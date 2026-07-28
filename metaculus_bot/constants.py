@@ -597,10 +597,18 @@ FORECASTER_SOFT_DEADLINE: int = 600
 # otherwise; see the single-forecaster guard in _research_and_make_predictions.
 MIN_FORECASTERS_TO_PUBLISH: int = 1
 
-# Per-question wall-clock cutoff, sized just inside the 60-min Metaculus close
-# window. At deadline, in-flight forecasters are cancelled; we base-combine
-# whatever completed (>=MIN_FORECASTERS_TO_PUBLISH) and submit. Remainder budget reserves
-# time for stacker-skip + publish (see PUBLISH_POST_TIMEOUT / PUBLISH_POST_RETRIES).
+# The Metaculus close window each scheduled run has to finish inside: the prod
+# crons fire hourly, so a question's whole forecast-and-publish cycle must fit in
+# one hour. Named because two deadlines below are sized against it and the
+# arithmetic was previously a bare 3600 living only in prose.
+METACULUS_CLOSE_WINDOW_SECONDS: int = 3600
+
+# Per-question wall-clock cutoff, sized just inside METACULUS_CLOSE_WINDOW_SECONDS.
+# At deadline, in-flight forecasters are cancelled; we base-combine
+# whatever completed (>=MIN_FORECASTERS_TO_PUBLISH) and submit. The remainder —
+# exactly WALL_CLOCK_STACKING_MIN_BUDGET, not a coincidence — reserves time for
+# stacker-skip + publish (see PUBLISH_POST_TIMEOUT / PUBLISH_POST_RETRIES).
+# tests/test_llm_retry.py pins both relationships.
 PER_QUESTION_WALL_CLOCK_DEADLINE: int = 3510
 
 # Below this remaining-budget threshold, skip stacking and force fallback_median
