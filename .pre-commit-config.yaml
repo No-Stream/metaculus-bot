@@ -22,3 +22,20 @@ repos:
         stages: [pre-push]
         pass_filenames: false
         always_run: true
+
+      # `main` is ruleset-protected on GitHub (PR required, `lint` + `test` must
+      # pass), but nothing stopped a local commit landing on `main` directly —
+      # which then cannot be pushed at all, so the work has to be replayed onto a
+      # branch afterwards. This refuses at commit time instead, on the branch the
+      # commit would land on. Belt to the ruleset's braces: the ruleset protects
+      # the remote, this protects the local history that feeds it.
+      # `stages` is pinned rather than left to default: an entry with no `stages`
+      # inherits `default_stages`, which is EVERY stage, so the guard would also fire
+      # on push and print a "commit refused" message at a push it isn't guarding.
+      - id: no-commit-to-main
+        name: refuse a commit on main (branch first)
+        entry: scripts/hooks/no_commit_to_main.sh
+        language: script
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true

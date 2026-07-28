@@ -31,6 +31,36 @@ make typecheck       # basedpyright (must stay at 0 errors)
 make check_credits   # print OpenRouter balances for both keys
 ```
 
+### Git hooks
+
+`make precommit_install` installs both hook types (`pre-commit` alone installs only
+the first):
+
+- **at commit** — the ruff hooks (check with `--fix --unsafe-fixes`, then format), plus
+  `no-commit-to-main`, which refuses a commit whose HEAD is `main`. `main` is
+  ruleset-protected on GitHub (PR required, `lint` + `test` required), so a direct push is
+  rejected — but only at push time, once the commits already sit on local `main` and have
+  to be replayed onto a branch. The guard moves that refusal to commit time, where the fix
+  is one `git switch -c`. Its message names the recovery command and the `git commit
+  --no-verify` bypass; `scripts/hooks/no_commit_to_main.sh` is a `language: script` hook,
+  so it must stay executable in the index (mode `100755` — `tests/test_no_commit_to_main_hook.py`
+  asserts that, along with the behavior on a feature branch and on a detached HEAD).
+- **at push** — the full pytest suite, the same command CI runs. ~105s, too much friction
+  per commit but the right price on the thing reviewers see.
+
+Two things can block or stale the install on a checkout that predates the uv migration:
+
+- **A pre-existing `core.hooksPath` makes pre-commit refuse to install** ("Cowardly
+  refusing to install hooks with `core.hooksPath` set"). Check where it points with
+  `git config --show-origin --get core.hooksPath` against `git rev-parse --git-path hooks`.
+  If they match, the setting is redundant — it names git's own default hooks directory —
+  so `git config --unset-all core.hooksPath` unblocks the install and changes nothing
+  about where git looks for hooks.
+- **The generated `.git/hooks/pre-commit` can be stale.** Hooks installed before the uv
+  migration hardcode an `INSTALL_PYTHON` under the old conda env, which still resolves on
+  disk and so fails confusingly rather than obviously. `make precommit_install` regenerates
+  the file against the current interpreter.
+
 ## API keys and the shared-vs-personal key model
 
 The bot needs several credentials. `.env.template` lists them with inline
