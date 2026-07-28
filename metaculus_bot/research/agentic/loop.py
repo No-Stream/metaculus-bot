@@ -153,11 +153,27 @@ def _normalize_quote_text(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", _QUOTE_GLYPHS_RE.sub("", text)).strip().lower()
 
 
-# Ellipsis boundary in a driver quote: the literal "..." (three-or-more dots) or
-# the Unicode ellipsis. The driver elides mid-quote ("<span A> ... <span B>"),
-# which no single contiguous substring test could satisfy.
-_ELLIPSIS_RE = re.compile(r"\.{3,}|…")
-# Minimum normalized length for an ellipsis-split span to be grounded on its own.
+# Span boundaries in a driver quote — the two ways it stitches non-contiguous
+# source text, neither of which any single contiguous substring test could satisfy:
+#   1. An ellipsis: the literal "..." (three-or-more dots) or the Unicode "…".
+#      The driver elides mid-quote ("<span A> ... <span B>").
+#   2. A QUOTE-GLYPH boundary: a closing glyph adjacent (optionally across
+#      whitespace) to an opening glyph, i.e. separately-quoted sentences joined by
+#      a space (`"<sentence A>" "<sentence B>"`). In the 2026-07-28 prod run this
+#      shape produced 8 quote_mismatch warnings, all false positives: both
+#      sentences were verbatim in the source but separated there by other text
+#      ("Methods: ..."), so the joined pair could never match contiguously.
+# This regex is applied to the RAW quote, BEFORE normalization, and each resulting
+# span normalized on its own. That order is load-bearing: _normalize_quote_text
+# DELETES quote glyphs, so normalizing first destroys the very boundary clause 2
+# looks for. Splitting raw is safe for clause 1 too — normalization collapses
+# whitespace and deletes glyphs but never touches runs of dots (verified by
+# execution across the quote shapes in tests/test_agentic_loop.py).
+# Only ADJACENT glyphs are a boundary, so the glyphs that merely wrap a whole
+# quote, an apostrophe inside a word ("don't"), and a nested quotation
+# ("he said “hello” to me") are each isolated and do not split.
+_SPAN_BOUNDARY_RE = re.compile(r"\.{3,}|…|[\"'‘’“”`]\s*[\"'‘’“”`]")
+# Minimum normalized length for a split span to be grounded on its own.
 # Below this a span is a bare token or punctuation run that appears in arbitrary
 # text, so trusting it per-span would rubber-stamp the check. Set to 10 rather
 # than the ~25 a prose-calibrated analysis suggested: real findings elide compact
@@ -183,24 +199,27 @@ _DIGIT_RE = re.compile(r"\d")
 def _quote_is_grounded(quote: str, tool_content_normalized: str) -> bool:
     """True when the finding's quote is grounded in the tool contents.
 
-    An empty quote is treated as grounded — there is nothing to verify. The
-    driver elides mid-quote with an ellipsis, so the quote is split on ellipsis
-    boundaries and every span that carries evidentiary weight must appear in the
-    tool contents independently (a plain quote with no ellipsis is one span — the
-    whole thing). A span carries weight when it clears
-    ``_MIN_GROUNDING_SPAN_CHARS`` or contains a digit; the digit clause closes the
-    hole where a fabricated figure rode alongside a genuine long clause. When no
-    span carries weight — the quote is all short non-numeric fragments — the whole
-    normalized quote is tested as a substring so a short quote is never
-    auto-passed; only a truly empty quote passes for free.
+    An empty quote is treated as grounded — there is nothing to verify. The driver
+    stitches non-contiguous source text two ways — eliding with an ellipsis, and
+    joining separately-quoted sentences with a space — so the quote is split on
+    ``_SPAN_BOUNDARY_RE`` and every span that carries evidentiary weight must
+    appear in the tool contents independently (a plain unstitched quote is one
+    span — the whole thing). The split runs on the RAW quote and each span is
+    normalized afterwards, because normalization deletes the quote glyphs that
+    mark a glyph boundary; see the ``_SPAN_BOUNDARY_RE`` block. A span carries
+    weight when it clears ``_MIN_GROUNDING_SPAN_CHARS`` or contains a digit; the
+    digit clause closes the hole where a fabricated figure rode alongside a
+    genuine long clause. When no span carries weight — the quote is all short
+    non-numeric fragments — the whole normalized quote is tested as a substring so
+    a short quote is never auto-passed; only a truly empty quote passes for free.
     """
     normalized_quote = _normalize_quote_text(quote)
     if not normalized_quote:
         return True
     spans = [
         span
-        for span in (part.strip() for part in _ELLIPSIS_RE.split(normalized_quote))
-        if len(span) >= _MIN_GROUNDING_SPAN_CHARS or _DIGIT_RE.search(span)
+        for span in (_normalize_quote_text(part) for part in _SPAN_BOUNDARY_RE.split(quote))
+        if span and (len(span) >= _MIN_GROUNDING_SPAN_CHARS or _DIGIT_RE.search(span))
     ]
     if not spans:
         return normalized_quote in tool_content_normalized

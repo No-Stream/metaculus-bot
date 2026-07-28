@@ -1356,6 +1356,66 @@ class TestProvenanceGate:
         assert result.telemetry.quote_mismatch_warnings == 0
 
     @pytest.mark.asyncio
+    async def test_glyph_separated_sentences_ground_per_span(self) -> None:
+        """Two separately-quoted sentences joined by a SPACE must ground per-span
+        when both are verbatim in the source but separated there by other text.
+
+        Regression: the split recognized only an ellipsis, so a glyph-joined pair
+        was tested as one contiguous substring and could never match — the source
+        has "Methods: ..." between the two sentences. In the 2026-07-28 prod run
+        this fired 8 times, all false positives, on exactly this Pearce-Raftery
+        abstract shape. The split therefore runs on the RAW quote: normalization
+        deletes the glyphs that mark the boundary.
+        """
+        fake_llm = FakeLlm(
+            [
+                _response(tool_calls=[_plan_call()]),
+                _response(tool_calls=[_tool_call("s1", "search_web", {"query": "lifespan"})]),
+                _response(
+                    tool_calls=[
+                        _tool_call(
+                            "rec1",
+                            "record_findings",
+                            {
+                                "findings": [
+                                    _finding(
+                                        "https://agency.example/report",
+                                        quote=(
+                                            "“Background: We consider the problem of quantifying the human "
+                                            "lifespan using a statistical approach that probabilistically "
+                                            "forecasts the maximum reported age at death (MRAD) through 2100.” "
+                                            "“We estimate the probabilities that a person lives to at least age "
+                                            "126, 128, or 130 this century, as 89%, 44%, and 13%, respectively.”"
+                                        ),
+                                    )
+                                ]
+                            },
+                        )
+                    ]
+                ),
+                _response(tool_calls=[_tool_call("done1", "conclude")]),
+            ]
+        )
+        search = _search_returning(
+            "https://agency.example/report abstract: Background: We consider the problem of quantifying the "
+            "human lifespan using a statistical approach that probabilistically forecasts the maximum "
+            "reported age at death (MRAD) through 2100. Methods: We fit a Bayesian hierarchical model to "
+            "records from 19 countries. Results: We estimate the probabilities that a person lives to at "
+            "least age 126, 128, or 130 this century, as 89%, 44%, and 13%, respectively."
+        )
+
+        result = await run_agentic_loop(
+            "system",
+            "briefing with no URLs",
+            [_tool_spec("search_web", search)],
+            _config(max_conclude_gate_rejections=0),
+            llm_call=fake_llm,
+        )
+
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
     async def test_ellipsis_joined_quote_grounds_per_span(self) -> None:
         """An ellipsis-joined quote grounds when EVERY span appears in the tool
         contents, so the driver's documented eliding style is not a false alarm.
