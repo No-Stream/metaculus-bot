@@ -148,4 +148,20 @@ class TestPlistSurvivesOneBadWake:
         with _PLIST.open("rb") as handle:
             plist = plistlib.load(handle)
         # Otherwise every assertion above could pass while launchd runs something else.
-        assert plist["ProgramArguments"] == [str(_RUN_SYNC)]
+        #
+        # SUFFIX, not equality, and do not "tighten" this back: the plist is a
+        # machine-specific launchd artifact carrying an absolute path to the operator's
+        # checkout (launchd has no notion of a repo-relative path), while _RUN_SYNC is
+        # derived from __file__. Comparing them for equality passes only on the machine
+        # that wrote the plist and can never pass in CI, where the checkout lives
+        # somewhere else — which is exactly how this test shipped red (CI run
+        # 30321344705, 2026-07-27).
+        program_arguments = plist["ProgramArguments"]
+        assert len(program_arguments) == 1, f"expect a bare wrapper invocation, got {program_arguments}"
+        invoked = program_arguments[0]
+        assert invoked.startswith("/"), f"launchd requires an absolute program path, got {invoked!r}"
+        wrapper_suffix = _RUN_SYNC.relative_to(_REPO_ROOT).as_posix()
+        assert invoked.endswith(wrapper_suffix), (
+            f"the plist must invoke {wrapper_suffix} — the wrapper whose contents the rest of this "
+            f"class asserts on — under whatever absolute prefix the install machine uses; got {invoked!r}"
+        )
