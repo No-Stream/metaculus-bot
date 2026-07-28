@@ -17,10 +17,15 @@ file when present.
 
 Faithfulness invariant
 ----------------------
-A record is only included when every public per-model parser returns IDENTICAL
-output on the shrunken comment and on the original. A miniature that parses
-differently from its source would make the test guard a fiction, so the check is
-a hard filter rather than a warning.
+A record is only included when every parser in ``parser_outputs`` returns
+IDENTICAL output on the shrunken comment and on the original. A miniature that
+parses differently from its source would make the test guard a fiction, so the
+check is a hard filter rather than a warning.
+
+``parse_per_model_reasoning_text`` is public but deliberately OUT of scope: the
+redaction below exists to elide rationale prose, which is exactly what that
+parser returns, so it necessarily diverges on every record. Its key set is
+preserved; only the bodies shrink.
 
 Redaction
 ---------

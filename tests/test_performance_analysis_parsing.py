@@ -861,8 +861,11 @@ _PERF_DATA_PATH = Path(__file__).parent.parent / "scratch" / "performance_data.j
 
 # Checked-in miniature: one record per distinct comment shape, distilled from the
 # big pull by ``scripts/derive_mini_comment_fixture.py`` under a hard invariant —
-# every public per-model parser returns identical output on the miniature and on
-# its full-size source. This is the DETERMINISTIC CI floor for the same
+# every parser in ``parser_outputs`` returns identical output on the miniature and
+# on its full-size source. (``parse_per_model_reasoning_text`` is public but out
+# of scope by design: the shrink elides rationale prose, which is what it returns,
+# so it diverges on every record while its key set survives.)
+# This is the DETERMINISTIC CI floor for the same
 # assertions, so the attribution guard runs on every PR instead of only for
 # whoever happens to have pulled the big file. ``.jsonl`` (not ``.json``)
 # because ``.gitignore`` carries a repo-wide ``*.json`` rule with no negations.
