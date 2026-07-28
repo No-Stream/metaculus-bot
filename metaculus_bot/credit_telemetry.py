@@ -26,6 +26,31 @@ total spend on a limit-bearing key. Per-run spend therefore comes from the
 as the fallback for uncapped keys (personal: ``limit_remaining`` is null and
 spend does land in ``usage``).
 
+THE PERSONAL KEY'S PER-RUN DELTA IS A LOWER BOUND, AND THE CAUSE IS SETTLEMENT
+LAG — NOT BYOK. Worth stating flatly because the BYOK paragraph above is the
+wrong explanation for it and misled two separate investigations: on the personal
+key ``usage`` genuinely does climb ($154.58 -> $160.24 over 2026-07-20..27), so
+nothing is hiding in ``byok_usage``. What happens is that OpenRouter has not
+booked the run's spend by the time the end snapshot fires, seconds after the last
+call. Measured over ``backtests/telemetry_archive/credit_balance.jsonl``, 178
+paired personal-key runs: the within-run deltas summed to $3.31 against $5.66 of
+true lifetime-usage growth (58% captured), and 160 of 178 runs reported exactly
+$0.00. The missing $2.35 is fully accounted for by the gap between each run's
+``phase=end`` usage and the NEXT run's ``phase=start`` usage — $3.31 + $2.35 =
+$5.66 exactly. The money is late, not lost.
+
+There is deliberately no wait-and-re-read here. The earliest CONFIRMED settlement
+in the archive is 153s after the end snapshot and the median is ~25 minutes, so a
+delay short enough to sit in cli.main's ``finally`` (where telemetry must never
+stall a run) is below anything the data can show would work — it would be an
+unverifiable guess that also slowed every run. Instead the marker states its own
+source (``source=usage_delta_unsettled``) and a sibling
+``CREDIT_SPEND_UNSETTLED`` WARNING says the figure is a floor, so a ``0.00`` can
+never be misread as "this run was free". The settled per-run number is recovered
+after the fact by ``scripts/reconcile_credit_spend.py``, which differences each
+run's start usage against its successor's — the only place the lag is actually
+observable.
+
 This module also owns the DRAINED-vs-REVOKED discriminator
 (``classify_donated_key_state``) that ``fallback_openrouter`` consults when a
 donated-key call fails with OpenRouter's spend-cap 403. Same endpoint, same
@@ -87,21 +112,35 @@ def _fmt(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2f}"
 
 
-def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) -> float | None:
-    """Per-run spend for one key, or None when it can't be computed.
+# How a CREDIT_SPEND delta was derived, which is what tells a reader how much to
+# trust it. Emitted as ``source=`` on the marker line.
+SPEND_SOURCE_REMAINING: str = "remaining_delta"
+SPEND_SOURCE_USAGE: str = "usage_delta_unsettled"
+SPEND_SOURCE_NONE: str = "unavailable"
 
-    Prefers the ``limit_remaining`` drop (start - end): on limit-bearing keys
-    it is the only field that includes BYOK-routed spend (see module docstring).
-    Falls back to the ``usage`` delta for uncapped keys, which report no
-    ``limit_remaining`` but do accrue ``usage``.
+
+def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) -> tuple[float | None, str]:
+    """Per-run spend for one key plus the SOURCE it came from.
+
+    Returns ``(delta, source)``. The source is the point: the two branches have
+    very different trustworthiness and the number alone cannot tell them apart.
+
+    * ``remaining_delta`` (start - end) — a limit-bearing key's ``limit_remaining``
+      drop. Reliable: it is the only field covering BYOK-routed spend, which the
+      donated key routes nearly everything through.
+    * ``usage_delta_unsettled`` (end - start) — the fallback for uncapped keys,
+      which report no ``limit_remaining``. Systematically UNDER-reports, because
+      ``usage`` lags the run (see ``_run_delta_usd``'s settlement note in the module
+      docstring). A ``0.00`` from this branch does NOT mean no spend.
+    * ``unavailable`` — no start snapshot, or neither field pair is reported.
     """
     if start is None:
-        return None
+        return None, SPEND_SOURCE_NONE
     if start.remaining_usd is not None and end.remaining_usd is not None:
-        return start.remaining_usd - end.remaining_usd
+        return start.remaining_usd - end.remaining_usd, SPEND_SOURCE_REMAINING
     if start.usage_usd is not None and end.usage_usd is not None:
-        return end.usage_usd - start.usage_usd
-    return None
+        return end.usage_usd - start.usage_usd, SPEND_SOURCE_USAGE
+    return None, SPEND_SOURCE_NONE
 
 
 def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
@@ -175,6 +214,13 @@ class CreditTelemetry:
         which the donated key routes nearly everything through (``usage`` sat
         frozen at $4.16 across a $3.34 run, 2026-07-17). Uncapped keys report
         no ``limit_remaining``, so they fall back to the ``usage`` delta.
+
+        Every ``CREDIT_SPEND`` line carries ``source=`` naming which branch produced
+        it, and the ``usage``-delta branch additionally logs
+        ``CREDIT_SPEND_UNSETTLED`` — that branch systematically under-reports
+        because of settlement lag (module docstring has the measurements), so the
+        number is a floor and a ``0.00`` is not evidence of no spend.
+
         Caveats: an out-of-band top-up mid-run skews the remaining-based delta
         (rare; per-run spend is indicative anyway), and OpenRouter caches these
         values briefly — don't build on exact figures.
@@ -190,13 +236,31 @@ class CreditTelemetry:
                 _fmt(snapshot.remaining_usd),
                 _fmt(snapshot.usage_usd),
             )
-            run_delta = _run_delta_usd(self._start.get(alias), snapshot)
+            run_delta, spend_source = _run_delta_usd(self._start.get(alias), snapshot)
             logger.info(
-                "CREDIT_SPEND: key=%s run_delta_usd=%s remaining=%s",
+                "CREDIT_SPEND: key=%s run_delta_usd=%s remaining=%s source=%s",
                 alias,
                 _fmt(run_delta),
                 _fmt(snapshot.remaining_usd),
+                spend_source,
             )
+            if spend_source == SPEND_SOURCE_USAGE:
+                # Say it inline rather than only in the docs. This is the number
+                # watching the operator's monthly cap on a self-funded key, and a
+                # bare "0.00" reads as "this run was free" when it actually means
+                # "OpenRouter had not settled the spend yet". Measured across 178
+                # archived personal-key runs: the within-run deltas summed to 58% of
+                # the true growth, and 7 of 25 runs that demonstrably forecast
+                # reported exactly 0.00.
+                logger.warning(
+                    "CREDIT_SPEND_UNSETTLED: key=%s run_delta_usd=%s is a LOWER BOUND — %s reports no "
+                    "limit_remaining, so this is a lifetime-usage delta and OpenRouter has typically "
+                    "not settled the run's spend by now. Do not read 0.00 as no spend; reconcile "
+                    "against the NEXT run's phase=start usage (see scripts/reconcile_credit_spend.py).",
+                    alias,
+                    _fmt(run_delta),
+                    alias,
+                )
             if alias == "donated" and snapshot.remaining_usd is not None and snapshot.remaining_usd < self._floor_usd:
                 logger.warning(
                     "CREDIT_FLOOR_BREACH: key=donated remaining=%s floor=%s — donated OpenRouter "

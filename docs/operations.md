@@ -252,8 +252,21 @@ archive. Worth grepping in the downloaded log:
   on why a credit-shaped failure happened (`drained`, `zeroed`, `revoked`,
   `funded`, `unknown`).
 - `CREDIT_BALANCE:` / `CREDIT_SPEND:` / `CREDIT_FLOOR_BREACH:` — the per-key
-  balances at start and end, the run's spend delta, and the refill warning.
-  `CREDIT_SPEND` is the actual answer to "what did this run cost."
+  balances at start and end, the run's spend delta, and the refill warning. Read
+  `CREDIT_SPEND`'s `source=` field before trusting the number:
+  - `source=remaining_delta` (the donated key) is reliable.
+  - `source=usage_delta_unsettled` (the personal key, which reports no
+    `limit_remaining`) is a **lower bound**, and frequently `0.00` on a run that
+    spent real money — OpenRouter has usually not settled the spend by the time
+    the end snapshot fires. A `CREDIT_SPEND_UNSETTLED` warning accompanies it.
+    **Do not read `0.00` here as "this run was free."** Measured over 178
+    archived personal-key runs: the markers captured 58% of true spend and 160 of
+    178 read exactly `0.00`.
+  - For the settled per-run figure, run
+    `uv run python scripts/reconcile_credit_spend.py` (free, offline, reads the
+    telemetry archive). It differences each run's start usage against the next
+    run's, which is the only place the lagged spend is observable. The most
+    recent run has no successor yet, so it shows as unsettled until another runs.
 - `FORECASTERS_SURVIVED:` (`forecaster.py`) — the answer to "did every forecaster
   survive?", as `survived=n/N models=...`. Check it rather than inferring: the
   minimum to publish is low enough that a thinned ensemble still exits zero, and
@@ -368,7 +381,12 @@ Marker lines land in the `run_logs/` artifact (every bot workflow tees stdout +
 stderr), so per-run spend is durably grep-able:
 
 - `CREDIT_BALANCE: key=<donated|personal> phase=<start|end> remaining=... usage=...`
-- `CREDIT_SPEND: key=... run_delta_usd=... remaining=...` at end of run.
+- `CREDIT_SPEND: key=... run_delta_usd=... remaining=... source=...` at end of
+  run. `source` is `remaining_delta` (reliable), `usage_delta_unsettled` (a lower
+  bound — see the smoke-test grep list above), or `unavailable`.
+- `CREDIT_SPEND_UNSETTLED: key=... run_delta_usd=... is a LOWER BOUND ...` beside
+  every `usage_delta_unsettled` figure, so a `0.00` is never mistaken for
+  no-spend. `scripts/reconcile_credit_spend.py` recovers the settled number.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
   (`constants.py`).

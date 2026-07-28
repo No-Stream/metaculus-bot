@@ -100,8 +100,17 @@ CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=1
 CREDIT_BALANCE_SKIP_LINE = (
     PFX_WARN + "CREDIT_BALANCE: key=personal phase=start skipped (env var OPENROUTER_API_KEY not set)"
 )
+# Pre-2026-07-27 shape: no source= field. Kept verbatim because re-harvesting
+# replays these older logs, and they must still parse.
 CREDIT_SPEND_LINE = PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=120.11"
 CREDIT_SPEND_NA_LINE = PFX + "CREDIT_SPEND: key=personal run_delta_usd=n/a remaining=n/a"
+# Current shape, verbatim from credit_telemetry.log_end_and_check_floor.
+CREDIT_SPEND_REMAINING_SOURCE_LINE = (
+    PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=120.11 source=remaining_delta"
+)
+CREDIT_SPEND_UNSETTLED_SOURCE_LINE = (
+    PFX + "CREDIT_SPEND: key=personal run_delta_usd=0.00 remaining=n/a source=usage_delta_unsettled"
+)
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
     "balance needs a top-up; run completed normally. cli.main logs the resulting "
@@ -407,6 +416,26 @@ class TestCredit:
         rec = _parse_one(CREDIT_SPEND_NA_LINE)
         assert rec["run_delta_usd"] is None
         assert rec["remaining"] is None
+
+    def test_spend_source_is_captured(self):
+        rec = _parse_one(CREDIT_SPEND_REMAINING_SOURCE_LINE)
+        assert rec["source"] == "remaining_delta"
+        assert rec["run_delta_usd"] == 3.34
+
+    def test_unsettled_zero_is_distinguishable_from_a_real_zero(self):
+        # The whole point of source=. A 0.00 from the usage branch means "OpenRouter
+        # had not settled yet", NOT "this run was free" — and the delta alone cannot
+        # carry that distinction, so the archive has to.
+        rec = _parse_one(CREDIT_SPEND_UNSETTLED_SOURCE_LINE)
+        assert rec["run_delta_usd"] == 0.0
+        assert rec["source"] == "usage_delta_unsettled"
+
+    def test_pre_field_lines_parse_with_source_none(self):
+        # Back-compat: a re-harvest of an older log must not drop the record. None
+        # reads correctly as "this run predates the field", which is distinct from
+        # any of the three real source values.
+        rec = _parse_one(CREDIT_SPEND_LINE)
+        assert rec.get("source") is None
 
     def test_floor_breach(self):
         rec = _parse_one(CREDIT_FLOOR_BREACH_LINE)

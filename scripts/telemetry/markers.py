@@ -355,8 +355,17 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "credit_spend",
+        # ``source`` (added 2026-07-27) names which branch produced the delta and so
+        # how much to trust it: ``remaining_delta`` is reliable,
+        # ``usage_delta_unsettled`` is a LOWER BOUND (settlement lag — see
+        # credit_telemetry's module docstring), ``unavailable`` means no delta. The
+        # group is OPTIONAL because re-harvesting replays pre-2026-07-27 logs whose
+        # lines end at ``remaining=``; a mandatory tail would drop every one of those
+        # records on the next replace-by-run sync. Missing coerces to None, which
+        # reads correctly as "this run predates the field".
         re.compile(
             r"CREDIT_SPEND:\s*key=(?P<key>\S+)\s+run_delta_usd=(?P<run_delta_usd>\S+)\s+remaining=(?P<remaining>\S+)"
+            r"(?:\s+source=(?P<source>\S+))?"
         ),
     ),
     MarkerSpec(

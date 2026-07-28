@@ -102,8 +102,8 @@ class TestNormalDeltaLogging:
         assert "CREDIT_BALANCE: key=donated phase=start remaining=109.16 usage=4.16" in messages
         assert "CREDIT_BALANCE: key=personal phase=start remaining=n/a usage=23.41" in messages
         assert "CREDIT_BALANCE: key=donated phase=end remaining=107.93 usage=5.39" in messages
-        assert "CREDIT_SPEND: key=donated run_delta_usd=1.23 remaining=107.93" in messages
-        assert "CREDIT_SPEND: key=personal run_delta_usd=0.50 remaining=n/a" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=1.23 remaining=107.93 source=remaining_delta" in messages
+        assert "CREDIT_SPEND: key=personal run_delta_usd=0.50 remaining=n/a source=usage_delta_unsettled" in messages
 
     def test_missing_start_snapshot_yields_na_delta(self, monkeypatch, caplog) -> None:
         """Start fetch failed → end still logs balances, delta renders n/a."""
@@ -118,7 +118,7 @@ class TestNormalDeltaLogging:
 
         assert below_floor is False
         messages = [record.getMessage() for record in caplog.records]
-        assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=90.00" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=90.00 source=unavailable" in messages
 
 
 class TestRunDeltaSource:
@@ -136,7 +136,7 @@ class TestRunDeltaSource:
             telemetry.log_end_and_check_floor()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=92.22" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=92.22 source=remaining_delta" in messages
         assert "run_delta_usd=0.00" not in "\n".join(messages)
 
     def test_remaining_delta_preferred_over_usage_delta_when_both_move(self, monkeypatch, caplog) -> None:
@@ -151,7 +151,7 @@ class TestRunDeltaSource:
             telemetry.log_end_and_check_floor()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=95.00" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=95.00 source=remaining_delta" in messages
 
     def test_remaining_missing_at_one_end_falls_back_to_usage(self, monkeypatch, caplog) -> None:
         """A key whose ``limit_remaining`` is only reported at one end (e.g. a
@@ -165,7 +165,7 @@ class TestRunDeltaSource:
             telemetry.log_end_and_check_floor()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert "CREDIT_SPEND: key=donated run_delta_usd=2.50 remaining=92.00" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=2.50 remaining=92.00 source=usage_delta_unsettled" in messages
 
     def test_no_usable_fields_yields_na_delta(self, monkeypatch, caplog) -> None:
         _set_keys(monkeypatch, personal=None)
@@ -176,7 +176,7 @@ class TestRunDeltaSource:
             telemetry.log_end_and_check_floor()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=n/a" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=n/a remaining=n/a source=unavailable" in messages
 
 
 class TestCreditAlertSuppressionWindow:
@@ -282,7 +282,7 @@ class TestFloorCheck:
         # "Not reported at one end" then routes the delta through the usage fallback, the
         # same path a mid-run limit change takes — so the spend figure survives while the
         # unusable balance renders as n/a.
-        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=n/a" in messages
+        assert "CREDIT_SPEND: key=donated run_delta_usd=5.00 remaining=n/a source=usage_delta_unsettled" in messages
         assert "nan" not in "\n".join(messages)
 
     def test_personal_key_low_remaining_never_trips_floor(self, monkeypatch) -> None:
@@ -309,7 +309,54 @@ class TestFloorCheck:
 
         messages = [record.getMessage() for record in caplog.records]
         assert "CREDIT_BALANCE: key=personal phase=end remaining=n/a usage=1234.50" in messages
-        assert "CREDIT_SPEND: key=personal run_delta_usd=234.50 remaining=n/a" in messages
+        assert "CREDIT_SPEND: key=personal run_delta_usd=234.50 remaining=n/a source=usage_delta_unsettled" in messages
+
+
+class TestUnsettledSpendDisclosure:
+    """A usage-delta spend figure must announce that it is a LOWER BOUND.
+
+    The personal key reports no ``limit_remaining``, so its per-run delta comes from
+    the lifetime ``usage`` field — which OpenRouter has typically not settled by the
+    time the end snapshot fires. Measured over 178 archived personal-key runs, the
+    within-run deltas summed to 58% of true growth and 160 read exactly $0.00. Since
+    this is the only spend figure the operator has on a self-funded key, a bare
+    ``0.00`` must never be readable as "this run was free".
+    """
+
+    def test_zero_delta_on_the_usage_branch_is_flagged_unsettled(self, monkeypatch, caplog) -> None:
+        # The exact production shape: usage identical at both ends (the settlement
+        # window had not closed), which is the case that reads as free-but-wasn't.
+        _set_keys(monkeypatch, donated=None)
+        responses = {PERSONAL_KEY: [_payload(None, 160.24), _payload(None, 160.24)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=personal run_delta_usd=0.00 remaining=n/a source=usage_delta_unsettled" in messages
+        unsettled = [m for m in messages if "CREDIT_SPEND_UNSETTLED:" in m]
+        assert unsettled, "a usage-delta spend figure must be disclosed as a lower bound"
+        assert "LOWER BOUND" in unsettled[0]
+        # Points at the recovery path rather than leaving the reader stuck.
+        assert "reconcile_credit_spend" in unsettled[0]
+
+    def test_remaining_branch_is_not_flagged(self, monkeypatch, caplog) -> None:
+        """The donated key's ``limit_remaining`` delta is reliable, so it stays quiet.
+
+        Warning on every run would train the operator to ignore the line, which is
+        what makes the personal-key case invisible again.
+        """
+        _set_keys(monkeypatch, personal=None)
+        responses = {DONATED_KEY: [_payload(100.0, 4.0), _payload(97.5, 4.0)]}
+        telemetry = CreditTelemetry(floor_usd=50.0)
+        with _patch_fetch(responses), caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            telemetry.log_start()
+            telemetry.log_end_and_check_floor()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "CREDIT_SPEND: key=donated run_delta_usd=2.50 remaining=97.50 source=remaining_delta" in messages
+        assert not [m for m in messages if "CREDIT_SPEND_UNSETTLED:" in m]
 
 
 class TestFetchFailureHandling:
