@@ -746,3 +746,21 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
             f"required provider {provider!r} did not report 'ok' in diagnostics — a provider dep may have broken:\n{text}"
         )
     assert ": errored" not in text, f"a research provider errored (swallowed by the orchestrator):\n{text}"
+
+    # Survivor count is stated POSITIVELY in the log. Before FORECASTERS_SURVIVED
+    # existed, the only line naming a survivor count was on the failure path and
+    # fired only below MIN_FORECASTERS_TO_PUBLISH — which is 1, so a 1-of-3 publish
+    # exited zero and read identically to a healthy 3-of-3. The count reached only
+    # the published Metaculus comment, never stdout, so an operator reading a run
+    # log had to count EXTRACTION_RUNG lines and dedupe model slugs to infer it.
+    survived_lines = [m for m in messages if "FORECASTERS_SURVIVED:" in m]
+    assert survived_lines, "no FORECASTERS_SURVIVED telemetry — the survivor count is not in the log"
+    configured = len(bot._forecaster_llms)
+    assert any(f"survived={configured}/{configured}" in m for m in survived_lines), (
+        f"expected a full-ensemble survivor line (survived={configured}/{configured}); got: {survived_lines}"
+    )
+    # The models= field must name the survivors, so a reader can diff them against
+    # FORECASTER_DROPS without cross-referencing the comment.
+    assert any("models=" in m and m.split("models=")[1].strip() for m in survived_lines), (
+        f"FORECASTERS_SURVIVED must name the surviving models: {survived_lines}"
+    )

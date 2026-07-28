@@ -559,6 +559,47 @@ class TestForecasterDrops:
         assert json.loads(rec["detail"]) == {}
 
 
+# Verbatim from metaculus_bot/forecaster.py:_research_and_make_predictions — the
+# positive per-question counterpart to FORECASTER_DROPS above.
+FORECASTERS_SURVIVED_FULL_LINE = (
+    PFX + "FORECASTERS_SURVIVED: question=70002 survived=3/3 models=claude-opus-4.8,gemini-3.1-pro-preview,gpt-5.6-sol"
+)
+FORECASTERS_SURVIVED_DEGRADED_LINE = PFX + "FORECASTERS_SURVIVED: question=14333 survived=1/3 models=gpt-5.6-sol"
+FORECASTERS_SURVIVED_UNKNOWN_LINE = PFX + "FORECASTERS_SURVIVED: question=14333 survived=2/3 models=unknown"
+
+
+class TestForecastersSurvived:
+    def test_full_ensemble_fields(self):
+        rec = _parse_one(FORECASTERS_SURVIVED_FULL_LINE)
+        assert rec["marker"] == "forecasters_survived"
+        assert rec["survived"] == 3
+        assert rec["configured"] == 3
+        assert rec["models"] == "claude-opus-4.8,gemini-3.1-pro-preview,gpt-5.6-sol"
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # forecaster.py emits question.id_of_question, not the post id — a residual
+        # join has to know which space to translate into.
+        rec = _parse_one(FORECASTERS_SURVIVED_FULL_LINE)
+        assert rec["qid"] == 70002
+        assert rec["qid_kind"] == "question_id"
+
+    def test_degraded_run_is_distinguishable_from_a_full_one(self):
+        # The whole reason the marker exists: at a low MIN_FORECASTERS_TO_PUBLISH a
+        # 1-of-3 publish exits zero, so the archive must be able to tell it apart.
+        rec = _parse_one(FORECASTERS_SURVIVED_DEGRADED_LINE)
+        assert rec["survived"] == 1
+        assert rec["configured"] == 3
+        assert rec["survived"] < rec["configured"]
+        assert rec["models"] == "gpt-5.6-sol"
+
+    def test_unknown_models_sentinel_survives_as_a_string(self):
+        # "unknown" is the fallback when no prediction carried a Model: prefix. It is
+        # NOT in _NONE_SENTINELS, so it must stay a readable string rather than None
+        # — a None here would be indistinguishable from a missing field.
+        rec = _parse_one(FORECASTERS_SURVIVED_UNKNOWN_LINE)
+        assert rec["models"] == "unknown"
+
+
 # The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
 # published comment (metaculus_bot/comment/markers.py); its durable home is the
 # comment, but the run-log parser carries a spec too (same as STACKER_OUTCOME /

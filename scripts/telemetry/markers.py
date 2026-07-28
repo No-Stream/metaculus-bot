@@ -15,6 +15,13 @@ against the ACTUAL emitted format strings (the source of truth):
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
+* ``FORECASTER_DROPS`` / ``Degradation counters`` — ``metaculus_bot/forecaster.py``
+  (per-RUN summaries: which models dropped and why, and the counter set that
+  decides CI color)
+* ``FORECASTERS_SURVIVED`` — ``metaculus_bot/forecaster.py``
+  ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
+  drop marker above is silent on a healthy question, and its comment-side twin
+  ``FORECASTERS_USED`` never reaches stdout)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
@@ -248,6 +255,26 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"FORECASTER_DROPS:\s*total=(?P<total>\S+)\s+systematic=(?P<systematic>\S+)\s+detail=(?P<detail>\{.*\})\s*$"
         ),
+    ),
+    MarkerSpec(
+        "forecasters_survived",
+        # The POSITIVE per-question counterpart to forecaster_drops above, emitted by
+        # forecaster.py's _research_and_make_predictions once the survivor set is
+        # known. Unlike the ``forecasters_used`` HTML marker further down — which
+        # carries the same count but lives in the published COMMENT and so is
+        # effectively never in a run log — this one is on stdout, which makes
+        # historical survivor counts queryable from the telemetry archive alone.
+        #
+        # ``models`` is a comma-joined slug list; OpenRouter slugs contain no spaces,
+        # so ``\S+`` takes the whole field. It is deliberately NOT in _RAW_FIELDS: a
+        # comma-joined string coerces to itself (``coerce_value`` only converts
+        # numeric-looking text), and the "unknown" sentinel is not in
+        # _NONE_SENTINELS, so it survives verbatim either way.
+        re.compile(
+            r"FORECASTERS_SURVIVED:\s*question=(?P<question>\S+)\s+survived=(?P<survived>\d+)/(?P<configured>\d+)"
+            r"\s+models=(?P<models>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
     ),
     MarkerSpec(
         "degradation_counters",

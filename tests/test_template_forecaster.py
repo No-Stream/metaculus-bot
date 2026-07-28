@@ -628,6 +628,58 @@ async def test_exception_dropped_forecaster_counts_as_degradation(mock_binary_qu
 
 
 @pytest.mark.asyncio
+async def test_degraded_publish_states_its_survivor_count_in_the_log(mock_binary_question, mock_general_llm, caplog):
+    """A degraded publish must SAY it was degraded, in the run log.
+
+    This is the case the marker exists for. At a ``min_forecasters_to_publish`` of 1
+    a 1-of-2 publish is a success: it exits zero, and the only line that had ever
+    named a survivor count fires solely BELOW the minimum, so it stays silent. The
+    count reached just the published Metaculus comment (``FORECASTERS_USED``), which
+    is never logged. So the operator reading a run log could not tell a thinned
+    ensemble from a healthy one without counting ``EXTRACTION_RUNG`` lines and
+    deduping model slugs.
+
+    Asserts the SURVIVED count and the configured total, so a degraded run is
+    self-evidently degraded from one grep.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm, mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+    bot._get_notepad = AsyncMock(
+        return_value=MagicMock(total_research_reports_attempted=0, total_predictions_attempted=0)
+    )
+    bot.run_research = AsyncMock(return_value="mock research")
+
+    call_count = {"n": 0}
+
+    async def one_raises(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # The "Model:" prefix is what _make_prediction stamps in production, and
+            # what the marker reads to name survivors.
+            return ReasonedPrediction(prediction_value=0.5, reasoning="Model: openrouter/openai/gpt-5.6-sol\n\nok")
+        raise AssertionError("message.content was None")
+
+    bot._forecaster_with_soft_deadline = cast(Any, one_raises)
+
+    with caplog.at_level("INFO"):
+        result = await bot._research_and_make_predictions(mock_binary_question)
+
+    assert len(result.predictions) == 1
+    survived = [m for m in (r.getMessage() for r in caplog.records) if "FORECASTERS_SURVIVED:" in m]
+    assert survived, "a degraded publish emitted no survivor-count line"
+    assert any("survived=1/2" in m for m in survived), f"expected survived=1/2 on a 1-of-2 publish; got: {survived}"
+    # Names the survivor, not the roster: reporting the configured models here would
+    # relabel this degraded run as full.
+    assert any("models=gpt-5.6-sol" in m for m in survived), f"expected only the survivor named; got: {survived}"
+
+
+@pytest.mark.asyncio
 async def test_soft_deadline_timeout_counted_once_through_gather(
     mock_binary_question, mock_general_llm, monkeypatch: pytest.MonkeyPatch
 ):

@@ -254,6 +254,12 @@ archive. Worth grepping in the downloaded log:
 - `CREDIT_BALANCE:` / `CREDIT_SPEND:` / `CREDIT_FLOOR_BREACH:` — the per-key
   balances at start and end, the run's spend delta, and the refill warning.
   `CREDIT_SPEND` is the actual answer to "what did this run cost."
+- `FORECASTERS_SURVIVED:` (`forecaster.py`) — the answer to "did every forecaster
+  survive?", as `survived=n/N models=...`. Check it rather than inferring: the
+  minimum to publish is low enough that a thinned ensemble still exits zero, and
+  the failure-path "Only n/N forecasters succeeded" line stays silent on a
+  degraded-but-published question. Anything below `n == N` means a model dropped,
+  and `FORECASTER_DROPS` names which and why.
 
 The general telemetry markers under "Reading run logs" below apply too; those
 are just the money-shaped ones.

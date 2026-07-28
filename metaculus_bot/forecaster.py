@@ -872,6 +872,34 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # equal to the number of per-model summary bullets across all report sections.
         self._contributing_forecasters[qid_for_log] += n_valid
 
+        # Positive survivor count, in the RUN LOG. Everything else that knows this
+        # number is either conditional or off-stdout: the "Only n/N forecasters
+        # succeeded" line fires only BELOW min_forecasters_to_publish (which the
+        # constant now permits to be low enough that zero survivors are needed to
+        # trip it), and the count above reaches the published Metaculus comment as
+        # FORECASTERS_USED, which is never logged. So a degraded publish exited zero
+        # and read identically to a healthy one — an operator checking "did every
+        # forecaster survive?" had to count EXTRACTION_RUNG lines and dedupe model
+        # slugs to infer it. Emitted unconditionally so the healthy case is stated
+        # rather than implied by the absence of a warning.
+        #
+        # models= is the deliberate symmetry with FORECASTER_DROPS's detail=: names on
+        # both sides let a reader diff survivors against drops from the log alone.
+        # Read off each prediction's own "Model: ..." prefix (stamped in
+        # _make_prediction) rather than self._forecaster_llms, because the roster
+        # lists CONFIGURED models and the survivors are a subset — reporting the
+        # roster here would relabel a degraded run as full.
+        survivor_models = sorted(
+            filter(None, (extract_model_display_name_from_reasoning(pred.reasoning) for pred in valid_predictions))
+        )
+        logger.info(
+            "FORECASTERS_SURVIVED: question=%s survived=%d/%d models=%s",
+            qid_for_log,
+            n_valid,
+            len(self._forecaster_llms),
+            ",".join(survivor_models) if survivor_models else "unknown",
+        )
+
         # Single-forecaster short-circuit. When MIN_FORECASTERS_TO_PUBLISH permits it, a
         # question can survive on one forecaster, but the spread metrics
         # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
