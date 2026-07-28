@@ -10,6 +10,7 @@ from typing import Any, Literal
 from forecasting_tools import MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
     METACULUS_CUP_ID,
@@ -20,7 +21,7 @@ from metaculus_bot.constants import (
     credit_alerts_active,
     env_flag_enabled,
 )
-from metaculus_bot.credit_telemetry import CreditTelemetry
+from metaculus_bot.credit_telemetry import CreditTelemetry, get_probed_donated_key_state
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
     get_credit_key_fallback_count,
@@ -76,6 +77,12 @@ def main() -> None:
     # metaculus_bot/fetch_hardening.py for rationale (a single transient
     # 403/429/5xx would otherwise kill the whole run).
     apply_fetch_hardening()
+
+    # One-shot, unauthenticated identity check before any mode sends the token.
+    # See metaculus_bot/api_preflight.py (DNS-parking incident): aborts non-zero
+    # if www.metaculus.com isn't answered by the real API, so we never leak
+    # METACULUS_TOKEN to a hijacked host.
+    verify_metaculus_api_identity()
 
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(
@@ -192,7 +199,8 @@ def main() -> None:
     # MIN_FORECASTERS_TO_PUBLISH is on Metaculus regardless of exit status.
     # Non-zero exit here just triggers the GitHub Actions red-check alert so
     # the operator knows to investigate (forecaster drops, stacker fallback
-    # usage, research provider timeouts, etc. — see main.py `alertable_count`).
+    # usage, research provider failures, etc. — see
+    # `forecaster.py` `alertable_count`).
     bot_alertable = template_bot.alertable_count
     # Donated->personal key fallback: counted in fallback_openrouter at the
     # wrapper level (process-global, since the wrapper has no link back to the
@@ -211,31 +219,48 @@ def main() -> None:
     # keeps its full weight, because 401/404/429/guardrail each mean real
     # breakage. Each event is still counted exactly once: generic adds it, and at
     # most one subset subtracts it.
+    #
+    # ``credit_fallback`` counts only the SUPPRESSIBLE credit subset — the
+    # donated key genuinely drained. A key that was revoked or re-capped to zero
+    # returns the same "Key limit exceeded" text but is classified separately by
+    # ``fallback_openrouter.is_suppressible_credit_error`` (which probes
+    # /auth/key), so it stays inside the generic total and keeps this run red.
     alerts_active = credit_alerts_active()
     generic_fallback = get_generic_key_fallback_count()
     donated_404 = get_donated_404_fallback_count()
     credit_fallback = get_credit_key_fallback_count()
     suppressed_credit_fallback = 0 if alerts_active else credit_fallback
     alertable = bot_alertable + generic_fallback - suppressed_credit_fallback
+
+    suppression_note = (
+        ""
+        if alerts_active
+        else f" with {suppressed_credit_fallback} credit event(s) suppressed until "
+        f"{CREDIT_ALERT_RESUME_DATE.isoformat()}"
+    )
+    # Only rendered when a spend-cap failure actually made the wrapper probe the
+    # donated key. Omitted otherwise, because "unknown" would read as a failed
+    # probe rather than "no run this shape ever needed one".
+    probed_donated_key_state = get_probed_donated_key_state()
+    donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
+    # One breakdown, both exit paths. The green path needs it as much as the red
+    # one: when every donated-key call fell back and the credit subset cancels the
+    # whole generic total, ``alertable`` is 0 — the exact shape of the 2026-07-26
+    # drained-key run — and gating this line on the exit status would leave that
+    # run's degradation and probe verdict entirely unrecorded.
+    breakdown = (
+        f"Run completed with {alertable} alertable degradation event(s) "
+        f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
+        f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
+    )
     if alertable > 0:
-        suppression_note = (
-            ""
-            if alerts_active
-            else f" with {suppressed_credit_fallback} credit event(s) suppressed until "
-            f"{CREDIT_ALERT_RESUME_DATE.isoformat()}"
-        )
-        logger.warning(
-            "Run completed with %d alertable degradation event(s) "
-            "(bot=%d, personal_key_fallback=%d of which donated_404=%d, credit=%d%s); "
-            "exiting non-zero so CI marks this run red.",
-            alertable,
-            bot_alertable,
-            generic_fallback,
-            donated_404,
-            credit_fallback,
-            suppression_note,
-        )
+        logger.warning("%s exiting non-zero so CI marks this run red.", breakdown)
         sys.exit(1)
+    if generic_fallback > 0:
+        # Reachable only under suppression with every fallback credit-caused (the
+        # subtraction can't otherwise reach zero from a positive total), so state
+        # that rather than leaving a reader to derive it from the arithmetic.
+        logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
     # already logged by credit_telemetry). The run completed and published

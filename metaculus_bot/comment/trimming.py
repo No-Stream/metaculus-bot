@@ -12,6 +12,8 @@ from metaculus_bot.constants import (
     RESEARCH_SECTION_CHAR_LIMIT,
     SUMMARY_SECTION_CHAR_LIMIT,
 )
+from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
+from metaculus_bot.research.provider_diagnostics import PROVIDER_DIAGNOSTICS_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,41 @@ _MODEL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^Model:[ \t]*[^\n]*$
 _JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```json\b.*?```", re.DOTALL)
 
 
+def _pin_summarizer_banner(text: str, limit: int, notice: str) -> tuple[str, bool]:
+    """Header + degradation banner + trimmed tail, for a research section carrying
+    the summarizer soft-fail banner.
+
+    The plain header-preserving trim keeps header + TAIL, which drops the banner —
+    and a summarizer soft-fail is itself what pushes a bundle over the research
+    budget (raw articles run longer than the briefing), so the banner was most likely
+    dropped precisely on the questions where it fired. Pinning it mirrors what
+    ``_trim_single_body`` already does for each rationale's ``Model:`` line: keep the
+    few bytes that carry the disclosure, sacrifice prose.
+
+    The banner is located by search rather than assumed to lead the body: the
+    orchestrator prepends it to the AskNews provider's own text, so in an assembled
+    bundle it sits after that provider's ``## News Articles (AskNews)`` header, not
+    at the body's first byte.
+
+    Returns ``(text, False)`` when the section carries no banner or the budget can't
+    seat header + banner + notice, so the caller falls back to the plain trim.
+    """
+    stripped = text.lstrip("\n")
+    header, separator, remainder = stripped.partition("\n")
+    if not separator:
+        return text, False
+    banner_idx = remainder.find(SUMMARIZER_SOFT_FAIL_BANNER)
+    if banner_idx < 0:
+        return text, False
+
+    after_banner = remainder[banner_idx + len(SUMMARIZER_SOFT_FAIL_BANNER) :]
+    # header + \n + banner + \n + notice + \n + tail -> 3 joining newlines.
+    tail_available = limit - len(header) - len(SUMMARIZER_SOFT_FAIL_BANNER) - len(notice) - 3
+    if tail_available <= 0:
+        return text, False
+    return f"{header}\n{SUMMARIZER_SOFT_FAIL_BANNER}\n{notice}\n{after_banner[-tail_available:]}", True
+
+
 def _section_budget(section_name: str, cfg: TrimConfig) -> tuple[int, bool]:
     """Map a comment section name to its ``(char_limit, block_aware)`` policy.
 
@@ -138,7 +175,11 @@ def trim_section(text: str, section_name: str, *, config: TrimConfig | None = No
     if block_aware:
         trimmed, did_trim = _trim_rationales_within_blocks(text, limit, cfg.notice)
     else:
-        trimmed, did_trim = _trim_with_notice(text, limit, cfg.notice, preserve_header=True)
+        # A summarizer-degradation banner is pinned ahead of the tail; every other
+        # section shape falls through to the plain header-preserving trim.
+        trimmed, did_trim = _pin_summarizer_banner(text, limit, cfg.notice) if len(text) > limit else (text, False)
+        if not did_trim:
+            trimmed, did_trim = _trim_with_notice(text, limit, cfg.notice, preserve_header=True)
     if did_trim:
         logger.warning(
             "Trimmed section '%s' from %s to %s characters",
@@ -412,6 +453,14 @@ def _trim_research_section_first(text: str, cfg: TrimConfig) -> tuple[str, bool]
     research_body = text[research_match.end() : forecasts_match.start()]
     tail = text[forecasts_match.start() :]  # "# FORECASTS" onward (incl. markers)
 
+    # The provider-diagnostics block is APPENDED to the research body, so keeping
+    # only the front drops it — and with it the ``lost=summarizer:error(...)`` token
+    # that names which source degraded. It is the one part of the research body that
+    # is bounded and non-narrative, so pin it after the kept front rather than
+    # letting front-truncation decide whether the reader learns what was lost.
+    diagnostics_idx = research_body.find(PROVIDER_DIAGNOSTICS_HEADER)
+    pinned_diagnostics = "" if diagnostics_idx < 0 else research_body[diagnostics_idx:].rstrip("\n")
+
     notice = cfg.notice
     fixed = len(head) + len(research_header) + len(tail)
 
@@ -424,7 +473,19 @@ def _trim_research_section_first(text: str, cfg: TrimConfig) -> tuple[str, bool]
     if research_budget < 0:
         return text, False
 
-    kept_research = research_body[:research_budget].rstrip("\n") if research_budget > 0 else ""
+    # Reserve the pinned block (plus its own joining newline) out of the research
+    # budget. When it cannot fit, drop the pin rather than the whole strategy — a
+    # trimmed comment without the diagnostics line still beats deferring to
+    # summary_and_tail, which discards the entire research body.
+    pin_reservation = len(pinned_diagnostics) + 1 if pinned_diagnostics else 0
+    if pin_reservation >= research_budget:
+        pinned_diagnostics = ""
+        pin_reservation = 0
+    front_budget = research_budget - pin_reservation
+
+    kept_research = research_body[:front_budget].rstrip("\n") if front_budget > 0 else ""
+    if pinned_diagnostics:
+        kept_research = f"{kept_research}\n{pinned_diagnostics}" if kept_research else pinned_diagnostics
     trimmed = f"{head}{research_header}\n{notice}\n{kept_research}\n{tail}"
     return trimmed, True
 

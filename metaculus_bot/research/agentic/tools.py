@@ -30,6 +30,7 @@ from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS, MAX_REDIRECTS, REDIRECT_STATUSES, read_body_capped
+from metaculus_bot.research.url_context_telemetry import extract_url_context_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,8 @@ _READ_DOCUMENT_TIMEOUT_S = 60.0
 # Client-side HTTP ceilings sized just UNDER the tools' loop budgets so the
 # underlying socket is torn down before the loop's asyncio.wait_for fires — a
 # hung endpoint then frees its slot instead of pinning it to the wall deadline.
-_EXA_HTTP_TIMEOUT_S = 18.0  # search_web ToolSpec budget is 20s
-_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # read_document internal deadline is 60s (_READ_DOCUMENT_TIMEOUT_S)
+_EXA_HTTP_TIMEOUT_S = 18.0  # under search_web's ToolSpec timeout_s in build_gap_fill_tools
+_READ_DOCUMENT_HTTP_TIMEOUT_MS = 55_000  # under _READ_DOCUMENT_TIMEOUT_S, read_document's own deadline
 _EXA_RETRY_DELAYS_S = (1.0, 4.0)
 _EXA_GLOBAL_SEMAPHORE = asyncio.Semaphore(4)
 # Process-global cap on concurrent headless Chromium launches. Module-level, so
@@ -403,7 +404,13 @@ async def _call_asknews_search(query: str) -> list[Any]:
                     return list(response.as_dicts or [])
                 except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
                     last_exc = exc
-                    if not _is_rate_limited_error(exc) and not research_providers.is_asknews_subscription_error(exc):
+                    # Transient-only retry, matching the primary provider's ``_is_retryable``
+                    # (``providers.py``). The 403011 subscription-inactive error is PERMANENT —
+                    # off-season billing, not throttling — so it must NOT be exempted here: re-rolling
+                    # it burns the whole ``ASKNEWS_MAX_TRIES`` ladder of ``ASKNEWS_BACKOFF_SECS``
+                    # sleeps (a double-digit fraction of GAP_FILL_V2_WALL_DEADLINE, since the sleep
+                    # below grows as 3**attempt) on a call that can never succeed.
+                    if not _is_rate_limited_error(exc):
                         msg = str(exc).lower()
                         if "concurrency limit" not in msg:
                             raise
@@ -869,7 +876,15 @@ def _build_document_prompt(ask: str) -> str:
     )
 
 
-def _run_document_read_sync(url: str, ask: str) -> str:
+def _run_document_read_sync(url: str, ask: str) -> tuple[str, int]:
+    """Read ``url`` via Gemini url_context. Returns ``(text, n_url_retrievals_that_succeeded)``.
+
+    The retrieval count is returned, not discarded, because the text alone cannot tell a
+    real document read from a fluent answer out of parametric memory — Gemini produces
+    both happily, and ``read_document`` grants the highest verification tier the artifact
+    renderer has. Same reader the grounded-search provider uses for the same reason (see
+    ``research/url_context_telemetry``).
+    """
     from google import genai  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
     from google.genai import types as genai_types  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
 
@@ -888,7 +903,8 @@ def _run_document_read_sync(url: str, ask: str) -> str:
         contents=f"{_build_document_prompt(ask)}\n\nURL: {url}",
         config=config,
     )
-    return _stringify(getattr(response, "text", "")) or ""
+    _, _, n_url_success, _ = extract_url_context_telemetry(response)
+    return (_stringify(getattr(response, "text", "")) or "", n_url_success)
 
 
 async def search_news(query: str) -> ToolOutcome:
@@ -955,16 +971,39 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
 
 
 async def read_document(url: str, ask: str) -> ToolOutcome:
+    """Read a document via Gemini url_context, granting the ``fetched`` tier only on a real read.
+
+    ``method="document"`` maps to the ``fetched`` tier (``loop._METHOD_TO_TIER``), which is
+    the highest authority the artifact renderer has: only a ``fetched`` discrepancy enters
+    the SUPERSEDE block that tells every forecaster to override the briefing. So a
+    fluent-but-ungrounded answer here is the Q38195 failure mode with a bigger blast
+    radius, and the quote check can't catch it — it is deliberately WARN-only for this
+    tool (paraphrase and ellipsis-joined quotes make a hard gate too false-positive-prone).
+
+    Hence the retrieval-count guard below, mirroring the grounded-chunk floor
+    ``gemini_search`` already applies: zero successful url_context retrievals withholds the
+    tier exactly like the empty-text guard does, rather than laundering parametric recall
+    as a primary-source read.
+    """
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
     try:
-        text = await asyncio.wait_for(
+        text, n_url_success = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask), timeout=_READ_DOCUMENT_TIMEOUT_S
         )
     except asyncio.TimeoutError:
         return _format_fetch_error("Document read timed out.", method="document")
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")
+    if n_url_success == 0:
+        # Greppable, mirroring gemini_search's GEMINI_UNGROUNDED_SUPPRESSED so the rate is
+        # measurable from the archived run logs.
+        logger.warning(f"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url={url}")
+        return _format_fetch_error(
+            f"Document read retrieved no URL content: Gemini's url_context tool fetched nothing from {url}, "
+            "so any answer would be unsourced recall rather than a read of the document.",
+            method="document",
+        )
     return ToolOutcome(content_markdown=text, method="document")
 
 
@@ -994,8 +1033,8 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             description=FETCH_DESCRIPTION,
             parameters=_FETCH_PARAMETERS,
             handler=_fetch_with_topic,
-            # 60s fetch budget + headroom for the rung-3 document auto-escalation
-            # (read_document's internal timeout is 60s).
+            # Sits above _READ_DOCUMENT_TIMEOUT_S so the rung-3 document
+            # auto-escalation has room to fire and return inside this budget.
             timeout_s=90,
         ),
         ToolSpec(

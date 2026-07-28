@@ -24,6 +24,11 @@ from metaculus_bot.config import load_environment
 
 OPENROUTER_AUTH_KEY_URL = "https://openrouter.ai/api/v1/auth/key"
 
+# Default request timeout for the balance lookup. Generous because the CLI and the
+# start/end run telemetry can afford to wait; callers on a latency-sensitive path
+# (the mid-run donated-key probe in credit_telemetry) pass a shorter one.
+AUTH_KEY_REQUEST_TIMEOUT_S = 15.0
+
 KEY_SPECS: dict[str, tuple[str, str]] = {
     # alias -> (env_var_name, display_label)
     "donated": ("OAI_ANTH_OPENROUTER_KEY", "Donated key (OAI_ANTH_OPENROUTER_KEY)"),
@@ -49,17 +54,18 @@ def _format_usd(value: Any) -> str:
         return str(value)
 
 
-def fetch_auth_key(api_key: str) -> dict[str, Any]:
+def fetch_auth_key(api_key: str, *, timeout: float = AUTH_KEY_REQUEST_TIMEOUT_S) -> dict[str, Any]:
     """Hit /api/v1/auth/key and return the parsed ``data`` payload.
 
     Raises ``httpx.HTTPStatusError`` on non-2xx responses so the caller can
     surface a friendly message. Shared with ``metaculus_bot.credit_telemetry``
-    (the per-run balance logging in cli.main) — one endpoint, one parser.
+    (the per-run balance logging in cli.main and the mid-run donated-key state
+    probe) — one endpoint, one parser. The endpoint is free and read-only.
     """
     response = httpx.get(
         OPENROUTER_AUTH_KEY_URL,
         headers={"Authorization": f"Bearer {api_key}"},
-        timeout=15.0,
+        timeout=timeout,
     )
     response.raise_for_status()
     payload = response.json()

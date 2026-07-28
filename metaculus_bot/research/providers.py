@@ -33,6 +33,9 @@ from metaculus_bot.constants import (
     EXA_API_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_RESEARCH_MODEL,
+    PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
+    PERPLEXITY_WALL_TIMEOUT,
     RESEARCH_PROVIDER_ENV,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
@@ -50,8 +53,35 @@ logger = logging.getLogger(__name__)
 
 
 _ASKNEWS_GLOBAL_SEMAPHORE: asyncio.Semaphore | None = None
-_ASKNEWS_RATE_LOCK: asyncio.Lock = asyncio.Lock()
+_ASKNEWS_RATE_LOCK: asyncio.Lock | None = None
 _ASKNEWS_LAST_CALL_TS: float = 0.0
+
+
+def _get_asknews_rate_lock() -> asyncio.Lock:
+    """Get-or-create the process-wide lock guarding the AskNews RPS gate.
+
+    Lazy purely for CONSISTENCY with ``get_asknews_semaphore`` below, which owns the
+    identical lifecycle two lines away. Both are process-wide asyncio primitives for
+    the same provider; having one built at import and the other lazily was a
+    difference with no reason behind it, and the import-time one is the shape that
+    can bind to a loop that later dies.
+
+    Honest scope: I could not construct a failing case against THIS gate.
+    ``asyncio.Lock`` binds to the running loop when it first creates a future, and a
+    lock left HELD at loop close does wedge later loops with "is bound to a different
+    event loop" — reproduced in isolation, where a cancelled holder left a waiter
+    queued. But driving the real ``_asknews_rate_gate`` the same way, a second
+    ``asyncio.run`` succeeds: the cancellation releases the lock before the loop
+    closes, so it rebinds cleanly. So this is a latent-shape cleanup, not a fix for an
+    observed failure, and it is deliberately not paired with a staleness check —
+    detecting a stale binding needs a private ``_get_loop`` probe that reads clean in
+    exactly the case that later fails, so the check would be reassuring rather than
+    effective.
+    """
+    global _ASKNEWS_RATE_LOCK
+    if _ASKNEWS_RATE_LOCK is None:
+        _ASKNEWS_RATE_LOCK = asyncio.Lock()
+    return _ASKNEWS_RATE_LOCK
 
 
 async def _asknews_rate_gate() -> None:
@@ -59,7 +89,7 @@ async def _asknews_rate_gate() -> None:
     if ASKNEWS_MAX_RPS <= 0:
         return
     min_interval = 1.0 / ASKNEWS_MAX_RPS
-    async with _ASKNEWS_RATE_LOCK:
+    async with _get_asknews_rate_lock():
         now = time.monotonic()
         wait = _ASKNEWS_LAST_CALL_TS + min_interval - now
         if wait > 0:
@@ -124,7 +154,11 @@ def _asknews_provider() -> ResearchCallable:
         tries = max(1, int(ASKNEWS_MAX_TRIES))
         backoff = float(ASKNEWS_BACKOFF_SECS)
 
-        # Retry helper: only retry on known transient rate/concurrency errors
+        # Retry helper: only retry on known transient rate/concurrency errors.
+        # Text-matched on purpose, unlike the LLM paths that read ``llm_status_code``:
+        # the AskNews SDK raises its own ``asknews_sdk.errors`` classes carrying a
+        # ``.code`` (429000 / 429001 / 403011) and never subclasses ``openai.APIError``,
+        # so a status-based primitive reads None here and would disable this retry.
         def _is_retryable(err: Exception) -> bool:
             msg = str(err).lower()
             return ("429" in msg) or ("rate limit" in msg) or ("concurrency limit" in msg)
@@ -320,11 +354,25 @@ def _exa_provider(default_llm: GeneralLlm) -> ResearchCallable:
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
-        model_name = "openrouter/perplexity/sonar-reasoning-pro" if use_open_router else "perplexity/sonar-pro"
+        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
         # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
         # kept to pin provider-default sampling against a future default flip. No top_p.
-        model = GeneralLlm(model=model_name, temperature=None)
+        # allowed_tries=1 hands the retry budget to the gated wrapper below; left
+        # unpinned it inherited forecasting-tools' default of 2 with an un-gated
+        # random.uniform(5, 10) tenacity sleep.
+        #
+        # No explicit api_key, unlike the near-identical builder in
+        # ``ResearchOrchestrator._call_perplexity`` which passes
+        # ``get_openrouter_api_key(model_name)``. Equivalent TODAY and only by
+        # coincidence: perplexity is not in ``DONATED_KEY_PROVIDERS``, so that helper
+        # returns ``OPENROUTER_API_KEY``, which litellm also reads straight from the
+        # environment. It stops being equivalent the moment perplexity becomes
+        # donated-key-eligible, at which point this call site silently keeps billing
+        # the personal key while the orchestrator's switches. The real fix is to
+        # collapse the two builders (forge flagged the duplication); until then, don't
+        # "clean up" this asymmetry by deleting the orchestrator's api_key argument.
+        model = GeneralLlm(model=model_name, temperature=None, allowed_tries=1)
         # Exclude prediction markets research when benchmarking to avoid data leakage
         prediction_markets_instruction = (
             "" if is_benchmarking else "In addition to news, consider all relevant prediction markets.\n"
@@ -336,7 +384,11 @@ def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = 
             "Do not produce forecasts yourself. Provide data for the superforecaster.\n\n"
             f"Question:\n{question.question_text}"
         )
-        return await model.invoke(prompt)
+        return await invoke_with_transient_retry(
+            lambda: model.invoke(prompt),
+            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
+            label="perplexity_research",
+        )
 
     return _fetch
 
@@ -389,8 +441,10 @@ def build_native_search_llm(
         # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
         # 2026-05-20 incident) won't be cured by retrying the same call, and
         # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
-        # bounding the budget. With allowed_tries=1 + wait_for(420s), worst
-        # case is ~7 min instead of timeout(360s) * default_tries(3) ~18 min.
+        # bounding the budget. With allowed_tries=1 the worst case is one
+        # NATIVE_SEARCH_WALL_TIMEOUT window instead of forecasting-tools'
+        # default ``allowed_tries`` multiplied by NATIVE_SEARCH_TIMEOUT (which
+        # resets per HTTP request).
         allowed_tries=1,
         plugins=[{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
         web_search_options={"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
@@ -543,7 +597,7 @@ def choose_provider_with_name(
 
 
 # OpenAI native search tags every citation URL with `?utm_source=openai`; it is
-# pure tracking noise fanned into 6 forecaster prompts + the published comment.
+# pure tracking noise fanned into every forecaster prompt + the published comment.
 # Match the param wherever it sits in the query string, capturing the leading
 # separator and an optional trailing `&` so removal keeps the query well-formed.
 _UTM_SOURCE_OPENAI_RE = re.compile(r"([?&])utm_source=openai\b(&)?")

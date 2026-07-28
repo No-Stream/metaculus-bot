@@ -170,3 +170,72 @@ async def test_rps_gate_sleeps_before_historical_call(
     # We expect both the explicit inter-call sleep and ~2.0s RPS sleep
     assert any(s > 0 for s in sleep_calls)
     assert any(abs(s - 2.0) < 1e-6 for s in sleep_calls)
+
+
+class TestRateGateLockLifecycle:
+    """The RPS gate's lock is created lazily, matching the semaphore beside it.
+
+    Both are process-wide asyncio primitives for the same provider, and
+    ``get_asknews_semaphore`` already owned a lazy get-or-create; the lock did not.
+    That asymmetry had no reason behind it, and the import-time shape is the one that
+    can bind to a loop which later dies.
+
+    Scope note, so a reader doesn't over-trust this class: the failure an import-time
+    ``asyncio.Lock`` can cause — "is bound to a different event loop" after a lock is
+    left HELD at loop close — is real and reproducible in isolation, but NOT reachable
+    through this gate. Driving the real ``_asknews_rate_gate`` that way, a second
+    ``asyncio.run`` succeeds, because the cancellation releases the lock before the
+    loop closes and a released lock rebinds cleanly. So these tests pin the lifecycle
+    that was made consistent, and deliberately do not claim to reproduce a bug.
+    """
+
+    def test_the_gate_works_across_two_event_loops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two real ``asyncio.run`` calls, with no reset of the lock between them.
+
+        Passes both before and after the change — recorded as such rather than dressed
+        up as a regression test. Its value is pinning that the lazy accessor did not
+        BREAK cross-loop reuse, which a naive "recreate every call" implementation
+        would have (each loop would get its own lock and the RPS gate would stop
+        serializing).
+        """
+        import asyncio
+
+        import metaculus_bot.research.providers as rp
+
+        monkeypatch.setattr(rp, "_ASKNEWS_RATE_LOCK", None, raising=False)
+        monkeypatch.setattr(rp, "_ASKNEWS_LAST_CALL_TS", 0.0, raising=False)
+        monkeypatch.setattr(rp, "ASKNEWS_MAX_RPS", 1000.0, raising=False)
+
+        async def _contend() -> None:
+            await asyncio.gather(*(rp._asknews_rate_gate() for _ in range(4)))
+
+        asyncio.run(_contend())
+        first_lock = rp._ASKNEWS_RATE_LOCK
+        assert first_lock is not None, "using the gate must have created the lock"
+
+        asyncio.run(_contend())
+
+        assert rp._ASKNEWS_RATE_LOCK is first_lock, (
+            "the gate must keep ONE process-wide lock; a per-call lock would silently stop serializing AskNews calls"
+        )
+
+    def test_lock_is_not_created_at_import(self) -> None:
+        """A fresh import must leave the lock unbound.
+
+        The only test here that discriminates: reintroducing
+        ``_ASKNEWS_RATE_LOCK = asyncio.Lock()`` at module scope fails this (verified by
+        mutation) even though nothing contends.
+        """
+        import importlib
+
+        import metaculus_bot.research.providers as rp
+
+        reloaded = importlib.reload(rp)
+        try:
+            assert reloaded._ASKNEWS_RATE_LOCK is None, (
+                "the RPS lock must be created lazily by _get_asknews_rate_lock, not at import"
+            )
+        finally:
+            # Leave the module in its normal state for the rest of the session; other
+            # tests monkeypatch attributes on this module object.
+            importlib.reload(rp)

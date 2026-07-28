@@ -96,27 +96,34 @@ to the message list, so the brief acts as a stable prompt-cache prefix.
 ## The four tools
 
 Built by `tools.py` `build_gap_fill_tools`. Each returns a `ToolOutcome`
-(content markdown, links, a `method` tag, a status, a truncation flag).
+(content markdown, links, a `method` tag, a status, a truncation flag). Each
+also carries its own per-call timeout, set as `timeout_s` on its `ToolSpec` in
+`build_gap_fill_tools` and scaled to how heavy the tool is; the loop enforces it
+and turns a breach into an error `ToolOutcome` rather than a crash.
 
 - **`search_news`** — recent and historical news via AskNews, using the same
   rate gate and concurrency semaphore as the primary AskNews provider. Returns a
-  digest of matching articles with dates and URLs. Tool timeout 90s.
+  digest of matching articles with dates and URLs.
 - **`search_web`** — semantic web search via Exa (direct SDK, not OpenRouter).
   Meant for official documents, datasets, reports, and primary sources the
   driver believes exist. Returns results with URLs and excerpts, which the
   driver is told to follow up with `fetch` since excerpts rarely verify a claim
-  on their own. Tool timeout 20s.
+  on their own. The lightest of the four, and the one on the tightest timeout.
 - **`fetch`** — fetch a URL and return its main content as markdown plus
   outbound links. This is an auto-escalating ladder (detailed below), so the
   driver is told not to avoid a URL because of its format. Supports windowed
   reads: over-cap content is truncated with a `start_char=N` marker, and
-  continuations are served from cache. Tool timeout 90s.
+  continuations are served from cache. Its `ToolSpec` timeout leaves headroom
+  above its own fetch budget for the rung-3 document auto-escalation.
 - **`read_document`** — ask a specific question of a specific document. Gemini
   reads the URL directly via the `url_context` tool on the native `google-genai`
   SDK, handling PDFs, images, and JS pages. Slower and costlier than `fetch`, so
   it is for targeted extraction from long or complex documents, or as a fallback
-  when `fetch` was blocked. Requires a precise `ask`. Tool timeout 70s
-  (Gemini's own read timeout is 60s).
+  when `fetch` was blocked. Requires a precise `ask`. Its deadlines nest: the
+  `ToolSpec` timeout sits above Gemini's own read timeout
+  (`_READ_DOCUMENT_TIMEOUT_S` in `tools.py`), which in turn sits above the HTTP
+  timeout handed to the SDK, so the innermost one fires first and the driver gets
+  a clean error outcome instead of a tool-level kill.
 
 ### The fetch ladder
 
@@ -130,8 +137,8 @@ escalates when the lighter one comes up short:
    resolver, and a bounded manual redirect loop that re-guards every hop.
    Trafilatura extracts the main text.
 3. **Headless Chromium** (`_try_rendered_fetch`). If plain extraction returns
-   too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`, default 500), the
-   ladder re-fetches with Playwright's headless Chromium to run JavaScript. The
+   too little text (below `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches
+   with Playwright's headless Chromium to run JavaScript. The
    SSRF guard is re-applied to every request Chromium makes. If Playwright isn't
    installed, this rung logs a one-time warning and the plain result stands.
 4. **read_document.** If the URL turns out to be a PDF or an image (by content
@@ -172,11 +179,13 @@ lint is rejected rather than banked, and the rejection is fed back to the driver
 in the tool result so it can rephrase. The `lint_rejections` counter tracks how
 often this happens.
 
-The driver records findings through two internal tools the loop exposes
-alongside the four research tools: `record_findings` (bank findings mid-run) and
-`conclude` (finish the loop, optionally banking final findings and leaving
-pending leads). Both run their input through the same validation and detachment
-lint.
+Alongside the four research tools, the loop exposes its own internal ones
+(`_INTERNAL_TOOL_NAMES` in `loop.py`): `set_research_plan` registers the dry
+run's ranked gaps, and external tool calls come back as a nudge to plan first
+until it has run; `record_findings` banks findings mid-run; `conclude` finishes
+the loop, optionally banking final findings and leaving pending leads. The two
+findings tools run their input through the same validation and detachment lint.
+Internal calls don't count against the tool-call budget.
 
 ## The ghost forecast (telemetry only)
 
@@ -186,31 +195,40 @@ structured forecast block. This is the "ghost forecast." It is never shown to
 the panel and never published. It exists so the run logs carry a signal of what
 a forecast built purely on v2's research would have looked like, which is useful
 for evaluating driver quality. The ghost phase runs only when the driver
-concluded explicitly (not when the deadline cut it off) and has its own 60s
-timeout. The parsed result is logged as a `GHOST_FORECAST` marker.
+concluded explicitly (not when the deadline cut it off) and is bounded by its own
+`asyncio.wait_for` in `loop.py`, so a slow ghost call can't eat into the run.
+
+`_run_ghost_phase` logs the parsed result twice: a lossy human-readable
+`GHOST_FORECAST` line kept byte-identical for the already-harvested archive, and
+an additive `GHOST_FORECAST_JSON` line carrying the complete forecast (every
+percentile, not just the median) so `scripts/score_ghosts.py` can score numeric
+ghosts. The JSON line is suppressed when no structured block parsed. The turn-one
+plan emits the same pair as `GHOST_PRE` / `GHOST_PRE_JSON`
+(`_set_research_plan_tool`) from the driver's pre-research dry run, so the
+pre-versus-post delta measures whether v2's own research moved its own view.
 
 ## The bounds
 
 The loop is anytime: it always emits whatever it has banked, even when it runs
-out of budget. Three limits bound it (defaults in `constants.py`, overridable by
-the matching env vars):
+out of budget. Three limits bound it:
 
-- **Wall deadline** `GAP_FILL_V2_WALL_DEADLINE` = 540s. A hard ceiling on the
-  whole loop, enforced by an outer `asyncio.wait_for`. It sits inside v1's
-  worst-case timing envelope, so running v2 concurrently with v1 adds no
-  research-phase wall-clock.
-- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` = 14. Parallel calls each
-  count against this cap. Steps, not calls, are where latency lives, so batching
-  is encouraged.
-- **Max steps** = 20 (`LoopConfig.max_steps` default; the seam doesn't override
-  it). A step is one driver turn.
+- **Wall deadline** `GAP_FILL_V2_WALL_DEADLINE` (`constants.py`, env-overridable).
+  A hard ceiling on the whole loop, enforced by an outer `asyncio.wait_for`. It
+  sits inside v1's worst-case timing envelope, so running v2 concurrently with v1
+  adds no research-phase wall-clock.
+- **Max tool calls** `GAP_FILL_V2_MAX_TOOL_CALLS` (`constants.py`,
+  env-overridable). Parallel calls each count against this cap. Steps, not calls,
+  are where latency lives, so batching is encouraged.
+- **Max steps** — `LoopConfig.max_steps`, which the seam doesn't override, so
+  this one lives on the dataclass rather than in `constants.py` and takes no env
+  var. A step is one driver turn.
 
-There is also a **conclude threshold** `GAP_FILL_V2_CONCLUDE_THRESHOLD` = 90s.
-Once fewer than this many seconds remain, or the tool-call cap is hit, the loop
-stops offering the research tools and exposes only `record_findings` and
-`conclude`, which forces the driver to wrap up inside the wall deadline. A
-budget line is appended to every tool result so the driver always knows how much
-room it has left.
+There is also a **conclude threshold** `GAP_FILL_V2_CONCLUDE_THRESHOLD`. Once
+fewer than that many seconds remain, or the tool-call cap is hit, `_tool_schemas`
+stops offering the research tools and exposes only the internal ones
+(`_INTERNAL_TOOL_NAMES`), which forces the driver to wrap up inside the wall
+deadline. A budget line is appended to every tool result so the driver always
+knows how much room it has left.
 
 The loop also does light stuck-detection: an exact-duplicate tool call (same
 tool, same normalized arguments) bumps a `dup_tool_calls` counter and gets a
@@ -252,15 +270,21 @@ Every run that reaches the loop emits one INFO line to the run logs
 (`loop.py` `_log_completion`):
 
 ```
-GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=... rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=... wall_s=... findings=... pending_leads=... lint_rejections=...
+GAP_FILL_V2: model=... steps=... tool_calls=... searches=... fetches=... rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=... wall_s=... findings=... pending_leads=... lint_rejections=... provenance_rejections=... quote_mismatch_warnings=... plan_gaps=... plan_skipped=... conclude_gate_rejections=... error=...
 ```
 
 `searches` sums `search_news` and `search_web`; `rendered` counts fetches that
 went all the way to the headless-Chromium rung; `reads` counts `read_document`
 calls; `concluded_early` is true when the driver called `conclude` before the
-deadline. This marker is grep-able in the durable `run_logs/` artifacts every
-workflow tees, so the driver can be vibe-evaluated after the fact without
-pulling any research-archive JSON.
+deadline. `error` carries the `repr` of whatever tripped the loop's catch-all
+soft-fail and is `None` on both a healthy run and a deadline hit, which makes it
+the one field that separates a step-zero crash from an idle run — the two emit
+otherwise byte-identical `steps=0 tool_calls=0 findings=0` lines. Everything from
+`provenance_rejections` onward postdates the original marker, so
+`scripts/telemetry/markers.py` wraps that tail in optional regex groups and still
+harvests pre-branch archived logs that end at `lint_rejections`. This marker is
+grep-able in the durable `run_logs/` artifacts every workflow tees, so the driver
+can be vibe-evaluated after the fact without pulling any research-archive JSON.
 
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
 actually ran, the orchestrator captures `{transcript, telemetry}` through it and
@@ -289,16 +313,20 @@ All flags are read in `constants.py`. The enable flag uses the standard
 `env_flag_enabled` helper, so it is off unless explicitly set to
 `true`/`1`/`yes`.
 
-| Env var | Default | What it controls |
-| --- | --- | --- |
-| `GAP_FILL_V2_ENABLED` | off | Master switch. On in all four workflow yamls since 2026-07-17. |
-| `GAP_FILL_V2_DRIVER_MODEL` | `openai/gpt-5.6-terra` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
-| `GAP_FILL_V2_DRIVER_EFFORT` | `low` | Driver reasoning effort. |
-| `GAP_FILL_V2_READER_MODEL` | `gemini-3.5-flash` | The `read_document` backend model on the native google-genai path. |
-| `GAP_FILL_V2_MAX_TOOL_CALLS` | 14 | Tool-call budget. |
-| `GAP_FILL_V2_WALL_DEADLINE` | 540.0 | Hard wall for the whole loop, in seconds. |
-| `GAP_FILL_V2_CONCLUDE_THRESHOLD` | 90.0 | Seconds-remaining threshold below which only `conclude` is offered. |
-| `GAP_FILL_V2_MIN_CONTENT_CHARS` | 500 | Extracted-char floor below which `fetch` escalates plain HTTP to headless Chromium. |
+Defaults are deliberately not reproduced here — read them off the definitions in
+`constants.py`, which is the only copy that cannot go stale.
+
+| Env var | What it controls |
+| --- | --- |
+| `GAP_FILL_V2_ENABLED` | Master switch. Off unless set; on in all four workflow yamls since 2026-07-17. |
+| `GAP_FILL_V2_DRIVER_MODEL` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
+| `GAP_FILL_V2_DRIVER_EFFORT` | Driver reasoning effort. |
+| `GAP_FILL_V2_READER_MODEL` | The `read_document` backend model on the native google-genai path. |
+| `GAP_FILL_V2_MAX_TOOL_CALLS` | Tool-call budget. |
+| `GAP_FILL_V2_MAX_GAPS` | Ranked gaps `set_research_plan` accepts; the excess is dropped from the low-relevance end. Independent of v1's `GAP_FILL_MAX_GAPS`. |
+| `GAP_FILL_V2_WALL_DEADLINE` | Hard wall for the whole loop, in seconds. |
+| `GAP_FILL_V2_CONCLUDE_THRESHOLD` | Seconds-remaining threshold below which only `conclude` is offered. |
+| `GAP_FILL_V2_MIN_CONTENT_CHARS` | Extracted-char floor below which `fetch` escalates plain HTTP to headless Chromium. |
 
 The driver and reader run on separate credentials. The driver goes through
 litellm/OpenRouter with donated-key-first routing (all eval candidates were
@@ -307,8 +335,8 @@ OpenAI/Anthropic models). The `read_document` reader uses the personal
 `search_news` (AskNews) use their own personal keys.
 
 One caveat worth flagging for operators: `GAP_FILL_V2_READER_MODEL`'s default id
-(`gemini-3.5-flash`) is noted in the constants file as unverified on the native
-AI Studio SDK. A wrong id soft-fails `read_document` (model-not-found becomes an
+is noted in the constants file as unverified on the native AI Studio SDK. A wrong
+id soft-fails `read_document` (model-not-found becomes an
 error outcome), which silently disables the directed-reading rung without
 breaking anything else. If `read_document` never seems to work, check the reader
 model id first.

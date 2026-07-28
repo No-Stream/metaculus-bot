@@ -100,8 +100,17 @@ CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=1
 CREDIT_BALANCE_SKIP_LINE = (
     PFX_WARN + "CREDIT_BALANCE: key=personal phase=start skipped (env var OPENROUTER_API_KEY not set)"
 )
+# Pre-2026-07-27 shape: no source= field. Kept verbatim because re-harvesting
+# replays these older logs, and they must still parse.
 CREDIT_SPEND_LINE = PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=120.11"
 CREDIT_SPEND_NA_LINE = PFX + "CREDIT_SPEND: key=personal run_delta_usd=n/a remaining=n/a"
+# Current shape, verbatim from credit_telemetry.log_end_and_check_floor.
+CREDIT_SPEND_REMAINING_SOURCE_LINE = (
+    PFX + "CREDIT_SPEND: key=donated run_delta_usd=3.34 remaining=120.11 source=remaining_delta"
+)
+CREDIT_SPEND_UNSETTLED_SOURCE_LINE = (
+    PFX + "CREDIT_SPEND: key=personal run_delta_usd=0.00 remaining=n/a source=usage_delta_unsettled"
+)
 CREDIT_FLOOR_BREACH_LINE = (
     PFX_WARN + "CREDIT_FLOOR_BREACH: key=donated remaining=45.00 floor=50.00 — donated OpenRouter "
     "balance needs a top-up; run completed normally. cli.main logs the resulting "
@@ -408,6 +417,26 @@ class TestCredit:
         assert rec["run_delta_usd"] is None
         assert rec["remaining"] is None
 
+    def test_spend_source_is_captured(self):
+        rec = _parse_one(CREDIT_SPEND_REMAINING_SOURCE_LINE)
+        assert rec["source"] == "remaining_delta"
+        assert rec["run_delta_usd"] == 3.34
+
+    def test_unsettled_zero_is_distinguishable_from_a_real_zero(self):
+        # The whole point of source=. A 0.00 from the usage branch means "OpenRouter
+        # had not settled yet", NOT "this run was free" — and the delta alone cannot
+        # carry that distinction, so the archive has to.
+        rec = _parse_one(CREDIT_SPEND_UNSETTLED_SOURCE_LINE)
+        assert rec["run_delta_usd"] == 0.0
+        assert rec["source"] == "usage_delta_unsettled"
+
+    def test_pre_field_lines_parse_with_source_none(self):
+        # Back-compat: a re-harvest of an older log must not drop the record. None
+        # reads correctly as "this run predates the field", which is distinct from
+        # any of the three real source values.
+        rec = _parse_one(CREDIT_SPEND_LINE)
+        assert rec.get("source") is None
+
     def test_floor_breach(self):
         rec = _parse_one(CREDIT_FLOOR_BREACH_LINE)
         assert rec["marker"] == "credit_floor_breach"
@@ -559,6 +588,47 @@ class TestForecasterDrops:
         assert json.loads(rec["detail"]) == {}
 
 
+# Verbatim from metaculus_bot/forecaster.py:_research_and_make_predictions — the
+# positive per-question counterpart to FORECASTER_DROPS above.
+FORECASTERS_SURVIVED_FULL_LINE = (
+    PFX + "FORECASTERS_SURVIVED: question=70002 survived=3/3 models=claude-opus-4.8,gemini-3.1-pro-preview,gpt-5.6-sol"
+)
+FORECASTERS_SURVIVED_DEGRADED_LINE = PFX + "FORECASTERS_SURVIVED: question=14333 survived=1/3 models=gpt-5.6-sol"
+FORECASTERS_SURVIVED_UNKNOWN_LINE = PFX + "FORECASTERS_SURVIVED: question=14333 survived=2/3 models=unknown"
+
+
+class TestForecastersSurvived:
+    def test_full_ensemble_fields(self):
+        rec = _parse_one(FORECASTERS_SURVIVED_FULL_LINE)
+        assert rec["marker"] == "forecasters_survived"
+        assert rec["survived"] == 3
+        assert rec["configured"] == 3
+        assert rec["models"] == "claude-opus-4.8,gemini-3.1-pro-preview,gpt-5.6-sol"
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # forecaster.py emits question.id_of_question, not the post id — a residual
+        # join has to know which space to translate into.
+        rec = _parse_one(FORECASTERS_SURVIVED_FULL_LINE)
+        assert rec["qid"] == 70002
+        assert rec["qid_kind"] == "question_id"
+
+    def test_degraded_run_is_distinguishable_from_a_full_one(self):
+        # The whole reason the marker exists: at a low MIN_FORECASTERS_TO_PUBLISH a
+        # 1-of-3 publish exits zero, so the archive must be able to tell it apart.
+        rec = _parse_one(FORECASTERS_SURVIVED_DEGRADED_LINE)
+        assert rec["survived"] == 1
+        assert rec["configured"] == 3
+        assert rec["survived"] < rec["configured"]
+        assert rec["models"] == "gpt-5.6-sol"
+
+    def test_unknown_models_sentinel_survives_as_a_string(self):
+        # "unknown" is the fallback when no prediction carried a Model: prefix. It is
+        # NOT in _NONE_SENTINELS, so it must stay a readable string rather than None
+        # — a None here would be indistinguishable from a missing field.
+        rec = _parse_one(FORECASTERS_SURVIVED_UNKNOWN_LINE)
+        assert rec["models"] == "unknown"
+
+
 # The FORECASTERS_USED ensemble-size marker is an HTML comment injected into the
 # published comment (metaculus_bot/comment/markers.py); its durable home is the
 # comment, but the run-log parser carries a spec too (same as STACKER_OUTCOME /
@@ -572,3 +642,142 @@ class TestForecastersUsed:
         assert rec["marker"] == "forecasters_used"
         assert rec["used"] == 2
         assert rec["configured"] == 3
+
+
+# The per-run degradation summary — the single line that decides CI color, since
+# cli.py exits non-zero whenever alertable_count is positive. Copied from the
+# format string in metaculus_bot/forecaster.py (forecast_questions), the source of
+# truth. Without a spec here the archive held no record of the counter that reddens
+# every run: the 2026-07-26 research_provider_timeouts -> research_provider_failures
+# rename would have been invisible to a replay.
+DEGRADATION_COUNTERS_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4"
+)
+# Pre-rename shape (research_provider_timeouts, no summarizer_failures, and
+# prediction_market_platform_failures as the trailing key). Replace-by-run
+# re-harvesting replays these old logs, so the trailing keys are optional-group
+# wrapped — a mandatory tail would drop every pre-rename record wholesale rather
+# than harvesting the counters it does carry (same rationale as gap_fill_v2).
+DEGRADATION_COUNTERS_LEGACY_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=0, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_timeouts=5, gap_fill_v2_errors=0, prediction_market_degraded=1"
+)
+
+
+class TestDegradationCounters:
+    def test_all_ten_current_keys_parse(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["forecasters_dropped"] == 2
+        assert rec["questions_failed_to_publish"] == 0
+        assert rec["stacker_primary_failed"] == 0
+        assert rec["stacker_fallback_used"] == 0
+        assert rec["stacker_fallback_failed"] == 0
+        assert rec["research_provider_failures"] == 1
+        assert rec["summarizer_failures"] == 3
+        assert rec["gap_fill_v2_errors"] == 0
+        assert rec["prediction_market_degraded"] == 0
+        assert rec["prediction_market_source_losses"] == 4
+
+    def test_per_run_summary_carries_no_question_ref(self):
+        rec = _parse_one(DEGRADATION_COUNTERS_LINE)
+        # Aggregates a whole run, so there is no id space to stamp.
+        assert "qid" not in rec
+
+    def test_pre_rename_line_still_harvests_its_leading_counters(self):
+        # The pre-rename keys it shares with today's line must still come through;
+        # the renamed/added ones are absent rather than dropping the whole record.
+        rec = _parse_one(DEGRADATION_COUNTERS_LEGACY_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["forecasters_dropped"] == 0
+        assert rec["stacker_fallback_failed"] == 0
+        assert rec["research_provider_timeouts"] == 5
+        assert rec["gap_fill_v2_errors"] == 0
+        assert rec["prediction_market_degraded"] == 1
+        # Keys that did not exist pre-rename coerce to None, not 0 — absent must not
+        # read as "measured zero" in the archive.
+        assert rec["research_provider_failures"] is None
+        assert rec["summarizer_failures"] is None
+        assert rec["prediction_market_source_losses"] is None
+
+
+# Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py
+# _format_grounded_response). The section is suppressed and "" returned, which the
+# orchestrator records as status="empty" — not alertable and not otherwise counted,
+# so the archive is the only way to measure how often grounding silently produced
+# nothing.
+GEMINI_UNGROUNDED_LINE = PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=38195 model=gemini-3.5-flash queries=3"
+
+
+class TestGeminiUngroundedSuppressed:
+    def test_fields(self):
+        rec = _parse_one(GEMINI_UNGROUNDED_LINE)
+        assert rec["marker"] == "gemini_ungrounded_suppressed"
+        assert rec["model"] == "gemini-3.5-flash"
+        assert rec["queries"] == 3
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GEMINI_UNGROUNDED_LINE)
+        # gemini_search.py passes question.id_of_question, not the post id.
+        assert rec["qid"] == 38195
+        assert rec["qid_kind"] == "question_id"
+
+    def test_absent_qid_coerces_to_none(self):
+        # qid is Optional at the call site; "None" renders into the line verbatim.
+        rec = _parse_one(PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=None model=gemini-3.5-flash queries=0")
+        assert rec["qid"] is None
+        assert rec["queries"] == 0
+
+
+# read_document's twin of the WARN above (metaculus_bot/research/agentic/tools.py): Gemini's
+# url_context tool retrieved nothing, so the "fetched" tier is withheld rather than granting a
+# parametric-recall answer the authority to supersede the briefing for every forecaster.
+AGENTIC_DOCUMENT_UNGROUNDED_LINE = (
+    PFX_WARN + "AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=https://example.com/filing.pdf"
+)
+
+
+class TestAgenticDocumentUngroundedSuppressed:
+    def test_fields(self):
+        rec = _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)
+        assert rec["marker"] == "agentic_document_ungrounded_suppressed"
+        assert rec["url"] == "https://example.com/filing.pdf"
+
+    def test_does_not_collide_with_the_gemini_search_marker(self):
+        # Both markers end in UNGROUNDED_SUPPRESSED; each spec must claim only its own
+        # line or the archive would double-count one of them.
+        assert _parse_one(GEMINI_UNGROUNDED_LINE)["marker"] == "gemini_ungrounded_suppressed"
+        assert _parse_one(AGENTIC_DOCUMENT_UNGROUNDED_LINE)["marker"] == "agentic_document_ungrounded_suppressed"
+
+
+# Gap-fill v1 analyzer death (metaculus_bot/research/targeted.py). The analyzer gates the whole
+# pass, so its failure zeroes the addendum and reads exactly like a question with no gaps —
+# and gap-fill has no ProviderResult to carry a `lost=` token, so this marker is the signal.
+GAP_FILL_ANALYZER_FAILED_LINE = (
+    PFX_WARN + "GAP_FILL_ANALYZER_FAILED: question=44912 error=APIError detail=404 model not found"
+)
+
+
+class TestGapFillAnalyzerFailed:
+    def test_fields(self):
+        rec = _parse_one(GAP_FILL_ANALYZER_FAILED_LINE)
+        assert rec["marker"] == "gap_fill_analyzer_failed"
+        assert rec["error"] == "APIError"
+        # detail holds the exception str, which contains spaces — it must capture to EOL.
+        assert rec["detail"] == "404 model not found"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GAP_FILL_ANALYZER_FAILED_LINE)
+        assert rec["qid"] == 44912
+        assert rec["qid_kind"] == "question_id"
+
+    def test_detail_is_optional(self):
+        # Keeps older lines (and any future terser form) parseable rather than dropped.
+        rec = _parse_one(PFX_WARN + "GAP_FILL_ANALYZER_FAILED: question=None error=TimeoutError")
+        assert rec["marker"] == "gap_fill_analyzer_failed"
+        assert rec["qid"] is None
+        assert rec["error"] == "TimeoutError"

@@ -352,6 +352,43 @@ def parse_forecasters_used_marker(comment_text: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+# ---------------------------------------------------------------------------
+# Anonymous attribution keys
+#
+# When neither an explicit roster nor a ``Model:`` line identifies a forecaster,
+# the parsers below key its forecast by POSITION instead of by model. Those keys
+# are not model names, and on stacking-era comments the position-1 bucket holds
+# whatever the stacker published — so pooling them across questions silently
+# mixes stacker aggregates with base-model forecasts. Per-model cuts have to be
+# able to recognize and drop them; ``is_anonymous_model_key`` is that predicate,
+# built from the same pieces ``anonymous_model_key`` writes so a change to the
+# key format can't leave the two out of step.
+# ---------------------------------------------------------------------------
+
+_ANONYMOUS_KEY_PREFIX: str = "Forecaster "
+_ANONYMOUS_KEY_BASE_SUFFIX: str = " base"
+
+_ANONYMOUS_MODEL_KEY_RE: re.Pattern[str] = re.compile(
+    rf"\A{re.escape(_ANONYMOUS_KEY_PREFIX)}\d+(?:{re.escape(_ANONYMOUS_KEY_BASE_SUFFIX)})?\Z"
+)
+
+
+def anonymous_model_key(index: int, *, is_base_model: bool = False) -> str:
+    """Return the positional attribution key for forecaster ``index`` (1-based).
+
+    ``is_base_model=True`` returns the variant used for base-model sub-blocks
+    inside a stacker-combined body, which all share the enclosing R1 header's
+    index and so need distinguishing from the stacker's own key.
+    """
+    suffix = _ANONYMOUS_KEY_BASE_SUFFIX if is_base_model else ""
+    return f"{_ANONYMOUS_KEY_PREFIX}{index}{suffix}"
+
+
+def is_anonymous_model_key(key: str) -> bool:
+    """True when ``key`` is a positional fallback key rather than a model name."""
+    return _ANONYMOUS_MODEL_KEY_RE.match(key) is not None
+
+
 def _iter_per_model_blocks(
     comment_text: str,
     model_names: list[str] | None = None,
@@ -389,11 +426,11 @@ def _iter_per_model_blocks(
 
             stacker_name = extract_model_display_name_from_reasoning(body_lstripped)
             if stacker_name is None:
-                stacker_name = fallback_map.get(idx) or f"Forecaster {idx}"
+                stacker_name = fallback_map.get(idx) or anonymous_model_key(idx)
             yield stacker_name, stacker_meta, True
 
             for base_model_name, prose in base_sub_blocks:
-                key = base_model_name or f"Forecaster {idx} base"
+                key = base_model_name or anonymous_model_key(idx, is_base_model=True)
                 yield key, prose, False
             continue
 
@@ -404,7 +441,7 @@ def _iter_per_model_blocks(
         else:
             prose = body_lstripped.rstrip()
         if key is None:
-            key = fallback_map.get(idx) or f"Forecaster {idx}"
+            key = fallback_map.get(idx) or anonymous_model_key(idx)
         yield key, prose, False
 
 
@@ -867,7 +904,7 @@ def parse_per_model_forecasts(
         if inline_name is not None:
             key = inline_name.strip()
         else:
-            key = fallback_map.get(idx) or f"Forecaster {idx}"
+            key = fallback_map.get(idx) or anonymous_model_key(idx)
         result[key] = value
     return result
 
@@ -935,7 +972,7 @@ def parse_per_model_mc_option_probs(
         if inline_name is not None:
             key = inline_name.strip()
         else:
-            key = fallback_map.get(idx) or f"Forecaster {idx}"
+            key = fallback_map.get(idx) or anonymous_model_key(idx)
 
         # Region: the captured first-line value (group 3) plus everything
         # until the next bullet or end of summary. Group 3 matters because for

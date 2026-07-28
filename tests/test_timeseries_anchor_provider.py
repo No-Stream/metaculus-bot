@@ -25,6 +25,9 @@ Coverage (one behavior per test):
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
@@ -516,6 +519,59 @@ class TestDerivationGating:
         # bare-"average" gate matched here, and the ~$3/gal band can't be caught by bounds).
         qt = "What will the national average price of regular gasoline be on July 31, 2026?"
         assert route_question(_make_numeric_q(question_text=qt)) is None
+
+
+class TestPolitenessPacing:
+    """The politeness wait must space real requests, not just occupy worker threads.
+
+    ``_http_get`` used to open with an unconditional ``time.sleep(POLITENESS_SLEEP_S)``,
+    which was strictly worse on both counts. ``fetch_series`` runs under
+    ``asyncio.to_thread`` from two providers, so N concurrent fetches all slept in
+    parallel and then fired within milliseconds of each other (measured: 6 concurrent
+    calls, gaps of 0.000-0.009s) — no pacing at all — while each held a slot in the
+    process-wide default executor for 0.5s doing nothing. That executor is shared with
+    financial_data's fan-out, resolution_source, the agentic fetch ladder, and the
+    /auth/key probe, and a task queued behind a full pool burns its ``wait_for`` budget
+    without running, so idle sleeps convert into timeouts elsewhere.
+    """
+
+    def test_concurrent_fetches_are_actually_spaced(self, monkeypatch):
+        tf._reset_politeness_clock()
+        monkeypatch.setattr(tf, "POLITENESS_SLEEP_S", 0.05)
+        fired: list[float] = []
+        lock = threading.Lock()
+
+        def record() -> None:
+            tf._politeness_gate()
+            with lock:
+                fired.append(time.monotonic())
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for future in [pool.submit(record) for _ in range(4)]:
+                future.result()
+
+        gaps = [b - a for a, b in zip(sorted(fired), sorted(fired)[1:])]
+        assert len(gaps) == 3
+        for gap in gaps:
+            assert gap >= 0.04, f"consecutive requests must be spaced, got gaps {gaps}"
+
+    def test_a_lone_fetch_does_not_wait(self, monkeypatch):
+        # The gate is a MINIMUM INTERVAL, not a fixed toll: the common case (one fetch,
+        # or fetches already far apart) must not pay for spacing it doesn't need.
+        tf._reset_politeness_clock()
+        monkeypatch.setattr(tf, "POLITENESS_SLEEP_S", 0.5)
+        started = time.monotonic()
+        tf._politeness_gate()
+        assert time.monotonic() - started < 0.1
+
+    def test_session_reset_clears_the_pacing_clock(self):
+        # Otherwise a fresh session's (or test's) first fetch waits out the last one's
+        # interval for no reason.
+        tf._politeness_gate()
+        ts._reset_session_caches()
+        started = time.monotonic()
+        tf._politeness_gate()
+        assert time.monotonic() - started < 0.1
 
 
 # Fetch layer (real fetch_series over a faked _http_get).

@@ -10,10 +10,10 @@ A forecasting bot for Metaculus. It runs an ensemble of frontier LLMs, gathers e
 
 What's inside:
 
-- **LLM ensemble with a meta-stacker.** Six forecaster models run in parallel, then the results are combined. The default aggregation is `CONDITIONAL_STACKING`: take the MEDIAN when the models agree, and let a stacker LLM rewrite the forecast when they disagree. In production the stacker is currently turned off, so prod runs effectively use the MEDIAN. The stacker chain stays live in backtests and ablations. The forecaster roster lives in `metaculus_bot/llm_configs.py` and rotates often; it's balanced across providers (OpenAI, Anthropic, Google, xAI).
+- **LLM ensemble with a meta-stacker.** An ensemble of forecaster models runs in parallel, then the results are combined. The default aggregation is `CONDITIONAL_STACKING`: take the MEDIAN when the models agree, and let a stacker LLM rewrite the forecast when they disagree. In production the stacker is currently turned off, so prod runs effectively use the MEDIAN. The stacker chain stays live in backtests and ablations. The forecaster roster lives in `metaculus_bot/llm_configs.py` and rotates often, so read its membership there rather than from any description of it.
 - **Multi-provider research, fanned out in parallel.** AskNews is the primary news source (dual-phase search, summarized by an LLM into an analyst briefing). Running alongside it: OpenAI native web search (an OpenAI model with web access via OpenRouter), Gemini grounded search (first-party Google Search via the `google-genai` SDK), a financial-data provider (yfinance + FRED), a prediction-market snapshot (Polymarket, Kalshi, Manifold, PredictIt), a resolution-source fetcher that reads the URLs cited in the question, and a time-series anchor that pulls historical base-rate data. Each source is turned on or off independently by an env flag.
-- **Two gap-fill research passes.** After the first research round, the bot looks for missing facts. v1 (`research/targeted.py`) has an analyzer LLM list up to five factual gaps and resolves each with a parallel web search. v2 (`research/agentic/`) runs an agentic tool loop: a driver LLM searches, fetches, and reads documents until it has what it needs, then appends a citation-only findings block. Both passes are on in production.
-- **Numeric CDF pipeline.** Each forecaster gives 13 percentiles; the bot turns them into a 201-point PCHIP CDF and enforces Metaculus's constraints (min/max step per bin, bound pinning, strictly increasing).
+- **Two gap-fill research passes.** After the first research round, the bot looks for missing facts. v1 (`research/targeted.py`) has an analyzer LLM list up to `GAP_FILL_MAX_GAPS` factual gaps and resolves each with a parallel web search. v2 (`research/agentic/`) runs an agentic tool loop: a driver LLM searches, fetches, and reads documents until it has what it needs, then appends a citation-only findings block. Both passes are on in production.
+- **Numeric CDF pipeline.** Each forecaster declares the canonical percentile set (`STANDARD_PERCENTILES` in `metaculus_bot/numeric/config.py`); the bot turns them into a PCHIP CDF on the `PCHIP_CDF_POINTS` grid and enforces Metaculus's constraints (min/max step per bin, bound pinning, strictly increasing).
 - **Backtest-first benchmarking.** Scores the bot's predictions against real question resolutions on binary, numeric, and multiple-choice questions (`backtest.py`).
 - **Credit telemetry.** Logs OpenRouter balance and spend per run, and flags when the shared donated key drops below a refill floor (`metaculus_bot/credit_telemetry.py`, `make check_credits`).
 
@@ -91,7 +91,7 @@ What's inside:
 - **`stacking.py`** / **`aggregation_strategies.py`** — the aggregation strategies (`MEAN` / `MEDIAN` / `STACKING` / `CONDITIONAL_STACKING`).
 - **`spread_metrics.py`** — per-question-type disagreement metric that triggers conditional stacking.
 - **`prompts.py`** — base, stacking, gap-fill, and targeted-research prompts.
-- **`numeric/`** — `pipeline.py`, `pchip_cdf.py`, `tail_widening.py`: the percentile → 201-point CDF pipeline.
+- **`numeric/`** — `pipeline.py`, `pchip_cdf.py`, `tail_widening.py`: the percentile → PCHIP CDF pipeline.
 - **`comment/`** — `formatting.py`, `markers.py`, `trimming.py`: assembles the comment published to Metaculus.
 - **`ensemble_analysis/`** — offline correlation and ensemble-simulation tooling.
 - **`probabilistic_tools/`** + **`tool_runner.py`** — deterministic probability math over structured forecaster JSON blocks. Wired but off in production (gated by `PROBABILISTIC_TOOLS_ENABLED`).
@@ -169,7 +169,7 @@ PERPLEXITY_API_KEY=...        # optional research fallback
 
 Each research source is turned on independently. The four production workflows set these; for local runs add whichever you want to `.env`.
 
-- `NATIVE_SEARCH_ENABLED` — OpenAI native web search via OpenRouter (default model `openai/gpt-5.6-terra`, see `constants.py`).
+- `NATIVE_SEARCH_ENABLED` — OpenAI native web search via OpenRouter (default model `NATIVE_SEARCH_DEFAULT_MODEL` in `constants.py`; `NATIVE_SEARCH_MODEL` overrides it).
 - `GEMINI_SEARCH_ENABLED` — Gemini grounded search via Google AI Studio (needs `GOOGLE_API_KEY`).
 - `FINANCIAL_DATA_ENABLED` — yfinance + FRED for financial/economic questions (needs `FRED_API_KEY`).
 - `PREDICTION_MARKETS_ENABLED` — prediction-market snapshot (suppressed during backtests to avoid leakage).
@@ -183,8 +183,8 @@ A few knobs also route Gemini traffic and control timeouts. `GEMINI_USE_DONATED_
 
 ### Model and aggregation configuration
 
-- **Models:** `metaculus_bot/llm_configs.py` is the single source of truth for the six forecasters, the stacker and its fallback, the disagreement analyzer, the summarizer/researcher, and the parser. It rotates frequently.
-- **Aggregation:** `CONDITIONAL_STACKING` by default (set in `metaculus_bot/cli.py`). Disagreement thresholds live in `metaculus_bot/constants.py` (binary 0.15 probability range, MC 0.20 max option spread, numeric 0.15 normalized percentile spread). Stacking is disabled across all production workflows via `*_STACKING_ENABLED=false`, so prod effectively runs the MEDIAN.
+- **Models:** `metaculus_bot/llm_configs.py` is the single source of truth for the forecaster roster, the stacker and its fallback, the disagreement analyzer, the summarizer/researcher, and the parser. It rotates frequently.
+- **Aggregation:** `CONDITIONAL_STACKING` by default (set in `metaculus_bot/cli.py`). Disagreement thresholds live in `metaculus_bot/constants.py`, one per question type: `CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD` (a probability range), `CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD` (a max per-option spread), and `CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD` (a normalized percentile spread). Stacking is disabled across all production workflows via `*_STACKING_ENABLED=false`, so prod effectively runs the MEDIAN.
 - **Provider:** OpenRouter, with automatic fallback from the donated key to the personal key on credit or routing errors.
 
 ## Development
@@ -230,7 +230,7 @@ metaculus-bot/
 │   ├── research/                   # providers, orchestrator, gemini_search, financial_data,
 │   │                               #   prediction_market, resolution_source, timeseries_anchor,
 │   │                               #   targeted (v1 gap-fill), agentic/ (v2 gap-fill), persistence
-│   ├── numeric/                    # pipeline, pchip_cdf, tail_widening — percentiles → 201pt CDF
+│   ├── numeric/                    # pipeline, pchip_cdf, tail_widening — percentiles → PCHIP CDF
 │   ├── comment/                    # formatting, markers, trimming — published-comment assembly
 │   ├── ensemble_analysis/          # offline correlation + ensemble simulation
 │   ├── probabilistic_tools/        # deterministic prob math (gated off in prod)

@@ -76,12 +76,14 @@ from forecasting_tools.ai_models import general_llm as ft_general_llm
 from litellm.files.main import ModelResponse
 from litellm.types.utils import Choices, Message, Usage
 
+from metaculus_bot.credit_telemetry import reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm
 from metaculus_bot.llm_configs import FORECASTER_LLMS
 from metaculus_bot.research.agentic import llm as agentic_llm
 from metaculus_bot.research.agentic.types import LoopConfig
 from metaculus_bot.research.providers import build_native_search_llm
 from metaculus_bot.structured_parse import PercentileListWrapper, _build_constrained_llm
+from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 # Our production reasoning-config shapes, pinned literally so a reader sees the
 # exact values and the tests stay non-vacuous even if the roster rotates.
@@ -393,6 +395,41 @@ class TestFallbackOpenRouterKeySwap:
         calls = _install_acompletion(
             monkeypatch,
             script=[Exception("429 Too Many Requests"), "PERSONAL-KEY ANSWER"],
+        )
+
+        out = await llm.invoke("hi")
+
+        assert out == "PERSONAL-KEY ANSWER"
+        assert [c["api_key"] for c in calls] == ["donated-key", "personal-key"]
+
+    async def test_key_limit_exceeded_403_falls_back_to_personal_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The 2026-07-26 production failure, driven at the acompletion boundary.
+
+        OpenRouter reports a drained per-key spend cap as HTTP 403 with
+        "Key limit exceeded (total limit)" — not the 402 its docs promise — and
+        litellm has no 403 branch for OpenRouter, so it arrives as a bare
+        ``APIError``. The old rule vetoed any message containing "403", which the
+        ``"code":403`` field in the body supplied, so the funded personal key was
+        never tried and two of three forecasters died.
+
+        The donated key env var is cleared so the wrapper's drained-vs-revoked probe
+        classifies as UNKNOWN without touching the network. UNKNOWN is the pessimistic
+        verdict (the run stays alertable), which makes this the strictest version of
+        the assertion: routing to the personal key must not depend on the probe.
+        """
+        monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
+        reset_donated_key_state_cache()
+        llm = FallbackOpenRouterLlm(
+            model="openrouter/openai/gpt-5.6-sol",
+            primary_api_key="donated-key",
+            secondary_api_key="personal-key",
+            temperature=None,
+            timeout=480,
+            allowed_tries=1,
+        )
+        calls = _install_acompletion(
+            monkeypatch,
+            script=[Exception(PRODUCTION_KEY_LIMIT_403), "PERSONAL-KEY ANSWER"],
         )
 
         out = await llm.invoke("hi")

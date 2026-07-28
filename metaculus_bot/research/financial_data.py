@@ -25,6 +25,7 @@ from metaculus_bot.constants import (
     FINANCIAL_YFINANCE_LOOKBACK_DAYS,
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
+    MAX_FINANCIAL_IDENTIFIERS,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
@@ -138,6 +139,65 @@ def _dedupe_preserving_order(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+def _cap_identifiers(
+    tickers: list[str],
+    fred_series: list[str],
+    extracted: dict[str, list[str]],
+) -> tuple[list[str], list[str]]:
+    """Bound the total fetch set to ``MAX_FINANCIAL_IDENTIFIERS``, dropping classifier IDs first.
+
+    Each identifier becomes its own ``asyncio.to_thread``, and the fan-out was
+    previously unbounded — one over-eager classification could queue arbitrarily many
+    blocking calls into the process-wide default executor that ts_fetch,
+    resolution_source, the agentic fetch ladder, and the /auth/key probe all share.
+    Queued tasks burn their ``wait_for`` budget without executing, so the damage lands on
+    unrelated providers and other questions.
+
+    Deliberately asymmetric about WHAT it drops: URL-EXTRACTED identifiers are kept
+    unconditionally, because they are the load-bearing guarantee that the source a
+    question actually resolves on is fetched even when the classifier misroutes (the
+    invariant the merged-set bail below rests on). Only classifier-added extras are
+    trimmed, from the tail, and the drop is logged so an over-eager classification is
+    visible rather than silent.
+    """
+    total = len(tickers) + len(fred_series)
+    if total <= MAX_FINANCIAL_IDENTIFIERS:
+        return (tickers, fred_series)
+
+    extracted_tickers = set(
+        extracted["tickers"]
+    )  # HARNESS-SCAN-EXEMPT-object-explosion: short id list, not a frame column
+    extracted_fred = set(
+        extracted["fred_series"]
+    )  # HARNESS-SCAN-EXEMPT-object-explosion: short id list, not a frame column
+    budget = MAX_FINANCIAL_IDENTIFIERS - len(extracted_tickers) - len(extracted_fred)
+    dropped: list[str] = []
+
+    def keep(identifiers: list[str], protected: set[str]) -> list[str]:
+        nonlocal budget
+        kept: list[str] = []
+        for identifier in identifiers:
+            if identifier in protected:
+                kept.append(identifier)  # extracted: never dropped
+            elif budget > 0:
+                kept.append(identifier)
+                budget -= 1
+            else:
+                dropped.append(identifier)
+        return kept
+
+    kept_tickers = keep(tickers, extracted_tickers)
+    kept_fred = keep(fred_series, extracted_fred)
+    logger.warning(
+        "financial_data: capped fetch set at %d identifiers (%d requested); dropped classifier-only "
+        "IDs %s. URL-extracted IDs are never dropped.",
+        MAX_FINANCIAL_IDENTIFIERS,
+        total,
+        dropped,
+    )
+    return (kept_tickers, kept_fred)
+
+
 def _sanitize_classifier_ids(items: list[str], char_re: re.Pattern[str], kind: str) -> list[str]:
     """Drop classifier IDs that don't fully match the extraction char class (log-and-skip).
 
@@ -209,12 +269,21 @@ async def _classify_financial_question(
     classifier_llm: GeneralLlm,
     resolution_criteria: str = "",
     fine_print: str = "",
-) -> dict[str, list[str]] | None:
+) -> tuple[dict[str, list[str]] | None, str | None]:
     """Use an LLM to determine if a question involves trackable financial/economic data.
 
-    Returns {"tickers": [...], "fred_series": [...]} or None if not financial.
-    Resolution criteria / fine print are passed through so the classifier also
-    sees the resolving source (belt-and-suspenders to the deterministic extraction).
+    Returns ``(classification, error_reason)``: the classification is
+    ``{"tickers": [...], "fred_series": [...]}`` or None when the question isn't
+    financial, and ``error_reason`` is the exception type name when the call FAILED
+    (None otherwise). Resolution criteria / fine print are passed through so the
+    classifier also sees the resolving source (belt-and-suspenders to the deterministic
+    extraction).
+
+    The two None cases have to be told apart by the caller: "read as non-financial" is a
+    normal outcome, while a dead classifier (a model retirement — the 2026-05-15 grok 404
+    precedent — a schema change, a quota) is a lost source that must render on the
+    diagnostics line. They used to be indistinguishable, so a persistently broken
+    classifier looked exactly like a question with no financial angle.
     """
     try:
         prompt = CLASSIFIER_PROMPT.format(
@@ -232,11 +301,11 @@ async def _classify_financial_question(
             wall_timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
             label="financial_classifier",
         )
-    except Exception:
+    except Exception as exc:
         logger.warning("Financial classifier LLM call failed", exc_info=True)
-        return None
+        return (None, type(exc).__name__)
 
-    return _parse_classifier_response(response)
+    return (_parse_classifier_response(response), None)
 
 
 def _parse_classifier_response(response: str) -> dict[str, list[str]] | None:
@@ -551,12 +620,22 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         criteria_text = f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
         extracted = extract_financial_identifiers_from_criteria(criteria_text)
 
-        classification = await _classify_financial_question(
+        classification, classifier_error = await _classify_financial_question(
             question.question_text,
             classifier_llm,
             resolution_criteria=question.resolution_criteria or "",
             fine_print=question.fine_print or "",
         )
+        qid = getattr(question, "id_of_question", None)
+        if classifier_error is not None:
+            # Recorded HERE, above the empty-fetch-set early return below, because that
+            # return happens before the per-identifier record_provider_detail call at the
+            # end — so a dead classifier on a question with no extracted identifiers
+            # produced NO diagnostics detail at all and read as "no financial angle".
+            # A later successful record for this qid overwrites the entry, which is
+            # correct: if identifiers were still fetched, their per-source map is the
+            # fuller picture and the classifier loss shows up there instead.
+            record_provider_detail(qid, "financial_data", {"sources": {"classifier": f"error({classifier_error})"}})
 
         # Sanitize classifier IDs (F2) BEFORE they reach the fetch set, marker, or
         # unknown-flagging: they come from comma-splitting with no char validation,
@@ -574,6 +653,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
         # resolving series is in the fetch set.
         tickers = _dedupe_preserving_order(classifier_tickers + extracted["tickers"])
         fred_series = _dedupe_preserving_order(classifier_fred + extracted["fred_series"])
+        tickers, fred_series = _cap_identifiers(tickers, fred_series, extracted)
 
         # The deterministic extraction is the load-bearing guarantee: even when the
         # classifier returns None (question read as non-financial) or misroutes, the
@@ -634,7 +714,7 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
             else:
                 sources[identifier] = "empty"
 
-        record_provider_detail(getattr(question, "id_of_question", None), "financial_data", {"sources": sources})
+        record_provider_detail(qid, "financial_data", {"sources": sources})
 
         if not non_empty_results:
             return ""

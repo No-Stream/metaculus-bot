@@ -27,8 +27,27 @@ archives (both gitignored) are the only durable copies:
 
 The pullers are manual (`make sync_research` / `make sync_telemetry`, both wrapped by
 `make sync_all`), so without a scheduler the archives silently go stale and old data is
-lost. This launchd job runs the pull weekly — well inside the 90-day window, with margin
-for a missed week.
+lost. This launchd job runs the pull twice weekly — well inside the 90-day window, with
+margin for a missed run.
+
+### The 2026-06/07 silent-failure run (why the hardening below exists)
+
+Every scheduled run from 2026-06-28 through 2026-07-26 failed, and nothing said so. Three
+bugs compounded:
+
+1. **Wake race.** launchd runs a job missed while asleep at the next wake, and Wi-Fi has
+   not re-associated at that instant. The first network call died with `ConnectionError`
+   ("Network is unreachable" / `NameResolutionError`).
+2. **Wrong-order abort.** That first call was the Metaculus-comment backfill, and under
+   `set -euo pipefail` its failure aborted the recipe before a single GHA artifact
+   downloaded — a failure in the half whose data lives forever killed the half that
+   expires at 90 days.
+3. **No signal.** The failure existed only in a dated logfile nobody reads, so six weeks
+   of staleness accumulated silently.
+
+Each is now fixed independently: `run_sync.sh` waits for the network before invoking
+make, the backfill is non-fatal in the Makefile recipe, a failed run writes
+`logs/LAST_SYNC_FAILED` and fires a macOS notification, and the plist wakes twice a week.
 
 ## What it does
 
@@ -36,10 +55,15 @@ for a missed week.
 
 1. `cd`s to the repo,
 2. prepends the dirs holding `uv` and `gh` to `PATH` (launchd jobs get a minimal PATH),
-3. runs `make sync_all`, which:
+3. waits for the network — polls `https://api.github.com/` up to 30 times, 10s apart, and
+   aborts with a reported failure if it never answers (the wake race above),
+4. runs `make sync_all`, which:
    - backfills from Metaculus comments (`backfill_research_from_comments.py`) FIRST — it
      hits Metaculus, not GHA, and writes `comments_backfill.jsonl` for the research build
-     to load;
+     to load. **Non-fatal** (the recipe line is `-`-prefixed): comments stay on Metaculus
+     indefinitely, so a backfill failure must never block the expiring GHA pull. On a
+     failed backfill the research build just reads the previous run's
+     `comments_backfill.jsonl`;
    - then runs the **single-pass** driver `scripts/sync_all.py`, which enumerates EVERY
      `research-*` AND `logs-*` artifact ONCE via the complete, paginated artifacts REST
      endpoint (no 1000-result `gh run list` cap, so nothing in the 90-day window is
@@ -50,7 +74,10 @@ for a missed week.
      - run-log telemetry markers → merged into the telemetry archive (replace-by-run);
      - `raw_research_<run_id>.jsonl` raw-payload logs → one file per run under
        `backtests/research_archive/raw/` (replace-by-run);
-4. appends a dated logfile under `scripts/research_sync/logs/`.
+5. appends a dated logfile under `scripts/research_sync/logs/`, and on failure writes
+   `logs/LAST_SYNC_FAILED` (naming the stage + logfile), fires a macOS notification, and
+   exits non-zero. The sentinel is removed only on a fully green run, so it never masks a
+   recovery or outlives one.
 
 Running the driver in one pass avoids the three-pass waste of the old chain (each of the
 three standalone `sync_*` targets re-enumerated every artifact and re-downloaded the
@@ -94,7 +121,7 @@ launchctl kickstart -k gui/$(id -u)/com.metaculusbot.research-sync
 ```
 
 Then watch the dated logfile (below). This is the fastest way to confirm the job
-runs end-to-end without waiting for Sunday 03:00.
+runs end-to-end without waiting for the next scheduled wake.
 
 ## Verify it's installed and ran
 
@@ -114,10 +141,11 @@ tail -n 40 /Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/lau
 
 A healthy run ends with `research-sync finished OK at ...` and the manifest under
 `backtests/research_archive/manifest.json` updates its `latest_timestamp` values. If
-the archive looks stale, check the logfile — the download phase logs "Artifacts
-endpoint returned N total, M research-* artifacts", how many downloaded, records added,
-and (loudly) any EXPIRED artifact by name + created_at so a short pull or any data loss
-is visible.
+the archive looks stale, **check `logs/LAST_SYNC_FAILED` first** — its presence names the
+failing stage and the logfile to read. Then check the logfile itself: the download phase
+logs "Artifacts endpoint returned N total, M research-* artifacts", how many downloaded,
+records added, and (loudly) any EXPIRED artifact by name + created_at so a short pull or
+any data loss is visible.
 
 ## Verifying maximal completeness
 
@@ -136,6 +164,8 @@ artifact. Read-only and free (GitHub API only).
 
 - `scripts/research_sync/logs/sync_<YYYY-MM-DD>.log` — full `make sync_all` output, one file per run-day.
 - `scripts/research_sync/logs/launchd.out.log` / `launchd.err.log` — launchd's own capture (job-start issues).
+- `scripts/research_sync/logs/LAST_SYNC_FAILED` — present only while the most recent run
+  failed; names the stage, timestamp, and logfile. Absence means the last run was green.
 
 The `logs/` directory is created on first run.
 

@@ -10,12 +10,31 @@ from metaculus_bot.simple_types import OptionProbability
 
 
 def clamp_and_renormalize_probs(probabilities: Sequence[float]) -> list[float]:
-    """Clamp probabilities into ``[MC_PROB_MIN, MC_PROB_MAX]`` and renormalize to sum 1,
-    guaranteeing every returned value stays within the bounds.
+    """Clamp probabilities into ``[MC_PROB_MIN, MC_PROB_MAX]`` and renormalize to sum 1.
+
+    **In-bounds output is guaranteed only when ``n * MC_PROB_MIN < 1.0``** (n <= 100 at the
+    0.01 floor). Above that no in-bounds sum-1 solution exists — 101 options each at least
+    0.01 already exceed 1 — so the degenerate branch below returns a plain
+    clamp-then-renormalize whose values sit BELOW ``MC_PROB_MIN`` (verified: 200 uniform
+    options come back at 0.005 apiece; 100 uniform come back at exactly 0.01, so the
+    boundary for the uniform case is n > 100, not n >= 100). ft's validator then moves
+    them, which is the correct behavior — there is nothing better to return — but it is
+    not the unconditional guarantee this docstring used to claim.
 
     Callers construct ``PredictedOptionList`` from the result; ft 0.2.92's validator
     re-clamps to ``[0.01, 0.99]`` + renormalizes + raises when any option moves > 0.05,
-    so feeding it already-in-bounds, sum-1 values makes that validator a no-op.
+    so feeding it already-in-bounds, sum-1 values makes that validator a no-op. That
+    no-op property likewise holds only under the feasibility condition above: on a
+    high-cardinality ballot with a DOMINANT option (200 options with one at 0.9; 120 with
+    0.5/0.3) ft's re-clamp moves the dominant option by more than 0.05 and raises
+    ``ValidationError`` at construction. Uniform high-cardinality is fine even above the
+    boundary — ft clamps 0.005 up to 0.01 and renormalizes straight back to 0.005, a zero
+    net move — so the publish-time loss needs high cardinality AND concentration. It is
+    not reachable by relaxing our floor: ft clamps to its OWN hard-coded 0.01 regardless of
+    what we send, so a lower floor here changes nothing about its move (measured — for
+    n=200 ft accepts a top option up to ~0.06 and no floor choice lifts that). Metaculus MC
+    ballots are far below this cardinality in practice; see
+    tests/test_ft_pin_mc_high_cardinality.py for the pinned shapes.
 
     The naive clamp-then-divide can push a clamped option back out of bounds: when a
     dominant option keeps the post-clamp total above 1, dividing drags the floored

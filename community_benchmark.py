@@ -32,6 +32,7 @@ from forecasting_tools.data_models.questions import QuestionBasicType
 from tqdm import tqdm
 
 from metaculus_bot.aiohttp_cleanup import enable_aiohttp_session_autoclose
+from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.benchmark.bot_factory import (
     BENCHMARK_BOT_CONFIG,
     DEFAULT_HELPER_LLMS,
@@ -234,6 +235,8 @@ async def benchmark_forecast_bot(
         run_benchmark_streamlit_page()
         return
     elif mode == "run":
+        # Confirm the host is the real Metaculus before the token-sending fetch.
+        verify_metaculus_api_identity()
         api_filter = ApiFilter(
             allowed_statuses=["open"],
             allowed_types=["binary"],
@@ -247,6 +250,8 @@ async def benchmark_forecast_bot(
             randomly_sample=False,
         )
     elif mode == "custom":
+        # Confirm the host is the real Metaculus before the token-sending fetch.
+        verify_metaculus_api_identity()
         # Below is an example of getting custom questions
         one_year_from_now = datetime.now() + timedelta(days=365)
 

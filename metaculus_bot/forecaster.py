@@ -219,6 +219,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         self._conditional_stacking_triggered_count: int = 0
         self._conditional_stacking_skipped_count: int = 0
+        # Skips from the single-forecaster short-circuit, kept in their own bucket so
+        # the two skip reasons stay separable (mirroring the STACKER_OUTCOME split of
+        # "skipped_config_off" out of "skipped"). That branch returns above both
+        # increment sites below, so it has to bump its own counter or the per-question
+        # "SKIPPED: single forecaster survived" logs would end the run at "skipped=0".
+        self._conditional_stacking_skipped_single_forecaster_count: int = 0
         self._conditional_stacking_crux_failures: int = 0
         self._conditional_stacking_search_failures: int = 0
 
@@ -240,9 +246,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             # _handle_errors_in__run_individual_question: it raises when
             # len(predictions) < expected_total_predictions * required_successful_predictions.
             # expected_total_predictions == predictions_per_research_report, which
-            # prepare_llm_config sets to len(forecaster_llms) (3 in prod). At the
-            # 0.5 default the gate would reject a single-survivor publish (1 < 3*0.5),
-            # contradicting MIN_FORECASTERS_TO_PUBLISH=1. Pin it to 0.0 so OUR
+            # prepare_llm_config sets to the configured roster width. At the 0.5
+            # default the gate would reject a single-survivor publish on any roster
+            # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
             # min_forecasters_to_publish guard (above) stays the sole arbiter of
             # whether a degraded ensemble still publishes.
             required_successful_predictions=0.0,
@@ -429,9 +435,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
             logger.info(
-                "Conditional stacking summary: triggered=%d, skipped=%d, crux_failures=%d, search_failures=%d",
+                "Conditional stacking summary: triggered=%d, skipped=%d, "
+                "skipped_single_forecaster=%d, crux_failures=%d, search_failures=%d",
                 self._conditional_stacking_triggered_count,
                 self._conditional_stacking_skipped_count,
+                self._conditional_stacking_skipped_single_forecaster_count,
                 self._conditional_stacking_crux_failures,
                 self._conditional_stacking_search_failures,
             )
@@ -443,17 +451,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
         logger.info(
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_timeouts=%d, gap_fill_v2_errors=%d, prediction_market_degraded=%d, "
-            "prediction_market_platform_failures=%d",
+            "research_provider_failures=%d, summarizer_failures=%d, gap_fill_v2_errors=%d, "
+            "prediction_market_degraded=%d, prediction_market_source_losses=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
             self._stacker_fallback_used_count,
             self._stacker_fallback_failed_count,
-            self._research_provider_timeout_count,
+            self._research_provider_failure_count,
+            self._summarizer_failure_count,
             self._gap_fill_v2_error_count,
             self._prediction_market_degraded_count,
-            self._prediction_market_platform_failure_count,
+            self._prediction_market_source_loss_count,
         )
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
@@ -463,20 +472,28 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return results
 
     @property
-    def _research_provider_timeout_count(self) -> int:
-        return self._research.timeout_count
+    def _research_provider_failure_count(self) -> int:
+        return self._research.provider_failure_count
 
-    @_research_provider_timeout_count.setter
-    def _research_provider_timeout_count(self, value: int) -> None:
-        self._research.timeout_count = value
+    @_research_provider_failure_count.setter
+    def _research_provider_failure_count(self, value: int) -> None:
+        self._research.provider_failure_count = value
+
+    @property
+    def _summarizer_failure_count(self) -> int:
+        return self._research.summarizer_failure_count
+
+    @_summarizer_failure_count.setter
+    def _summarizer_failure_count(self, value: int) -> None:
+        self._research.summarizer_failure_count = value
 
     @property
     def _prediction_market_degraded_count(self) -> int:
         return self._research.prediction_market_degraded_count
 
     @property
-    def _prediction_market_platform_failure_count(self) -> int:
-        return self._research.prediction_market_platform_failure_count
+    def _prediction_market_source_loss_count(self) -> int:
+        return self._research.prediction_market_source_loss_count
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -493,6 +510,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         Consumed by cli.py to decide whether to sys.exit(1) after all
         publications complete. Any individual non-zero counter is enough to
         trip the alert; the sum is just a convenient single number.
+
+        The conditional-stacking counters are deliberately absent: a triggered or
+        skipped stacker is normal operation, not degradation.
         """
         return (
             self._forecasters_dropped_count
@@ -500,10 +520,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._stacker_primary_failed_count
             + self._stacker_fallback_used_count
             + self._stacker_fallback_failed_count
-            + self._research_provider_timeout_count
+            + self._research_provider_failure_count
+            + self._summarizer_failure_count
             + self._gap_fill_v2_error_count
             + self._prediction_market_degraded_count
-            + self._prediction_market_platform_failure_count
+            + self._prediction_market_source_loss_count
         )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
@@ -527,10 +548,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         into "which model failed, how often, and why" answerable in one grep.
 
         The systematic signal (a single model dropping on >=2 DISTINCT questions)
-        is a WARNING, not just a summary line: with ``MIN_FORECASTERS_TO_PUBLISH=1``
-        a model going bad silently degrades every forecast in the run while CI shows
-        one modest red mark, so it must be visible without grepping. It deliberately
-        does NOT change the exit code or block publishing (that is the operator's
+        is a WARNING, not just a summary line: at the current
+        ``MIN_FORECASTERS_TO_PUBLISH`` floor a model going bad silently degrades every
+        forecast in the run while CI shows one modest red mark, so it must be visible
+        without grepping. It deliberately does NOT change the exit code or block
+        publishing (that is the operator's
         call); ``alertable_count`` already reddens CI on ANY drop.
         """
         drops = self._forecaster_drops
@@ -600,8 +622,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         ``start_time`` is captured at the top of ``_research_and_make_predictions``
         and represents this question's processing-start tick. Compared against
-        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` (58:30 of the 60-min Metaculus close
-        window).
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE``, which sits just inside the 60-min
+        Metaculus close window.
         """
         return PER_QUESTION_WALL_CLOCK_DEADLINE - (time.time() - start_time)
 
@@ -850,7 +872,35 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # equal to the number of per-model summary bullets across all report sections.
         self._contributing_forecasters[qid_for_log] += n_valid
 
-        # Single-forecaster short-circuit. With MIN_FORECASTERS_TO_PUBLISH=1 a
+        # Positive survivor count, in the RUN LOG. Everything else that knows this
+        # number is either conditional or off-stdout: the "Only n/N forecasters
+        # succeeded" line fires only BELOW min_forecasters_to_publish (which the
+        # constant now permits to be low enough that zero survivors are needed to
+        # trip it), and the count above reaches the published Metaculus comment as
+        # FORECASTERS_USED, which is never logged. So a degraded publish exited zero
+        # and read identically to a healthy one — an operator checking "did every
+        # forecaster survive?" had to count EXTRACTION_RUNG lines and dedupe model
+        # slugs to infer it. Emitted unconditionally so the healthy case is stated
+        # rather than implied by the absence of a warning.
+        #
+        # models= is the deliberate symmetry with FORECASTER_DROPS's detail=: names on
+        # both sides let a reader diff survivors against drops from the log alone.
+        # Read off each prediction's own "Model: ..." prefix (stamped in
+        # _make_prediction) rather than self._forecaster_llms, because the roster
+        # lists CONFIGURED models and the survivors are a subset — reporting the
+        # roster here would relabel a degraded run as full.
+        survivor_models = sorted(
+            filter(None, (extract_model_display_name_from_reasoning(pred.reasoning) for pred in valid_predictions))
+        )
+        logger.info(
+            "FORECASTERS_SURVIVED: question=%s survived=%d/%d models=%s",
+            qid_for_log,
+            n_valid,
+            len(self._forecaster_llms),
+            ",".join(survivor_models) if survivor_models else "unknown",
+        )
+
+        # Single-forecaster short-circuit. When MIN_FORECASTERS_TO_PUBLISH permits it, a
         # question can survive on one forecaster, but the spread metrics
         # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
         # >=2 predictions and raise otherwise, and stacking a lone base model is
@@ -858,13 +908,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # stacking entirely and hand the single prediction to the parent
         # aggregator, whose _base_combine returns it as-is (snap-to-integers
         # applied for discrete numerics). Placed before the budget gate and the
-        # per-strategy branches so it short-circuits every stacking path. The
-        # _stacker_outcome marker is "skipped" (stacking was skipped, non-stacked
-        # aggregation); the distinct log line records the single-forecaster reason.
+        # per-strategy branches so it short-circuits every stacking path — which is
+        # also why this branch has to bump its OWN skip counter: the two increment
+        # sites below are unreachable from here.  The _stacker_outcome marker is
+        # "skipped" (stacking was skipped, non-stacked aggregation); the distinct log
+        # line and counter record the single-forecaster reason.
         if n_valid == 1 and self.aggregation_strategy in (
             AggregationStrategy.STACKING,
             AggregationStrategy.CONDITIONAL_STACKING,
         ):
+            self._conditional_stacking_skipped_single_forecaster_count += 1
             logger.info(
                 "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
                 "skipping spread + stacking, aggregating the lone prediction",
@@ -881,18 +934,19 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Stacking budget gate. If we've burned through the per-Q wall-clock
         # budget (e.g. research stalled, fan-out used most of the budget),
         # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
-        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET (90s) floor leaves
-        # headroom for sustained slowness on a single POST. The 160s worst case
-        # (4 POSTs * 20s * (1 + 1 retry)) requires multi-POST stalling, which
-        # is recovered by skip_stacking_for_budget already.
+        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET floor leaves
+        # headroom for sustained slowness on a single POST. The full worst case
+        # (both POSTs stalling for PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1))
+        # requires multi-POST stalling, which is recovered by
+        # skip_stacking_for_budget already.
         skip_stacking_for_budget = (
             self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
             and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
         )
         if skip_stacking_for_budget:
             # F15: the base-combine re-entry uses MEAN under STACKING and
-            # MEDIAN under CONDITIONAL_STACKING (see base_combine_strategy in
-            # aggregation_pipeline.py:226-231). The marker must match the
+            # MEDIAN under CONDITIONAL_STACKING (see ``base_combine_strategy`` in
+            # aggregation_pipeline.py). The marker must match the
             # actual aggregation method so residual analysis cuts bucket the
             # two paths correctly.
             budget_skip_outcome = (
@@ -968,9 +1022,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
 
                 # 1. Extract the crux of disagreement under a soft deadline.
-                # Without the wait_for the call's worst case is litellm timeout
-                # (300s) * allowed_tries (3) ≈ 15 min on the critical path; the
-                # CRUX_SOFT_DEADLINE caps that at 180s.
+                # Without the wait_for the only bound is the analyzer LLM's own
+                # litellm timeout (UTILITY_MODEL_CONFIG in llm_configs.py), which
+                # is looser than CRUX_SOFT_DEADLINE on this critical path.
                 base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
                 try:
                     crux = await asyncio.wait_for(
@@ -1176,8 +1230,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         """Run a single forecaster with FORECASTER_SOFT_DEADLINE.
 
         Why the deadline: a single stuck forecaster used to be able to hold a
-        question for litellm_timeout(480s) * allowed_tries(3) ≈ 24 min. This
-        caps each forecaster at FORECASTER_SOFT_DEADLINE (10 min).
+        question for REASONING_MODEL_CONFIG's litellm timeout times its
+        allowed_tries. This caps each forecaster at FORECASTER_SOFT_DEADLINE.
 
         On timeout: bumps _forecasters_dropped_count, logs a loud WARNING
         identifying the model + question, and re-raises TimeoutError so the

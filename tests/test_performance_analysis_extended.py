@@ -6,19 +6,25 @@ disagreement_predicts_error.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.analysis import (
     _interpolate_pit,
+    binary_summary,
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
     no_bias_check,
     numeric_pit_analysis,
+    per_model_binary_scores,
+    per_model_cohort,
     stacking_effectiveness,
 )
 from metaculus_bot.performance_analysis.collector import resolve_numeric_record_to_score_inputs
+from metaculus_bot.performance_analysis.parsing import anonymous_model_key, is_anonymous_model_key
 
 
 def _old_interpolate_pit(resolution: float, lower_bound: float, upper_bound: float, cdf_values: list[float]) -> float:
@@ -50,7 +56,11 @@ def _binary_record(
     resolution: bool,
     per_model: dict[str, str] | None = None,
     category: str | None = None,
+    **stacker_fields: object,
 ) -> dict:
+    """Build a binary record. ``stacker_fields`` sets the stacker-detection
+    signals (``was_stacked``, ``stacker_outcome``, ``comment_text``) that
+    ``per_model_cohort`` reads; omit them for an ordinary unstacked record."""
     return {
         "post_id": post_id,
         "type": "binary",
@@ -63,6 +73,7 @@ def _binary_record(
         "mc_log_score": None,
         "per_model_forecasts": per_model or {},
         "metadata": {"category": category},
+        **stacker_fields,
     }
 
 
@@ -229,6 +240,153 @@ class TestDisagreementPredictsError:
         result = disagreement_predicts_error(records)
         assert result["count"] == 2
         assert result["spearman_rho"] is None  # n<3
+
+
+# ---------------------------------------------------------------------------
+# per_model_cohort — phantom "Forecaster N" buckets and stacked records
+# ---------------------------------------------------------------------------
+
+
+class TestPerModelCohort:
+    """Per-model cuts must see only named base models.
+
+    Two ways a non-model entry reaches ``per_model_forecasts``: an anonymous
+    positional key (no ``Model:`` line to attribute the bullet) and a
+    stacker-fired record (the one summary bullet holds the stacker's aggregate,
+    not a base model's forecast). Measured on the 2026-04 dataset, 50 such
+    forecasts were being scored as if ``Forecaster 1`` and ``Forecaster 2`` were
+    ensemble members, making that bucket a stacker-vs-base-model mixture.
+    """
+
+    def test_anonymous_keys_dropped_named_models_kept(self):
+        record = _binary_record(
+            1,
+            prob_yes=0.60,
+            resolution=True,
+            per_model={"gpt-5.6-sol": "70%", "Forecaster 1": "50%", "Forecaster 2 base": "40%"},
+        )
+        [(returned, per_model)] = per_model_cohort([record], cut="unit_test")
+        assert returned is record
+        assert per_model == {"gpt-5.6-sol": "70%"}
+
+    @pytest.mark.parametrize(
+        "stacker_fields",
+        [
+            {"was_stacked": True},
+            {"stacker_outcome": "primary"},
+            {"stacker_outcome": "fallback_llm"},
+            {"comment_text": "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=primary -->\n"},
+            {"comment_text": "*Forecaster 1*: 70%\n<!-- STACKED=true -->\n"},
+        ],
+    )
+    def test_stacker_fired_records_excluded_entirely(self, stacker_fields):
+        stacked = _binary_record(
+            1, prob_yes=0.60, resolution=True, per_model={"claude-opus-4.8": "70%"}, **stacker_fields
+        )
+        assert per_model_cohort([stacked], cut="unit_test") == []
+
+    def test_median_records_kept(self):
+        # The mirror of the case above: a record the detector confirms ran on
+        # MEDIAN keeps its per-model bullets.
+        unstacked = _binary_record(
+            1,
+            prob_yes=0.60,
+            resolution=True,
+            per_model={"claude-opus-4.8": "70%"},
+            stacker_outcome="skipped",
+        )
+        [(_record, per_model)] = per_model_cohort([unstacked], cut="unit_test")
+        assert per_model == {"claude-opus-4.8": "70%"}
+
+    def test_high_spread_record_without_stacker_signals_is_kept(self):
+        # ``likely_stacker`` (high spread + published value far from the median)
+        # must NOT exclude: that shape is also what a MEAN-era aggregate looks
+        # like, and dropping it would silently remove the high-disagreement
+        # records these cuts exist to measure.
+        wide = _binary_record(1, prob_yes=0.10, resolution=True, per_model={"m1": "90%", "m2": "10%"})
+        [(_record, per_model)] = per_model_cohort([wide], cut="unit_test")
+        assert per_model == {"m1": "90%", "m2": "10%"}
+
+    def test_exclusions_are_logged_with_counts_and_reason(self, caplog):
+        records = [
+            _binary_record(1, 0.6, True, per_model={"gpt-5.6-sol": "70%", "Forecaster 1": "50%"}),
+            _binary_record(2, 0.6, True, per_model={"Forecaster 1": "50%", "Forecaster 2": "40%"}),
+            _binary_record(3, 0.6, True, per_model={"claude-opus-4.8": "70%"}, was_stacked=True),
+        ]
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.performance_analysis.analysis"):
+            per_model_cohort(records, cut="my_cut")
+
+        [line] = [r.getMessage() for r in caplog.records if "PER_MODEL_COHORT" in r.getMessage()]
+        assert "cut=my_cut" in line
+        assert "eligible_records=2" in line
+        assert "excluded_stacked_records=1" in line
+        assert "excluded_stacked_observations=1" in line
+        assert "excluded_anonymous_observations=3" in line
+        assert "reason=" in line
+
+    def test_per_model_binary_scores_excludes_phantoms(self):
+        records = [
+            _binary_record(1, 0.6, True, per_model={"gpt-5.6-sol": "70%", "Forecaster 1": "10%"}),
+            _binary_record(2, 0.4, False, per_model={"gpt-5.6-sol": "30%", "Forecaster 1": "90%"}),
+            # Stacker-fired: its bullet is the aggregate, not a base model.
+            _binary_record(3, 0.6, True, per_model={"gemini-3.1-pro-preview": "70%"}, was_stacked=True),
+        ]
+        scores = per_model_binary_scores(records)
+        assert set(scores) == {"gpt-5.6-sol"}
+        assert scores["gpt-5.6-sol"]["count"] == 2
+
+    def test_aggregate_cuts_still_include_excluded_records(self):
+        # The operator keeps the aggregates over stacked / anonymously-attributed
+        # records — only the per-MODEL cuts drop them. Same three records, both
+        # aggregate paths must count all three.
+        records = [
+            _binary_record(1, 0.6, True, per_model={"Forecaster 1": "60%"}),
+            _binary_record(2, 0.6, True, per_model={"claude-opus-4.8": "70%"}, was_stacked=True),
+            _binary_record(3, 0.4, False, per_model={"gpt-5.6-sol": "40%"}),
+        ]
+        assert binary_summary(records)["count"] == 3
+        assert no_bias_check(records)["count"] == 3
+        # ...while the per-model cut sees one named model on one question.
+        assert set(per_model_binary_scores(records)) == {"gpt-5.6-sol"}
+
+    def test_spread_cuts_skip_stacked_records(self):
+        stacked_wide = _binary_record(
+            1, 0.5, True, per_model={"Forecaster 1": "10%", "Forecaster 2": "90%"}, was_stacked=True
+        )
+        named_wide = _binary_record(2, 0.5, True, per_model={"m1": "10%", "m2": "90%"})
+        effectiveness = stacking_effectiveness([stacked_wide, named_wide], threshold=0.20)
+        assert effectiveness["triggered_count"] == 1
+        assert effectiveness["skipped_count"] == 0
+
+        correlation = disagreement_predicts_error([stacked_wide, named_wide])
+        assert correlation["count"] == 1
+
+
+class TestAnonymousModelKey:
+    """The producer and the predicate must agree — they are what keeps the
+    phantom filter from drifting away from the key format it filters on."""
+
+    @pytest.mark.parametrize("index", [1, 3, 12])
+    @pytest.mark.parametrize("is_base_model", [False, True])
+    def test_produced_keys_are_recognized(self, index, is_base_model):
+        assert is_anonymous_model_key(anonymous_model_key(index, is_base_model=is_base_model))
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "gpt-5.6-sol",
+            "claude-opus-4.8",
+            "gemini-3.1-pro-preview",
+            # Near-misses: real display names that merely start the same way, and
+            # a bullet-shaped string, must not be swept up.
+            "Forecaster",
+            "Forecaster One",
+            "Forecaster 1 (gpt-5.6-sol)",
+            "*Forecaster 1*",
+        ],
+    )
+    def test_model_names_are_not_anonymous(self, key):
+        assert not is_anonymous_model_key(key)
 
 
 # ---------------------------------------------------------------------------

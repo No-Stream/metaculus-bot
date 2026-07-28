@@ -6,6 +6,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from metaculus_bot.constants import (
+    GAP_FILL_V2_CONCLUDE_THRESHOLD,
+    GAP_FILL_V2_MAX_TOOL_CALLS,
+    GAP_FILL_V2_WALL_DEADLINE,
+)
+
 
 class ToolOutcome(BaseModel):
     content_markdown: str
@@ -115,11 +121,15 @@ class GapAccountingEntry(BaseModel):
 
 @dataclass(slots=True)
 class LoopConfig:
+    # Budget defaults derive from the constants the production seam passes in
+    # (``agentic_gap_fill.run_gap_fill_v2``) rather than repeating their values, so a
+    # constant change (or an env override of one) can't leave this dataclass disagreeing
+    # with the loop it configures.
     model: str
     reasoning_effort: str = "medium"
-    max_tool_calls: int = 14
-    wall_deadline_s: float = 540.0
-    conclude_threshold_s: float = 90.0
+    max_tool_calls: int = GAP_FILL_V2_MAX_TOOL_CALLS
+    wall_deadline_s: float = GAP_FILL_V2_WALL_DEADLINE
+    conclude_threshold_s: float = GAP_FILL_V2_CONCLUDE_THRESHOLD
     max_result_chars: int = 8000
     max_steps: int = 20
     # Max ranked gaps set_research_plan accepts (W1). Extra gaps beyond this are

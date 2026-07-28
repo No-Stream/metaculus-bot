@@ -50,8 +50,11 @@ audit:
 	osv-scanner scan --lockfile=uv.lock --config=osv-scanner.toml
 
 # Pre-commit helpers (use local cache to avoid readonly home cache)
+# Both hook types: the ruff hooks fire pre-commit, the full-suite hook fires
+# pre-push, and `pre-commit install` alone would install only the former.
 precommit_install:
 	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit install
+	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit install --hook-type pre-push
 
 precommit:
 	PRE_COMMIT_HOME=.pre-commit-cache uv run pre-commit run
@@ -183,8 +186,8 @@ test_fast:
 # build's in-memory records, never in the backfill dir), so we do exactly one build
 # that sees both sources.
 sync_research:
-	@echo "=== Backfilling from Metaculus comments (historical) ==="
-	uv run python scripts/backfill_research_from_comments.py
+	@echo "=== Backfilling from Metaculus comments (historical; non-fatal — see sync_all) ==="
+	-uv run python scripts/backfill_research_from_comments.py
 	@echo ""
 	@echo "=== Downloading GHA artifacts + building archive (artifacts + backfill) ==="
 	uv run python scripts/download_research.py $(ARGS)
@@ -226,9 +229,22 @@ sync_raw_research:
 # (it hits Metaculus, not GHA) so its comments_backfill.jsonl is on disk when the
 # driver's research build loads it. NOTE: ARGS is forwarded only to sync_all.py, which
 # accepts --repo / --since-days (and the per-archive --*-dir overrides).
+#
+# THE BACKFILL IS NON-FATAL (leading `-`), and that asymmetry is the whole point.
+# The two halves have opposite deadlines: comments live on Metaculus forever, while GHA
+# artifacts are deleted at 90 days, so the GHA pull is the only half that can lose data
+# permanently. Under `set -euo pipefail` (scripts/research_sync/run_sync.sh) a bare
+# backfill failure aborted the recipe before sync_all.py downloaded a single artifact —
+# which is exactly what happened on all five scheduled runs from 2026-06-28 to 2026-07-26:
+# launchd fires at the first wake after Sun 03:00, the laptop's network is not up yet, the
+# backfill's un-retried requests.get raises ConnectionError, and the expiring half never
+# ran. The `-` lets the recoverable half fail without taking the unrecoverable half with
+# it. Keeping it FIRST preserves the one-authoritative-build invariant above (sync_all.py's
+# research build loads comments_backfill.jsonl); on a failed backfill the build simply
+# reads the previous run's file.
 sync_all:
-	@echo "=== Backfilling from Metaculus comments (historical) ==="
-	uv run python scripts/backfill_research_from_comments.py
+	@echo "=== Backfilling from Metaculus comments (historical; non-fatal — see comment above) ==="
+	-uv run python scripts/backfill_research_from_comments.py
 	@echo ""
 	@echo "=== Single-pass GHA sync: research + telemetry + raw-research (one download pass) ==="
 	uv run python scripts/sync_all.py $(ARGS)

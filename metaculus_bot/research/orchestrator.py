@@ -33,19 +33,27 @@ from metaculus_bot.constants import (
     NATIVE_SEARCH_MODEL_ENV,
     OPENROUTER_API_KEY_ENV,
     PERPLEXITY_API_KEY_ENV,
+    PERPLEXITY_RESEARCH_MODEL,
+    PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER,
+    PERPLEXITY_WALL_TIMEOUT,
     PREDICTION_MARKETS_ENABLED_ENV,
     RESOLUTION_SOURCE_ENABLED_ENV,
     SUMMARIZER_WALL_TIMEOUT,
     TS_ANCHOR_ENABLED_ENV,
     env_flag_enabled,
 )
-from metaculus_bot.llm_retry import invoke_with_broad_retry
-from metaculus_bot.prompts import TS_ANCHOR_SECTION_HEADER, asknews_summarizer_prompt
+from metaculus_bot.llm_retry import invoke_with_broad_retry, invoke_with_transient_retry
+from metaculus_bot.prompts import (
+    SUMMARIZER_SOFT_FAIL_BANNER,
+    TS_ANCHOR_SECTION_HEADER,
+    asknews_summarizer_prompt,
+)
 from metaculus_bot.research.provider_diagnostics import (
     SUCCEEDED_STATUSES,
     ProviderResult,
     format_provider_diagnostics_block,
     pop_provider_detail,
+    record_provider_detail,
 )
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -110,9 +118,20 @@ class ResearchOrchestrator:
         # returns forecaster-clean text; TemplateForecaster pops the block via
         # pop_provider_diagnostics when assembling the published comment.
         self._comment_diagnostics: dict[int, str] = {}
-        self.timeout_count: int = 0
+        # Per-run count of research-provider calls that FAILED — any exception, not
+        # just timeouts (the generic failure branch in _run_one never inspects the
+        # exception type). Excludes the expected off-season AskNews subscription
+        # error, which reports status="inactive" and is not alertable.
+        self.provider_failure_count: int = 0
+        # Per-run count of AskNews summarizer soft-fails (transient LLM error or
+        # blank output), each of which ships raw unscreened articles in place of the
+        # analyst briefing. Alertable by operator decision 2026-07-26 on quality
+        # grounds: provider status is computed from POST-summarizer text, so a
+        # permanently dead summarizer otherwise degrades every briefing while
+        # AskNews keeps reporting status="ok".
+        self.summarizer_failure_count: int = 0
         # Genuine gap-fill-v2 CRASHES (not idle "driver found nothing" runs, not
-        # deadline hits). Mirrors timeout_count: surfaced to the forecaster as
+        # deadline hits). Mirrors provider_failure_count: surfaced to the forecaster as
         # _gap_fill_v2_error_count and folded into alertable_count so a dead v2
         # feature reddens CI. A dead-on-arrival bug (the fastapi eager-import
         # defect) bumps this on EVERY question -> CI reddens immediately; a
@@ -128,9 +147,9 @@ class ResearchOrchestrator:
 
         The prediction-market provider soft-fails internally (a dead Kalshi
         series path still returns fuzzy-over-events matches), so this sub-path
-        failure never raises and never bumps timeout_count. Reading the module
-        counter here is the only way it reddens CI (the 2026-07-25 hole where
-        research_provider_timeouts=0 while the path was dead)."""
+        failure never raises and never bumps provider_failure_count. Reading the
+        module counter here is the only way it reddens CI (the 2026-07-25 hole where
+        research_provider_failures=0 while the path was dead)."""
         from metaculus_bot.research.prediction_market import (
             kalshi_series_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
@@ -138,34 +157,43 @@ class ResearchOrchestrator:
         return kalshi_series_fetch_failures()
 
     @property
-    def prediction_market_platform_failure_count(self) -> int:
-        """Per-run count of lost prediction-market platform fetches (one per venue
-        whose query/prefetch fan-out lost a sub-fetch, plus one per whole-provider
-        failure), read from the module counter and folded into alertable_count.
+    def prediction_market_source_loss_count(self) -> int:
+        """Per-run count of LOST prediction-market sources, read from the module
+        counter and folded into alertable_count.
 
-        Operator decision 2026-07-25: alert on ANY platform failure, not only a total
+        A "source" is anything the snapshot depends on: one per venue whose
+        query/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
+        one when the keyword extractor produces nothing (which silences all four
+        venues without any venue failing). That last cause is why this counts
+        sources rather than venues — a dead extractor loses every venue's data
+        without any venue going down. The distinguishing detail is durable
+        per-source in ``MarketSnapshot.sources`` (``keywords:error(no_queries)`` vs
+        ``polymarket:error(...)``), which rides the published comment and the
+        schema-v2 research archive; this scalar deliberately stays one number.
+
+        Operator decision 2026-07-25: alert on ANY source loss, not only a total
         blackout. The provider soft-fails every venue internally, so without this the
         forecasters silently run on zero market data while CI stays green."""
         from metaculus_bot.research.prediction_market import (
-            prediction_market_platform_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            prediction_market_source_losses,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
 
-        return prediction_market_platform_failures()
+        return prediction_market_source_losses()
 
     def reset_run_degradation_counters(self) -> None:
         """Zero per-run degradation counters at run start (called by
         forecast_questions alongside reset_pchip_stats). The prediction-market
-        series and platform counters are module globals — resetting them here keeps
+        series and source-loss counters are module globals — resetting them here keeps
         them clean per-run metrics instead of leaking across runs/tests that share a
         process. The orchestrator's own instance counters are fresh per bot, so they
         need no reset here."""
         from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
-            reset_platform_degradation_counter,
             reset_series_degradation_counter,
+            reset_source_loss_counter,
         )
 
         reset_series_degradation_counter()
-        reset_platform_degradation_counter()
+        reset_source_loss_counter()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)
@@ -187,10 +215,10 @@ class ResearchOrchestrator:
 
             # Gap-fill v1 and v2 both consume the pre-gap-fill bundle and run
             # CONCURRENTLY in one gather (plan doc §2: research-phase wall-clock
-            # is max(v1, v2), not the sum — v2's 540s deadline fits inside v1's
-            # worst-case envelope only under this parallelism). Consequence: the
-            # v2 driver's brief sees the bundle WITHOUT v1's addendum. v2's
-            # section appends after v1's.
+            # is max(v1, v2), not the sum — v2's GAP_FILL_V2_WALL_DEADLINE fits
+            # inside v1's worst-case envelope only under this parallelism).
+            # Consequence: the v2 driver's brief sees the bundle WITHOUT v1's
+            # addendum. v2's section appends after v1's.
             gap_fill_v1_active = (
                 env_flag_enabled(GAP_FILL_ENABLED_ENV) and len(research.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS
             )
@@ -335,12 +363,31 @@ class ResearchOrchestrator:
             return ""
         return self._comment_diagnostics.pop(qid, "")
 
+    def _degraded_to_raw_articles(self, question: MetaculusQuestion, research: str, reason: str) -> str:
+        """Return the raw articles under a visible banner, counting the soft-fail.
+
+        Three destinations, because the loss was invisible in all three before
+        2026-07-26: the forecaster sees the banner in its research bundle, CI sees
+        ``summarizer_failures`` in the end-of-run degradation line, and the published
+        comment / research archive see a ``summarizer`` source loss on the AskNews
+        diagnostics line (whose ``status`` is computed from POST-summarizer text and
+        therefore still reads ``ok``).
+        """
+        self.summarizer_failure_count += 1
+        record_provider_detail(
+            getattr(question, "id_of_question", None),
+            "asknews",
+            {"sources": {"summarizer": f"error({reason})"}},
+        )
+        return f"{SUMMARIZER_SOFT_FAIL_BANNER}\n\n{research}"
+
     async def _summarize_asknews(self, question: MetaculusQuestion, research: str) -> str:
         """Compress raw AskNews article markdown into an analyst briefing.
 
         Only AskNews output flows here — it's the one provider that returns raw
         article text rather than LLM-written prose. Soft-fails to the raw input
-        so a summarizer hiccup never drops the news entirely.
+        (under a banner, see _degraded_to_raw_articles) so a summarizer hiccup never
+        drops the news entirely.
         """
         if not research.strip():
             return research
@@ -358,22 +405,26 @@ class ResearchOrchestrator:
             research=research,
         )
         try:
-            # Broad, 30s-gated retry (SUMMARIZER_LLM is allowed_tries=1 in
-            # llm_configs.py): recovers a fast blip / empty-response while obeying
-            # the universal "no retry after 30s" deadline rule. Adds the wall-clock
-            # cap this call previously lacked. A slow/permanent failure still
-            # propagates to the soft-fail below (raw AskNews articles).
+            # Broad retry under the TRANSIENT_RETRY_MAX_ELAPSED_S elapsed gate
+            # (SUMMARIZER_LLM is allowed_tries=1 in llm_configs.py): recovers a fast
+            # blip / empty-response while obeying the universal "don't retry a slow
+            # failure" deadline rule. Adds the wall-clock cap this call previously
+            # lacked. A slow/permanent failure still propagates to the soft-fail
+            # below (raw AskNews articles).
             summary = await invoke_with_broad_retry(
                 lambda: self._summarizer_llm.invoke(prompt),
                 wall_timeout=SUMMARIZER_WALL_TIMEOUT,
                 label="asknews_summarizer",
             )
         except _SUMMARIZER_TRANSIENT_EXCEPTIONS as exc:
-            logger.warning("AskNews summarization failed (%s); using raw articles", type(exc).__name__)
-            return research
+            logger.warning(
+                "AskNews summarization failed (%s); using raw articles under a degradation banner",
+                type(exc).__name__,
+            )
+            return self._degraded_to_raw_articles(question, research, type(exc).__name__)
         if not summary.strip():
-            logger.warning("AskNews summarization returned blank output; using raw articles")
-            return research
+            logger.warning("AskNews summarization returned blank output; using raw articles under a banner")
+            return self._degraded_to_raw_articles(question, research, "blank_output")
         return summary
 
     def _lookup_research_cache(self, question: MetaculusQuestion) -> tuple[int | None, str | None]:
@@ -395,7 +446,13 @@ class ResearchOrchestrator:
         provider, provider_name = choose_provider_with_name(
             self._default_llm,
             exa_callback=self._call_exa_smart_searcher,
-            perplexity_callback=self._call_perplexity,
+            # Each rung gets the vendor its env var pays for. Binding the bare
+            # ``_call_perplexity`` here would hand priority 3 the method's
+            # OpenRouter-first default — deliberate on the AskNews-fallback path
+            # (_attempt_research_fallback prefers the cheap route), wrong here,
+            # where it collapses the ladder's two Perplexity rungs into one and
+            # passes api_key=None whenever only PERPLEXITY_API_KEY is set.
+            perplexity_callback=self._call_perplexity_direct,
             openrouter_callback=self._call_perplexity_openrouter,
             is_benchmarking=self._is_benchmarking,
         )
@@ -491,11 +548,12 @@ class ResearchOrchestrator:
             # ProviderResult.details instead of vanishing behind a healthy `ok`.
             qid = getattr(question, "id_of_question", None)
             try:
-                used_fallback = False
+                fallback_provider: str | None = None
                 if name == "asknews" and self._allow_research_fallback:
-                    raw, used_fallback = await self._fetch_research_with_fallback(question, provider, name)
+                    raw, fallback_provider = await self._fetch_research_with_fallback(question, provider, name)
                 else:
                     raw = await provider(question)
+                used_fallback = fallback_provider is not None
                 # AskNews returns raw article markdown (no LLM prose); summarize it
                 # into an analyst briefing. Every other provider already emits
                 # LLM-written prose (native search, Gemini, Perplexity, Exa) or
@@ -521,6 +579,7 @@ class ResearchOrchestrator:
                     chars=len(raw) if has_output else 0,
                     latency_ms=latency_ms,
                     details=pop_provider_detail(qid, name),
+                    fallback_provider=fallback_provider,
                 )
                 return (raw, result)
             except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
@@ -539,7 +598,7 @@ class ResearchOrchestrator:
                     )
                 else:
                     status = "errored"
-                    self.timeout_count += 1
+                    self.provider_failure_count += 1
                     logger.warning(f"Research provider {name} failed ({type(e).__name__}): {e}")
                     from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
                         _record_deprecation_if_matched,
@@ -564,7 +623,12 @@ class ResearchOrchestrator:
         for raw, provider_result in results:
             provider_results.append(provider_result)
             if raw and raw.strip():
-                header = self._provider_header(provider_result.name)
+                # Label the section with whoever actually produced the text. On a
+                # fallback that is NOT provider_result.name (which keeps the primary's
+                # identity for the diagnostics line) — rendering Perplexity prose under
+                # "## News Articles (AskNews)" mislabelled the source in the published
+                # comment and in the archive.
+                header = self._provider_header(provider_result.fallback_provider or provider_result.name)
                 combined_parts.append(f"{header}\n{_demote_inner_headings(raw)}")
 
         combined = "\n\n---\n\n".join(combined_parts) if combined_parts else ""
@@ -592,24 +656,50 @@ class ResearchOrchestrator:
         question: MetaculusQuestion,
         provider: ResearchCallable,
         provider_name: str,
-    ) -> tuple[str, bool]:
-        """Return (research_text, used_fallback).
+    ) -> tuple[str, str | None]:
+        """Return ``(research_text, fallback_provider_name)``.
 
-        used_fallback is True when the primary (AskNews) failed and a prose
-        fallback provider (Perplexity/Exa) supplied the result instead — the
-        caller uses this to skip AskNews summarization on already-prose output.
+        ``fallback_provider_name`` is None on the normal path and otherwise names the
+        vendor that actually answered ("openrouter" / "perplexity" / "exa"). The caller
+        uses it for two things: to skip AskNews summarization on already-prose output, and
+        to label the research section with the source that produced it.
+
+        A vendor swap on the PRIMARY provider is real degradation, not a success: a
+        different index, a different recency profile, and — because the fallback is already
+        prose — no AskNews summarizer pass, so the briefing loses the per-article relevance
+        gate, [PRE-WINDOW] labeling, and recency reordering that the 2026-07-18 audit made
+        load-bearing. It used to bump no counter and record no detail, so it read as
+        healthy. We record a per-source loss token here so the diagnostics line and the
+        schema-v2 archive carry it. Deliberately NOT a new alertable counter: folding one
+        into alertable_count changes what CI treats as red, which is the operator's call.
         """
         try:
-            return (await provider(question), False)
+            return (await provider(question), None)
         except Exception as exc:
             if self._allow_research_fallback and provider_name == "asknews":
                 logger.warning(f"Primary research provider '{provider_name}' failed with {type(exc).__name__}: {exc}")
-                fallback = await self._attempt_research_fallback(question.question_text)
-                if fallback is not None:
-                    return (fallback, True)
+                fallback_text, fallback_name = await self._attempt_research_fallback(question.question_text)
+                if fallback_text is not None:
+                    record_provider_detail(
+                        getattr(question, "id_of_question", None),
+                        provider_name,
+                        {
+                            "sources": {
+                                provider_name: f"error({type(exc).__name__})",
+                                "fallback": f"ok({fallback_name})",
+                            }
+                        },
+                    )
+                    return (fallback_text, fallback_name)
             raise
 
-    async def _attempt_research_fallback(self, question_text: str) -> str | None:
+    async def _attempt_research_fallback(self, question_text: str) -> tuple[str | None, str | None]:
+        """Return ``(research_text, provider_name)``, or ``(None, None)`` if no rung answered.
+
+        The provider name rides back so the caller can label the section with the vendor
+        that actually answered; rendering it as AskNews mislabeled the source in the
+        published comment and in the archive.
+        """
         # Ordering intentionally differs from the primary selector
         # (choose_provider_with_name: AskNews -> Exa -> Perplexity -> OpenRouter).
         # This fallback only fires when AskNews (always the primary in prod) has
@@ -619,19 +709,22 @@ class ResearchOrchestrator:
         # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
         # expensive path). The primary selector orders by index quality, not cost,
         # which is why the two lists diverge by design.
+        #
+        # The names returned here are the same keys ``_provider_header`` maps, so the
+        # section header follows the vendor automatically.
         try:
             if os.getenv(OPENROUTER_API_KEY_ENV):
                 logger.info("Falling back to openrouter/perplexity for research")
-                return await self._call_perplexity(question_text, use_open_router=True)
+                return (await self._call_perplexity(question_text, use_open_router=True), "openrouter")
             if os.getenv(PERPLEXITY_API_KEY_ENV):
                 logger.info("Falling back to Perplexity for research")
-                return await self._call_perplexity(question_text, use_open_router=False)
+                return (await self._call_perplexity(question_text, use_open_router=False), "perplexity")
             if os.getenv(EXA_API_KEY_ENV):
                 logger.info("Falling back to Exa search for research")
-                return await self._call_exa_smart_searcher(question_text)
+                return (await self._call_exa_smart_searcher(question_text), "exa")
         except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except — best-effort fallback; logs and returns None so the primary error propagates
             logger.warning(f"Fallback research provider also failed: {type(fallback_exc).__name__}: {fallback_exc}")
-        return None
+        return (None, None)
 
     async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
@@ -658,21 +751,29 @@ class ResearchOrchestrator:
             {question_text}
             """
         )
-        if use_open_router:
-            model_name = "openrouter/perplexity/sonar-reasoning-pro"
-        else:
-            model_name = "perplexity/sonar-reasoning-pro"
+        model_name = PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER if use_open_router else PERPLEXITY_RESEARCH_MODEL
         model = GeneralLlm(
             model=model_name,
             # temperature=None defers to provider defaults; redundant on ft 0.2.92
             # (GeneralLlm ctor default is already None). No top_p.
             temperature=None,
             api_key=get_openrouter_api_key(model_name) if model_name.startswith("openrouter/") else None,
+            # allowed_tries=1 hands the retry budget to the gated wrapper below; left
+            # unpinned it inherited forecasting-tools' default of 2 with an un-gated
+            # random.uniform(5, 10) tenacity sleep.
+            allowed_tries=1,
         )
-        return await model.invoke(prompt)
+        return await invoke_with_transient_retry(
+            lambda: model.invoke(prompt),
+            wall_timeout=PERPLEXITY_WALL_TIMEOUT,
+            label="perplexity_research",
+        )
 
     async def _call_perplexity_openrouter(self, question: MetaculusQuestion) -> str:
         return await self._call_perplexity(question, use_open_router=True)
+
+    async def _call_perplexity_direct(self, question: MetaculusQuestion) -> str:
+        return await self._call_perplexity(question, use_open_router=False)
 
     async def _call_exa_smart_searcher(self, question: MetaculusQuestion | str) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question

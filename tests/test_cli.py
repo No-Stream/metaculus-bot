@@ -40,6 +40,7 @@ import pytest
 
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, credit_alerts_active
+from metaculus_bot.credit_telemetry import DonatedKeyState, reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import (
     reset_credit_key_fallback_count,
     reset_donated_404_fallback_count,
@@ -59,10 +60,15 @@ def _reset_fallback_counters() -> None:
     fallback_openrouter). Reset all three between tests so cross-test pollution
     can't silently turn an "alertable=0" path into "alertable=1" because a
     prior test bumped a counter.
+
+    The donated-key probe verdict is process-global for the same reason (probe
+    once per run), and cli renders it in the end-of-run summary, so it is reset
+    here too.
     """
     reset_generic_key_fallback_count()
     reset_donated_404_fallback_count()
     reset_credit_key_fallback_count()
+    reset_donated_key_state_cache()
 
 
 @contextmanager
@@ -122,6 +128,10 @@ def _cli_main_test_mode(
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates"),
+            # The API identity preflight makes a real unauthenticated GET to
+            # metaculus.com; stub it so these exit-status/telemetry tests stay
+            # hermetic (its own behavior is covered in test_api_preflight.py).
+            patch("metaculus_bot.cli.verify_metaculus_api_identity"),
             # Patch log_report_summary: a classmethod on TemplateForecaster that
             # iterates forecast_reports. Our stub returns []; patch the method
             # anyway to keep the test surface small.
@@ -439,6 +449,155 @@ class TestCliCreditAlertSuppression:
             fb_module._generic_key_fallback_count = 0
             fb_module._credit_key_fallback_count = 0
             fb_module._donated_404_fallback_count = 0
+
+    def test_drained_donated_key_alone_exits_zero(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The full shape of the 2026-07-26 run, once the fix lands. Both credit
+        paths fire together — every donated-key call fell back to the personal key
+        AND the end-of-run balance is under the refill floor — and because the probe
+        confirmed the key is genuinely drained, the whole run is green.
+
+        This is the outcome the operator asked for: while they self-fund the season,
+        an empty donated wallet is bookkeeping, not breakage.
+
+        Green is exactly the shape that most needs a written record, so the run must
+        still explain itself: the same breakdown the red path logs (rendered at INFO),
+        carrying the probe verdict, plus the floor-breach explanation. Without the
+        summary on this branch, the run this whole change set was built for — every
+        donated call falling back, so the credit subset cancels the entire generic
+        total — would leave no trace of either the degradation or the verdict.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 7
+        fb_module._credit_key_fallback_count = 7
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=DURING_SUPPRESSION),
+                patch("metaculus_bot.cli.get_probed_donated_key_state", return_value=DonatedKeyState.DRAINED),
+                caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            ):
+                # Must NOT raise SystemExit.
+                cli_main()
+
+            messages = [record.getMessage() for record in caplog.records]
+            summary = [msg for msg in messages if "alertable degradation event" in msg]
+            assert summary, messages
+            assert "with 0 alertable" in summary[0], summary
+            assert "personal_key_fallback=7" in summary[0], summary
+            assert "credit=7 with 7 credit event(s) suppressed until 2026-09-10" in summary[0], summary
+            assert "donated_key=drained" in summary[0], summary
+            # The floor-breach explanation is a separate concern and still lands.
+            assert any("credit alerting is suppressed until 2026-09-10" in msg for msg in messages), messages
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
+
+    def test_revoked_donated_key_exits_non_zero_during_suppression(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The regression the discriminator exists to prevent. Same error text as the
+        drained run, but the probe found the key revoked, so the wrapper left the
+        credit subset at zero: nothing is subtracted and CI goes red.
+
+        Without the probe, "Key limit exceeded" alone would have exempted a revoked
+        or re-capped-to-zero donated key from alerting for six weeks.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 7
+        fb_module._credit_key_fallback_count = 0
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, donated_below_floor=False, today=DURING_SUPPRESSION),
+                patch("metaculus_bot.cli.get_probed_donated_key_state", return_value=DonatedKeyState.REVOKED),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+                messages = [record.getMessage() for record in caplog.records]
+                assert any("with 7 alertable" in msg for msg in messages), messages
+                # The summary names the verdict so a reader knows why nothing was
+                # suppressed on a run full of credit-shaped failures.
+                assert any("donated_key=revoked" in msg for msg in messages), messages
+        finally:
+            fb_module._generic_key_fallback_count = 0
+
+    def test_clean_run_logs_no_degradation_summary(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The green-path summary is conditioned on a fallback having happened, not
+        on the exit status: a run where nothing degraded says nothing, so the line's
+        presence in a log remains a signal rather than boilerplate.
+        """
+        with (
+            _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+        ):
+            cli_main()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any("alertable degradation event" in msg for msg in messages), messages
+
+    def test_probe_verdict_is_rendered_on_partially_suppressed_red_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Partial suppression: two fallbacks, one of them credit-caused, so one
+        event survives the subtraction and the run is red. The verdict still rides
+        the summary — a reader has to be able to tell that the suppressed share was
+        exempted because the key was genuinely drained. (The fully-suppressed green
+        counterpart is ``test_drained_donated_key_alone_exits_zero``.)
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 2
+        fb_module._credit_key_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                patch("metaculus_bot.cli.get_probed_donated_key_state", return_value=DonatedKeyState.DRAINED),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit):
+                    cli_main()
+                messages = [record.getMessage() for record in caplog.records]
+                assert any("donated_key=drained" in msg for msg in messages), messages
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
+
+    def test_unprobed_run_omits_the_verdict_clause(self, caplog: pytest.LogCaptureFixture) -> None:
+        """No key-limit failure means no probe ran, and "unknown" would read as a
+        failed probe rather than "never needed one" — so the clause is omitted.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+            ):
+                with pytest.raises(SystemExit):
+                    cli_main()
+                messages = [record.getMessage() for record in caplog.records]
+                assert not any("donated_key=" in msg for msg in messages), messages
+        finally:
+            fb_module._generic_key_fallback_count = 0
+
+    def test_bot_degradation_still_red_on_a_drained_key_run(self) -> None:
+        """A drained donated key must not launder real bot-side degradation into a
+        green run: the subtraction is scoped to the credit subset only.
+        """
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 7
+        fb_module._credit_key_fallback_count = 7
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=2, donated_below_floor=True, today=DURING_SUPPRESSION),
+                patch("metaculus_bot.cli.get_probed_donated_key_state", return_value=DonatedKeyState.DRAINED),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
 
     def test_bot_alertable_survives_credit_suppression(self) -> None:
         """The subtraction is scoped to the credit subset — a bot-side degradation

@@ -26,13 +26,18 @@ from metaculus_bot.constants import (
     GOOGLE_API_KEY_ENV,
 )
 from metaculus_bot.prompts import web_research_prompt
+from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
+from metaculus_bot.research.url_context_telemetry import (
+    URL_RETRIEVAL_SUCCESS,
+    extract_url_context_telemetry,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "_extract_url_context_telemetry",
+    "extract_url_context_telemetry",
     "build_gemini_client",
     "gemini_search_provider",
     "invoke_gemini_grounded",
@@ -74,63 +79,8 @@ def _resolve_model(model_slug: str | None) -> str:
     return model_slug or os.getenv(GEMINI_SEARCH_MODEL_ENV, GEMINI_SEARCH_DEFAULT_MODEL)
 
 
-_URL_RETRIEVAL_SUCCESS = "URL_RETRIEVAL_STATUS_SUCCESS"
 _URL_CONTEXT_NONE_MARKER = "_url_context: none_"
 _URL_CONTEXT_HEADER = "### URL Context Fetches"
-
-
-def _coerce_status_name(status: object) -> str:
-    """Coerce a url_retrieval_status (enum-with-.name, plain string, or None) to a string name."""
-    name = getattr(status, "name", None)
-    if isinstance(name, str):
-        return name
-    if isinstance(status, str):
-        return status
-    return str(status)
-
-
-def _extract_url_context_telemetry(
-    response: genai_types.GenerateContentResponse,
-) -> tuple[bool, int, int, list[tuple[str, str]]]:
-    """Pull url_context retrieval telemetry off a grounded-search response.
-
-    Returns ``(reported, n_total, n_success, [(status_name, retrieved_url), ...])``. ``reported``
-    is whether the SDK attached a url_context_metadata object at all — the tool ran and reported
-    back, even with an empty fetch list — which lets callers keep 'fired but fetched nothing'
-    greppably distinct from 'no url_context signal'. ``n_total`` is the url_metadata entry count
-    and ``n_success`` those with status URL_RETRIEVAL_STATUS_SUCCESS.
-
-    Every field read here is a declared field on the typed SDK pydantic models
-    (``url_context_metadata``, ``url_metadata``, and each ``UrlMetadata``'s
-    ``url_retrieval_status`` / ``retrieved_url``), so they're accessed directly: a
-    future SDK rename should fail loudly here rather than silently report zero
-    forever, matching the direct ``.grounding_metadata`` access below. A
-    None-valued (but present) entry still coerces gracefully —
-    ``_coerce_status_name(None)`` maps to ``"None"`` and ``None or ""`` to ``""`` —
-    so telemetry never takes down the research path it only observes.
-    """
-    candidates = response.candidates
-    if not candidates:
-        return (False, 0, 0, [])
-
-    url_context_metadata = candidates[0].url_context_metadata
-    if url_context_metadata is None:
-        return (False, 0, 0, [])
-
-    url_metadata = url_context_metadata.url_metadata
-    if not url_metadata:
-        return (True, 0, 0, [])
-
-    entries: list[tuple[str, str]] = []
-    n_success = 0
-    for meta in url_metadata:
-        status_name = _coerce_status_name(meta.url_retrieval_status)
-        retrieved_url = meta.retrieved_url or ""
-        if status_name == _URL_RETRIEVAL_SUCCESS:
-            n_success += 1
-        entries.append((status_name, retrieved_url))
-
-    return (True, len(url_metadata), n_success, entries)
 
 
 def _format_url_context_marker(reported: bool, entries: list[tuple[str, str]]) -> str:
@@ -143,7 +93,7 @@ def _format_url_context_marker(reported: bool, entries: list[tuple[str, str]]) -
     at all → empty string (no marker). Failed-fetch URLs are still captured in the INFO logs for
     auditing, just not in the forecaster-facing research blob.
     """
-    successes = [(status, url) for status, url in entries if status == _URL_RETRIEVAL_SUCCESS and url]
+    successes = [(status, url) for status, url in entries if status == URL_RETRIEVAL_SUCCESS and url]
     if successes:
         lines = ["", "", _URL_CONTEXT_HEADER]
         lines.extend(f"{status} — {url}" for status, url in successes)
@@ -219,10 +169,19 @@ def _format_grounded_response(
         # genuine retrieval, so it counts as grounding. Absent both, the text is
         # ungrounded parametric output; suppress the section (the orchestrator
         # then omits it) and leave a greppable WARN.
-        _, _, n_url_success, _ = _extract_url_context_telemetry(response)
+        _, _, n_url_success, _ = extract_url_context_telemetry(response)
         if n_url_success == 0:
             n_queries = len(metadata.web_search_queries or []) if metadata is not None else 0
             logger.warning(f"GEMINI_UNGROUNDED_SUPPRESSED: question={qid} model={model} queries={n_queries}")
+            # Record the loss so the Provider Diagnostics line and the schema-v2 archive
+            # carry a `lost=grounding:...` token. Without it, the "" this returns maps to
+            # ProviderResult status `empty` — byte-identical to a healthy Gemini call that
+            # legitimately found nothing, since the provider didn't raise and so no counter
+            # moves. Mirrors _degraded_to_raw_articles, which solved the same shape for the
+            # AskNews summarizer. Deliberately NOT an alertable counter: folding a new term
+            # into alertable_count changes what CI treats as red, which is the operator's
+            # call, not a side effect of adding visibility.
+            record_provider_detail(qid, "gemini_search", {"sources": {"grounding": "error(ungrounded_suppressed)"}})
             return ""
         # url_context grounded the text but google_search produced no chunks: keep
         # the text as-is (no citation markers to splice, no Sources block). The
@@ -330,7 +289,7 @@ async def invoke_gemini_grounded(
         if metadata is not None and metadata.grounding_chunks:
             n_chunks = len(metadata.grounding_chunks)
 
-    reported, n_url_total, n_url_success, url_entries = _extract_url_context_telemetry(response)
+    reported, n_url_total, n_url_success, url_entries = extract_url_context_telemetry(response)
     logger.info(
         f"GeminiSearch: got {len(formatted)} chars, {n_chunks} grounding chunks, "
         f"{n_url_success}/{n_url_total} url_context fetches from {model}"

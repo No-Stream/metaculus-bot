@@ -1397,6 +1397,37 @@ def test_infer_failure_stage_tags_value_extraction_error_as_parser() -> None:
     assert _infer_failure_stage(exc, "some-model") == "parser"
 
 
+def test_infer_failure_stage_reads_reported_429_not_message_digits() -> None:
+    """The rate-limit arm reads the reported status; coincidental "429" digits don't count.
+
+    litellm formats the message as ``f"APIError: {provider} - {body}"``, and an OpenRouter
+    body embeds a 64-hex key hash plus (on a moderation refusal) ~100 chars of our own
+    prompt — either can contain "429" that was never a status. English wording stays live
+    as the statusless fallback, since AskNews-shaped SDKs report no status at all.
+    """
+    from litellm.exceptions import APIError
+
+    from metaculus_bot.ablation.forecasters import _infer_failure_stage
+
+    reported_429 = APIError(status_code=429, message="slow down", llm_provider="openrouter", model="openai/gpt-5.6-sol")
+    assert _infer_failure_stage(reported_429, "some-model") == "forecaster"
+
+    # Statusless English still classifies — that is the AskNews/non-litellm path.
+    assert _infer_failure_stage(RuntimeError("rate limit hit upstream"), "some-model") == "forecaster"
+    assert _infer_failure_stage(RuntimeError("Too Many Requests"), "some-model") == "forecaster"
+
+    # A key hash carrying "429" on a 403 refusal is not a rate limit. It used to be,
+    # because the digits were matched in the message.
+    key_hash_403 = APIError(
+        status_code=403,
+        message='OpenrouterException - {"error":{"message":"Blocked by moderation. Manage your key at '
+        'https://openrouter.ai/keys/8f5a429f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd"}}',
+        llm_provider="openrouter",
+        model="openai/gpt-5.6-sol",
+    )
+    assert _infer_failure_stage(key_hash_403, "some-model") == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # C1 — Soft-deadline timeout
 #

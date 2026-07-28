@@ -89,8 +89,8 @@ logger = logging.getLogger(__name__)
 FEATURE_FLAG_ENV = "PROBABILISTIC_TOOLS_ENABLED"
 
 # Per-question-type allow-list. CSV of {"binary", "multiple_choice", "numeric"}.
-# Defaults to all 3 types when unset (back-compat: setting only the global
-# flag enables everything as before). Production workflows set this
+# Defaults to every supported type when unset (back-compat: setting only the
+# global flag enables everything as before). Production workflows set this
 # explicitly to scope which types receive tool augmentation — empirically,
 # binary + MC benefit, numeric is inconclusive.
 TYPES_ENV = "PROBABILISTIC_TOOLS_TYPES"
@@ -104,10 +104,10 @@ _VALID_TYPES = frozenset({"binary", "multiple_choice", "numeric"})
 _P10_P90_Z_GAP: float = 2.5631
 
 # Per-forecaster σ ratio (vs ensemble median σ) below which we emit a
-# ⚠ Spread anomaly line. Threshold of 0.10 catches the qid 43171
-# GLM-4.5-air case (σ=13K vs ensemble median σ ~965K, ratio ~1.3%) while
-# being generous enough that legitimate-but-tighter forecasters don't get
-# flagged. Defense-in-depth atop the family-consistency check.
+# ⚠ Spread anomaly line. Calibrated to catch the qid 43171 GLM-4.5-air case
+# (σ=13K vs ensemble median σ ~965K, ratio ~1.3%) while being generous enough
+# that legitimate-but-tighter forecasters don't get flagged. Defense-in-depth
+# atop the family-consistency check.
 _SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
 
 # Anchor-overshoot telemetry threshold (percentage points). The 2026-07-08
@@ -123,7 +123,7 @@ def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choic
     """Return True iff global PROBABILISTIC_TOOLS_ENABLED is set AND
     question_type (when given) appears in the PROBABILISTIC_TOOLS_TYPES allow-list.
 
-    The allow-list defaults to all 3 types; production workflows set it explicitly
+    The allow-list defaults to every supported type; production workflows set it explicitly
     to scope which types receive tool augmentation. When question_type is None
     (rare callers that don't know the type yet), only the global flag is checked.
     """
@@ -221,7 +221,7 @@ def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
 
     Emitted into the per-forecaster "Computed quantities" section built by
     ``run_tools_for_forecaster``, which is gated behind
-    ``PROBABILISTIC_TOOLS_ENABLED`` (all three prod workflows pin the flag
+    ``PROBABILISTIC_TOOLS_ENABLED`` (every prod workflow pins the flag
     to ``'false'`` today, so these lines and their ``ANCHOR_OVERSHOOT_PP`` /
     ``CLAUSE_PRODUCT_DIVERGENCE_PP`` HTML markers are dormant in prod
     comments). The raw ``base_rate_anchor`` / ``criteria_clauses`` JSON the
@@ -230,7 +230,8 @@ def _anchor_and_clause_telemetry_lines(block: BinaryStructured) -> list[str]:
     / divergence math is trivially replayable offline from that JSON.
 
     NO forecast mutation anywhere — the 2026-07-08 experiments buried the
-    clamp variant; only the >15pp-overshoot *measurement* survived.
+    clamp variant; only the ``ANCHOR_OVERSHOOT_FLAG_THRESHOLD_PP``
+    *measurement* survived.
     """
     lines: list[str] = []
 
@@ -740,8 +741,8 @@ def aggregate_numeric_values(
         if isinstance(entry, NumericDistribution):
             # declared_percentiles preserves the standard anchor points the
             # forecaster asserted; that's what the median-extraction loop
-            # expects. The 201-point CDF would also work but is less
-            # information-dense (median is one of the declared anchors).
+            # expects. The full ``PCHIP_CDF_POINTS`` CDF grid would also work but
+            # is less information-dense (median is one of the declared anchors).
             normalized.append(list(entry.declared_percentiles))
         else:
             normalized.append(list(entry))

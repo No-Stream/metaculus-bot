@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sys
@@ -12,8 +13,48 @@ from metaculus_bot.constants import (
     credit_alerts_active,
     gemini_use_donated_openrouter_key,
 )
+from metaculus_bot.credit_telemetry import (
+    DONATED_KEY_PROBE_TIMEOUT_S,
+    DonatedKeyState,
+    classify_donated_key_state,
+)
+from metaculus_bot.llm_retry import llm_status_code
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Where a provider's error message stops being the PROVIDER'S words and starts being
+# OURS. Two carriers, both verified: an OpenRouter moderation 403 body replays up to ~100
+# characters of the prompt as ``flagged_input``, and forecasting-tools' empty-completion
+# guard raises ``RuntimeError("LLM answer is an empty string. The model was ... and the
+# prompt was: <up to 2000 chars>")``.
+_PROMPT_ECHO_MARKERS: tuple[str, ...] = ("and the prompt was:", "flagged_input", "flagged input")
+
+
+def _without_prompt_echo(lowercased_msg: str) -> str:
+    """Drop the tail that follows the first prompt-echo marker.
+
+    Everything past a marker is text WE sent, so it must not classify anything. Measured
+    against the 963-bundle research archive, our own prompts contain "402" in 13.0% of
+    bundles, "guardrail" in 1.9%, "unauthorized" in 4.7% and "deprecated" in 0.1% — so
+    without this, a benign zero-output blip on a question about a $402M revenue target
+    billed the personal key, counted as an expected empty wallet, and took a degraded run
+    green.
+
+    The marker itself is KEPT: ``flagged_input`` is OpenRouter's own field name and one of
+    ``_MODERATION_CUES``, so cutting at the marker rather than after it would disarm the
+    veto on the very bodies this exists to defend against.
+
+    Only TEXT cues read the truncated string. The reported ``status_code`` is an int on
+    the exception and cannot be echoed, so ``_is_status`` / ``llm_status_code`` keep
+    reading the full message.
+    """
+    cut = len(lowercased_msg)
+    for marker in _PROMPT_ECHO_MARKERS:
+        found_at = lowercased_msg.find(marker)
+        if found_at != -1:
+            cut = min(cut, found_at + len(marker))
+    return lowercased_msg[:cut]
 
 
 def _record_deprecation_if_matched(model: str, error_msg: str) -> bool:
@@ -26,7 +67,7 @@ def _record_deprecation_if_matched(model: str, error_msg: str) -> bool:
     providers (Grok native search), etc. Idempotent within a single recording —
     every distinct error string adds an entry; cli.py only checks ``len > 0``.
     """
-    msg_lower = error_msg.lower()
+    msg_lower = _without_prompt_echo(error_msg.lower())
     if any(pattern in msg_lower for pattern in _DEPRECATION_PATTERNS):
         _DEPRECATION_ALERTS.append((model, error_msg))
         return True
@@ -223,26 +264,179 @@ def should_route_via_donated_key(model: str) -> bool:
     return True
 
 
-def _is_credit_message(lowercased_msg: str) -> bool:
-    """Whether an already-lowercased error message reads as "this key is out of money".
+# OpenRouter reports a breached per-key SPEND CAP as HTTP 403 with this phrase —
+# not the 402 its own error docs document. Verified against the 2026-07-26
+# production failure, where litellm surfaced it as a bare ``APIError`` (litellm has
+# no 403 branch for OpenRouter) whose body carried ``"code":403``. The old negative
+# rule below vetoed any message containing "403", so the operator's funded personal
+# key was never tried and two of three forecasters plus most of the research stack
+# died on a key that was merely empty.
+#
+# The full phrase is load-bearing. The shorter "limit exceeded" is a substring of
+# "rate limit exceeded: free-models-per-day", so it would classify every 429 as an
+# empty wallet and silently exempt real rate-limit breakage from alerting for the
+# whole suppression window.
+KEY_LIMIT_EXCEEDED_CUE = "key limit exceeded"
 
-    Single source of truth for the credit-cause classification: the retry
-    decision in ``should_retry_with_general_key`` and the credit-subset counter
-    in ``FallbackOpenRouterLlm.invoke`` both go through here, so a text-cue edit
-    can't make the two disagree about which fallbacks were credit-caused.
+# "Out of money" wording that is ORDINARY ENGLISH, so a forecasting prompt can contain
+# it innocently — "declared insolvent for insufficient funds", "the ransom demand states
+# payment required". Since a moderation body replays our prompt (see _MODERATION_CUES),
+# these are trusted only when nothing says the body is a refusal. Split out from
+# KEY_LIMIT_EXCEEDED_CUE by SPECIFICITY, not by category: that phrase is OpenRouter's own
+# spend-cap wording and will not appear in a question about an election, so it outranks
+# the veto; these four cannot be given that power.
+_GENERIC_CREDIT_PHRASES: tuple[str, ...] = (
+    "payment required",
+    "insufficient credit",
+    "out of credits",
+    "insufficient funds",
+)
+
+# Signals that the body is a content-moderation refusal rather than a billing
+# problem. litellm builds the message as ``APIError: {provider} - {raw body}``, and
+# an OpenRouter moderation 403 body carries ``flagged_input``: up to ~100 characters
+# of OUR OWN PROMPT replayed back. A forecasting prompt full of dollar figures and
+# bill numbers can easily contain the token "402", which would otherwise read as an
+# empty wallet — billing the personal key for a call that will refuse again AND
+# exempting a real moderation block from alerting.
+#
+# Word cues only, deliberately: a genuine 402 links to a key hash with a small but
+# non-negligible chance of containing the substring "403", and reading that as moderation
+# would break the long-standing 402 fallback. Odds derived in
+# ``test_key_hash_status_collision_is_small_but_nonnegligible``; note it pins TWO bands —
+# one status alone, and any of the six at once — and the six-status one does not apply here.
+_MODERATION_CUES: tuple[str, ...] = ("moderation", "forbidden", "flagged_input", "flagged for")
+
+
+# Textual cues that stay live regardless of the reported status: English wording, not
+# status digits, so they carry no key-hash / prompt-echo risk. They are what classifies
+# a statusless exception (a plain ``Exception("401 Unauthorized")``, a non-litellm
+# caller) and a provider that words the failure without a recognizable status.
+_RATE_LIMIT_TEXT_CUES: tuple[str, ...] = ("too many requests", "rate limit", "rate-limited upstream")
+_BAD_CREDENTIAL_TEXT_CUES: tuple[str, ...] = ("unauthorized", "invalid api key", "disabled api key")
+
+# Blocks that are scoped to the KEY'S ROUTING rather than to the request, so the personal
+# key genuinely can serve the same call. Two donated-key quirks: server-side
+# allowed-providers preferences ("no allowed providers"), and the Metaculus
+# data-collection guardrail that excludes OpenAI's native-search endpoint ("No endpoints
+# available matching your guardrail restrictions and data policy") — see FUTURE.md
+# "Resolve OAI_ANTH_OPENROUTER_KEY data-policy block".
+#
+# Classified by TEXT on purpose, and checked on every status including 403. OpenRouter
+# returns these as 404, the same status as a plain missing model, which must NOT fall
+# back — so the status alone cannot tell the two apart.
+_ROUTE_SCOPED_TEXT_CUES: tuple[str, ...] = ("no allowed providers", "guardrail", "data policy")
+
+
+def _is_status(reported_status: int | None, code: int, lowercased_msg: str) -> bool:
+    """Whether the failure is HTTP ``code``, preferring the reported status over digits.
+
+    When the provider reported a status, that integer is the ONLY numeric evidence
+    consulted. The message is not: litellm formats it as ``APIError: {provider} - {raw
+    body}``, and an OpenRouter body carries a 64-hex key hash that has a small but
+    non-negligible chance of containing one of 401/402/403/429/502/503 (derived in
+    ``test_key_hash_status_collision_is_small_but_nonnegligible``) plus, on a moderation
+    refusal, up to ~100 characters of our own prompt in ``flagged_input``. Matching digits there reads
+    coincidences as statuses in both directions — a stray "429" sends a moderation 403
+    to the paid key for a call that will refuse again.
+
+    With no status reported, fall back to the substring — but on the ECHO-STRIPPED
+    message, not the raw one. Without that, the digit fallback reopened at every status
+    the exact hole the prompt-echo truncation closed for the credit cues: a
+    forecasting-tools empty-completion ``RuntimeError`` replays up to 2000 characters of
+    our prompt, so a question about "S.429 (the Fentanyl Act)" or a bill numbered 401 read
+    as a rate limit or a bad credential and billed the paid key for a call that would
+    return empty again. Measured against the 989-bundle research archive: "429" appears in
+    10.2% of our own prompts and "401" in 13.8%, comparable to the 13.0% for "402" that
+    motivated the original truncation.
+
+    Truncating here costs the plain-``Exception`` callers nothing, which is why the earlier
+    carve-out was unnecessary: ``_without_prompt_echo`` only cuts at an echo marker, and
+    strings like "401 unauthorized" or "429 too many requests" carry none, so they pass
+    through byte-identical (pinned in ``test_plain_status_strings_survive_echo_stripping``).
     """
-    return (
-        "402" in lowercased_msg
-        or "payment required" in lowercased_msg
-        or "insufficient credit" in lowercased_msg
-        or "out of credits" in lowercased_msg
-        or "insufficient funds" in lowercased_msg
-    )
+    if reported_status is not None:
+        return reported_status == code
+    return str(code) in _without_prompt_echo(lowercased_msg)
+
+
+def _is_credit_failure(reported_status: int | None, lowercased_msg: str) -> bool:
+    """Whether this failure means "the key is out of money". The one credit arbiter.
+
+    ``should_retry_with_general_key`` (routing) and ``is_credit_caused_error`` → the
+    credit-subset counter in ``record_donated_key_fallback`` (alerting) both reach the
+    answer through here, so a cue edit cannot make them disagree.
+
+    Three guards, in an order the real bodies force:
+
+    1. **The spend-cap phrase wins outright.** It is OpenRouter's own wording for a
+       drained per-key budget (which it reports as 403, not the 402 its docs promise) and
+       will not turn up in a question about an election. It has to outrank the veto below:
+       the production body renders as "403 Forbidden: Key limit exceeded", and "forbidden"
+       is both a moderation cue and generic HTTP boilerplate, so gating the phrase behind
+       the veto would stop the dry key falling back and strand the ensemble on it.
+    2. **Otherwise a reported status decides alone.** 402 is "Payment Required" and has no
+       second meaning, while OpenRouter words refusals as 403, so the int outranks any
+       English in the body. The failure asymmetry agrees: reading a real 402 as a refusal
+       strands the ensemble on a dry key — the production bug — whereas reading a
+       hypothetical 402-shaped refusal as credit costs one paid call that refuses again.
+    3. **With no status, moderation wording vetoes, then ordinary credit English or a bare
+       "402" classifies.** Everything in that last tier is forgeable by a replayed prompt,
+       which is why it sits below the veto and reads only ``_without_prompt_echo``.
+
+    Nothing here reads a live balance — ``status_code`` is an int already on the exception.
+    The ``/auth/key`` probe belongs to ``is_suppressible_credit_error`` and the ALERTING
+    decision, never to routing.
+    """
+    provider_text = _without_prompt_echo(lowercased_msg)
+    if KEY_LIMIT_EXCEEDED_CUE in provider_text:
+        return True
+    if reported_status is not None:
+        return reported_status == 402
+    if any(cue in provider_text for cue in _MODERATION_CUES):
+        return False
+    return "402" in provider_text or any(phrase in provider_text for phrase in _GENERIC_CREDIT_PHRASES)
 
 
 def is_credit_caused_error(exc: Exception) -> bool:
-    """Whether ``exc`` is a credit shortfall (402 / payment required / insufficient credit)."""
-    return _is_credit_message(str(exc).lower())
+    """Whether ``exc`` is a credit shortfall (402, spend-cap 403, insufficient credit).
+
+    The public form of ``_is_credit_failure``, so the routing decision in
+    ``should_retry_with_general_key`` and the alerting decision in
+    ``is_suppressible_credit_error`` answer "was this about money?" the same way. They
+    used to disagree: routing became status-aware while this stayed text-only, so a
+    terse reported-402 (``APIError(status_code=402, message="wallet empty")``) fell
+    back to the paid key without being credit-classified — reddening CI on exactly
+    the expected empty wallet the suppression window exists for.
+    """
+    return _is_credit_failure(llm_status_code(exc), str(exc).lower())
+
+
+def is_suppressible_credit_error(exc: Exception) -> bool:
+    """Whether ``exc`` is the EXPECTED drained donated key, not some other breakage.
+
+    Only this narrower class is exempt from CI alerting during the suppression
+    window (``constants.credit_alerts_active``). The distinction matters because a
+    donated key Metaculus revoked, or re-capped to zero, returns the SAME
+    "Key limit exceeded" text as one that simply spent its allocation — so the text
+    cue alone would have exempted genuine breakage from alerting for six weeks. We
+    ask OpenRouter's free, read-only ``/auth/key`` endpoint instead (once per run,
+    cached), and every inconclusive answer stays alertable.
+
+    The 402 / insufficient-credit family deliberately skips the probe: it is
+    unambiguous, it predates the discriminator, and keeping it probe-free means an
+    unreachable balance endpoint cannot change long-standing behavior.
+
+    Note this governs ALERTING only. Fallback ROUTING never consults the probe (see
+    ``should_retry_with_general_key``) so a stale or cached balance read can never
+    strand the ensemble on a dry key — the failure mode this whole change exists to
+    fix.
+    """
+    if not is_credit_caused_error(exc):
+        return False
+    if KEY_LIMIT_EXCEEDED_CUE not in _without_prompt_echo(str(exc).lower()):
+        return True
+    return classify_donated_key_state() is DonatedKeyState.DRAINED
 
 
 def should_retry_with_general_key(exc: Exception) -> bool:
@@ -260,11 +454,26 @@ def should_retry_with_general_key(exc: Exception) -> bool:
       allowed-providers preferences; a 404 there means the donated key cannot
       route this model, but the general key (no preferences) can. Treated as
       key-scoped so callers fall through to the secondary key.
+    - 403 carrying spend-cap wording ("Key limit exceeded"), which is how
+      OpenRouter reports a drained per-key budget despite documenting credit
+      exhaustion as 402. Classified by ``_is_credit_failure`` UPSTREAM of the 403
+      veto below — that ordering is load-bearing.
     - Common text cues for these scenarios.
 
     Avoids fallback on:
-    - Plain 403 Forbidden (moderation/blocked, both keys would refuse),
-    - 502/503 upstream/provider outages (infrastructure, not key-scoped).
+    - 403 Forbidden without credit wording (moderation / permission block, both
+      keys would refuse),
+    - 502/503 upstream/provider outages (infrastructure, not key-scoped),
+    - Plain 404 (missing model), which is why the 404 family is classified by
+      TEXT rather than status: the same status covers both a route problem the
+      paid key can fix and a model that simply does not exist.
+
+    Numeric detection reads the status the provider reported
+    (``llm_status_code`` / ``_is_status``), never digits in the message. litellm
+    formats the message as ``APIError: {provider} - {raw body}``, and an OpenRouter
+    body carries a 64-hex key hash plus, on a moderation refusal, up to ~100
+    characters of our own prompt — either can contain a number that was never a
+    status. Statusless exceptions still classify on text, unchanged.
 
     Note: direct google-genai SDK 429s (google.genai.errors.ClientError with
     code=429) are out of scope for this wrapper — they don't flow through
@@ -288,45 +497,44 @@ def should_retry_with_general_key(exc: Exception) -> bool:
         return True
 
     msg = msg_raw.lower()
+    # Authoritative for every NUMERIC branch below; None for statusless exceptions,
+    # which then classify on message text exactly as they always have.
+    status = llm_status_code(exc)
+    # Everything after a prompt-echo marker is text WE sent, so no WORD cue may read it.
+    # The digit fallbacks inside ``_is_status`` still see the whole message: they only
+    # engage when no status was reported, and shortening their input there would change
+    # long-standing behavior for plain ``Exception("401 Unauthorized")`` callers.
+    provider_text = _without_prompt_echo(msg)
 
-    # Belt-and-suspenders textual detection for 429 edge cases where litellm
-    # doesn't raise the typed exception (e.g., class drift, non-standard wrapping).
-    if "429" in msg or "too many requests" in msg or "rate limit" in msg or "rate-limited upstream" in msg:
+    # A REPORTED 403 is decided here, ahead of every text cue, because the body is the
+    # least trustworthy input we have on this path: an OpenRouter moderation 403 carries
+    # ``flagged_input``, up to ~100 characters of OUR OWN PROMPT replayed back. A
+    # forecasting question can say "insufficient funds", "payment required", "rate limit",
+    # or "unauthorized" for entirely ordinary reasons, and each of those would otherwise
+    # send a content block to the paid key for a call it will refuse just the same.
+    # OpenRouter uses 403 for refusals, so only two shapes deserve a key swap: the
+    # spend-cap phrase, and a route-scoped block the personal key genuinely can route.
+    if status == 403:
+        return KEY_LIMIT_EXCEEDED_CUE in provider_text or any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES)
+
+    # Belt-and-suspenders detection for 429 edge cases where litellm doesn't raise the
+    # typed exception (e.g., class drift, non-standard wrapping).
+    if _is_status(status, 429, msg) or any(cue in provider_text for cue in _RATE_LIMIT_TEXT_CUES):
         return True
 
     # Positive signals: credentials/credits
-    if "401" in msg or "unauthorized" in msg or "invalid api key" in msg or "disabled api key" in msg:
+    if _is_status(status, 401, msg) or any(cue in provider_text for cue in _BAD_CREDENTIAL_TEXT_CUES):
         return True
-    if _is_credit_message(msg):
+    if _is_credit_failure(status, msg):
         return True
-    # Donated-key allowed-providers quirk: the donated key has server-side
-    # provider preferences; a model only available via a non-allowed provider
-    # returns 404 with "no allowed providers". The general key has no such
-    # restriction and routes the same model fine.
-    if "no allowed providers" in msg:
-        return True
-    # Donated-key data-policy / guardrail block (added 2026-05-17 during native
-    # search migration). When OpenAI native search is invoked on the donated
-    # key, OpenRouter returns 404 with text like:
-    #   "No endpoints available matching your guardrail restrictions and data
-    #   policy. Configure: https://openrouter.ai/settings/privacy"
-    # The donated key has data-collection guardrails set by Metaculus that
-    # exclude OpenAI's native-search endpoint. The personal key has no such
-    # restriction. Treat as key-scoped so callers fall through to the
-    # secondary key automatically — see FUTURE.md "Resolve
-    # OAI_ANTH_OPENROUTER_KEY data-policy block".
-    if "guardrail" in msg or "data policy" in msg:
+    if any(cue in provider_text for cue in _ROUTE_SCOPED_TEXT_CUES):
         return True
 
-    # Negative signals: do not swap keys for these
-    if "403" in msg or "forbidden" in msg or "moderation" in msg:
-        return False
-    if "502" in msg or "bad gateway" in msg:
-        return False
-    if "503" in msg or "service unavailable" in msg:
-        return False
-
-    # Default: be conservative and do not fallback when unsure
+    # Default: keep the key. What reaches here is everything a swap cannot help —
+    # moderation and permission refusals (both keys refuse the same prompt), 502/503
+    # upstream outages, and a plain missing-model 404. The explicit negative blocks this
+    # replaced were unreachable in the reported-status regime, because the 403 return
+    # above and the positive branches had already claimed every status they named.
     return False
 
 
@@ -339,19 +547,130 @@ def _is_donated_404(exc: Exception) -> bool:
     return "no allowed providers" in str(exc).lower()
 
 
-def _fallback_alert_note(exc: Exception) -> str:
+def _fallback_alert_note(*, suppressible: bool) -> str:
     """The "what happens to the exit code" clause of the paid-fallback WARNING.
 
-    A credit-caused fallback during the suppression window does NOT redden CI
-    (see ``constants.credit_alerts_active``), so saying it will would mislead
-    whoever greps this line. Every other cause still exits non-zero.
+    A suppressible credit fallback during the window does NOT redden CI (see
+    ``constants.credit_alerts_active``), so saying it will would mislead whoever
+    greps this line. Every other cause still exits non-zero.
+
+    ``suppressible`` is the caller's already-computed
+    ``is_suppressible_credit_error`` verdict — it has paid for the donated-key
+    probe, and re-deriving it here would either duplicate that HTTP call or key the
+    note on the text cue alone and promise a green run a revoked key won't deliver.
     """
-    if is_credit_caused_error(exc) and not credit_alerts_active():
+    if suppressible and not credit_alerts_active():
         return (
             "Cause is a credit shortfall, so it is NOT counted as alertable until "
             f"{CREDIT_ALERT_RESUME_DATE.isoformat()} (operator is self-funding the season)."
         )
     return "Run will complete, then exit non-zero to alert."
+
+
+async def record_donated_key_fallback(model: str, exc: Exception) -> None:
+    """Count and log ONE donated -> personal-key fallback that is about to happen.
+
+    The shared accounting seam for every donated-first call path: the
+    ``FallbackOpenRouterLlm.invoke`` wrapper and gap-fill v2's hand-rolled
+    raw-litellm retry in ``research/agentic/llm.py``, which shared the retry
+    PREDICATE but not the accounting and so fell over silently — no counter, no
+    ``PAID PERSONAL-KEY FALLBACK`` warning, no line in the end-of-run summary —
+    despite firing on every question in all four prod workflows. That was the
+    ``TODO(unify-fallback-routing)``.
+
+    Every successful donated -> personal fallback means a paid personal-key call
+    happened where the free donated key was expected to cover it, so all of them
+    are counted and logged loudly: silent personal-key spend must not accumulate
+    unnoticed.
+
+    Counting invariant (see the CLAUDE.md credit-suppression note): each event is
+    counted exactly ONCE in the generic total, and at most one subset counter
+    (credit-caused, or the 404 "no allowed providers" quirk) also claims it. That
+    is what lets cli.py compute ``alertable`` as "generic adds, one subset
+    subtracts" without drift. Call this only when the fallback will actually be
+    attempted — a rejected fallback bills nothing and must not count.
+
+    Async because the probe below must leave the event loop; the counting must not.
+    """
+    # Only the EXPECTED drained-donated-key subset is exempt from alerting. A key that
+    # was revoked or re-capped to zero produces identical "Key limit exceeded" text, so
+    # this asks OpenRouter rather than trusting the cue — otherwise the suppression
+    # window would have hidden genuine breakage for six weeks.
+    #
+    # Threaded because on the spend-cap 403 path it reaches
+    # ``credit_telemetry.classify_donated_key_state``, which does blocking httpx. Called
+    # inline from these coroutines it stalled EVERY concurrently in-flight forecaster and
+    # research task, not just the call that hit the 403, eating into per-question soft
+    # deadlines. Probing first also keeps the accounting below free of any await.
+    # Bounded because ``DONATED_KEY_PROBE_TIMEOUT_S`` is a PER-OPERATION httpx timeout, not
+    # a cap on elapsed time: a server trickling bytes slower than the read timeout resets
+    # the clock on every chunk, so the probe can run many multiples of it (measured against
+    # a local trickling server, a one-second timeout took ten seconds to return twenty
+    # bytes). This call sits BEFORE ``_invoke_once_using_secondary``, so that
+    # latency delays the recovery call itself even though routing was already decided
+    # textually — and a degraded-but-alive OpenRouter control plane is exactly what
+    # co-occurs with a spend-cap 403. ``wait_for`` unblocks us without killing the worker
+    # thread, which is fine: the orphan only holds a socket and (under the probe's lock)
+    # writes the cache.
+    #
+    # Guarded because ANY failure in alerting bookkeeping must leave routing untouched. The
+    # probe promises "never raises" and now catches broadly enough to keep that promise, but
+    # an escape here aborted the fallback and left the funded personal key untried — the
+    # production incident reached through the exception path instead of a stale balance read.
+    # A timeout is likewise inconclusive, so both degrade to "not suppressible" (stay
+    # alertable) exactly like UNKNOWN does.
+    try:
+        suppressible = await asyncio.wait_for(
+            asyncio.to_thread(is_suppressible_credit_error, exc), timeout=DONATED_KEY_PROBE_TIMEOUT_S
+        )
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
+        # Deliberately swallowed rather than re-raised, against the usual fail-fast rule:
+        # re-raising here is the bug being fixed. This is bookkeeping for a decision that
+        # was already made textually, so ANY failure in it must leave routing untouched.
+        # The event is still loud (exception logged with traceback) and still alertable.
+        logger.exception(
+            "DONATED_KEY_PROBE_FAILED: model=%s — the /auth/key probe raised or outlasted its %.1fs "
+            "budget, so this fallback stays ALERTABLE. The personal-key call proceeds regardless; "
+            "alerting bookkeeping must not gate recovery.",
+            model,
+            DONATED_KEY_PROBE_TIMEOUT_S,
+        )
+        suppressible = False
+
+    # NO await from here down, so the whole accounting block runs to completion on the
+    # event loop. That is load-bearing, not incidental: ``+=`` on a module global compiles
+    # to LOAD_GLOBAL / INPLACE_ADD / STORE_GLOBAL and is interruptible between bytecodes,
+    # so threading this function as a whole (rather than just the probe) would let N
+    # forecasters failing on one dry key — the exact 2026-07-26 shape — race the
+    # increment, undercount the generic total, and take a degraded run GREEN. That is the
+    # failure this whole change exists to prevent.
+    global _generic_key_fallback_count
+    _generic_key_fallback_count += 1
+    if suppressible:
+        global _credit_key_fallback_count
+        _credit_key_fallback_count += 1
+    if _is_donated_404(exc):
+        global _donated_404_fallback_count
+        _donated_404_fallback_count += 1
+        logger.warning(
+            "Donated OpenRouter key returned 404 'no allowed providers' for model=%s; "
+            "falling back to general (paid personal) key. This means the donated key's "
+            "server-side allowed-providers list does not cover this model's upstream "
+            "provider. Run will complete, then exit non-zero to alert. error=%s: %s",
+            model,
+            type(exc).__name__,
+            exc,
+        )
+    else:
+        logger.warning(
+            "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=%s, so this "
+            "call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
+            "%s error=%s: %s",
+            model,
+            _fallback_alert_note(suppressible=suppressible),
+            type(exc).__name__,
+            exc,
+        )
 
 
 class FallbackOpenRouterLlm(GeneralLlm):
@@ -386,49 +705,13 @@ class FallbackOpenRouterLlm(GeneralLlm):
             # log is clearer with the slug.
             _record_deprecation_if_matched(self.model, str(e))
             if self._secondary_llm is not None and should_retry_with_general_key(e):
-                # Every successful donated->personal fallback means a paid
-                # personal-key call happened where the free donated key was
-                # expected to cover it. Count and log ALL of them loudly so
-                # silent personal-key spend can't accumulate unnoticed. The
-                # 404 "no allowed providers" subset is ALSO tracked separately
-                # for diagnostics, but it still counts as a personal-key
-                # fallback here.
-                global _generic_key_fallback_count
-                _generic_key_fallback_count += 1
-                if is_credit_caused_error(e):
-                    # Credit-caused subset: the donated wallet is empty. Counted
-                    # separately so cli.py can drop it from ``alertable`` during the
-                    # dated suppression window without touching any other cause.
-                    global _credit_key_fallback_count
-                    _credit_key_fallback_count += 1
-                if _is_donated_404(e):
-                    global _donated_404_fallback_count
-                    _donated_404_fallback_count += 1
-                    logger.warning(
-                        "Donated OpenRouter key returned 404 'no allowed providers' for model=%s; "
-                        "falling back to general (paid personal) key. This means the donated key's "
-                        "server-side allowed-providers list does not cover this model's upstream "
-                        "provider. Run will complete, then exit non-zero to alert. error=%s: %s",
-                        self.model,
-                        type(e).__name__,
-                        e,
-                    )
-                else:
-                    logger.warning(
-                        "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=%s, so this "
-                        "call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
-                        "%s error=%s: %s",
-                        self.model,
-                        _fallback_alert_note(e),
-                        type(e).__name__,
-                        e,
-                    )
-                # ASYNC120: a checkpoint inside `except` can drop the active
-                # exception if the task is cancelled mid-await. That's the
+                # ASYNC120 (both awaits): a checkpoint inside `except` can drop the
+                # active exception if the task is cancelled mid-await. That's the
                 # correct behavior here — on success we return the secondary's
                 # output; on cancellation the secondary is cancelled too. The
                 # primary's exception is intentionally discarded because the
                 # caller asked for a fallback, not a re-raise.
+                await record_donated_key_fallback(self.model, e)  # noqa: ASYNC120
                 return await self._invoke_once_using_secondary(prompt, system_prompt)  # noqa: ASYNC120
             raise
 

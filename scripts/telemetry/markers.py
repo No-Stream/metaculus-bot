@@ -15,6 +15,13 @@ against the ACTUAL emitted format strings (the source of truth):
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
+* ``FORECASTER_DROPS`` / ``Degradation counters`` — ``metaculus_bot/forecaster.py``
+  (per-RUN summaries: which models dropped and why, and the counter set that
+  decides CI color)
+* ``FORECASTERS_SURVIVED`` — ``metaculus_bot/forecaster.py``
+  ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
+  drop marker above is silent on a healthy question, and its comment-side twin
+  ``FORECASTERS_USED`` never reaches stdout)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
@@ -250,6 +257,96 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "forecasters_survived",
+        # The POSITIVE per-question counterpart to forecaster_drops above, emitted by
+        # forecaster.py's _research_and_make_predictions once the survivor set is
+        # known. Unlike the ``forecasters_used`` HTML marker further down — which
+        # carries the same count but lives in the published COMMENT and so is
+        # effectively never in a run log — this one is on stdout, which makes
+        # historical survivor counts queryable from the telemetry archive alone.
+        #
+        # ``models`` is a comma-joined slug list; OpenRouter slugs contain no spaces,
+        # so ``\S+`` takes the whole field. It is deliberately NOT in _RAW_FIELDS: a
+        # comma-joined string coerces to itself (``coerce_value`` only converts
+        # numeric-looking text), and the "unknown" sentinel is not in
+        # _NONE_SENTINELS, so it survives verbatim either way.
+        re.compile(
+            r"FORECASTERS_SURVIVED:\s*question=(?P<question>\S+)\s+survived=(?P<survived>\d+)/(?P<configured>\d+)"
+            r"\s+models=(?P<models>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "degradation_counters",
+        # The per-run summary that DECIDES CI COLOR (cli.py exits non-zero on a
+        # positive alertable_count), emitted by forecaster.py's forecast_questions.
+        # No per-question ref — it aggregates a whole run — so qid_kind stays None.
+        #
+        # The trailing keys are OPTIONAL-group wrapped for the same reason as
+        # gap_fill_v2 above: replace-by-run re-harvesting replays pre-rename logs
+        # (``research_provider_timeouts``, no ``summarizer_failures``,
+        # ``prediction_market_platform_failures`` as the tail), and a mandatory tail
+        # would drop each of those records wholesale instead of harvesting the
+        # counters it does carry. The rename pairs are alternations so one group name
+        # can't cover both spellings; missing groups coerce to None, which reads as
+        # "this era didn't emit it" rather than a measured zero.
+        re.compile(
+            r"Degradation counters:\s*forecasters_dropped=(?P<forecasters_dropped>\S+?),"
+            r"\s*questions_failed_to_publish=(?P<questions_failed_to_publish>\S+?),"
+            r"\s*stacker_primary_failed=(?P<stacker_primary_failed>\S+?),"
+            r"\s*stacker_fallback_used=(?P<stacker_fallback_used>\S+?),"
+            r"\s*stacker_fallback_failed=(?P<stacker_fallback_failed>\S+?),"
+            r"\s*(?:research_provider_failures=(?P<research_provider_failures>\S+?)"
+            r"|research_provider_timeouts=(?P<research_provider_timeouts>\S+?)),"
+            r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
+            r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
+            r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
+            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+)"
+            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+)))?"
+            r"\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "gemini_ungrounded_suppressed",
+        # Gemini grounded-search suppression (research/gemini_search.py
+        # _format_grounded_response): google_search returned no grounding chunks and
+        # no url_context read succeeded, so the section is dropped as ungrounded
+        # parametric output. The orchestrator then records status="empty", which is
+        # NOT alertable and bumps no counter — so this WARN is the only signal, and
+        # without a spec the suppression rate was unmeasurable from the archive.
+        re.compile(
+            r"GEMINI_UNGROUNDED_SUPPRESSED:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
+            r"\s+queries=(?P<queries>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # gemini_search.py passes question.id_of_question
+    ),
+    MarkerSpec(
+        "agentic_document_ungrounded_suppressed",
+        # The read_document twin of the marker above (research/agentic/tools.py
+        # read_document): Gemini's url_context tool retrieved nothing, so the answer would
+        # be unsourced recall and the "fetched" verification tier is withheld. Worth
+        # measuring separately because a "fetched" document discrepancy is the only kind
+        # that enters the artifact's SUPERSEDE block, i.e. the one that tells every
+        # forecaster to override the briefing. Carries no question id — read_document is a
+        # per-URL tool with no question in scope — so the URL is the only field.
+        re.compile(r"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED:\s*url=(?P<url>\S+)"),
+    ),
+    MarkerSpec(
+        "gap_fill_analyzer_failed",
+        # Gap-fill v1's analyzer (research/targeted.py run_gap_fill_pass) died, which
+        # GATES the whole pass — the addendum is silently "" and the run looks identical
+        # to a question that legitimately had no gaps. Gap-fill isn't one of the
+        # orchestrator's _run_one providers, so it has no ProviderResult and no `lost=`
+        # token; this marker is the only durable signal, and v1's searches are one of the
+        # largest research spend lines (~44%). ``detail`` captures greedily to end-of-line
+        # because it holds the exception's str.
+        re.compile(
+            r"GAP_FILL_ANALYZER_FAILED:\s*question=(?P<question>\S+)\s+error=(?P<error>\S+)"
+            r"(?:\s+detail=(?P<detail>.*))?$"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # targeted.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"
@@ -258,8 +355,17 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "credit_spend",
+        # ``source`` (added 2026-07-27) names which branch produced the delta and so
+        # how much to trust it: ``remaining_delta`` is reliable,
+        # ``usage_delta_unsettled`` is a LOWER BOUND (settlement lag — see
+        # credit_telemetry's module docstring), ``unavailable`` means no delta. The
+        # group is OPTIONAL because re-harvesting replays pre-2026-07-27 logs whose
+        # lines end at ``remaining=``; a mandatory tail would drop every one of those
+        # records on the next replace-by-run sync. Missing coerces to None, which
+        # reads correctly as "this run predates the field".
         re.compile(
             r"CREDIT_SPEND:\s*key=(?P<key>\S+)\s+run_delta_usd=(?P<run_delta_usd>\S+)\s+remaining=(?P<remaining>\S+)"
+            r"(?:\s+source=(?P<source>\S+))?"
         ),
     ),
     MarkerSpec(

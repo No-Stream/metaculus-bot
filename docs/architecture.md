@@ -14,21 +14,23 @@ combine them into one prediction and publish it as a comment on Metaculus.
 
 Three files form the startup chain:
 
-- `main.py` — a six-line shim. It re-exports `TemplateForecaster` (for anything that
+- `main.py` — a thin shim. It re-exports `TemplateForecaster` (for anything that
   imports it) and, when run directly, calls `cli.main()`.
 - `metaculus_bot/cli.py` — the command-line entry point. It parses `--mode`
   (`tournament`, `minibench`, `metaculus_cup`, `quarterly_cup`, `test_questions`),
   builds the LLM roster dict from `llm_configs.py`, constructs a `TemplateForecaster`
   with `aggregation_strategy=CONDITIONAL_STACKING`, and runs the mode-specific
   forecast loop. It also wires credit telemetry and decides the process exit code:
-  the run exits non-zero when any degradation counter fired (dropped forecasters,
-  stacker fallbacks, research timeouts) or the donated OpenRouter key dropped below
-  the refill floor. Credit-caused alerts are suppressed until 2026-09-10 while the
-  operator self-funds the season — see "Credit alerting is suppressed" in
-  `docs/operations.md`. See `cli.py:45` (`main`).
+  the run exits non-zero when any degradation counter fired (`alertable_count` on
+  `TemplateForecaster` sums them: dropped forecasters, questions that failed to
+  publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
+  v2 errors, and prediction-market degradation) or the donated OpenRouter key
+  dropped below the refill floor. Credit-caused alerts are suppressed until
+  2026-09-10 while the operator self-funds the season — see "Credit alerting is
+  suppressed" in `docs/operations.md`. See `main` in `cli.py`.
 - `metaculus_bot/forecaster.py` — the bot itself. `TemplateForecaster` subclasses the
   framework's `ForecastBot` and owns the per-question pipeline. The method to read
-  first is `_research_and_make_predictions` (`forecaster.py:548`).
+  first is `_research_and_make_predictions`.
 
 Publication happens inside the framework's forecast loop, not in `cli.py`. Every
 question that clears the min-forecasters guard is already on Metaculus by the time
@@ -38,7 +40,7 @@ question that clears the min-forecasters guard is already on Metaculus by the ti
 
 Everything below runs once per question inside `_research_and_make_predictions`,
 under a shared per-question wall-clock budget (`PER_QUESTION_WALL_CLOCK_DEADLINE`,
-3510s — about 58.5 minutes of the 60-minute Metaculus close window). Research,
+sized to finish just inside the 60-minute Metaculus close window). Research,
 forecaster fan-out, aggregation, and publish all draw from that one budget.
 
 ```
@@ -68,15 +70,15 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  3. FORECASTER FAN-OUT                           │
-        │  N forecaster LLMs run in parallel, each under   │
-        │  a 10-min soft deadline. Type-specific runner    │
-        │  per question (binary / MC / numeric).           │
+        │  N forecaster LLMs run in parallel, each capped  │
+        │  by FORECASTER_SOFT_DEADLINE. Type-specific      │
+        │  runner per question (binary / MC / numeric).    │
         └────────────────────────────────────────────────┘
                                  │  N reasoned predictions
                                  ▼
         ┌────────────────────────────────────────────────┐
         │  4. MIN-FORECASTERS GUARD                        │
-        │  Fewer than MIN_FORECASTERS_TO_PUBLISH (2) valid │
+        │  Fewer than MIN_FORECASTERS_TO_PUBLISH valid     │
         │  → skip this question, keep the batch going.     │
         └────────────────────────────────────────────────┘
                                  │
@@ -98,7 +100,7 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
 
 ### 1. Research fan-out
 
-`run_research` (`forecaster.py:414`) delegates to a `ResearchOrchestrator`
+`run_research` (`forecaster.py`) delegates to a `ResearchOrchestrator`
 (`research/orchestrator.py`). It picks one primary provider by priority (AskNews in
 prod, then Exa, then Perplexity, then a stub) and runs several additional providers
 alongside it in parallel, each behind its own env flag. AskNews returns raw article
@@ -109,7 +111,7 @@ selection, gating, and the shared-vs-personal API-key routing.
 ### 2. Gap-fill (two passes)
 
 After the first-pass bundle is assembled, two gap-fill passes run concurrently in one
-`asyncio.gather` (`orchestrator.py:144`), so the research phase costs `max(v1, v2)`
+`asyncio.gather` inside `run_research` (`orchestrator.py`), so the research phase costs `max(v1, v2)`
 in wall-clock, not the sum:
 
 - **v1** (`research/targeted.py`): an analyzer LLM reads the bundle, names up to a few
@@ -126,40 +128,51 @@ tools, and telemetry.
 
 The orchestrator also builds a provider-diagnostics block that is deliberately
 withheld from the forecaster-facing text (so it never pollutes prompts) but is
-re-attached to the published comment later. This is the "diagnostics seam" you'll see
-referenced in `forecaster.py:571`.
+re-attached to the published comment later. This is the "diagnostics seam": the
+orchestrator's `pop_provider_diagnostics`, which `_research_and_make_predictions` in
+`forecaster.py` drains once the research phase is done.
 
 ### 3. Forecaster fan-out
 
-Each forecaster LLM runs through `_forecaster_with_soft_deadline` (`forecaster.py:869`),
-which caps a single model at `FORECASTER_SOFT_DEADLINE` (600s / 10 min) so one stuck
+Each forecaster LLM runs through `_forecaster_with_soft_deadline` (`forecaster.py`),
+which caps a single model at `FORECASTER_SOFT_DEADLINE` so one stuck
 model can't hold the whole question. `_make_prediction` dispatches to the
 type-specific runner (`forecaster_runners.py`) for binary, multiple-choice, or numeric
 questions. The N coroutines are gathered under the shared wall-clock budget by
-`_gather_predictions_with_wall_clock` (`forecaster.py:430`), which cancels any
+`_gather_predictions_with_wall_clock` (`forecaster.py`), which cancels any
 forecaster still pending at the deadline and counts the drop.
 
-The ensemble is six forecaster LLMs balanced across providers. The exact roster
+The ensemble is a handful of forecaster LLMs, one per vendor. The exact roster
 rotates often, so **read `metaculus_bot/llm_configs.py` for the current list** rather
 than trusting any names written here. Support models (summarizer, parser, stacker,
 disagreement analyzer) live in the same file.
 
 Each forecaster emits its answer inside a fenced ```json STRUCTURED FORECAST block,
 which is parsed by a deterministic extraction ladder (`value_extraction.py`). Numeric
-questions produce 13 percentiles that get turned into a 201-point PCHIP CDF. See
+questions produce the canonical percentile set (`STANDARD_PERCENTILES` in
+`numeric/config.py`), turned into a PCHIP CDF on the `PCHIP_CDF_POINTS` grid. See
 [numeric_pipeline.md](numeric_pipeline.md) for the percentile-to-CDF machinery and its
 bound/step constraints.
 
 ### 4. Min-forecasters guard
 
-If fewer than `MIN_FORECASTERS_TO_PUBLISH` (default 2, `constants.py:487`) forecasters
+If fewer than `MIN_FORECASTERS_TO_PUBLISH` (`constants.py`) forecasters
 returned a valid prediction, the ensemble is too degraded to trust. The question is
 skipped and a counter bumps for end-of-run alerting, but the rest of the batch and all
-other publications continue (`forecaster.py:638`).
+other publications continue. The guard lives in `_research_and_make_predictions`
+(`forecaster.py`).
+
+When the threshold is 1, a lone survivor publishes: the median of one forecast is
+that forecast. Because the spread metrics in `spread_metrics.py` require at least two
+predictions and raise otherwise, `_research_and_make_predictions` short-circuits the
+n == 1 case before spread computation and stacking and hands the single prediction
+straight to the aggregator. Exception-driven drops still bump the degradation
+counters, so a run thinned to one model reddens CI rather than silently withholding
+the question.
 
 ### 5. Aggregation: CONDITIONAL_STACKING
 
-The default strategy is `CONDITIONAL_STACKING` (`cli.py:120`). Conceptually:
+The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conceptually:
 
 - Compute the spread across the N forecasts (`spread_metrics.compute_spread`).
 - **Low spread**: return the MEDIAN of the raw per-model predictions.
@@ -168,19 +181,24 @@ The default strategy is `CONDITIONAL_STACKING` (`cli.py:120`). Conceptually:
   stacker LLM that rewrites the forecast. If the stacker fails, it falls back to a
   second stacker LLM, then to MEDIAN.
 
-Spread thresholds live in `constants.py`: binary 0.15, MC 0.20, numeric 0.15.
+Spread thresholds live in `constants.py`, one per question type:
+`CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD` (a probability range),
+`CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD` (a max per-option spread), and
+`CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD` (a normalized percentile spread).
 
 **Stacking is disabled in production.** All four workflow YAMLs set
 `BINARY_STACKING_ENABLED`, `MC_STACKING_ENABLED`, and `NUMERIC_STACKING_ENABLED` to
-`false`, so even when spread exceeds the threshold, the per-type gate bypasses the
-stacker and forces the MEDIAN path (`forecaster.py:689`). In effect, **prod runs
-MEDIAN of the raw forecasts.** The stacker chain stays fully wired and is exercised in
+`false`, so even when spread exceeds the threshold, the per-type gate in
+`_research_and_make_predictions` (`forecaster.py`) bypasses the stacker and forces the
+MEDIAN path. In effect, **prod runs MEDIAN of the raw forecasts.** The stacker chain
+stays fully wired and is exercised in
 backtests and ablation runs. The aggregation dispatch, base-combine, and stacker
 fallback ladder all live in `metaculus_bot/aggregation_pipeline.py`
 (`AggregationPipeline`). The conditional-stacking path runs the combined result
-through a Platt-calibration hook (`aggregation_pipeline.py:276`), but that hook is
-gated by `PLATT_CALIBRATION_ENABLED`, which is unset in every workflow, so in prod
-it is a passthrough (`post_processing.py:34`).
+through a Platt-calibration hook (`_apply_platt_calibration` in
+`aggregation_pipeline.py`), but that hook is gated by `PLATT_CALIBRATION_ENABLED`,
+which is unset in every workflow, so in prod `apply_platt_calibration`
+(`post_processing.py`) is a passthrough.
 
 ### 6. Published comment
 

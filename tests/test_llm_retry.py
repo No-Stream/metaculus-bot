@@ -17,18 +17,45 @@ no bare ``async def`` helpers for flake8-async to complain about.
 """
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import asknews_sdk.errors as asknews_errors
+import asknews_sdk.response as asknews_response
 import litellm.exceptions as litellm_exc
 import pytest
+import requests
 
+from metaculus_bot import fetch_hardening
+from metaculus_bot.constants import (
+    CRUX_SOFT_DEADLINE,
+    FORECASTER_SOFT_DEADLINE,
+    METACULUS_CLOSE_WINDOW_SECONDS,
+    PER_QUESTION_WALL_CLOCK_DEADLINE,
+    PREDICTION_MARKET_KEYWORD_BACKOFFS,
+    PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
+    PREDICTION_MARKET_TIMEOUT,
+    PUBLISH_POST_RETRIES,
+    PUBLISH_POST_TIMEOUT,
+    STACKER_FALLBACK_SOFT_DEADLINE,
+    STACKER_SOFT_DEADLINE,
+    SUMMARIZER_WALL_TIMEOUT,
+    WALL_CLOCK_STACKING_MIN_BUDGET,
+)
+from metaculus_bot.llm_configs import REASONING_MODEL_CONFIG, UTILITY_MODEL_CONFIG
 from metaculus_bot.llm_retry import (
     DEFAULT_TRANSIENT_BACKOFFS,
+    NON_RETRYABLE_HTTP_STATUS_CODES,
+    TRANSIENT_RETRY_EXCEPTIONS,
     TRANSIENT_RETRY_MAX_ELAPSED_S,
+    _is_transient_type,
     invoke_with_broad_retry,
     invoke_with_transient_retry,
+    is_broadly_retryable,
+    llm_status_code,
 )
+from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 # A wall_timeout comfortably larger than any simulated call duration in these
 # tests, so the helper's own asyncio.wait_for never fires unless we want it to.
@@ -286,6 +313,206 @@ def test_elapsed_gate_default_is_30s() -> None:
     every real per-call timeout (120/300/360/420/480/500s).
     """
     assert TRANSIENT_RETRY_MAX_ELAPSED_S == 30.0
+
+
+def test_wall_timeout_is_per_attempt_not_a_total_budget() -> None:
+    """Pin the semantics every caller's budget arithmetic depends on.
+
+    ``invoke_with_transient_retry`` starts a FRESH ``asyncio.wait_for(...,
+    wall_timeout)`` inside the attempt loop, so ``wall_timeout`` bounds each attempt
+    individually — the worst case for a call site is
+    ``(len(backoffs) + 1) * wall_timeout + sum(backoffs)``, NOT ``wall_timeout``.
+    Callers that size the value to fit inside an outer ``wait_for`` (see
+    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` against ``PREDICTION_MARKET_TIMEOUT``)
+    read it the other way round and silently overrun, so make the semantics explicit
+    here rather than leaving them implied by the loop body.
+
+    Two attempts each hitting the wall must therefore consume ~2x the wall, and the
+    per-attempt ``asyncio.TimeoutError`` must not be retried (it is a SLOW failure).
+    """
+    wall = 0.05
+    attempt_durations: list[float] = []
+
+    async def _hang() -> str:
+        started = time.monotonic()
+        try:
+            await _REAL_SLEEP(5)
+        finally:
+            attempt_durations.append(time.monotonic() - started)
+        return "never"
+
+    async def _run() -> None:
+        # A predicate that accepts asyncio.TimeoutError plus a gate above the wall
+        # forces the retry the production predicates deliberately refuse, which is
+        # what exposes the per-attempt (rather than total) nature of the cap.
+        with pytest.raises(asyncio.TimeoutError):
+            await invoke_with_transient_retry(
+                _hang,
+                wall_timeout=wall,
+                label="per_attempt_wall",
+                backoffs=(0.0,),
+                max_elapsed_s=_BIG_WALL,
+                predicate=lambda _exc: True,
+            )
+
+    asyncio.run(_run())
+
+    assert len(attempt_durations) == 2, "wall_timeout bounds each attempt, so both attempts must run"
+    assert sum(attempt_durations) >= wall * 1.5, (
+        f"two attempts must cost ~2x the wall, not one wall total: {attempt_durations=}"
+    )
+
+
+def test_prediction_market_keyword_retry_budget_fits_the_snapshot_timeout() -> None:
+    """The keyword extractor's WORST CASE must fit inside the snapshot budget.
+
+    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` is per-attempt (see the test above), so
+    the real ceiling is ``(len(backoffs) + 1) * wall + sum(backoffs)``. At 15.0s that
+    was 31.0s against a 30.0s ``PREDICTION_MARKET_TIMEOUT`` — the exact overrun the
+    per-attempt cap was added to prevent stayed reachable, without either attempt
+    hitting its own wall: a fast ``litellm.Timeout`` at ~14.9s is retryable and under
+    the 30s elapsed gate, then the 1s backoff, then a second attempt to the wall.
+    The snapshot-level ``wait_for`` then cancels all four venues and mis-attributes
+    the loss to ``snapshot`` rather than ``keywords``.
+
+    Asserting the product (not the two halves separately) is the point: ``sum(backoffs)
+    < T`` and ``wall <= T`` both held true at 31.0s.
+    """
+    worst_case = (len(PREDICTION_MARKET_KEYWORD_BACKOFFS) + 1) * PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT + sum(
+        PREDICTION_MARKET_KEYWORD_BACKOFFS
+    )
+
+    assert worst_case < PREDICTION_MARKET_TIMEOUT, (
+        f"keyword retry worst case {worst_case}s must fit inside the {PREDICTION_MARKET_TIMEOUT}s snapshot budget"
+    )
+    # Leave real room for the four-platform fan-out that runs after extraction, not
+    # merely a hair under the cap.
+    assert PREDICTION_MARKET_TIMEOUT - worst_case >= 5.0, (
+        "at least 5s of the snapshot budget must remain for the platform fan-out"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Soft-deadline / model-timeout alignment
+#
+# Every soft deadline in constants.py is documented in terms of a timeout that
+# lives in llm_configs.py ("slightly above the stacker LLM's own litellm
+# timeout", "matches the summarizer's litellm per-request timeout", "the
+# analyzer's own bound ... is looser than this"). Those relationships are what
+# make each wrapper a backstop rather than the primary bound, and NOTHING
+# enforced them: the values sit in two files that change for unrelated reasons,
+# and the existing deadline tests all monkeypatch the constant to a fraction of a
+# second to test the wrapper's BEHAVIOR, which passes at any value. So a
+# llm_configs.py timeout bump silently inverts the intended ordering and the
+# soft deadline starts firing first, converting a clean provider timeout into an
+# opaque asyncio.TimeoutError. Pin the arithmetic the comments assert, in the
+# same spirit as the keyword-budget test above.
+# ---------------------------------------------------------------------------
+
+
+def test_stacker_soft_deadline_sits_above_the_reasoning_model_timeout() -> None:
+    """The stacker wrapper must be a backstop, not the primary bound.
+
+    ``STACKER_SOFT_DEADLINE``'s comment says it is set "slightly above the stacker
+    LLM's own litellm timeout ... so the model's timeout fires first with a clean
+    exception when possible". Inverted, every stalled stacker surfaces as an
+    ``asyncio.TimeoutError`` from the wrapper instead of the provider's own typed
+    error, and the fallback chain loses the reason it fired.
+    """
+    model_timeout = REASONING_MODEL_CONFIG["timeout"]
+    assert STACKER_SOFT_DEADLINE > model_timeout, (
+        f"STACKER_SOFT_DEADLINE={STACKER_SOFT_DEADLINE} must exceed the stacker's litellm "
+        f"timeout={model_timeout} so the model's own timeout fires first"
+    )
+    # "Slightly" above: a huge margin would mean a stuck call burns budget the
+    # fallback stacker needs. The fallback's own deadline is the natural scale.
+    assert STACKER_SOFT_DEADLINE - model_timeout <= STACKER_FALLBACK_SOFT_DEADLINE, (
+        "the backstop margin should stay small relative to the fallback's budget"
+    )
+
+
+def test_stacker_fallback_deadline_is_tighter_than_the_primary() -> None:
+    """The fallback fires late on the critical path, so it gets less time.
+
+    Documented at ``STACKER_FALLBACK_SOFT_DEADLINE``. If this ever inverted, a
+    failing primary followed by a slow fallback would eat the publish budget that
+    ``WALL_CLOCK_STACKING_MIN_BUDGET`` reserves.
+    """
+    assert STACKER_FALLBACK_SOFT_DEADLINE < STACKER_SOFT_DEADLINE
+
+
+def test_summarizer_wall_timeout_matches_the_utility_model_timeout() -> None:
+    """``SUMMARIZER_WALL_TIMEOUT`` is documented as matching its litellm budget.
+
+    The point of the equality is that the per-attempt cap and the underlying
+    request budget expire together, so a breach means the request really is stuck
+    rather than the wrapper being impatient.
+    """
+    assert SUMMARIZER_WALL_TIMEOUT == UTILITY_MODEL_CONFIG["timeout"], (
+        f"SUMMARIZER_WALL_TIMEOUT={SUMMARIZER_WALL_TIMEOUT} must equal the summarizer's "
+        f"litellm timeout={UTILITY_MODEL_CONFIG['timeout']}"
+    )
+
+
+def test_crux_soft_deadline_is_tighter_than_the_analyzer_model_timeout() -> None:
+    """The crux extractor is deliberately capped BELOW its model's own timeout.
+
+    Unlike the stacker, here the wrapper is meant to fire first: the comment says
+    the analyzer's own per-attempt bound "is looser than this, so without the
+    wrapper a stalled call runs well past the crux's usefulness". A crux that
+    arrives too late is worthless even if it arrives, so this one inverts the
+    backstop relationship on purpose — pin it so the intent survives.
+    """
+    assert CRUX_SOFT_DEADLINE < UTILITY_MODEL_CONFIG["timeout"], (
+        f"CRUX_SOFT_DEADLINE={CRUX_SOFT_DEADLINE} must undercut the analyzer's litellm "
+        f"timeout={UTILITY_MODEL_CONFIG['timeout']} so the wrapper bounds a stalled crux"
+    )
+
+
+def test_forecaster_soft_deadline_caps_the_model_retry_ladder() -> None:
+    """A single stuck forecaster must not be able to hold a question.
+
+    ``FORECASTER_SOFT_DEADLINE``'s comment describes the worst case it caps:
+    the reasoning model's litellm timeout times its ``allowed_tries``. If a config
+    bump ever made the ladder shorter than the deadline the wrapper would stop
+    being the binding constraint and the drop-with-a-WARNING path would go dead.
+    """
+    ladder_worst_case = REASONING_MODEL_CONFIG["timeout"] * REASONING_MODEL_CONFIG["allowed_tries"]
+    assert FORECASTER_SOFT_DEADLINE < ladder_worst_case, (
+        f"FORECASTER_SOFT_DEADLINE={FORECASTER_SOFT_DEADLINE} must cap the model's own "
+        f"{ladder_worst_case}s retry ladder, else the wrapper never binds"
+    )
+
+
+def test_per_question_deadline_reserves_exactly_the_publish_budget() -> None:
+    """The close-window remainder is sized to the stacking/publish reserve.
+
+    ``PER_QUESTION_WALL_CLOCK_DEADLINE`` is documented as sitting "just inside"
+    the hourly close window, and the leftover is what pays for stacker-skip plus
+    the two publish POSTs. The equality is deliberate, not incidental: reserving
+    LESS than ``WALL_CLOCK_STACKING_MIN_BUDGET`` would let a question run past its
+    own close window while still believing it had time to publish.
+    """
+    reserve = METACULUS_CLOSE_WINDOW_SECONDS - PER_QUESTION_WALL_CLOCK_DEADLINE
+    assert reserve >= WALL_CLOCK_STACKING_MIN_BUDGET, (
+        f"only {reserve}s of the {METACULUS_CLOSE_WINDOW_SECONDS}s close window is reserved, "
+        f"less than the {WALL_CLOCK_STACKING_MIN_BUDGET}s publish budget"
+    )
+
+
+def test_stacking_min_budget_clears_both_publish_posts() -> None:
+    """``WALL_CLOCK_STACKING_MIN_BUDGET`` must cover the publish worst case.
+
+    Two hardened POSTs (the prediction and the comment), each up to
+    ``PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)``. Documented at the
+    constant; unpinned until now, so a retry-count bump could have silently made
+    the reserve too small to publish inside.
+    """
+    publish_worst_case = 2 * PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1)
+    assert WALL_CLOCK_STACKING_MIN_BUDGET > publish_worst_case, (
+        f"WALL_CLOCK_STACKING_MIN_BUDGET={WALL_CLOCK_STACKING_MIN_BUDGET} must exceed the "
+        f"{publish_worst_case}s two-POST publish worst case"
+    )
 
 
 # Broad-predicate retry (Round-2 change 3): for the allowed_tries>=2 sites
@@ -602,5 +829,266 @@ async def test_transient_predicate_does_not_exempt_zero_output() -> None:
     with patch("metaculus_bot.llm_retry.time.monotonic", clock):
         with pytest.raises(litellm_exc.APIError):
             await invoke_with_transient_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="stacker_binary")
+
+    assert awaitable.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic-4xx non-retry (2026-07-26 fix).
+#
+# The donated OpenRouter key hit its spend cap and OpenRouter answered every call
+# with HTTP 403 "Key limit exceeded (total limit)" in ~35ms. litellm has no 403
+# branch in _map_openrouter_exception, so it arrives as a BARE APIError — the root
+# of the litellm/openai tree, matching nothing in PERMANENT_NO_RETRY_EXCEPTIONS.
+# (PermissionDeniedError is in that list and reads as though it covers 403, but it
+# subclasses a different openai branch and litellm never raises it for OpenRouter,
+# so it gave zero coverage.) The broad predicate therefore called it retryable, and
+# because it failed in 0.035s the TRANSIENT_RETRY_MAX_ELAPSED_S gate — designed to block
+# SLOW failures — waved it through: the AskNews summarizer burned ~42s on the full
+# DEFAULT_TRANSIENT_BACKOFFS ladder and two forecasters each did a 3-attempt dance, all
+# against a key that was dry the entire run.
+#
+# The fix reads the authoritative ``status_code`` int that every litellm exception
+# carries and treats the deterministic client-error statuses as permanent. Substring
+# matching numbers against the message is NOT viable here: litellm builds the message
+# as f"APIError: {provider} - {body}", and the OpenRouter body embeds both a 64-hex
+# key hash and, on a moderation refusal, up to ~100 chars of our own prompt in
+# ``flagged_input`` — either can make a status-shaped number appear that was never a
+# status. How likely the key hash alone is to do that is derived by
+# ``test_key_hash_status_collision_is_small_but_nonnegligible`` below, which is the
+# only place that arithmetic is written down.
+# ---------------------------------------------------------------------------
+
+# The status substrings a message-scanning classifier would look for. Not a code
+# constant: the point is what a reader of the raw body might match on.
+_STATUS_SUBSTRINGS: tuple[str, ...] = ("401", "402", "403", "429", "502", "503")
+_KEY_HASH_LEN = 64
+_HEX_ALPHABET = "0123456789abcdef"
+
+
+def _p_hash_contains(patterns: tuple[str, ...], length: int = _KEY_HASH_LEN) -> float:
+    """Exact P(a uniform random hex string of ``length`` contains any of ``patterns``).
+
+    DP over "the last two characters seen", which is sufficient state because every
+    pattern is three characters long. Exact rather than a Poisson/independence
+    approximation, and it handles the overlaps between patterns ("402" and "403" share
+    the prefix "40") that a naive 1-(1-p)^n would get wrong.
+    """
+    assert all(len(p) == 3 for p in patterns), "state is the last 2 chars, so patterns must be length 3"
+    # Probability mass per suffix state; absorbed (matched) mass leaves the system.
+    states: dict[str, float] = {"": 1.0}
+    step = 1.0 / len(_HEX_ALPHABET)
+    for _ in range(length):
+        nxt: dict[str, float] = {}
+        for suffix, mass in states.items():
+            for char in _HEX_ALPHABET:
+                window = suffix + char
+                if window in patterns:
+                    continue  # matched, so this path is absorbed
+                nxt[window[-2:]] = nxt.get(window[-2:], 0.0) + mass * step
+        states = nxt
+    return 1.0 - sum(states.values())
+
+
+def test_key_hash_status_collision_is_small_but_nonnegligible() -> None:
+    """Why reading status digits out of the message body is unsafe, derived not asserted.
+
+    Every classifier in this repo that could have matched status digits in prose instead
+    reads ``llm_status_code``. The justification is that an OpenRouter body carries a
+    64-hex key hash whose characters are status-shaped often enough to matter. This pins
+    that claim as arithmetic so it can't drift into folklore, and deliberately asserts
+    BANDS rather than exact figures — the design only depends on the order of magnitude.
+    """
+    single = _p_hash_contains(("403",))
+    # Order 1%: far too likely to dismiss, given the cost is stranding the ensemble on a
+    # dry key, and far too unlikely to be caught by eyeballing one live key hash.
+    assert 0.01 < single < 0.02
+
+    any_status = _p_hash_contains(_STATUS_SUBSTRINGS)
+    # Order 10% across the six statuses a message scanner might match — roughly one key
+    # rotation in twelve produces a hash that lies about its own status.
+    assert 0.05 < any_status < 0.15
+
+    # Six near-disjoint chances, so the union lands near (but below) six times one.
+    assert 5.0 * single < any_status < 6.0 * single
+
+
+# Verbatim from the 2026-07-26 06:45 UTC production run (run_log_facts.md): the donated
+# key at $0.00 of its $850 cap. Note what it does NOT contain — "credit", "insufficient",
+# "balance", or "402" — and that the only "403" is the JSON code field, which is exactly
+# why classification must read status_code, not the text. Shared from conftest so this
+# reasoning about the exact bytes stays true for every suite that replays it.
+_PROD_KEY_LIMIT_MESSAGE = PRODUCTION_KEY_LIMIT_403
+
+
+def _api_error_with_status(status: int, message: str = "boom") -> litellm_exc.APIError:
+    """Build a bare litellm APIError carrying ``status``, the shape OpenRouter 403s take."""
+    return litellm_exc.APIError(
+        status_code=status, message=message, llm_provider="openrouter", model="openai/gpt-5.6-sol"
+    )
+
+
+@pytest.mark.parametrize("status", sorted(NON_RETRYABLE_HTTP_STATUS_CODES))
+def test_broad_predicate_rejects_deterministic_client_statuses(status: int) -> None:
+    """A bare APIError carrying a hard 4xx is permanent — re-rolling it cannot change it.
+
+    402 and 403 are the ones that actually move: 400/401/404/422 already map to typed
+    permanent litellm classes, so the status rule is close to a no-op for them.
+    """
+    assert is_broadly_retryable(_api_error_with_status(status)) is False
+
+
+def test_broad_predicate_rejects_production_key_limit_403() -> None:
+    """The verbatim 2026-07-26 dry-donated-key 403 is permanent, not a transient blip."""
+    assert is_broadly_retryable(_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE)) is False
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_broad_predicate_still_retries_server_and_rate_limit_statuses(status: int) -> None:
+    """5xx, 429 and 408 stay retryable — those genuinely can succeed on a re-roll."""
+    assert is_broadly_retryable(_api_error_with_status(status)) is True
+
+
+def test_transient_types_are_never_reclassified_as_permanent() -> None:
+    """Guard against generalizing the rule to "all 4xx are permanent".
+
+    ``litellm.Timeout`` carries status 408 — a 4xx — and is the ORIGINAL reason this
+    module exists (an instant 0.001s Timeout during a concurrent async burst that lost
+    all work at allowed_tries=1). Widening NON_RETRYABLE_HTTP_STATUS_CODES to the whole
+    4xx range would silently kill that, so pin every transient type as retryable.
+    """
+    transient = (
+        _timeout(),
+        litellm_exc.APIConnectionError(message="conn", model="m", llm_provider="openrouter"),
+        litellm_exc.InternalServerError(message="500", model="m", llm_provider="openrouter"),
+        litellm_exc.ServiceUnavailableError(message="503", model="m", llm_provider="openrouter"),
+    )
+    # Every configured transient type is represented above, so widening the type set
+    # without extending this guard fails here rather than silently going uncovered.
+    assert {type(exc) for exc in transient} == set(TRANSIENT_RETRY_EXCEPTIONS)
+    for exc in transient:
+        assert is_broadly_retryable(exc) is True, f"{type(exc).__name__} must stay retryable"
+        assert _is_transient_type(exc) is True, f"{type(exc).__name__} must stay transient"
+
+
+def test_broad_predicate_retries_zero_output_statuses() -> None:
+    """Regression guard on the zero-output carve-out (2026-07-25 fix).
+
+    The whitespace-body APIError takes its status from the raw response: 200 in the
+    production case, 500 in the repo fixture. Neither may appear in the non-retryable
+    set, or the carve-out that recovered a dropped forecaster silently dies.
+    """
+    assert 200 not in NON_RETRYABLE_HTTP_STATUS_CODES
+    assert 500 not in NON_RETRYABLE_HTTP_STATUS_CODES
+    assert is_broadly_retryable(_api_error_with_status(200, _PROD_WHITESPACE_BODY_MESSAGE)) is True
+    assert is_broadly_retryable(_api_error(_PROD_WHITESPACE_BODY_MESSAGE)) is True
+
+
+def test_broad_predicate_ignores_status_on_non_llm_exceptions() -> None:
+    """The status rule is scoped to the litellm/openai exception tree.
+
+    ``requests``-shaped HTTP errors carry their status on ``.response``, not on the
+    exception, and this repo deliberately treats a CDN/WAF 403 on the Metaculus
+    question-list endpoint as RETRYABLE (the 2026-05-19 incident — see
+    ``fetch_hardening._is_retryable`` and its tests). "403 is permanent" is a claim
+    about LLM provider calls only, so nothing outside that tree may be reclassified.
+    """
+    cdn_403 = requests.HTTPError("403 Client Error")
+    cdn_403.response = MagicMock(spec=requests.Response)
+    cdn_403.response.status_code = 403
+
+    assert fetch_hardening._is_retryable(cdn_403) is True
+    assert is_broadly_retryable(cdn_403) is True
+
+
+def test_broad_predicate_falls_back_to_type_check_without_status() -> None:
+    """A plain Exception whose text mentions 403 keeps its old classification.
+
+    Nothing textual was added: the rule reads the status attribute or nothing at all.
+    A statusless exception still flows through the type deny-list exactly as before.
+    """
+    assert is_broadly_retryable(Exception("403 Forbidden")) is True
+    assert is_broadly_retryable(ValueError("402 payment required")) is True
+
+
+@pytest.mark.asyncio
+async def test_production_403_consumes_one_attempt_with_no_backoff(_no_real_sleep: AsyncMock) -> None:
+    """The wall-clock fix: the production 403 costs ONE attempt, not four.
+
+    Before this change the summarizer ran attempts 1-4 and slept the full
+    1s/10s/30s ladder (~42s of dead wall clock, log 06:46:01-06:46:43) against a key
+    that could not succeed. Asserting attempt count + zero sleeps rather than real
+    elapsed time keeps the test deterministic.
+    """
+    awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE))
+
+    with pytest.raises(litellm_exc.APIError):
+        await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="asknews_summarizer")
+
+    assert awaitable.await_count == 1
+    _no_real_sleep.assert_not_awaited()
+
+
+def test_llm_status_code_reads_the_reported_status() -> None:
+    """The shared numeric primitive returns the provider's own status, nothing else."""
+    assert llm_status_code(_api_error_with_status(403, _PROD_KEY_LIMIT_MESSAGE)) == 403
+    assert llm_status_code(_api_error_with_status(402)) == 402
+
+
+def test_llm_status_code_is_none_outside_the_llm_exception_tree() -> None:
+    """Only ``openai.APIError`` descendants can report a status.
+
+    Two families depend on this returning ``None`` so their callers stay on text cues:
+    ``requests``-shaped errors (status lives on ``.response``, and a CDN/WAF 403 on the
+    Metaculus question-list endpoint must stay RETRYABLE per the 2026-05-19 incident),
+    and the AskNews SDK, whose ``asknews_sdk.errors`` classes carry a ``.code`` and do
+    not subclass ``openai.APIError`` at all.
+    """
+    cdn_403 = requests.HTTPError("403 Client Error")
+    cdn_403.response = MagicMock(spec=requests.Response)
+    cdn_403.response.status_code = 403
+
+    # The SDK stores the response verbatim without reading it, so a spec'd stand-in is
+    # enough to build the real exception type — what matters here is its class, not its
+    # payload. Built with the genuine SDK class rather than a look-alike so the test
+    # keeps passing only while AskNews really does stay outside the openai tree.
+    asknews_403 = asknews_errors.ForbiddenError(
+        MagicMock(spec=asknews_response.APIResponse), "Your subscription is not currently active", 403011
+    )
+
+    assert llm_status_code(cdn_403) is None
+    assert llm_status_code(Exception("403 Forbidden")) is None
+    assert llm_status_code(asknews_403) is None
+
+
+def test_llm_status_code_rejects_a_non_int_status() -> None:
+    """A string status is not numeric evidence — the narrowing keeps it out.
+
+    litellm normally sets an int, but the attribute is untyped and a provider-shaped
+    string ("403") must not be compared against the int frozenset, or membership
+    silently fails open on a status that IS a hard rejection.
+    """
+    exc = _api_error_with_status(403)
+    # setattr, not a direct assignment: the whole point is a value the annotation
+    # forbids, so both type checkers would flag the plain form.
+    setattr(exc, "status_code", "403")  # noqa: B010
+
+    assert llm_status_code(exc) is None
+
+
+@pytest.mark.asyncio
+async def test_slow_403_is_not_rescued_by_the_zero_output_exemption() -> None:
+    """A hard 403 can never reach the zero-output re-roll, even worded like one.
+
+    The exemption is ANDed with the retry predicate, so making the status permanent
+    closes the path outright — a defense against a provider that returns an
+    unparseable body *and* a client-error status.
+    """
+    awaitable = AsyncMock(side_effect=_api_error_with_status(403, _PROD_WHITESPACE_BODY_MESSAGE))
+    clock = _fake_clock(0.0, TRANSIENT_RETRY_MAX_ELAPSED_S + 5.0)
+
+    with patch("metaculus_bot.llm_retry.time.monotonic", clock):
+        with pytest.raises(litellm_exc.APIError):
+            await invoke_with_broad_retry(lambda: awaitable(), wall_timeout=_BIG_WALL, label="forecaster_binary")
 
     assert awaitable.await_count == 1

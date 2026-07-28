@@ -60,6 +60,7 @@ from metaculus_bot.constants import FORECASTER_SOFT_DEADLINE
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.llm_configs import RESEARCHER_LLM, SUMMARIZER_LLM
+from metaculus_bot.llm_retry import llm_status_code
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 
 logger = logging.getLogger(__name__)
@@ -256,8 +257,13 @@ def _infer_failure_stage(exc: Exception, forecaster_model_slug: str) -> str:
     # are now plain GeneralLlm so they don't 404 on this code path.
     if "no allowed providers" in msg:
         return "parser"
-    # Rate limits: provider-throttled before parser is invoked.
-    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+    # Rate limits: provider-throttled before parser is invoked. The reported status is
+    # the only numeric evidence consulted — litellm formats the message as
+    # ``f"APIError: {provider} - {body}"`` and an OpenRouter body embeds a 64-hex key hash
+    # plus, on a moderation refusal, ~100 chars of our own prompt, so a bare ``"429" in msg``
+    # read coincidental digits as a status. English wording stays as the statusless
+    # fallback (AskNews-shaped SDKs and non-litellm callers report no status).
+    if llm_status_code(exc) == 429 or "rate limit" in msg or "too many requests" in msg:
         return "forecaster"
     # Model-specific text: if the exception names the forecaster slug, the
     # forecaster invoke itself raised. Parser-side errors typically wrap

@@ -8,9 +8,10 @@ import numpy as np
 from scipy.stats import spearmanr
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.parsing import _parse_probability
+from metaculus_bot.performance_analysis.parsing import _parse_probability, is_anonymous_model_key
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
+from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
 from metaculus_bot.spread_metrics import binary_prob_range_spread
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -35,6 +36,68 @@ def _mean(values: list[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def per_model_cohort(data: list[dict], *, cut: str) -> list[tuple[dict, dict]]:
+    """Return ``(record, per_model_forecasts)`` pairs valid for a per-model cut.
+
+    ``per_model_forecasts`` is only a per-MODEL record on questions the bot
+    published as an aggregate of individually-attributed base forecasts. Two
+    kinds of entry break that, and both are dropped here:
+
+    * **Stacker-fired records.** When the stacker LLM produced the published
+      value, the bot writes ONE summary bullet holding the stacker's aggregate.
+      Bucketing it under whatever key that bullet carries makes a per-model
+      score that is really a stacker-vs-base-model mixture. Detection is
+      ``detect_stacker_fired(record) == "confirmed_stacker"`` — the verdict
+      backed by an explicit flag, marker, or body signature. ``likely_stacker``
+      is deliberately NOT excluded: it is a spread-plus-delta heuristic that
+      fires on any high-spread question whose published value sits far from the
+      median, which is exactly what a MEAN-era aggregate looks like, so
+      honoring it would drop the high-disagreement records these cuts exist to
+      measure.
+    * **Anonymous attribution keys.** ``Forecaster N`` keys are positional
+      fallbacks, assigned when neither an explicit roster nor a ``Model:`` line
+      identified the forecaster (``parsing.anonymous_model_key``). Pooled across
+      questions, one positional bucket spans different models — and on
+      stacking-era comments it is the stacker's own aggregate, which is how 50
+      such forecasts reached the 2026-04 per-model cuts as if they were two
+      extra ensemble members.
+
+    Both exclusion counts are logged at INFO under the ``PER_MODEL_COHORT``
+    marker, keyed by ``cut``, so a shrunken cohort is visible in the run log
+    rather than passing for full coverage.
+
+    Records are returned even when every key was dropped; callers already handle
+    an empty per-model dict (they need <2 parseable values to mean "no spread").
+    """
+    cohort: list[tuple[dict, dict]] = []
+    excluded_stacked_records = 0
+    excluded_stacked_observations = 0
+    excluded_anonymous_observations = 0
+
+    for record in data:
+        per_model = record.get("per_model_forecasts") or {}
+        if detect_stacker_fired(record) == "confirmed_stacker":
+            excluded_stacked_records += 1
+            excluded_stacked_observations += len(per_model)
+            continue
+        attributed = {name: value for name, value in per_model.items() if not is_anonymous_model_key(name)}
+        excluded_anonymous_observations += len(per_model) - len(attributed)
+        cohort.append((record, attributed))
+
+    logger.info(
+        "PER_MODEL_COHORT: cut=%s eligible_records=%d excluded_stacked_records=%d "
+        "excluded_stacked_observations=%d excluded_anonymous_observations=%d "
+        "reason=a stacked record's per-model slot holds the stacker aggregate, and an "
+        "anonymous Forecaster-N key is a positional bucket, not one model",
+        cut,
+        len(cohort),
+        excluded_stacked_records,
+        excluded_stacked_observations,
+        excluded_anonymous_observations,
+    )
+    return cohort
 
 
 def binary_summary(data: list[dict]) -> dict:
@@ -94,12 +157,15 @@ def per_model_binary_scores(data: list[dict]) -> dict[str, dict]:
 
     Returns dict mapping model name to {mean_brier, mean_log_score, count}.
     Only includes questions where the model's per-model forecast is parseable as a percentage.
+
+    Restricted to the per-model cohort (see ``per_model_cohort``): stacker-fired
+    records and anonymous ``Forecaster N`` keys are excluded, so every bucket
+    here is one named model.
     """
     binary = [r for r in data if r["type"] == "binary" and isinstance(r["resolution_parsed"], bool)]
 
     model_scores: dict[str, list[tuple[float, float]]] = {}
-    for r in binary:
-        per_model = r.get("per_model_forecasts") or {}
+    for r, per_model in per_model_cohort(binary, cut="per_model_binary_scores"):
         outcome = r["resolution_parsed"]
         for model_name, raw_value in per_model.items():
             prob = _parse_probability(raw_value)
@@ -339,13 +405,17 @@ def stacking_effectiveness(
     actually produced via stacking or base aggregation. We can't distinguish
     those from stored data alone; this is a counterfactual cohort cut showing
     how the trigger metric correlates with outcome difficulty.
+
+    Restricted to the per-model cohort (see ``per_model_cohort``), so the spread
+    is always measured across named base models. Records whose spread can't be
+    computed (fewer than two parseable per-model values) land in ``skipped``, as
+    they always have.
     """
     binary = [r for r in data if r["type"] == "binary" and isinstance(r["resolution_parsed"], bool)]
 
     triggered: list[dict] = []
     skipped: list[dict] = []
-    for r in binary:
-        per_model = r.get("per_model_forecasts") or {}
+    for r, per_model in per_model_cohort(binary, cut="stacking_effectiveness"):
         parsed = [_parse_probability(raw) for raw in per_model.values()]
         probs = [p for p in parsed if p is not None]
         if len(probs) < 2:
@@ -394,11 +464,13 @@ def disagreement_predicts_error(
     error in practice).
 
     Returns dict with computed rho, n, and mean Brier per spread quartile.
+
+    Restricted to the per-model cohort (see ``per_model_cohort``), so the
+    disagreement being correlated is disagreement among named base models.
     """
     binary = [r for r in data if r["type"] == "binary" and r["brier_score"] is not None]
     paired: list[tuple[float, float]] = []
-    for r in binary:
-        per_model = r.get("per_model_forecasts") or {}
+    for r, per_model in per_model_cohort(binary, cut="disagreement_predicts_error"):
         parsed = [_parse_probability(raw) for raw in per_model.values()]
         probs = [p for p in parsed if p is not None]
         if len(probs) < 2:
