@@ -13,7 +13,7 @@ Tests cover (one per behavior):
 - Kalshi prefetch + client-side fuzzy match + yes_bid/yes_ask -> implied_prob
 - Manifold search + direct probability field
 - `as_of` filter drops post-as-of matches (backtest leakage defense)
-- Keyword-extraction calls gpt-5.4-mini with max_tokens >= 800 (G0 token-budget trap)
+- Keyword-extraction calls gpt-5.6-luna with max_tokens >= 800 (G0 token-budget trap)
 - Malformed response -> empty snapshot + WARNING logged
 - Polymarket 403 rate-limit -> bounded retry-with-backoff -> eventual empty
 - Per-question timeout -> empty snapshot (soft-fail)
@@ -749,7 +749,7 @@ class TestPredictIt:
 
 
 # ---------------------------------------------------------------------------
-# Keyword extraction (S4 + S5 union, gpt-5.4-mini max_tokens >= 800)
+# Keyword extraction (S4 + S5 union, gpt-5.6-luna max_tokens >= 800)
 # ---------------------------------------------------------------------------
 
 
@@ -757,7 +757,8 @@ class TestKeywordExtractor:
     @pytest.mark.asyncio
     async def test_extract_runs_s4_and_s5_with_max_tokens_800(self, mock_question):
         """G0 token-budget trap defense: the extractor MUST request max_tokens >= 800.
-        reasoning=low gpt-5.4-mini burns 128-512 tokens on invisible reasoning."""
+        reasoning=low burns 128-512 tokens on invisible reasoning (G0, measured
+        on gpt-5.4-mini; luna succeeded it 2026-08-03 and is unmeasured there)."""
 
         captured_kwargs: list[dict] = []
         calls: list[str] = []
@@ -783,8 +784,8 @@ class TestKeywordExtractor:
         assert len(queries) >= 2
         # The constructed LLM must have max_tokens >= 800
         assert all(kw.get("max_tokens", 0) >= 800 for kw in captured_kwargs), captured_kwargs
-        # And use gpt-5.4-mini
-        assert all("gpt-5.4-mini" in kw.get("model", "") for kw in captured_kwargs)
+        # And use gpt-5.6-luna
+        assert all("gpt-5.6-luna" in kw.get("model", "") for kw in captured_kwargs)
 
     @pytest.mark.asyncio
     async def test_manifold_gets_extra_s2_query(self, mock_question):
@@ -926,7 +927,7 @@ class TestKeywordExtractor:
                     status_code=403,
                     message='{"error":{"message":"Key limit exceeded (total limit).","code":403}}',
                     llm_provider="openrouter",
-                    model="openai/gpt-5.4-mini",
+                    model="openai/gpt-5.6-luna",
                 )
 
         with patch.object(pmp, "build_llm_with_openrouter_fallback", DeadLlm):

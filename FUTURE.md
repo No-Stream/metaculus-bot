@@ -795,8 +795,8 @@ truncates 48%, 6,000 truncates 21%, past 6,000 only whales that need summarizati
 Follow-ups:
 
 1. **MEDIUM — conditional summarization for oversized sources.** First-cited URL stays verbatim
-   (provenance); URLs 2+ / whales (≥~10k chars) go through the cheap summarizer (`gpt-5.4-mini`, temp
-   0, ~$0.01/call). ~5 whale sources per 40 questions no cap captures.
+   (provenance); URLs 2+ / whales (≥~10k chars) go through the cheap summarizer (`gpt-5.6-luna`, temp
+   0, a rounding error at $0.10/$0.60 per 1M). ~5 whale sources per 40 questions no cap captures.
 2. **MEDIUM — Tier-2 LLM fetch** for the js_wall/blocked slice (~15%; Masters.com, childmortality.org,
    UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked/js_wall) is the seam.
    **Precondition:** the Gemini `url_context` probe above. *Note 2026-07-16:* the gap-fill v2 fetch

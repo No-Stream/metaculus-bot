@@ -144,10 +144,13 @@ SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     **{**UTILITY_MODEL_CONFIG, "allowed_tries": 1},
 )
 # Parser: deterministic extraction of percentiles/JSON from rationales — a
-# capability-saturated task where mini is still cheaper than gpt-5.6-luna
-# ($0.75/$4.50 vs $1/$6 per 1M) and keeps allowed_tries=3 for robustness.
+# capability-saturated task, so it rides the cheapest tier that saturates it and
+# keeps allowed_tries=3 for robustness. mini → luna 2026-08-03: the per-token
+# comparison that used to favor mini inverted when luna was marked down. Luna is
+# $0.10/$0.60 vs mini's $0.75/$4.50 per 1M (OpenRouter, verified 2026-08-03), so
+# the newer model is now also the ~7x cheaper one. Effort unchanged at low.
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
-    "openrouter/openai/gpt-5.4-mini",
+    "openrouter/openai/gpt-5.6-luna",
     reasoning={"effort": "low"},
     **UTILITY_MODEL_CONFIG,
 )
@@ -197,10 +200,12 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 )
 
 # Keyword-extraction LLM config for the prediction-market provider.
-# Keyword extraction is capability-saturated; mini is the cheapest capable tier.
+# Keyword extraction is capability-saturated; luna is the cheapest capable tier
+# (mini → luna 2026-08-03, same effort — prices in the PARSER_LLM comment above).
 # Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
-# gpt-5.4-mini reasoning=low burns 128-512 tokens on invisible reasoning before
-# emitting any visible response, so the max_tokens set below is load-bearing.
+# gpt-5.4-mini reasoning=low burned 128-512 tokens on invisible reasoning before
+# emitting any visible response. That measurement is mini's and luna is
+# unmeasured on that axis, so the max_tokens set below stays load-bearing.
 # Constructed per-call inside _run_llm rather than as a singleton because the
 # provider is gated OFF by default and we don't want to pay construction cost
 # (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
@@ -213,7 +218,7 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # PREDICTION_MARKET_TIMEOUT spent sleeping blind, which is exactly what llm_retry
 # exists to eliminate.
 PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
-    "model": "openrouter/openai/gpt-5.4-mini",
+    "model": "openrouter/openai/gpt-5.6-luna",
     "temperature": None,
     "max_tokens": 800,
     "reasoning_effort": "low",

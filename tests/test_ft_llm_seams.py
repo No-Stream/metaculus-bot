@@ -218,7 +218,7 @@ class TestProductionKwargShapesReachAcompletion:
     ) -> None:
         """The real structured-parse builder funnels a pydantic ``response_format`` class + extra_body."""
         calls = _install_acompletion(monkeypatch)
-        llm = _build_constrained_llm(PercentileListWrapper, "openrouter/openai/gpt-5.4-mini")
+        llm = _build_constrained_llm(PercentileListWrapper, "openrouter/openai/gpt-5.6-luna")
 
         await llm.invoke("parse this")
 

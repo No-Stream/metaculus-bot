@@ -44,7 +44,7 @@ def _tool_spec(
 
 def _config(
     *,
-    model: str = "openai/gpt-5.4-mini",
+    model: str = "openai/gpt-5.6-luna",
     reasoning_effort: str = "medium",
     max_tool_calls: int = 14,
     wall_deadline_s: float = 1.0,
@@ -141,7 +141,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
 
     assert "## Agentic Research Findings" in result.findings_markdown
     assert "The report was published on July 1." in result.findings_markdown
-    assert result.telemetry.model == "openai/gpt-5.4-mini"
+    assert result.telemetry.model == "openai/gpt-5.6-luna"
     assert result.telemetry.steps == 4
     assert result.telemetry.tool_calls == 4
     assert result.telemetry.per_tool_counts == {
@@ -161,7 +161,7 @@ async def test_happy_path_records_findings_and_emits_telemetry(caplog: pytest.Lo
     assert len(marker_lines) == 1
     # Plan-§6 marker shape: model + per-surface counters, grep-able in run_logs.
     marker = marker_lines[0]
-    assert "model=openai/gpt-5.4-mini" in marker
+    assert "model=openai/gpt-5.6-luna" in marker
     assert "searches=0" in marker
     assert "fetches=1" in marker
     assert "rendered=1" in marker
