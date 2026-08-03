@@ -67,6 +67,12 @@ from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.http_fetch import build_session, read_body_capped, read_body_snippet
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
+from metaculus_bot.research.provider_health import (
+    VENUE_EXPECTED_LIQUIDITY_FIELDS,
+    VenueObservation,
+    record_catalogue_size,
+    record_venue_observation,
+)
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
 
@@ -114,6 +120,12 @@ PREDICTIT_MIN_FUZZY_SCORE = 40.0
 # often bot-dominated (roughly sub-$10k), so a "thin" label is a real noise
 # warning, not a formality. These cutoffs are a tunable first pass, not
 # calibrated values — the "thin" ceiling sits at $5k deliberately conservatively.
+#
+# The unit is USD, and that is load-bearing rather than incidental: Polymarket's
+# `volumeNum` / `openInterest` are already USD, while Kalshi reports CONTRACT COUNTS
+# (`FixedPointCount`, "market volume in contracts" — docs.kalshi.com, 2026-08-03). One
+# shared threshold pair across both venues therefore requires converting Kalshi's
+# counts to dollars at the point of parse; see `_kalshi_usd_liquidity`.
 LIQUIDITY_THIN_USD = 5_000.0
 LIQUIDITY_DEEP_USD = 50_000.0
 MANIFOLD_THIN_BETTORS = 20
@@ -413,6 +425,84 @@ def _strategy_s2(question_text: str) -> str:
     return t.strip()
 
 
+# Content-word stopwords, shared by the formatter's relevance gate and Manifold's
+# conjunction-relaxation ladder. Kept byte-identical to the tuning script
+# (scratch/new_analyses_2026-07-18/market_match_precision.py `_overlap`) so the shipped labels
+# match the 403-contract grading the thresholds were chosen on. The ladder reuses it because
+# Manifold's search constrains on the same notion of a content word: stopwords measurably do
+# not narrow a `term` ("gas prices" and "gas prices in the" both return 10 results).
+_RELEVANCE_STOPWORDS: frozenset[str] = frozenset(
+    """a an the of in on at to for by with will be is are was were before after during between
+    and or not no yes if then than as from into over under above below more less most least
+    what which who whom whose when where why how this that these those there here it its
+    do does did done have has had having get gets got question market resolve resolves resolved
+    resolution against per any all each both other another same different new old first last
+    2025 2026 2027 january february march april may june july august september october november december
+    """.split()
+)
+
+# Longest relaxation rung, in content tokens. 3 is the measured ceiling for a satisfiable
+# Manifold conjunction: recall collapses at ~4 (`US gas prices 2026` returns 10,
+# `US gas prices high 2026` returns 0).
+MANIFOLD_RELAXATION_MAX_TOKENS = 3
+
+_MANIFOLD_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'À-ɏ&.\-]*")
+
+
+def manifold_relaxation_terms(title: str) -> list[str]:
+    """Progressively shorter Manifold `term` candidates, most specific first.
+
+    Manifold's `/v0/search-markets` treats `term` as a STRICT CONJUNCTION of content
+    tokens: every token must appear in a market's text, and one absent token returns `[]`
+    (measured 2026-08-03 — appending a nonsense token to a query with a known hit zeroes
+    it, while reordering present tokens does not, which rules out a relevance floor).
+    Its semantics are undocumented, so `tests/test_prediction_market_integration.py`
+    carries a live tripwire for the day upstream switches to ranked search.
+
+    Two consequences follow, and together they fix the query length rather than tune it:
+    recall is monotone DECREASING in token count, and precision is monotone INCREASING.
+    So the best query is the LONGEST SATISFIABLE conjunction — which the caller finds by
+    walking these rungs and stopping at the first non-empty result. That is a derived
+    optimum, not a threshold someone picked, which is why there is no tunable knob here.
+
+    Tokens are ranked by how much they narrow the search rather than by position:
+    acronyms first (`VIX`), then proper nouns (`Australia`), then ordinary content words.
+    Duplicates are dropped — a repeated entity would spend a rung slot without narrowing
+    anything ("Sturgis Sturgis Motorcycle").
+    """
+    ranked: list[tuple[int, int, str]] = []
+    seen_tokens: set[str] = set()
+    for position, token in enumerate(_MANIFOLD_TERM_TOKEN_RE.findall(title or "")):
+        normalized = token.lower().strip(".-'")
+        if len(normalized) < 3 or normalized in _RELEVANCE_STOPWORDS or normalized in seen_tokens:
+            continue
+        seen_tokens.add(normalized)
+        if token.isupper() and len(token) >= 2:
+            specificity = 0  # acronym / ticker
+        elif token[0].isupper() and position > 0:
+            # Position 0 is the leading interrogative ("Will", "What"), not an entity.
+            specificity = 1  # proper noun
+        else:
+            specificity = 2
+        ranked.append((specificity, position, token))
+
+    # Most-narrowing first; longer tokens break ties (they carry more signal than "the"-ish
+    # short words that survived the stopword filter), then original order.
+    ranked.sort(key=lambda t: (t[0], -len(t[2]), t[1]))
+
+    terms: list[str] = []
+    seen_terms: set[str] = set()
+    for width in range(min(MANIFOLD_RELAXATION_MAX_TOKENS, len(ranked)), 0, -1):
+        # Re-sort the chosen tokens into reading order: `term` matching is order-invariant,
+        # but a readable query is what shows up in logs.
+        chosen = sorted(ranked[:width], key=lambda t: t[1])
+        term = " ".join(t[2] for t in chosen)
+        if term and term.lower() not in seen_terms:
+            seen_terms.add(term.lower())
+            terms.append(term)
+    return terms
+
+
 def _clean_llm_query(content: str) -> str:
     """Take the first non-empty line, strip quotes and trailing colons/labels."""
     for line in (content or "").splitlines():
@@ -503,7 +593,9 @@ class KeywordExtractor:
         """Per-platform query augmentation.
 
         Manifold prefers natural-language S2 framings (G0 finding); we ALWAYS add
-        S2 for Manifold on top of whatever the core strategy produced.
+        S2 for Manifold on top of whatever the core strategy produced. The
+        strict-conjunction fallback for Manifold is NOT added here — it only fires when
+        these precise queries return nothing (see `manifold_relaxation_terms`).
         """
         out = list(base_queries)
         if platform == "manifold":
@@ -652,6 +744,10 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
         end_iso = ev.get("endDate") or ev.get("end_date_iso") or ""
         close_time = _parse_iso(end_iso)
         volume = _safe_float(ev.get("volume"))
+        # Gamma carries `openInterest` on the EVENT, not the nested market (5/5 live
+        # events vs 0/42 nested, verified 2026-08-03) — reading it only at the market
+        # level left the rendered OI column blank on every Polymarket row ever archived.
+        event_open_interest = _safe_float(ev.get("openInterest"))
 
         implied: float | None = None
         bid: float | None = None
@@ -675,9 +771,14 @@ def _parse_polymarket_matches(payload: Any, query: str = "") -> list[MarketMatch
             liquidity = _safe_float(m0.get("liquidityNum"))
             if liquidity is None:
                 liquidity = _safe_float(m0.get("liquidity"))
+            # Market-level first (more specific when present), event-level as the
+            # fallback that actually populates on today's payloads.
             open_interest = _safe_float(m0.get("openInterest"))
+            if open_interest is None:
+                open_interest = event_open_interest
         else:
             total_volume = volume
+            open_interest = event_open_interest
         spread = (ask - bid) if (bid is not None and ask is not None) else None
 
         confidence = fuzz.token_set_ratio(q_lower, title.lower()) / 100.0 if q_lower and title else 0.0
@@ -954,6 +1055,51 @@ async def _kalshi_prefetch_events(
     return all_events, _FetchTally(pages_ok, 0 if clean_exit else 1)  # noqa: ASYNC910
 
 
+def _kalshi_usd_liquidity(market: dict) -> tuple[float | None, float | None]:
+    """Convert a Kalshi market's contract counts to the USD the thresholds expect.
+
+    Returns ``(volume_usd, open_interest_usd)``, either leg ``None`` when its count is
+    absent — the distinction `_liquidity_label` needs to tell "upstream sent no field"
+    (`no-liquidity-data`) from "a real zero" (`thin`).
+
+    Field names and units are from the Kalshi OpenAPI spec (docs.kalshi.com, re-read
+    2026-08-03). Two details drive the arithmetic:
+
+    - ``volume_fp`` and ``open_interest_fp`` are ``FixedPointCount`` — "market volume in
+      contracts" and "number of contracts bought ... disconsidering netting". They are
+      COUNTS, not dollars. The bare names ``volume`` / ``open_interest`` appear nowhere
+      in the spec and were absent from every archived payload, which is why reading them
+      blanked the label on 100% of Kalshi rows.
+    - The two counts convert with DIFFERENT multipliers, because they measure different
+      things. Volume is turnover, so it scales by trade price. Open interest is
+      collateral: both sides of a contract together post the full settlement value, so it
+      scales by ``notional_value_dollars``. Using trade price for both would call a
+      market holding 119k contracts of open interest at $0.001 "thin" when ~$119k of
+      capital is actually locked in it.
+
+    ``liquidity_dollars`` is deliberately not consulted: upstream marks it deprecated and
+    documents it to "always return 0.0000" (confirmed on 1,504 live markets and all 127
+    archived rows). Scoring off it would wire in a constant zero.
+    """
+    volume = _safe_float(market.get("volume_fp"))
+    open_interest = _safe_float(market.get("open_interest_fp"))
+    if volume is None and open_interest is None:
+        return None, None
+
+    # Kalshi prices every market in dollars-per-contract. Prefer the live bid/ask
+    # midpoint (what the row already reports as its implied probability) and fall back to
+    # the last trade, so a market that has quotes but no trades still converts.
+    bid, ask = _safe_float(market.get("yes_bid_dollars")), _safe_float(market.get("yes_ask_dollars"))
+    price = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
+    if not price:
+        price = _safe_float(market.get("last_price_dollars"))
+    notional = _safe_float(market.get("notional_value_dollars")) or 1.0
+
+    volume_usd = None if volume is None else volume * (price or 0.0)
+    open_interest_usd = None if open_interest is None else open_interest * notional
+    return volume_usd, open_interest_usd
+
+
 def _kalshi_search_local(
     events: list[dict], query: str, top_k: int = 5, min_score: float = KALSHI_MIN_FUZZY_SCORE
 ) -> list[MarketMatch]:
@@ -975,7 +1121,6 @@ def _kalshi_search_local(
         volume_24h: float | None = None
         total_volume: float | None = None
         open_interest: float | None = None
-        liquidity: float | None = None
         is_resolved = False
         if nested and isinstance(nested[0], dict):
             first = nested[0]
@@ -984,9 +1129,7 @@ def _kalshi_search_local(
             yes_bid = _safe_float(first.get("yes_bid_dollars"))
             yes_ask = _safe_float(first.get("yes_ask_dollars"))
             volume_24h = _safe_float(first.get("volume_24h_fp"))
-            total_volume = _safe_float(first.get("volume"))
-            open_interest = _safe_float(first.get("open_interest"))
-            liquidity = _safe_float(first.get("liquidity_dollars"))
+            total_volume, open_interest = _kalshi_usd_liquidity(first)
             is_resolved = (first.get("status") or "").lower() in ("settled", "finalized", "closed")
 
         title_score = fuzz.token_set_ratio(q_lower, title.lower())
@@ -1022,7 +1165,6 @@ def _kalshi_search_local(
                     raw_rules=rules_primary[:2000],  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # rules-text truncation
                     total_volume=total_volume,
                     open_interest=open_interest,
-                    liquidity=liquidity,
                 ),
             )
         )
@@ -1617,6 +1759,10 @@ async def _fetch_market_snapshot_impl(
         logger.warning(f"Invalid PREDICTION_MARKET_KEYWORD_STRATEGY={strategy!r}, using default")
         strategy = "s4_s5_union"
 
+    # Every provider-health observation is keyed on the question, so a question with
+    # no id records nothing (matching record_provider_detail / record_raw_research).
+    qid: int | None = getattr(question, "id_of_question", None)
+
     extractor = KeywordExtractor(strategy=strategy)
     queries = await extractor.extract(question)
     if not queries:
@@ -1649,13 +1795,48 @@ async def _fetch_market_snapshot_impl(
         mf_queries = extractor.queries_for_platform(question, queries, "manifold")
         tasks = [_manifold_search(session, q) for q in mf_queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return _flatten_results(results, "manifold")
+        matches, tally = _flatten_results(results, "manifold")
+        if matches:
+            return matches, tally
+
+        # Nothing matched at full query length. Because `term` is a strict conjunction
+        # (see `manifold_relaxation_terms`), that is far more often an unsatisfiable query
+        # than an absent market, so walk progressively shorter terms and STOP at the first
+        # one that returns anything — the longest satisfiable conjunction, i.e. the most
+        # precise query that isn't empty. Sequential on purpose: each rung is only worth
+        # issuing if the previous found nothing, so a satisfiable query costs zero extra
+        # calls and the worst case is bounded by MANIFOLD_RELAXATION_MAX_TOKENS.
+        title = getattr(question, "title", None) or getattr(question, "question_text", "") or ""
+        already_issued = {q.lower() for q in mf_queries}
+        for term in manifold_relaxation_terms(title):
+            if term.lower() in already_issued:
+                continue
+            relaxed = await _manifold_search(session, term)
+            if relaxed is None:
+                tally += _FetchTally(failed=1)
+                continue
+            tally += _FetchTally(ok=1)
+            if relaxed:
+                logger.info(
+                    f"Manifold relaxed query rescued {len(relaxed)} match(es): "
+                    f"term={term!r} (full-length queries returned none)"
+                )
+                return relaxed, tally
+        return [], tally
 
     async def _kalshi_for_all_queries() -> tuple[list[MarketMatch], _FetchTally]:
         # Inner narrow handlers in _kalshi_prefetch_events are exhaustive
         # (ClientError, TimeoutError, ValueError, TypeError). No outer catch
         # here -- anything escaping is a programming bug we want loud.
         events, prefetch_tally = await _kalshi_prefetch_events(session, event_limit=KALSHI_PREFETCH_EVENT_LIMIT)
+        # A prefetch that reports SUCCESS and hands the local fuzzy matcher an empty
+        # catalogue is a contradiction the match count alone can't show (it looks
+        # identical to "the venue had nothing to say"). A cache hit tallies (0, 0) —
+        # cached data is a success, not a degradation — so `failed` is the right leg.
+        if qid is not None:
+            record_catalogue_size(
+                qid=qid, source="kalshi_events", entries=len(events), fetch_ok=prefetch_tally.failed == 0
+            )
         merged: list[MarketMatch] = []
         for q in queries:
             merged.extend(_kalshi_search_local(events, q, top_k=max_matches_per_platform + 2))
@@ -1673,7 +1854,11 @@ async def _fetch_market_snapshot_impl(
         # (mirrors the Kalshi prefetch-and-local-match pattern).
         markets = await _predictit_prefetch(session)
         if markets is None:
+            # A failed fetch is already the source-loss counter's business; recording
+            # it here too would double-count one outage (see provider_health Signal C).
             return [], _FetchTally(failed=1)
+        if qid is not None:
+            record_catalogue_size(qid=qid, source="predictit_markets", entries=len(markets), fetch_ok=True)
         merged: list[MarketMatch] = []
         for q in queries:
             merged.extend(_predictit_search_local(markets, q, top_k=max_matches_per_platform + 2))
@@ -1690,6 +1875,17 @@ async def _fetch_market_snapshot_impl(
         platform_tasks.append(("predictit", asyncio.create_task(_predictit_for_all_queries())))
 
     lost_platforms: list[str] = []
+    # Which venues reported a CLEAN fan-out. A venue that lost a sub-fetch is
+    # already alertable via _bump_source_loss, so provider_health skips it rather
+    # than counting one outage twice (and "check the query construction" would be
+    # the wrong remedy for a 503 anyway).
+    platform_fetch_ok: dict[str, bool] = {}
+    # PRE-filter candidate counts, i.e. what each venue's fan-out returned before the
+    # as_of / dedup / cap loop below. Captured here because this is the only point
+    # where the pre-filter list is still per-venue; re-deriving it from all_matches
+    # afterwards would work but is exactly the kind of second derivation that let the
+    # D1 field-name guess drift from reality.
+    candidates_per_platform: dict[str, int] = {}
     for platform, task in platform_tasks:
         try:
             matches, tally = await task
@@ -1706,6 +1902,8 @@ async def _fetch_market_snapshot_impl(
         if platform_lost:
             lost_platforms.append(f"{platform}={sources[platform]}")
             _bump_source_loss()
+        platform_fetch_ok[platform] = not platform_lost
+        candidates_per_platform[platform] = len(matches)
         all_matches.extend(matches)
 
     if lost_platforms:
@@ -1741,6 +1939,32 @@ async def _fetch_market_snapshot_impl(
     for plat in ("polymarket", "kalshi", "manifold", "predictit"):
         combined.extend(by_platform[plat])
 
+    # Provider-health observations, recorded HERE because this is the one point where
+    # the pre-filter counts and the post-filter rows are simultaneously in scope. The
+    # liquidity-field presence is read off the parsed MarketMatch objects that actually
+    # render, so the field-contract signal cannot disagree with the `signal` column a
+    # forecaster reads. Pure module-state writes: no I/O, no await, cannot raise,
+    # cannot alter the snapshot.
+    if qid is not None:
+        for platform in platform_fetch_ok:
+            if not platform_fetch_ok[platform]:
+                continue
+            rows = by_platform[platform]
+            present = {
+                field_name
+                for field_name in VENUE_EXPECTED_LIQUIDITY_FIELDS.get(platform, ())
+                if any(getattr(row, field_name) is not None for row in rows)
+            }
+            record_venue_observation(
+                VenueObservation(
+                    qid=qid,
+                    venue=platform,
+                    candidates_pre_filter=candidates_per_platform.get(platform, 0),
+                    rows_post_filter=len(rows),
+                    liquidity_fields_present=frozenset(present),
+                )
+            )
+
     return MarketSnapshot(matches=combined, sources=sources)
 
 
@@ -1770,19 +1994,6 @@ def _flatten_results(results: list[Any], platform: str) -> tuple[list[MarketMatc
 # Formatter — relevance gate (content-word overlap + matcher conf)
 # ---------------------------------------------------------------------------
 
-# Content-word stopwords for the relevance gate. Kept byte-identical to the tuning script
-# (scratch/new_analyses_2026-07-18/market_match_precision.py `_overlap`) so the shipped labels
-# match the 403-contract grading the thresholds were chosen on.
-_RELEVANCE_STOPWORDS: frozenset[str] = frozenset(
-    """a an the of in on at to for by with will be is are was were before after during between
-    and or not no yes if then than as from into over under above below more less most least
-    what which who whom whose when where why how this that these those there here it its
-    do does did done have has had having get gets got question market resolve resolves resolved
-    resolution against per any all each both other another same different new old first last
-    2025 2026 2027 january february march april may june july august september october november december
-    """.split()
-)
-
 
 def _relevance_content_words(text: str | None) -> set[str]:
     words = re.findall(r"[a-z0-9']+", (text or "").lower())
@@ -1801,7 +2012,10 @@ def _is_likely_relevant(overlap: int, confidence: float) -> bool:
 # Shared trailing legend (the table's signal + relevance columns are present in both branches).
 _MARKET_SIGNAL_LEGEND = (
     "The `signal` column labels each market's liquidity/participation "
-    "(thin/decent/deep or thin/decent/high); the raw total volume and open interest are shown alongside. Treat "
+    "(thin/decent/deep for real-money venues, thin/decent/high for Manifold's play-money bettor count); "
+    "`total_vol` and `OI` are that market's traded volume and open interest in approximate USD. "
+    "`no-liquidity-data` means the venue publishes no volume figures at all (PredictIt) — it says nothing "
+    "about how liquid the market is, so treat it as unknown rather than as thin. Treat "
     "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy. "
     "The `relevance` column flags whether the fuzzy match cleared a content-overlap + confidence bar for THIS "
     "question (`likely-relevant`) or did not (`verify-carefully`)."

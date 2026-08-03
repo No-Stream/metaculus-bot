@@ -23,6 +23,14 @@ against the ACTUAL emitted format strings (the source of truth):
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
+* ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
+  ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
+  whether it counted toward the exit code)
+* ``PAID PERSONAL-KEY FALLBACK`` — ``metaculus_bot/fallback_openrouter.py``
+  ``_log_fallback`` (per-CALL: which model fell back off the donated key, and why)
+* ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
+  breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
+  recorded)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
   ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
@@ -301,9 +309,57 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
             r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
             r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
-            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+)"
-            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+)))?"
+            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
+            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
+            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+))?"
             r"\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "provider_degradation",
+        # Per-run provider-degradation summary (metaculus_bot/research/provider_health.py
+        # log_provider_degradation_summary), the positive/negative counterpart to the
+        # ``provider_degradation`` counter in the line above. Aggregates a whole run, so
+        # qid_kind stays None. Emitted even at ``findings=0``, which makes a measured
+        # zero a recorded fact rather than an absent line.
+        #
+        # ``detail`` is a compact JSON ARRAY of findings captured verbatim (it is in
+        # _RAW_FIELDS): venue and field names are delimiter-hostile, and residual
+        # analysis json.loads it. The trailing suppression clause is free text after
+        # the JSON, so ``detail`` stops at the array's closing bracket.
+        re.compile(
+            r"PROVIDER_DEGRADATION:\s*run=(?P<run>\S+)\s+findings=(?P<findings>\d+)"
+            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)\s+detail=(?P<detail>\[.*?\])"
+        ),
+    ),
+    MarkerSpec(
+        "paid_personal_key_fallback",
+        # Per-CALL donated->personal key fallback WARN (fallback_openrouter.py
+        # _log_fallback). The counters it feeds are already in degradation_counters /
+        # the cli summary, but only this line names WHICH MODEL fell back and with
+        # what error, which is what separates "one flaky Gemini call" from "every
+        # forecaster ran on the paid key". ``error`` captures greedily to end-of-line
+        # because it holds the exception's str.
+        re.compile(
+            r"PAID PERSONAL-KEY FALLBACK:\s*donated OpenRouter key failed for model=(?P<model>\S+?),"
+            r".*?error=(?P<error_type>[^:]+):\s*(?P<error>.*)$"
+        ),
+    ),
+    MarkerSpec(
+        "run_alertable_summary",
+        # The end-of-run alertable breakdown (cli.py), emitted on BOTH exit paths —
+        # the green fully-suppressed case is exactly the one that would otherwise
+        # leave no record (the 2026-07-26 drained-key run read alertable=0 alongside
+        # real degradation). ``donated_key`` is the /auth/key probe verdict and is
+        # OPTIONAL-group wrapped twice over: it is omitted entirely when no spend-cap
+        # failure made the wrapper probe, and the suppression clause between it and
+        # ``credit`` only appears mid-window.
+        re.compile(
+            r"Run completed with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
+            r"\(bot=(?P<bot>\S+?), personal_key_fallback=(?P<personal_key_fallback>\S+?) of which "
+            r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
+            r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
+            r"(?:, donated_key=(?P<donated_key>\S+?))?\);"
         ),
     ),
     MarkerSpec(

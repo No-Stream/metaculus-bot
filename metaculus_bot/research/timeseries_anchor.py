@@ -25,6 +25,14 @@ relative-return spread block; other two-ticker framings (a ratio, a price
 difference, or a single ticker's level) skip — a mean-zero relative-log-return
 band in percentage points is wrong-unit for those.
 
+Two guards decide whether a routed question actually gets a section, both of them
+"no payload, no section" rules. The magnitude backstop (``_band_misses_bounds``)
+drops a band whose values are the wrong quantity for the question's displayed
+range, and a question whose history is too short for its horizon renders no band
+at all, which also drops the section — the numeric prompt's anchor clause fires on
+the section header alone, so a headline with no band promises a P10/P50/P90 range
+that isn't there.
+
 Estimators are pure-numpy ports of ``estimators.py`` (simplified, no registry or
 CV policy): level/spread → empirical h-step-change quantiles (log for strictly-
 positive series, absolute otherwise) applied to the last value; max-over-window →
@@ -51,6 +59,7 @@ from metaculus_bot.constants import (
     TS_ANCHOR_LOOKBACK_YEARS,
     TS_ANCHOR_MONTHLY_TABLE_ROWS,
     TS_ANCHOR_NATIVE_TABLE_ROWS,
+    TS_ANCHOR_OPEN_BOUND_SPAN_TOLERANCE,
     TS_ANCHOR_SECTION_MAX_CHARS,
     TS_ANCHOR_SPREAD_LOOKBACK_YEARS,
     TS_ANCHOR_TIMEOUT,
@@ -125,6 +134,31 @@ _MAX_KEYWORD_RE = re.compile(r"\b(highest|peak|maximum|max)\b", re.IGNORECASE)
 # ratio/level shapes that slip through).
 _RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelative\b", re.IGNORECASE)
 
+# Wording that says the question resolves on a DIFFERENCE between two series, or on a
+# CHANGE in one, rather than on a level. Every registry entry serves a level (or a declared
+# derivation of one), so a single-series level band on one of these shapes is the wrong
+# quantity — usually the wrong unit too (a two-leg Treasury spread resolves in basis points
+# while the leg's level is in percent).
+#
+# The URL branch already refuses the two-URL version of this via its ambiguity check, but a
+# question that names both legs in prose and cites no URL reaches the keyword registry with
+# nothing to catch it, and the magnitude backstop does not: a 4.4-4.95 percent level band
+# against a −50..50 basis-point displayed range scores INSIDE that range once the open-bound
+# tolerance widens it (pinned in the tests).
+#
+# Applied as a ROUTE-level guard rather than per-entry `exclude_keywords`, because an exclude
+# removes the entry from ambiguity detection too: excluding DGS10 on "the 10-year treasury
+# yield versus the high yield spread" left the HY-OAS entry as the sole match, so a two-leg
+# question that used to skip as ambiguous would have routed to one leg. The guard runs AFTER
+# the ambiguity check, so it can only ever turn a route into a skip.
+_TWO_LEG_OR_CHANGE_RE = re.compile(
+    r"\bbasis point|\bbps\b|\bspread\b|\bminus\b|\bversus\b|\bvs\.?\b|\bdifference between\b", re.IGNORECASE
+)
+
+# Registry entries whose own series IS the published spread/difference, so the wording above
+# describes exactly what they serve rather than a quantity they cannot express.
+_SPREAD_NATIVE_SERIES: frozenset[str] = frozenset({"BAMLH0A0HYM2"})
+
 # The non-revising FRED allowlist lives in ts_fetch (fetch-layer knowledge shared with
 # financial_data); imported above as FRED_NON_REVISING_SERIES.
 
@@ -164,6 +198,17 @@ class _TemplateEntry:
     # leakage bug if it disagreed with the allowlist).
 
 
+# Wording that scopes a quantity to a whole MONTH rather than a point in time. GASREGW is a
+# WEEKLY series, so the two gasoline entries below split on exactly these tokens: the
+# monthly-average entry REQUIRES one of them, the weekly-level entry EXCLUDES all of them.
+# Sharing one tuple is what makes them exact complements rather than two keyword lists that
+# happen to agree — the gap between a required-token list and a separately-maintained excluded
+# one is where the point-in-time gasoline family previously fell through both gates and landed
+# nowhere. Any phrasing reaches exactly one entry, so neither derivation can leak into the
+# other's family and the pair can never co-match into an ambiguity skip.
+_MONTH_SCOPED_KEYWORDS = ("for the month", "monthly average", "during the month", "monthly")
+_GASOLINE_KEYWORDS = ("regular gasoline", "regular gas price", "gasoline price")
+
 # Conservative curated registry: title keyword(s) → resolving series. Kept small
 # and unambiguous on purpose; anything not here (or matching >1 entry) yields "".
 _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
@@ -175,6 +220,14 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
             "10y treasury",
             "ten-year treasury",
             "10-year yield",
+            # The recurring "ending value of the UST 10Y Yield for these biweekly periods"
+            # family names the series in a form none of the DGS10 keywords above cover. Those
+            # questions DO cite the DGS10 FRED URL in their resolution criteria and already
+            # route through the URL branch, so these two tokens recover no question observed
+            # today (all 9 of that family route pre-fix on real text). They are wording
+            # robustness for a family whose criteria could drop the link, not new coverage.
+            "ust 10y",
+            "ust 10-year",
         ),
         "DGS10",
         "fred",
@@ -188,7 +241,7 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
     ),
     _TemplateEntry(("vix",), "^VIX", "yfinance", "CBOE Volatility Index (VIX)"),
     _TemplateEntry(
-        ("regular gasoline", "regular gas price", "gasoline price"),
+        _GASOLINE_KEYWORDS,
         "GASREGW",
         "fred",
         "US regular gasoline price — monthly average ($/gal)",
@@ -199,7 +252,19 @@ _TEMPLATE_REGISTRY: tuple[_TemplateEntry, ...] = (
         # gasoline question, including spot/point-in-time ones, which must not inherit
         # monthly_avg (and the bounds backstop can't catch it: both are ~$3/gal). The tokens
         # here key on the monthly PERIOD framing instead.
-        require_any_keywords=("for the month", "monthly average", "during the month", "monthly"),
+        require_any_keywords=_MONTH_SCOPED_KEYWORDS,
+    ),
+    _TemplateEntry(
+        _GASOLINE_KEYWORDS,
+        "GASREGW",
+        "fred",
+        "US regular gasoline price — weekly level ($/gal)",
+        # The complement of the entry above. GASREGW is weekly, so a point-in-time gasoline
+        # question ("the average price ... on August 17") resolves on the weekly LEVEL, which
+        # this series answers directly. Without this sibling the monthly gate correctly refused
+        # those questions and they had nowhere else to land, so the whole point-in-time family
+        # went dark while reading identically to a family that was never in scope.
+        exclude_keywords=_MONTH_SCOPED_KEYWORDS,
     ),
     _TemplateEntry(("brent",), "DCOILBRENTEU", "fred", "Brent crude spot ($/bbl)"),
     _TemplateEntry(("wti", "west texas intermediate"), "CL=F", "yfinance", "WTI crude front-month ($/bbl)"),
@@ -391,16 +456,27 @@ def _entry_matches(entry: _TemplateEntry, lowered: str) -> bool:
     return _entry_quantity_ok(entry, lowered)
 
 
-def _registry_entry_for_series(series_id: str, source: Literal["fred", "yfinance"]) -> _TemplateEntry | None:
+def _registry_entry_for_series(
+    series_id: str, source: Literal["fred", "yfinance"], lowered: str
+) -> _TemplateEntry | None:
     """Registry entry whose series_id matches (case-insensitive) a URL-cited series.
 
     A URL pins WHICH series resolves the question, but the registry still holds HOW the
     raw series maps to the resolved quantity (derivation / scale / model_target / note /
     label). Without this, a question citing a FRED URL for e.g. PAYEMS or CPIAUCSL would
     render a raw unscaled level band for a MoM-change / MoM-% quantity — actively
-    misleading. None when no registry entry declares this series."""
+    misleading. None when no registry entry declares this series.
+
+    One series may carry several entries that differ only in derivation (GASREGW has a
+    monthly-average and a weekly-level sibling), so pick the one whose quantity gate the
+    question's own wording satisfies. Those siblings are built as exact complements, so at most
+    one can pass. When none passes, return the first candidate so the caller still reports a
+    concrete derivation in its skip log."""
     sid = series_id.upper()
-    return next((e for e in _TEMPLATE_REGISTRY if e.source == source and e.series_id.upper() == sid), None)
+    candidates = [e for e in _TEMPLATE_REGISTRY if e.source == source and e.series_id.upper() == sid]
+    if not candidates:
+        return None
+    return next((e for e in candidates if _entry_quantity_ok(e, lowered)), candidates[0])
 
 
 def _single_spec(series_id: str, source: Literal["fred", "yfinance"], text: str) -> SeriesSpec:
@@ -425,12 +501,15 @@ def _single_url_route(series_id: str, source: Literal["fred", "yfinance"], text:
     question text fails that entry's quantity gate (``_entry_quantity_ok``): a MoM-%,
     MoM-change, or monthly-average band on a question asking for a level / YoY / foreign
     quantity is worse than no anchor, and we deliberately do NOT fall back to a raw-level
-    band (see ``_registry_entry_for_series`` on why that would be misleading)."""
+    band (see ``_registry_entry_for_series`` on why that would be misleading). A series with
+    a level sibling (GASREGW) reaches that sibling instead of skipping, because the sibling is
+    a genuine route for the question's quantity rather than a fallback."""
+    lowered = text.lower()
     spec = _single_spec(series_id, source, text)
-    entry = _registry_entry_for_series(series_id, source)
+    entry = _registry_entry_for_series(series_id, source, lowered)
     if entry is None:
         return _Route(kind="single", spec=spec, label=series_id, is_max=is_max)
-    if entry.derivation != "level" and not _entry_quantity_ok(entry, text.lower()):
+    if entry.derivation != "level" and not _entry_quantity_ok(entry, lowered):
         logger.info(
             "ts_anchor: URL-cited %s carries registry derivation %r but the question text lacks the "
             "matching quantity language (or hits an exclude) — skipping to avoid a wrong-units band",
@@ -508,6 +587,14 @@ def route_question(question: MetaculusQuestion) -> _Route | None:
         return None
 
     entry = matches[0]
+    if entry.series_id not in _SPREAD_NATIVE_SERIES and _TWO_LEG_OR_CHANGE_RE.search(text):
+        logger.info(
+            "ts_anchor: keyword-matched %s but the question wording asks for a spread/difference/change "
+            "(qid=%s) — skipping rather than anchoring a single-series level band on a different quantity",
+            entry.series_id,
+            getattr(question, "id_of_question", None),
+        )
+        return None
     spec = _single_spec(entry.series_id, entry.source, text)
     return _Route(
         kind="single",
@@ -997,19 +1084,32 @@ def _band_misses_bounds(question: NumericQuestion, band: tuple[float, float, flo
     """Generic units/magnitude backstop: True when the rendered P10–P90 band lies ENTIRELY
     outside the question's displayed range — a gross mismatch (level-vs-derived, or a
     wrong-country CPI magnitude) meaning the anchor describes a different quantity than the
-    one that resolves. An OPEN or non-finite bound imposes no constraint on that side (the
-    outcome can settle beyond the displayed edge), so the check is one-sided or skipped
-    accordingly. Returns False when no band was rendered — nothing to check."""
+    one that resolves. Returns False when no band was rendered — nothing to check.
+
+    A CLOSED edge is absolute: the outcome cannot settle past it, so any band clear of it is
+    disqualifying. An OPEN edge only LOOSENS the constraint — the outcome can settle somewhat
+    beyond a displayed edge, so a band sitting just outside is an ordinary forecast rather than
+    a units error, but one sitting far outside is still the wrong quantity. Treating open as
+    "no constraint at all" disarmed this guard on the ~95% of numeric questions that carry two
+    open bounds, which is how a percent-unit band on a basis-point question could have shipped
+    unchecked. A non-finite edge stays a genuine no-constraint case: with no finite span there
+    is nothing to scale a tolerance against.
+    """
     if band is None:
         return False
-    eff_lower = (
-        question.lower_bound if _finite_bound(question.lower_bound) and not question.open_lower_bound else -np.inf
+    lower_finite = _finite_bound(question.lower_bound)
+    upper_finite = _finite_bound(question.upper_bound)
+    # Tolerance is a multiple of the displayed span, so it is unit-agnostic; it needs both
+    # edges finite to be defined at all.
+    margin = (
+        TS_ANCHOR_OPEN_BOUND_SPAN_TOLERANCE * (question.upper_bound - question.lower_bound)
+        if lower_finite and upper_finite
+        else np.inf
     )
-    eff_upper = (
-        question.upper_bound if _finite_bound(question.upper_bound) and not question.open_upper_bound else np.inf
-    )
+    eff_lower = -np.inf if not lower_finite else question.lower_bound - (margin if question.open_lower_bound else 0.0)
+    eff_upper = np.inf if not upper_finite else question.upper_bound + (margin if question.open_upper_bound else 0.0)
     p10, _p50, p90 = band
-    return p90 < eff_lower or p10 > eff_upper
+    return bool(p90 < eff_lower or p10 > eff_upper)
 
 
 def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
@@ -1061,6 +1161,24 @@ def build_anchor_section(question: NumericQuestion, as_of: datetime) -> str:
     text, band = _render_single(
         series, route=route, ceiling=ceiling, calendar_days=calendar_days, window_start=window_start
     )
+    if band is None and route.model_target:
+        # No band, no section. The band IS the anchor's quantitative payload, and the numeric
+        # prompt's anchor clause fires on the section header alone (prompts.py
+        # `_ts_anchor_evidence_clause`), so a bandless section tells the forecaster to expect a
+        # P10/P50/P90 range that isn't there and leaves only a bare label plus a history table.
+        # Live case: a newly-listed ticker whose history was shorter than the horizon.
+        # Gated on model_target because that flag is what distinguishes the two ways
+        # _render_single returns no band: a NON-model-target route is deliberately band-free
+        # (context-only history), whereas a model-target route promised a band and came up short.
+        logger.info(
+            "ts_anchor: no empirical band for qid=%s (series=%s derivation=%s; history shorter than "
+            "the horizon) — skipping section rather than emitting a header the prompt's anchor "
+            "clause promises a band for",
+            question.id_of_question,
+            route.spec.series_id,
+            route.derivation,
+        )
+        return ""
     if _band_misses_bounds(question, band):
         assert band is not None  # _band_misses_bounds returns False for a None band
         logger.warning(

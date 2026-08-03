@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from forecasting_tools import BinaryQuestion, NumericQuestion
+from forecasting_tools.data_models.questions import DiscreteQuestion
 
 from metaculus_bot.research import timeseries_anchor as ts
 from metaculus_bot.research import ts_fetch as tf
@@ -152,6 +153,32 @@ def _make_numeric_q(
     q.open_upper_bound = open_upper_bound
     q.page_url = f"https://www.metaculus.com/questions/{qid}/"
     return q
+
+
+def _make_discrete_q(**kwargs) -> MagicMock:
+    """A ``DiscreteQuestion``-spec'd twin of ``_make_numeric_q``.
+
+    ``DiscreteQuestion`` subclasses ``NumericQuestion``, so the provider's ``isinstance``
+    gate admits it and routing (which is text-only) must reach the same verdict. A real
+    subclass spec — not just a relabelled numeric mock — is what makes that a real check."""
+    q = _make_numeric_q(**kwargs)
+    discrete = MagicMock(spec=DiscreteQuestion)
+    for attr in (
+        "id_of_question",
+        "question_text",
+        "resolution_criteria",
+        "fine_print",
+        "title",
+        "open_time",
+        "scheduled_resolution_time",
+        "lower_bound",
+        "upper_bound",
+        "open_lower_bound",
+        "open_upper_bound",
+        "page_url",
+    ):
+        setattr(discrete, attr, getattr(q, attr))
+    return discrete
 
 
 # A resolution-criteria string that routes deterministically to a non-revising FRED series.
@@ -496,11 +523,17 @@ class TestDerivationGating:
         qt = "What will total nonfarm payroll employment (in thousands of persons) be in December 2026?"
         assert route_question(_make_numeric_q(question_text=qt)) is None
 
-    def test_gasoline_point_in_time_question_skips(self):
-        # A spot gasoline-price question resolves on a point value, not a monthly mean, so
-        # the monthly_avg entry must not fire (no monthly-period language).
+    def test_gasoline_point_in_time_routes_to_weekly_level_not_monthly_avg(self):
+        # GASREGW is WEEKLY, so a point-in-time gasoline question resolves on the weekly
+        # LEVEL. Before the level sibling existed the monthly gate correctly refused this
+        # question and there was nowhere else for it to land, so the whole point-in-time
+        # gasoline family went dark (qid 45082, missed in prod). It must now route to level
+        # — and never inherit monthly_avg, which is the 548ba88 rule.
         qt = "What will the price of regular gasoline be on December 31, 2026?"
-        assert route_question(_make_numeric_q(question_text=qt)) is None
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == "level"
 
     def test_gasoline_for_the_month_intended_routes(self):
         # qid 41795/41791/41785 — the intended "national average price ... for the month of X" family.
@@ -513,12 +546,201 @@ class TestDerivationGating:
         assert route.spec.series_id == "GASREGW"
         assert route.derivation == "monthly_avg"
 
-    def test_gasoline_national_average_spot_question_skips(self):
+    def test_gasoline_national_average_spot_routes_to_level_not_monthly_avg(self):
         # The GEOGRAPHIC "national average" descriptor is in every gasoline question; on a
-        # point-in-time question it must NOT trigger monthly_avg (the bug F4 fixed — the old
+        # point-in-time question it must NOT select monthly_avg (the bug F4 fixed — the old
         # bare-"average" gate matched here, and the ~$3/gal band can't be caught by bounds).
+        # It now lands on the weekly level instead of nowhere.
         qt = "What will the national average price of regular gasoline be on July 31, 2026?"
-        assert route_question(_make_numeric_q(question_text=qt)) is None
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == "level"
+
+
+# The two gasoline entries are exact complements on the same four month-scoped tokens: the
+# monthly_avg entry REQUIRES one, the level entry EXCLUDES all four. That is what makes the
+# split safe rather than lucky — a point-in-time question cannot inherit monthly_avg (the
+# 548ba88 rule) and a month-scoped question cannot inherit level, so neither derivation can
+# leak into the other's family. It also means they can never co-match, which matters because
+# two matches make route_question skip as ambiguous — strictly worse than the old behavior.
+class TestGasolineDerivationSplit:
+    _MONTH_SCOPED_TOKENS = ("for the month", "monthly average", "during the month", "monthly")
+
+    @pytest.mark.parametrize(
+        ("text", "expected_derivation"),
+        [
+            # Month-scoped phrasings -> monthly_avg (each of the four gate tokens).
+            ("average price for regular gasoline for the month of April 2026", "monthly_avg"),
+            ("the monthly average price of regular gasoline in April 2026", "monthly_avg"),
+            ("the price of regular gasoline during the month of April 2026", "monthly_avg"),
+            ("the monthly regular gasoline price for April 2026", "monthly_avg"),
+            # Point-in-time phrasings -> level.
+            ("the price of regular gasoline on August 17, 2026", "level"),
+            ("the national average price of regular gasoline on December 31, 2026", "level"),
+            ("regular gasoline price as of the resolution date", "level"),
+        ],
+    )
+    def test_each_phrasing_selects_exactly_one_derivation(self, text: str, expected_derivation: str):
+        route = route_question(_make_numeric_q(question_text=text))
+        assert route is not None, f"{text!r} routed nowhere"
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == expected_derivation
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "average price for regular gasoline for the month of April 2026",
+            "the price of regular gasoline on August 17, 2026",
+        ],
+    )
+    def test_exactly_one_gasoline_entry_matches(self, text: str):
+        # Guards the ambiguity trap directly: if both entries ever matched, route_question
+        # would log "ambiguous keyword routing" and skip, silently un-routing the family
+        # this change exists to route.
+        gasoline_hits = [
+            e for e in ts._TEMPLATE_REGISTRY if e.series_id == "GASREGW" and ts._entry_matches(e, text.lower())
+        ]
+        assert len(gasoline_hits) == 1, [e.derivation for e in gasoline_hits]
+
+    def test_real_prod_question_text_routes_to_level(self):
+        # Verbatim qid 45082, the question that went dark in prod. Its title says only "gas
+        # price" (which matches no keyword); the KEYWORD hit comes from the resolution
+        # criteria's "Regular Gasoline", which is why a title-only check mis-diagnosed this
+        # as a missing-keyword bug. route_question reads title + criteria + fine_print.
+        qt = "What will be the average gas price in the U.S. on August 17, 2026?"
+        rc = (
+            "This question resolves as the average price of U.S. Regular Gasoline in dollars per gallon "
+            "for August 17, 2026 according to the U.S. Energy Information Administration's Gasoline and "
+            "Diesel Fuel Update for or closest to that date."
+        )
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "GASREGW"
+        assert route.derivation == "level"
+
+    def test_level_entry_gate_tokens_mirror_the_monthly_entry(self):
+        # The safety argument is "exact complements on the same tokens". If someone edits one
+        # entry's tokens without the other, the complement breaks and a phrasing can fall
+        # through both gates again (exactly how the point-in-time family went dark). Pin it.
+        monthly = next(e for e in ts._TEMPLATE_REGISTRY if e.series_id == "GASREGW" and e.derivation == "monthly_avg")
+        level = next(e for e in ts._TEMPLATE_REGISTRY if e.series_id == "GASREGW" and e.derivation == "level")
+        assert monthly.require_any_keywords == self._MONTH_SCOPED_TOKENS
+        assert level.exclude_keywords == self._MONTH_SCOPED_TOKENS
+        # Same keyword surface, so neither family can be reachable only through the other.
+        assert monthly.keywords == level.keywords
+
+    def test_discrete_question_routes_identically_to_its_numeric_twin(self):
+        # DiscreteQuestion subclasses NumericQuestion and routing is text-only, so a discrete
+        # question with registry-matching text must route the same. Pinned because "all 10
+        # discrete questions routed to nothing" was read as a discrete-specific gate; it was
+        # question composition (poll aggregators and bespoke trackers), not a code path.
+        qt = "What will the price of regular gasoline be on December 31, 2026?"
+        numeric = route_question(_make_numeric_q(question_text=qt))
+        discrete = route_question(_make_discrete_q(question_text=qt))
+        assert numeric is not None
+        assert discrete is not None
+        assert (discrete.spec.series_id, discrete.derivation) == (numeric.spec.series_id, numeric.derivation)
+
+
+# UST-10Y wording. The recurring "ending value of the UST 10Y Yield for these biweekly
+# periods" family (qids 43931, 43650, 42143, 40788, 40216, 40089, 39915, 39590, 39509) names
+# the series in a form none of the DGS10 keywords covered. But all 9 DO cite the DGS10 FRED
+# URL in their resolution criteria and therefore already routed pre-fix through the URL
+# branch, verified on the real pulled text — so these tokens are WORDING ROBUSTNESS for the
+# case where a future sibling drops the link, and they recover ZERO currently-observed
+# questions. (The earlier claim that the family carried no routable URL came from a
+# title-only probe; the archive stores no resolution_criteria at all, so it could not have
+# been the evidence either way.)
+class TestUstTenYearWording:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "What will be the ending value of the UST 10Y Yield for these biweekly periods of Q2 2026? (Jun 15 - Jun 26)",
+            "What will be the ending value of the UST 10Y Yield for the following biweekly periods? (Sep 29 - Oct 10)",
+        ],
+    )
+    def test_ust_10y_wording_routes_to_dgs10_level(self, title: str):
+        route = route_question(_make_numeric_q(question_text=title))
+        assert route is not None
+        assert route.spec.series_id == "DGS10"
+        assert route.derivation == "level"
+
+    def test_nob_spread_question_still_skips(self):
+        # The load-bearing half. q44868 ("the NOB spread") cites TWO FRED URLs (DGS30 and
+        # DGS10) and resolves on their DIFFERENCE in basis points. Widening DGS10's keywords
+        # must not turn it into a single-leg 10-year LEVEL anchor — that would publish a
+        # ~4.7-percent band on a question resolving around 53 basis points. The URL branch
+        # runs before the registry and rejects it as ambiguous, which is what keeps the
+        # widening safe; this test fails if anyone reorders those branches.
+        qt = "What will be the NOB spread on August 14, 2026?"
+        rc = (
+            "This question resolves as the difference, in basis points, between the yield on 30-Year "
+            "U.S. Treasury Securities on August 14, 2026 as presented by FRED at "
+            "https://fred.stlouisfed.org/series/DGS30 and the yield on 10-Year U.S. Treasury Securities "
+            "on that date as presented by FRED at https://fred.stlouisfed.org/series/DGS10."
+        )
+        assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+
+    @pytest.mark.parametrize(
+        "question_text",
+        [
+            "What will be the UST 10Y Yield minus the UST 2Y Yield on August 14, 2026?",
+            "By how many basis points will the UST 10Y Yield change between July 1 and August 14, 2026?",
+            "What will the UST 10-Year spread over Bunds be in August 2026?",
+            # The same shapes on the PRE-EXISTING keywords: the hazard was never specific to
+            # the two UST tokens, so the guard sits on the route, not on those keywords.
+            "What will be the 10-year treasury yield minus the 2-year treasury yield on August 14, 2026?",
+            "By how many bps will the 10-year yield move by August 14, 2026?",
+        ],
+    )
+    def test_two_leg_or_change_wording_with_no_url_does_not_route(self, question_text: str):
+        # The hazard the NOB test above does NOT cover: the same quantity mismatch with no
+        # extractable FRED URL, so the URL branch's ambiguity check never runs and the keyword
+        # route is the only gate. The magnitude backstop cannot catch these either (next test).
+        assert route_question(_make_numeric_q(question_text=question_text)) is None
+
+    def test_the_backstop_alone_would_not_have_caught_those(self):
+        # Pins WHY the wording guard is required rather than redundant with the backstop.
+        # If a future change makes the backstop catch this shape, this test fails and the
+        # guard can be reconsidered on evidence instead of taste.
+        level_band_in_percent = (4.40, 4.68, 4.95)
+        bps_change_question = _make_numeric_q(
+            question_text="basis-point change",
+            lower_bound=-50.0,
+            upper_bound=50.0,
+            open_lower_bound=True,
+            open_upper_bound=True,
+        )
+        assert _band_misses_bounds(bps_change_question, level_band_in_percent) is False
+
+    def test_the_guard_does_not_disarm_ambiguity_detection(self, caplog):
+        # The reason this is a ROUTE-level guard and not per-entry `exclude_keywords`. An
+        # exclude removes the entry from the match list the ambiguity check counts, so
+        # excluding DGS10 on this two-leg question left HY-OAS as the SOLE match and it routed
+        # to one leg — turning a correct ambiguous-skip into a wrong single-series anchor. The
+        # guard runs after that check, so it can only ever turn a route into a skip.
+        q = _make_numeric_q(question_text="the 10-year treasury yield versus the high yield spread")
+        with caplog.at_level(logging.INFO):
+            assert route_question(q) is None
+        assert any("ambiguous keyword routing" in r.message for r in caplog.records)
+
+    def test_a_natively_published_spread_series_still_routes(self):
+        # The guard must not refuse an entry whose OWN series is the spread. HY OAS is
+        # published as a spread, so "spread" in the wording describes exactly what it serves.
+        route = route_question(
+            _make_numeric_q(question_text="What will the ICE BofA high yield spread be on August 14, 2026?")
+        )
+        assert route is not None
+        assert route.spec.series_id == "BAMLH0A0HYM2"
+
+    def test_plain_level_wording_still_routes(self):
+        # The guard must not cost the family the keywords were widened for.
+        route = route_question(
+            _make_numeric_q(question_text="What will be the ending value of the UST 10Y Yield on August 14, 2026?")
+        )
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("DGS10", "level")
 
 
 class TestPolitenessPacing:
@@ -1210,18 +1432,79 @@ class TestBoundsBackstop:
         q = _make_numeric_q(lower_bound=0.0, upper_bound=1.0)
         assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
 
-    def test_open_lower_bound_lifts_lower_constraint(self):
-        # Value can settle below an OPEN lower edge, so a low band is not a mismatch.
+    def test_open_lower_bound_loosens_but_does_not_remove_the_constraint(self):
+        # An OPEN lower edge means the outcome CAN settle below it, so the constraint has to
+        # loosen — but mapping the edge to -inf removed it entirely, which disarmed the whole
+        # backstop on the ~95% of real numeric questions that carry two open bounds. A
+        # ~0.3-magnitude band against an index-level range is still the canonical wrong-units
+        # shape whether or not the edge is open.
         q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0, open_lower_bound=True)
-        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
+        assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is True
 
-    def test_open_upper_bound_lifts_upper_constraint(self):
+    def test_open_upper_bound_loosens_but_does_not_remove_the_constraint(self):
         q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0, open_upper_bound=True)
-        assert _band_misses_bounds(q, (400.0, 450.0, 500.0)) is False
+        assert _band_misses_bounds(q, (400.0, 450.0, 500.0)) is True
+
+    def test_band_just_beyond_an_open_edge_is_tolerated(self):
+        # The other half of "loosens": a band sitting a little past an OPEN edge is a normal
+        # forecast (the outcome really can settle out there), not a units error. Only a band
+        # clear of the range by more than the tolerance margin is suppressed.
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0, open_lower_bound=True)
+        assert _band_misses_bounds(q, (240.0, 245.0, 249.0)) is False
+
+    def test_band_just_beyond_a_closed_edge_still_misses(self):
+        # A CLOSED edge means the outcome cannot settle beyond it, so no tolerance is granted
+        # there and the original zero-overlap rule stands unchanged.
+        q = _make_numeric_q(lower_bound=250.0, upper_bound=350.0)
+        assert _band_misses_bounds(q, (240.0, 245.0, 249.0)) is True
 
     def test_non_finite_bounds_impose_no_constraint(self):
+        # A non-finite edge carries no span to scale a tolerance against, so it stays a
+        # genuine no-constraint case (unlike an open-but-finite edge).
         q = _make_numeric_q(lower_bound=float("-inf"), upper_bound=float("inf"))
         assert _band_misses_bounds(q, (0.1, 0.3, 0.5)) is False
+
+    def test_wrong_quantity_band_on_a_two_open_bound_question_is_caught(self):
+        # qid 44868 ("the NOB spread", resolves in basis points around 53, displayed
+        # [29.5, 70.5] with BOTH bounds open). These are the two wrong-quantity bands a
+        # single-leg or unscaled route would produce. Pre-fix both returned False — the exact
+        # hole that left the 548ba88 magnitude guard unable to police open-bound questions.
+        q = _make_numeric_q(lower_bound=29.5, upper_bound=70.5, open_lower_bound=True, open_upper_bound=True)
+        assert _band_misses_bounds(q, (4.40, 4.68, 4.95)) is True  # single-leg 10-year LEVEL, in percent
+        assert _band_misses_bounds(q, (0.35, 0.53, 0.72)) is True  # spread in percent, not basis points
+
+    def test_correct_quantity_band_on_the_same_question_is_kept(self):
+        # Same question, the CORRECT basis-point spread band -> must not be suppressed.
+        q = _make_numeric_q(lower_bound=29.5, upper_bound=70.5, open_lower_bound=True, open_upper_bound=True)
+        assert _band_misses_bounds(q, (35.0, 53.0, 72.0)) is False
+
+    @pytest.mark.parametrize(
+        ("qid", "band", "lower_bound", "upper_bound"),
+        [
+            # Every band the anchor actually published in prod, read verbatim from the
+            # archived `## Time Series Anchor` sections, with that question's real bounds.
+            # All four carry two OPEN bounds, so they are precisely the population the
+            # tolerance margin newly constrains — a too-tight threshold silently suppresses
+            # healthy anchors, and silent suppression is the failure direction that would go
+            # unnoticed. q44944's band sits partly above its own stale displayed range, which
+            # is what makes it the binding case rather than a decorative one.
+            (44943, (3.992, 4.200, 4.312), 3.9, 4.5),
+            (44944, (330.9, 332.3, 335.4), 328.0, 332.0),
+            (45114, (4.194, 4.336, 4.535), 4.2, 4.8),
+            (45172, (18.70, 22.49, 30.83), 15.0, 25.0),
+        ],
+    )
+    def test_real_published_bands_are_not_suppressed(
+        self, qid: int, band: tuple[float, float, float], lower_bound: float, upper_bound: float
+    ):
+        q = _make_numeric_q(
+            qid=qid,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            open_lower_bound=True,
+            open_upper_bound=True,
+        )
+        assert _band_misses_bounds(q, band) is False
 
     def test_build_anchor_section_skips_on_bounds_mismatch(self, monkeypatch, caplog):
         # End-to-end: a ~0.3-magnitude series routed onto a level question with an
@@ -1275,7 +1558,8 @@ class TestBoundsBackstop:
             qid=qid,
             question_text=qt,
             resolution_criteria=rc,
-            scheduled_resolution_time=datetime(2026, 3, 29, tzinfo=UTC),  # 14 days past the 2026-03-15 as_of
+            # 14 calendar days past the as_of every caller below passes.
+            scheduled_resolution_time=datetime(2026, 3, 29, tzinfo=UTC),
             lower_bound=lower_bound,
             upper_bound=upper_bound,
         )
@@ -1302,6 +1586,107 @@ class TestBoundsBackstop:
         assert out  # non-empty; the ±few-pp band lies within [-50, 50]
         assert "Relative-return spread: CL=F vs ^GSPC" in out
         assert "P10 / P50 / P90 →" in out
+
+
+# A band is the anchor's whole quantitative payload, and the numeric prompt's anchor clause
+# fires on the section HEADER alone — so a section without a band tells the forecaster to
+# expect a P10/P50/P90 range that isn't there. Prod shipped exactly that once (qid 44803, a
+# newly-listed ticker whose history was shorter than the horizon): a bare label, a 52-week
+# range whose low WAS the latest value, and "empirical band withheld".
+class TestNoBandNoSection:
+    # A 28-calendar-day horizon is 19 TRADING steps on a daily series, so the history has to
+    # be shorter than that (not merely shorter than 28) to reach the withheld branch.
+    _HORIZON_CALENDAR_DAYS = 28
+    _HISTORY_OBSERVATIONS = 15
+    _AS_OF = datetime(2026, 3, 15, tzinfo=UTC)
+    _RESOLVES = datetime(2026, 4, 12, tzinfo=UTC)  # _HORIZON_CALENDAR_DAYS past _AS_OF
+
+    @classmethod
+    def _short_history(cls) -> pd.Series:
+        return pd.Series(
+            np.linspace(150.0, 119.0, cls._HISTORY_OBSERVATIONS),
+            index=pd.bdate_range("2026-02-23", periods=cls._HISTORY_OBSERVATIONS),
+            name="SPCX",
+        )
+
+    def test_fixture_history_is_genuinely_shorter_than_the_horizon(self):
+        # The fixture only exercises the withheld branch if y.size <= h; assert that rather
+        # than trusting the arithmetic, so a constant change can't quietly make the tests
+        # below pass for the wrong reason.
+        assert self._HISTORY_OBSERVATIONS <= horizon_steps("daily", self._HORIZON_CALENDAR_DAYS)
+        assert (self._RESOLVES.date() - self._AS_OF.date()).days == self._HORIZON_CALENDAR_DAYS
+
+    def test_section_suppressed_when_horizon_exceeds_history(self, monkeypatch, caplog):
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: self._short_history())
+        q = _make_numeric_q(
+            qid=44803,
+            resolution_criteria=_DGS10_RC,
+            scheduled_resolution_time=self._RESOLVES,
+            lower_bound=50.0,
+            upper_bound=250.0,
+        )
+
+        with caplog.at_level(logging.INFO):
+            out = build_anchor_section(q, self._AS_OF)
+
+        assert out == ""
+        assert any("no empirical band" in r.message for r in caplog.records)
+
+    def test_render_still_reports_the_withheld_sentinel(self):
+        # The suppression belongs in build_anchor_section, not in _render_single: the renderer
+        # keeps returning band=None plus its explanatory line so the caller (and any future
+        # coverage instrumentation) can tell "no band" from "unroutable".
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="yfinance", series_id="SPCX"),
+            label="SPCX",
+        )
+        out, band = _render_single(
+            self._short_history(),
+            route=route,
+            ceiling=self._AS_OF.date(),
+            calendar_days=self._HORIZON_CALENDAR_DAYS,
+        )
+        assert band is None
+        assert "empirical band withheld" in out
+
+    def test_section_renders_when_history_covers_the_horizon(self, monkeypatch):
+        # Control: same question shape, enough history -> band and section both survive, so
+        # the suppression keys on the missing band rather than on anything else here.
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: _daily_positive_series("SPCX"))
+        q = _make_numeric_q(
+            resolution_criteria=_DGS10_RC,
+            scheduled_resolution_time=self._RESOLVES,
+            lower_bound=0.0,
+            upper_bound=1000.0,
+        )
+
+        out = build_anchor_section(q, self._AS_OF)
+
+        assert out
+        assert "P10 / P50 / P90 →" in out
+
+    def test_non_model_target_route_still_renders_without_a_band(self, monkeypatch):
+        # The suppression is gated on model_target, which is what separates the two reasons a
+        # band can be absent. A NON-model-target route is deliberately band-free (context-only
+        # history plus its explanatory note), so dropping that gate would silently delete a
+        # whole intended section shape rather than only the broken one.
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="fred", series_id="PAYEMS", revises=True),
+            label="Total nonfarm payrolls",
+            model_target=False,
+            note="This is the payrolls LEVEL series.",
+        )
+        monkeypatch.setattr(ts, "route_question", lambda _q: route)
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: _daily_positive_series("PAYEMS"))
+        q = _make_numeric_q(scheduled_resolution_time=self._RESOLVES, lower_bound=0.0, upper_bound=1000.0)
+
+        out = build_anchor_section(q, self._AS_OF)
+
+        assert out
+        assert "P10 / P50 / P90" not in out
+        assert "- Note: This is the payrolls LEVEL series." in out
 
 
 # Chart side-channel must respect the bounds backstop: build_anchor_section stashes the

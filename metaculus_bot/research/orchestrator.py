@@ -180,20 +180,64 @@ class ResearchOrchestrator:
 
         return prediction_market_source_losses()
 
+    @property
+    def provider_degradation_count(self) -> int:
+        """Per-run count of ALERTABLE provider-degradation findings, folded into
+        alertable_count.
+
+        One finding per (signal, venue): a liquidity field dead across 100% of a
+        venue's rows, a venue contributing nothing while >=2 siblings answered the
+        same query set, or a prefetch reporting success with an empty catalogue.
+        Each is a 100%-of-denominator conjunction over the whole run, so a single
+        question with no matching market stays silent — the denominators are rows,
+        sibling venues, and catalogue entries, never questions-in-a-run (prod runs
+        carry 1-2 questions, so a rate over those IS a per-question flag).
+
+        These are the signals that would have caught the two degradations that ran
+        for weeks in prod while every counter read zero: Kalshi's liquidity labels
+        blank on 100% of rows, and Manifold contributing nothing at all.
+
+        Suppressed findings are excluded here but still logged in full and still
+        ride the PROVIDER_DEGRADATION marker (see
+        constants.provider_degradation_alerts_active)."""
+        from metaculus_bot.research.provider_health import (
+            provider_degradation_count,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        return provider_degradation_count()
+
+    def log_provider_degradation_summary(self) -> None:
+        """Emit the per-run PROVIDER_DEGRADATION marker + one WARN per finding.
+
+        Called from forecast_questions after publishing completes, alongside the
+        other end-of-run summaries. Fires even at zero findings — a measured zero is
+        a positive statement of provider health, the same reasoning behind
+        FORECASTERS_SURVIVED existing next to FORECASTER_DROPS."""
+        from metaculus_bot.research.provider_health import (
+            log_provider_degradation_summary,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
+
+        log_provider_degradation_summary()
+
     def reset_run_degradation_counters(self) -> None:
         """Zero per-run degradation counters at run start (called by
         forecast_questions alongside reset_pchip_stats). The prediction-market
-        series and source-loss counters are module globals — resetting them here keeps
-        them clean per-run metrics instead of leaking across runs/tests that share a
-        process. The orchestrator's own instance counters are fresh per bot, so they
-        need no reset here."""
+        series and source-loss counters, and the provider-health observation store,
+        are module globals — resetting them here keeps them clean per-run metrics
+        instead of leaking across runs/tests that share a process. The
+        orchestrator's own instance counters are fresh per bot, so they need no
+        reset here."""
         from metaculus_bot.research.prediction_market import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
             reset_series_degradation_counter,
             reset_source_loss_counter,
         )
+        from metaculus_bot.research.provider_health import (
+            reset_provider_health,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        )
 
         reset_series_degradation_counter()
         reset_source_loss_counter()
+        reset_provider_health()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         cache_key, cached = self._lookup_research_cache(question)

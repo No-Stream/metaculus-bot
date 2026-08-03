@@ -171,6 +171,13 @@ cython_debug/
 
 *.json
 
+# Checked-in test fixtures, un-ignored from the blanket *.json above. These are real
+# captured venue payloads that the parsers' field-name contract is pinned against, so CI
+# must have them: without the negation the file exists locally and is absent on a fresh
+# checkout, the fixture-backed tests never run in CI, and the suite is green on the
+# developer's machine by construction (the local-green-proves-nothing trap in CLAUDE.md).
+!tests/data/*.json
+
 # Benchmark and ablation outputs — never committed; per-operator local state
 backtests/
 

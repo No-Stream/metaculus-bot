@@ -417,10 +417,70 @@ _RESOLUTION_HTML = (
 )
 
 
+# The two PREFETCH venues (Kalshi events, PredictIt) must return a POPULATED
+# catalogue of off-topic markets, not an empty one. Both fuzzy-match locally over a
+# whole-catalogue dump, so "no relevant market" upstream looks like a full catalogue
+# that scores below the match floor — an EMPTY catalogue from a successful fetch is a
+# different thing entirely (a dead response parser or a silently emptied index), and
+# provider_health.py's catalogue_empty signal alerts on it by design. An empty stub
+# therefore both trips that alert and skips the local matcher this suite exists to
+# exercise end to end. The search venues (Polymarket, Manifold) legitimately return
+# `[]` for a query with no hits, so those stay empty.
+_OFF_TOPIC_KALSHI_EVENTS = json.dumps(
+    {
+        "events": [
+            {
+                "event_ticker": "KXWORLDCUP-26",
+                "title": "Who will win the 2026 FIFA World Cup?",
+                "sub_title": "Tournament winner",
+                "markets": [
+                    {
+                        "ticker": "KXWORLDCUP-26-BRA",
+                        "title": "Brazil",
+                        "rules_primary": "Resolves Yes if Brazil wins the 2026 FIFA World Cup final.",
+                        "status": "active",
+                        "close_time": "2026-07-19T23:59:59Z",
+                    }
+                ],
+            }
+        ],
+        "cursor": "",
+    }
+).encode()
+_OFF_TOPIC_PREDICTIT_MARKETS = json.dumps(
+    {
+        "markets": [
+            {
+                "id": 7001,
+                "name": "Who will win the 2026 FIFA World Cup?",
+                "shortName": "World Cup 2026",
+                "url": "https://www.predictit.org/markets/detail/7001",
+                "status": "Open",
+                "contracts": [
+                    {
+                        "id": 70011,
+                        "name": "Brazil",
+                        "shortName": "Brazil",
+                        "status": "Open",
+                        "lastTradePrice": 0.22,
+                        "bestBuyYesCost": 0.23,
+                        "bestBuyNoCost": 0.78,
+                    }
+                ],
+            }
+        ]
+    }
+).encode()
+
+
 class _FakeHttpSession:
-    """aiohttp.ClientSession stand-in. Prediction-market JSON hosts return an empty
-    but well-formed payload (no matches — the formatter is still exercised); the
-    resolution-source host returns an article-shaped HTML body so trafilatura runs.
+    """aiohttp.ClientSession stand-in for the prediction-market + resolution-source hosts.
+
+    The SEARCH venues return a well-formed empty result (no hits for this query — the
+    formatter is still exercised). The PREFETCH venues return a populated off-topic
+    catalogue, because that is what "no relevant market" actually looks like upstream
+    (see the note above the payloads). The resolution-source host returns an
+    article-shaped HTML body so trafilatura runs.
     """
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -430,15 +490,14 @@ class _FakeHttpSession:
         low = url.lower()
         if "example.gov" in low or "example.com" in low:
             return _FakeHttpResponse(200, body=_RESOLUTION_HTML, content_type="text/html; charset=utf-8")
-        # Prediction-market JSON APIs: shape-valid empty results.
         if "manifold" in low:
             return _FakeHttpResponse(200, body=b"[]", content_type="application/json")
         if "predictit" in low:
-            return _FakeHttpResponse(200, body=b'{"markets": []}', content_type="application/json")
+            return _FakeHttpResponse(200, body=_OFF_TOPIC_PREDICTIT_MARKETS, content_type="application/json")
         if "kalshi" in low and "series" in low:
             return _FakeHttpResponse(200, body=b'{"series": []}', content_type="application/json")
         if "kalshi" in low:
-            return _FakeHttpResponse(200, body=b'{"events": [], "cursor": ""}', content_type="application/json")
+            return _FakeHttpResponse(200, body=_OFF_TOPIC_KALSHI_EVENTS, content_type="application/json")
         # Polymarket public-search + anything else.
         return _FakeHttpResponse(200, body=b'{"events": [], "markets": []}', content_type="application/json")
 

@@ -1,0 +1,45 @@
+{
+  "events": [
+    {
+      "title": "How many Fed rate cuts in 2026?",
+      "slug": "how-many-fed-rate-cuts-in-2026",
+      "description": "This market will resolve according to the exact amount of cuts of 25 basis points in 2026 by the Fed (including any cuts made during the December meeting).\n\nEme",
+      "endDate": "2026-12-31T00:00:00Z",
+      "volume": 46225700.358878,
+      "openInterest": 1751721.9963359998,
+      "closed": false,
+      "markets": [
+        {
+          "question": "Will no Fed rate cuts happen in 2026?",
+          "outcomePrices": "[\"0.888\", \"0.112\"]",
+          "volume24hr": 16872.515132000004,
+          "bestBid": 0.887,
+          "bestAsk": 0.889,
+          "volumeNum": 6805439.545684001,
+          "liquidityNum": 164606.08201
+        }
+      ]
+    },
+    {
+      "title": "Fed rate hike in 2026?",
+      "slug": "fed-rate-hike-in-2026",
+      "description": "This market will resolve to \u201cYes\u201d if the upper bound of the target federal funds rate is increased at any point between January 1, 2026 and the Fed's December 2",
+      "endDate": "2026-12-09T00:00:00Z",
+      "volume": 6195929.993454998,
+      "openInterest": 1642076.56564,
+      "closed": false,
+      "markets": [
+        {
+          "question": "Fed rate hike in 2026?",
+          "outcomePrices": "[\"0.675\", \"0.325\"]",
+          "volume24hr": 63785.333483999995,
+          "bestBid": 0.67,
+          "bestAsk": 0.68,
+          "volumeNum": 6195929.993454998,
+          "liquidityNum": 230633.3431
+        }
+      ]
+    }
+  ],
+  "markets": []
+}

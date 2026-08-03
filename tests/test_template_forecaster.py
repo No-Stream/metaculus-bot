@@ -17,7 +17,7 @@ from metaculus_bot.comment.trimming import TRIM_NOTICE
 from metaculus_bot.constants import FORECASTS_SECTION_CHAR_LIMIT, RESEARCH_SECTION_CHAR_LIMIT
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.research import prediction_market
+from metaculus_bot.research import prediction_market, provider_health
 from metaculus_bot.research import timeseries_anchor as ts_anchor
 from metaculus_bot.value_extraction import ExtractionOutcome
 
@@ -930,7 +930,7 @@ def test_emit_drop_telemetry_clean_run_emits_zero_marker_no_warning(mock_general
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all ten degradation counters. Using distinct powers of 2
+    """Property must sum all eleven degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -961,8 +961,13 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # Tenth term: a dead AskNews summarizer silently ships raw ungated articles on
     # every question (operator approved alerting on it, 2026-07-26).
     bot._summarizer_failure_count = 512
+    # Eleventh term: a provider that populated but degraded — a liquidity field dead
+    # across 100% of a venue's rows, or a venue contributing nothing while its
+    # siblings answered. Same read-only shape as the two above, so stub the accessor
+    # the property imports rather than recording 1024 observations.
+    monkeypatch.setattr(provider_health, "provider_degradation_count", lambda: 1024)
 
-    assert bot.alertable_count == 1023
+    assert bot.alertable_count == 2047
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1011,65 @@ async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
 
     stacking = next(line for line in caplog.messages if line.startswith("Conditional stacking summary:"))
     assert "skipped_single_forecaster=2" in stacking
+
+
+@pytest.mark.asyncio
+async def test_provider_degradation_rides_the_run_summary(mock_general_llm, caplog):
+    """The counter reaches the ``Degradation counters:`` line and the marker fires,
+    both per run and both even at zero.
+
+    This is the wiring that makes a degraded provider VISIBLE: the counter is the one
+    grep that answers "why was this run red", and the marker is the positive
+    counterpart — without it "no provider degraded" and "the check never ran" are the
+    same absent line. The tail placement matters too, since the telemetry parser's
+    optional-group tail keys on it.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    with caplog.at_level(logging.INFO):
+        await bot.forecast_questions([])
+
+    degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
+    assert degradation.endswith("provider_degradation=0"), degradation
+    assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_run_start_resets_provider_health_observations(mock_general_llm):
+    """A leaked observation would make a healthy run report a degradation it inherited
+    from an earlier run in the same process — and would poison every later
+    ``alertable_count == 0`` assertion in the suite. ``forecast_questions`` is where
+    the reset has to happen, alongside ``reset_pchip_stats``.
+    """
+    llms_config = {
+        "forecasters": [mock_general_llm],
+        "summarizer": "mock_summarizer_model",
+        "parser": "mock_parser_model",
+        "researcher": "mock_researcher_model",
+        "default": "mock_default_model",
+    }
+    bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
+
+    provider_health.record_venue_observation(
+        provider_health.VenueObservation(
+            qid=1,
+            venue="kalshi",
+            candidates_pre_filter=3,
+            rows_post_filter=3,
+            liquidity_fields_present=frozenset(),
+        )
+    )
+    assert bot.alertable_count == 1
+
+    await bot.forecast_questions([])
+    assert bot.alertable_count == 0
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):

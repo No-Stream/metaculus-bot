@@ -452,7 +452,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
             "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
             "research_provider_failures=%d, summarizer_failures=%d, gap_fill_v2_errors=%d, "
-            "prediction_market_degraded=%d, prediction_market_source_losses=%d",
+            "prediction_market_degraded=%d, prediction_market_source_losses=%d, provider_degradation=%d",
             self._forecasters_dropped_count,
             self._questions_failed_to_publish,
             self._stacker_primary_failed_count,
@@ -463,11 +463,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             self._gap_fill_v2_error_count,
             self._prediction_market_degraded_count,
             self._prediction_market_source_loss_count,
+            self._provider_degradation_count,
         )
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
         # WARNING when one model failed across multiple questions this run.
         self._emit_forecaster_drop_telemetry()
+        # The provider-degradation counterpart: which venue/signal degraded, on how
+        # many rows or questions, and what to do about it. Emitted even at zero, so
+        # "no provider degraded" is a recorded fact rather than an absent line.
+        self._research.log_provider_degradation_summary()
 
         return results
 
@@ -494,6 +499,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @property
     def _prediction_market_source_loss_count(self) -> int:
         return self._research.prediction_market_source_loss_count
+
+    @property
+    def _provider_degradation_count(self) -> int:
+        return self._research.provider_degradation_count
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -525,6 +534,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             + self._gap_fill_v2_error_count
             + self._prediction_market_degraded_count
             + self._prediction_market_source_loss_count
+            + self._provider_degradation_count
         )
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:

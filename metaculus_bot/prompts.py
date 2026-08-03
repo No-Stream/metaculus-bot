@@ -426,14 +426,21 @@ _SOURCE_PROVENANCE_LADDER = """
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
 
 
-# The new liquidity/participation weighting sentence, appended to the shared
-# strong-evidence clause so every forecaster prompt tells the model to weight a
-# crowd signal by how informative it is (the prediction-market provider now emits
-# a per-market `signal` label plus raw volume/OI).
+# The liquidity/participation weighting sentence, appended to the shared strong-evidence
+# clause so every forecaster prompt tells the model to weight a crowd signal by how
+# informative it is (the prediction-market provider emits a per-market `signal` label
+# plus volume/OI in approximate USD).
+#
+# The `no-liquidity-data` sentence is load-bearing and must stay in sync with
+# `prediction_market._liquidity_label`. That label means "this venue publishes no volume
+# figures", which is only ever true of PredictIt now that the Kalshi field names are
+# fixed — so it is an absence of measurement, not a measurement of thinness, and a
+# forecaster that collapses it into "thin" would discount a market for the wrong reason.
 _MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
     "Weight each market/crowd signal by its stated liquidity/participation label: treat deep / "
     "high-liquidity markets as a strong anchor, and discount thin markets (low volume, few participants) "
-    "as noisy."
+    "as noisy. A `no-liquidity-data` label means the venue publishes no volume figures at all, so treat "
+    "that market's depth as unknown — judge it on its resolution-criteria match, and do not read it as thin."
 )
 
 

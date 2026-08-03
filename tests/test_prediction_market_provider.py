@@ -61,6 +61,12 @@ from metaculus_bot.research.prediction_market import (
     prediction_market_provider,
 )
 from metaculus_bot.research.provider_diagnostics import _partial_loss_suffix, pop_provider_detail
+from metaculus_bot.research.provider_health import (
+    VENUE_EXPECTED_LIQUIDITY_FIELDS,
+    provider_degradation_findings,
+    recorded_observations,
+    reset_provider_health,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +264,17 @@ def manifold_payload():
 
 @pytest.fixture
 def kalshi_events_payload():
-    """Kalshi /events?status=open&with_nested_markets=true shape."""
+    """Kalshi /events?status=open&with_nested_markets=true shape.
+
+    Field names match the live API (`volume_fp` / `open_interest_fp`, fixed-point STRINGS;
+    `liquidity_dollars` deprecated at a constant "0.0000"). This fixture previously carried
+    the bare names `volume` / `open_interest`, which exist nowhere in Kalshi's spec — it was
+    written in the same commit as the parser and encoded the same wrong guess, so the pair
+    stayed green while every real Kalshi row rendered `no-liquidity-data`. The field-name
+    contract is now additionally pinned against captured live payloads in
+    `test_prediction_market_liquidity_contract.py`, which is where a rename should fail
+    first.
+    """
     return {
         "events": [
             {
@@ -272,10 +288,11 @@ def kalshi_events_payload():
                         "rules_primary": "If Starship achieves orbital velocity in 2026 per SpaceX confirmation.",
                         "yes_bid_dollars": "0.68",
                         "yes_ask_dollars": "0.72",
+                        "notional_value_dollars": "1.0000",
                         "volume_24h_fp": "2500.0",
-                        "volume": 82000.0,
-                        "open_interest": 15000.0,
-                        "liquidity_dollars": 9000.0,
+                        "volume_fp": "82000.00",
+                        "open_interest_fp": "15000.00",
+                        "liquidity_dollars": "0.0000",
                         "close_time": "2026-12-31T23:59:59Z",
                     }
                 ],
@@ -459,10 +476,13 @@ class TestKalshi:
         assert top.implied_prob_yes == pytest.approx(0.70, abs=0.01)
         assert top.market_url.startswith("https://kalshi.com/")
         assert "orbital velocity" in top.raw_rules.lower()
-        # Previously-discarded liquidity fields now populate from volume / open_interest / liquidity_dollars.
-        assert top.total_volume == pytest.approx(82000.0)
-        assert top.open_interest == pytest.approx(15000.0)
-        assert top.liquidity == pytest.approx(9000.0)
+        # Liquidity fields come from volume_fp / open_interest_fp, converted to the USD the
+        # thresholds are denominated in: volume is turnover (x $0.70 midpoint price) and
+        # open interest is collateral (x $1.00 notional). See _kalshi_usd_liquidity.
+        assert top.total_volume == pytest.approx(82_000.0 * 0.70)
+        assert top.open_interest == pytest.approx(15_000.0)
+        # `liquidity_dollars` is deprecated upstream (always "0.0000"), so nothing reads it.
+        assert top.liquidity is None
 
     @pytest.mark.asyncio
     async def test_prefetch_handles_http_error(self, caplog):
@@ -2165,6 +2185,115 @@ class TestSnapshotSourceDiagnostics:
         # redden CI, however sensitive the outage alert is.
         assert pmp.prediction_market_source_losses() == 0
 
+    # The D2 tests below need PRODUCTION-SHAPED keyword output. `_fake_llm` returns a
+    # 3-token query, which sits below Manifold's ~4-content-token satisfiability cliff and
+    # would therefore match even on the broken code — a test that passes pre-fix. Real S4
+    # and S5 prompts ask for "3-5 noun phrases" / "under 12 words" and measure at 5-8
+    # content tokens, so a faithful stub has to be long.
+    @staticmethod
+    def _fake_llm_long_query():
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "SpaceX Starship orbital velocity reach orbit July 2026 threshold"  # noqa: ASYNC910
+
+        return FakeLlm
+
+    @staticmethod
+    def _manifold_conjunction_stub(
+        seen_terms: list[str], payload: Any, *, empty_response: Any = None
+    ) -> Callable[[dict[str, Any]], FakeResponse]:
+        """Stub Manifold's measured STRICT-CONJUNCTION behaviour: a term over ~3 content
+        tokens is unsatisfiable and returns `[]`; a short one matches. `empty_response`
+        overrides what a satisfiable-but-broken rung returns (used to test failure paths)."""
+
+        def _handler(params: dict[str, Any]) -> FakeResponse:
+            term = params.get("term") or ""
+            seen_terms.append(term)
+            content_tokens = [t for t in term.split() if t.lower().strip(".,'") not in pmp._RELEVANCE_STOPWORDS]
+            if len(content_tokens) > 3:
+                return FakeResponse(200, [])
+            return empty_response if empty_response is not None else FakeResponse(200, payload)
+
+        return _handler
+
+    @pytest.mark.asyncio
+    async def test_manifold_relaxes_the_query_when_full_length_matches_nothing(self, mock_question, manifold_payload):
+        """D2: Manifold's `term` is a strict conjunction, so a full-length question
+        sentence is usually unsatisfiable and returns `[]`. This venue contributed zero
+        rows to any bundle for 17+ days while every observability channel read healthy —
+        `[]` classifies as the benign `none` token, so nothing warned.
+
+        Pre-fix the provider only ever issued long terms, so the snapshot came back empty.
+        """
+        handlers = self._handlers({"series": []})
+        seen_terms: list[str] = []
+        handlers[self._MANIFOLD_URL] = self._manifold_conjunction_stub(seen_terms, manifold_payload)
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm_long_query()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert "manifold" in {m.platform for m in snapshot.matches}
+        assert snapshot.sources["manifold"].startswith("ok(")
+        # A rescued query is NOT a degradation: the plumbing worked, so nothing alerts.
+        assert pmp.prediction_market_source_losses() == 0
+        # The precise queries were tried FIRST — relaxation is a fallback, not a
+        # replacement, so questions that already match at full length keep their precision.
+        assert any(len(t.split()) > 4 for t in seen_terms), seen_terms
+
+    @pytest.mark.asyncio
+    async def test_manifold_does_not_relax_when_a_full_length_query_already_matched(
+        self, mock_question, manifold_payload
+    ):
+        """The fallback must cost nothing on the healthy path. A question whose full-length
+        query matches must issue no relaxation calls at all — otherwise every question pays
+        extra HTTP for a rescue it doesn't need, and the high-precision long-query result
+        could be displaced by a looser one."""
+        handlers = self._handlers({"series": []})
+        seen_terms: list[str] = []
+
+        def _manifold_handler(params: dict[str, Any]) -> FakeResponse:
+            seen_terms.append(params.get("term") or "")
+            return FakeResponse(200, manifold_payload)
+
+        handlers[self._MANIFOLD_URL] = _manifold_handler
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm_long_query()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert "manifold" in {m.platform for m in snapshot.matches}
+        # Exactly the base query set (the LLM query plus S2) — no relaxation rungs.
+        assert len(seen_terms) == 2, seen_terms
+        assert all(len(t.split()) > 3 for t in seen_terms), seen_terms
+
+    @pytest.mark.asyncio
+    async def test_manifold_relaxation_failure_is_still_classified_as_a_loss(self, mock_question):
+        """A relaxation rung that 503s must not be laundered into a benign `none`: the
+        whole point of the None-vs-`[]` split is that a fetch failure stays visible."""
+        handlers = self._handlers({"series": []})
+        seen_terms: list[str] = []
+        handlers[self._MANIFOLD_URL] = self._manifold_conjunction_stub(
+            seen_terms, None, empty_response=FakeResponse(503, text="down")
+        )
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm_long_query()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert snapshot.sources["manifold"].startswith("partial("), snapshot.sources["manifold"]
+        assert "lost=manifold:" in _partial_loss_suffix({"sources": snapshot.sources})
+        assert pmp.prediction_market_source_losses() == 1
+
     @pytest.mark.asyncio
     async def test_one_lost_query_of_two_reads_as_partial(self, mock_question, manifold_payload):
         """Manifold runs two queries (the LLM query plus the extra S2 natural-language
@@ -2226,3 +2355,265 @@ class TestSnapshotSourceDiagnostics:
         assert "kalshi" not in {m.platform for m in first.matches}
         assert second.sources["kalshi"].startswith("ok(")
         assert "kalshi" in {m.platform for m in second.matches}
+
+
+class TestProviderHealthRecording:
+    """The recording seam: what a real snapshot fetch hands the degradation rules.
+
+    The rules themselves are tested in ``tests/test_provider_health.py``. These tests
+    pin the numbers this module feeds them, which is where the risk actually lives —
+    both counts (pre-filter candidates and post-filter rows) are only simultaneously
+    in scope at the tail of ``_fetch_market_snapshot_impl``, and re-deriving either
+    one somewhere else is the kind of second derivation that let the Kalshi
+    field-name guess drift from reality in the first place.
+    """
+
+    _POLY_URL = "https://gamma-api.polymarket.com/public-search"
+    _MANIFOLD_URL = "https://api.manifold.markets/v0/search-markets"
+    _KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
+    _KALSHI_SERIES_URL = "https://api.elections.kalshi.com/trade-api/v2/series"
+    _PREDICTIT_URL = "https://www.predictit.org/api/marketdata/all/"
+
+    @pytest.fixture(autouse=True)
+    def _reset_health(self):
+        reset_provider_health()
+        yield
+        reset_provider_health()
+
+    @staticmethod
+    def _fake_llm():
+        class FakeLlm:
+            def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                return "SpaceX Starship orbit"  # noqa: ASYNC910
+
+        return FakeLlm
+
+    # A market-less question is one where every venue's catalogue POPULATED and simply
+    # held nothing relevant. So the baseline stubs return non-matching entries rather
+    # than empty catalogues — an empty catalogue is a different degradation (Signal C),
+    # and stubbing one here would make every test in this class fire it.
+    _OFF_TOPIC_KALSHI_EVENT = {
+        "event_ticker": "KXWORLDCUP-26",
+        "title": "Who wins the 2026 World Cup?",
+        "markets": [{"ticker": "KXWORLDCUP-26-BRA", "title": "Brazil", "status": "active"}],
+    }
+    _OFF_TOPIC_PREDICTIT_MARKET = {
+        "id": 9001,
+        "name": "Who wins the 2026 World Cup?",
+        "url": "https://www.predictit.org/markets/detail/9001",
+        "status": "Open",
+        "contracts": [{"id": 1, "name": "Brazil", "status": "Open", "lastTradePrice": 0.2}],
+    }
+
+    def _handlers(self, **overrides: Any) -> dict:
+        handlers: dict[str, Any] = {
+            self._POLY_URL: FakeResponse(200, {"events": [], "markets": []}),
+            self._MANIFOLD_URL: FakeResponse(200, []),
+            self._KALSHI_EVENTS_URL: FakeResponse(200, {"events": [self._OFF_TOPIC_KALSHI_EVENT], "cursor": ""}),
+            self._KALSHI_SERIES_URL: FakeResponse(200, {"series": []}),
+            self._PREDICTIT_URL: FakeResponse(200, {"markets": [self._OFF_TOPIC_PREDICTIT_MARKET]}),
+        }
+        handlers.update(overrides)
+        return handlers
+
+    async def _fetch(self, question: Any, handlers: dict, *, as_of: datetime | None = None) -> Any:
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", self._fake_llm()),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            return await pmp.fetch_market_snapshot(question, timeout=5.0, as_of=as_of)
+
+    @pytest.mark.asyncio
+    async def test_an_all_empty_run_records_zeros_and_finds_nothing(self, mock_question):
+        """The market-less question, end to end from the HTTP seam. Every venue's
+        catalogue populated and matched nothing, so all four are observed at zero rows
+        and zero candidates, and NOTHING is alertable.
+
+        The false-positive case that matters most, verified through the real fetch path
+        rather than hand-recorded observations — this is the tournament day the naive
+        per-run-rate design would have reddened.
+        """
+        await self._fetch(mock_question, self._handlers())
+
+        observed = {obs.venue: obs for obs in recorded_observations()[0]}
+        assert set(observed) == {"polymarket", "manifold", "kalshi", "predictit"}
+        assert all(obs.rows_post_filter == 0 and obs.candidates_pre_filter == 0 for obs in observed.values())
+        assert provider_degradation_findings() == []
+
+    @pytest.mark.asyncio
+    async def test_rows_and_liquidity_presence_come_from_the_rendered_matches(
+        self, mock_question, kalshi_events_payload
+    ):
+        """Presence is read off the parsed ``MarketMatch`` objects that actually render,
+        so the signal can never disagree with the ``signal`` column the forecaster is
+        told to weight by."""
+        handlers = self._handlers(**{self._KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+        snapshot = await self._fetch(mock_question, handlers)
+
+        rendered = [m for m in snapshot.matches if m.platform == "kalshi"]
+        observed = next(obs for obs in recorded_observations()[0] if obs.venue == "kalshi")
+        assert observed.rows_post_filter == len(rendered)
+        for name in VENUE_EXPECTED_LIQUIDITY_FIELDS["kalshi"]:
+            assert (name in observed.liquidity_fields_present) == any(
+                getattr(row, name) is not None for row in rendered
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_candidate_carrying_the_field_does_not_mask_a_blank_rendered_row(self, mock_question):
+        """The case that makes the rendered-vs-pre-filter distinction OBSERVABLE.
+
+        Two Polymarket events: one carries ``openInterest`` but closes before ``as_of``
+        (so the filter drops it), the other renders and carries no OI. Presence read
+        off the PRE-filter matches would report ``open_interest`` alive and stay silent,
+        while the table a forecaster reads shows ``-`` in the OI column on every
+        rendered row. Reading the rendered rows is what keeps the signal and the
+        rendered output from disagreeing — the whole reason presence is computed off
+        the parsed ``MarketMatch`` objects rather than the upstream payload.
+        """
+        payload = {
+            "events": [
+                {
+                    "title": "Will SpaceX Starship reach orbit in 2026?",
+                    "slug": "starship-orbit-2026-early",
+                    "description": "Closes early; dropped by the as_of filter.",
+                    "endDate": "2026-01-31T23:59:59Z",
+                    "volume": 50000.0,
+                    "markets": [
+                        {
+                            "question": "Will SpaceX Starship reach orbit in 2026?",
+                            "outcomePrices": '["0.60", "0.40"]',
+                            "volumeNum": 50000.0,
+                            "openInterest": 12345.0,
+                        }
+                    ],
+                },
+                {
+                    "title": "Will SpaceX Starship reach orbit before 2028?",
+                    "slug": "starship-orbit-2028",
+                    "description": "Renders; carries no openInterest.",
+                    "endDate": "2027-12-31T23:59:59Z",
+                    "volume": 70000.0,
+                    "markets": [
+                        {
+                            "question": "Will SpaceX Starship reach orbit before 2028?",
+                            "outcomePrices": '["0.80", "0.20"]',
+                            "volumeNum": 70000.0,
+                        }
+                    ],
+                },
+            ],
+            "markets": [],
+        }
+        handlers = self._handlers(**{self._POLY_URL: FakeResponse(200, payload)})
+        snapshot = await self._fetch(mock_question, handlers, as_of=datetime(2026, 6, 1, tzinfo=timezone.utc))
+
+        rendered = [m for m in snapshot.matches if m.platform == "polymarket"]
+        assert rendered, "the later-closing event must survive the as_of filter"
+        assert all(row.open_interest is None for row in rendered)
+
+        observed = next(obs for obs in recorded_observations()[0] if obs.venue == "polymarket")
+        assert observed.candidates_pre_filter > observed.rows_post_filter
+        assert "open_interest" not in observed.liquidity_fields_present
+        assert "total_volume" in observed.liquidity_fields_present
+
+        findings = provider_degradation_findings()
+        assert [f.detail["fields"] for f in findings] == ["open_interest"]
+
+    @pytest.mark.asyncio
+    async def test_as_of_dropped_candidates_are_recorded_pre_filter(self, mock_question, polymarket_payload):
+        """The leg that keeps correct as_of drops from alerting. Polymarket fetched
+        markets that all close before ``as_of``, so zero rows RENDER while the
+        candidate count stays positive. Recording only the post-filter number would
+        make this indistinguishable from a dead venue — which is precisely the shape
+        that would have fired on 20 of 47 archived runs.
+        """
+        handlers = self._handlers(**{self._POLY_URL: FakeResponse(200, polymarket_payload)})
+        # The fixture's Polymarket events all close 2026-12-31, so an as_of past that
+        # date drops every one of them at the filter — the same mechanism that dropped
+        # 20 real candidates on a question resolving after the markets closed.
+        snapshot = await self._fetch(mock_question, handlers, as_of=datetime(2027, 6, 1, tzinfo=timezone.utc))
+
+        assert [m for m in snapshot.matches if m.platform == "polymarket"] == []
+        observed = next(obs for obs in recorded_observations()[0] if obs.venue == "polymarket")
+        assert observed.rows_post_filter == 0
+        assert observed.candidates_pre_filter > 0
+        assert provider_degradation_findings() == []
+
+    @pytest.mark.asyncio
+    async def test_a_lost_venue_records_no_observation(self, mock_question):
+        """A venue whose fan-out lost a sub-fetch is already alertable via
+        ``prediction_market_source_losses``, so it is not observed here — counting the
+        same outage twice would report one failure as two, and "check the query
+        construction" is the wrong remedy for a 503."""
+        handlers = self._handlers(**{self._MANIFOLD_URL: FakeResponse(503, text="service unavailable")})
+        with patch.object(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0):
+            await self._fetch(mock_question, handlers)
+
+        venues = {obs.venue for obs in recorded_observations()[0]}
+        assert "manifold" not in venues
+        assert pmp.prediction_market_source_losses() >= 1
+        assert provider_degradation_findings() == []
+
+    @pytest.mark.asyncio
+    async def test_prefetch_catalogue_sizes_are_recorded_with_their_fetch_outcome(
+        self, mock_question, kalshi_events_payload
+    ):
+        """Signal C's input. Both prefetch venues report their catalogue size AND
+        whether the fetch succeeded, which is the only way an empty-but-successful
+        catalogue is distinguishable from an outage."""
+        predictit_payload = {"markets": [{"id": 1, "name": "Some market", "contracts": [], "status": "Open"}]}
+        handlers = self._handlers(
+            **{
+                self._KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload),
+                self._PREDICTIT_URL: FakeResponse(200, predictit_payload),
+            }
+        )
+        await self._fetch(mock_question, handlers)
+
+        catalogues = {obs.source: obs for obs in recorded_observations()[1]}
+        assert catalogues["kalshi_events"].entries == len(kalshi_events_payload["events"])
+        assert catalogues["kalshi_events"].fetch_ok is True
+        assert catalogues["predictit_markets"].entries == 1
+        assert catalogues["predictit_markets"].fetch_ok is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_prefetch_records_the_failure_not_a_phantom_empty_catalogue(self, mock_question):
+        """A 503'd Kalshi prefetch must record ``fetch_ok=False``, so Signal C stays
+        silent and the source-loss counter remains the sole reporter."""
+        handlers = self._handlers(**{self._KALSHI_EVENTS_URL: FakeResponse(503, text="service unavailable")})
+        with patch.object(pmp, "HTTP_RETRY_BACKOFF_SECS", 0.0):
+            await self._fetch(mock_question, handlers)
+
+        catalogues = {obs.source: obs for obs in recorded_observations()[1]}
+        assert catalogues["kalshi_events"].fetch_ok is False
+        assert provider_degradation_findings() == []
+
+    @pytest.mark.asyncio
+    async def test_a_question_with_no_id_records_nothing(self, mock_question):
+        """Every observation is keyed on the question, so an id-less question records
+        nothing — matching ``record_provider_detail`` / ``record_raw_research``."""
+        mock_question.id_of_question = None
+        await self._fetch(mock_question, self._handlers())
+
+        assert recorded_observations()[0] == ()
+        assert recorded_observations()[1] == ()
+
+    @pytest.mark.asyncio
+    async def test_recording_does_not_alter_the_snapshot(self, mock_question, kalshi_events_payload):
+        """Recording is a pure module-state write on the research path: same matches,
+        same source tokens, with or without observations already present."""
+        handlers = self._handlers(**{self._KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+        first = await self._fetch(mock_question, handlers)
+
+        _reset_session_caches()
+        reset_provider_health()
+        handlers = self._handlers(**{self._KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+        second = await self._fetch(mock_question, handlers)
+
+        assert [(m.platform, m.market_title) for m in first.matches] == [
+            (m.platform, m.market_title) for m in second.matches
+        ]
+        assert first.sources == second.sources

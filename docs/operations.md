@@ -155,7 +155,8 @@ primary, each independently gated.
 | `GAP_FILL_ENABLED` | off | `true` | v1 gap-fill: analyzer finds up to `GAP_FILL_MAX_GAPS` factual gaps, parallel native searches resolve each |
 | `GAP_FILL_V2_ENABLED` | off | `true` | v2 agentic research loop (`research/agentic/`); runs concurrently with v1 during the overlap window |
 
-Both gap-fill passes run in prod as of 2026-07-17. Each soft-fails to an empty
+Both gap-fill passes run in prod as of 2026-07-21 (v2 was authored 2026-07-17 but reached
+`main` in merge `b4e9df0`; era analysis keys on the latter). Each soft-fails to an empty
 string on any error, and both are suppressed under `is_benchmarking=True`. v2's
 driver model and reasoning effort come from `GAP_FILL_V2_DRIVER_MODEL` /
 `GAP_FILL_V2_DRIVER_EFFORT`; its wall deadline is `GAP_FILL_V2_WALL_DEADLINE` and
@@ -639,13 +640,27 @@ published numeric distributions are and how well that width is calibrated, split
 by config era. Era-bucketing is mandatory for any calibration claim: the bot's
 roster and pipeline change often enough that pooled calibration numbers are
 misleading. The monitor reports central-80% and central-50% coverage with
-Jeffreys-prior CIs, tail coverage (cov@10/50/90), PIT std, and median relative
-band width per era.
+Jeffreys-prior CIs, tail coverage (cov@10/50/90), PIT std, median relative
+band width, and `band_miss (lo/hi)` per era. That last one is the out-of-band
+rate split by tail: it distinguishes a band that is too tight (both tails
+elevated) from one of roughly the right width that is mis-centered (misses piled
+in one tail), which `cov80` cannot express and which call for opposite
+corrections.
+
+Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
+`TS_ANCHOR_ENABLE`), not authoring dates — prod runs from `main`, so a change is
+live only once its merge commit lands there, and keying on the authoring date
+files every run in the author-to-merge gap under the wrong config. Empty eras are
+omitted, so while no post-july15-bundle numeric has resolved the `ts_anchor` row
+is absent from the table rather than present-and-empty.
 
 ```bash
 uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <slug>
 # or against a cached dataset:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
+# drop the known open-bound bug pair (43746/43747) from every row; the excluded
+# count is rendered in the table, so the exclusion is never silent:
+uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug
 ```
 
 Before either analysis, run `make sync_all` (also read-only and free) so the

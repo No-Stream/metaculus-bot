@@ -263,6 +263,34 @@ def credit_alerts_active(today: date | None = None) -> bool:
     return (today or date.today()) >= CREDIT_ALERT_RESUME_DATE
 
 
+# Prediction-market venues (or prefetch catalogues) whose degradation is KNOWN and
+# ACCEPTED, each with a dated resume. Same contract as CREDIT_ALERT_RESUME_DATE
+# above: the finding is still logged in full, still rides the PROVIDER_DEGRADATION
+# marker, and still names its resume date in the end-of-run summary — only its
+# contribution to ``alertable`` is dropped, and only until the date. Dated rather
+# than a bare boolean so a stale acceptance cannot outlive the season unnoticed,
+# and per-venue rather than global so accepting a dead Manifold does not blind the
+# operator to a dead Kalshi.
+#
+# Ships EMPTY on purpose. Both degradations this machinery was built for (Kalshi's
+# blank liquidity labels, Manifold's zero contribution) are being FIXED in the same
+# round, so suppressing either would hide the fix's own verification. The mechanism
+# exists to give the operator a documented, dated lever instead of reaching for a
+# code deletion when a venue is genuinely dead for good.
+PROVIDER_DEGRADATION_SUPPRESSED_UNTIL: dict[str, date] = {}
+
+
+def provider_degradation_alerts_active(venue: str, today: date | None = None) -> bool:
+    """Whether ``venue``'s provider-degradation findings should still exit non-zero.
+
+    ``today`` defaults to the system clock read at CALL time (not at import), so a
+    resume needs no redeploy and tests can inject a fixed date. A venue with no
+    entry is always alertable.
+    """
+    resume = PROVIDER_DEGRADATION_SUPPRESSED_UNTIL.get(venue)
+    return resume is None or (today or date.today()) >= resume
+
+
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
 # (Atlas publishes `0.96 * estimate + 0.02`; we adopt the clip portion only).
@@ -799,6 +827,22 @@ TS_ANCHOR_SECTION_MAX_CHARS: int = 6000
 TS_ANCHOR_NATIVE_TABLE_ROWS: int = 10
 TS_ANCHOR_WEEKLY_TABLE_ROWS: int = 13
 TS_ANCHOR_MONTHLY_TABLE_ROWS: int = 24
+# How far past an OPEN displayed edge a rendered band may sit before the magnitude backstop
+# treats it as a wrong-quantity anchor, measured in multiples of the displayed span. An open
+# edge means the outcome genuinely can settle beyond it, so the constraint has to loosen
+# there — but treating open as "no constraint at all" disarmed the backstop entirely on the
+# ~95% of numeric questions that carry two open bounds.
+#
+# The measured window is wide, and BOTH ends are pinned by tests so a future tweak has to
+# confront the evidence. The rule compares the NEAREST BAND EDGE (not the P50) against the
+# range, which is what makes the window wide: every band the anchor has actually published
+# overlaps its own range, so it scores 0.00 spans outside and no tolerance below 1.0 can
+# suppress it. Meanwhile the wrong-quantity shapes this exists to catch — a percent-unit band
+# on a basis-point question — sit 0.63-0.73 outside, so anything at or above ~0.63 stops
+# catching them (a 1.0 tolerance catches nothing, which is why the value is well under it).
+# Closed edges get no tolerance at all: the outcome cannot settle past them, so the original
+# zero-overlap rule stands there unchanged and this whole knob is inert.
+TS_ANCHOR_OPEN_BOUND_SPAN_TOLERANCE: float = 0.25
 
 # --- Research persistence (write path for backtest replay) ---
 PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"

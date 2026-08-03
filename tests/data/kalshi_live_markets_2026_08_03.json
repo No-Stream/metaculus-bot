@@ -1,0 +1,74 @@
+{
+  "events": [
+    {
+      "event_ticker": "KXTAIWANLVL4",
+      "title": "Will the US issue a Level 4 travel advisory for Taiwan?",
+      "sub_title": "Taiwan Travel Advisory",
+      "_fixture_role": "oi_only",
+      "markets": [
+        {
+          "ticker": "KXTAIWANLVL4-26JUL01",
+          "title": "Will the U.S. State Department issue a Level 4 warning for Taiwan before Jul 1, 2026?",
+          "rules_primary": "If the U.S. State Department issues, updates, or reaffirms a Level 4 travel advisory for Taiwan after Issuance and before Jul 1, 2026, then the market resolves to Yes.",
+          "status": "finalized",
+          "close_time": "2026-07-01T03:59:00Z",
+          "yes_bid_dollars": "0.0000",
+          "yes_ask_dollars": "1.0000",
+          "last_price_dollars": "0.0010",
+          "notional_value_dollars": "1.0000",
+          "liquidity_dollars": "0.0000",
+          "volume_fp": "202100.00",
+          "volume_24h_fp": "0.00",
+          "open_interest_fp": "119177.59"
+        }
+      ]
+    },
+    {
+      "event_ticker": "POWER-28",
+      "title": "2028: Who will win the Presidency, House, and Senate?",
+      "sub_title": "In 2029",
+      "_fixture_role": "v24h_trap",
+      "markets": [
+        {
+          "ticker": "POWER-28-DH-DS-DP",
+          "title": "Will the Democratic party win the House, the Democratic party win the Senate, and the Democratic party win the Presidency?",
+          "rules_primary": "If the Democratic party wins the House, the Democratic party wins the Senate, and the Democratic party wins the Presidency in the 2028 election, then the market resolves to Yes.",
+          "status": "active",
+          "close_time": "2029-11-07T15:00:00Z",
+          "yes_bid_dollars": "0.4900",
+          "yes_ask_dollars": "0.5000",
+          "last_price_dollars": "0.5000",
+          "notional_value_dollars": "1.0000",
+          "liquidity_dollars": "0.0000",
+          "volume_fp": "105980.72",
+          "volume_24h_fp": "0.00",
+          "open_interest_fp": "59025.77"
+        }
+      ]
+    },
+    {
+      "event_ticker": "KXGREENLANDPRICE-29JAN21",
+      "title": "How much will the US acquire Greenland for?",
+      "sub_title": "During Trump's term",
+      "_fixture_role": "deep",
+      "markets": [
+        {
+          "ticker": "KXGREENLANDPRICE-29JAN21-NOACQ",
+          "title": "Will there be no U.S. acquisition of Greenland during Trump's term?",
+          "rules_primary": "If the Total Monetary Consideration for a U.S. Acquisition of Greenland is exactly $0 / No Acquisition during Trump's term, then the market resolves to Yes.",
+          "status": "active",
+          "close_time": "2029-01-22T04:59:00Z",
+          "yes_bid_dollars": "0.8200",
+          "yes_ask_dollars": "0.8300",
+          "last_price_dollars": "0.8300",
+          "notional_value_dollars": "1.0000",
+          "liquidity_dollars": "0.0000",
+          "volume_fp": "735353.56",
+          "volume_24h_fp": "145.15",
+          "open_interest_fp": "174378.79"
+        }
+      ]
+    }
+  ],
+  "cursor": ""
+}

@@ -15,12 +15,18 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 > long-gestating items live in prod (all four workflow yamls). This block is just the index;
 > detailed status lives in the per-item entries below.
 >
-> - **Agentic gap-fill v2** is ON (`GAP_FILL_V2_ENABLED: 'true'`) since 2026-07-17, running
+> **Every date in this block is an AUTHORING date on the july15 branch. All of it reached prod
+> together in merge `b4e9df0` at 2026-07-21T17:07:37Z, which is the single era boundary** —
+> nothing on `main` changed between the 2026-07-12 merge (`f084bf7`) and that one, so 07-15 /
+> 07-17 / 07-18 / 07-20 are not separable eras, and no shift across the boundary can be
+> attributed to any one item (AGENTS.md, era-bucketing → merge-date rule).
+>
+> - **Agentic gap-fill v2** is ON (`GAP_FILL_V2_ENABLED: 'true'`), authored 2026-07-17, running
 >   concurrently with v1 during the overlap window.
-> - **Time-series anchor (text)** is ON (`TS_ANCHOR_ENABLED: 'true'`) since 2026-07-17; the
+> - **Time-series anchor (text)** is ON (`TS_ANCHOR_ENABLED: 'true'`), authored 2026-07-17; the
 >   chart-image side-channel (`TS_ANCHOR_CHART_ENABLED`) stays OFF pending its A/B.
 > - **Summarizer, native-search, and crux-analyzer models migrated sol→terra** (native-search +
->   crux 2026-07-17; summarizer 2026-07-18) — see the per-role entries below.
+>   crux authored 2026-07-17; summarizer 2026-07-18) — see the per-role entries below.
 > - **Supporting infrastructure landed**: raw pre-summarization AskNews text archived as
 >   `asknews_raw` in the research-persistence record (`research/persistence.py` +
 >   `research/orchestrator.py`), OpenRouter credit telemetry (`credit_telemetry.py`, wired in
@@ -75,8 +81,10 @@ with era-bucketing.
 
 ### Frozen-triple numeric watch: re-run the ensemble delta after a same-lineage era accrues (added 2026-07-20, HIGH)
 
-Status: shipped-and-watch. The 2026-07-20 drop to the latest-per-vendor triple
-(`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) ships accepting a fragile
+Status: shipped-and-watch. The drop to the latest-per-vendor triple
+(`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) — authored 2026-07-20, live in prod
+2026-07-21T17:07:37Z in merge `b4e9df0`, and the merge date is where the era clock starts (AGENTS.md,
+era-bucketing → merge-date rule) — ships accepting a fragile
 numeric lean toward the full 6-member roster. Two adversarially-verified analyses
 (`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`)
 found the triple non-inferior on binary (delta +0.01, P(loss>1pt/Q)=0.35) and MC (−0.14,
@@ -104,8 +112,9 @@ collecting more questions.
 1. **FREEZE the triple** (gpt-5.6-sol / opus-4.8 / gemini-3.1-pro-preview). Roster churn
    restarts the era clock and re-inflates the between-era variance floor that blocks any
    numeric measurement — the current lineage has ~0 resolved questions, so the frozen triple
-   is the *first* modern-lineage era. This is the second roster change on 2026-07-20 (it
-   supersedes the morning fable-5 → opus-4.7 swap); do not swap members mid-window.
+   is the *first* modern-lineage era. This is the second roster change authored on 2026-07-20 (it
+   supersedes the morning fable-5 → opus-4.7 swap, which rode the SAME merge and so never ran in
+   prod at all); do not swap members mid-window.
 2. After **~30–50 numeric questions resolve under the frozen triple** (~2–3 months at
    ~15.8 numeric/mo), re-run `bash scratch/ensemble_power_model_2026-07-20/run_all.sh` with the
    new era added. Its value is a **same-lineage read** — replacing the current lineage-transfer
@@ -125,7 +134,8 @@ brings back.
 
 Receipts: `scratch/ensemble_power_model_2026-07-20/synthesis.md` (composed-delta model, power
 floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthesis.md` (paired
-bootstrap audit). Era boundary: 2026-07-20 = the triple config.
+bootstrap audit). Era boundary: **2026-07-21T17:07:37Z** (`b4e9df0`) = the triple config live in prod;
+2026-07-20 is only its authoring date.
 
 ### Score the archived gap-fill v2 ghost forecasts (added 2026-07-18, HIGH, cheap)
 
@@ -154,8 +164,9 @@ countable but not scoreable — the operator wants gap-free ghost-vs-published a
 
 ### Grok drop — RESOLVED 2026-07-20 (superseded by the latest-per-vendor triple) (added 2026-07-19, HIGH)
 
-Status: RESOLVED. Grok was removed entirely on 2026-07-20 as part of the drop to the 3-member
-latest-per-vendor triple — not the incremental 6→5 step this entry originally scoped. See the
+Status: RESOLVED. Grok was removed entirely as part of the drop to the 3-member
+latest-per-vendor triple (authored 2026-07-20, live in prod 2026-07-21T17:07Z) — not the incremental
+6→5 step this entry originally scoped. See the
 "Frozen-triple numeric watch" entry above and the ensemble analyses in
 `scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`. The
 re-add question (should any dropped member, grok included, come back?) now lives in that
@@ -323,11 +334,15 @@ reliably *hurt* accuracy via over-decisiveness: step-by-step "Bayesian reasoning
 (binary:394 anchor-and-adjust) is the benign outside-view move the study carves out. The three
 base prompts (~11.7k/7.8k/12.8k chars) are focused, not bloated. **No action.** Follow-up
 **RESOLVED 2026-07-16:** the `base_rate_anchor` / `criteria_clauses` binary-schema fields are NOT
-dead — live-elicited since `30bca2f` (2026-07-08); the "0/2203 rows" finding was a data-window
-artifact (archive ended 2026-07-01). Wrong-mechanism claims in `comment/markers.py` +
-`scratch/coherence_2026-07-15/synthesis.md` fixed same-day.
+dead — live-elicited since `30bca2f` reached main in merge `642b027` on 2026-07-11T16:37Z (authored
+2026-07-08; the merge date is the era boundary, per AGENTS.md era-bucketing → merge-date rule, and it
+is what makes the presence rate a clean 100% instead of a partial one — **58%** on the per-slot cohort
+in `scratch/residual_2026-08-02/dim_ghosts-and-guards.md:118`, 78.9% on a per-comment recount; the
+cohort-dependence is itself a reason to key on the merge date and read 100%); the "0/2203 rows"
+finding was a data-window artifact (archive ended 2026-07-01). Wrong-mechanism claims in
+`comment/markers.py` + `scratch/coherence_2026-07-15/synthesis.md` fixed same-day.
 
-### Market-deference: time-to-close term MEASURED DEAD; liquidity fixes survive, downsized (updated 2026-07-16)
+### Market-deference: time-to-close term MEASURED DEAD; liquidity fix SHIPPED 2026-08-03, matching fixes survive (updated 2026-08-03)
 
 Applicability gate (offline archive mining) killed the headline half:
 
@@ -336,9 +351,24 @@ Applicability gate (offline archive mining) killed the headline half:
   intersection **zero**. Structural, not small-n: a near-identical market closes ≈ when the question
   resolves, we forecast near open (`skip_previously_forecasted_questions=True`, `cli.py:119-148`), and
   the `as_of` filter drops markets closing before resolution. Revisit only if we add late re-forecasting.
-- **Surviving — three small liquidity/matching fixes (top-of-low / bottom-of-medium):** (1)
-  **Fallback-chain bug**: 39 real-money matches render `no-liquidity-data` because volume/OI fields are
-  dropped — fix the `total_volume`/`open_interest` fallback (`prediction_market.py:498-506`). (2)
+- **~~(1) Blank liquidity labels~~ — FIXED 2026-08-03, and the logged diagnosis was WRONG.** This item
+  read "fallback-chain bug — fix the `total_volume`/`open_interest` fallback", i.e. add a `volume_24h`
+  fallback for when those fields are absent. There was no fallback to fix: Kalshi's live API carries
+  `volume_fp` / `open_interest_fp`, the bare names the builder read appear nowhere in its OpenAPI spec,
+  and the third field it consulted (`liquidity_dollars`) is documented to always return `0.0000`. So the
+  fields were never "dropped" — they were never read. The logged one-line fix would also have made
+  things worse: on the long-horizon markets this bot forecasts `volume_24h_fp` is 0.00 (only 189 of
+  1,504 live markets have any 24h volume), so scoring off it labels a deep market `thin`, which the
+  prompt reads as "discount this as noisy". Two lessons worth keeping: a "one-line fix" logged without
+  reading the upstream schema sat open for three weeks and got worse, and the blank label was never
+  cosmetic — the shared prompt clause tells forecasters to weight market signals BY that label, so
+  100% blank was a live instruction to weight by nothing. Sibling found and fixed in the same pass:
+  Polymarket's `openInterest` lives on the EVENT (5/5 live events) while the parser read it off the
+  nested market (0/42), so its OI column was dead on 142/142 archived rows. Guards:
+  `tests/test_prediction_market_liquidity_contract.py` against committed live payloads, plus
+  provider_health's `market_field_contract` signal, which now reddens CI the same day a venue renames
+  a field.
+- **Surviving — two matching/deference fixes (top-of-low / bottom-of-medium):** (2)
   **Fuzzy floor (40) so loose "match" ≈ topical-adjacent**: 100% "match" but confidence never exceeds
   0.77; ≥0.7-confidence (the defer trigger) is only ~8% of questions, ≥decent-liquidity ~12% — raise
   the floor or add a confidence tier. (3) Optional mild deference nudge for deep+high-confidence matches
@@ -346,6 +376,22 @@ Applicability gate (offline archive mining) killed the headline half:
 - Mechanics: `## Prediction Market Snapshot` header renders only on ≥1 match (`orchestrator.py:401-403`),
   so header-absence ≠ provider-off — use `providers_attempted`; close dates captured for
   Polymarket/Kalshi/Manifold (PredictIt lacks them).
+
+**Manifold's zero-contribution outage — FIXED 2026-08-03, and the mechanism is worth remembering
+because it is undocumented upstream.** Manifold contributed zero rows to any forecaster bundle for
+17+ days while reporting healthy in every channel (source token `none`, tally clean, alertable 0).
+`/v0/search-markets` treats `term` as a **strict conjunction of content tokens** — every token must
+appear in a market's text and one absent token returns `[]` — measured by appending a nonsense token
+to a query with a known hit (zeroes it) versus reordering present tokens (does not), which rules out a
+relevance floor. The provider was sending 9-15-token question sentences, well past the measured ~4-token
+satisfiability cliff. Fix: a relaxation ladder (`manifold_relaxation_terms`) that walks progressively
+shorter terms and stops at the **first non-empty** result, i.e. the longest satisfiable conjunction.
+Recall is monotone decreasing in token count and precision monotone increasing, so that stopping rule
+is a derived optimum rather than a tuned threshold — which is why there is no knob. It fires only after
+the precise queries return nothing, so the healthy path costs zero extra calls. **Watch item:** the
+semantics are undocumented, so `tests/test_prediction_market_integration.py` carries a live tripwire
+for the day upstream switches to ranked search, at which point the ladder becomes unnecessary (harmless,
+but the base queries would then suffice and the ladder could be retired).
 
 **Rides along (low-value, operator 2026-07-16):** a bias-corrected **∆LL-over-matched-market diagnostic**
 on the ~8% near-identical subset — do we add signal beyond the price or defer harder. NOT worth building
@@ -378,7 +424,7 @@ no-supervisor 0.1199 ≈ 0.0074 Brier) + BTF-2 evidence as motivating a targeted
 second BASE-MODEL round rather than a stacker revisit. The stacker-as-judge rejection still stands
 (disabled in prod; our own benchmark found it counterproductive on the current ensemble).
 
-### Time-series anchor for numeric questions — Phase A verdict IN; Phase B text anchor SHIPPED ON in prod (2026-07-17), chart still OFF
+### Time-series anchor for numeric questions — Phase A verdict IN; Phase B text anchor SHIPPED ON in prod (2026-07-21), chart still OFF
 
 For numeric questions resolving on a fetchable series, render an empirical P10/P50/P90 band from
 the series' own history into the briefing — **TS-as-anchor, not TS-as-answer**; a principled
@@ -394,14 +440,17 @@ P90 on target — sharper AND better-tail-calibrated. **CV model selection rejec
 must-beat-naive gate passed 76% but those picks beat naive OOS only 43% (worse than a coin flip),
 so we render the naive/empirical band directly.
 
-**Phase B text anchor SHIPPED ON 2026-07-17** (`TS_ANCHOR_ENABLED: 'true'` in all four yamls; chart
+**Phase B text anchor SHIPPED ON, live in prod 2026-07-21T17:07Z** (authored 2026-07-17, landed in
+merge `b4e9df0`; `TS_ANCHOR_ENABLED: 'true'` in all four yamls; chart
 side-channel `TS_ANCHOR_CHART_ENABLED` stays OFF, next entry). Provider
 `research/timeseries_anchor.py` + `ts_fetch.py` (deterministic routing + point-in-time/ALFRED-vintage
 fetch + empirical bands); prompt clause `_ts_anchor_evidence_clause` (gated on section header).
 Cleared its validation ladder (paid 3-arm smoke → `test_bot.yaml` eyeball → `make backtest_medium`,
 leakage-safe because the provider date-ceilings the fetch to `open_time` under `is_benchmarking`) —
 the FIRST prod research provider also measurable in backtest. The `TS_ANCHOR_ENABLE` config era
-(2026-07-17) is tracked by the width monitor. Seed doc:
+(2026-07-21T17:07:37Z, `b4e9df0` — the merge-to-main date, not the 07-17 authoring date) is tracked
+by the width monitor; it is the whole july15 bundle, so an anchor-only attribution needs the
+per-record `anchor_present` tagging follow-up rather than the era row. Seed doc:
 `scratch_docs_and_planning/ts_anchor_plan_seed_2026-07-16.md`.
 
 **Applicability gate** (`scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`): **53.2% (123/231) map to
@@ -419,6 +468,75 @@ gasoline, unemployment, CPI, payrolls, poll averages, TSA volume). Design notes:
   TSA (4/5 spot-checked FRED series absent), and emits a raw last-6-obs table, not a fitted band.
 - **Class B later-add:** Mauna Loa CO2 + Norwegian EV-share (held out of A on ingestion only; fold in
   once statsforecast wiring exists). Backtest measurement uses the gap-fill v2 eval-ladder pattern.
+
+**The 53.2% is NOT a target for the shipped fetch layer — stop comparing the live routing rate to
+it.** `SeriesSpec.source` is `Literal["fred", "yfinance"]`, and 13 of the gate's own 123 Class A rows
+carry notes naming a publisher neither can speak (poll aggregator ×9, TSA daily throughput ×4), so
+the fetch-layer-achievable slice of that corpus is 110/231 = 47.6%. Worse, the two populations
+differ: on the 22 triple-era numeric-family questions, 11 resolve on bespoke one-off web trackers
+(CDC surveillance portals, a Bluesky index, a robotaxi leaderboard, Copernicus burnt-area, state
+election turnout) with no FRED/yfinance analogue at all, so that cohort's ceiling is 7/22 = 31.8%.
+Read routing coverage as **routed / fetch-layer-reachable** (5/7 = 71.4% on the triple era before
+the gasoline fix, 6/7 after) and treat the applicability gate as a scoping study, not a KPI. The
+rate claims are n=22 and wide; the mechanism claims (which branch rejected which question) are
+exact. Receipts: `scratch/provider_repair_2026-08-03/diag_d3-ts-anchor-routing.md`.
+
+**Deferred, deliberately: poll averages and the two-leg FRED spread.** Both are reachable in
+principle and both need new machinery, and both are where a wrong-quantity band is most likely — so
+neither should ride in behind a keyword change.
+
+- *Poll averages* (q44841, q44855, q44858, q44911 in the triple era; the "strong-value core" bullet
+  above cites q43611/q43591) need a THIRD `SeriesSpec.source`. The blocking detail is that the free
+  published CSV is poll-LEVEL (one row per poll) while the questions resolve on the tracker's
+  weighted+adjusted daily trendline, so serving them means reimplementing a proprietary aggregation —
+  and a mismatch produces a band centered on the wrong number while looking authoritative. The
+  article page is also paywalled, so the link's stability is not ours. If built, the tracker's own
+  trendline file is the only acceptable input, and `Derivation` needs a `trailing_avg` member gated
+  the way the gasoline pair is: q44911 resolves on a 7-poll moving average and q44841 on a daily
+  trendline value, which are two different derivations of the same polls — the CPI wrong-quantity
+  hazard in a venue with no gate yet.
+- *Two-leg FRED spreads* (q44868, the NOB spread: DGS30 − DGS10 in basis points) currently land in
+  `route_question`'s `url_ambiguous` branch and skip, which is correct — there is no two-leg FRED
+  route, and the yfinance two-ticker route builds a mean-zero relative-log-return in percentage
+  points, a different quantity. Building it needs a spread route plus an explicit unit-scaling rule
+  (percentage points → basis points). Two gates now hold that line, covering DIFFERENT cases: the URL
+  branch's two-FRED-link ambiguity check (q44868's shape), and — added 2026-08-03 — a route-level
+  wording guard (`_TWO_LEG_OR_CHANGE_RE`) for the same quantity mismatch when NO URL is cited, which
+  the URL branch never sees. The magnitude backstop does not substitute for either: a 4.4-4.95 percent
+  level band against a −50..50 basis-point displayed range scores INSIDE that range once the open-bound
+  tolerance widens it (pinned by `test_the_backstop_alone_would_not_have_caught_those`). The guard
+  changed zero routes across 264 corpus rows and closes the hazard on the pre-existing `10-year yield`
+  keywords too, so it is not specific to the UST tokens. **Placement is load-bearing and was got wrong
+  once:** implementing it as per-entry `exclude_keywords` removed DGS10 from the match list the
+  AMBIGUITY check counts, so "the 10-year treasury yield versus the high yield spread" left HY-OAS as
+  the sole match and routed to one leg — a correct ambiguous-skip converted into a wrong single-series
+  anchor. The guard therefore runs AFTER the ambiguity check, where it can only turn a route into a
+  skip, and entries whose own series IS a published spread (HY OAS) are exempt via
+  `_SPREAD_NATIVE_SERIES`. Both properties are pinned by tests. A spread route must clear both gates
+  deliberately rather than by loosening one.
+
+**Registry families still absent but FRED-reachable** (same silent-coverage shape the gasoline gap
+had, logged rather than left implicit): `USEPUINDXD` Economic Policy Uncertainty (q40196, q40195) and
+weekly SPR stocks (q42815). And every non-`level` derivation carries the same two-entry hazard the
+gasoline pair just fixed — `mom_pct` (CPIAUCSL) and `mom_diff` (PAYEMS) gate on quantity language
+with no complementary level sibling, so a CPI index-LEVEL question or a payroll LEVEL question routes
+nowhere. That is deliberate per `548ba88` (a wrong-quantity band is worse than none), but it means
+those families go dark silently, exactly as point-in-time gasoline did.
+
+**Method note for any future registry claim: probe against `question_text + resolution_criteria +
+fine_print` through `route_question` itself, and treat any title-only number as inadmissible for a
+route-level claim.** A title-only check produced the wrong diagnosis for q45082 twice — its title
+says only "gas price" (matching no keyword), while the keyword hit actually comes from the criteria's
+"Regular Gasoline", so the logged "add a `gas price` keyword" one-token fix would have changed
+nothing. The same method error then produced a wrong coverage claim for the UST-10Y widening: on
+titles the two new tokens look like they recover 9 questions, but on real text all 9 already routed
+through the URL branch (their criteria cite the DGS10 FRED link), so the tokens recover **zero**
+observed questions and are wording robustness only. The applicability-gate corpus
+(`scratch/ts_anchor_gate_2026-07-16/ts_labeled.json`) stores TITLES with no criteria, which is why
+every gate-derived rate in this section is a scoping figure and not a routing measurement. Two
+further traps in the tooling: a probe that calls `_entry_matches` directly skips `route_question`'s
+URL branch entirely (so it over-credits keywords), and probes living under `scratch/` are gitignored
+and do not survive a merge — re-derive rather than cite one.
 
 ### TS anchor chart image — enable + A/B (HIGH, added 2026-07-17)
 
@@ -500,7 +618,7 @@ own search; Gemini was slightly *better* on fixed shared research). Our architec
 shared briefing + gap-fill + 6-model ensemble + median) already **is** BTF-2's winning recipe, at ~7
 calls vs ~5N. The lever is **shared-research quality + a strong prompt**, not integration topology.
 So: make the shared research more agentic (gap-fill v2,
-`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`, SHIPPED + ON since 2026-07-17 — that half is
+`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`, SHIPPED + ON in prod since 2026-07-21 — that half is
 done); do NOT rebuild into per-forecaster agents; if ever tried, give it only to the Opus-class slot.
 Calibration caveat: these agentic-research wins optimize pass@1, and edge-over-consensus has a
 *flat-to-negative* trend across model generations — "more search → more decisive" trades calibration
@@ -518,6 +636,31 @@ affordable middle is more v2 rounds / parallelism, not a rebuild. The NO verdict
 
 ## Near-term (worth exploring soon)
 
+### Provider-degradation alerting: SHIPPED 2026-08-03, extend beyond prediction markets
+
+`metaculus_bot/research/provider_health.py` gives a silently-degraded provider a same-day exit code:
+the run publishes normally, then `alertable_count` folds in a per-run provider-degradation summand and
+`cli.py` exits non-zero. Three rules today, all scoped to the prediction-market provider and all
+100%-of-denominator conjunctions with no tunable float: `market_field_contract` (a declared liquidity
+field dead across every row a venue produced), `venue_no_contribution` (a venue returned zero candidates
+while ≥2 siblings answered the same query set, on every question), `catalogue_empty` (a prefetch reported
+success and returned an empty catalogue). Replayed over 47 archived runs the rules fire on exactly the two
+real degradations in 20 runs with zero confirmed false positives, and go silent on the fixed tree.
+
+**The load-bearing design constraint, for anyone extending this: prod runs carry ONE OR TWO questions**
+(median 1, verified on a 1011-run histogram of `{1: 1008, 2: 3}`). So a rate over "the questions in a run"
+IS a per-question flag, and a per-question flag must never fire — a single question with no matching
+market is normal, not a defect. Every denominator has to exist INSIDE one question (rows a venue produced,
+sibling venues, a catalogue's own size). A longer run then makes every signal strictly harder to trip,
+which is the correct direction and means no retuning when a `test_bot` run carries four questions.
+
+Worth extending to the other providers on the same denominator discipline: Gemini grounded search
+(grounding metadata absent on 100% of calls), the resolution-source fetcher (every URL blocked/js_wall on
+a question that had extractable URLs), gap-fill v1 (analyzer names gaps and every resolver search returns
+empty). `PROVIDER_DEGRADATION_SUPPRESSED_UNTIL` (constants.py) ships EMPTY and is the dated per-venue lever
+for a known-and-accepted degradation — the same contract as `CREDIT_ALERT_RESUME_DATE`, dated rather than
+boolean so a stale acceptance cannot outlive the season unnoticed.
+
 ### TS-anchor follow-ups from the derivation-gating fix (added 2026-07-20)
 
 Context: commit `548ba88` closed the wrong-quantity routing bug (Codex P1 on b6edd2b) — CPI
@@ -532,14 +675,16 @@ and SKIPS when ambiguous. Two follow-ups deliberately left out of that commit:
   country-specific series (ONS/ABS per `scratch/ts_anchor_gate_2026-07-16/MAPPING_AUDIT.md`) or
   stay skipped — don't reuse CPIAUCSL. Same conservative registry pattern; the
   `require_any_keywords` machinery from 548ba88 makes this a small add.
-- **Split `timeseries_anchor.py` (~1100 lines, over the monolithic ceiling).** Forge flagged;
+- **Split `timeseries_anchor.py` (~1270 lines as of the 2026-08-03 routing repair, over the
+  monolithic ceiling).** Forge flagged;
   deferred as its own PR. Natural seams: routing+registry vs estimators/render. Fold in the
   duplicated 8-field `_Route` construction (`_single_url_route` vs `route_question`) via a
   `_route_from_entry` helper when splitting.
 
-### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-17 (added 2026-07-16)
+### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 
-**FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON 2026-07-17 after
+**FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON in the branch 2026-07-17
+and live in prod 2026-07-21T17:07Z (merge `b4e9df0`; the merge date is the era boundary) after
 the paid smoke, the blind driver eval (winner: gpt-5.6-terra effort=low, now the prod default),
 and the Exa-alive confirmation replay (`scratch/driver_replay_2026-07-17/arm_terra_low_exa_alive/`).
 Pending: turn v1 gap-fill OFF after the overlap window (operator must remember — **now gated on
@@ -947,7 +1092,9 @@ damages the largest, best-calibrated era). Receipts: `scratch/residual_2026-07-0
 
 ### Telemetry-first guard revival program (added 2026-07-08, passive)
 
-Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses` on `BinaryStructured`)
+Shipped `30bca2f` telemetry (`base_rate_anchor {low, high}` + `criteria_clauses` on `BinaryStructured`;
+authored 2026-07-08, live on main 2026-07-11T16:37Z in merge `642b027` — that merge date is the era
+boundary for any replay that splits on the telemetry's presence)
 plus `PREDICTION_MARKETS_ENABLED: 'true'` make future guard replays exact rather than parser-based. No
 code on the roadmap; passive. Note: the computed `ANCHOR_OVERSHOOT_PP` / `CLAUSE_PRODUCT_DIVERGENCE_PP`
 markers emit only from `tool_runner` (gated behind `PROBABILISTIC_TOOLS_ENABLED`, off in prod) so they're
@@ -1169,10 +1316,15 @@ framing is superseded by this version-confound note.
 ### Numeric-width history — receipts + ongoing monitor (added 2026-07-17)
 
 Consolidated, git-verified history of numeric-width config, so future sessions never re-litigate from memory.
-Short version: tails deliberately widened 2025-09 → 2026-05, turned off 2026-05-12, and the 2026-07-17 TS-anchor
-clause now pushes back toward sharpening.
+Short version: tails deliberately widened 2025-09 → 2026-05, turned off on main 2026-05-18, and the TS-anchor
+clause (on main 2026-07-21) now pushes back toward sharpening.
 
-| Date | Change | Value before → after | Commit | Source |
+The **Date** column below is each commit's AUTHORING date — this table is a commit history, which is what that
+column is for. The two rows that also define config eras land on main later, and the era boundary is the
+landing date: `b8d730f` (2026-05-12) → main 2026-05-18T17:21:19Z (`0e85e1b`); `3a7ba7d` and the Phase-8 fix
+(2026-07-17) → main 2026-07-21T17:07:37Z (`b4e9df0`). See AGENTS.md, era-bucketing → merge-date rule.
+
+| Date (authored) | Change | Value before → after | Commit | Source |
 |---|---|---|---|---|
 | 2025-08-21 | Numeric prompt: earliest "widen" language added | (none) → "aim to produce somewhat wider and less confident predictions" | `4bd8685` | `prompts.py` |
 | 2025-09-06 | Numeric prompt: widen language strengthened | "somewhat wider" → "wider and less confident … penalties for narrow intervals are severe" | `0437f3e` | `prompts.py` |
@@ -1201,12 +1353,24 @@ Notes on the story:
 
 **Ongoing monitor: `metaculus_bot/performance_analysis/width_monitor.py`** (read-only, free — not cost-gated).
 Run: `uv run python -m metaculus_bot.performance_analysis.width_monitor --cached scratch/coherence_2026-07-15/perf_all_tagged.json`
-(or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist). Per config era it reports
+(or `--tournament <slug>` for a live read-only pull; `--output-json <path>` to persist;
+`--exclude-qids known_bug` drops the 43746/43747 open-bound bug pair that every other residual dimension already
+excludes, and renders the dropped count so the exclusion is never silent). Per config era it reports
 central-80% / central-50% coverage with Jeffreys CIs, cov@10/50/90, PIT std (uniform ideal 0.289 — below ⇒ too
-wide, above ⇒ too narrow), and median relative band width `(P90−P10)/|P50|` as the raw sharpness metric. Eras are
-the two width-relevant flips: `WIDENING_FLIP` (2026-05-12, k_tail 1.25→1.0) and `TS_ANCHOR_ENABLE` (2026-07-17); the
-`ts_anchor` bucket is intentionally empty until the anchor provider is flipped on in prod, so post-enable records
-land in their own era instead of contaminating the widening-off baseline.
+wide, above ⇒ too narrow), median relative band width `(P90−P10)/|P50|` as the raw sharpness metric, and
+`band_miss (lo/hi)` — the out-of-band rate split by tail, which separates a band that is too TIGHT (both tails
+elevated) from one of roughly the right width that is MIS-CENTERED (misses piled in one tail); `cov80` cannot
+express that difference and the two call for opposite corrections.
+
+Eras are the two width-relevant flips, keyed on **merge-to-main timestamps** (AGENTS.md, era-bucketing →
+merge-date rule): `WIDENING_FLIP` = 2026-05-18T17:21:19Z (`0e85e1b`, k_tail 1.25→1.0; authored 2026-05-12,
+`b8d730f`) and `TS_ANCHOR_ENABLE` = 2026-07-21T17:07:37Z (`b4e9df0`, the july15 bundle; authored 2026-07-17).
+Both constants previously held their authoring dates, which manufactured a phantom one-record `ts_anchor` era
+out of qid 44795 — a question whose own comment names the retired six-model roster that the very same merge
+dropped. The `ts_anchor` bucket is empty again and correctly so: no post-bundle numeric has resolved and been
+pulled, and empty eras are omitted, so a two-row table is expected. Note the bucket is the whole july15 bundle
+(anchor + triple roster + `MIN_FORECASTERS_TO_PUBLISH` 3→1 + gap-fill v2), so a width shift across it cannot be
+attributed to the anchor alone.
 
 **Measured 2026-07-17 on the 231 recovered numeric+discrete questions** (`scratch/coherence_2026-07-15/perf_all_tagged.json`):
 
@@ -1237,7 +1401,8 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
    `cov@10 ≈ 0.03` as a too-wide signal here — that's a pooling artifact; the current-era value is 0.107 (on
    target). The ~0.03 the TS-anchor prompt clause quotes is the live-prod low tail, a different cohort.
 2. **Tag monitor records with `anchor_present` / `gap_fill_v2_present` (low effort).** The `ts_anchor` era
-   bucket is confounded (TS anchor + gap-fill v2 + native-search/crux terra swaps all flipped 2026-07-17) AND
+   bucket is confounded (TS anchor + gap-fill v2 + native-search/crux terra swaps + the 6→3 roster drop +
+   `MIN_FORECASTERS_TO_PUBLISH` 3→1 all reached prod in one merge, `b4e9df0` 2026-07-21T17:07Z) AND
    pools treated with untreated (only ~53% of numerics route to a fetchable series). Fix: at collection time
    grep research text for the `## Time Series Anchor` and `## Agentic Research Findings` headers, thread the
    booleans into the record, split era rows by presence. Cheap; unblocks any real anchor-effect read.
@@ -1303,7 +1468,7 @@ prompt-era issues not model tier. Terra: −43% cost, ~50s vs ~118s. Packets:
 
 ## Longer-term (significant R&D)
 
-### Agentic deep research (ReAct loop) — SHIPPED 2026-07-17
+### Agentic deep research (ReAct loop) — SHIPPED, live in prod 2026-07-21
 
 The gap-fill v2 plan (near-term entry; `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) IS this —
 a bounded tool-loop second pass, ON in prod (`GAP_FILL_V2_ENABLED: 'true'`). The old cost blocker is
@@ -1369,7 +1534,8 @@ here so future sessions don't re-recommend them without new data.
   Brier at 10pp) because 76% of parsed anchor bands are degenerate points; union-band variant is
   sign-consistent but 100% top-5-concentrated (1–2 Qs/era) and catches 1/5 of known misses; same-side tail
   clamping hurts both well-powered eras. Revival: ≥50 current-roster binaries with `base_rate_anchor`
-  telemetry (30bca2f) AND an era-stable, top-5<50% replay. `.../GUARD1_FINDINGS.md`.
+  telemetry (`30bca2f`, live on main 2026-07-11T16:37Z in `642b027`) AND an era-stable, top-5<50% replay.
+  `.../GUARD1_FINDINGS.md`.
 - **No-market-no-extremize cap** — feasibility kill: market-presence signal exists in ~one era (fall 89%
   NO_SIGNAL, `## Prediction Market Snapshot` in exactly 1 archived binary), so era-stability un-testable;
   marketless fallback = Arm A's point-anchor drift bomb; strict form's gain is 3 spring questions and the
@@ -1382,8 +1548,10 @@ here so future sessions don't re-recommend them without new data.
   AND leave-one-era-out passes everywhere; don't re-grid λ/t absent that. `.../GUARD3_FINDINGS.md`.
 - **Cross-cutting** — at mid-grid all three guards fire on the same spring miss cluster (42024 / 42304 /
   41800; often 42018 / 42577 / 42855 / 41644) — one lever measured three ways. The shipped `30bca2f` prompt
-  changes target that cluster, so any future guard replay must never fit on pre-`30bca2f` eras (the
-  roster-drift bomb with a prompt-change fuse; config-era bucketing already handles this).
+  changes target that cluster, so any future guard replay must never fit on pre-`30bca2f` eras — and the
+  cut is at its MERGE date, 2026-07-11T16:37Z (`642b027`), not its 2026-07-08 authoring date, or three days
+  of pre-change runs land on the wrong side (the roster-drift bomb with a prompt-change fuse; config-era
+  bucketing already handles this).
 
 ## Killed / evaluated 2026-07-11 (blind-forecaster review + crowd-signal audit)
 

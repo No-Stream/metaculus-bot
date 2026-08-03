@@ -14,7 +14,14 @@ must contain the documented sections. We use stronger asserts than "doesn't
 crash" precisely because the provider is permissive.
 
 FRED tests skip if `FRED_API_KEY` is not set in the environment.
-yfinance has no auth requirement.
+yfinance has no auth requirement. Both APIs are free — FRED's key is free to obtain
+and its calls are unmetered — so these are outside the repo's cost gate.
+
+`allow_network` is REQUIRED alongside the env gate. The autouse `_block_network_egress`
+guard in `tests/conftest.py` blocks every non-localhost connect for a test carrying
+neither `allow_network` nor `live`, so without the marker these died on a blocked socket
+even with `RUN_INTEGRATION_TESTS=1` set and the whole file was unrunnable. Same defect
+found and fixed in `test_prediction_market_integration.py` on 2026-08-03.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ import os
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.allow_network]
 
 
 # ---------------------------------------------------------------------------
