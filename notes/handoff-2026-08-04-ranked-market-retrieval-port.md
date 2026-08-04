@@ -147,6 +147,39 @@ Steps 1-2 sequential; inside step 2 the module split may parallelize per PORT_SP
   polarity (should fail, not skip, if a workflow drops RAW_RESEARCH_LOG_ENABLED);
   FUTURE.md follow-ups untouched.
 
+## Enrichment recon verdicts (arrived at handoff time — headline conclusions; full receipts in ENRICHMENT_SPEC.md)
+
+- **Manifold**: add `textDescription` truncated at 300 chars via `GET /v0/market/{id}` —
+  the ONLY field the search endpoint omits — ~1s wall for 60 rows at concurrency 10,
+  +3.1k prompt tokens. Close time and liquidity need NO extra fetch: prod's search parse
+  already reads them off every search row (30/30 non-null measured; the bake-off's blank
+  fields were an artifact of reading the frozen snapshot instead of the search row — the
+  port gets that fix free by reading search rows). Do NOT fund this by narrowing width:
+  width 60 retains 22/22 in-pool labeled rows, width 30 only 16/22.
+- **Prod bug found**: `_manifold_rules_text` prefers `textDescription`/`description`,
+  but the search response carries neither, so its title fallback ALWAYS wins — raw_rules
+  is a duplicate of the title on every Manifold row today.
+- **PredictIt**: KEEP, fix = delete the width=20 fuzzy pre-filter and render all 197
+  markets (+6.8k tokens; 6/6 labeled-row pool recall by construction). 5 of the 6 labeled
+  rows were cut by the fuzzy pre-filter at true ranks 26-107, and the fuzzy scorer is
+  ~noise on short political headlines (rank-1 for an Ethereum question was "Will the Pope
+  visit Cuba in 2026?"). PredictIt lines are BETTER formatted than Manifold's (contract
+  rules on 360/360), contrary to the brief's suspicion.
+- **44941 confirmed as the DROP-clause, not attention decay**: the ranker returned a
+  literal [] for the whole question in both replicates; the "different office/race is
+  irrelevant" clause matches a Florida down-ballot primary exactly. Attention decay is
+  UNTESTED — input-order venue interleaving is cheap insurance, not a fix for a measured
+  mechanism.
+- **OPEN QUESTION 1 (bigger Manifold lever, decide scope)**: `contractType=BINARY` in
+  `_manifold_search` is a hard ceiling — 27 of 89 labeled-wanted Manifold markets are
+  MULTIPLE_CHOICE/MULTI_NUMERIC/NUMBER/DATE and unreachable at any width. Fixing it needs
+  a rendering decision for multi-outcome markets (`probability` is null on all of them).
+  Recommend: flag to operator as a follow-up rather than folding into this port.
+- **OPEN QUESTION 2 (token budget)**: ranker input is ALREADY 24.3k tokens median (the
+  brief's 10-15k target was wrong); both fixes take it to ~31k. Recommendation: accept —
+  at upstream rates that is still <$0.01/question input, and the alternative (trimming
+  Kalshi/Polymarket line format, 84% of input chars) risks the rows that carry the value.
+
 ## References
 
 - Port working dir: `scratch/market_port_2026-08-04/` (ENRICHMENT_SPEC.md on disk;
