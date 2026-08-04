@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 # single run can upload more than one artifact, e.g. the pre-2026-08-03 test workflows'
 # research-* plus logs-*, and name-keying keeps them from colliding). Under
 # ``backtests/``, which .gitignore excludes — the store is local-disk state, never
-# committed. 859 dirs / 42 MB as of 2026-08-03 (~12 MB/month at current run cadence),
+# committed. 864 dirs / 44 MB as of 2026-08-03 (measured ~18 MB/month, ~220 MB/year),
 # so nothing here needs compression or pruning; permanence is the entire point.
 DEFAULT_STORE_DIR = "backtests/gha_artifact_store"
 
