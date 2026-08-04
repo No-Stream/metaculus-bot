@@ -11,12 +11,14 @@ per-artifact download skipping that run for every harvester without aborting.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TypedDict
 from unittest import mock
 
 import scripts.sync_all as sync_all
-from scripts.telemetry.archive import load_marker_records
+from scripts.telemetry.archive import load_marker_records, load_run_manifest
 
 # A valid EXTRACTION_RUNG log line (mirrors the run-log tests) so the telemetry harvest
 # produces a real marker record from a fake run's run_logs/*.log.
@@ -68,12 +70,23 @@ def _write_logs_run_dir(dest_dir: Path, run_id: int) -> Path:
     return run_dir
 
 
-def _dirs(tmp_path: Path) -> dict[str, Path]:
+class SyncDirs(TypedDict):
+    """``run_sync``'s directory kwargs. Typed so ``**dirs`` doesn't widen to ``Path``."""
+
+    research_dir: Path
+    backfill_dir: Path
+    telemetry_dir: Path
+    raw_dir: Path
+    store_dir: Path
+
+
+def _dirs(tmp_path: Path) -> SyncDirs:
     return {
         "research_dir": tmp_path / "research_archive",
         "backfill_dir": tmp_path / "research_archive" / "backfill",  # absent -> empty backfill
         "telemetry_dir": tmp_path / "telemetry_archive",
         "raw_dir": tmp_path / "research_archive" / "raw",
+        "store_dir": tmp_path / "gha_artifact_store",
     }
 
 
@@ -194,3 +207,91 @@ class TestSinglePassDriver:
         assert len(summary.expired) == 2
         research_expired, logs_expired = sync_all._expired_by_family(summary.expired)
         assert (research_expired, logs_expired) == (1, 1)
+
+
+class TestOfflineReharvestFromTheStore:
+    """``--from-store`` rebuilds all three archives off local disk, with no network at all.
+
+    This is what makes an ingest fix cheap: the artifacts are already persisted, so the
+    corrected parser re-runs over the same bytes for free instead of re-downloading (and
+    instead of being unable to, once the 90-day retention has passed).
+    """
+
+    def _seed_store(self, tmp_path: Path, dirs: SyncDirs) -> None:
+        """Run one ONLINE sync so the store holds two artifacts, exactly as a real pull leaves it."""
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=2)),
+            _artifact("research-200", 200, now - timedelta(days=1)),
+        ]
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            return _write_research_run_dir(dest_dir, run_id, qid=40000 + run_id)
+
+        with (
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download),
+            mock.patch("scripts.sync_all.build_workflow_map", return_value={100: "tournament", 200: "minibench"}),
+        ):
+            sync_all.run_sync("repo", 0, **dirs)
+
+    def test_rebuilds_every_archive_with_no_network_call(self, tmp_path: Path) -> None:
+        dirs = _dirs(tmp_path)
+        self._seed_store(tmp_path, dirs)
+
+        # Wipe the three archives so only a genuine re-harvest off the store can restore them.
+        for key in ("research_dir", "telemetry_dir", "raw_dir"):
+            shutil.rmtree(dirs[key], ignore_errors=True)
+
+        def forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"--from-store must not shell out: {args!r}")
+
+        with (
+            mock.patch("scripts.gha_artifacts.subprocess.run", side_effect=forbidden),
+            mock.patch("scripts.download_run_logs.subprocess.run", side_effect=forbidden),
+        ):
+            summary = sync_all.run_sync("repo", 0, from_store=True, **dirs)
+
+        manifest = json.loads((dirs["research_dir"] / "manifest.json").read_text())
+        assert set(manifest) == {"40100", "40200"}
+        assert {r["run_id"] for r in load_marker_records(dirs["telemetry_dir"], "extraction_rung")} == {"100", "200"}
+        assert (dirs["raw_dir"] / "100.jsonl").exists() and (dirs["raw_dir"] / "200.jsonl").exists()
+        assert (summary.research_questions, summary.telemetry_runs) == (2, 2)
+        assert summary.expired == [], "the store cannot hold an expired artifact"
+
+    def test_offline_reharvest_keeps_workflow_attribution(self, tmp_path: Path) -> None:
+        """Without the archive-derived map, every re-harvested run would read ``unknown``.
+
+        ``infer_workflow`` can only fall back to the artifact-name prefix, which stopped
+        distinguishing test runs from prod ones once every workflow uploaded ``research-*``
+        — and the replace-by-run merge would then overwrite the good slug with that.
+        """
+        dirs = _dirs(tmp_path)
+        self._seed_store(tmp_path, dirs)
+
+        sync_all.run_sync("repo", 0, from_store=True, **dirs)
+
+        manifest = load_run_manifest(dirs["telemetry_dir"])
+        assert {r["run_id"]: r["workflow"] for r in manifest} == {"100": "tournament", "200": "minibench"}
+
+    def test_re_running_the_online_sync_downloads_nothing_new(self, tmp_path: Path) -> None:
+        """A second online pull re-enumerates but re-fetches nothing already in the store."""
+        dirs = _dirs(tmp_path)
+        self._seed_store(tmp_path, dirs)
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=2)),
+            _artifact("research-200", 200, now - timedelta(days=1)),
+        ]
+
+        with (
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to") as dl_mock,
+            mock.patch("scripts.sync_all.build_workflow_map", return_value={}),
+        ):
+            summary = sync_all.run_sync("repo", 0, **dirs)
+
+        assert dl_mock.call_count == 0
+        assert summary.research_questions == 2, "and the harvest still sees both runs, off the store"

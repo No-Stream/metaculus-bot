@@ -164,6 +164,9 @@ class TestDownloadTimeoutResilience:
 
         monkeypatch.setattr(gha, "_download_artifact_to", _fake_download)
 
-        _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, tmp_path)
+        # store_dir is explicit: without it the harvest persists these fixture artifacts
+        # into the operator's real backtests/gha_artifact_store/ (the conftest redirect is
+        # the backstop, this is the local statement of intent).
+        _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, tmp_path, store_dir=tmp_path / "store")
         assert {r.run_id for r in runs} == {"2"}, "the surviving artifact must still be harvested"
         assert len(runs[0].records["extraction_rung"]) == 1

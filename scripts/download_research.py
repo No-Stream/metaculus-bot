@@ -56,8 +56,12 @@ from pathlib import Path
 # into accepting records the reader rejects.
 from metaculus_bot.performance_analysis.id_mapping import PAGE_URL_ID_PATTERN
 
-# Enumeration + download run through the shared core.
-from scripts.gha_artifacts import download_run_dirs, select_run_artifacts
+# Enumeration + persistence run through the shared core.
+from scripts.gha_artifacts import (
+    add_store_arguments,
+    persisted_run_dirs,
+    select_artifacts,
+)
 from scripts.telemetry.jsonl import load_jsonl_records
 
 logger = logging.getLogger(__name__)
@@ -133,26 +137,38 @@ def deduplicate_records(records: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
-def download_research_artifacts(repo: str, since_days: int) -> list[dict]:
-    """Download every LIVE research artifact in the repo and return their JSONL records.
+def download_research_artifacts(
+    repo: str,
+    since_days: int,
+    *,
+    store_dir: Path | str | None = None,
+    from_store: bool = False,
+) -> list[dict]:
+    """Persist every LIVE research artifact and return the JSONL records from the store.
 
-    Delegates enumeration + download to the shared core (``select_run_artifacts`` +
-    ``download_run_dirs``), then reads the per-question research JSONL from each
-    downloaded run dir (excluding the raw-research logs that ride alongside). Logs how
-    many artifacts downloaded, records added, and how many were EXPIRED/lost.
+    Delegates enumeration + persistence to the shared core (``select_artifacts`` +
+    ``persisted_run_dirs``), then reads the per-question research JSONL from each
+    PERSISTED run dir (excluding the raw-research logs that ride alongside). Logs how
+    many artifacts were read, records added, and how many were EXPIRED/lost.
 
     `since_days <= 0` (the default) disables the window and pulls every live artifact.
+    ``from_store=True`` reads only what is already persisted and makes no network call.
     """
-    selection = select_run_artifacts(
-        repo, family_prefixes=(RESEARCH_ARTIFACT_PREFIX,), since_days=since_days, family_label="research"
+    selection = select_artifacts(
+        repo,
+        family_prefixes=(RESEARCH_ARTIFACT_PREFIX,),
+        since_days=since_days,
+        family_label="research",
+        store_dir=store_dir,
+        from_store=from_store,
     )
-    logger.info(f"Downloading {len(selection.by_run)} live research artifact(s)...")
+    logger.info(f"Harvesting {len(selection.by_run)} research artifact(s)...")
 
     all_records: list[dict] = []
     downloaded = 0
     records_added = 0
-    for _run_id, _art, run_dir in download_run_dirs(
-        selection, repo, tmp_prefix="research_dl_", progress_noun="research artifacts"
+    for _run_id, _art, run_dir in persisted_run_dirs(
+        selection, repo, store_dir=store_dir, from_store=from_store, progress_noun="research artifacts"
     ):
         jsonl_files = research_jsonl_files(run_dir)
         if jsonl_files:
@@ -438,11 +454,15 @@ def main():
         action="store_true",
         dest="rebuild_only",
         help=(
-            "Skip the GHA download and rebuild the archive from local data only (the records "
-            "already in by_qid/ plus the backfill dir). Artifact records are NOT discarded. "
-            "`--skip-download` is a deprecated alias for this flag."
+            "Skip the artifact harvest entirely and rebuild the archive from local ARCHIVE data "
+            "only (the records already in by_qid/ plus the backfill dir). Artifact records are "
+            "NOT discarded. To re-harvest the artifacts themselves off local disk, use "
+            "--from-store instead: it re-reads the persisted JSONL and so recovers records a "
+            "past ingest bug dropped, which a rebuild cannot. `--skip-download` is a deprecated "
+            "alias for this flag."
         ),
     )
+    add_store_arguments(parser)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -452,9 +472,25 @@ def main():
 
     all_records: list[dict] = []
 
-    # --- Phase 1: Download artifacts from GHA (complete artifacts endpoint) ---
-    if not args.rebuild_only:
-        all_records.extend(download_research_artifacts(repo=args.repo, since_days=args.since_days))
+    # --- Phase 1: Harvest artifacts (from GHA, or from the store with --from-store) ---
+    if args.rebuild_only:
+        # The two offline flags are NOT the same thing and asking for both is almost
+        # certainly a mistake: --rebuild-only skips the artifact harvest entirely, so
+        # pairing it with --from-store silently drops the store read the operator asked for.
+        if args.from_store:
+            logger.warning(
+                "--rebuild-only overrides --from-store: the artifact harvest is skipped, so nothing is read "
+                "from the store. Drop --rebuild-only to re-harvest the persisted artifacts."
+            )
+    else:
+        all_records.extend(
+            download_research_artifacts(
+                repo=args.repo,
+                since_days=args.since_days,
+                store_dir=args.store_dir,
+                from_store=args.from_store,
+            )
+        )
 
     # --- Phase 2: Load what the archive already holds, then the backfill ---
     # Existing records come first so a rebuild (or a download that returned less than

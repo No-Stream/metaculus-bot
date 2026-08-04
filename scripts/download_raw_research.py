@@ -38,7 +38,7 @@ from pathlib import Path
 # logs-*) constant lives with the run-log harvester. Raw research rides in the same
 # artifacts as the run logs.
 from scripts.download_run_logs import RUN_LOG_ARTIFACT_PREFIXES
-from scripts.gha_artifacts import download_run_dirs, select_run_artifacts
+from scripts.gha_artifacts import add_store_arguments, persisted_run_dirs, select_artifacts
 from scripts.telemetry.jsonl import load_jsonl_records
 
 logger = logging.getLogger(__name__)
@@ -118,20 +118,32 @@ def merge_and_write(archive_dir: Path, harvested: dict[str, list[dict]]) -> dict
     return totals
 
 
-def download_and_harvest(repo: str, since_days: int, archive_dir: Path) -> tuple[dict[str, int], int]:
-    """Enumerate + download every live run-log artifact, harvest raw logs, merge into the archive.
+def download_and_harvest(
+    repo: str,
+    since_days: int,
+    archive_dir: Path,
+    *,
+    store_dir: Path | str | None = None,
+    from_store: bool = False,
+) -> tuple[dict[str, int], int]:
+    """Persist every live run-log artifact, harvest raw logs from the store, merge into the archive.
 
-    Enumeration + download go through the shared core; this function contributes only the
-    raw-research-specific harvest (``harvest_raw_logs_from_dir``) and merge. Returns
-    ``(per_run_totals, expired_count)``.
+    Enumeration + persistence go through the shared core; this function contributes only
+    the raw-research-specific harvest (``harvest_raw_logs_from_dir``) and merge. With
+    ``from_store=True`` nothing is downloaded. Returns ``(per_run_totals, expired_count)``.
     """
-    selection = select_run_artifacts(
-        repo, family_prefixes=RUN_LOG_ARTIFACT_PREFIXES, since_days=since_days, family_label="run-log"
+    selection = select_artifacts(
+        repo,
+        family_prefixes=RUN_LOG_ARTIFACT_PREFIXES,
+        since_days=since_days,
+        family_label="run-log",
+        store_dir=store_dir,
+        from_store=from_store,
     )
 
     harvested: dict[str, list[dict]] = {}
-    for _run_id, _art, run_dir in download_run_dirs(
-        selection, repo, tmp_prefix="raw_research_dl_", progress_noun="run-log artifacts"
+    for _run_id, _art, run_dir in persisted_run_dirs(
+        selection, repo, store_dir=store_dir, from_store=from_store, progress_noun="run-log artifacts"
     ):
         for harvested_run_id, records in harvest_raw_logs_from_dir(run_dir).items():
             harvested.setdefault(harvested_run_id, []).extend(records)
@@ -150,12 +162,17 @@ def main() -> None:
         help="Optional post-filter: only artifacts created within N days (0 = every live artifact).",
     )
     parser.add_argument("--archive-dir", default=DEFAULT_ARCHIVE_DIR, help="Where to write the raw-research archive")
+    add_store_arguments(parser)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
     totals, expired_count = download_and_harvest(
-        repo=args.repo, since_days=args.since_days, archive_dir=Path(args.archive_dir)
+        repo=args.repo,
+        since_days=args.since_days,
+        archive_dir=Path(args.archive_dir),
+        store_dir=args.store_dir,
+        from_store=args.from_store,
     )
     total_records = sum(totals.values())
     logger.info("=" * 60)

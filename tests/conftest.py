@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
+from scripts import gha_artifacts
+
 _OPEN = datetime(2026, 1, 1)
 _RESOLVE = datetime(2026, 5, 1)
 
@@ -96,6 +98,29 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+
+
+# ---------------------------------------------------------------------------
+# Persisted-artifact-store guard (data-safety backstop)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _redirect_artifact_store(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the persisted artifact store at a temp dir for every test.
+
+    ``backtests/gha_artifact_store/`` is the durable local copy of GHA artifacts that
+    expire at 90 days, so a test writing into it plants fake data in real research
+    evidence. Not hypothetical: a run-log test that simply omitted ``store_dir`` persisted
+    a fixture artifact named ``research-2`` there, and the next real offline harvest
+    ingested its one-line log into the live telemetry archive as an ``unknown`` run.
+
+    ``scripts.gha_artifacts._resolve_store_dir`` reads this module attribute at CALL time
+    precisely so this redirect works; a signature default would be captured at import and
+    leave the omission unprotected. Tests that pass ``store_dir`` explicitly are
+    unaffected.
+    """
+    monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(tmp_path_factory.mktemp("gha_artifact_store")))
 
 
 # ---------------------------------------------------------------------------

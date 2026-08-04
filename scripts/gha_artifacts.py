@@ -4,35 +4,70 @@
 same six things: (1) enumerate EVERY repo artifact via the paginated REST endpoint,
 (2) filter to an artifact family by name prefix, (3) report expired (unrecoverable)
 artifacts loudly, (4) window by ``--since-days``, (5) dedup by originating
-workflow-run id, and (6) download each unique artifact once into a temp dir. This
-module is the single implementation of that skeleton.
+workflow-run id, and (6) make each unique artifact's contents available on local disk.
+This module is the single implementation of that skeleton.
 
 Two consumers use it:
 
 * the three standalone scripts, each over its own family (research-* for the
   research archive; research-* + logs-* for the run-log + raw-research archives);
 * ``scripts/sync_all.py``, which enumerates + downloads ONCE over the UNION family
-  and runs all three harvests over the shared downloaded dirs — so a ``make sync_all``
-  does ~100 downloads instead of ~300 (three scripts each re-downloading overlapping
-  families into their own temp dirs).
+  and runs all three harvests over the shared run dirs — so a ``make sync_all``
+  does one download per artifact instead of three (one per standalone script).
+
+THE PERSISTED ARTIFACT STORE
+----------------------------
+Downloads land in ``backtests/gha_artifact_store/<artifact-name>/`` and STAY THERE.
+This is the fix for the original design, where every artifact was extracted into one
+``tempfile.TemporaryDirectory`` that the generator wiped on close: harvesting had to
+happen inside the iteration, and any ingest bug downstream destroyed the payload
+rather than leaving it re-parseable on disk. GHA deletes artifacts at 90 days
+(``maximum_allowed_days: 90`` for this repo — the ceiling cannot be raised), so the
+staging area is transient by construction and local disk is the source of truth from
+the moment an artifact is grabbed.
+
+Each store dir holds the artifact's extracted contents plus a ``_meta.json``
+(``artifact_id`` / ``name`` / ``created_at`` / ``run_id``) so an artifact's age is
+knowable without another API call.
+
+IDEMPOTENCY — SKIP-IF-PRESENT. An uploaded artifact is immutable, so a re-grab of one
+already in the store is a no-op: ``ensure_store_current`` re-downloads only what is
+absent or INCOMPLETE (a dir with no ``_meta.json``, i.e. a previous run interrupted
+mid-extraction). Deleting a store dir is therefore the way to force a re-fetch.
 
 The download path is READ-ONLY and FREE — it hits only the GitHub API, no LLM /
-research calls, no publishing.
+research calls, no publishing. ``from_store=True`` skips the API entirely and harvests
+what is already on disk, so re-parsing after an ingest fix costs nothing and needs no
+network.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
+import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Where downloaded artifacts are persisted, one dir per artifact NAME (not per run: a
+# single run can upload more than one artifact, e.g. the pre-2026-08-03 test workflows'
+# research-* plus logs-*, and name-keying keeps them from colliding). Under
+# ``backtests/``, which .gitignore excludes — the store is local-disk state, never
+# committed. 859 dirs / 42 MB as of 2026-08-03 (~12 MB/month at current run cadence),
+# so nothing here needs compression or pruning; permanence is the entire point.
+DEFAULT_STORE_DIR = "backtests/gha_artifact_store"
+
+# Written INSIDE each store dir. Its presence is the "extraction finished" marker that
+# makes skip-if-present safe, so it is written before the dir is moved into place.
+STORE_META_FILENAME = "_meta.json"
 
 # subprocess.run timeouts (seconds). Bounding both keeps one slow/hung `gh` call from
 # stalling a scheduled pull: a per-artifact download that times out is skipped (the
@@ -162,6 +197,17 @@ class ArtifactSelection:
     total_artifacts: int
 
 
+def _apply_window(live: list[dict], since_days: int) -> list[dict]:
+    """Keep artifacts created within ``since_days``; ``since_days <= 0`` keeps everything."""
+    if since_days <= 0:
+        return live
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    before = len(live)
+    windowed = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
+    logger.info(f"--since-days={since_days} post-filter: {len(windowed)}/{before} live artifacts within window")
+    return windowed
+
+
 def select_run_artifacts(
     repo: str, *, family_prefixes: tuple[str, ...], since_days: int, family_label: str
 ) -> ArtifactSelection:
@@ -180,12 +226,7 @@ def select_run_artifacts(
     )
     report_expired(expired, family_label)
 
-    if since_days > 0:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
-        before = len(live)
-        live = [a for a in live if (_parse_created_at(a.get("created_at", "")) or cutoff) >= cutoff]
-        logger.info(f"--since-days={since_days} post-filter: {len(live)}/{before} live artifacts within window")
-
+    live = _apply_window(live, since_days)
     return ArtifactSelection(by_run=_dedup_by_run(live), expired=expired, total_artifacts=len(all_artifacts))
 
 
@@ -212,25 +253,279 @@ def _download_artifact_to(run_id: int, repo: str, artifact_name: str, dest_dir: 
     return run_dir
 
 
-def download_run_dirs(
-    selection: ArtifactSelection, repo: str, *, tmp_prefix: str, progress_noun: str = "artifacts"
-) -> Iterator[tuple[int, dict, Path]]:
-    """Download each unique artifact into ONE temp dir, yielding ``(run_id, artifact, run_dir)``.
+def _resolve_store_dir(store_dir: Path | str | None) -> Path:
+    """The store path to use, reading ``DEFAULT_STORE_DIR`` at CALL time when unset.
 
-    A per-artifact download that fails (returns None) is skipped so one hung `gh` never
-    aborts the pull. The temp dir lives for the life of the generator, so the consumer must
-    harvest each ``run_dir`` INSIDE the iteration (before the next artifact / generator close)
-    — every consumer here does exactly that. Progress is printed every 25 downloads so a
-    long pull isn't silent.
+    Resolving late rather than binding the constant into each signature is what lets the
+    test suite redirect the store wholesale (the autouse fixture in ``tests/conftest.py``):
+    a signature default is captured at import, so a test that merely OMITTED ``store_dir``
+    wrote into the operator's real 42 MB store — and one did, until its fixture log turned
+    up in the live telemetry archive.
     """
-    by_run = selection.by_run
-    total = len(by_run)
-    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmpdir:
-        tmp_path = Path(tmpdir)
-        for idx, (run_id, art) in enumerate(sorted(by_run.items(), key=lambda kv: kv[1].get("created_at", "")), 1):
-            run_dir = _download_artifact_to(run_id, repo, art.get("name", ""), tmp_path)
-            if run_dir is None:
-                continue
-            yield run_id, art, run_dir
-            if idx % 25 == 0:
-                print(f"  processed {idx}/{total} {progress_noun}", flush=True)
+    return Path(DEFAULT_STORE_DIR if store_dir is None else store_dir)
+
+
+def store_run_dir(store_dir: Path | str | None, artifact_name: str) -> Path:
+    """The store path an artifact's extracted contents live at (keyed by artifact NAME)."""
+    return _resolve_store_dir(store_dir) / artifact_name
+
+
+def read_store_meta(run_dir: Path) -> dict | None:
+    """Read a store dir's ``_meta.json``, or None when it is absent/unreadable."""
+    meta_path = Path(run_dir) / STORE_META_FILENAME
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        logger.warning(f"Unreadable {STORE_META_FILENAME} in {run_dir}; treating the dir as not persisted")
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def is_persisted(store_dir: Path | str | None, artifact_name: str) -> bool:
+    """Whether this artifact is already fully persisted (dir present AND meta written)."""
+    return read_store_meta(store_run_dir(store_dir, artifact_name)) is not None
+
+
+def _write_store_meta(run_dir: Path, art: dict) -> None:
+    """Stamp the artifact's identity + upload time beside its contents.
+
+    Written before the dir is moved into place, so a store dir either has meta and is
+    complete or has none and gets re-downloaded. ``artifact_id`` / ``run_id`` are stored
+    as strings to match the 859 dirs the first bulk grab wrote.
+    """
+    meta = {
+        "artifact_id": str(art.get("id", "")),
+        "name": str(art.get("name", "")),
+        "created_at": str(art.get("created_at", "")),
+        "run_id": str(art.get("run_id", "")),
+    }
+    (Path(run_dir) / STORE_META_FILENAME).write_text(json.dumps(meta))
+
+
+def _swap_into_place(src: Path, dest: Path) -> Path:
+    """Move a fully-extracted staging dir onto ``dest``, replacing whatever was there.
+
+    ``dest`` is only ever occupied by an INCOMPLETE copy here: ``ensure_store_current``
+    skips artifacts that are already persisted, so the only dir this clears is one a
+    previous run left without ``_meta.json``. A download that failed never reaches this
+    function at all (``persist_artifact`` returns early), which is what keeps a failed
+    extraction from clobbering a good copy.
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    os.replace(src, dest)
+    return dest
+
+
+def persist_artifact(art: dict, repo: str, store_dir: Path | str | None = None) -> Path | None:
+    """Download one artifact into the store, or None if the download failed.
+
+    Extraction happens in a staging sibling and is moved into place only once complete,
+    so an interrupted or failed `gh run download` leaves no half-populated store dir.
+    """
+    name = str(art.get("name", ""))
+    run_id = art.get("run_id")
+    if not name or run_id is None:
+        logger.warning(f"Artifact {art.get('id')} has no name/run_id; cannot persist")
+        return None
+
+    store_dir = _resolve_store_dir(store_dir)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    staging = store_dir / f".staging-{name}-{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        downloaded = _download_artifact_to(int(run_id), repo, name, staging)
+        if downloaded is None:
+            return None
+        _write_store_meta(downloaded, art)
+        return _swap_into_place(downloaded, store_run_dir(store_dir, name))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+@dataclass
+class StoreSyncStats:
+    """What ``ensure_store_current`` did: how much was already on disk vs. newly grabbed."""
+
+    already_present: int = 0
+    downloaded: int = 0
+    failed: int = 0
+
+
+def _ordered_artifacts(selection: ArtifactSelection) -> list[dict]:
+    """The selection's artifacts oldest-upload-first (name breaks created_at ties).
+
+    Deterministic order matters twice: the grab walks oldest-first so the artifacts
+    closest to expiry are secured first, and the harvest replays in the same order every
+    run, which keeps replace-by-run merges reproducible.
+    """
+    return sorted(selection.by_run.values(), key=lambda a: (str(a.get("created_at", "")), str(a.get("name", ""))))
+
+
+def ensure_store_current(
+    selection: ArtifactSelection, repo: str, *, store_dir: Path | str | None = None, progress_noun: str = "artifacts"
+) -> StoreSyncStats:
+    """Persist every selected artifact that isn't already in the store.
+
+    Skip-if-present (uploaded artifacts are immutable) makes a re-run cheap: only new
+    artifacts and dirs left incomplete by an earlier interruption are fetched. A
+    per-artifact download that fails is counted and skipped so one hung `gh` never
+    aborts the pull. Progress prints every 25 fetches so a long first pull isn't silent.
+    """
+    store_dir = _resolve_store_dir(store_dir)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    ordered = _ordered_artifacts(selection)
+    stats = StoreSyncStats()
+
+    for art in ordered:
+        if is_persisted(store_dir, str(art.get("name", ""))):
+            stats.already_present += 1
+            continue
+        if persist_artifact(art, repo, store_dir) is None:
+            stats.failed += 1
+            continue
+        stats.downloaded += 1
+        if stats.downloaded % 25 == 0:
+            print(f"  persisted {stats.downloaded} new {progress_noun}", flush=True)
+
+    logger.info(
+        f"Artifact store {store_dir}: {len(ordered)} selected -> {stats.already_present} already persisted, "
+        f"{stats.downloaded} newly downloaded, {stats.failed} failed"
+    )
+    return stats
+
+
+def iter_store_run_dirs(
+    selection: ArtifactSelection, store_dir: Path | str | None = None
+) -> Iterator[tuple[int, dict, Path]]:
+    """Yield ``(run_id, artifact, run_dir)`` from the STORE for each selected artifact.
+
+    Makes no network call and no temp dir: the yielded ``run_dir`` is the persisted copy,
+    so a consumer may re-read it after the iteration and a re-parse needs no re-download.
+    A selected artifact missing from the store (its download failed) is skipped, and the
+    count is reported so a short grab is visible.
+    """
+    store_dir = _resolve_store_dir(store_dir)
+    missing: list[str] = []
+    for art in _ordered_artifacts(selection):
+        name = str(art.get("name", ""))
+        if not is_persisted(store_dir, name):
+            missing.append(name)
+            continue
+        yield int(art["run_id"]), art, store_run_dir(store_dir, name)
+    if missing:
+        # The count above is exact; the tail is named for grep-ability, not analysis.
+        named = ", ".join(missing[:5])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+        logger.warning(
+            f"{len(missing)} selected artifact(s) are not in the store at {store_dir} and were NOT harvested "
+            f"(first few: {named})"
+        )
+
+
+def store_artifacts(store_dir: Path | str | None = None) -> list[dict]:
+    """Every persisted artifact as an artifact object, read from the store's ``_meta.json``s.
+
+    The offline counterpart to ``list_research_artifacts``: same shape, no API call.
+    Nothing in the store can be ``expired`` — that is the whole point of persisting it.
+    """
+    store_dir = _resolve_store_dir(store_dir)
+    if not store_dir.exists():
+        logger.warning(f"Artifact store {store_dir} does not exist yet; nothing to harvest offline")
+        return []
+
+    artifacts: list[dict] = []
+    for run_dir in sorted(store_dir.iterdir()):
+        # Leading-dot dirs are this module's own staging/scratch names, never artifacts.
+        if not run_dir.is_dir() or run_dir.name.startswith("."):
+            continue
+        meta = read_store_meta(run_dir)
+        if meta is None:
+            logger.warning(
+                f"Store dir {run_dir.name} has no readable {STORE_META_FILENAME} (incomplete grab); "
+                "skipping — a sync will re-download it"
+            )
+            continue
+        run_id = str(meta.get("run_id", ""))
+        if not run_id.isdigit():
+            logger.warning(f"Store dir {run_dir.name} has a non-numeric run_id {run_id!r}; skipping")
+            continue
+        artifacts.append(
+            {
+                "id": meta.get("artifact_id"),
+                "name": str(meta.get("name") or run_dir.name),
+                "created_at": str(meta.get("created_at", "")),
+                "expired": False,
+                "run_id": int(run_id),
+            }
+        )
+    return artifacts
+
+
+def select_store_artifacts(
+    store_dir: Path | str | None = None, *, family_prefixes: tuple[str, ...], since_days: int, family_label: str
+) -> ArtifactSelection:
+    """Build a selection from the PERSISTED store instead of the GitHub API (no network)."""
+    all_artifacts = store_artifacts(store_dir)
+    live, _expired = split_by_family(all_artifacts, family_prefixes)
+    logger.info(
+        f"Artifact store holds {len(all_artifacts)} persisted artifact(s), {len(live)} in the {family_label} family"
+    )
+    live = _apply_window(live, since_days)
+    return ArtifactSelection(by_run=_dedup_by_run(live), expired=[], total_artifacts=len(all_artifacts))
+
+
+def select_artifacts(
+    repo: str,
+    *,
+    family_prefixes: tuple[str, ...],
+    since_days: int,
+    family_label: str,
+    store_dir: Path | str | None = None,
+    from_store: bool = False,
+) -> ArtifactSelection:
+    """Select artifacts to harvest, from GitHub (default) or from the persisted store."""
+    if from_store:
+        return select_store_artifacts(
+            store_dir, family_prefixes=family_prefixes, since_days=since_days, family_label=family_label
+        )
+    return select_run_artifacts(repo, family_prefixes=family_prefixes, since_days=since_days, family_label=family_label)
+
+
+def add_store_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the two store flags every sync script shares (``--store-dir`` / ``--from-store``)."""
+    parser.add_argument(
+        "--store-dir",
+        default=None,
+        help=f"Where downloaded artifacts are persisted, one dir per artifact name (default: {DEFAULT_STORE_DIR}).",
+    )
+    parser.add_argument(
+        "--from-store",
+        action="store_true",
+        help=(
+            "OFFLINE re-parse: harvest the artifacts already persisted in --store-dir and make "
+            "no network call at all. Use after fixing an ingest bug — the bytes are already on "
+            "disk, so re-parsing them is free and needs no re-download."
+        ),
+    )
+
+
+def persisted_run_dirs(
+    selection: ArtifactSelection,
+    repo: str,
+    *,
+    store_dir: Path | str | None = None,
+    from_store: bool = False,
+    progress_noun: str = "artifacts",
+) -> Iterator[tuple[int, dict, Path]]:
+    """Ensure the selection is on disk, then yield each artifact's PERSISTED run dir.
+
+    The download phase ("make the store current") and the harvest phase ("iterate the
+    store") are separate on purpose: the harvest reads only local disk, so an ingest bug
+    is re-runnable against the same bytes with ``from_store=True``. With
+    ``from_store=True`` the download phase is skipped entirely and nothing touches the
+    network.
+    """
+    if not from_store:
+        ensure_store_current(selection, repo, store_dir=store_dir, progress_noun=progress_noun)
+    return iter_store_run_dirs(selection, store_dir)

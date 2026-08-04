@@ -36,7 +36,11 @@ from scripts.download_research import (
     record_source,
 )
 from scripts.download_research import main as download_research_main
-from scripts.research_sync.verify_completeness import unpromoted_artifact_questions
+from scripts.research_sync.verify_completeness import (
+    classify_gap_or_empty,
+    unpersisted_artifacts,
+    unpromoted_artifact_questions,
+)
 from scripts.sync_all import _build_research_archive
 
 # The real qid-44220 pair that exposed the bug: the artifact ran at 13:13 and the comment
@@ -501,6 +505,78 @@ class TestCompletenessCheckSeesTheMergeStage:
             "43592": {"sources": [SOURCE_COMMENT_BACKFILL, SOURCE_LOG_BACKFILL], "latest_source": SOURCE_LOG_BACKFILL}
         }
         assert unpromoted_artifact_questions(manifest) == []
+
+
+class TestCompletenessCheckWatchesThePersistedStore:
+    """The gate's other blind spot: an artifact GitHub has that local disk does not.
+
+    The archive check can pass on an artifact that was never persisted — 632 of the 859
+    live artifacts hold run logs and no research at all, so "not represented in the
+    archive" is the ordinary case for them and says nothing about whether their bytes are
+    safe. Only the store answers that, and it is the copy that survives the 90-day
+    retention, so the store check has to be its own signal.
+    """
+
+    def _persisted(self, store: Path, name: str, *, research: bool) -> None:
+        run_dir = store / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "_meta.json").write_text(
+            json.dumps({"artifact_id": "1", "name": name, "created_at": "2026-07-01T00:00:00Z", "run_id": "100"})
+        )
+        if research:
+            (run_dir / "research_100.jsonl").write_text(json.dumps({"qid": 44220, "run_id": "100"}) + "\n")
+
+    def test_a_live_artifact_absent_from_the_store_is_reported(self, tmp_path: Path) -> None:
+        live = [{"name": "research-100", "run_id": 100}, {"name": "research-200", "run_id": 200}]
+        self._persisted(tmp_path, "research-100", research=True)
+
+        assert [a["name"] for a in unpersisted_artifacts(live, tmp_path)] == ["research-200"]
+
+    def test_a_fully_persisted_set_reports_nothing(self, tmp_path: Path) -> None:
+        live = [{"name": "research-100", "run_id": 100}]
+        self._persisted(tmp_path, "research-100", research=True)
+
+        assert unpersisted_artifacts(live, tmp_path) == []
+
+    def test_an_incomplete_store_dir_counts_as_missing(self, tmp_path: Path) -> None:
+        """No ``_meta.json`` means the extraction never finished, so the copy isn't trustworthy."""
+        (tmp_path / "research-100").mkdir(parents=True)
+        assert [a["name"] for a in unpersisted_artifacts([{"name": "research-100", "run_id": 100}], tmp_path)] == [
+            "research-100"
+        ]
+
+    def test_gap_vs_empty_is_classified_off_the_store_without_downloading(self, tmp_path: Path) -> None:
+        store = tmp_path / "store"
+        self._persisted(store, "research-100", research=True)  # has records -> a genuine GAP
+        self._persisted(store, "research-200", research=False)  # logs only -> legitimately EMPTY
+        missing = [{"name": "research-100", "run_id": 100}, {"name": "research-200", "run_id": 200}]
+
+        with mock.patch("scripts.research_sync.verify_completeness._download_artifact_to") as dl_mock:
+            gaps, empties = classify_gap_or_empty(missing, "repo", store, tmp_path / "dl")
+
+        assert dl_mock.call_count == 0, "the bytes are already on disk; re-downloading them is waste"
+        assert [a["name"] for a in gaps] == ["research-100"]
+        assert [a["name"] for a in empties] == ["research-200"]
+
+    def test_an_unpersisted_artifact_still_falls_back_to_a_download(self, tmp_path: Path) -> None:
+        store = tmp_path / "store"
+        store.mkdir()
+
+        def fake_download(run_id, repo, artifact_name, dest_dir):  # noqa: ANN001, ANN202
+            run_dir = Path(dest_dir) / str(run_id)
+            run_dir.mkdir(parents=True)
+            (run_dir / "research_100.jsonl").write_text(json.dumps({"qid": 44220, "run_id": "100"}) + "\n")
+            return run_dir
+
+        with mock.patch(
+            "scripts.research_sync.verify_completeness._download_artifact_to", side_effect=fake_download
+        ) as dl_mock:
+            gaps, empties = classify_gap_or_empty(
+                [{"name": "research-100", "run_id": 100}], "repo", store, tmp_path / "dl"
+            )
+
+        assert dl_mock.call_count == 1
+        assert ([a["name"] for a in gaps], empties) == (["research-100"], [])
 
 
 class TestTruncationGuard:

@@ -676,8 +676,47 @@ local archives are fresh: the per-provider research archive
 narrower `sync_*` targets — it is a single download pass over the union of
 artifact families, so it is cheaper than running them in sequence, and GHA
 artifacts expire at 90 days, which makes anything a partial pull skipped
-permanently unrecoverable. The weekly launchd job in `scripts/research_sync/` is
-wired to `sync_all` for the same reason.
+permanently unrecoverable. The twice-weekly launchd job in
+`scripts/research_sync/` is wired to `sync_all` for the same reason.
+
+### The persisted artifact store, and re-parsing for free
+
+`sync_all` downloads each artifact into `backtests/gha_artifact_store/<artifact-name>/`
+and leaves it there — the extracted contents as `gh run download` unzipped them,
+plus a `_meta.json` holding `artifact_id` / `name` / `created_at` / `run_id`. All
+three archives are parsed FROM that store, never from a self-destructing temp
+dir, which is the point: 90 days is a hard ceiling for this repo
+(`{"days":90,"maximum_allowed_days":90}`), so GHA is a staging area and local
+disk is the source of truth the moment an artifact is grabbed. An artifact
+already in the store is never re-downloaded — uploads are immutable, so only
+absent or half-extracted dirs are fetched.
+
+```bash
+make resync_from_store    # rebuild all three archives from local disk, zero network
+```
+
+Reach for that after fixing an ingest or parse bug: the bytes are already on
+disk, so a corrected harvest costs nothing and still works on artifacts GitHub
+has since deleted. Each sync script also accepts `--from-store` / `--store-dir`.
+In `download_research.py` the two offline flags differ in an important way —
+`--rebuild-only` re-merges the records already in `by_qid/`, while `--from-store`
+re-reads the persisted JSONL and so can RECOVER records a past ingest bug
+dropped. The offline path cannot ask GitHub which workflow a run belonged to, so
+it recovers that from the telemetry archive's own `runs.jsonl`; a run entering the
+store for the first time during an offline re-parse reads `workflow: unknown`
+until the next online sync.
+
+Storage is not a concern at this scale: 859 artifacts occupy 38 MB (median 4.4
+KiB, mean 44 KiB, largest under 1 MB), and at ~13 artifacts/day that is roughly
+17 MB/month, so about 210 MB after a year. Nothing needs compression, and
+nothing is pruned on purpose — permanence is the whole point.
+
+`uv run python -m scripts.research_sync.verify_completeness` checks store
+coverage as its own FAIL condition (a live artifact missing from the store is
+research one clock-tick from unrecoverable), separately from archive coverage.
+Read the two signals differently: most artifacts legitimately hold no research at
+all — 632 of the 859 carry only `run_logs/`, which is why the archive holds
+artifact records from 227 runs rather than 859.
 
 ## Reading run logs
 
