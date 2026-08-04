@@ -57,6 +57,7 @@ from metaculus_bot.research.provider_health import (
 )
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
+_MULTI_CLOSE_PATH = Path(__file__).parent / "data" / "kalshi_multi_close_event_2026_08_04.json"
 
 DURING_SUPPRESSION = date(2026, 8, 3)
 AFTER_RESUME_DATE = date(2027, 1, 1)
@@ -95,6 +96,31 @@ def test_the_captured_payload_fixture_is_committed_and_complete() -> None:
     payload = json.loads(_PAYLOADS_PATH.read_text())
     assert set(payload) >= {"kalshi_events", "polymarket_search", "manifold_search", "predictit_all"}
     assert payload["_provenance"]["endpoints"].keys() == {"kalshi", "polymarket", "manifold", "predictit"}
+
+
+def test_the_multi_close_kalshi_fixture_is_committed_and_still_divergent() -> None:
+    """Same tracked-ness check as above, for the fixture the ranked port added.
+
+    It also asserts the property the fixture EXISTS for, because a capture that lost its
+    divergence would leave the tests that read it green while proving nothing: the event must
+    carry differing nested ``close_time`` values AND a first nested market whose status
+    disagrees with its siblings', which is what separates the max-over-nested / all-resolved
+    derivations from the old ``nested[0]`` read.
+    """
+    assert _MULTI_CLOSE_PATH.exists(), (
+        f"{_MULTI_CLOSE_PATH} missing. If it exists locally but not in CI, check .gitignore — "
+        "the blanket *.json rule needs the !tests/data/*.json negation."
+    )
+    payload = json.loads(_MULTI_CLOSE_PATH.read_text())
+    assert set(payload) >= {"events", "_provenance"}
+    assert payload["_provenance"]["endpoints"].keys() == {"kalshi"}
+
+    divergent = next(event for event in payload["events"] if event["event_ticker"] == "KXMARRIAGESTYLESKRAVITZ-HSZK")
+    nested = divergent["markets"]
+    assert len({market["close_time"] for market in nested}) == len(nested) > 1
+    assert nested[0]["status"] not in {market["status"] for market in nested[1:]}
+    assert divergent["settlement_sources"], "the event-level settlement sources are read by the join"
+    assert all(market.get("settlement_sources") is None for market in nested)
 
 
 def _observe(

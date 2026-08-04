@@ -159,6 +159,42 @@ def deterministic_queries(title: str) -> list[str]:
     return dedupe_queries([title, _strategy_s2(title), *manifold_relaxation_terms(title)])
 
 
+# The query author's prompt. It carries the recall framing, the additive framing ("your
+# queries are ADDED to a set that already has the question's own words") and the no-dates
+# rule. The digit ban is ASKED for here and ENFORCED in `_authored_strings`; the code is the
+# guarantee, since a model that ignores the instruction would otherwise zero a Manifold
+# conjunction. Substituted with `.replace`, matching the ranker prompt, so a brace in a
+# question title can never raise.
+QUERY_AUTHOR_PROMPT = """You are writing search queries to find prediction markets RELATED to a forecasting question.
+
+Recall is the objective: a market on the same subject with a different resolution date or a different threshold is a WANTED hit, not a miss.
+
+Your queries are ADDED to a deterministic query set that already contains the question's own words. So do not restate words already in the question -- they are already covered, and a repeat wastes a slot. Emit the vocabulary a token match on the question could never reach.
+
+Return JSON with exactly two keys:
+  "synonyms":  domain vocabulary absent from the question -- alternate names for the measured quantity, the agency or index that publishes it, the ticker, trader slang. Up to 8 short strings.
+  "framings":  2-3 alternate short phrasings of the whole question, each at most 4 words.
+
+Do NOT include dates, years, or numbers in any string: the venues we query treat a query as a strict conjunction, so a date token zeroes the result set.
+
+QUESTION
+title: {title}
+resolution criteria: {rc}
+
+Return ONLY the JSON object.
+JSON:"""
+
+# The author only needs enough resolution criteria to name the publishing agency and the
+# measured quantity; the ranker is the stage that reads the full clause.
+QUERY_AUTHOR_RC_CHARS = 800
+
+
+def build_query_author_prompt(title: str, resolution_criteria: str) -> str:
+    return QUERY_AUTHOR_PROMPT.replace("{title}", title or "").replace(
+        "{rc}", (resolution_criteria or "")[:QUERY_AUTHOR_RC_CHARS]
+    )
+
+
 def _authored_strings(value: object) -> list[str]:
     """One of the author's two JSON arrays, cleaned into usable queries.
 

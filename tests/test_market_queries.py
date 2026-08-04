@@ -28,6 +28,8 @@ import pytest
 from metaculus_bot.research.market_retrieval.queries import (
     _RELEVANCE_STOPWORDS,
     MANIFOLD_RELAXATION_MAX_TOKENS,
+    QUERY_AUTHOR_RC_CHARS,
+    build_query_author_prompt,
     deterministic_queries,
     fuzzy_best,
     manifold_relaxation_terms,
@@ -156,6 +158,34 @@ class TestParseQueryAuthor:
         """Every unreadable shape degrades to "no extra queries" — never to an exception and
         never to a query set the deterministic half has been replaced by."""
         assert parse_query_author(text) == (), shape
+
+
+class TestQueryAuthorPrompt:
+    """The author asks for the vocabulary a token match on the question cannot reach, and asks
+    for it WITHOUT dates. The digit ban is asked for here and ENFORCED in
+    ``parse_query_author`` — the code is the guarantee, since a model that ignores the
+    instruction would otherwise zero a Manifold conjunction."""
+
+    def test_the_additive_framing_and_the_digit_ban_are_stated(self):
+        prompt = build_query_author_prompt("Will unemployment exceed 4.5%?", "Resolves per BLS.")
+
+        assert "Recall is the objective" in prompt
+        assert "Your queries are ADDED to a deterministic query set" in prompt
+        assert "Do NOT include dates, years, or numbers in any string" in prompt
+        assert '"synonyms"' in prompt and '"framings"' in prompt
+
+    def test_the_question_is_substituted_and_the_criteria_capped(self):
+        prompt = build_query_author_prompt("Will unemployment exceed 4.5%?", "c" * 5000)
+
+        assert "title: Will unemployment exceed 4.5%?" in prompt
+        assert "{title}" not in prompt and "{rc}" not in prompt
+        assert "c" * QUERY_AUTHOR_RC_CHARS in prompt
+        assert "c" * (QUERY_AUTHOR_RC_CHARS + 1) not in prompt
+
+    def test_a_brace_in_a_title_does_not_break_substitution(self):
+        prompt = build_query_author_prompt("Will {x} happen?", "")
+
+        assert "title: Will {x} happen?" in prompt
 
 
 class TestFuzzyBest:

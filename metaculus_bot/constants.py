@@ -769,6 +769,50 @@ PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEO
 PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT: float = 12.0
 PREDICTION_MARKET_KEYWORD_BACKOFFS: tuple[float, ...] = (1.0,)
 
+# --- Ranked market retrieval (the two LLM stages and the catalogue pull) ---
+# Wall caps and backoff ladders for the snapshot's two new LLM stages, plus the bounds
+# on the full Kalshi events catalogue pull. Each stage's worst case is
+# ``(len(backoffs) + 1) * wall + sum(backoffs)``, and the SERIAL chain of those worst
+# cases has to fit under PREDICTION_MARKET_TIMEOUT. Stages 1a and 1b run concurrently,
+# so the chain takes the max of them:
+#
+#   | stage                                   | cap                    | worst |
+#   |-----------------------------------------|------------------------|-------|
+#   | 1a Kalshi catalogue (wall)              | 40.0                   |  40   |
+#   | 1b query author (concurrent with 1a)    | wall 20, backoffs (1,) |  41   |
+#   | 1a PredictIt dump (concurrent)          | 10 x 2 + 0.5           |  20.5 |
+#   | 2  venue search                         | 10 x 2 + 0.5           |  20.5 |
+#   | 2.5 manifold detail fan-out (wall)      | 10.0                   |  10   |
+#   | 4  ranking                              | wall 60, backoffs ()   |  60   |
+#   | total  max(41, 40, 20.5) + 20.5 + 10 + 60                       | 131.5 |
+#
+# The ranker gets NO retry: 36 of 36 measured calls parsed first try, a retry on a
+# ~36k-token prompt is expensive latency, and the deterministic pool-order fail-open
+# slate is a good fallback sitting right there. Its wall is 60 rather than the
+# originally specced 45 because the prompt grew ~50% (full PredictIt universe +
+# Manifold enrichment) and prefill scales with it.
+MARKET_QUERY_AUTHOR_WALL_TIMEOUT: float = 20.0
+MARKET_QUERY_AUTHOR_BACKOFFS: tuple[float, ...] = (1.0,)
+MARKET_RANKER_WALL_TIMEOUT: float = 60.0
+MARKET_RANKER_BACKOFFS: tuple[float, ...] = ()
+
+# Kalshi catalogue pull: a WALL-CLOCK budget for the whole paginated fetch, retries
+# included, so pagination can never push the snapshot past its own timeout. The
+# per-page ``aiohttp.ClientTimeout`` sits under this wall, not beside it.
+#
+# ``KALSHI_PAGE_SLEEP_S = 0.0`` is the measured change, not a guess: a live probe of six
+# consecutive pages (free unauthenticated GET, 2026-08-03) returned 200 events/page at
+# 0.28-0.44s/page with no throttling, so the complete ~49-page pull runs ~17s while the
+# 1.0s-per-page sleep prod pays makes 15 pages cost more than the whole catalogue. It
+# stays a named constant so it is tunable the day Kalshi starts 429ing; the existing 429
+# path already stops pagination early and refuses to cache a truncated list.
+# EVENT_LIMIT is a runaway guard well above the ~9,762 live open events; MAX_PAGES is
+# the real bound.
+KALSHI_CATALOGUE_WALL_TIMEOUT: float = 40.0
+KALSHI_PAGE_SLEEP_S: float = 0.0
+KALSHI_PREFETCH_EVENT_LIMIT: int = 20_000
+KALSHI_PREFETCH_MAX_PAGES: int = 120
+
 # Keyword-extraction strategy for matching Metaculus questions to market
 # listings. Default ``s4_s5_union`` is the empirical best on a 15-question
 # G0 study (67% hit rate vs 33% naive baseline; see
