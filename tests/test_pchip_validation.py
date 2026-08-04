@@ -12,8 +12,10 @@ import pytest
 from forecasting_tools import GeneralLlm, NumericQuestion
 from forecasting_tools.data_models.numeric_report import Percentile
 
-from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.value_extraction import ExtractionOutcome
 
 
@@ -130,160 +132,85 @@ class TestPchipValidation:
             )
             assert result is not None
 
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_wrong_length_cdf_fails_validation(self, mock_format, mock_generate):
-        """Test that CDF with wrong length fails validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question()
+    # ---------------------------------------------------------------------
+    # Constraint enforcement, against the REAL generator.
+    #
+    # Seven tests used to live here, one per constraint (wrong length, probs
+    # outside [0,1], non-monotonic, min-step, max-step, closed-bound, open-bound).
+    # Each mocked `generate_pchip_cdf` to return a hand-built invalid CDF and
+    # asserted `pytest.raises(Exception)`. All seven were vacuous: they patched
+    # `forecaster_runners.parse_structured` to return a percentile LIST, but at
+    # that point in `run_numeric_forecast` that call serves the C3 outcome_type
+    # read, so production did `outcome_result.is_discrete_integer` on a list and
+    # died with `AttributeError` BEFORE any CDF work. Probed directly:
+    # `mock_generate.call_count == 0` — the invalid CDFs never reached anything,
+    # and the bare `raises(Exception)` swallowed the AttributeError. Introduced
+    # accidentally by bdbd452 (2026-02-19), which inserted that production call
+    # and fixed every test it visibly broke; these were invisible because
+    # `raises(Exception)` kept them green.
+    #
+    # Wiring the mocks correctly does NOT rescue them: `build_numeric_distribution`
+    # (numeric/pipeline.py) catches a failing CDF build and substitutes
+    # `create_fallback_numeric_distribution`, and `validate_cdf_construction`
+    # deliberately skips PCHIP distributions — so a forced-invalid CDF produces a
+    # fallback distribution, not an exception. The premise "an invalid CDF raises
+    # out of _run_forecast_on_numeric" was never true on this path.
+    #
+    # So the constraint claim is asserted where it is actually decidable: on the
+    # real generator's OUTPUT. This is the property the seven tests were reaching
+    # for — the pipeline cannot emit a CDF that violates Metaculus's submission
+    # rules — and it fails loudly if any enforcement tier regresses.
+    # ---------------------------------------------------------------------
 
-        # Wrong length (200 instead of 201)
-        invalid_cdf = np.linspace(0.0, 1.0, 200).tolist()
-        mock_generate.return_value = invalid_cdf
-        mock_format.return_value = {}
+    @pytest.mark.parametrize("open_bounds", [False, True], ids=["closed_bounds", "open_bounds"])
+    @pytest.mark.parametrize(
+        "shape,percentile_values",
+        [
+            ("spread", {1.0: 1.0, 25.0: 25.0, 50.0: 50.0, 75.0: 75.0, 99.0: 99.0}),
+            ("concentrated", {1.0: 49.0, 25.0: 49.8, 50.0: 50.0, 75.0: 50.2, 99.0: 51.0}),
+            ("skewed_low", {1.0: 0.5, 25.0: 1.0, 50.0: 2.0, 75.0: 10.0, 99.0: 95.0}),
+            ("all_duplicate_values", {1.0: 50.0, 25.0: 50.0, 50.0: 50.0, 75.0: 50.0, 99.0: 50.1}),
+        ],
+    )
+    def test_generated_cdf_satisfies_every_submission_constraint(
+        self, shape: str, percentile_values: dict[float, float], open_bounds: bool
+    ) -> None:
+        """The real generator's output satisfies all six server-side CDF rules.
 
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
+        Input shapes span the cases that stress different enforcement tiers: a
+        well-spread distribution, one concentrated in a hair-thin band (stresses
+        min-step), a heavily skewed one (stresses max-step), and one whose
+        declared values are all identical (the degenerate case). ``shape`` is
+        unused in the body — it names the case in the test id so a failure says
+        which shape broke.
+        """
+        del shape  # named for the parametrize id only
 
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to PCHIP validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
+        cdf, _aggressive_enforcement = generate_pchip_cdf(
+            percentile_values=percentile_values,
+            open_upper_bound=open_bounds,
+            open_lower_bound=open_bounds,
+            upper_bound=100.0,
+            lower_bound=0.0,
+            zero_point=None,
+            min_step=NUM_MIN_PROB_STEP,
+        )
+        steps = np.diff(cdf)
 
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_invalid_probabilities_fail_validation(self, mock_format, mock_generate):
-        """Test that CDF with probabilities outside [0,1] fails validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question()
+        assert len(cdf) == PCHIP_CDF_POINTS
+        assert all(0.0 <= v <= 1.0 for v in cdf), f"probability outside [0,1]: {min(cdf)}..{max(cdf)}"
+        # Strict, not >=: the min-step rule below already forbids flat segments,
+        # and Metaculus rejects a CDF with any zero-width bin.
+        assert bool(np.all(steps > 0.0)), f"non-monotonic: min step {np.min(steps)}"
+        assert float(np.min(steps)) >= NUM_MIN_PROB_STEP - 1e-12, f"min-step violated: {np.min(steps)}"
+        assert float(np.max(steps)) <= NUM_MAX_STEP + 1e-12, f"max-step violated: {np.max(steps)}"
 
-        # Invalid probabilities (some > 1.0)
-        invalid_cdf = np.linspace(0.0, 1.2, 201).tolist()  # Goes up to 1.2
-        mock_generate.return_value = invalid_cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
-
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_non_monotonic_cdf_fails_validation(self, mock_format, mock_generate):
-        """Test that non-monotonic CDF fails validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question()
-
-        # Non-monotonic CDF
-        invalid_cdf = [0.0] * 100 + [0.5] + [0.4] * 100  # Goes down at position 101
-        mock_generate.return_value = invalid_cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
-
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_step_size_violation_fails_validation(self, mock_format, mock_generate):
-        """Test that CDF violating minimum step size fails validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question()
-
-        # Create CDF with step size violation
-        cdf = np.linspace(0.0, 0.5, 200).tolist()
-        cdf.append(0.5 + 1e-6)  # Very small step < 5e-5
-        mock_generate.return_value = cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
-
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_max_step_violation_fails_validation(self, mock_format, mock_generate):
-        """Test that CDF violating maximum step size fails validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question()
-
-        # Create CDF with max step violation
-        cdf = [0.0] * 100 + [NUM_MAX_STEP + 0.05] + [1.0] * 100  # Jump above NUM_MAX_STEP
-        mock_generate.return_value = cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
-
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_closed_bound_violations_fail_validation(self, mock_format, mock_generate):
-        """Test that closed bound violations fail validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question(open_upper=False, open_lower=False)  # Closed bounds
-
-        # CDF that doesn't start at 0.0 (closed lower bound violation)
-        invalid_cdf = np.linspace(0.01, 1.0, 201).tolist()
-        mock_generate.return_value = invalid_cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
-
-    @pytest.mark.asyncio
-    @patch("metaculus_bot.numeric.pchip_cdf.generate_pchip_cdf")
-    @patch("metaculus_bot.numeric.pchip_cdf.percentiles_to_pchip_format")
-    async def test_open_bound_violations_fail_validation(self, mock_format, mock_generate):
-        """Test that open bound violations fail validation."""
-        forecaster = self.create_mock_template_forecaster()
-        question = self.create_mock_question(open_upper=True, open_lower=True)  # Open bounds
-
-        # CDF that starts too low for open bounds (< 0.001)
-        invalid_cdf = np.linspace(0.0005, 0.9995, 201).tolist()  # Starts at 0.0005 < 0.001
-        mock_generate.return_value = invalid_cdf
-        mock_format.return_value = {}
-
-        percentiles = [Percentile(percentile=0.50, value=50.0)]
-
-        with patch("metaculus_bot.numeric.pipeline._apply_jitter_and_clamp", return_value=percentiles):
-            with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=percentiles):
-                with pytest.raises(Exception):  # Should fall back due to validation failure
-                    await forecaster._run_forecast_on_numeric(
-                        cast(NumericQuestion, question), "test", cast(GeneralLlm, forecaster.get_llm("default"))
-                    )
+        if open_bounds:
+            assert cdf[0] >= 0.001, f"open lower bound needs >= 0.001 mass, got {cdf[0]}"
+            assert cdf[-1] <= 0.999, f"open upper bound caps at 0.999, got {cdf[-1]}"
+        else:
+            assert cdf[0] == 0.0
+            assert cdf[-1] == 1.0
 
 
 if __name__ == "__main__":

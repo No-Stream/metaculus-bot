@@ -1,7 +1,7 @@
 import socket
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
@@ -102,7 +102,6 @@ def _block_network_egress(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
 
 # ---------------------------------------------------------------------------
 # Persisted-artifact-store guard (data-safety backstop)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
@@ -123,7 +122,6 @@ def _redirect_artifact_store(tmp_path_factory: pytest.TempPathFactory, monkeypat
     monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(tmp_path_factory.mktemp("gha_artifact_store")))
 
 
-# ---------------------------------------------------------------------------
 # Shared failure fixtures
 # ---------------------------------------------------------------------------
 
@@ -145,6 +143,33 @@ PRODUCTION_KEY_LIMIT_403 = (
     "https://openrouter.ai/workspaces/default/keys/"
     '8f5af82f134c33c0dbada6e1ce93b780819cc08716001bef5ab4af81791702bd","code":403}}'
 )
+
+
+def gather_predictions_stub(result: tuple[Any, Any, Any]) -> AsyncMock:
+    """An ``AsyncMock`` stand-in for ``TemplateForecaster._gather_predictions_with_wall_clock``.
+
+    ``_research_and_make_predictions`` (``metaculus_bot/forecaster.py``) builds one
+    coroutine per forecaster by CALLING ``_forecaster_with_soft_deadline``, then hands
+    the whole list to ``_gather_predictions_with_wall_clock``, which owns them from
+    that point on. Tests that stub the forecaster with an ``AsyncMock`` make each of
+    those calls produce a real coroutine object, so a plain ``MagicMock`` stand-in for
+    gather silently drops them: every one is later garbage-collected unawaited and
+    emits ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never
+    awaited``. Those warnings are attributed to whichever unrelated test happened to
+    trigger the collection, which is why they were so hard to place.
+
+    This closes the coroutines it receives (honoring gather's ownership contract)
+    without running the stubs, then returns ``result`` — the ``(valid_predictions,
+    errors, exception_group)`` triple the real function returns. The returned mock
+    records its calls normally, so assertions on gather's args still work.
+    """
+
+    async def _close_tasks_and_return(tasks, *_args, **_kwargs):
+        for task in tasks:
+            task.close()
+        return result
+
+    return AsyncMock(side_effect=_close_tasks_and_return)
 
 
 def make_mock_binary_question(qid: int = 1001) -> MagicMock:

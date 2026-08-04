@@ -22,7 +22,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from tests.conftest import make_mock_numeric_question
+from tests.conftest import gather_predictions_stub, make_mock_numeric_question
 
 # Standard 13-percentile values used throughout numeric tests (P1/P99 added 2026-07)
 _STANDARD_PERCENTILES = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
@@ -91,7 +91,11 @@ def mock_stacking_pipeline(
     with (
         patch.object(bot, "_get_notepad") as mock_notepad,
         patch.object(bot, "run_research", return_value=research) as mock_research,
-        patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+        patch.object(
+            bot,
+            "_gather_predictions_with_wall_clock",
+            new=gather_predictions_stub((predictions, [], None)),
+        ) as mock_gather,
         patch.object(
             bot,
             "_forecaster_with_soft_deadline",
@@ -101,7 +105,6 @@ def mock_stacking_pipeline(
         patch("metaculus_bot.forecaster.run_targeted_search", **search_kwargs) as mock_targeted,
     ):
         mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-        mock_gather.return_value = (predictions, [], None)
 
         # Optional _aggregate_predictions mock
         agg_cm = None

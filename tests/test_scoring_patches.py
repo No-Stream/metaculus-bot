@@ -178,8 +178,11 @@ class TestMultipleChoiceScoring:
         assert math.isfinite(score)
         assert isinstance(score, float)
 
-        # Score should be in reasonable range for baseline scoring
-        assert -500 <= score <= 500
+        # Bound matches the sibling per-type assertions below (-200..100), not the
+        # 5x-wider -500..500 this used to carry. The MC formula caps at +100 by
+        # construction, so the old upper bound was unreachable by any input; measured
+        # value for these fixed literals is 41.83.
+        assert -200 <= score <= 100, f"MC baseline score off the Metaculus-like scale: {score}"
 
     def test_mc_scoring_insufficient_predictions(self):
         """Test MC scoring with insufficient community predictions."""
@@ -548,35 +551,74 @@ class TestScoreScaling:
 
         numeric_score = calculate_numeric_baseline_score(numeric_report)
 
-        # All scores should be finite and in comparable ranges
-        assert all(math.isfinite(s) for s in [binary_score, mc_score, numeric_score] if s is not None)
+        # ``binary_score`` is the hand-computed reference above, not production output —
+        # only mc_score and numeric_score come from the functions under test. That matters:
+        # the previous version of this block computed
+        # ``max(abs(binary_score), abs(mc_score), abs(numeric_score)) > 0``, which the
+        # 8.7546 constant satisfies unconditionally, and bounded every score by
+        # ``-500 <= score <= 500`` — 12x wider than the +100 the MC formula can reach, so
+        # unfalsifiable by any input. Both sat inside
+        # ``if mc_score is not None and numeric_score is not None``, and numeric_score IS
+        # None for these inputs, so the whole block never executed at all.
+        #
+        # Bounds match the sibling per-type tests (-200..100), which 4c1db3a re-tightened
+        # from the same 5x-wide band after finding the missing ln(10) normalization.
+        assert mc_score is not None, "MC baseline scoring returned no score for a complete report"
+        assert math.isfinite(mc_score)
+        assert -200 <= mc_score <= 100, f"MC score off the Metaculus-like scale: {mc_score}"
 
-        # Scores should be in similar order of magnitude (within factor of 10)
-        if mc_score is not None and numeric_score is not None:
-            score_range = max(abs(binary_score), abs(mc_score), abs(numeric_score))
-            assert score_range > 0  # Scores should not all be zero
+        # The scaling claim, actually asserted: the MC score must land within an order of
+        # magnitude of the hand-computed binary reference for an equivalent-confidence
+        # forecast. This is what the old "within factor of 10" comment described and never
+        # checked. Both are single-digit positive for these inputs (8.75 vs 2.90).
+        assert 0.1 <= mc_score / binary_score <= 10.0, (
+            f"MC and binary scores are not within a factor of 10: {mc_score=} {binary_score=}"
+        )
 
-            # All scores should be within reasonable bounds (Metaculus-like range)
-            # After normalization, all scores should be on similar scales
-            for score in [binary_score, mc_score, numeric_score]:
-                if score is not None:
-                    assert -500 <= score <= 500
+        # numeric_score is None here (these mock percentiles produce no community
+        # comparison), so assert that explicitly rather than guarding on it: a change that
+        # starts returning a value should fail loudly and get a real bound, not slip
+        # through a None-check. Per-type numeric scoring is covered by
+        # tests/test_numeric_scoring_sanity.py and the -200..100 sibling assertions above.
+        assert numeric_score is None
 
 
 class TestMonkeyPatching:
     """Test monkey patching functionality."""
 
-    def test_apply_scoring_patches(self):
-        """Test that patches are applied without errors."""
-        # This test verifies the patches can be applied
-        # The actual functionality is tested in integration tests
-        try:
-            apply_scoring_patches()
-        except ImportError:
-            # Expected if forecasting_tools not available in test environment
-            pytest.skip("forecasting_tools not available for patching test")
-        except Exception as e:
-            pytest.fail(f"Patching failed with unexpected error: {e}")
+    def test_apply_scoring_patches_installs_all_three_patches(self):
+        """Each patch target actually carries our replacement afterwards.
+
+        Asserting on the installed attributes rather than merely "didn't raise":
+        every one of ``patch_multiple_choice_scoring`` / ``patch_numeric_scoring``
+        / ``patch_error_handling`` swallows its own ImportError and Exception and
+        only logs, so ``apply_scoring_patches`` returns cleanly even when all
+        three silently no-op. A raises-nothing check therefore cannot fail and
+        cannot distinguish "patched" from "every patch bailed".
+
+        Identity of the replacement function is the assertion substrate rather
+        than its behavior (covered by the calculate_* tests above): what this
+        test uniquely guards is that the monkey-patch reached the class.
+        """
+        from forecasting_tools.data_models.forecast_report import ForecastReport
+        from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
+        from forecasting_tools.data_models.numeric_report import NumericReport
+
+        apply_scoring_patches()
+
+        mc_patch = MultipleChoiceReport.__dict__["expected_baseline_score"]
+        assert isinstance(mc_patch, property)
+        assert mc_patch.fget is not None
+        assert mc_patch.fget.__name__ == "expected_baseline_score_mc"
+
+        numeric_patch = NumericReport.__dict__["expected_baseline_score"]
+        assert isinstance(numeric_patch, property)
+        assert numeric_patch.fget is not None
+        assert numeric_patch.fget.__name__ == "expected_baseline_score_numeric"
+
+        avg_patch = ForecastReport.__dict__["calculate_average_expected_baseline_score"]
+        assert isinstance(avg_patch, staticmethod)
+        assert avg_patch.__func__.__name__ == "calculate_average_expected_baseline_score_fixed"
 
 
 if __name__ == "__main__":

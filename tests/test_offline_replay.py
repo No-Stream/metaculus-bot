@@ -115,14 +115,14 @@ class TestZeroNetwork:
             pass
         assert socket.getaddrinfo is original
 
-    def test_load_replay_dataset_makes_no_network_call(self):
-        # Loading the dataset under no_network() must not raise — it is pure disk I/O.
-        # Skip if the prod cache is absent (CI). An empty cache loads to an empty dataset.
-        if not PROD_CACHE_ROOT.exists():
-            pytest.skip("prod ablation cache not present")
-        with no_network():
-            dataset = load_replay_dataset(AblationCache(root=str(PROD_CACHE_ROOT)))
-        assert isinstance(dataset, ReplayDataset)
+    # "load_replay_dataset makes no network call" is asserted by
+    # TestLoadReplayDatasetFromSeededCache below, which runs the same load under
+    # no_network() against a tmp cache it seeds itself. That version is strictly
+    # stronger and never skips: it loads a NON-empty dataset (one binary, one MC,
+    # one numeric), so it exercises the per-record deserialization paths that a
+    # load against an absent-or-empty prod cache returns before reaching. The
+    # prod-cache-gated variant that used to live here added no coverage and, since
+    # backtests/ is gitignored, never ran in CI at all.
 
 
 # Binary configs + scoring
@@ -506,7 +506,16 @@ class TestScoreAll:
 # Integration: real prod cache (skips gracefully if absent)
 
 
-@pytest.mark.skipif(not PROD_CACHE_ROOT.exists(), reason="prod ablation cache not present")
+@pytest.mark.skipif(
+    not PROD_CACHE_ROOT.exists(),
+    reason=(
+        f"local-only: {PROD_CACHE_ROOT} is a gitignored ablation-run output, absent in CI. "
+        "Loader + scoring coverage is enforced unconditionally by "
+        "TestLoadReplayDatasetFromSeededCache (tmp cache) and the synthetic scoring/CV "
+        "classes above; what only real payloads add is the shape of actual forecaster "
+        "output, so skipping loses breadth, not the contract."
+    ),
+)
 class TestRealCacheIntegration:
     def test_load_returns_finite_scores_end_to_end(self):
         cache = AblationCache(root=str(PROD_CACHE_ROOT))

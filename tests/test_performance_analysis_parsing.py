@@ -1525,7 +1525,15 @@ class TestMiniFixtureAttribution(_RealCommentAttributionChecks):
             )
 
 
-@pytest.mark.skipif(not _PERF_DATA_PATH.exists(), reason="big local performance pull not present")
+@pytest.mark.skipif(
+    not _PERF_DATA_PATH.exists(),
+    reason=(
+        f"local-only breadth cohort: {_PERF_DATA_PATH.name} is a gitignored collector pull "
+        "(rewritten by every spring-aib-2026 run), absent in CI. The same attribution checks "
+        "run unconditionally in TestMiniFixtureAttribution over the checked-in "
+        "tests/data/performance_comments_mini.jsonl, which is the CI floor."
+    ),
+)
 class TestRealDataRegression(_RealCommentAttributionChecks):
     """The broad local sweep: same checks across all 283 records, every era.
 

@@ -34,6 +34,20 @@ import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.allow_network]
 
+# Spelled out so a run log states WHY this is off rather than just that it is: these
+# calls are free (four public unauthenticated read endpoints), so the gate is about
+# keeping a network round-trip out of the dev loop and out of CI's failure surface,
+# NOT about cost or credentials. Schema-drift coverage against the venues' real
+# payloads is enforced unconditionally by tests/test_prediction_market_provider.py
+# against the committed verbatim payload trims in tests/data/, so what this file
+# uniquely adds is "the live API still answers this shape TODAY".
+_SKIP_REASON = (
+    "opt-in live-API check: set RUN_INTEGRATION_TESTS=1 to enable. Free (public "
+    "unauthenticated endpoints) but network-dependent, so it is off by default; parser "
+    "coverage against committed real payloads runs unconditionally in "
+    "tests/test_prediction_market_provider.py."
+)
+
 
 def _build_integration_question() -> MagicMock:
     q = MagicMock()
@@ -47,7 +61,7 @@ def _build_integration_question() -> MagicMock:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_polymarket_real_search_returns_parseable_response():
     from metaculus_bot.research.prediction_market import _polymarket_search
 
@@ -78,7 +92,7 @@ async def test_polymarket_real_search_returns_parseable_response():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_manifold_real_search_returns_parseable_response():
     from metaculus_bot.research.prediction_market import _manifold_search
 
@@ -104,7 +118,7 @@ async def test_manifold_real_search_returns_parseable_response():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_manifold_search_term_is_still_a_strict_conjunction():
     """Tripwire on the UPSTREAM ASSUMPTION the relaxation ladder rests on.
 
@@ -138,7 +152,7 @@ async def test_manifold_search_term_is_still_a_strict_conjunction():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
     from metaculus_bot.research.prediction_market import _kalshi_prefetch_events, _kalshi_search_local
 
@@ -177,7 +191,7 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_predictit_real_prefetch_and_search_returns_parseable_response():
     """PredictIt's /marketdata/all/ is free + no-auth. Assert the schema
     (top-level `markets` list, contracts carrying `lastTradePrice`) and that a
@@ -215,7 +229,7 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
     from metaculus_bot.research import prediction_market as pmp
 

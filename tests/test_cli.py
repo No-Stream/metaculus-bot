@@ -29,6 +29,7 @@ balance all go unnoticed.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import sys
@@ -72,6 +73,31 @@ AFTER_RESUME_DATE = date(2026, 10, 1)
 # resume dates that can never fall on the wrong side of the real clock.
 PERMANENTLY_FUTURE_RESUME = date(2099, 1, 1)
 PERMANENTLY_PAST_RESUME = date(2000, 1, 1)
+
+
+def asyncio_run_stub(side_effect):
+    """A ``metaculus_bot.cli.asyncio.run`` stand-in that closes the coroutine it is given.
+
+    ``cli.main`` calls ``asyncio.run(template_bot.forecast_questions(...))``, so the
+    coroutine is constructed by the inner call and handed to ``asyncio.run``, which
+    owns it. Patching ``asyncio.run`` with a bare ``side_effect`` drops it, and since
+    ``forecast_questions`` is an ``AsyncMock`` on the stub bot, the dropped object is a
+    real coroutine: it is later garbage-collected unawaited and emits ``RuntimeWarning:
+    coroutine ... was never awaited``, attributed to whichever unrelated test happened
+    to trigger the collection.
+
+    Closing it honors the ownership contract without executing it, then defers to
+    ``side_effect`` for the behavior each test is actually pinning (crash, or return a
+    report list).
+    """
+
+    def _close_then_apply(*args: object, **kwargs: object):
+        for arg in args:
+            if inspect.iscoroutine(arg):
+                arg.close()
+        return side_effect(*args, **kwargs)
+
+    return _close_then_apply
 
 
 @pytest.fixture(autouse=True)
@@ -304,10 +330,11 @@ class TestCliCreditFloor:
         spend (the original exception propagates, not a floor SystemExit).
         """
         with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE) as telemetry:
-            with patch(
-                "metaculus_bot.cli.asyncio.run",
-                side_effect=RuntimeError("forecasting blew up"),
-            ):
+
+            def _crash(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("forecasting blew up")
+
+            with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
                 with pytest.raises(RuntimeError, match="forecasting blew up"):
                     cli_main()
             telemetry.log_start.assert_called_once()
@@ -377,7 +404,7 @@ class TestCliResearchFlush:
 
         with _cli_main_test_mode(alertable_count=0):
             with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=_record_then_crash):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)):
                     # The original exception must still propagate: the flush is a rescue,
                     # not a swallow.
                     with pytest.raises(RuntimeError, match="forecast loop blew up"):
@@ -397,7 +424,7 @@ class TestCliResearchFlush:
 
         with _cli_main_test_mode(alertable_count=0):
             with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=_record_then_return):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)):
                     cli_main()
 
         assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
@@ -408,10 +435,13 @@ class TestCliResearchFlush:
         monkeypatch.delenv(PERSIST_RESEARCH_ENABLED_ENV, raising=False)
         monkeypatch.chdir(tmp_path)
 
+        def _crash(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
+
         forecaster_class = self._forecaster_class()
         with _cli_main_test_mode(alertable_count=0):
             with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with patch("metaculus_bot.cli.asyncio.run", side_effect=RuntimeError("boom")):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
                     with pytest.raises(RuntimeError, match="boom"):
                         cli_main()
 

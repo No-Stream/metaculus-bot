@@ -9,7 +9,18 @@ import pytest
 
 
 def test_import_community_benchmark():
-    """Test that the module can be imported without errors."""
+    """Importing the module must not raise (it does real work at module scope).
+
+    The body asserts on the imported module rather than just importing it: an
+    import-only body is an unused import, and Ruff's autofix DELETED it in
+    ``4ac46cc`` ("ruff reformat all"), leaving this test with an empty body that
+    passed unconditionally for ~11 months. Binding the module and asserting a
+    known attribute keeps the import live, so the formatter has no reason to
+    remove it and the test cannot silently become a no-op again.
+    """
+    import community_benchmark
+
+    assert callable(community_benchmark.benchmark_forecast_bot)
 
 
 def test_cli_argument_parsing():
