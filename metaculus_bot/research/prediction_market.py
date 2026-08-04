@@ -42,9 +42,8 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable
 
 import aiohttp
 import ijson
@@ -67,6 +66,26 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import PREDICTION_MARKET_KEYWORD_LLM_CONFIG
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.http_fetch import build_session, read_body_capped, read_body_snippet
+
+# The row types, the liquidity vocabulary and the query builders live in the market_retrieval
+# package; this module re-exports them because it is the seam every consumer imports from —
+# `raw_log`'s `asdict`, `provider_health`'s `getattr`, and the test suite all reach them through
+# `metaculus_bot.research.prediction_market`.
+from metaculus_bot.research.market_retrieval.queries import (
+    _RELEVANCE_STOPWORDS,
+    _strategy_s2,
+    manifold_relaxation_terms,
+)
+from metaculus_bot.research.market_retrieval.types import (
+    LIQUIDITY_DEEP_USD,  # noqa: F401  # re-export: consumed by the liquidity-contract tests
+    LIQUIDITY_THIN_USD,  # noqa: F401  # re-export
+    MANIFOLD_HIGH_BETTORS,  # noqa: F401  # re-export
+    MANIFOLD_THIN_BETTORS,  # noqa: F401  # re-export
+    MarketMatch,
+    MarketSnapshot,
+    _FetchTally,
+    _liquidity_label,
+)
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.provider_health import (
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
@@ -116,21 +135,6 @@ KALSHI_ENTITY_MAX_SERIES = 4
 # Client-side PredictIt fuzzy-match threshold (mirrors Kalshi; PredictIt has no
 # keyword-search endpoint, so we prefetch the full market dump and fuzzy-match).
 PREDICTIT_MIN_FUZZY_SCORE = 40.0
-
-# Liquidity / participation signal-label thresholds. Low-volume markets are
-# often bot-dominated (roughly sub-$10k), so a "thin" label is a real noise
-# warning, not a formality. These cutoffs are a tunable first pass, not
-# calibrated values — the "thin" ceiling sits at $5k deliberately conservatively.
-#
-# The unit is USD, and that is load-bearing rather than incidental: Polymarket's
-# `volumeNum` / `openInterest` are already USD, while Kalshi reports CONTRACT COUNTS
-# (`FixedPointCount`, "market volume in contracts" — docs.kalshi.com, 2026-08-03). One
-# shared threshold pair across both venues therefore requires converting Kalshi's
-# counts to dollars at the point of parse; see `_kalshi_usd_liquidity`.
-LIQUIDITY_THIN_USD = 5_000.0
-LIQUIDITY_DEEP_USD = 50_000.0
-MANIFOLD_THIN_BETTORS = 20
-MANIFOLD_HIGH_BETTORS = 100
 
 # Per-platform search timeout (s). Wrapped in an outer `timeout` in
 # fetch_market_snapshot; this is the per-HTTP-call cap.
@@ -184,62 +188,8 @@ RAW_RULES_MAX_CHARS = 200
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses
+# Per-source diagnostics tokens
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class MarketMatch:
-    platform: Literal["polymarket", "kalshi", "manifold", "predictit"]
-    market_title: str
-    market_url: str
-    implied_prob_yes: float | None
-    bid: float | None
-    ask: float | None
-    spread: float | None
-    volume_24h: float | None
-    close_time: datetime | None
-    is_resolved: bool
-    match_confidence: float
-    raw_rules: str
-    # Liquidity / participation fields. Previously received-but-discarded; now
-    # parsed so the formatter can label how informative each crowd signal is.
-    total_volume: float | None = None
-    liquidity: float | None = None
-    open_interest: float | None = None
-    num_bettors: int | None = None
-
-
-@dataclass
-class MarketSnapshot:
-    matches: list[MarketMatch] = field(default_factory=list)
-    # Per-source outcome tokens ({source_name: token}) for the provider-diagnostics
-    # line: the 4 platforms, plus `kalshi_series` (the entity-index fetch), plus
-    # `keywords` / `snapshot` on the whole-provider failure paths (keyword extraction
-    # produced nothing; the snapshot timed out or blew up). A token starting with
-    # "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)", "error(...)",
-    # "partial(1/2)") is a LOST source. `none` means every sub-fetch SUCCEEDED and
-    # matched nothing — an outage must never land there, or the published line reads
-    # healthy through a blackout. See provider_diagnostics.
-    sources: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class _FetchTally:
-    """How many of a platform's HTTP sub-fetches came back vs. were lost.
-
-    Carried alongside the matches because an upstream outage and a genuine no-match
-    both arrive as an empty match list; without these counts the diagnostics token
-    cannot tell them apart (see `_platform_source_token`). The unit is one sub-fetch
-    at each platform's natural granularity: a keyword query for Polymarket/Manifold,
-    a page for the Kalshi events prefetch, the single dump for PredictIt.
-    """
-
-    ok: int = 0
-    failed: int = 0
-
-    def __add__(self, other: _FetchTally) -> _FetchTally:
-        return _FetchTally(self.ok + other.ok, self.failed + other.failed)
 
 
 def _platform_source_token(matches: list[MarketMatch], tally: _FetchTally) -> str:
@@ -256,38 +206,6 @@ def _platform_source_token(matches: list[MarketMatch], tally: _FetchTally) -> st
             return "error(all_queries_failed)"
         return f"partial({tally.ok}/{tally.ok + tally.failed})"
     return f"ok({len(matches)})" if matches else "none"
-
-
-def _liquidity_label(m: MarketMatch) -> str:
-    """Label how informative a market's price is, given its liquidity/participation.
-
-    Real-money venues (Polymarket, Kalshi) score on dollar volume / open interest;
-    Manifold (play-money) scores on unique bettor count instead. A thin market is
-    a noise warning: sub-$10k volume is often bot-dominated, so its price should be
-    discounted relative to a deep, actively-traded market. Thresholds are tunable.
-    """
-    if m.platform == "predictit":
-        # PredictIt exposes no volume/liquidity/OI fields in its all-markets dump.
-        return "no-liquidity-data"
-
-    if m.platform == "manifold":
-        if m.num_bettors is None:
-            return "no-liquidity-data"
-        if m.num_bettors < MANIFOLD_THIN_BETTORS:
-            return "thin"
-        if m.num_bettors <= MANIFOLD_HIGH_BETTORS:
-            return "decent"
-        return "high"
-
-    # Real-money venues: score on the larger of total volume and open interest.
-    if m.total_volume is None and m.open_interest is None:
-        return "no-liquidity-data"
-    score = max(m.total_volume or 0.0, m.open_interest or 0.0)
-    if score < LIQUIDITY_THIN_USD:
-        return "thin"
-    if score <= LIQUIDITY_DEEP_USD:
-        return "decent"
-    return "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -415,93 +333,6 @@ Question: {title}
 Resolution criteria (first 400 chars): {rc}
 
 Search query:"""
-
-
-def _strategy_s2(question_text: str) -> str:
-    """Natural-language framing: question_text trimmed at the first '?'."""
-    t = (question_text or "").strip()
-    i = t.find("?")
-    if i > 0:
-        t = t[:i]
-    return t.strip()
-
-
-# Content-word stopwords, shared by the formatter's relevance gate and Manifold's
-# conjunction-relaxation ladder. Kept byte-identical to the tuning script
-# (scratch/new_analyses_2026-07-18/market_match_precision.py `_overlap`) so the shipped labels
-# match the 403-contract grading the thresholds were chosen on. The ladder reuses it because
-# Manifold's search constrains on the same notion of a content word: stopwords measurably do
-# not narrow a `term` ("gas prices" and "gas prices in the" both return 10 results).
-_RELEVANCE_STOPWORDS: frozenset[str] = frozenset(
-    """a an the of in on at to for by with will be is are was were before after during between
-    and or not no yes if then than as from into over under above below more less most least
-    what which who whom whose when where why how this that these those there here it its
-    do does did done have has had having get gets got question market resolve resolves resolved
-    resolution against per any all each both other another same different new old first last
-    2025 2026 2027 january february march april may june july august september october november december
-    """.split()
-)
-
-# Longest relaxation rung, in content tokens. 3 is the measured ceiling for a satisfiable
-# Manifold conjunction: recall collapses at ~4 (`US gas prices 2026` returns 10,
-# `US gas prices high 2026` returns 0).
-MANIFOLD_RELAXATION_MAX_TOKENS = 3
-
-_MANIFOLD_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'À-ɏ&.\-]*")
-
-
-def manifold_relaxation_terms(title: str) -> list[str]:
-    """Progressively shorter Manifold `term` candidates, most specific first.
-
-    Manifold's `/v0/search-markets` treats `term` as a STRICT CONJUNCTION of content
-    tokens: every token must appear in a market's text, and one absent token returns `[]`
-    (measured 2026-08-03 — appending a nonsense token to a query with a known hit zeroes
-    it, while reordering present tokens does not, which rules out a relevance floor).
-    Its semantics are undocumented, so `tests/test_prediction_market_integration.py`
-    carries a live tripwire for the day upstream switches to ranked search.
-
-    Two consequences follow, and together they fix the query length rather than tune it:
-    recall is monotone DECREASING in token count, and precision is monotone INCREASING.
-    So the best query is the LONGEST SATISFIABLE conjunction — which the caller finds by
-    walking these rungs and stopping at the first non-empty result. That is a derived
-    optimum, not a threshold someone picked, which is why there is no tunable knob here.
-
-    Tokens are ranked by how much they narrow the search rather than by position:
-    acronyms first (`VIX`), then proper nouns (`Australia`), then ordinary content words.
-    Duplicates are dropped — a repeated entity would spend a rung slot without narrowing
-    anything ("Sturgis Sturgis Motorcycle").
-    """
-    ranked: list[tuple[int, int, str]] = []
-    seen_tokens: set[str] = set()
-    for position, token in enumerate(_MANIFOLD_TERM_TOKEN_RE.findall(title or "")):
-        normalized = token.lower().strip(".-'")
-        if len(normalized) < 3 or normalized in _RELEVANCE_STOPWORDS or normalized in seen_tokens:
-            continue
-        seen_tokens.add(normalized)
-        if token.isupper() and len(token) >= 2:
-            specificity = 0  # acronym / ticker
-        elif token[0].isupper() and position > 0:
-            # Position 0 is the leading interrogative ("Will", "What"), not an entity.
-            specificity = 1  # proper noun
-        else:
-            specificity = 2
-        ranked.append((specificity, position, token))
-
-    # Most-narrowing first; longer tokens break ties (they carry more signal than "the"-ish
-    # short words that survived the stopword filter), then original order.
-    ranked.sort(key=lambda t: (t[0], -len(t[2]), t[1]))
-
-    terms: list[str] = []
-    seen_terms: set[str] = set()
-    for width in range(min(MANIFOLD_RELAXATION_MAX_TOKENS, len(ranked)), 0, -1):
-        # Re-sort the chosen tokens into reading order: `term` matching is order-invariant,
-        # but a readable query is what shows up in logs.
-        chosen = sorted(ranked[:width], key=lambda t: t[1])
-        term = " ".join(t[2] for t in chosen)
-        if term and term.lower() not in seen_terms:
-            seen_terms.add(term.lower())
-            terms.append(term)
-    return terms
 
 
 def _clean_llm_query(content: str) -> str:
@@ -1806,7 +1637,8 @@ async def _fetch_market_snapshot_impl(
         # one that returns anything — the longest satisfiable conjunction, i.e. the most
         # precise query that isn't empty. Sequential on purpose: each rung is only worth
         # issuing if the previous found nothing, so a satisfiable query costs zero extra
-        # calls and the worst case is bounded by MANIFOLD_RELAXATION_MAX_TOKENS.
+        # calls and the worst case is bounded by the ladder's rung count
+        # (MANIFOLD_RELAXATION_MAX_TOKENS, in market_retrieval.queries).
         title = getattr(question, "title", None) or getattr(question, "question_text", "") or ""
         already_issued = {q.lower() for q in mf_queries}
         for term in manifold_relaxation_terms(title):
