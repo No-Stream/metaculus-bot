@@ -525,7 +525,9 @@ class TestDownloadMergeE2E:
         archive_dir = tmp_path / "archive"
         build_archive(records, archive_dir)
 
-        # latest/<qid>.json contains the newest record
+        # latest/<qid>.json holds the precedence winner. Every record here is
+        # artifact-class, so the winner is simply the newest; the source-class ranking is
+        # covered in tests/test_download_research.py.
         latest_43613 = json.loads((archive_dir / "latest" / "43613.json").read_text())
         assert latest_43613["research_text"] == "Newer research for 43613"
         assert latest_43613["timestamp"] == "2026-05-21T10:00:00Z"
@@ -534,7 +536,7 @@ class TestDownloadMergeE2E:
         assert latest_50001["research_text"] == "Newer research for 50001"
         assert latest_50001["timestamp"] == "2026-05-21T11:00:00Z"
 
-        # by_qid/<qid>.jsonl has all versions, newest first
+        # by_qid/<qid>.jsonl has all versions, best-first (newest first within one class)
         by_qid_43613 = (archive_dir / "by_qid" / "43613.jsonl").read_text().strip().splitlines()
         assert len(by_qid_43613) == 2
         first_record = json.loads(by_qid_43613[0])
@@ -761,9 +763,11 @@ class TestSyncResearchNoClobber:
     The clobber bug: comment-backfill records (run_id `comment-<id>`) live in the backfill
     dir, but freshly DOWNLOADED artifact records (numeric run_id) live only in the build's
     in-memory list — never written to the backfill dir. A standalone `--skip-download`
-    rebuild therefore drops every artifact run_id. The fix is a single `main()` build that
-    downloads artifacts AND loads backfill, so the archive ends up with both. These tests
-    lock that invariant: every live artifact's run_id survives into the rebuilt archive.
+    rebuild therefore dropped every artifact run_id. Two changes fixed it: a single
+    `main()` build that downloads artifacts AND loads backfill, and (2026-08-03) a rebuild
+    that re-ingests whatever `by_qid/` already holds. These tests lock the first
+    invariant — every live artifact's run_id survives into the rebuilt archive; the second
+    is locked in `tests/test_download_research.py::TestRebuildIsNonDestructive`.
 
     All `gh`/subprocess access is mocked — no live GitHub calls.
     """
@@ -860,11 +864,16 @@ class TestSyncResearchNoClobber:
         # Comment-only qid (no artifact) is still present too.
         assert "90000" in manifest
 
-    def test_skip_download_alone_drops_artifacts(self, tmp_path: Path) -> None:
-        """Documents the clobber: --skip-download rebuilds from backfill ONLY (no artifacts).
+    def test_rebuild_from_an_empty_archive_yields_backfill_only(self, tmp_path: Path) -> None:
+        """A rebuild with nothing on disk to re-ingest is backfill-only, and that's correct.
 
-        This is WHY the old third sync step clobbered — it ran exactly this. The fix is to
-        not run a standalone --skip-download rebuild after the artifact download.
+        This used to be the clobber: ``--skip-download`` rebuilt from the backfill dir
+        alone while ``build_archive`` overwrote ``by_qid/`` wholesale, so an archive that
+        already held artifact records lost them (measured: 280 -> 27 on the live archive).
+        The rebuild now re-ingests ``by_qid/`` first, so the ONLY reason no artifact
+        appears here is that this archive never had one. The non-destructive case — a
+        rebuild over an archive that does hold artifacts — is
+        ``tests/test_download_research.py::TestRebuildIsNonDestructive``.
         """
         backfill_dir = tmp_path / "backfill"
         output_dir = tmp_path / "archive"
@@ -872,7 +881,7 @@ class TestSyncResearchNoClobber:
 
         argv = [
             "download_research.py",
-            "--skip-download",
+            "--rebuild-only",
             "--backfill-dir",
             str(backfill_dir),
             "--output-dir",
@@ -882,8 +891,8 @@ class TestSyncResearchNoClobber:
             download_research_main()
 
         manifest = json.loads((output_dir / "manifest.json").read_text())
-        # Only comment-sourced records — the artifact run_id is absent (the clobber).
         assert manifest["43613"]["versions_count"] == 1
+        assert manifest["43613"]["latest_source"] == "comment_backfill"
         versions = [
             json.loads(line) for line in (output_dir / "by_qid" / "43613.jsonl").read_text().strip().splitlines()
         ]

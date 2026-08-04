@@ -183,7 +183,7 @@ CRPS and is no better than median on binary.
 | Flag | Code default | Prod value | What it gates |
 |---|---|---|---|
 | `PROBABILISTIC_TOOLS_ENABLED` | off | `false` | The deterministic probability-math post-processor (`tool_runner.py`); wired but dormant |
-| `PERSIST_RESEARCH_ENABLED` | off | `true` (prod runs; off in test_bot) | Writes per-question research to JSONL for offline backtest replay |
+| `PERSIST_RESEARCH_ENABLED` | off | `true` (every bot workflow, test ones included since 2026-08-03) | Writes per-question research to JSONL for offline backtest replay |
 | `PLATT_CALIBRATION_ENABLED` | off | unset | Post-hoc logistic recalibration of the final published probability |
 | `GEMINI_USE_DONATED_OPENROUTER_KEY` | on | `true` | Route OpenRouter Gemini calls through the donated key with personal fallback |
 | `OPENROUTER_CREDIT_FLOOR_USD` | see `constants.py` | unset (uses default) | Donated-key remaining-balance floor for the end-of-run refill reminder |
@@ -218,10 +218,17 @@ because GitHub silently drops `*/N` schedules under runner load, and a
 `test_bot_basic.yaml` has its own group, so a smoke run never contends with a
 full `test_bot` run.
 
-The prod workflows (tournament / minibench / cup) upload their artifact as
-`research-<run_id>` and include `research_outputs/`. Both test workflows upload
-`logs-<run_id>` with only `run_logs/`, so the research-archive sync script never
-picks up test runs. Neither sets `PERSIST_RESEARCH_ENABLED`.
+All five bot workflows (the three prod tournaments plus `test_bot` and
+`test_bot_basic`) upload their artifact as `research-<run_id>` with both
+`research_outputs/` and `run_logs/`, and all five set
+`PERSIST_RESEARCH_ENABLED`. The two test workflows joined that shape on
+2026-08-03: they previously uploaded `logs-<run_id>` with only `run_logs/` and
+set no persist flag, which was framed as keeping test runs out of the research
+archive but in practice just discarded their research. Three runs' worth of
+assembled per-question research is gone that way — we still hold their raw
+provider payloads and telemetry markers, but not the briefing the forecasters
+read. Test runs now contribute to the archive on purpose; they forecast the
+evergreen questions, so their records are the ones backtest replay wants most.
 
 `ci.yaml` is the pull-request check (lint + tests); the `gemini-*` and
 `claude.yml` workflows are repo automation unrelated to forecasting.
@@ -271,11 +278,9 @@ until it merges to `main`. That is already satisfied here — the file is on
 Bot Basic (1 numeric Q smoke)" as active — so the `--ref` argument can point at
 any branch you want to test.
 
-Afterward, the log is in the `logs-<run_id>` artifact (90-day retention),
-tee'd from `run_logs/` during the run. The `logs-` prefix is deliberate:
-`scripts/download_research.py` enumerates artifacts by
-`RESEARCH_ARTIFACT_PREFIX`, so a test run can never contaminate the research
-archive. Worth grepping in the downloaded log:
+Afterward, the log is in the `research-<run_id>` artifact (90-day retention),
+tee'd from `run_logs/` during the run, alongside the run's
+`research_outputs/` JSONL. Worth grepping in the downloaded log:
 
 - `PAID PERSONAL-KEY FALLBACK` (`fallback_openrouter.py`) — a call fell off the
   donated key onto the operator's personal one.
@@ -677,8 +682,10 @@ wired to `sync_all` for the same reason.
 ## Reading run logs
 
 Each run tees to `run_logs/run_<run_id>_<timestamp>.log`, uploaded as a workflow
-artifact (`research-<run_id>` for the three prod workflows, `logs-<run_id>` for
-both test workflows). Grep these for the telemetry markers:
+artifact (`research-<run_id>` for every bot workflow; the two test
+workflows used `logs-<run_id>` before 2026-08-03, and those older artifacts are
+still harvested — `RUN_LOG_ARTIFACT_PREFIXES` covers both names). Grep these for
+the telemetry markers:
 
 - `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...`
   — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage

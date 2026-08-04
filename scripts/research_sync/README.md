@@ -140,7 +140,10 @@ tail -n 40 /Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/lau
 ```
 
 A healthy run ends with `research-sync finished OK at ...` and the manifest under
-`backtests/research_archive/manifest.json` updates its `latest_timestamp` values. If
+`backtests/research_archive/manifest.json` gains an entry per newly-seen question. Don't
+read `latest_timestamp` as a freshness signal: it is the timestamp of whichever record won
+precedence, not the newest record's, so promoting an artifact over a later comment moves it
+BACKWARD (that happened on 255 questions in the 2026-08-03 fix). If
 the archive looks stale, **check `logs/LAST_SYNC_FAILED` first** — its presence names the
 failing stage and the logfile to read. Then check the logfile itself: the download phase
 logs "Artifacts endpoint returned N total, M research-* artifacts", how many downloaded,

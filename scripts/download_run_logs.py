@@ -1,10 +1,12 @@
 """Download GHA run-log artifacts and harvest telemetry markers into a durable archive.
 
-The bot's four workflows tee stdout+stderr to ``run_logs/`` and upload it:
+All five bot workflows tee stdout+stderr to ``run_logs/`` and upload it:
 
-* the three PROD workflows (tournament / metaculus_cup / minibench) bundle ``run_logs/``
-  INSIDE the ``research-<run_id>`` artifact (alongside ``research_outputs/``);
-* ``test_bot`` uploads ``run_logs/`` as a SEPARATE ``logs-<run_id>`` artifact.
+* every one of them (the three PROD workflows tournament / metaculus_cup / minibench, plus
+  ``test_bot`` and ``test_bot_basic``) bundles ``run_logs/`` INSIDE the
+  ``research-<run_id>`` artifact, alongside ``research_outputs/``;
+* the two test workflows uploaded a SEPARATE ``logs-<run_id>`` artifact until 2026-08-03,
+  and those stay on GHA until their 90-day retention expires.
 
 So harvesting run logs means pulling BOTH artifact families and reading the ``*.log``
 files under ``run_logs/``. Enumeration + download run through the shared
@@ -35,8 +37,10 @@ from scripts.telemetry.markers import parse_log_text
 
 logger = logging.getLogger(__name__)
 
-# Run logs live in these two artifact families (see module docstring): prod runs bundle
-# them in ``research-*``; test_bot uploads a separate ``logs-*``.
+# Run logs live in these two artifact families (see module docstring). Every bot
+# workflow now bundles them in ``research-*``; ``logs-*`` is the pre-2026-08-03 name the
+# two test workflows used, kept here because those artifacts stay on GHA until their
+# 90-day retention expires.
 RUN_LOG_ARTIFACT_PREFIXES: tuple[str, ...] = ("research-", "logs-")
 
 DEFAULT_REPO = "No-Stream/metaculus-bot"
@@ -104,7 +108,14 @@ def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
 
 
 def infer_workflow(artifact_name: str, run_id: int, workflow_map: dict[int, str]) -> str:
-    """Resolve a run's workflow: exact from the map, else infer from the artifact prefix."""
+    """Resolve a run's workflow: exact from the map, else infer from the artifact prefix.
+
+    The prefix rung only identifies test runs that predate the 2026-08-03 rename to
+    ``research-*``; a newer test run whose id is missing from the map (enumeration
+    failed, or the run is older than the map's window) reads ``unknown``, since the
+    artifact name no longer distinguishes it from a prod run. Bucketing convenience
+    only — the markers themselves never depend on it.
+    """
     mapped = workflow_map.get(run_id)
     if mapped:
         return mapped

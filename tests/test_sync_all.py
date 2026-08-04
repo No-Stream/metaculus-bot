@@ -82,7 +82,8 @@ class TestSinglePassDriver:
         """One enumeration; each unique run downloaded once; research + telemetry + raw all written.
 
         run 100 is a prod research-* run feeding ALL THREE harvesters from a single
-        downloaded dir; run 300 is a test_bot logs-* run (telemetry only). The prod run
+        downloaded dir; run 300 is a legacy pre-2026-08-03 test_bot logs-* run, which carried
+        only run_logs/ (telemetry only). The prod run
         must appear exactly once in the download calls despite three consumers reading it.
         """
         now = datetime.now(timezone.utc)

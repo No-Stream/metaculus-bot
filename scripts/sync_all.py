@@ -38,7 +38,9 @@ from scripts.download_research import (
     RESEARCH_ARTIFACT_PREFIX,
     build_archive,
     deduplicate_records,
+    guard_against_truncation,
     load_backfill,
+    load_existing_by_qid,
     load_jsonl_records,
     research_jsonl_files,
 )
@@ -100,9 +102,11 @@ def run_sync(
         downloaded += 1
         name = art.get("name", "")
 
-        # (a) Research JSONL — research-* dirs only. test_bot's logs-* artifacts carry
-        # only run_logs/ (no research_outputs/), so they never contribute research
-        # records; gating on the prefix keeps test runs out of the research archive.
+        # (a) Research JSONL — research-* dirs only. Every bot workflow (three prod plus
+        # test_bot and test_bot_basic) uploads under that name as of 2026-08-03, when the
+        # test pair moved off logs-* so their research gets archived too; the surviving
+        # pre-rename logs-* artifacts carry only run_logs/, so they contribute telemetry
+        # below but no research records.
         if name.startswith(RESEARCH_ARTIFACT_PREFIX):
             for jsonl_file in research_jsonl_files(run_dir):
                 research_records.extend(load_jsonl_records(jsonl_file))
@@ -139,15 +143,19 @@ def run_sync(
 
 
 def _build_research_archive(downloaded_records: list[dict], backfill_dir: Path, research_dir: Path) -> tuple[int, int]:
-    """Merge downloaded research records + backfill, dedup, and build the archive.
+    """Merge downloaded research records + what's on disk + backfill, dedup, and build.
 
-    Mirrors ``download_research.main``'s Phase 2/3 exactly (load backfill, dedup by
-    (qid, run_id), build) so both the standalone script and this driver end up with an
-    archive holding BOTH artifact and comment-backfill records. Returns
-    ``(distinct_questions, unique_records)``; leaves the archive untouched when there is
-    nothing to build (no artifacts + no backfill).
+    Mirrors ``download_research.main``'s Phase 2/3 exactly (re-ingest the existing
+    ``by_qid/`` records, load backfill, dedup by (qid, run_id), guard against
+    truncation, build) so both the standalone script and this driver end up with an
+    archive holding BOTH artifact and comment-backfill records. Re-ingesting the
+    existing records is what keeps a download that came back short of last time from
+    silently deleting artifacts: ``build_archive`` overwrites ``by_qid/`` wholesale and
+    artifact records live nowhere else. Returns ``(distinct_questions, unique_records)``;
+    leaves the archive untouched when there is nothing to build.
     """
     all_records = list(downloaded_records)
+    all_records.extend(load_existing_by_qid(research_dir))
     all_records.extend(load_backfill(backfill_dir))
     if not all_records:
         logger.warning("Research: no records (no artifacts downloaded and no backfill). Archive not rebuilt.")
@@ -155,6 +163,7 @@ def _build_research_archive(downloaded_records: list[dict], backfill_dir: Path, 
 
     deduped = deduplicate_records(all_records)
     logger.info(f"Research: {len(deduped)} unique records (from {len(all_records)} total)")
+    guard_against_truncation(research_dir, deduped)
     build_archive(deduped, research_dir)
     questions = len({r["qid"] for r in deduped if r.get("qid") is not None})
     return questions, len(deduped)

@@ -3,9 +3,10 @@
 metaculus_bot.research.raw_log appends each provider's RAW return (AskNews article
 dicts per phase, native/Gemini raw responses, prediction-market contracts,
 resolution-source fetches, gap-fill search results) to ``run_logs/raw_research_<run_id>.jsonl``.
-The four workflows upload ``run_logs/`` — bundled inside ``research-<run_id>`` for the
-three prod workflows, as a standalone ``logs-<run_id>`` for test_bot — so, like the
-telemetry harvest, this pulls BOTH artifact families.
+All five bot workflows upload ``run_logs/`` bundled inside ``research-<run_id>``. Like the
+telemetry harvest, this still pulls BOTH artifact families, because the two test
+workflows uploaded ``logs-<run_id>`` until 2026-08-03 and those artifacts remain on GHA
+until their retention expires.
 
 Archive layout under ``backtests/research_archive/raw/`` (gitignored via ``backtests/``):
 

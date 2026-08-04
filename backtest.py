@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, cast
 
@@ -157,6 +158,12 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
         logger.warning(f"Research archive dir does not exist: {research_dir}")
         return cache
 
+    # Provenance of what we replay, logged below. A comment-backfilled record is
+    # middle-trimmed text with sections re-headed and Provider Diagnostics leaked in,
+    # so a replay's own log should state how much of it is that rather than the
+    # artifact capture. "unknown" covers records written before build_archive stamped
+    # the field. See scripts/download_research.py `record_source`.
+    source_counts: Counter[str] = Counter()
     loaded = 0
     for q in questions:
         ids = QuestionIds.from_question(q)
@@ -175,11 +182,15 @@ def _load_research_from_archive(research_dir: str, questions: list) -> dict[int,
                 )
                 continue
             cache[cache_key] = record.get("research_text", "")
+            source_counts[str(record.get("source", "unknown"))] += 1
             loaded += 1
             break
 
     uncached = len(questions) - loaded
-    logger.info(f"Loaded {loaded} cached research records from {research_dir} ({uncached} questions uncached)")
+    logger.info(
+        f"Loaded {loaded} cached research records from {research_dir} ({uncached} questions uncached); "
+        f"sources: {dict(source_counts)}"
+    )
     if uncached > 0:
         logger.warning(f"{uncached} question(s) have no cached research — they will run live research")
     return cache

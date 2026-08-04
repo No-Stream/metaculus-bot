@@ -314,11 +314,16 @@ means on large-n bounded proportions. The problem is never "a mean was used" —
 `backtest_{smoke,small,medium,large}` targets **re-run live research at replay time**
 (leakage-exposed; the leakage detector is a filter, not a fix). Frozen-replay already exists
 (`--research-dir` → `make backtest_with_cache` → orchestrator skips providers), so code distance
-to leak-free ≈ zero. The gap is archive quality: of 921 records in
-`backtests/research_archive/latest/`, only **19 are genuine GHA-captured payloads; 902 are
-reconstructed from published comments** (trimmed, empty `providers_used`), and uncached qids
-silently fall back to live fetch. So: (1) flip default targets to `--research-dir`, (2) grow
-genuine GHA-captured coverage from prod runs. Cheap near-term RetroSearch (below).
+to leak-free ≈ zero. The gap is archive quality, though less of one than this entry used to
+claim: it read "only 19 of 921 `latest/` records are genuine GHA-captured payloads" off a
+`latest/` that the merge bug had filled with comment reconstructions. `by_qid/` held **280
+artifact records** the whole time, and the 2026-08-03 precedence fix (artifact beats
+comment_backfill in `download_research.record_precedence_key`) promotes all 280 into
+`latest/` — 100% of the 269 questions that have any artifact-era record. The remaining ~734
+`latest/` records are pre-2026-05-29 questions where no artifact was ever written, so they
+are correctly comment-sourced (trimmed, reconstructed `providers_used`), and uncached qids
+still fall back to live fetch. So: (1) flip default targets to `--research-dir`, (2) keep
+growing artifact coverage from prod runs. Cheap near-term RetroSearch (below).
 
 **Framing takeaway (papers-skeptic, arXiv 2506.00723 + Vaticinus preprint):** the re-run backtest
 is an optimistic **upper bound**; calibration-on-own-published-forecasts (elicited at forecast

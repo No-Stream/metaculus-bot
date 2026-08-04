@@ -23,11 +23,22 @@ import plistlib
 import re
 from pathlib import Path
 
+import pytest
+import yaml
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MAKEFILE = _REPO_ROOT / "Makefile"
 _SYNC_DIR = _REPO_ROOT / "scripts" / "research_sync"
 _RUN_SYNC = _SYNC_DIR / "run_sync.sh"
 _PLIST = _SYNC_DIR / "com.metaculusbot.research-sync.plist"
+_WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
+
+# Every workflow that runs the bot: three scheduled prod tournaments plus the two
+# dispatch-only test workflows (test_bot / test_bot_basic both match *bot*).
+# .y*ml, not .yaml: the exact-set assertion below is what forces a NEW bot workflow to
+# satisfy this invariant, and a .yml-suffixed one would slip past it (six .yml workflows
+# already exist here, all non-bot).
+_BOT_WORKFLOWS = sorted(p.relative_to(_REPO_ROOT).as_posix() for p in _WORKFLOW_DIR.glob("*bot*.y*ml"))
 
 
 def _sync_all_recipe() -> list[str]:
@@ -123,6 +134,96 @@ class TestSyncFailureIsVisible:
     def test_failure_exits_non_zero(self) -> None:
         script = _RUN_SYNC.read_text()
         assert script.count("exit 1") >= 2, "both the preflight and the make failure paths must exit non-zero"
+
+
+def _workflow(rel_path: str) -> dict:
+    return yaml.safe_load((_REPO_ROOT / rel_path).read_text())
+
+
+def _run_bot_env(workflow: dict) -> dict[str, str]:
+    """The env the step that invokes ``main.py`` actually runs under.
+
+    Scoped to that one step (plus job-level env) rather than merged across all of them: a
+    flag set on the checkout or uv-setup step would satisfy a flattened assertion while the
+    bot process never saw it.
+    """
+    env: dict[str, str] = {}
+    for job in workflow["jobs"].values():
+        env.update(job.get("env") or {})
+        bot_steps = [step for step in job.get("steps", []) if "main.py" in str(step.get("run", ""))]
+        assert len(bot_steps) == 1, f"expected exactly one step invoking main.py, got {len(bot_steps)}"
+        env.update(bot_steps[0].get("env") or {})
+    return env
+
+
+def _upload_step(workflow: dict) -> dict:
+    """The single ``actions/upload-artifact`` step in a bot workflow."""
+    steps = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).startswith("actions/upload-artifact")
+    ]
+    assert len(steps) == 1, f"expected exactly one upload-artifact step, got {len(steps)}"
+    return steps[0]
+
+
+class TestBotWorkflowsArchiveTheirResearch:
+    """Every bot workflow must persist its research AND upload it under a harvestable name.
+
+    Both halves are needed and each was missing from the two test workflows until
+    2026-08-03: they set ``RAW_RESEARCH_LOG_ENABLED`` but never
+    ``PERSIST_RESEARCH_ENABLED``, and uploaded ``logs-<run_id>`` with only ``run_logs/``.
+    ``sync_all.py`` gates the research harvest on the ``research-`` prefix, so even a
+    correctly-written JSONL under a ``logs-*`` name contributes nothing. Measured cost:
+    three runs (29718821482, 30039072456, 30321419722) whose raw provider payloads and
+    telemetry markers we still hold, with no assembled per-question research at all.
+
+    Asserted on repo-relative paths only — never a path derived from the developer's
+    checkout, which passes locally by construction and fails on the first CI run.
+    """
+
+    def test_every_bot_workflow_is_covered_by_this_invariant(self) -> None:
+        # Pinned as an exact set so a NEW bot workflow has to either satisfy the
+        # invariant below or fail here. Silently escaping it is the failure mode that
+        # cost us the three runs above.
+        assert _BOT_WORKFLOWS == [
+            ".github/workflows/run_bot_on_metaculus_cup.yaml",
+            ".github/workflows/run_bot_on_minibench.yaml",
+            ".github/workflows/run_bot_on_tournament.yaml",
+            ".github/workflows/test_bot.yaml",
+            ".github/workflows/test_bot_basic.yaml",
+        ]
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_raw_research_logging_implies_research_persistence(self, rel_path: str) -> None:
+        env = _run_bot_env(_workflow(rel_path))
+        if env.get("RAW_RESEARCH_LOG_ENABLED") != "true":
+            pytest.skip(f"{rel_path} does not log raw research payloads")
+        assert env.get("PERSIST_RESEARCH_ENABLED") == "true", (
+            f"{rel_path} archives RAW provider payloads but not the assembled research text — "
+            "the raw log is only useful next to the briefing the forecasters actually read"
+        )
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_artifact_name_uses_the_harvestable_research_prefix(self, rel_path: str) -> None:
+        name = _upload_step(_workflow(rel_path))["with"]["name"]
+        assert name.startswith("research-"), (
+            f"{rel_path} uploads as {name!r}; scripts/sync_all.py harvests research only from "
+            "artifacts named research-* (RESEARCH_ARTIFACT_PREFIX)"
+        )
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_artifact_path_carries_research_outputs_and_run_logs(self, rel_path: str) -> None:
+        paths = _upload_step(_workflow(rel_path))["with"]["path"].split()
+        assert "research_outputs/" in paths, f"{rel_path} would upload no research JSONL"
+        assert "run_logs/" in paths, f"{rel_path} would upload no telemetry log"
+
+    @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
+    def test_upload_runs_even_when_the_bot_run_failed(self, rel_path: str) -> None:
+        # Load-bearing for the crash-path flush in cli.py: the partial batch a crashed run
+        # flushes only reaches the archive because this step is unconditional.
+        assert _upload_step(_workflow(rel_path))["if"] == "always()"
 
 
 class TestPlistSurvivesOneBadWake:

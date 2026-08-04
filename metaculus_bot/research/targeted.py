@@ -65,7 +65,8 @@ async def extract_disagreement_crux(
     """Identify the core factual disagreement across base forecaster analyses.
 
     Args:
-        analyzer_llm: A cheap model (e.g. GPT-5-mini) used for extraction only.
+        analyzer_llm: A cheap, low-effort model used for extraction only (the
+            DISAGREEMENT_ANALYZER_LLM slot in llm_configs.py).
         question_text: The full question text being forecasted.
         base_prediction_texts: Reasoning texts from base models (already stripped of model tags).
 

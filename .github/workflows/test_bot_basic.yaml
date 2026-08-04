@@ -143,17 +143,26 @@ jobs:
           # Raw research-provider payload log: each provider's RAW return (AskNews
           # article dicts per phase, native/Gemini raw responses + grounding, market
           # contracts, resolution-source fetches, gap-fill results) →
-          # run_logs/raw_research_<run_id>.jsonl, uploaded in the logs-* artifact
-          # below. make sync_raw_research archives it (pulls research-* + logs-*).
+          # run_logs/raw_research_<run_id>.jsonl, uploaded in this artifact.
+          # make sync_raw_research archives it (pulls research-* + logs-*).
           RAW_RESEARCH_LOG_ENABLED: 'true'
-      # Durable capture of run logs (telemetry lives on stderr, tee'd to run_logs/).
-      # Artifact name is logs-* (NOT research-*) so scripts/download_research.py's
-      # research-* enumeration never picks up test runs.
-      - name: Upload run logs
+          # Persist research outputs as JSONL for offline backtest replay, same as the
+          # three prod workflows. Without it a test run's assembled per-question
+          # research text is unrecoverable — we keep the raw provider payloads and the
+          # telemetry markers but lose the briefing the forecasters actually read.
+          PERSIST_RESEARCH_ENABLED: 'true'
+      # Durable capture of research outputs + run logs (telemetry lives on stderr,
+      # tee'd to run_logs/). The artifact name MUST start with research-: sync_all.py
+      # gates the research harvest on that prefix, so a logs-* artifact contributes
+      # zero research records no matter what it contains. RUN_LOG_ARTIFACT_PREFIXES
+      # covers both families, so telemetry harvesting is unaffected by the name.
+      - name: Upload research outputs
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: logs-${{ github.run_id }}
-          path: run_logs/
+          name: research-${{ github.run_id }}
+          path: |
+            research_outputs/
+            run_logs/
           retention-days: 90
           if-no-files-found: ignore

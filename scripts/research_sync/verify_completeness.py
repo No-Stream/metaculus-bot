@@ -15,7 +15,13 @@ WHAT IT CHECKS
 3. For each live artifact, confirm its originating `workflow_run.id` is present among
    the archive's recorded run_ids. A live artifact whose run_id is absent is a GAP
    (its research was not captured) — reported explicitly.
-4. Print a clear PASS / FAIL: "all N live artifacts represented in archive", or the
+4. Confirm the MERGE stage promoted what it captured: every question holding an artifact
+   record must be served by one in `latest/`. Presence in `by_qid/` is not the same as
+   being the record a backtest replays, and for months it wasn't — a raw-string timestamp
+   sort handed `latest/` to the lossy comment reconstruction on 255 of 256 dual-sourced
+   questions while this check reported PASS throughout, because it only ever looked at
+   `by_qid/`. That blind spot is why the bug survived so long.
+5. Print a clear PASS / FAIL: "all N live artifacts represented in archive", or the
    exact misses, plus any expired (lost-forever) artifacts.
 
 This pull is READ-ONLY and FREE — it hits only the GitHub API, no LLM/research calls,
@@ -40,7 +46,12 @@ from pathlib import Path
 
 # Reuse the puller's authoritative enumeration + download + parse helpers so the QA
 # uses the exact same code paths as the sync itself.
-from scripts.download_research import RESEARCH_ARTIFACT_PREFIX, load_jsonl_records, research_jsonl_files
+from scripts.download_research import (
+    RESEARCH_ARTIFACT_PREFIX,
+    SOURCE_ARTIFACT,
+    load_jsonl_records,
+    research_jsonl_files,
+)
 from scripts.gha_artifacts import _download_artifact_to, list_research_artifacts, verify_gh_cli
 
 logger = logging.getLogger(__name__)
@@ -65,6 +76,22 @@ def archived_run_ids(output_dir: Path) -> set[str]:
             if run_id is not None and str(run_id) != "":
                 run_ids.add(str(run_id))
     return run_ids
+
+
+def unpromoted_artifact_questions(manifest: dict) -> list[str]:
+    """Questions that HAVE an artifact record but whose latest/ is served by a lesser source.
+
+    The manifest's ``sources`` lists every source class in that question's ``by_qid/``
+    history and ``latest_source`` names the one that won. An artifact in the history that
+    did not win means the merge stage demoted the authoritative capture — the exact failure
+    the precedence fix addressed, and one that leaves the archive looking complete while a
+    replay reads trimmed comment text.
+    """
+    return sorted(
+        qid
+        for qid, entry in manifest.items()
+        if SOURCE_ARTIFACT in entry.get("sources", []) and entry.get("latest_source") != SOURCE_ARTIFACT
+    )
 
 
 def main() -> None:
@@ -122,6 +149,8 @@ def main() -> None:
                 has_records = any(load_jsonl_records(f) for f in files)
                 (genuine_gaps if has_records else empty_artifacts).append(art)
 
+    unpromoted = unpromoted_artifact_questions(manifest)
+
     represented = len(live) - len(missing)
     print("\n" + "=" * 72)
     print("RESEARCH ARCHIVE COMPLETENESS CHECK")
@@ -131,6 +160,7 @@ def main() -> None:
     print(f"Empty artifacts (no records, OK)   : {len(empty_artifacts)}")
     print(f"Genuine gaps (records NOT captured): {len(genuine_gaps)}")
     print(f"Expired (unrecoverable, lost)      : {len(expired)}")
+    print(f"Captured but not promoted to latest: {len(unpromoted)}")
 
     if expired:
         print("\nEXPIRED / LOST FOREVER (past 90-day retention):")
@@ -142,11 +172,22 @@ def main() -> None:
         for art in sorted(empty_artifacts, key=lambda a: a.get("created_at", "")):
             print(f"  EMPTY: {art.get('name')} (created_at={art.get('created_at')})")
 
-    if genuine_gaps:
-        print("\nGAPS — live artifacts with research records NOT in the archive:")
-        for art in sorted(genuine_gaps, key=lambda a: a.get("created_at", "")):
-            print(f"  GAP: {art.get('name')} (run_id={art.get('run_id')}, created_at={art.get('created_at')})")
-        print("\nFAIL: archive is missing capturable research from the artifacts above.")
+    if unpromoted:
+        print("\nNOT PROMOTED — questions with an artifact record that latest/ does not serve:")
+        # Report truncation, not analysis: the count above is exact and the tail is named.
+        for qid in unpromoted[:20]:  # noqa: HARNESS-SCAN-EXEMPT-subsampling
+            print(f"  DEMOTED: qid={qid} (latest_source={manifest[qid].get('latest_source')})")
+        if len(unpromoted) > 20:
+            print(f"  ... and {len(unpromoted) - 20} more")
+
+    if genuine_gaps or unpromoted:
+        if genuine_gaps:
+            print("\nGAPS — live artifacts with research records NOT in the archive:")
+            for art in sorted(genuine_gaps, key=lambda a: a.get("created_at", "")):
+                print(f"  GAP: {art.get('name')} (run_id={art.get('run_id')}, created_at={art.get('created_at')})")
+            print("\nFAIL: archive is missing capturable research from the artifacts above.")
+        if unpromoted:
+            print("\nFAIL: the merge stage demoted captured artifact research on the questions above.")
         print("=" * 72)
         sys.exit(1)
 
