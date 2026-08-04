@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import pytest
 
+from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
 from metaculus_bot.research.market_retrieval.ranking import (
+    FP_CHARS,
+    RC_CHARS,
     RENDER_BUDGET,
     RULES_CHARS,
+    SETTLEMENT_SOURCE_CHARS,
+    SETTLEMENT_SOURCES_RENDERED,
     TIER_UNSPECIFIED,
     TIERS,
     WHY_CHARS,
@@ -33,6 +38,35 @@ from metaculus_bot.research.market_retrieval.ranking import (
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, SettlementSource
 from tests.test_market_retrieval_generation import Platform
+
+# Chars per token, the measured calibration for this prompt shape. Used instead of a tokenizer
+# so the budget test stays dependency-free and deterministic.
+CHARS_PER_TOKEN = 3.88
+
+# Ceiling on the ranker prompt at the pool scale the design was MEASURED at: ~100 Kalshi + ~30
+# Polymarket + ~15 Manifold (the venue searches return ~10 rows per query and dedup hard, so
+# their width-60 ceilings are rarely approached) + the full 197-market PredictIt universe. That
+# pool measures 35,760 estimated tokens (2026-08-04), which lands inside the spec's own
+# 36.3k-median / 39.4k-worst arithmetic — so 50,000 is ~40% headroom and catches silent
+# line-format growth.
+#
+# For scale, not as the binding constraint: luna's context window is 1,050,000 tokens (verified
+# live 2026-08-04), so this prompt is ~3% of it. The ceiling guards OUR line format, not the
+# model's limits.
+MARKET_RANKER_PROMPT_TOKEN_CEILING = 50_000
+
+# Ceiling on the degenerate case: every per-venue width saturated (100/60/60) AND every field at
+# its cap simultaneously. That measures 83,022 estimated tokens — 2.3x the measured-scale pool —
+# because the caps sit well above the real distributions on purpose (Kalshi `rules_primary` is
+# p50=134 / p90=174 against a 700 cap, so the cap "truncates nothing real" rather than describing
+# a typical row). This bound pins the CAPS and the widths themselves, which the measured-scale
+# assertion above cannot see; 90,000 is ~8% headroom.
+#
+# Worth knowing before either number is edited: the two assertions catch different regressions. A
+# new candidate-line segment moves both. Raising a rules cap or a retrieval width moves only this
+# one. And a fully-saturated pool does NOT fit the 50,000 ceiling — that ceiling was sized
+# against the measured (unsaturated) pools, which is why it is asserted against one.
+MARKET_RANKER_PROMPT_SATURATED_TOKEN_CEILING = 90_000
 
 QUESTION = RankerQuestion(
     title="Will US unemployment exceed 4.5% in June 2026?",
@@ -403,3 +437,144 @@ class TestRankerPrompt:
         prompt = build_ranker_prompt(QUESTION, [])
 
         assert "0 candidates from 0 venue(s)" in prompt
+
+
+class TestRankerPromptTokenBudget:
+    """Validate the counts; don't trust the estimates.
+
+    The ranker prompt is the one place in this port where input size grows with the pool, and it
+    grows in two independent ways: the per-candidate LINE FORMAT (a new segment costs ~400 rows
+    worth of chars) and the per-venue CAPS AND WIDTHS. Two pools are asserted because a single
+    one cannot see both — a measured-scale pool would miss a raised rules cap, and a saturated
+    one has so much slack it would miss a new segment.
+
+    The other direction is the RENDERED snapshot, which is budgeted far more tightly
+    (~6,000 chars) in tests/test_market_retrieval_rendering.py: it goes to the expensive
+    forecaster models, while this prompt goes to a cheap one and is where recall lives.
+    """
+
+    def _row_at(
+        self,
+        platform: Platform,
+        *,
+        title: str,
+        rules: str,
+        sub_title: str = "",
+        sources: tuple[SettlementSource, ...] = (),
+    ) -> MarketMatch:
+        return _row(
+            platform,
+            title=title,
+            rules=rules,
+            sub_title=sub_title,
+            sources=sources,
+            volume=123456.0,
+            bettors=250 if platform == "manifold" else None,
+        )
+
+    def _maxed_question(self) -> RankerQuestion:
+        return RankerQuestion(
+            title="T" * 200,
+            qtype="numeric",
+            unit="percent",
+            resolution_criteria="C" * (RC_CHARS * 2),
+            fine_print="F" * (FP_CHARS * 2),
+        )
+
+    def _measured_scale_pool(self) -> list[MarketMatch]:
+        """The pool scale the design was measured at, with realistic per-field content."""
+        real_sources = (
+            SettlementSource(name="Bureau of Labor Statistics", url="https://bls.gov"),
+            SettlementSource(name="The Washington Post", url="https://washingtonpost.com"),
+            SettlementSource(name="Reuters", url="https://reuters.com"),
+        )
+        pool = [
+            self._row_at(
+                "kalshi",
+                title="Will the US unemployment rate be above 4.5% in June 2026?",
+                rules="R" * 174,  # measured p90; p50 is 134 and the cap is 700
+                sub_title="Above 4.5%",
+                sources=real_sources,
+            )
+            for _ in range(100)
+        ]
+        pool += [
+            self._row_at(
+                "polymarket", title="US unemployment above 4.5% in June?", rules="R" * RULES_CHARS["polymarket"]
+            )
+            for _ in range(30)
+        ]
+        pool += [
+            self._row_at("manifold", title="Will unemployment top 4.5%?", rules="R" * RULES_CHARS["manifold"])
+            for _ in range(15)
+        ]
+        pool += [
+            self._row_at(
+                "predictit",
+                title="Which party will win the 2026 Senate race in Ohio?",
+                rules="contracts: " + ", ".join(["Republican Candidate Name"] * 8),
+            )
+            for _ in range(197)
+        ]
+        return pool
+
+    def _saturated_pool_at_caps(self) -> list[MarketMatch]:
+        """Every width saturated and every field at its cap at once. A bound, not a forecast."""
+        maxed_sources = tuple(
+            SettlementSource(name="N" * SETTLEMENT_SOURCE_CHARS, url="https://s.test")
+            for _ in range(SETTLEMENT_SOURCES_RENDERED)
+        )
+        pool = [
+            self._row_at(
+                "kalshi", title="M" * 80, rules="R" * RULES_CHARS["kalshi"], sub_title="S" * 60, sources=maxed_sources
+            )
+            for _ in range(RETRIEVAL_WIDTH["kalshi"])
+        ]
+        pool += [
+            self._row_at("polymarket", title="M" * 80, rules="R" * RULES_CHARS["polymarket"], sub_title="S" * 60)
+            for _ in range(RETRIEVAL_WIDTH["polymarket"])
+        ]
+        pool += [
+            self._row_at("manifold", title="M" * 80, rules="R" * RULES_CHARS["manifold"], sub_title="S" * 60)
+            for _ in range(RETRIEVAL_WIDTH["manifold"])
+        ]
+        pool += [
+            self._row_at(
+                "predictit",
+                title="M" * 80,
+                rules="contracts: " + ", ".join(["C" * 40] * 8),
+                sub_title="S" * 60,
+            )
+            for _ in range(197)
+        ]
+        return pool
+
+    def test_the_measured_scale_pool_fits_the_token_ceiling(self) -> None:
+        prompt = build_ranker_prompt(self._maxed_question(), self._measured_scale_pool())
+        estimated = len(prompt) / CHARS_PER_TOKEN
+
+        assert estimated < MARKET_RANKER_PROMPT_TOKEN_CEILING, (
+            f"ranker prompt grew to ~{estimated:,.0f} estimated tokens at measured pool scale, over the "
+            f"{MARKET_RANKER_PROMPT_TOKEN_CEILING:,} ceiling. Most likely a new candidate-line segment."
+        )
+
+    def test_the_width_saturated_pool_at_every_cap_stays_bounded(self) -> None:
+        """The bound that pins the caps and the widths, which the measured-scale pool cannot see."""
+        prompt = build_ranker_prompt(self._maxed_question(), self._saturated_pool_at_caps())
+        estimated = len(prompt) / CHARS_PER_TOKEN
+
+        assert estimated < MARKET_RANKER_PROMPT_SATURATED_TOKEN_CEILING, (
+            f"ranker prompt grew to ~{estimated:,.0f} estimated tokens with every width and cap maxed, over the "
+            f"{MARKET_RANKER_PROMPT_SATURATED_TOKEN_CEILING:,} bound. Most likely a raised rules cap or "
+            f"retrieval width."
+        )
+
+    def test_the_question_header_is_a_negligible_share_of_the_prompt(self) -> None:
+        """RC_CHARS + FP_CHARS is fixed overhead, so it must not be where the budget goes: the
+        candidate block is ~99% of the prompt and is the only part worth policing."""
+        pool = self._measured_scale_pool()
+        prompt = build_ranker_prompt(self._maxed_question(), pool)
+        candidate_lines = [line for line in prompt.split("\n") if line.startswith("[")]
+
+        assert len(candidate_lines) == len(pool)
+        assert sum(len(line) for line in candidate_lines) > 0.9 * len(prompt)

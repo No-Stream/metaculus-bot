@@ -21,19 +21,54 @@ from datetime import datetime, timezone
 
 import pytest
 
-from metaculus_bot.research.market_retrieval.ranking import DEGRADED_RANKING_MARKER, TIER_UNSPECIFIED, TIERS
+from metaculus_bot.constants import RESEARCH_SECTION_CHAR_LIMIT
+from metaculus_bot.research.market_retrieval.ranking import (
+    DEGRADED_RANKING_MARKER,
+    RENDER_BUDGET,
+    TIER_UNSPECIFIED,
+    TIERS,
+    WHY_CHARS,
+)
 from metaculus_bot.research.market_retrieval.rendering import (
     MARKET_PREAMBLE_NEUTRAL,
     MARKET_PREAMBLE_STRONG,
     MARKET_SIGNAL_LEGEND,
     RAW_RULES_MAX_CHARS,
     TABLE_COLUMNS,
+    TITLE_MAX_CHARS,
     render_snapshot,
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot
 from tests.test_market_retrieval_generation import Platform
 
 _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
+
+# Char budget for the WORST-CASE rendered snapshot: 8 rows with every field simultaneously at
+# its cap. Measured at 6,246 chars (2026-08-04). The operator's directive names ~6,000, "roughly
+# today's 12-row render", and all 246 chars of the overshoot are the degenerate simultaneous-max
+# assumption rather than real content — a realistic 8-row snapshot measures 4,590 and is asserted
+# below against the operator's 6,000 exactly. 6,500 leaves ~4% headroom over the measured worst
+# case, deliberately tight: this section goes to the expensive forecaster models, so adding a
+# column, lengthening the legend, or raising RAW_RULES_MAX_CHARS has to trip it.
+MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 6_500
+
+# The operator's figure, asserted where it describes something real: 8 rows of realistic content,
+# using shapes measured off live payloads rather than chosen. Measured at 4,590 chars.
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 6_000
+
+# Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
+# 1,386 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# the only part with no data to justify it — the whole-snapshot budget has slack that would
+# otherwise absorb an added paragraph unnoticed.
+MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 1_500
+
+_REAL_TITLE = "Will the US unemployment rate be above 4.5% in June 2026?"
+_REAL_RULES = (
+    "If the BLS-reported seasonally adjusted U-3 unemployment rate for June 2026 is above 4.5%, "
+    "then the market resolves to Yes."
+)
+_REAL_WHY = "near-identical: same BLS U-3 series, same month"
+_REAL_URL = "https://kalshi.com/markets/KXUNRATE-26JUN"
 
 
 def _row(
@@ -282,6 +317,96 @@ class TestDegradedRender:
         rendered = render_snapshot(MarketSnapshot(matches=[_row(tier="weak")]))
 
         assert DEGRADED_RANKING_MARKER not in rendered
+
+
+class TestRenderBudget:
+    """The forecaster-facing section must stay compact: all relevant data, no excess verbosity.
+
+    Two token budgets in this port point opposite ways. The ~38k RANKER prompt is fine — it goes
+    to a cheap model and recall lives there. This snapshot goes to the expensive forecaster and
+    reasoning models on every question, so it is the one that has to stay lean. These assertions
+    are the regression guard: a future edit that adds a column, pads the legend, or raises
+    RAW_RULES_MAX_CHARS cannot bloat the section silently.
+    """
+
+    def _maxed_rows(self) -> list[MarketMatch]:
+        """Eight rows with every field simultaneously at its cap — a bound, not a forecast."""
+        return [
+            _row(
+                title="M" * TITLE_MAX_CHARS,
+                tier="same_quantity_other_cut",
+                why="W" * WHY_CHARS,
+                rules="R" * RAW_RULES_MAX_CHARS,
+                url="https://kalshi.com/markets/" + "T" * 40,
+                prob=0.4237,
+                volume=123456789.0,
+                oi=98765432.0,
+                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                resolved=index % 2 == 0,
+            )
+            for index in range(RENDER_BUDGET)
+        ]
+
+    def _realistic_rows(self) -> list[MarketMatch]:
+        return [
+            _row(
+                title=_REAL_TITLE,
+                tier="same_quantity_other_cut",
+                why=_REAL_WHY,
+                rules=_REAL_RULES,
+                url=_REAL_URL,
+                close=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            )
+            for _ in range(RENDER_BUDGET)
+        ]
+
+    def test_a_maxed_eight_row_snapshot_fits_the_char_budget(self) -> None:
+        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows()))
+
+        assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET, (
+            f"maxed render grew to {len(rendered)} chars, over the "
+            f"{MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET} budget — this section goes to the expensive "
+            f"forecaster models on every question. Cut something or re-derive the budget."
+        )
+
+    def test_a_realistic_eight_row_snapshot_fits_the_operators_budget(self) -> None:
+        """The operator's ~6,000 figure, against content shaped like the real thing."""
+        rendered = render_snapshot(MarketSnapshot(matches=self._realistic_rows()))
+
+        assert len(rendered) < MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET
+
+    def test_the_fixed_prose_overhead_is_budgeted_separately(self) -> None:
+        """Prose has no data to justify it, so it gets the tight budget. Without this, the
+        whole-snapshot slack would absorb an added paragraph unnoticed."""
+        overhead = len(MARKET_PREAMBLE_STRONG) + len(MARKET_SIGNAL_LEGEND)
+
+        assert overhead < MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET
+        assert len(MARKET_PREAMBLE_NEUTRAL) < len(MARKET_PREAMBLE_STRONG) + 200
+
+    def test_the_snapshot_sits_far_under_the_research_section_limit(self) -> None:
+        """Stated explicitly so the relationship between the two ceilings is visible: the
+        snapshot is one section inside a research bundle that gets middle-trimmed at
+        RESEARCH_SECTION_CHAR_LIMIT, and a section approaching that limit would start evicting
+        its siblings rather than itself."""
+        rendered = render_snapshot(MarketSnapshot(matches=self._maxed_rows()))
+
+        assert len(rendered) < RESEARCH_SECTION_CHAR_LIMIT / 4
+        assert MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET < RESEARCH_SECTION_CHAR_LIMIT / 4
+
+    def test_the_new_columns_are_single_tokens_per_row(self) -> None:
+        """`status` and `relation` are graded labels, not prose: one token each, so the two new
+        columns cost ~30 chars a row rather than a clause."""
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=self._maxed_rows())))
+
+        for row_cells in cells:
+            assert " " not in row_cells["status"]
+            assert " " not in row_cells["relation"]
+
+    def test_the_row_count_is_capped(self) -> None:
+        """Nothing downstream re-caps this, so a snapshot handed more than the budget's worth of
+        rows would render all of them. The cap lives in the ranking stage; this pins that the
+        renderer is fed at most that many by asserting the budget was measured at the cap."""
+        assert RENDER_BUDGET == 8
 
 
 class TestRulesBullets:

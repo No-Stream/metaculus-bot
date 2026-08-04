@@ -55,11 +55,12 @@ TABLE_COLUMNS: tuple[str, ...] = (
 
 TITLE_MAX_CHARS = 80
 
-# Shared trailing legend, shipped INSIDE the research section. The liquidity half is
-# unchanged; the final sentences replace the old `relevance` column's content-overlap
-# explanation with the ranker's own relation + why, and say what RESOLVED means about a price.
-# Every label either half can produce must appear here — a legend that omits a label a cell
-# can hold teaches forecasters to guess.
+# Shared trailing legend, shipped INSIDE the research section. The liquidity half is unchanged;
+# the retired `relevance` column's content-overlap explanation is replaced by ONE sentence per
+# new axis — the ranker's relation + why, and what RESOLVED means about a price. This text is
+# fixed overhead on every rendered snapshot and the snapshot goes to the expensive forecaster
+# models, so it earns its length: every label a cell can hold is named (a legend that omits one
+# teaches forecasters to guess at it) and nothing else is.
 MARKET_SIGNAL_LEGEND = (
     "The `signal` column labels each market's liquidity/participation "
     "(thin/decent/deep for real-money venues, thin/decent/high for Manifold's play-money bettor count); "
@@ -67,25 +68,25 @@ MARKET_SIGNAL_LEGEND = (
     "`no-liquidity-data` means the venue publishes no volume figures at all (PredictIt) — it says nothing "
     "about how liquid the market is, so treat it as unknown rather than as thin. Treat "
     "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy. "
-    "The rows are ordered by EVIDENTIAL VALUE, most valuable first: `relation` says how each market relates to "
-    "THIS question (`same_quantity_same_date` measures the same thing on the same date, "
-    "`same_quantity_other_cut` the same thing at a different date/threshold/source, `driver_or_consequence` and "
-    "`weak` are context rather than anchors, `unspecified` means the relation was not labelled), and `why` is the "
-    "one-phrase reason it was selected. `status` is `open` or `RESOLVED`, and a RESOLVED market's price is a "
-    "realized outcome rather than a forecast."
+    "Rows are ordered by EVIDENTIAL VALUE, best first, and `relation` grades how each bears on THIS question — "
+    "`same_quantity_same_date`, then `same_quantity_other_cut`, then `driver_or_consequence`, then `weak` "
+    "(`unspecified` if ungraded); only the first two measure the quantity asked about, and `why` is the "
+    "one-phrase reason. `status` is `open` or `RESOLVED`; a RESOLVED price is a realized outcome, not a forecast."
 )
 
 # Strong-evidence framing — used when at least one rendered row measures the same quantity
-# (relation tier 1 or 2). "MAY be relevant" and "verify each market's resolution criteria"
-# are asserted verbatim elsewhere; the old "the match below is fuzzy" clause is gone, because
-# the rows are now selected by a model reading each market's rules rather than by word overlap.
+# (relation tier 1 or 2). "MAY be relevant" and "verify each market's resolution criteria" are
+# asserted verbatim elsewhere; the old "the match below is fuzzy" clause is gone, because the
+# rows are now selected by a model reading each market's rules rather than by word overlap. The
+# old "a poorly-matched market may be worth little or nothing" clause is gone too — the
+# per-row `relation` grade now says that per row, and saying it twice is the verbosity the
+# forecaster-facing budget exists to stop.
 MARKET_PREAMBLE_STRONG = (
     "The following prediction markets MAY be relevant — each was selected and ranked for THIS question, so "
     "verify each market's resolution criteria, resolution date, and topic against THIS question before "
     "weighting. A market whose criteria and date match this question is extremely strong evidence — anchor on "
-    "its price. A market on a related but different event, different date, or different criteria carries "
-    "proportionally less weight — name the specific mismatch and discount accordingly; a poorly-matched market "
-    "may be worth little or nothing. "
+    "its price; on a related but different event, date, or threshold, name the specific mismatch and discount "
+    "accordingly. "
 )
 
 # Neutral framing — used when NO rendered row measures the same quantity, so the table is
