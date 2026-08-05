@@ -472,9 +472,9 @@ class TestSignalCatalogueEmpty:
         assert provider_degradation_findings() == []
 
     def test_one_populated_question_clears_the_run(self) -> None:
-        """Same whole-run conjunction as Signal B: one question whose prefetch came
-        back populated proves the catalogue is reachable, so a single empty read is a
-        blip, not a dead matcher."""
+        """The whole-run conjunction: one question whose prefetch came back populated
+        proves the catalogue is reachable, so a single empty read is a blip, not a dead
+        matcher."""
         record_catalogue_size(qid=1, source="kalshi_events", entries=0, fetch_ok=True)
         record_catalogue_size(qid=2, source="kalshi_events", entries=12_370, fetch_ok=True)
         assert provider_degradation_findings() == []

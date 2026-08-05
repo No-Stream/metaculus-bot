@@ -1716,11 +1716,11 @@ class TestProviderHealthRecording:
         answered, the ranker kept nothing, and NOTHING is alertable.
 
         Note the asymmetry, which is a fact about ranked retrieval rather than a quirk of this
-        fixture. The two SEARCH venues sit at zero candidates, because their index had no hit.
-        The two ENUMERABLE venues cannot: their whole catalogue enters the pool, so a healthy
-        catalogue always yields candidates. That is why Signal B is structurally dead for them and
-        `record_catalogue_size` (Signal C) is their only alarm — and why a test that forced them
-        to zero would have to stub an EMPTY catalogue, which is itself a finding.
+        fixture. The two SEARCH venues sit at zero candidates, because their index had no hit, so
+        Signal A never evaluates them. The two ENUMERABLE venues cannot be at zero: their whole
+        catalogue enters the pool, so a healthy catalogue always yields candidates and their
+        parsers are always checked — while `record_catalogue_size` (Signal C) is the only thing
+        that can fire on an EMPTY catalogue for them.
         """
         await _fetch(mock_question, _handlers())
 

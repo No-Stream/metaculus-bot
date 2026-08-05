@@ -74,7 +74,7 @@ def parse_iso(value: Any) -> datetime | None:
     snapshot-level net and zeroes ALL FOUR venues for the question — and the offending event
     stays in the 6h catalogue cache, so every later question repeats it.
 
-    A naive value is TREATED as UTC — the same assumption `_filter_pool_by_as_of` already makes.
+    A naive value is TREATED as UTC — the same assumption ``assemble_pool``'s ``as_of`` makes.
     Not an assertion that every venue publishes UTC: PredictIt's ``dateEnd`` is historically
     Eastern, and only the date-granular rendering makes that <=5h skew immaterial. Behaviour is
     unchanged for rendering, since attaching a tzinfo does not shift the wall clock.
