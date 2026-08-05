@@ -328,6 +328,19 @@ class TestQueryAuthorPrompt:
 
         assert "title: Will {x} happen?" in prompt
 
+    def test_a_literal_placeholder_in_a_title_is_not_itself_substituted(self):
+        """Substitution is SINGLE-PASS, so question data is never re-scanned for placeholders.
+
+        Two sequential ``.replace`` calls corrupt the question here: the title lands first, and
+        the ``{rc}`` pass then rewrites the title's own literal ``{rc}`` into the resolution
+        criteria, so the model reads a question nobody asked. Metaculus titles do quote template
+        and JSON syntax, and the corruption is silent — the prompt still looks well-formed."""
+        prompt = build_query_author_prompt("Will the {rc} field be dropped?", "Resolves per BLS.")
+
+        assert "title: Will the {rc} field be dropped?" in prompt
+        assert "resolution criteria: Resolves per BLS." in prompt
+        assert prompt.count("Resolves per BLS.") == 1
+
     def test_the_stated_ceilings_match_the_enforced_ones(self):
         """The prompt asks for the ceilings in prose and the parser enforces them in code, so the
         two can drift apart silently — raising ``MAX_SYNONYMS`` alone wastes the extra slots the

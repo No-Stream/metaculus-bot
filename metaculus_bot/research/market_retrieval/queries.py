@@ -241,7 +241,7 @@ def deterministic_queries(title: str) -> list[str]:
 # conjunction. The ban has to be scoped exactly as `has_date_like_token` scopes it: a prompt
 # banning digits outright would suppress the series codes the parser now keeps, which is the
 # same silent drift as a ceiling raised in code while the prompt still asks for the old one.
-# Substituted with `.replace`, matching the ranker prompt, so a brace in a question title can
+# Filled by `build_query_author_prompt`, never `.format`, so a brace in a question title can
 # never raise.
 QUERY_AUTHOR_PROMPT = """You are writing search queries to find prediction markets RELATED to a forecasting question.
 
@@ -266,11 +266,23 @@ JSON:"""
 # measured quantity; the ranker is the stage that reads the full clause.
 QUERY_AUTHOR_RC_CHARS = 800
 
+_QUERY_AUTHOR_PLACEHOLDER_RE = re.compile(r"\{title\}|\{rc\}")
+
 
 def build_query_author_prompt(title: str, resolution_criteria: str) -> str:
-    return QUERY_AUTHOR_PROMPT.replace("{title}", title or "").replace(
-        "{rc}", (resolution_criteria or "")[:QUERY_AUTHOR_RC_CHARS]
-    )
+    """Fill the author prompt's two placeholders in ONE pass over the template.
+
+    Single-pass because sequential `.replace` calls let question data be re-substituted: a
+    title containing the literal `"{rc}"` (Metaculus titles quote JSON and template syntax)
+    would have its own text replaced by the resolution criteria on the second call, so the
+    model reads a corrupted question. `re.sub` with a lookup visits each placeholder once and
+    never looks at what it substituted.
+    """
+    substitutions = {
+        "{title}": title or "",
+        "{rc}": (resolution_criteria or "")[:QUERY_AUTHOR_RC_CHARS],
+    }
+    return _QUERY_AUTHOR_PLACEHOLDER_RE.sub(lambda m: substitutions[m.group(0)], QUERY_AUTHOR_PROMPT)
 
 
 def _authored_strings(value: object) -> list[str]:

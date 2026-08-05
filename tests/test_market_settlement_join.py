@@ -67,6 +67,43 @@ class TestNormalizeHost:
         assert normalize_host("not a url at all") is None
         assert normalize_host("") is None
 
+    def test_punycode_and_unicode_spellings_of_one_host_converge(self):
+        """The two live spellings of an internationalized host must produce ONE join key.
+
+        A Metaculus resolution criterion carries whatever the author pasted while a Kalshi
+        settlement source carries whatever the exchange stored, so both forms are in play. Left
+        as-is they are different domains and never join, and the punycode side additionally
+        fails suffix lookup: the vendored PSL is unicode throughout (zero ``xn--`` rules), so
+        decoding toward unicode is the only direction that reaches the right registrable
+        domain."""
+        assert normalize_host("https://xn--bcher-kva.de/report") == "bücher.de"
+        assert normalize_host("https://bücher.de/report") == "bücher.de"
+        assert normalize_host("https://WWW.XN--BCHER-KVA.de/report") == "bücher.de"
+
+    def test_a_punycode_host_joins_its_unicode_twin(self):
+        """The consequence at the channel's seam: one question-side spelling, one venue-side
+        spelling, and the join still fires."""
+        question_side = question_domains("Resolves per https://xn--bcher-kva.de/bestseller.")
+        index = settlement_domain_index(
+            [{"event_ticker": "KXBOOKS-26", "settlement_sources": [{"name": "Bücher", "url": "https://bücher.de/x"}]}]
+        )
+
+        assert question_side == {"bücher.de"}
+        assert set(index) & question_side == {"bücher.de"}
+
+    def test_a_malformed_punycode_label_is_kept_rather_than_raised_on(self):
+        """A designed soft boundary: this channel is a pure recall gain, so one undecodable host
+        in a 10k-event catalogue must not take the whole index build down. The raw label is kept
+        so an equally-malformed twin can still match."""
+        assert normalize_host("https://xn--.example.com/x") == "xn--.example.com"
+        assert normalize_host("https://xn--bcher-kva-.de/x") == "xn--bcher-kva-.de"
+        assert registrable_domain("xn--zzzz.de") == "xn--zzzz.de"
+
+        index = settlement_domain_index(
+            [{"event_ticker": "KXBAD-26", "settlement_sources": [{"name": "bad", "url": "https://xn--.de/x"}]}]
+        )
+        assert list(index) == ["xn--.de"]
+
 
 class TestRegistrableDomain:
     def test_collapses_a_subdomain_to_its_publisher(self):

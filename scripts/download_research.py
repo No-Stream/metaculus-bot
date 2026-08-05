@@ -123,7 +123,16 @@ def load_backfill(backfill_dir: Path) -> list[dict]:
 
 
 def deduplicate_records(records: list[dict]) -> list[dict]:
-    """Deduplicate by (qid, run_id), keeping the record with the latest timestamp."""
+    """Deduplicate by (qid, run_id), keeping the ``record_precedence_key`` winner.
+
+    Same ordering as the merge stage, deliberately: dedup used to compare timestamps as RAW
+    STRINGS, which cannot agree with the parsed-datetime, source-class-first ordering
+    ``record_precedence_key`` applies downstream. A (qid, run_id) collision between an
+    artifact and a log-backfill record — the same run id is what makes them collide — was
+    then settled here by lexicographic timestamp, so the artifact could be DISCARDED before
+    precedence ever saw it, whichever order the two arrived in. Two stages ranking the same
+    records two ways is the disagreement, not either ranking on its own.
+    """
     by_key: dict[tuple[int, str], dict] = {}
     for record in records:
         qid = record.get("qid")
@@ -132,7 +141,7 @@ def deduplicate_records(records: list[dict]) -> list[dict]:
             continue
         key = (qid, str(run_id))
         existing = by_key.get(key)
-        if existing is None or record.get("timestamp", "") > existing.get("timestamp", ""):
+        if existing is None or record_precedence_key(record) > record_precedence_key(existing):
             by_key[key] = record
     return list(by_key.values())
 

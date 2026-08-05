@@ -22,6 +22,8 @@ from metaculus_bot.performance_analysis.width_monitor import (
     compute_pit,
     default_eras,
     jeffreys_ci,
+    main,
+    parse_exclude_qids,
     relative_band_width,
     render_markdown,
 )
@@ -402,6 +404,61 @@ class TestExcludeQids:
         assert "excl" in md
         # The dropped record is visible as a count, not just absent.
         assert "| 1 | 1 |" in md
+
+
+class TestParseExcludeQids:
+    """The ``known_bug`` shorthand COMPOSES with explicit ids.
+
+    It used to expand only as the whole argument, so ``--exclude-qids known_bug,43800``
+    produced the literal ``{"known_bug", "43800"}``: no question id matches the word, so the
+    bug pair stayed in every row while the ``excl`` column reported one exclusion and made the
+    run look like the shorthand had worked. That is exactly the silent-exclusion failure the
+    column exists to prevent.
+    """
+
+    def test_empty_excludes_nothing(self):
+        assert parse_exclude_qids("") == frozenset()
+        assert parse_exclude_qids("  ,  ") == frozenset()
+
+    def test_shorthand_alone_expands_to_the_pair(self):
+        assert parse_exclude_qids("known_bug") == KNOWN_BUG_QIDS
+        assert parse_exclude_qids("  known_bug  ") == KNOWN_BUG_QIDS
+
+    def test_shorthand_mixed_with_explicit_ids_expands_and_keeps_both(self):
+        assert parse_exclude_qids("known_bug,43800") == KNOWN_BUG_QIDS | {"43800"}
+        assert parse_exclude_qids("43800, known_bug ,43801") == KNOWN_BUG_QIDS | {"43800", "43801"}
+
+    def test_the_shorthand_token_never_survives_as_a_literal_id(self):
+        """The word itself must not reach ``compute_all_eras`` — it matches no question id, so
+        its only effect there is an exclusion the table reports and never performs."""
+        assert "known_bug" not in parse_exclude_qids("known_bug,43800")
+
+    def test_explicit_ids_alone_are_passed_through(self):
+        assert parse_exclude_qids("43800,43801") == frozenset({"43800", "43801"})
+
+    def test_the_mixed_form_actually_drops_all_three_questions(self):
+        """End-to-end through the metrics, not just the parse: the shorthand's ids and the
+        explicit id all leave the rows."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-06-01T00:00:00Z", question_id=43746),
+            _record_with_pit(0.975, created_at="2026-06-01T00:00:00Z", question_id=43747),
+            _record_with_pit(0.1, created_at="2026-06-01T00:00:00Z", question_id=43800),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data, exclude_qids=parse_exclude_qids("known_bug,43800"))}
+
+        assert by_label["all"].n_pit == 1
+        assert by_label["all"].n_excluded == 3
+
+    def test_the_help_text_states_that_the_shorthand_composes(self, capsys):
+        """The composing behavior is only discoverable from ``--help``, and a help string that
+        still described the sole-value form is what made the old bug invisible."""
+        with pytest.raises(SystemExit):
+            main(["--help"])
+
+        help_text = capsys.readouterr().out
+        assert "composes" in help_text
+        assert "known_bug,43800" in help_text
 
 
 class TestBandMissSplit:

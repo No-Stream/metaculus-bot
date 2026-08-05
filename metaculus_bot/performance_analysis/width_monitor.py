@@ -112,6 +112,24 @@ TS_ANCHOR_ENABLE = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)  # b4e9
 # the set explicitly so an exclusion is always a visible choice.
 KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747"})
 
+# The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
+KNOWN_BUG_SHORTHAND = "known_bug"
+
+
+def parse_exclude_qids(raw: str) -> frozenset[str]:
+    """A ``--exclude-qids`` comma list, with the ``known_bug`` shorthand expanded in place.
+
+    The shorthand COMPOSES with explicit ids rather than only standing alone. It used to be
+    recognized only as the whole argument, so ``--exclude-qids known_bug,43800`` produced the
+    literal set ``{"known_bug", "43800"}``: no question id matches the word, so the bug pair
+    stayed in every row while the table's ``excl`` column reported one exclusion and looked
+    like it had worked.
+    """
+    tokens = {token.strip() for token in raw.split(",") if token.strip()}
+    if KNOWN_BUG_SHORTHAND not in tokens:
+        return frozenset(tokens)
+    return frozenset((tokens - {KNOWN_BUG_SHORTHAND}) | KNOWN_BUG_QIDS)
+
 
 def default_eras() -> list[Era]:
     """The three width-relevant config eras, oldest first.
@@ -474,17 +492,16 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Comma-separated question ids to drop from every row (the count is rendered in the table "
             f"so the exclusion is visible). The documented open-bound bug pair is {','.join(sorted(KNOWN_BUG_QIDS))}; "
-            "pass 'known_bug' as shorthand for it. Default: exclude nothing."
+            f"pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, anywhere in the list — it composes with "
+            f"explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' excludes the pair AND 43800. "
+            "Default: exclude nothing."
         ),
     )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 
-    if args.exclude_qids.strip() == "known_bug":
-        exclude_qids = KNOWN_BUG_QIDS
-    else:
-        exclude_qids = frozenset(q.strip() for q in args.exclude_qids.split(",") if q.strip())
+    exclude_qids = parse_exclude_qids(args.exclude_qids)
 
     if args.tournament:
         # Confirm the host is the real Metaculus before the token-sending pull.

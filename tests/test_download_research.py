@@ -31,8 +31,10 @@ from scripts.download_research import (
     SOURCE_LOG_BACKFILL,
     _merge_latest,
     build_archive,
+    deduplicate_records,
     guard_against_truncation,
     load_existing_by_qid,
+    record_precedence_key,
     record_source,
 )
 from scripts.download_research import main as download_research_main
@@ -233,6 +235,64 @@ class TestLogBackfillNeverDisplacesAQuestionKeyedRecord:
         ids = QuestionIds(post_id=43593, question_id=43592)
 
         assert not ids.matches_archive_record(winner)
+
+
+class TestDedupAgreesWithPrecedence:
+    """Dedup and the merge stage must rank records the SAME way, or dedup decides alone.
+
+    ``deduplicate_records`` collapses a (qid, run_id) collision before ``build_archive`` ever
+    sorts, so a loser it picks is gone — precedence never sees the record at all. It used to
+    compare timestamps as RAW STRINGS while ``record_precedence_key`` parses to datetimes and
+    ranks the source class first, and the archive's two real timestamp formats invert under a
+    string compare: at the same second the bare ``...Z`` form (the log-backfill writer's)
+    outranks ``...+00:00`` with fractional seconds (live capture's), because ``Z`` (0x5A) beats
+    ``.`` (0x2E). So the log-backfill record survived and the artifact — the authoritative
+    capture, and the question-keyed one — was discarded, in EITHER arrival order.
+    """
+
+    COLLIDING_RUN_ID = "26093553404"
+
+    def _colliding_pair(self) -> tuple[dict, dict]:
+        artifact = _artifact(qid=43592, run_id=self.COLLIDING_RUN_ID, timestamp="2026-05-19T11:20:34.500000+00:00")
+        log_record = _log_backfill(43592, self.COLLIDING_RUN_ID, timestamp="2026-05-19T11:20:34Z")
+        assert log_record["timestamp"] > artifact["timestamp"], "precondition: lexicographic order is inverted here"
+        return artifact, log_record
+
+    @pytest.mark.parametrize("log_first", [False, True], ids=["artifact-first", "log-backfill-first"])
+    def test_the_artifact_survives_dedup_in_either_arrival_order(self, log_first: bool) -> None:
+        artifact, log_record = self._colliding_pair()
+        records = [log_record, artifact] if log_first else [artifact, log_record]
+
+        deduped = deduplicate_records(records)
+
+        assert len(deduped) == 1
+        assert record_source(deduped[0]) == SOURCE_ARTIFACT
+
+    def test_the_surviving_record_is_the_one_precedence_would_have_picked(self) -> None:
+        # The property that makes the two stages consistent, stated directly: whatever dedup
+        # keeps is the max under the merge stage's own ordering.
+        artifact, log_record = self._colliding_pair()
+        deduped = deduplicate_records([log_record, artifact])
+
+        assert deduped[0] is max([artifact, log_record], key=record_precedence_key)
+
+    def test_dedup_still_keeps_the_newest_of_two_same_class_records(self, tmp_path: Path) -> None:
+        # The ordinary case dedup exists for: one run re-uploaded, newest text wins. Parsed
+        # timestamps, so the two formats compare as instants rather than as strings.
+        older = _artifact(run_id="run-1", timestamp="2026-05-20T10:00:00.100000+00:00", research_text="old")
+        newer = _artifact(run_id="run-1", timestamp="2026-05-20T12:00:00Z", research_text="newer")
+
+        deduped = deduplicate_records([newer, older])
+
+        assert len(deduped) == 1
+        assert deduped[0]["research_text"] == "newer"
+
+    def test_distinct_run_ids_are_not_collapsed(self) -> None:
+        records = [_artifact(run_id="run-1"), _artifact(run_id="run-2"), _artifact(qid=50001, run_id="run-1")]
+        assert len(deduplicate_records(records)) == 3
+
+    def test_records_without_a_qid_are_dropped(self) -> None:
+        assert deduplicate_records([{"run_id": "run-1", "timestamp": ARTIFACT_TIMESTAMP}]) == []
 
 
 class TestLatestPrecedence:

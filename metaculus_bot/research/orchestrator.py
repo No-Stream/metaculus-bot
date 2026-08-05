@@ -188,17 +188,23 @@ class ResearchOrchestrator:
         """Per-run count of ALERTABLE provider-degradation findings, folded into
         alertable_count.
 
-        One finding per (signal, venue): a liquidity field dead across 100% of a
-        venue's rows, a venue contributing nothing while >=2 siblings answered the
-        same query set, or a prefetch reporting success with an empty catalogue.
-        Each is a 100%-of-denominator conjunction over the whole run, so a single
-        question with no matching market stays silent — the denominators are rows,
-        sibling venues, and catalogue entries, never questions-in-a-run (prod runs
+        One finding per (signal, venue), over the two signals provider_health
+        defines: a declared liquidity field dead across 100% of the pool rows a
+        venue produced (``market_field_contract``), or a prefetch reporting success
+        while returning an empty catalogue (``catalogue_empty``). Each is a
+        100%-of-denominator conjunction over the whole run, so a single question
+        with no matching market stays silent — the denominators are a venue's own
+        pool rows and a catalogue's own size, never questions-in-a-run (prod runs
         carry 1-2 questions, so a rate over those IS a per-question flag).
 
-        These are the signals that would have caught the two degradations that ran
-        for weeks in prod while every counter read zero: Kalshi's liquidity labels
-        blank on 100% of rows, and Manifold contributing nothing at all.
+        The first is the signal that would have caught Kalshi's liquidity labels
+        blank on 100% of rows for weeks in prod while every counter read zero; the
+        second closes its blind spot, since a catalogue that silently empties out
+        looks to it like a venue with nothing to say. A third rule (Signal B, a
+        venue contributing nothing while >=2 siblings answered) was deleted
+        2026-08-04 as unsound under ranked retrieval — see provider_health's module
+        docstring and FUTURE.md; the surviving cross-run intent is unjudgeable
+        inside one question.
 
         Suppressed findings are excluded here but still logged in full and still
         ride the PROVIDER_DEGRADATION marker (see

@@ -97,18 +97,48 @@ def _public_suffix_rules() -> tuple[frozenset[str], frozenset[str], frozenset[st
     return frozenset(exact), frozenset(wildcard_parents), frozenset(exceptions)
 
 
+def _decode_idna_label(label: str) -> str:
+    """A punycode (`xn--`) label decoded to unicode; the raw label when it will not decode.
+
+    Keeping a malformed label is the designed soft boundary for this join, not laziness: the
+    channel is a pure recall gain, so an undecodable host must still get its shot at matching
+    another host that is spelled the same way. Raising would take down the whole
+    settlement-source join — index build included — over one bad URL in a 10k-event catalogue.
+
+    One `UnicodeError` covers every way this fails, since it is the base of both halves: the
+    `ascii` encode rejects a non-ASCII label that still opens with `xn--`, and the `idna`
+    decode rejects an empty, over-long, non-round-tripping or truncated punycode payload.
+    """
+    if not label.startswith("xn--"):
+        return label
+    try:
+        return label.encode("ascii").decode("idna")
+    except UnicodeError:
+        return label
+
+
 def normalize_host(url: str) -> str | None:
-    """The lower-cased hostname of a URL, `www.`-stripped. None when there isn't one.
+    """The lower-cased, unicode hostname of a URL, `www.`-stripped. None when there isn't one.
 
     `.hostname` rather than `.netloc` so a port or userinfo cannot smuggle a host past the
     self-reference check — the same reason `resolution_source.is_metaculus_self_ref` uses it.
     `www\\d*\\.` catches `www150.statcan.gc.ca`, which is real in the Kalshi payload.
+
+    Punycode labels are decoded to unicode so the two spellings of one host converge on ONE
+    key. Both spellings are live: a Metaculus resolution criterion carries whatever the author
+    pasted while a Kalshi settlement source carries whatever the exchange stored, so without
+    this `bücher.de` and `xn--bcher-kva.de` are different domains and never join. The direction
+    has to be toward unicode rather than toward punycode because the vendored PSL is the
+    unicode form throughout (`公司.cn`, `ᬩᬮᬶ.id` — zero `xn--` rules), so a punycode host
+    also fails suffix lookup and collapses to the wrong registrable domain.
     """
     try:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return None
     host = _WWW_PREFIX_RE.sub("", host).strip(".")
+    if "xn--" in host:
+        host = ".".join(_decode_idna_label(label) for label in host.split("."))
     return host or None
 
 
