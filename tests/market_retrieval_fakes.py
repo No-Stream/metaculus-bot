@@ -423,12 +423,13 @@ def handlers(**overrides: Any) -> dict[str, Any]:
 def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     """Zero BOTH copies of the retry backoff, for tests that drive retry-exhaustion paths.
 
-    `venues.py` imports the constant by name, so patching only `http` leaves the catalogue
+    `venues.kalshi` imports the constant by name, so patching only `http` leaves the catalogue
     pull's own retry sleeping the real 0.5s — which is exactly the kind of half-patch that makes
-    a suite mysteriously slow rather than red.
+    a suite mysteriously slow rather than red. The second target is the SUBMODULE, not the
+    `venues` package: the package re-export is a separate binding the pull never reads.
     """
     monkeypatch.setattr("metaculus_bot.research.market_retrieval.http.HTTP_RETRY_BACKOFF_SECS", 0.0)
-    monkeypatch.setattr(venues, "HTTP_RETRY_BACKOFF_SECS", 0.0)
+    monkeypatch.setattr(venues.kalshi, "HTTP_RETRY_BACKOFF_SECS", 0.0)
 
 
 async def fetch_snapshot(

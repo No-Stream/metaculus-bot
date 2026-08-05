@@ -110,6 +110,9 @@ class TestKalshiEventProjection:
             "fixture needs a multi-market event, or the tail tier is never exercised"
         )
         assert set(venues.KALSHI_NESTED_TAIL_FIELDS) == set(venues.KALSHI_MARKET_FIELDS) - {"rules_primary"}
+        # The per-strike sub-row labels have to survive on EVERY strike, not just the head: they are
+        # what each `↳` row is titled, and the tail is where all but one strike lives.
+        assert {"yes_sub_title", "ticker"} <= set(venues.KALSHI_NESTED_TAIL_FIELDS)
 
         session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
         pull = await venues.kalshi_prefetch_events(session)
@@ -210,9 +213,11 @@ class TestKalshiEventProjection:
         rate-limited exchange for a body that will be just as oversized the second time. The
         other half is `complete=False`, since the seam caches on exactly that flag and a
         `complete=True` here would pin a truncated catalogue for the 6h TTL. The real 64 MB
-        ceiling is impractical to materialize, so the constant is patched down.
+        ceiling is impractical to materialize, so the constant is patched down — on the
+        `venues.kalshi` SUBMODULE, since the `venues` package re-export is a separate binding
+        the stream never reads.
         """
-        monkeypatch.setattr(venues, "KALSHI_PAGE_MAX_BYTES", 32)
+        monkeypatch.setattr(venues.kalshi, "KALSHI_PAGE_MAX_BYTES", 32)
         session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
 
         pull = await venues.kalshi_prefetch_events(session)
@@ -258,7 +263,7 @@ class TestKalshiEventProjection:
             {venues.KALSHI_EVENTS_URL: [FakeResponse(503, text="down"), FakeResponse(503, text="still down")]}
         )
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues.kalshi"):
             pull = await venues.kalshi_prefetch_events(session, wall_timeout=0.01)
 
         assert pull.token == "error(http_503)", "the wall must not relabel the transport failure"
@@ -282,6 +287,60 @@ class TestKalshiEventProjection:
         assert [event["event_ticker"] for event in pull.events] == ["KXMARRIAGESTYLESKRAVITZ-HSZK", "USCLIMATE"]
         assert pull.tally.ok == 2
         assert pull.complete is True
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_with_an_open_cursor_is_a_truncated_pull_not_a_finished_one(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """Only an EXHAUSTED cursor ends pagination on its own terms.
+
+        A mid-pagination page that returns zero rows while still handing back a token has stopped
+        short of the catalogue. Treating that as the end reported `complete=True`, so the seam
+        pinned the pages collected so far — here 1 of an unknown number — for the whole 6h TTL, and
+        every later question in the run read a short universe back as a healthy `ok(n)` with no
+        HTTP and no counter bump. The runaway-bound re-check cannot cover it: that fires only on
+        `max_pages` / `event_limit`, and one page reaches neither.
+        """
+        first = {"events": multi_close_page["events"][:1], "cursor": "page2"}
+        empty_with_more = {"events": [], "cursor": "page3"}
+        session = FakeSession(
+            {
+                venues.KALSHI_EVENTS_URL: [
+                    FakeResponse(200, payload=first),
+                    FakeResponse(200, payload=empty_with_more),
+                ]
+            }
+        )
+
+        pull = await venues.kalshi_prefetch_events(session, page_sleep_s=0.0)
+
+        assert [event["event_ticker"] for event in pull.events] == ["KXMARRIAGESTYLESKRAVITZ-HSZK"], (
+            "the pages that did arrive must still reach the question that paid for them"
+        )
+        assert pull.complete is False, "a truncated pull must never be cached for the TTL"
+        assert pull.token == "dropped(empty_page)"
+        assert pull.tally.ok == 2
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_that_EXHAUSTS_the_cursor_is_a_clean_finish(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """The other side of the rule, and why it keys on the CURSOR rather than the row count.
+
+        A final page carrying no rows and no token is how a catalogue whose size is a multiple of
+        the page size ends. Reading that as truncated would refuse to cache every such pull and
+        redden CI on a perfectly normal boundary.
+        """
+        first = {"events": multi_close_page["events"][:1], "cursor": "page2"}
+        last = {"events": [], "cursor": ""}
+        session = FakeSession(
+            {venues.KALSHI_EVENTS_URL: [FakeResponse(200, payload=first), FakeResponse(200, payload=last)]}
+        )
+
+        pull = await venues.kalshi_prefetch_events(session, page_sleep_s=0.0)
+
+        assert len(pull.events) == 1
+        assert (pull.token, pull.complete) == ("", True)
 
     @pytest.mark.asyncio
     async def test_the_page_bound_stops_a_runaway_cursor_and_reports_it_incomplete(
@@ -456,10 +515,17 @@ class TestKalshiEventDerivations:
         assert match.total_volume is not None and match.total_volume > 0.0
         assert _liquidity_label(match) != "no-liquidity-data"
 
-    def test_a_multi_strike_family_quotes_no_price(self, multi_close_page: dict[str, Any]) -> None:
-        """Three live strikes at $0.285, $0.35 and $0.445 have no single probability, so the row
-        reports none — the `prob` column renders `-` rather than one threshold's price under the
-        event's title. The liquidity legs still populate, which is what keeps the row useful."""
+    def test_a_multi_strike_family_quotes_no_family_price_and_shows_every_strikes_own(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """Three live strikes at $0.285, $0.35 and $0.445 have no single probability, so the FAMILY
+        reports none and each strike reports its own instead.
+
+        Both halves are the contract. Quoting one threshold's price under the event's title says
+        "35%" about a question the row never asked, so the family-level legs stay `None`. But
+        withholding them and stopping there — what this did until the strike children landed — left
+        8,103 of 9,417 frozen-universe events rendering a bare `-` with their prices one field away.
+        """
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
         assert sum(1 for market in event["markets"] if market["status"] == "active") == 3
 
@@ -469,6 +535,104 @@ class TestKalshiEventDerivations:
         assert (match.implied_prob_yes, match.bid, match.ask, match.spread) == (None, None, None, None)
         assert match.volume_24h is None, "24h volume belongs to the quoted strike, and none is quoted"
         assert match.total_volume is not None, "withholding the price must not withhold the money"
+        assert [(child.title, child.implied_prob_yes) for child in match.children] == [
+            ("Before Jul 1, 2027", pytest.approx(0.35)),
+            ("Before Jan 1, 2028", pytest.approx(0.445)),
+            ("Before Jan 1, 2027", pytest.approx(0.285)),
+        ]
+
+    def test_the_strike_children_are_ordered_by_traded_size(self, multi_close_page: dict[str, Any]) -> None:
+        """The renderer truncates a long ladder from the end, so the order decides which rungs a
+        forecaster sees. Ranked on the same figure the `signal` label scores — the larger of a
+        strike's USD volume and its USD open interest — so the leading sub-row is the one whose
+        price is worth the most weight, not the catalogue's first threshold."""
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        assert [market["yes_sub_title"] for market in event["markets"]][1] == "Before Jan 1, 2027", (
+            "fixture must not already be in traded-size order, or this proves nothing"
+        )
+
+        children = venues.kalshi_strike_children(event["markets"])
+
+        depths = [max(child.total_volume or 0.0, child.open_interest or 0.0) for child in children]
+        assert depths == sorted(depths, reverse=True)
+        assert children[0].title == "Before Jul 1, 2027", "the deepest strike leads"
+
+    def test_a_settled_strike_is_never_rendered_as_a_child(self, multi_close_page: dict[str, Any]) -> None:
+        """The same scope the money legs use, for the same reason: a settled Kalshi market publishes
+        an EMPTY book (bid 0.0000 / ask 1.0000), so its midpoint is a synthetic $0.50 nobody traded
+        at. Rendering that as a sub-row would invent a price, which is worse than the withholding
+        the children replace."""
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        settled = event["markets"][0]
+        assert (settled["status"], settled["yes_bid_dollars"], settled["yes_ask_dollars"]) == (
+            "finalized",
+            "0.0000",
+            "1.0000",
+        )
+
+        children = venues.kalshi_strike_children(event["markets"])
+
+        assert settled["yes_sub_title"] not in {child.title for child in children}
+        assert all(child.implied_prob_yes != pytest.approx(0.5) for child in children)
+
+    def test_each_strike_child_carries_its_own_usd_liquidity(self, family_liquidity_page: dict[str, Any]) -> None:
+        """A strike's own conversion, not a share of the family sum: the three governorship strikes
+        convert at wildly different prices, so per-strike dollars are the only honest figure. The sum
+        of the children equals the family total, which is what makes both readings consistent."""
+        event = _event(family_liquidity_page, "KXGOVWINS-27JAN01")
+
+        children = venues.kalshi_strike_children(event["markets"])
+        family_volume, family_open_interest = venues.kalshi_event_usd_liquidity(event["markets"])
+
+        assert len(children) == 3
+        assert sum(child.total_volume or 0.0 for child in children) == pytest.approx(family_volume)
+        assert sum(child.open_interest or 0.0 for child in children) == pytest.approx(family_open_interest)
+        by_label = {child.title: child for child in children}
+        for market in event["markets"]:
+            child = by_label[market["yes_sub_title"]]
+            volume, open_interest = venues.kalshi_usd_liquidity(market)
+            assert (child.total_volume, child.open_interest) == (pytest.approx(volume), pytest.approx(open_interest))
+
+    def test_a_strike_child_falls_back_to_the_ticker_when_the_label_is_missing(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """`yes_sub_title` is present on every strike in every committed capture, but it is not a
+        documented guarantee and a labelless sub-row would render blank. The ticker is opaque and it
+        is the strike's primary key, so it always exists."""
+        event = _event(multi_close_page, "USCLIMATE")
+        event["markets"][0].pop("yes_sub_title")
+
+        children = venues.kalshi_strike_children(event["markets"])
+
+        assert children[0].title == event["markets"][0]["ticker"]
+
+    def test_a_collapsed_family_renders_no_children_because_it_quotes_a_price(
+        self, family_liquidity_page: dict[str, Any]
+    ) -> None:
+        """The exact complement of `kalshi_price_strike`: a family either quotes one price at the
+        family level or quotes every strike's beneath it, never both and never neither. This one has
+        collapsed to a single live strike, so the price belongs on the row itself."""
+        event = _event(family_liquidity_page, "KXNETANYAHUPARDON-26")
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.implied_prob_yes is not None
+        assert match.children == ()
+        assert venues.kalshi_price_strike(event["markets"]) is not None
+
+    @pytest.mark.parametrize("ticker", ["KXMARRIAGESTYLESKRAVITZ-HSZK", "USCLIMATE"])
+    def test_a_family_never_carries_both_a_price_and_children(
+        self, multi_close_page: dict[str, Any], ticker: str
+    ) -> None:
+        """The invariant the render depends on: a row with children shows a dash in `prob`, so a row
+        carrying both would render its own price AND its outcomes' — two answers to one question."""
+        event = _event(multi_close_page, ticker)
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert (match.implied_prob_yes is None) is bool(match.children)
 
     def test_a_collapsed_family_quotes_its_live_strike_not_the_first(
         self, family_liquidity_page: dict[str, Any]
@@ -602,8 +766,93 @@ class TestPolymarket:
 
         rows = venues.parse_polymarket_matches(payload, width=60)
 
+        assert rows is not None
         assert rows[0].open_interest == 4321.0
         assert rows[0].platform == "polymarket"
+
+    def test_a_multi_market_event_prices_each_child_and_not_itself(self, captured_payloads: dict[str, Any]) -> None:
+        """The mislabelled anchor this whole expansion starts from, pinned on the payload that
+        produced it.
+
+        The fixture's first event is titled "How many Fed rate cuts in 2026?" and its first nested
+        market is "Will no Fed rate cuts happen in 2026?" at 0.888. Reading `markets[0]` for the
+        price legs rendered 0.89 under the EVENT's title — and the forecaster prompts tell the model
+        to anchor on a matched market's price, so that row mislabelled an anchor rather than merely
+        losing one. Each child now carries its own `groupItemTitle` and its own `outcomePrices`.
+        """
+        event = captured_payloads["polymarket_search"]["events"][0]
+        assert event["title"] == "How many Fed rate cuts in 2026?"
+        assert event["markets"][0]["question"] == "Will no Fed rate cuts happen in 2026?"
+
+        rows = venues.parse_polymarket_matches(captured_payloads["polymarket_search"], width=60)
+
+        assert rows is not None
+        assert rows[0].market_title == "How many Fed rate cuts in 2026?"
+        assert (rows[0].implied_prob_yes, rows[0].bid, rows[0].ask, rows[0].spread) == (None, None, None, None)
+        assert [(child.title, child.implied_prob_yes) for child in rows[0].children] == [
+            ("0 (0 bps)", pytest.approx(0.888)),
+            ("1 (25 bps)", pytest.approx(0.065)),
+        ]
+
+    def test_a_multi_market_events_money_comes_off_the_event_not_a_child_sum(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """Gamma's public-search response TRUNCATES the nested markets list, so the children are a
+        subset of the event's outcomes: this event reports $46.2M of volume against $9.1M across the
+        two markets it shipped. Summing the visible subset would understate the family 5x, and
+        reading `markets[0]` (the pre-expansion behaviour) understated it by nearly 7x."""
+        event = captured_payloads["polymarket_search"]["events"][0]
+        child_volume_sum = sum(safe_float(market["volumeNum"]) or 0.0 for market in event["markets"])
+
+        rows = venues.parse_polymarket_matches(captured_payloads["polymarket_search"], width=60)
+
+        assert rows is not None
+        assert rows[0].total_volume == pytest.approx(safe_float(event["volume"]))
+        assert rows[0].open_interest == pytest.approx(safe_float(event["openInterest"]))
+        assert rows[0].volume_24h == pytest.approx(safe_float(event["volume24hr"]))
+        assert rows[0].total_volume is not None and rows[0].total_volume > 4 * child_volume_sum
+
+    def test_a_single_market_event_is_unchanged_and_gains_no_children(self, captured_payloads: dict[str, Any]) -> None:
+        """The superset half: event and market ask the same question when there is only one, so the
+        price legs stay the market's and the row renders exactly as it always has."""
+        payload = copy.deepcopy(captured_payloads["polymarket_search"])
+        event = payload["events"][1]
+        assert len(event["markets"]) == 1, "fixture must be single-market or this proves nothing"
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[1].children == ()
+        # Gamma ships `outcomePrices` as a JSON-encoded array of STRINGS, so the float conversion is
+        # part of what the parser is being pinned to do.
+        assert rows[1].implied_prob_yes == pytest.approx(float(json.loads(event["markets"][0]["outcomePrices"])[0]))
+        assert rows[1].bid == safe_float(event["markets"][0]["bestBid"])
+        assert rows[1].total_volume == pytest.approx(safe_float(event["markets"][0]["volumeNum"]))
+
+    def test_the_children_are_ordered_by_traded_size(self, captured_payloads: dict[str, Any]) -> None:
+        """The renderer truncates from the end, so this order decides which outcomes a forecaster
+        sees. Reversing the payload must not reverse the render."""
+        payload = copy.deepcopy(captured_payloads["polymarket_search"])
+        payload["events"][0]["markets"].reverse()
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert [child.title for child in rows[0].children] == ["0 (0 bps)", "1 (25 bps)"]
+
+    def test_a_child_falls_back_to_its_question_when_it_has_no_group_label(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """`groupItemTitle` is a third the length and reads as the ladder rung it is, but the live
+        capture in `polymarket_live_events_2026_08_03.json` ships it null, so the full binary
+        question is the fallback rather than a theoretical one."""
+        payload = copy.deepcopy(captured_payloads["polymarket_search"])
+        payload["events"][0]["markets"][0]["groupItemTitle"] = None
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[0].children[0].title == "Will no Fed rate cuts happen in 2026?"
 
     def test_the_markets_fallback_branch_also_reads_open_interest(self) -> None:
         payload = {
@@ -622,6 +871,7 @@ class TestPolymarket:
 
         rows = venues.parse_polymarket_matches(payload, width=60)
 
+        assert rows is not None
         assert len(rows) == 1
         assert rows[0].open_interest == 999.0
         assert rows[0].total_volume == 12345.0
@@ -631,6 +881,7 @@ class TestPolymarket:
     def test_the_score_is_the_inverted_venue_rank(self, captured_payloads: dict[str, Any]) -> None:
         rows = venues.parse_polymarket_matches(captured_payloads["polymarket_search"], width=60)
 
+        assert rows is not None
         assert [row.match_confidence for row in rows] == [100.0 - rank for rank in range(len(rows))]
         assert all(row.retrieval_channel == "venue_search" for row in rows)
 
@@ -638,10 +889,37 @@ class TestPolymarket:
         payload = copy.deepcopy(captured_payloads["polymarket_search"])
         payload["events"] = payload["events"] * 5
 
-        assert len(venues.parse_polymarket_matches(payload, width=3)) == 3
+        rows = venues.parse_polymarket_matches(payload, width=3)
 
-    def test_a_non_dict_payload_parses_to_nothing(self) -> None:
-        assert venues.parse_polymarket_matches(["not", "a", "dict"], width=60) == []
+        assert rows is not None and len(rows) == 3
+
+    def test_a_wrong_top_level_shape_reads_as_a_lost_fetch_not_an_empty_search(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 200 whose top-level shape is not Gamma's object is a LOSS, and ``[]`` hid that.
+
+        ``http_get_with_backoff`` has already converted every non-200 and every undecodable body
+        to ``None`` by the time this runs, so the only payload reaching here shapeless is a 200
+        whose contract changed. As ``[]`` that counted as a successful query in
+        ``flatten_results`` and published as a benign ``none`` token — the venue read exactly
+        like one whose index found nothing, which is the shape that hid a dead Manifold for 17
+        days. The WARN has to name the venue and the shape, because the operator's next question
+        is which venue broke.
+        """
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues.polymarket"):
+            assert venues.parse_polymarket_matches(["not", "a", "dict"], width=60) is None
+
+        assert "Polymarket returned a list payload" in "\n".join(caplog.messages)
+
+    def test_a_malformed_ROW_is_skipped_without_losing_the_venue(self) -> None:
+        """The other side of the top-level rule: one unreadable event among several is not a
+        venue-wide failure, so the row is dropped and its siblings still reach the pool."""
+        payload = {"events": ["not a dict", {"title": "Will X happen?", "slug": "x"}]}
+
+        rows = venues.parse_polymarket_matches(payload, width=60)
+
+        assert rows is not None
+        assert [row.market_title for row in rows] == ["Will X happen?"]
 
 
 class TestManifold:
@@ -663,6 +941,7 @@ class TestManifold:
     def test_the_score_is_the_inverted_venue_rank(self, captured_payloads: dict[str, Any]) -> None:
         rows = venues.parse_manifold_matches(captured_payloads["manifold_search"], width=60)
 
+        assert rows is not None
         assert [row.match_confidence for row in rows] == [100.0 - rank for rank in range(len(rows))]
 
     def test_the_caller_owns_the_row_width(self) -> None:
@@ -670,8 +949,28 @@ class TestManifold:
         make "width 60" mean 10 per query, with nothing to see at the call site."""
         payload = [{"id": f"m{i}", "question": f"Q{i}", "probability": 0.5} for i in range(25)]
 
-        assert len(venues.parse_manifold_matches(payload, width=25)) == 25
-        assert len(venues.parse_manifold_matches(payload, width=4)) == 4
+        wide = venues.parse_manifold_matches(payload, width=25)
+        narrow = venues.parse_manifold_matches(payload, width=4)
+
+        assert wide is not None and len(wide) == 25
+        assert narrow is not None and len(narrow) == 4
+
+    def test_a_wrong_top_level_shape_reads_as_a_lost_fetch_not_an_empty_search(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Manifold's half of the top-level-shape rule; see the Polymarket sibling for why ``[]``
+        was the wrong answer. This venue is where the cost was actually paid: it contributed zero
+        rows for 17+ days and every channel read it as healthy."""
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues.manifold"):
+            assert venues.parse_manifold_matches({"markets": []}, width=60) is None
+
+        assert "Manifold returned a dict payload" in "\n".join(caplog.messages)
+
+    def test_a_malformed_ROW_is_skipped_without_losing_the_venue(self) -> None:
+        rows = venues.parse_manifold_matches(["not a dict", {"id": "m1", "question": "Q"}], width=60)
+
+        assert rows is not None
+        assert [row.venue_market_id for row in rows] == ["m1"]
 
     @pytest.mark.asyncio
     async def test_the_search_asks_for_every_contract_type(self, captured_payloads: dict[str, Any]) -> None:
@@ -736,6 +1035,7 @@ class TestManifoldMultiOutcome:
         payload = manifold_multi_outcome["search_all"]
         rows = venues.parse_manifold_matches(payload, width=60)
 
+        assert rows is not None
         multi = [(row, raw) for row, raw in zip(rows, payload) if raw["outcomeType"] != "BINARY"]
         assert len(multi) == 2, "fixture must carry multi-outcome rows, or this proves nothing"
         for row, raw in multi:
@@ -755,6 +1055,7 @@ class TestManifoldMultiOutcome:
         payload = manifold_multi_outcome["search_all"]
         rows = venues.parse_manifold_matches(payload, width=60)
 
+        assert rows is not None
         assert [row.match_confidence for row in rows] == [100.0 - rank for rank in range(len(rows))]
         assert [row.market_title for row in rows] == [raw["question"] for raw in payload]
 
@@ -846,6 +1147,124 @@ class TestManifoldMultiOutcome:
 
         assert answers[0] == ("A" * venues.MANIFOLD_ANSWER_TEXT_MAX_CHARS, 0.9)
         assert answers[1] == ("two lines here", 0.8)
+
+    def test_the_answer_children_keep_every_rung_with_its_own_volume(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """The render-side read of the same array, and where it differs from the ranker's.
+
+        `top_answers` keeps three leaders and no volume, because it becomes one segment of a
+        one-line candidate line. The `↳` sub-rows have a volume column and their own budget, so they
+        keep the WHOLE ladder — throwing 14 of 17 rungs away here would discard the distribution's
+        shape to satisfy a cap tuned for a different surface.
+        """
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+
+        children = venues.manifold_answer_children(detail)
+
+        assert len(children) == len(detail["answers"]) == 17
+        assert len(children) > len(venues.manifold_top_answers(detail))
+        by_label = {child.title: child for child in children}
+        for answer in detail["answers"]:
+            assert by_label[answer["text"]].total_volume == pytest.approx(answer["volume"])
+            assert by_label[answer["text"]].implied_prob_yes == pytest.approx(answer["probability"])
+
+    def test_the_answer_children_are_ordered_by_probability(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """Not by volume like the real-money venues: these answers are a distribution over one
+        question's outcomes, and reading it means seeing where the mass sits."""
+        children = venues.manifold_answer_children(manifold_multi_outcome["detail_multi_numeric"])
+
+        # An answer with no readable probability is dropped rather than carried, so every child here
+        # has one — asserted rather than assumed, since the sort would be undefined otherwise.
+        assert all(child.implied_prob_yes is not None for child in children)
+        assert not any(child.is_resolved for child in children), "this fixture's rungs are all open"
+        probabilities = [child.implied_prob_yes or 0.0 for child in children]
+        assert probabilities == sorted(probabilities, reverse=True)
+        assert children[0].title == "$3.80 - $4.19"
+
+    def test_settled_rungs_queue_behind_the_ones_still_carrying_uncertainty(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """Probability alone was the obvious sort and is measurably wrong here.
+
+        A threshold ladder settles its crossed rungs to exactly 1.0 while the market stays open, so
+        this fixture's 10 settled rungs would sort to the front as a block of `1.00 RESOLVED` rows
+        and push all 7 rungs that still carry uncertainty past the render budget — spending the whole
+        allowance on the part of the ladder that is no longer a forecast. The settled rungs are real
+        evidence about the floor the series has crossed, so they follow rather than being dropped.
+        """
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+        settled = sum(1 for answer in detail["answers"] if answer.get("resolution"))
+        assert settled > len(detail["answers"]) / 2, "fixture must be settled-heavy, or this proves nothing"
+
+        children = venues.manifold_answer_children(detail)
+
+        flags = [child.is_resolved for child in children]
+        assert flags == sorted(flags), "every open rung precedes every settled one"
+        open_rungs = [child for child in children if not child.is_resolved]
+        assert len(open_rungs) == len(detail["answers"]) - settled
+        open_probabilities = [child.implied_prob_yes or 0.0 for child in open_rungs]
+        assert open_probabilities == sorted(open_probabilities, reverse=True)
+
+    def test_a_market_publishing_answers_publishes_no_market_level_price(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """The venue convention the render invariant rests on, pinned against the live capture.
+
+        Three of the four adapters enforce "a row with outcomes has no single price" structurally.
+        Manifold does not — the enrichment hook attaches children without touching
+        `implied_prob_yes` — because the venue itself guarantees it: a multi-outcome market arrives
+        with `probability` null and a BINARY one carries no `answers` key. If a payload refresh ever
+        shipped both, a row would render its own price AND its outcomes', which is two answers to one
+        question and makes the table's legend false. This is where that would be caught.
+        """
+        for key in ("detail_multiple_choice", "detail_multi_numeric", "detail_binary"):
+            detail = manifold_multi_outcome[key]
+            has_answers = isinstance(detail.get("answers"), list)
+            assert has_answers is (detail.get("probability") is None), key
+
+        # And the same convention on the SEARCH side, which is where the row's `implied_prob_yes`
+        # actually comes from: keyed on `outcomeType`, the field the parsers deliberately never read.
+        search = manifold_multi_outcome["search_all"]
+        assert {market["outcomeType"] for market in search} == {"BINARY", "MULTIPLE_CHOICE"}
+        for row, market in zip(venues.parse_manifold_matches(search, width=60) or [], search):
+            assert (row.implied_prob_yes is None) is (market["outcomeType"] != "BINARY"), row.market_title
+
+    def test_an_answer_child_carries_the_markets_bettor_count(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """The one field that is legitimately the PARENT's. Manifold scores participation on unique
+        bettors and publishes no per-answer count, so a child with `num_bettors=None` would render
+        `no-liquidity-data` — telling a forecaster the venue publishes no volume figures, on a venue
+        that publishes a volume for every answer. Every answer really does share one bettor pool."""
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+        assert detail["uniqueBettorCount"] > 0
+
+        children = venues.manifold_answer_children(detail)
+
+        assert {child.num_bettors for child in children} == {detail["uniqueBettorCount"]}
+
+    def test_a_settled_rung_is_marked_resolved_while_the_market_stays_open(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """A threshold ladder settles its crossed rungs individually — 10 of this fixture's 17
+        answers resolved YES while the market itself is open — so `status` is read per answer. A
+        rung's realized 1.0 is evidence about what happened, not a forecast, and the `status` column
+        is the only thing that says so."""
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+        assert detail["isResolved"] is False
+
+        children = venues.manifold_answer_children(detail)
+
+        resolved = {child.title for child in children if child.is_resolved}
+        assert resolved == {answer["text"] for answer in detail["answers"] if answer.get("resolution")}
+        assert 0 < len(resolved) < len(children), "fixture must mix settled and open rungs"
+
+    def test_a_binary_market_has_no_answer_children(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """The same discriminator `top_answers` uses: a BINARY detail carries no `answers` key at
+        all, so nothing here reads `outcomeType`."""
+        detail = manifold_multi_outcome["detail_binary"]
+        assert "answers" not in detail
+
+        assert venues.manifold_answer_children(detail) == ()
 
 
 class TestScalarCoercions:
@@ -966,6 +1385,73 @@ class TestPredictIt:
         assert match.close_time is not None
         assert match.close_time.strftime("%Y-%m-%d") == "2026-12-31"
 
+    def test_each_contract_becomes_a_child_with_its_own_last_trade_price(
+        self, captured_payloads: dict[str, Any]
+    ) -> None:
+        """Where a PredictIt ballot's prices finally reach a forecaster.
+
+        The market level has always (correctly) refused to quote one arbitrary contract as the
+        market's — the whole ~197-market universe reaches the pool, so there is no per-question query
+        to pick one with — which until the sub-rows landed meant every PredictIt row rendered
+        priceless. `lastTradePrice` rather than `bestBuyYesCost`: the last trade is a price somebody
+        paid, while the best ask on a thin contract can sit far from it.
+        """
+        market = captured_payloads["predictit_all"]["markets"][0]
+
+        match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.implied_prob_yes is None, "a ballot has no single probability"
+        assert [(child.title, child.implied_prob_yes) for child in match.children] == [
+            (contract["name"], pytest.approx(contract["lastTradePrice"])) for contract in market["contracts"]
+        ]
+
+    def test_the_contract_children_keep_ballot_order(self, captured_payloads: dict[str, Any]) -> None:
+        """Unsorted, unlike the real-money venues: PredictIt's dump carries no per-contract volume to
+        rank by — the same absence that makes every PredictIt row read `no-liquidity-data` — and its
+        own order is the meaningful one, since seat-count rungs and candidate lists arrive ordered."""
+        market = copy.deepcopy(captured_payloads["predictit_all"]["markets"][0])
+        market["contracts"] = [
+            {"name": "192 or fewer", "lastTradePrice": 0.21, "status": "Open"},
+            {"name": "193 to 197", "lastTradePrice": 0.09, "status": "Open"},
+            {"name": "198 to 202", "lastTradePrice": 0.40, "status": "Open"},
+        ]
+
+        children = venues.predictit_contract_children(market["contracts"])
+
+        assert [child.title for child in children] == ["192 or fewer", "193 to 197", "198 to 202"]
+
+    def test_a_settled_contract_is_marked_resolved_per_contract(self, captured_payloads: dict[str, Any]) -> None:
+        """Same rule as the market-level derivation, one level down: a missing status is not evidence
+        of settlement, so it reads open."""
+        market = copy.deepcopy(captured_payloads["predictit_all"]["markets"][0])
+        market["contracts"] = [
+            {"name": "Settled", "lastTradePrice": 1.0, "status": "Closed"},
+            {"name": "Trading", "lastTradePrice": 0.4, "status": "Open"},
+            {"name": "Unstated", "lastTradePrice": 0.4},
+        ]
+
+        children = venues.predictit_contract_children(market["contracts"])
+
+        assert [(child.title, child.is_resolved) for child in children] == [
+            ("Settled", True),
+            ("Trading", False),
+            ("Unstated", False),
+        ]
+
+    def test_a_contract_child_parses_its_own_close_date_through_the_guard(self) -> None:
+        """Each contract carries its own `dateEnd`, and PredictIt's `NA` sentinel is the common case
+        (the committed dump ships it on every contract), so the guard has to run per child too."""
+        contracts = [
+            {"name": "Dated", "lastTradePrice": 0.5, "dateEnd": "2026-11-03T23:59:59"},
+            {"name": "Sentinel", "lastTradePrice": 0.5, "dateEnd": "NA"},
+        ]
+
+        children = venues.predictit_contract_children(contracts)
+
+        assert children[0].close_time == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
+        assert children[1].close_time is None
+
     def test_contract_names_become_the_rules_text(self, captured_payloads: dict[str, Any]) -> None:
         """A PredictIt market's own title is often just "Which party will win ...", so the
         contract names are most of its semantic content."""
@@ -1046,8 +1532,31 @@ class TestPredictIt:
         lost = FakeSession({venues.PREDICTIT_URL: [FakeResponse(503, text="down"), FakeResponse(503, text="down")]})
         assert await venues.predictit_prefetch(lost) is None
 
-        shapeless = FakeSession({venues.PREDICTIT_URL: FakeResponse(200, payload={"nope": []})})
-        assert await venues.predictit_prefetch(shapeless) == []
+        empty = FakeSession({venues.PREDICTIT_URL: FakeResponse(200, payload={"markets": []})})
+        assert await venues.predictit_prefetch(empty) == [], "a genuinely empty dump is Signal C's business"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shapeless_body", [{"nope": []}, {"markets": "not a list"}, ["not", "an", "object"]])
+    async def test_a_wrong_top_level_shape_is_a_lost_dump_not_an_empty_universe(self, shapeless_body: Any) -> None:
+        """The caller CACHES a successful dump for 6h, which is what makes ``[]`` here expensive.
+
+        A 200 whose top-level shape changed parsed to an empty universe that
+        ``_predictit_universe`` then pinned as healthy for the TTL, so every later question in the
+        run read the venue back as fine with no HTTP and no counter bump. Signal C does fire on
+        the first question's empty observation, but the cache outlives the finding. ``None`` puts
+        it on the fetch-failed path instead: no cache write, one source loss.
+        """
+        session = FakeSession({venues.PREDICTIT_URL: FakeResponse(200, payload=shapeless_body)})
+
+        assert await venues.predictit_prefetch(session) is None
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_MARKET_is_filtered_without_losing_the_dump(self) -> None:
+        session = FakeSession(
+            {venues.PREDICTIT_URL: FakeResponse(200, payload={"markets": ["nonsense", {"id": 1, "name": "M"}]})}
+        )
+
+        assert await venues.predictit_prefetch(session) == [{"id": 1, "name": "M"}]
 
 
 class TestVenueRetryBudget:
