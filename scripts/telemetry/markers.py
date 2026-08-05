@@ -15,9 +15,10 @@ against the ACTUAL emitted format strings (the source of truth):
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
-* ``FORECASTER_DROPS`` / ``Degradation counters`` — ``metaculus_bot/forecaster.py``
-  (per-RUN summaries: which models dropped and why, and the counter set that
-  decides CI color)
+* ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
+  (per-RUN summary: which models dropped and why)
+* ``Degradation counters`` — ``metaculus_bot/degradation_counters.py``
+  ``format_degradation_summary`` (per-RUN counter set that decides CI color)
 * ``FORECASTERS_SURVIVED`` — ``metaculus_bot/forecaster.py``
   ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
   drop marker above is silent on a healthy question, and its comment-side twin
@@ -280,7 +281,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "forecaster_drops",
         # Per-run ensemble-drop summary emitted by
-        # forecaster.py:_emit_forecaster_drop_telemetry. No per-question ref (it
+        # drop_telemetry.py:emit_drop_telemetry. No per-question ref (it
         # aggregates a whole run), so qid_kind stays None. ``detail`` is a compact
         # model->cause->count JSON blob captured verbatim (it is in _RAW_FIELDS) so
         # the '/'-laden OpenRouter slugs and nested counts survive; ``systematic`` is

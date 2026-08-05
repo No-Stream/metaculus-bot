@@ -101,8 +101,8 @@ def mock_stacking_pipeline(
             "_forecaster_with_soft_deadline",
             new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
         ),
-        patch("metaculus_bot.forecaster.extract_disagreement_crux", **crux_kwargs) as mock_crux,
-        patch("metaculus_bot.forecaster.run_targeted_search", **search_kwargs) as mock_targeted,
+        patch("metaculus_bot.stacking_route.extract_disagreement_crux", **crux_kwargs) as mock_crux,
+        patch("metaculus_bot.stacking_route.run_targeted_search", **search_kwargs) as mock_targeted,
     ):
         mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
 
@@ -1228,7 +1228,7 @@ class TestConditionalStackingSkipLogMessage:
         question = _make_binary_question()
 
         with mock_stacking_pipeline(bot, predictions=_HIGH_SPREAD_BINARY):
-            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
                 await bot._research_and_make_predictions(question)
 
         skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
@@ -1253,7 +1253,7 @@ class TestConditionalStackingSkipLogMessage:
         question = _make_binary_question()
 
         with mock_stacking_pipeline(bot, predictions=_LOW_SPREAD_BINARY):
-            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
                 await bot._research_and_make_predictions(question)
 
         skip_logs = [r.getMessage() for r in caplog.records if "Conditional stacking SKIPPED" in r.getMessage()]
@@ -1314,7 +1314,7 @@ class TestSingleForecasterShortCircuit:
             question = make_mock_numeric_question(id_of_question=301)
 
         with mock_stacking_pipeline(bot, predictions=[single_prediction]) as mocks:
-            with caplog.at_level("INFO", logger="metaculus_bot.forecaster"):
+            with caplog.at_level("INFO", logger="metaculus_bot.stacking_route"):
                 result = await bot._research_and_make_predictions(question)
 
         # No spread-driven machinery ran (short-circuit fires before the branch).
@@ -1367,7 +1367,7 @@ class TestSingleForecasterShortCircuit:
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", new=AsyncMock(return_value="research")),
             patch.object(bot, "_forecaster_with_soft_deadline", new=AsyncMock(side_effect=fake_forecaster)),
-            patch("metaculus_bot.forecaster.extract_disagreement_crux", new=AsyncMock()) as mock_crux,
+            patch("metaculus_bot.stacking_route.extract_disagreement_crux", new=AsyncMock()) as mock_crux,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
             result = await bot._research_and_make_predictions(question)

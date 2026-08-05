@@ -95,10 +95,14 @@ class TestBinaryHighSpreadTriggersStacking:
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text"
+                "metaculus_bot.stacking_route.extract_disagreement_crux",
+                new_callable=AsyncMock,
+                return_value="Crux text",
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results"
+                "metaculus_bot.stacking_route.run_targeted_search",
+                new_callable=AsyncMock,
+                return_value="Targeted results",
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=0.45) as mock_stacking,
         ):

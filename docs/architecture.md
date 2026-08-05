@@ -164,11 +164,11 @@ other publications continue. The guard lives in `_research_and_make_predictions`
 
 When the threshold is 1, a lone survivor publishes: the median of one forecast is
 that forecast. Because the spread metrics in `spread_metrics.py` require at least two
-predictions and raise otherwise, `_research_and_make_predictions` short-circuits the
-n == 1 case before spread computation and stacking and hands the single prediction
-straight to the aggregator. Exception-driven drops still bump the degradation
-counters, so a run thinned to one model reddens CI rather than silently withholding
-the question.
+predictions and raise otherwise, `route_after_forecasts` (`stacking_route.py`)
+short-circuits the n == 1 case before spread computation and stacking and hands the
+single prediction straight to the aggregator. Exception-driven drops still bump the
+degradation counters, so a run thinned to one model reddens CI rather than silently
+withholding the question.
 
 ### 5. Aggregation: CONDITIONAL_STACKING
 
@@ -189,7 +189,7 @@ Spread thresholds live in `constants.py`, one per question type:
 **Stacking is disabled in production.** All four workflow YAMLs set
 `BINARY_STACKING_ENABLED`, `MC_STACKING_ENABLED`, and `NUMERIC_STACKING_ENABLED` to
 `false`, so even when spread exceeds the threshold, the per-type gate in
-`_research_and_make_predictions` (`forecaster.py`) bypasses the stacker and forces the
+`route_after_forecasts` (`stacking_route.py`) bypasses the stacker and forces the
 MEDIAN path. In effect, **prod runs MEDIAN of the raw forecasts.** The stacker chain
 stays fully wired and is exercised in
 backtests and ablation runs. The aggregation dispatch, base-combine, and stacker
@@ -214,6 +214,8 @@ record the performance-analysis tooling later parses.
 |---|---|
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
+| Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
+| Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`, `degradation_counters.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Forecaster runners | `metaculus_bot/forecaster_runners.py` |

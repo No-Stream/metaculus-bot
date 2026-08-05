@@ -371,10 +371,14 @@ class TestNumericHighSpreadTriggersStacking:
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text"
+                "metaculus_bot.stacking_route.extract_disagreement_crux",
+                new_callable=AsyncMock,
+                return_value="Crux text",
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results"
+                "metaculus_bot.stacking_route.run_targeted_search",
+                new_callable=AsyncMock,
+                return_value="Targeted results",
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_dist) as mock_stacking,
         ):
@@ -510,10 +514,10 @@ class TestMCHighSpreadTriggersStacking:
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux"
+                "metaculus_bot.stacking_route.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux"
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
+                "metaculus_bot.stacking_route.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_result) as mock_stacking,
         ):

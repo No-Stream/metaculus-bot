@@ -1,10 +1,9 @@
 import asyncio
-import json
 import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, NamedTuple, Sequence, cast
+from typing import Any, Callable, Coroutine, Sequence, cast
 
 from forecasting_tools import (  # AskNewsSearcher,
     BinaryQuestion,
@@ -29,24 +28,29 @@ from metaculus_bot.close_margin import format_close_margin_marker
 from metaculus_bot.comment.trimming import trim_section
 from metaculus_bot.config import load_environment
 from metaculus_bot.constants import (
-    BINARY_STACKING_ENABLED_ENV,
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
-    CRUX_SOFT_DEADLINE,
     DEFAULT_MAX_CONCURRENT_RESEARCH,
     FORECASTER_SOFT_DEADLINE,
-    MC_STACKING_ENABLED_ENV,
     MIN_FORECASTERS_TO_PUBLISH,
-    NUMERIC_STACKING_ENABLED_ENV,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     STACKER_SOFT_DEADLINE,
     TS_ANCHOR_CHART_ENABLED_ENV,
-    WALL_CLOCK_STACKING_MIN_BUDGET,
     env_flag_enabled,
 )
-from metaculus_bot.exceptions import ValueExtractionError
-from metaculus_bot.llm_retry import is_zero_output_failure
+from metaculus_bot.degradation_counters import (
+    alertable_total,
+    format_conditional_stacking_summary,
+    format_degradation_summary,
+)
+from metaculus_bot.drop_telemetry import (
+    DROP_CAUSE_TIMEOUT_SOFT_DEADLINE,
+    DROP_CAUSE_TIMEOUT_WALL_CLOCK,
+    ForecasterDrop,
+    classify_raised_drop_cause,
+    emit_drop_telemetry,
+)
 from metaculus_bot.llm_setup import prepare_llm_config
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import (
@@ -57,56 +61,12 @@ from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
 )
-from metaculus_bot.research.targeted import extract_disagreement_crux, run_targeted_search
-from metaculus_bot.spread_metrics import compute_spread
-
-# Probabilistic-tools wiring (Workstream C activation). The feature flag is
-# re-exported under a descriptive local alias so call sites read clearly.
+from metaculus_bot.stacking_route import route_after_forecasts
 from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
 
 load_environment()
-
-
-# --- Forecaster-drop attribution (systematic-failure observability) ----------
-# When a forecaster is dropped from the ensemble, we record WHICH model, WHICH
-# question, and WHY — turning the bare forecasters_dropped=N scalar into a signal
-# that can tell a one-off blip from a model going systematically bad (a refusal
-# class, a routing problem, provider-wide instability). Each cause below is
-# honestly DETERMINABLE at its recording site (see the _record_forecaster_drop
-# call sites); we never guess — "error_other" is the explicit catch-all.
-DROP_CAUSE_TIMEOUT_WALL_CLOCK = "timeout_wall_clock"  # per-question wall-clock budget expired; task cancelled
-DROP_CAUSE_TIMEOUT_SOFT_DEADLINE = "timeout_soft_deadline"  # per-forecaster FORECASTER_SOFT_DEADLINE exceeded
-DROP_CAUSE_ZERO_OUTPUT = "zero_output"  # provider returned no usable content (empty/whitespace body)
-DROP_CAUSE_PARSE_EXTRACTION = "parse_extraction"  # the value-extraction ladder exhausted every rung
-DROP_CAUSE_ERROR_OTHER = "error_other"  # a raised exception outside the classes above
-
-
-class _ForecasterDrop(NamedTuple):
-    """One dropped ensemble member, attributed. ``model`` is the GeneralLlm slug,
-    ``qid`` the question id (None only when a site genuinely can't know it), and
-    ``cause`` one of the ``DROP_CAUSE_*`` categories."""
-
-    model: str
-    qid: int | None
-    cause: str
-
-
-def _classify_raised_drop_cause(exc: BaseException) -> str:
-    """Map an exception that dropped a forecaster to a ``DROP_CAUSE_*`` category.
-
-    Inspects the ALREADY-CAUGHT exception's type/shape — no new try/except. Reuses
-    ``llm_retry.is_zero_output_failure`` so this telemetry's "zero_output" label
-    agrees with the retry gate's own classification by construction (the 2026-07-25
-    OpenRouter whitespace-drip). ``asyncio.TimeoutError`` is recorded at the
-    soft-deadline site and excluded before this is called, so it never lands here.
-    """
-    if is_zero_output_failure(exc):
-        return DROP_CAUSE_ZERO_OUTPUT
-    if isinstance(exc, ValueExtractionError):
-        return DROP_CAUSE_PARSE_EXTRACTION
-    return DROP_CAUSE_ERROR_OTHER
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -209,7 +169,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Per-model drop attribution (same lifecycle as the scalar above — one
         # bot instance == one run). _record_forecaster_drop is the single write
         # path that keeps this list and the scalar in lockstep.
-        self._forecaster_drops: list[_ForecasterDrop] = []
+        self._forecaster_drops: list[ForecasterDrop] = []
         self._questions_failed_to_publish: int = 0
         # qid -> forecasters that contributed to the published value, recorded by
         # _research_and_make_predictions and drained by _create_unified_explanation
@@ -434,37 +394,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         log_pchip_summary()
 
         if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
-            logger.info(
-                "Conditional stacking summary: triggered=%d, skipped=%d, "
-                "skipped_single_forecaster=%d, crux_failures=%d, search_failures=%d",
-                self._conditional_stacking_triggered_count,
-                self._conditional_stacking_skipped_count,
-                self._conditional_stacking_skipped_single_forecaster_count,
-                self._conditional_stacking_crux_failures,
-                self._conditional_stacking_search_failures,
-            )
+            logger.info(format_conditional_stacking_summary(self))
 
         # Loud end-of-run degradation summary. Any non-zero counter here means
         # something got dropped, the stacker fell back, or a research provider
         # failed — all states where CI (cli.py) should exit non-zero so we get
         # paged, but every publishable question has already been published.
-        logger.info(
-            "Degradation counters: forecasters_dropped=%d, questions_failed_to_publish=%d, "
-            "stacker_primary_failed=%d, stacker_fallback_used=%d, stacker_fallback_failed=%d, "
-            "research_provider_failures=%d, summarizer_failures=%d, gap_fill_v2_errors=%d, "
-            "prediction_market_degraded=%d, prediction_market_source_losses=%d, provider_degradation=%d",
-            self._forecasters_dropped_count,
-            self._questions_failed_to_publish,
-            self._stacker_primary_failed_count,
-            self._stacker_fallback_used_count,
-            self._stacker_fallback_failed_count,
-            self._research_provider_failure_count,
-            self._summarizer_failure_count,
-            self._gap_fill_v2_error_count,
-            self._prediction_market_degraded_count,
-            self._prediction_market_source_loss_count,
-            self._provider_degradation_count,
-        )
+        logger.info(format_degradation_summary(self))
         # Per-model attribution for the forecasters_dropped scalar above: which
         # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
         # WARNING when one model failed across multiple questions this run.
@@ -514,28 +450,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
     @property
     def alertable_count(self) -> int:
-        """Sum of counters whose non-zero value should page us.
-
-        Consumed by cli.py to decide whether to sys.exit(1) after all
-        publications complete. Any individual non-zero counter is enough to
-        trip the alert; the sum is just a convenient single number.
-
-        The conditional-stacking counters are deliberately absent: a triggered or
-        skipped stacker is normal operation, not degradation.
-        """
-        return (
-            self._forecasters_dropped_count
-            + self._questions_failed_to_publish
-            + self._stacker_primary_failed_count
-            + self._stacker_fallback_used_count
-            + self._stacker_fallback_failed_count
-            + self._research_provider_failure_count
-            + self._summarizer_failure_count
-            + self._gap_fill_v2_error_count
-            + self._prediction_market_degraded_count
-            + self._prediction_market_source_loss_count
-            + self._provider_degradation_count
-        )
+        """Sum of counters whose non-zero value should page us (see degradation_counters)."""
+        return alertable_total(self)
 
     def _record_forecaster_drop(self, *, model: str, qid: int | None, cause: str) -> None:
         """Record ONE dropped ensemble member with attribution, bumping the scalar.
@@ -545,63 +461,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         so the two can never drift. The scalar stays a plain settable int for
         continuity — the telemetry archive and ``alertable_count`` both read it.
         """
-        self._forecaster_drops.append(_ForecasterDrop(model=model, qid=qid, cause=cause))
+        self._forecaster_drops.append(ForecasterDrop(model=model, qid=qid, cause=cause))
         self._forecasters_dropped_count += 1
 
     def _emit_forecaster_drop_telemetry(self) -> None:
-        """Emit the per-run ``FORECASTER_DROPS`` marker + a human per-model summary,
-        and WARN on any single model that dropped across MULTIPLE questions.
-
-        Attribution is CODE-derived (never model-self-reported): every entry was
-        stamped at a drop site with the model slug, the question id, and a
-        determinable cause. This turns the bare ``forecasters_dropped=N`` scalar
-        into "which model failed, how often, and why" answerable in one grep.
-
-        The systematic signal (a single model dropping on >=2 DISTINCT questions)
-        is a WARNING, not just a summary line: at the current
-        ``MIN_FORECASTERS_TO_PUBLISH`` floor a model going bad silently degrades every
-        forecast in the run while CI shows one modest red mark, so it must be visible
-        without grepping. It deliberately does NOT change the exit code or block
-        publishing (that is the operator's
-        call); ``alertable_count`` already reddens CI on ANY drop.
-        """
-        drops = self._forecaster_drops
-        # model -> cause -> count, plus the set of DISTINCT questions each model
-        # dropped on (the systematic-failure key).
-        detail: dict[str, dict[str, int]] = {}
-        questions_by_model: dict[str, set[int]] = defaultdict(set)
-        for drop in drops:
-            per_cause = detail.setdefault(drop.model, {})
-            per_cause[drop.cause] = per_cause.get(drop.cause, 0) + 1
-            if drop.qid is not None:
-                questions_by_model[drop.model].add(drop.qid)
-
-        systematic = sorted(model for model, qids in questions_by_model.items() if len(qids) >= 2)
-        systematic_field = ",".join(systematic) if systematic else "none"
-        # Compact JSON blob: robust to '/'-laden OpenRouter slugs (which defeat any
-        # delimiter-based encoding) and json.loads-able by residual analysis.
-        detail_json = json.dumps(detail, sort_keys=True, separators=(",", ":"))
-        logger.info("FORECASTER_DROPS: total=%d systematic=%s detail=%s", len(drops), systematic_field, detail_json)
-
-        if not drops:
-            return
-
-        for model in sorted(detail):
-            cause_str = ",".join(f"{cause}:{count}" for cause, count in sorted(detail[model].items()))
-            logger.info("Forecaster drops by model: %s=%d [%s]", model, sum(detail[model].values()), cause_str)
-
-        for model in systematic:
-            cause_str = ",".join(f"{cause}:{count}" for cause, count in sorted(detail[model].items()))
-            qids = ",".join(str(qid) for qid in sorted(questions_by_model[model]))
-            logger.warning(
-                "SYSTEMATIC_FORECASTER_FAILURE: model=%s dropped_on_questions=%d qids=%s causes=%s — "
-                "one model failed across multiple questions this run (likely a refusal class or routing "
-                "problem, not a blip); investigate or consider pulling it from the roster.",
-                model,
-                len(questions_by_model[model]),
-                qids,
-                cause_str,
-            )
+        """Emit this run's per-model drop attribution (see drop_telemetry)."""
+        emit_drop_telemetry(self._forecaster_drops)
 
     async def _run_stacking(
         self,
@@ -711,7 +576,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     self._record_forecaster_drop(
                         model=task_model.get(task, "unknown"),
                         qid=qid_for_log,
-                        cause=_classify_raised_drop_cause(exc),
+                        cause=classify_raised_drop_cause(exc),
                     )
         exception_group: ExceptionGroup | None = (
             ExceptionGroup(f"Errors: {errors}", cast(list[Exception], exceptions)) if exceptions else None
@@ -818,12 +683,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Diagnostics seam: run_research returns forecaster-clean text (the
         # provider-diagnostics block is withheld so it never reaches forecaster
         # prompts, the stacker, or the gap-fill v2 driver brief). It must still
-        # reach the published comment, so re-append it to the comment-bound
-        # research_report strings only.
+        # reach the published comment, so it rides down to the router, which
+        # re-appends it to the comment-bound research_report strings only.
         diagnostics_block = self._research.pop_provider_diagnostics(question.id_of_question)
-
-        def _with_diagnostics(text: str) -> str:
-            return f"{text}\n\n{diagnostics_block}" if diagnostics_block else text
 
         # Pull the time-series-anchor chart image (if the chart flag rendered one
         # this question) out of the provider's per-session cache so the base
@@ -838,13 +700,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # the char limit. The "### Research Summary" heading is emitted
         # regardless of body, so the trim anchor and parser markers survive.
         summary_report = "_Full research in the RESEARCH section below._"
-        research_to_use = research
 
         qid_for_log = question.id_of_question
         tasks = cast(
             list[Coroutine[Any, Any, ReasonedPrediction[Any]]],
             [
-                self._forecaster_with_soft_deadline(question, research_to_use, llm_instance, qid_for_log, chart_b64)
+                self._forecaster_with_soft_deadline(question, research, llm_instance, qid_for_log, chart_b64)
                 for llm_instance in self._forecaster_llms
             ],
         )
@@ -910,234 +771,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ",".join(survivor_models) if survivor_models else "unknown",
         )
 
-        # Single-forecaster short-circuit. When MIN_FORECASTERS_TO_PUBLISH permits it, a
-        # question can survive on one forecaster, but the spread metrics
-        # (compute_spread and the per-type helpers in spread_metrics.py) REQUIRE
-        # >=2 predictions and raise otherwise, and stacking a lone base model is
-        # meaningless. So when only one forecaster survived we skip spread +
-        # stacking entirely and hand the single prediction to the parent
-        # aggregator, whose _base_combine returns it as-is (snap-to-integers
-        # applied for discrete numerics). Placed before the budget gate and the
-        # per-strategy branches so it short-circuits every stacking path — which is
-        # also why this branch has to bump its OWN skip counter: the two increment
-        # sites below are unreachable from here.  The _stacker_outcome marker is
-        # "skipped" (stacking was skipped, non-stacked aggregation); the distinct log
-        # line and counter record the single-forecaster reason.
-        if n_valid == 1 and self.aggregation_strategy in (
-            AggregationStrategy.STACKING,
-            AggregationStrategy.CONDITIONAL_STACKING,
-        ):
-            self._conditional_stacking_skipped_single_forecaster_count += 1
-            logger.info(
-                "Conditional stacking SKIPPED: single forecaster survived for Q %s; "
-                "skipping spread + stacking, aggregating the lone prediction",
-                qid_for_log,
-            )
-            self._register_expected_base_combine(question)
-            self._stacker_outcome[question.id_of_question] = "skipped"
-            return ResearchWithPredictions(
-                research_report=_with_diagnostics(research),
-                summary_report=summary_report,
-                errors=errors,
-                predictions=valid_predictions,
-            )
-        # Stacking budget gate. If we've burned through the per-Q wall-clock
-        # budget (e.g. research stalled, fan-out used most of the budget),
-        # skip the stacker LLM entirely and force the MEDIAN fallback. Typical
-        # publish is ~1s; the WALL_CLOCK_STACKING_MIN_BUDGET floor leaves
-        # headroom for sustained slowness on a single POST. The full worst case
-        # (both POSTs stalling for PUBLISH_POST_TIMEOUT * (PUBLISH_POST_RETRIES + 1))
-        # requires multi-POST stalling, which is recovered by
-        # skip_stacking_for_budget already.
-        skip_stacking_for_budget = (
-            self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
-            and self._remaining_budget_seconds(per_q_start) < WALL_CLOCK_STACKING_MIN_BUDGET
-        )
-        if skip_stacking_for_budget:
-            # F15: the base-combine re-entry uses MEAN under STACKING and
-            # MEDIAN under CONDITIONAL_STACKING (see ``base_combine_strategy`` in
-            # aggregation_pipeline.py). The marker must match the
-            # actual aggregation method so residual analysis cuts bucket the
-            # two paths correctly.
-            budget_skip_outcome = (
-                "fallback_median"
-                if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING
-                else "fallback_mean"
-            )
-            logger.warning(
-                "WALLCLOCK_ABORT: skipping stacking for Q %s; remaining=%.1fs < %ds; forcing %s fallback",
-                qid_for_log,
-                self._remaining_budget_seconds(per_q_start),
-                WALL_CLOCK_STACKING_MIN_BUDGET,
-                budget_skip_outcome,
-            )
-            self._stacker_outcome[question.id_of_question] = budget_skip_outcome
-            # Register so parent's _aggregate_predictions (which will run with
-            # reasoned_predictions=None) takes the expected base-combine path
-            # and doesn't log "Unexpected STACKING combine".
-            self._register_expected_base_combine(question)
-
-        # If using stacking, aggregate the predictions here
-        if self.aggregation_strategy == AggregationStrategy.STACKING and not skip_stacking_for_budget:
-            if getattr(self, "research_reports_per_question", 1) != 1:
-                logger.warning(
-                    "STACKING configured with research_reports_per_question=%s; final results will average per-report stacked outputs by mean.",
-                    getattr(self, "research_reports_per_question", 1),
-                )
-            return await self._finalize_stacked_prediction(
-                question,
-                valid_predictions,
-                research_for_stacking=research_to_use,
-                research_report=_with_diagnostics(research),
-                summary_report=summary_report,
-                errors=errors,
-                default_meta_reasoning="Stacked prediction aggregated from multiple models",
-            )
-        elif self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING and not skip_stacking_for_budget:
-            prediction_values = [pred.prediction_value for pred in valid_predictions]
-            spread = compute_spread(question, prediction_values)
-            threshold = self._get_threshold_for_question(question)
-
-            # Per-question-type stacking gates. All three default to DISABLED. Set
-            # <TYPE>_STACKING_ENABLED=true in deploy env to opt a type back into
-            # stacking; otherwise the stacker is bypassed (forces median/skipped path).
-            spread_exceeds_threshold = spread > threshold
-            type_stacking_disabled = False
-            type_to_stacking_env = {
-                BinaryQuestion: BINARY_STACKING_ENABLED_ENV,
-                MultipleChoiceQuestion: MC_STACKING_ENABLED_ENV,
-                NumericQuestion: NUMERIC_STACKING_ENABLED_ENV,
-            }
-            for q_type, env_name in type_to_stacking_env.items():
-                if isinstance(question, q_type):
-                    if spread_exceeds_threshold and not env_flag_enabled(env_name, default=False):
-                        # Disagreement was high enough to trigger stacking, but the
-                        # per-type gate is off, so we deliberately bypass it.
-                        spread_exceeds_threshold = False
-                        type_stacking_disabled = True
-                    break
-
-            if spread_exceeds_threshold:
-                self._conditional_stacking_triggered_count += 1
-                logger.info(
-                    "Conditional stacking TRIGGERED: spread=%.3f > threshold=%.3f for question %s",
-                    spread,
-                    threshold,
-                    question.id_of_question,
-                )
-
-                if self._stacker_llm is None:
-                    raise ValueError("CONDITIONAL_STACKING requires a stacker LLM to be configured")
-                if self._analyzer_llm is None:
-                    raise ValueError("CONDITIONAL_STACKING requires an analyzer LLM to be configured")
-
-                # 1. Extract the crux of disagreement under a soft deadline.
-                # Without the wait_for the only bound is the analyzer LLM's own
-                # litellm timeout (UTILITY_MODEL_CONFIG in llm_configs.py), which
-                # is looser than CRUX_SOFT_DEADLINE on this critical path.
-                base_texts = [stacking.strip_model_tag(pred.reasoning) for pred in valid_predictions]
-                try:
-                    crux = await asyncio.wait_for(
-                        extract_disagreement_crux(
-                            self._analyzer_llm,
-                            question.question_text,
-                            base_texts,
-                        ),
-                        timeout=CRUX_SOFT_DEADLINE,
-                    )
-                except asyncio.TimeoutError:
-                    self._conditional_stacking_crux_failures += 1
-                    logger.warning(
-                        "CRUX_SOFT_DEADLINE: crux extraction exceeded %ds for Q %s; skipping targeted research",
-                        CRUX_SOFT_DEADLINE,
-                        question.id_of_question,
-                    )
-                    crux = ""
-                except Exception:
-                    self._conditional_stacking_crux_failures += 1
-                    logger.exception("Disagreement crux extraction failed, skipping targeted research")
-                    crux = ""
-
-                # 2. Run targeted research if crux was extracted
-                targeted_research_text = ""
-                if crux:
-                    try:
-                        targeted_research_text = await run_targeted_search(
-                            crux, question.question_text, is_benchmarking=self.is_benchmarking
-                        )
-                    except Exception:
-                        self._conditional_stacking_search_failures += 1
-                        logger.exception("Targeted search failed, proceeding with base research only")
-
-                # 3. Combine research
-                if targeted_research_text:
-                    combined_research = (
-                        f"{research_to_use}\n\n"
-                        f"## Targeted Research (addressing model disagreement)\n"
-                        f"{targeted_research_text}"
-                    )
-                else:
-                    combined_research = research_to_use
-
-                # 4. Run stacking.
-                #
-                # research_report must be combined_research so the
-                # ## Targeted Research (addressing model disagreement) header
-                # reaches the published comment.
-                return await self._finalize_stacked_prediction(
-                    question,
-                    valid_predictions,
-                    research_for_stacking=combined_research,
-                    research_report=_with_diagnostics(combined_research),
-                    summary_report=summary_report,
-                    errors=errors,
-                    default_meta_reasoning=(
-                        "Conditional stacking: aggregated from multiple models after high-disagreement detected"
-                    ),
-                )
-            else:
-                self._conditional_stacking_skipped_count += 1
-                if type_stacking_disabled:
-                    logger.info(
-                        "Conditional stacking SKIPPED: stacking disabled for this question type "
-                        "(spread=%.3f, threshold=%.3f) for question %s",
-                        spread,
-                        threshold,
-                        question.id_of_question,
-                    )
-                else:
-                    logger.info(
-                        "Conditional stacking SKIPPED: spread=%.3f <= threshold=%.3f for question %s",
-                        spread,
-                        threshold,
-                        question.id_of_question,
-                    )
-                self._register_expected_base_combine(question)
-                # "skipped_config_off" (spread exceeded the threshold but the
-                # per-type gate was off) vs plain "skipped" (spread at/below
-                # threshold) — keeps the suppression reason durable in the
-                # published marker instead of requiring git archaeology over
-                # workflow-yaml flag history.
-                self._stacker_outcome[question.id_of_question] = (
-                    "skipped_config_off" if type_stacking_disabled else "skipped"
-                )
-                return ResearchWithPredictions(
-                    research_report=_with_diagnostics(research),
-                    summary_report=summary_report,
-                    errors=errors,
-                    predictions=valid_predictions,
-                )
-
-        # Catch-all: non-stacking strategy, OR stacking strategy whose budget
-        # gate forced fallback_median above. In both cases we return the raw
-        # valid_predictions and let the parent class's per-Q aggregator combine
-        # them. For the skip case, _stacker_outcome was already set to
-        # "fallback_median" upstream so the comment-marker reflects reality.
-        return ResearchWithPredictions(
-            research_report=_with_diagnostics(research),
-            summary_report=summary_report,
+        return await route_after_forecasts(
+            self,
+            question=question,
+            qid=qid_for_log,
+            valid_predictions=valid_predictions,
             errors=errors,
-            predictions=valid_predictions,
+            research=research,
+            summary_report=summary_report,
+            diagnostics_block=diagnostics_block,
+            per_q_start=per_q_start,
         )
 
     @classmethod
@@ -1382,19 +1025,3 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._discrete_integer_votes[qid].append(discrete_vote)
         return prediction
-
-    def _log_llm_output(self, llm_to_use: GeneralLlm, question_id: int | None, reasoning: str) -> None:
-        model_name = llm_to_use.model
-        logger.info(
-            f"""
-\n\n
-========================================
-LLM OUTPUT | Model: {model_name} | Question: {question_id} | Length: {len(reasoning)} chars
-========================================
-{reasoning}
-========================================
-END LLM OUTPUT | {model_name}
-========================================
-\n\n
-"""
-        )

@@ -4,7 +4,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
 
 from scripts import gha_artifacts
 
@@ -345,3 +345,40 @@ def _build_mock_question(
 def make_mock_question():
     """Factory for building mock MetaculusQuestion objects with configurable fields."""
     return _build_mock_question
+
+
+# Shared TemplateForecaster mocks.
+#
+# Shared rather than per-file because the forecaster's own tests are split across
+# three modules by responsibility (the bot itself, drop attribution, degradation
+# counters) and all three construct the same one-forecaster bot. The open/resolve
+# times are relative to now (not conftest's fixed _OPEN/_RESOLVE) because the
+# prompt builders call _forecasting_window_str, which reads them as a live window.
+
+
+def make_mock_general_llm(model: str = "mock_model") -> MagicMock:
+    """A ``MagicMock(spec=GeneralLlm)`` whose ``invoke`` returns canned reasoning."""
+    llm = MagicMock(spec=GeneralLlm)
+    llm.model = model
+    llm.invoke = AsyncMock(return_value="mock reasoning")
+    return llm
+
+
+@pytest.fixture
+def mock_general_llm() -> MagicMock:
+    return make_mock_general_llm()
+
+
+@pytest.fixture
+def mock_binary_question() -> MagicMock:
+    question = MagicMock(spec=BinaryQuestion)
+    question.page_url = "http://example.com/binary_question"
+    question.question_text = "Binary Test Question"
+    question.background_info = "Binary background info"
+    question.resolution_criteria = "Binary resolution criteria"
+    question.fine_print = "Binary fine print"
+    question.unit_of_measure = "binary units"
+    question.id_of_question = 456
+    question.open_time = datetime.now() - timedelta(days=30)
+    question.scheduled_resolution_time = datetime.now() + timedelta(days=365)
+    return question

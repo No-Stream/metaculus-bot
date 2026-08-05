@@ -624,7 +624,7 @@ class TestParseLogText:
 
 
 # Example lines copied from the emitting format string
-# (metaculus_bot/forecaster.py:_emit_forecaster_drop_telemetry) — the source of
+# (metaculus_bot/drop_telemetry.py:emit_drop_telemetry) — the source of
 # truth, so a producer-side shape change breaks these loudly.
 FORECASTER_DROPS_LINE = (
     PFX + "FORECASTER_DROPS: total=3 systematic=openrouter/anthropic/claude-opus-4.8 "
@@ -719,7 +719,8 @@ class TestForecastersUsed:
 
 # The per-run degradation summary — the single line that decides CI color, since
 # cli.py exits non-zero whenever alertable_count is positive. Copied from the
-# format string in metaculus_bot/forecaster.py (forecast_questions), the source of
+# format string in metaculus_bot/degradation_counters.py
+# (format_degradation_summary), the source of
 # truth. Without a spec here the archive held no record of the counter that reddens
 # every run: the 2026-07-26 research_provider_timeouts -> research_provider_failures
 # rename would have been invisible to a replay.
