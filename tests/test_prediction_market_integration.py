@@ -5,6 +5,12 @@ FREE, unauthenticated, public read endpoints — no key, no spend — so they ar
 the repo's cost gate. They stay opt-in on `RUN_INTEGRATION_TESTS` only because a
 network round-trip does not belong in a dev loop, not because they cost anything.
 
+**The two LLM stages are MOCKED even here, and that is a cost-gate requirement rather
+than convenience.** The full-pipeline test drives the real venues but patches
+`_invoke_market_llm`, so no test in this file can ever bill an OpenRouter key. A live
+ranking call is a priced step the operator fires deliberately, not something a test
+turns on by setting an env var.
+
 Run them with:
 
     RUN_INTEGRATION_TESTS=1 uv run pytest -m integration tests/test_prediction_market_integration.py
@@ -26,13 +32,27 @@ which is the point.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import aiohttp
 import pytest
 
 pytestmark = [pytest.mark.integration, pytest.mark.allow_network]
+
+# Canned completions for the two LLM stages, in the shapes their parsers accept. The ranker
+# array is empty on purpose: `[]` is a VALID answer (it is the adaptive-width mechanism), it
+# needs no knowledge of how many candidates today's live catalogues produced, and it exercises
+# the parse-and-apply path without pretending to be a judgment.
+_CANNED_QUERY_AUTHOR = json.dumps({"synonyms": ["POTUS", "White House"], "framings": ["Trump stays president"]})
+_CANNED_RANKING = "[]"
+
+
+async def _canned_market_llm(config: dict, prompt: str, **_kwargs: object) -> str:
+    """Stand-in for `_invoke_market_llm`, routing on the prompt each stage builds."""
+    return _CANNED_RANKING if "Rank the candidates by EVIDENTIAL VALUE" in prompt else _CANNED_QUERY_AUTHOR
+
 
 # Spelled out so a run log states WHY this is off rather than just that it is: these
 # calls are free (four public unauthenticated read endpoints), so the gate is about
@@ -63,11 +83,11 @@ def _build_integration_question() -> MagicMock:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_polymarket_real_search_returns_parseable_response():
-    from metaculus_bot.research.prediction_market import _polymarket_search
+    from metaculus_bot.research.market_retrieval.venues import polymarket_search
 
     async with aiohttp.ClientSession() as session:
         try:
-            matches = await _polymarket_search(session, "Trump president 2026")
+            matches = await polymarket_search(session, "Trump president 2026", width=10)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Polymarket transient error: {e}")
 
@@ -94,11 +114,11 @@ async def test_polymarket_real_search_returns_parseable_response():
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_manifold_real_search_returns_parseable_response():
-    from metaculus_bot.research.prediction_market import _manifold_search
+    from metaculus_bot.research.market_retrieval.venues import manifold_search
 
     async with aiohttp.ClientSession() as session:
         try:
-            matches = await _manifold_search(session, "Trump president 2026")
+            matches = await manifold_search(session, "Trump president 2026", width=10)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Manifold transient error: {e}")
 
@@ -130,13 +150,13 @@ async def test_manifold_search_term_is_still_a_strict_conjunction():
     token that appears in no market zeroes the result, while reordering present tokens does
     not. A relevance floor would behave the opposite way.
     """
-    from metaculus_bot.research.prediction_market import _manifold_search
+    from metaculus_bot.research.market_retrieval.venues import manifold_search
 
     async with aiohttp.ClientSession() as session:
         try:
-            baseline = await _manifold_search(session, "gas prices")
-            with_impossible_token = await _manifold_search(session, "gas prices zzzqqqxyz")
-            reordered = await _manifold_search(session, "prices gas")
+            baseline = await manifold_search(session, "gas prices", width=10)
+            with_impossible_token = await manifold_search(session, "gas prices zzzqqqxyz", width=10)
+            reordered = await manifold_search(session, "prices gas", width=10)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Manifold transient error: {e}")
 
@@ -154,15 +174,15 @@ async def test_manifold_search_term_is_still_a_strict_conjunction():
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
-    from metaculus_bot.research.prediction_market import _kalshi_prefetch_events, _kalshi_search_local
+    from metaculus_bot.research.market_retrieval.venues import kalshi_event_match, kalshi_prefetch_events
 
     async with aiohttp.ClientSession() as session:
         try:
-            events, _tally = await _kalshi_prefetch_events(session, event_limit=500, page_sleep_s=1.0)
+            pull = await kalshi_prefetch_events(session, event_limit=500, max_pages=3)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Kalshi prefetch transient error: {e}")
 
-    if not events:
+    if not pull.events:
         pytest.skip("Kalshi prefetch returned no events (transient)")
 
     # Liquidity-field contract, checked against the LIVE payload rather than a fixture.
@@ -170,16 +190,23 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
     # and a probability range, so a Kalshi field rename (or a parser reading a name that
     # never existed) passed here indefinitely. Every open Kalshi market carries volume and
     # open interest — 1,504/1,504 on 2026-08-03 — so a venue-wide absence is a real break.
-    nested = [mkt for ev in events for mkt in (ev.get("markets") or []) if isinstance(mkt, dict)]
+    #
+    # The pull PROJECTS each page down as it streams, so a field missing here means either
+    # Kalshi renamed it or the projection stopped retaining it — both are the same defect from
+    # the parser's point of view, and both blank the rendered `signal` column.
+    nested = [mkt for ev in pull.events for mkt in (ev.get("markets") or []) if isinstance(mkt, dict)]
     assert nested, "Kalshi events carried no nested markets"
-    assert any("volume_fp" in mkt for mkt in nested), "Kalshi no longer publishes volume_fp — parser needs updating"
-    assert any("open_interest_fp" in mkt for mkt in nested), (
-        "Kalshi no longer publishes open_interest_fp — parser needs updating"
+    assert any(mkt.get("volume_fp") is not None for mkt in nested), (
+        "Kalshi volume_fp reached no projected market — either upstream renamed it or the projection dropped it"
+    )
+    assert any(mkt.get("open_interest_fp") is not None for mkt in nested), (
+        "Kalshi open_interest_fp reached no projected market — upstream rename or a dropped projection field"
     )
 
-    matches = _kalshi_search_local(events, "Trump president 2026", top_k=3, min_score=30.0)
-    # It's OK if matches is empty -- Kalshi coverage is sparse for some topics.
-    for m in matches:
+    rows = [kalshi_event_match(ev, match_confidence=1.0, channel="universe_fuzzy") for ev in pull.events]
+    matches = [row for row in rows if row is not None]
+    assert matches, "no candidate row survived from a live catalogue page"
+    for m in matches[:20]:
         assert m.platform == "kalshi"
         if m.implied_prob_yes is not None:
             assert 0.0 <= m.implied_prob_yes <= 1.0
@@ -195,13 +222,12 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
 async def test_predictit_real_prefetch_and_search_returns_parseable_response():
     """PredictIt's /marketdata/all/ is free + no-auth. Assert the schema
     (top-level `markets` list, contracts carrying `lastTradePrice`) and that a
-    US-politics query fuzzy-matches. Schema breaks fail loud; transient errors
-    and sparse-topic zero-results skip."""
-    from metaculus_bot.research.prediction_market import _predictit_prefetch, _predictit_search_local
+    every market becomes a candidate row. Schema breaks fail loud; transient errors skip."""
+    from metaculus_bot.research.market_retrieval.venues import predictit_market_match, predictit_prefetch
 
     async with aiohttp.ClientSession() as session:
         try:
-            markets = await _predictit_prefetch(session)
+            markets = await predictit_prefetch(session)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"PredictIt prefetch transient error: {e}")
 
@@ -217,12 +243,15 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
     assert isinstance(contracts, list) and contracts
     assert "lastTradePrice" in contracts[0]
 
-    matches = _predictit_search_local(markets, "Trump president 2026", top_k=3, min_score=30.0)
-    for m in matches:
+    rows = [predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy") for market in markets]
+    matches = [row for row in rows if row is not None]
+    assert matches, "the whole PredictIt universe must reach the pool — there is no pre-filter"
+    for m in matches[:20]:
         assert m.platform == "predictit"
         assert m.market_title
-        if m.implied_prob_yes is not None:
-            assert 0.0 <= m.implied_prob_yes <= 1.0
+        # No price: a design that hands the whole universe to a ranker has no per-question query
+        # to select a contract on, so pricing an arbitrary one would misreport the market.
+        assert m.implied_prob_yes is None
         # PredictIt exposes no liquidity fields.
         assert m.total_volume is None
         assert m.open_interest is None
@@ -236,14 +265,30 @@ async def test_full_orchestrator_against_real_apis():  # noqa: ASYNC910
     q = _build_integration_question()
     pmp._reset_session_caches()
 
-    try:
-        snapshot = await pmp.fetch_market_snapshot(q, timeout=30.0)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        pytest.skip(f"Orchestrator transient error: {e}")
+    # The LLM stages are patched, NOT enabled: see the module docstring. This test's job is the
+    # live venue surface and the pool it produces, and the canned ranking returns `[]` so no
+    # rows render — which is why the assertions below are about the POOL, read out of the
+    # MARKET_RANKING telemetry line, rather than about rendered matches.
+    with patch.object(pmp, "_invoke_market_llm", _canned_market_llm):
+        try:
+            snapshot = await pmp.fetch_market_snapshot(q, timeout=pmp.PREDICTION_MARKET_TIMEOUT)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            pytest.skip(f"Orchestrator transient error: {e}")
 
-    # Zero matches is acceptable -- skip rather than fail on a sparse-topic day.
-    if not snapshot.matches:
-        pytest.skip("No matches across any platform (transient or zero-result)")
+    # Every source must have reported, and none of the four venues may be a loss: this is the
+    # live check that the seven-key diagnostics dict still describes a working pipeline.
+    assert set(snapshot.sources) == {
+        "polymarket",
+        "manifold",
+        "kalshi",
+        "predictit",
+        "manifold_detail",
+        "query_author",
+        "ranking",
+    }, snapshot.sources
+    for venue in ("polymarket", "manifold", "kalshi", "predictit"):
+        assert snapshot.sources[venue].startswith(("ok", "none")), f"{venue} lost a sub-fetch: {snapshot.sources}"
+    assert snapshot.sources["ranking"] == "ok(0)", snapshot.sources
 
     for m in snapshot.matches:
         assert m.platform in ("polymarket", "kalshi", "manifold", "predictit")

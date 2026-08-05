@@ -953,7 +953,7 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # prediction_market_degraded is read-only — it reads the prediction-market
     # module's per-run global — so stub the accessor the property imports rather
     # than bumping the counter 128 times.
-    monkeypatch.setattr(prediction_market, "kalshi_series_fetch_failures", lambda: 128)
+    monkeypatch.setattr(prediction_market, "kalshi_catalogue_fetch_failures", lambda: 128)
     # Same shape for the source-loss counter (operator decision 2026-07-25: any
     # prediction-market source losing a fetch reddens CI), so a dropped or
     # double-counted ninth term shows up in the sum.
@@ -1105,16 +1105,16 @@ async def test_forecast_questions_resets_prediction_market_counter(mock_general_
     }
     bot = TemplateForecaster(llms=llms_config, min_forecasters_to_publish=1)
 
-    prediction_market._bump_kalshi_series_failure()
+    prediction_market._bump_kalshi_catalogue_failure()
     prediction_market._bump_source_loss()
-    assert prediction_market.kalshi_series_fetch_failures() == 1
+    assert prediction_market.kalshi_catalogue_fetch_failures() == 1
     assert prediction_market.prediction_market_source_losses() == 1
     # Live module bumps (not stubbed accessors) reach alertable_count...
     assert bot.alertable_count == 2
     try:
         await bot.forecast_questions([])
 
-        assert prediction_market.kalshi_series_fetch_failures() == 0
+        assert prediction_market.kalshi_catalogue_fetch_failures() == 0
         assert prediction_market.prediction_market_source_losses() == 0
         assert bot.alertable_count == 0
     finally:

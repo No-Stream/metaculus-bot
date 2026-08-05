@@ -237,38 +237,67 @@ unrecognized (fetched-anyway-but-flagged) IDs.
 
 ### Prediction-market snapshot — `PREDICTION_MARKETS_ENABLED`
 
-A crowd-forecast cross-check (`research/prediction_market.py`). Fans out to four
-venues concurrently:
+A crowd-forecast cross-check (`research/prediction_market.py`, with the retrieval
+machinery in `research/market_retrieval/`). Generation is deliberately
+recall-maximal and ALL the judgment sits in one LLM ranking call, because the
+bake-off measured that selection, not generation, is the binding constraint: a
+perfect ranker over the pool that already exists reaches 14/16 questions while the
+same pool's deterministic top-4 reaches 5/16.
 
-- **Polymarket** (Gamma public-search, bounded retry on 403 IP rate limits).
-- **Kalshi** (no keyword endpoint — prefetch open events once per session up to
-  `KALSHI_PREFETCH_EVENT_LIMIT`, cached for `KALSHI_CACHE_TTL_S`, fuzzy-match
-  client-side with rapidfuzz).
-- **Manifold** (search endpoint, plus an extra natural-language query since its
-  search prefers that framing).
-- **PredictIt** (prefetch the full market dump, fuzzy-match locally, and pick the
-  *contract* whose name best matches the query so a "Trump 2028?" query surfaces
-  the Trump contract's price, not whichever contract is listed first).
+Four stages per question:
 
-Keyword extraction defaults to `s4_s5_union`: two LLM prompts (noun phrases +
-entity/event/deadline) run in parallel via a small model, unioned and deduped
-(`PREDICTION_MARKET_KEYWORD_STRATEGY`, valid: `s4_s5_union` / `s5_only` /
-`simple`). The result is rendered as a markdown table: implied probability, total
-volume, open interest, a liquidity/participation `signal` label (thin / decent /
-deep for real-money venues, thin / decent / high by bettor count for Manifold,
-`no-liquidity-data` for PredictIt), close date, and match confidence, followed by
-each market's resolution rules. The prompt tells forecasters to verify each
-market's criteria and date against the question — a matched market is strong
-evidence, a mismatched one is discounted proportionally — and to weight by the
-liquidity label.
+1. **Catalogue prefetch**, concurrent with a **query author**. Kalshi's complete
+   open-events catalogue is paginated and projected down to the ~14 retained fields
+   as each page streams in (`KALSHI_CATALOGUE_WALL_TIMEOUT`,
+   `KALSHI_PREFETCH_MAX_PAGES`, cached `KALSHI_CACHE_TTL_S`); PredictIt's whole
+   ~197-market dump is one GET. Neither needs a query, which is what makes the
+   concurrency free. The query author is one LLM call
+   (`MARKET_QUERY_AUTHOR_LLM_CONFIG`) emitting domain vocabulary the question's own
+   tokens cannot reach; its output is ADDITIVE to a deterministic query set, so its
+   failure costs no recall.
+2. **Venue-native search** for Manifold and Polymarket — the two venues whose own
+   index is the only way in. Every deduped query is issued in parallel, with
+   per-query failure isolation, and every query is stripped of digit-bearing tokens
+   first because Manifold's `term` is a strict conjunction that one date token
+   zeroes. The enumerable venues score against the UN-stripped set, where a year is
+   real signal against a catalogue of dated market titles.
+3. **Pool assembly**, three channels unioned, with channel order as the ranking: a
+   settlement-source join (Kalshi events settling on a publisher the question's own
+   resolution text names — the recall channel a word-overlap scorer structurally
+   cannot see), then the venue-index hits, then the enumerable universes ranked by
+   a fuzzy scorer with NO floor. A bounded Manifold detail fan-out then fills in the
+   rules text the search listing omits.
+4. **Ranking**: one call (`MARKET_RANKER_LLM_CONFIG`) over the whole ~380-440
+   candidate pool, returning up to 8 rows in ranked order with a relation tier and a
+   one-phrase reason. Width is the model's choice in 0..8 — an empty array is a
+   VALID answer, not a failure — and nothing downstream re-orders, re-scores or
+   caps per venue. On unreadable output the provider falls open to the pool-order
+   top rows, marked as such.
+
+The render is that order verbatim: implied probability, total volume, open
+interest, a liquidity/participation `signal` label (thin / decent / deep for
+real-money venues, thin / decent / high by bettor count for Manifold,
+`no-liquidity-data` for PredictIt), close date, `open`/`RESOLVED` status, and the
+ranker's `relation` + `why`, followed by each market's resolution rules. The
+forecaster prompts tell models to weight by both axes — the liquidity label and the
+relation tier — and to read a RESOLVED price as a realized outcome rather than a
+forecast.
 
 This provider is **hard-disabled under benchmarking** (`is_benchmarking=True`
-returns `""`), regardless of the env flag. The `as_of` filter only drops markets
-that closed *before* `as_of`; still-open markets would leak post-`as_of`
-information into a backtest, so the benchmarking guard is the only safe defense.
-That guard is why its forecasting value can't be measured by the standard
-backtest gate — it was validated with live `test_bot.yaml` runs and opt-in live
-integration tests.
+returns `""`), regardless of the env flag, and that guard is the ONLY leakage
+defence: markets retain their last-trade price after resolution, so a market that
+closes between an `as_of` instant and now leaks either way. The provider path
+therefore passes `as_of=None`. The filter itself survives for explicit callers
+(backtests, replay tooling) and filters the POOL, so a leaked market never reaches
+the ranker either. Prod ran with a derived `as_of` until 2026-08-04, and it cost
+real recall: it dropped every market closing before the question resolved — the
+"same quantity, adjacent month" class that carries most of the evidential value —
+and prod telemetry recorded 20 of 47 archived runs where Polymarket fetched
+candidates and rendered nothing because of it.
+
+The benchmarking guard is also why this provider's forecasting value can't be
+measured by the standard backtest gate — it was validated with live
+`test_bot.yaml` runs and opt-in live integration tests.
 
 ### Resolution-source fetcher — `RESOLUTION_SOURCE_ENABLED`
 

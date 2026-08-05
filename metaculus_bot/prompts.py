@@ -443,6 +443,23 @@ _MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
     "that market's depth as unknown — judge it on its resolution-criteria match, and do not read it as thin."
 )
 
+# The second axis market retrieval gained when it moved to ranked selection: the table arrives
+# in EVIDENTIAL order with a per-row `relation` grade and a one-phrase `why`, so a forecaster
+# has something better to weight on than word overlap. Kept next to the liquidity
+# sentence, inside the same shared constant region, so all three prompts stay in sync — which is
+# what the comment block above exists to protect. The four tier names are verbatim from
+# `market_retrieval.ranking.TIERS`; renaming one there without renaming it here silently teaches
+# forecasters a vocabulary the table no longer uses.
+_MARKET_RELATION_WEIGHTING_SENTENCE = (
+    "The markets are listed in order of evidential value, most valuable first, and each row carries a "
+    "`relation` label saying how it relates to this question: `same_quantity_same_date` measures the same "
+    "thing on the same date and is the strongest anchor available; `same_quantity_other_cut` measures the "
+    "same thing at a different date, threshold, or source, so extrapolate from it rather than discounting it "
+    "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. A row marked "
+    "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
+    "evidence about what happened, not as a probability."
+)
+
 
 def _strong_evidence_market_clause(
     *,
@@ -477,7 +494,7 @@ def _strong_evidence_market_clause(
         "When the criteria are practically identical and the only material difference is the resolution date, do "
         f"NOT apply a vague haircut — EXPLICITLY EXTRAPOLATE {extrapolate_target} to our resolution date with a "
         f"simple model and state the assumption. {projection} "
-        f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE}"
+        f"{_MARKET_LIQUIDITY_WEIGHTING_SENTENCE} {_MARKET_RELATION_WEIGHTING_SENTENCE}"
     )
 
 

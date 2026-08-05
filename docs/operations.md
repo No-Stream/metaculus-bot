@@ -763,6 +763,26 @@ the telemetry markers:
   `prediction_market_platform_failures` also became
   `prediction_market_source_losses`. `scripts/telemetry/markers.py` matches both
   spellings, so archived pre-rename logs still harvest.
+  `prediction_market_degraded` kept its name when the counter behind it moved off
+  the retired Kalshi `/series` index onto the full events-catalogue pull, so the
+  field name is stable across that change while what it guards got strictly more
+  load-bearing — the catalogue feeds both the settlement-source join and the fuzzy
+  channel. Note that a lost catalogue pull bumps BOTH this counter and
+  `prediction_market_source_losses`, so one outage adds 2 to `alertable_count`;
+  that is deliberate over-counting (the two carry different marker fields) and not
+  two separate failures.
+
+**One analysis hazard from ranked market retrieval, worth knowing before you diff
+`providers_used` across eras.** The ranker may legitimately return zero rows, in
+which case the provider renders nothing and the `## Prediction Market Snapshot`
+header never appears. An ARTIFACT record still lists the provider under
+`providers_attempted` (it ran, it just had nothing to say), but a COMMENT- or
+LOG-backfilled record reconstructs `providers_used` by scanning for that header,
+so the provider simply vanishes from it. So a drop in prediction-market presence
+across backfilled records can mean "the ranker declined" rather than "the provider
+broke", and the two are only distinguishable from an artifact record or from the
+`MARKET_RANKING:` line's `outcome=` field. No code change: the header-scan
+reconstruction is lossy by construction and always was.
 
 A run can also exit non-zero for degradation alerts — the counters above,
 personal-key fallbacks, or the model-deprecation tripwire — even when every

@@ -749,25 +749,16 @@ NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
 # instead. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 
-# Outer wall-clock timeout for the full prediction-market snapshot (keyword
-# extraction + HTTP fan-out to all platforms). Runs inside asyncio.gather
-# alongside other research providers, so increasing this does not add
-# wall-clock time to the overall research phase.
-PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "30.0"))
-
-# Per-attempt wall cap and backoff ladder for the keyword-extraction LLM call, which
-# is the FIRST stage of the snapshot above. Before these existed the call's only
-# bound was the snapshot-level wait_for, so a stalled extractor killed the whole
-# snapshot instead of just itself, and its retries came from forecasting-tools'
-# un-gated ``random.uniform(5, 10)`` tenacity sleep. A single short backoff (two
-# attempts, matching the effective budget the un-gated tenacity gave) rather than the
-# shared ``llm_retry.DEFAULT_TRANSIENT_BACKOFFS``, whose sleeps alone exceed the
-# snapshot budget. The wall is PER ATTEMPT, so the ceiling both values must fit under
-# is (len(backoffs) + 1) * wall + sum(backoffs), which has to stay below
-# PREDICTION_MARKET_TIMEOUT with room left for the four-platform fan-out. Redo that
-# arithmetic when changing either value — tests/test_llm_retry.py pins it.
-PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT: float = 12.0
-PREDICTION_MARKET_KEYWORD_BACKOFFS: tuple[float, ...] = (1.0,)
+# Outer wall-clock timeout for the full prediction-market snapshot (both LLM stages, the
+# catalogue pulls, the venue fan-out and the Manifold detail enrichment). Runs inside
+# asyncio.gather alongside the other research providers, so raising it adds no wall-clock time
+# to the research phase — for scale, NATIVE_SEARCH_WALL_TIMEOUT is 420, Gemini 360, AskNews 300.
+# 150 is the ranked pipeline's 131.5s worst case (table below) plus margin; it was 30.0 under
+# the keyword/fuzzy design, which a ~36k-token ranking call and a full catalogue pull do not
+# fit inside. `prediction_market.SNAPSHOT_STAGE_BUDGET_S` recomputes that worst case from these
+# constants and WARNs loudly at provider init when an env override sits below it, so a stale
+# `PREDICTION_MARKET_TIMEOUT=30` in a .env cannot masquerade as a generic snapshot timeout.
+PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "150.0"))
 
 # --- Ranked market retrieval (the two LLM stages and the catalogue pull) ---
 # Wall caps and backoff ladders for the snapshot's two new LLM stages, plus the bounds
@@ -812,26 +803,6 @@ KALSHI_CATALOGUE_WALL_TIMEOUT: float = 40.0
 KALSHI_PAGE_SLEEP_S: float = 0.0
 KALSHI_PREFETCH_EVENT_LIMIT: int = 20_000
 KALSHI_PREFETCH_MAX_PAGES: int = 120
-
-# Keyword-extraction strategy for matching Metaculus questions to market
-# listings. Default ``s4_s5_union`` is the empirical best on a 15-question
-# G0 study (67% hit rate vs 33% naive baseline; see
-# scratch_docs_and_planning/prediction_market_keyword_extraction_experiment.md).
-# ``s5_only`` is cheaper at 60%; ``simple`` is the cost-floor baseline.
-PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
-PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
-
-# Relevance gate for the prediction-market snapshot. A matched contract is labelled
-# ``likely-relevant`` (and its question earns the strong-evidence preamble) only when the
-# content-word overlap between the question (title + resolution criteria) and the contract
-# (title + rules) is >= MARKET_RELEVANCE_OVERLAP_MIN AND the matcher confidence is
-# >= MARKET_RELEVANCE_CONF_MIN; otherwise it is ``verify-carefully`` and the question gets a
-# neutral "fuzzy-matched, verify before weighting" preamble. Nothing is dropped — the gate only
-# governs labels + the header. Tuned on 403 hand-graded contracts (2026-07-19): 60% contract
-# precision / 57% recall, question-level header precision 34%->68%, false-strong 100%->17%. See
-# scratch/new_analyses_2026-07-18/threshold_sanity.md and market_match_precision.md §d.
-MARKET_RELEVANCE_OVERLAP_MIN: int = 3
-MARKET_RELEVANCE_CONF_MIN: float = 0.50
 
 # --- Time-Series Anchor Provider (Phase B) ---
 # Env-gated OFF by default. Renders a deterministic empirical-band anchor grounded

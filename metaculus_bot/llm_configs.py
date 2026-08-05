@@ -19,7 +19,8 @@ __all__ = [
     "STACKER_LLM",
     "STACKER_FALLBACK_LLM",
     "DISAGREEMENT_ANALYZER_LLM",
-    "PREDICTION_MARKET_KEYWORD_LLM_CONFIG",
+    "MARKET_QUERY_AUTHOR_LLM_CONFIG",
+    "MARKET_RANKER_LLM_CONFIG",
 ]
 # Reasoning models ignore (or degrade under) explicit sampling params, so we
 # defer to provider defaults. temperature=None is explicit but redundant on
@@ -199,30 +200,57 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     **{**REASONING_MODEL_CONFIG, "allowed_tries": 1, "timeout": 300},
 )
 
-# Keyword-extraction LLM config for the prediction-market provider.
-# Keyword extraction is capability-saturated; luna is the cheapest capable tier
-# (mini → luna 2026-08-03, same effort — prices in the PARSER_LLM comment above).
-# Per G0 (2026-05-12 prediction_market_keyword_extraction_experiment.md):
-# gpt-5.4-mini reasoning=low burned 128-512 tokens on invisible reasoning before
-# emitting any visible response. That measurement is mini's and luna is
-# unmeasured on that axis, so the max_tokens set below stays load-bearing.
-# Constructed per-call inside _run_llm rather than as a singleton because the
-# provider is gated OFF by default and we don't want to pay construction cost
-# (or break the existing test pattern that patches build_llm_with_openrouter_fallback).
-# temperature=None defers reasoning models to provider defaults; redundant on
-# ft 0.2.92 (GeneralLlm ctor default is already None). top_p left unset.
-# allowed_tries=1: the call is wrapped in the elapsed-gated retry
-# (prediction_market.KeywordExtractor._run_llm), so that wrapper is the SOLE retry
-# layer. Left unpinned this inherited forecasting-tools' default of 2 with an
-# UN-GATED random.uniform(5, 10) tenacity sleep — a large slice of
-# PREDICTION_MARKET_TIMEOUT spent sleeping blind, which is exactly what llm_retry
-# exists to eliminate.
-PREDICTION_MARKET_KEYWORD_LLM_CONFIG: dict = {
+# --- The prediction-market provider's two LLM stages ---
+#
+# Both are RAW DICTS rather than built GeneralLlm singletons, unlike PARSER_LLM and friends:
+# the provider is gated OFF by default, so paying construction cost at import would be waste,
+# and the tests patch `build_llm_with_openrouter_fallback` at the provider's one invocation
+# helper. Both route `openrouter/openai/...` through that wrapper, which tries the donated
+# Metaculus key first and falls back to the personal key on credential / credit / route errors
+# — so prod spend lands on OAI_ANTH_OPENROUTER_KEY.
+#
+# `allowed_tries=1` is required, not decorative: the repo's elapsed-gated `llm_retry` wrapper
+# (prediction_market._invoke_market_llm) is the SOLE retry layer, and leaving this unpinned
+# inherits forecasting-tools' default of 2 with an UN-GATED `random.uniform(5, 10)` tenacity
+# sleep — a large slice of PREDICTION_MARKET_TIMEOUT spent sleeping blind, which is exactly
+# what llm_retry exists to eliminate. `temperature=None` defers reasoning models to provider
+# defaults (redundant on ft 0.2.92, whose ctor default is already None); top_p left unset. Each
+# litellm `timeout` sits ABOVE its elapsed-gated wall cap in constants.py, so the wall is the
+# binding bound.
+#
+# Luna is the cheapest tier that saturates both tasks, at $0.10/M in and $0.60/M out
+# (OpenRouter list, verified 2026-08-03 — same prices quoted in the PARSER_LLM comment above).
+# Cost per question at the measured shapes: ranker ~36k in (median, post-enrichment and
+# full-PredictIt) + ~589 out ≈ $0.0040; author ~1.4k in + ~300 out ≈ $0.0003. The two keyword
+# calls they replace measured ~170 tok in / ~50 out ≈ $0.0001, so net new is ≈ +$0.003 per
+# question — fractions of a cent per run at the prod shape of 1-2 questions. The bake-off's
+# $0.0068/question is the BYOK ceiling, where input is marked up ~2.5x list and this traffic is
+# 97% input.
+
+# Prediction-market RANKER: one call per question over the whole ~380-440-candidate pool,
+# emitting up to 8 ranked rows with a relation tier and a one-phrase label. Measured completion
+# averages 589 tokens including reasoning, max 1,042 (scratch/bakeoff_run_2026-08-03/results/
+# RANKED_ARM_RESULTS.md). max_tokens sits ~3x above that max because a TRUNCATED ranking is a
+# fail-open — the whole ranking is lost, not just its tail — and luna's output tokens are cheap.
+MARKET_RANKER_LLM_CONFIG: dict = {
     "model": "openrouter/openai/gpt-5.6-luna",
     "temperature": None,
-    "max_tokens": 800,
+    "max_tokens": 3000,
     "reasoning_effort": "low",
-    "timeout": 60,
+    "timeout": 90,
+    "allowed_tries": 1,
+}
+
+# Prediction-market QUERY AUTHOR: one call per question emitting the domain vocabulary the
+# question's own tokens cannot reach (up to 8 synonyms + 3 framings). Its output is ADDITIVE to
+# a deterministic query set, so its failure costs recall nothing. Measured completion max 588
+# tokens including reasoning; max_tokens sits ~2.5x above that.
+MARKET_QUERY_AUTHOR_LLM_CONFIG: dict = {
+    "model": "openrouter/openai/gpt-5.6-luna",
+    "temperature": None,
+    "max_tokens": 1500,
+    "reasoning_effort": "low",
+    "timeout": 45,
     "allowed_tries": 1,
 }
 

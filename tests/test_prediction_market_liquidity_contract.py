@@ -31,18 +31,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
+from metaculus_bot.research.market_retrieval.queries import (
+    _RELEVANCE_STOPWORDS,
+    deterministic_queries,
+    manifold_relaxation_terms,
+)
+from metaculus_bot.research.market_retrieval.venues import kalshi_event_match, parse_polymarket_matches
 from metaculus_bot.research.prediction_market import (
     LIQUIDITY_DEEP_USD,
     LIQUIDITY_THIN_USD,
-    KeywordExtractor,
-    _kalshi_search_local,
     _liquidity_label,
-    _parse_polymarket_matches,
-    manifold_relaxation_terms,
 )
 
 _DATA = Path(__file__).parent / "data"
@@ -72,10 +73,16 @@ def _event_by_role(events: list[dict], role: str) -> dict:
 
 
 def _match_for(events: list[dict], role: str):
+    """The fixture event as a candidate row, plus its first nested market.
+
+    No score argument and no floor: ranked retrieval builds a row for EVERY catalogue event and
+    lets the ranker select, so the parse is unconditional and this helper cannot accidentally be
+    testing a filter.
+    """
     ev = _event_by_role(events, role)
-    matches = _kalshi_search_local([ev], ev["title"], top_k=1, min_score=0.0)
-    assert matches, f"fixture event {role!r} did not fuzzy-match its own title"
-    return matches[0], ev["markets"][0]
+    match = kalshi_event_match(ev, match_confidence=1.0, channel="universe_fuzzy")
+    assert match is not None, f"fixture event {role!r} produced no candidate row"
+    return match, ev["markets"][0]
 
 
 # D1 — Kalshi field names
@@ -171,7 +178,7 @@ class TestPolymarketOpenInterestNesting:
         market (0/42), so the market-level read yielded None on every row ever archived."""
         ev = polymarket_live_payload["events"][0]
         assert "openInterest" not in ev["markets"][0], "fixture no longer exercises the nesting defect"
-        matches = _parse_polymarket_matches(polymarket_live_payload, query=ev["title"])
+        matches = parse_polymarket_matches(polymarket_live_payload, width=10)
         assert matches
         assert matches[0].open_interest == pytest.approx(float(ev["openInterest"]))
 
@@ -181,7 +188,7 @@ class TestPolymarketOpenInterestNesting:
         payload = json.loads(json.dumps(polymarket_live_payload))
         ev = payload["events"][0]
         ev["markets"][0]["openInterest"] = 4242.0
-        matches = _parse_polymarket_matches(payload, query=ev["title"])
+        matches = parse_polymarket_matches(payload, width=10)
         assert matches[0].open_interest == pytest.approx(4242.0)
 
     def test_top_level_markets_fallback_branch_also_reads_open_interest(self):
@@ -200,7 +207,7 @@ class TestPolymarketOpenInterestNesting:
                 }
             ],
         }
-        matches = _parse_polymarket_matches(payload, query="Fed cut rates 2026")
+        matches = parse_polymarket_matches(payload, width=10)
         assert matches[0].open_interest == pytest.approx(90000.0)
         assert _liquidity_label(matches[0]) == "deep"
 
@@ -211,8 +218,6 @@ class TestPolymarketOpenInterestNesting:
 def _content_tokens(term: str) -> int:
     """Manifold requires every CONTENT token to appear in a market's text; stopwords are
     measured not to constrain the match (see the D2 diagnosis), so they don't count."""
-    from metaculus_bot.research.prediction_market import _RELEVANCE_STOPWORDS
-
     return len([t for t in term.split() if t.lower().strip(".,'") not in _RELEVANCE_STOPWORDS])
 
 
@@ -252,14 +257,20 @@ class TestManifoldQueryLength:
     def test_ladder_is_empty_for_a_title_with_no_content_tokens(self):
         assert manifold_relaxation_terms("Will it?") == []
 
-    def test_manifold_query_set_still_leads_with_the_precise_terms(self):
-        """The relaxation rungs are a FALLBACK. The base queries must still be issued
-        first and unchanged, so a question that already matches at full length keeps its
-        high-precision result (measured: pre-era questions score 2 likely-relevant rows
-        at full length and would lose them to a short-query-first design)."""
-        q = MagicMock()
-        q.question_text = "Will Anthropic release Claude Opus 5 by August 31, 2026?"
-        q.title = q.question_text
-        base = ["Anthropic Claude Opus 5 release", "Claude Opus 5 August 2026"]
-        out = KeywordExtractor(strategy="s4_s5_union").queries_for_platform(q, base, "manifold")
-        assert out[: len(base)] == base
+    def test_the_deterministic_set_leads_with_the_full_length_query(self):
+        """The relaxation rungs are ADDITIVE, not a replacement, and they come after the
+        precise queries.
+
+        Every rung is now issued unconditionally in parallel rather than walked until one lands,
+        because recall is monotone decreasing in token count while precision is monotone
+        increasing — the pool wants the precise rung's hits AND the general rung's, and the
+        ranker sorts them out. So the full title must still be first and still be issued: a
+        short-query-first design loses the high-precision rows a question that already matches at
+        full length earns."""
+        title = "Will Anthropic release Claude Opus 5 by August 31, 2026?"
+        queries = deterministic_queries(title)
+
+        assert queries[0] == title
+        for rung in manifold_relaxation_terms(title):
+            assert rung in queries
+            assert queries.index(rung) > 0

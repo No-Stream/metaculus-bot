@@ -1143,6 +1143,37 @@ them OUT of feature work, land as their own PRs.
 
 ## Medium-term (requires more exploration)
 
+### Ranked market retrieval: three known ceilings left open by the port (added 2026-08-04, LOW/MEDIUM)
+
+Filed by the ranked-retrieval cutover. Each is a measured limitation with a known fix shape, held
+back because it needs its own measurement rather than because it is hard.
+
+1. **Manifold's `contractType=BINARY` costs a ~30% recall ceiling** (MEDIUM). Multi-outcome
+   Manifold markets are invisible to the search, and roughly 30% of its catalogue is
+   multi-outcome. Flipping to `ALL` is one parameter, but the search response carries NO
+   per-answer data — no probability, no per-answer resolution — so every multi-outcome row would
+   need a detail GET to render honestly, plus a multi-outcome render path (one row per answer, or
+   a summarised row). The detail-enrichment fan-out already fires once per Manifold candidate, so
+   the marginal cost is close to zero once the render path exists. Do the render path first.
+2. **`parse_query_author` strips every digit-bearing token, which throws away ticker-shaped
+   vocabulary** (LOW). Digit stripping exists because Manifold's `term` is a strict conjunction
+   and one date token zeroes the result set — a measured cliff, not a guess. But it is applied at
+   PARSE time, so a synonym like `CPI-U` survives while `S&P 500` or `Q3` does not, and those are
+   exactly the names the enumerable venues (which score on the un-stripped set) could have used.
+   The fix shape: keep both forms of each authored query, route the stripped one to the
+   conjunctive venues and the raw one to the fuzzy scorer. Needs a recall measurement to know
+   whether it buys anything.
+3. **A multi-market Kalshi event renders `nested[0]`'s price and liquidity as the event's**
+   (LOW/MEDIUM). `close_time` and `is_resolved` were moved to max-over-nested and
+   all-nested-resolved by this port, because both became a rendered column and a ranker input.
+   Price and liquidity deliberately stayed on the first nested market: they describe one tradeable
+   contract, summing open interest across four strikes is not defensible, and the
+   liquidity-contract test pins the current arithmetic against a committed live payload. The
+   consequence is that a threshold family renders one strike's price under the event's title, and
+   this port renders many more Kalshi rows than its predecessor (85-88% of them wanted), so the
+   misleading-price surface grew. Two candidate fixes — aggregate across nested markets, or render
+   the specific nested market the ranker keyed on — and both need their own measurement.
+
 ### Consider migrating scheduled runs off GitHub Actions cron (added 2026-07-19, MEDIUM)
 
 The 2026-07-18 latency/completeness audit

@@ -96,14 +96,19 @@ class MarketMatch:
 @dataclass
 class MarketSnapshot:
     matches: list[MarketMatch] = field(default_factory=list)
-    # Per-source outcome tokens ({source_name: token}) for the provider-diagnostics
-    # line: the 4 platforms, plus `kalshi_series` (the entity-index fetch), plus
-    # `keywords` / `snapshot` on the whole-provider failure paths (keyword extraction
-    # produced nothing; the snapshot timed out or blew up). A token starting with
-    # "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)", "error(...)",
-    # "partial(1/2)") is a LOST source. `none` means every sub-fetch SUCCEEDED and
-    # matched nothing — an outage must never land there, or the published line reads
-    # healthy through a blackout. See provider_diagnostics.
+    # Per-source outcome tokens ({source_name: token}) for the provider-diagnostics line.
+    # SEVEN keys on a complete run: the four venues, plus `query_author` (the additive query
+    # stage), `manifold_detail` (the rules-text enrichment fan-out) and `ranking` (the one
+    # selection call). Plus `snapshot` INSTEAD of all of them on the whole-provider failure
+    # paths, where the snapshot timed out or blew up before any source reported.
+    #
+    # A token starting with "ok"/"none" is benign; anything else (e.g. "dropped(size_cap)",
+    # "error(...)", "partial(1/2)") is a LOST source. `none` means the source was reached
+    # successfully and had nothing to contribute — an outage must never land there, or the
+    # published line reads healthy through a blackout. Two `none`s are load-bearing and worth
+    # knowing: `manifold_detail: none` means there were no Manifold candidates to enrich, and
+    # `ranking: none` means the pool was empty so the ranking call never ran. See
+    # provider_diagnostics.
     sources: dict[str, str] = field(default_factory=dict)
 
 

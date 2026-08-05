@@ -155,6 +155,37 @@ _CANNED_NATIVE_SEARCH_PROSE = (
     "[BLS](https://www.bls.gov/news.release/empsit.nr0.htm)."
 )
 
+# The prediction-market query author: `{"synonyms": [...], "framings": [...]}`. Anything else —
+# prose, or a shape `parse_query_author` rejects — makes the stage report a lost source, which
+# bumps the market provider's source-loss counter and fails `_assert_pipeline_ran`'s
+# `alertable_count == 0`.
+_CANNED_QUERY_AUTHOR = json.dumps(
+    {"synonyms": ["jobless rate", "U-3", "household survey"], "framings": ["unemployment print", "jobs report rate"]}
+)
+
+# The prediction-market ranker's tiers, in value order. Only the first two earn the
+# strong-evidence preamble on the rendered snapshot.
+_RANKER_TIERS = ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence")
+
+
+def _canned_ranking(prompt: str) -> str:
+    """A well-formed ranking array over whatever pool this prompt actually carries.
+
+    The indices have to be real: `parse_ranking` drops out-of-range ones, so a hard-coded
+    `[0, 1, 2]` would silently render fewer rows than intended on a small pool and nothing at all
+    on an empty one — and a canned array that cannot be read as JSON at all would fail open,
+    bumping the source-loss counter and reddening `_assert_pipeline_ran`. The prompt states its
+    own candidate count, so read it back rather than assuming the stub payloads' shape.
+    """
+    match = re.search(r"^(\d+) candidates from ", prompt, flags=re.MULTILINE)
+    pool_size = int(match.group(1)) if match else 0
+    picks = [
+        {"i": index, "tier": _RANKER_TIERS[index % len(_RANKER_TIERS)], "why": f"stub pick at pool index {index}"}
+        for index in range(min(pool_size, 3))
+    ]
+    return json.dumps(picks)
+
+
 # gap-fill v1 analyzer: a single-gap JSON payload (parse_gap_list).
 _CANNED_GAP_ANALYZER = json.dumps(
     {"gaps": [{"gap": "Latest BLS release date", "why_matters": "Anchors the level", "search_query": "BLS release"}]}
@@ -163,9 +194,11 @@ _CANNED_GAP_ANALYZER = json.dumps(
 # Providers that MUST report `ok` in the diagnostics block for these questions.
 # Verified empirically (all three question types, INFO logs) to be identical:
 # asknews/native_search/gemini_search/resolution_source all land `ok`, while
-# financial_data + prediction_market legitimately return `empty` (non-financial
-# question, no market matches on the stubbed empty payloads) — so those two are
-# NOT asserted `ok`. A future dep break that errors any required provider is
+# financial_data legitimately returns `empty` (non-financial question) — so it is
+# NOT asserted `ok`. prediction_market now renders rows off the stubbed off-topic
+# payloads, but it is left out of this set anyway: whether it renders is the canned
+# RANKING's call, not a statement about the provider's health, and pinning it here
+# would make the set assert a test fixture. A dep break that errors any required provider is
 # swallowed into status="errored" by the orchestrator, so this is the direct
 # catch for the non-litellm dependency class (google-genai / asknews / aiohttp).
 _REQUIRED_OK_PROVIDERS = frozenset({"asknews", "native_search", "gemini_search", "resolution_source"})
@@ -214,6 +247,16 @@ def _route_general_llm(kwargs: dict[str, Any]) -> str:
         if "options (in resolution order)" in lower:
             return _CANNED_MC
         return _CANNED_BINARY
+
+    # Prediction-market ranker: the only call ranking candidates by evidential value. Checked
+    # before the generic branches because its prompt carries a resolution-criteria header and no
+    # block, so it would otherwise fall through to canned prose it cannot parse.
+    if "Rank the candidates by EVIDENTIAL VALUE" in text:
+        return _canned_ranking(text)
+
+    # Prediction-market query author: asks for a two-key JSON object of extra search queries.
+    if "You are writing search queries to find prediction markets" in text:
+        return _CANNED_QUERY_AUTHOR
 
     # gap-fill v1 analyzer: asks for a JSON {"gaps": [...]} list.
     if "research-quality auditor" in lower or '"gaps"' in text:
@@ -417,15 +460,22 @@ _RESOLUTION_HTML = (
 )
 
 
-# The two PREFETCH venues (Kalshi events, PredictIt) must return a POPULATED
-# catalogue of off-topic markets, not an empty one. Both fuzzy-match locally over a
-# whole-catalogue dump, so "no relevant market" upstream looks like a full catalogue
-# that scores below the match floor — an EMPTY catalogue from a successful fetch is a
-# different thing entirely (a dead response parser or a silently emptied index), and
-# provider_health.py's catalogue_empty signal alerts on it by design. An empty stub
-# therefore both trips that alert and skips the local matcher this suite exists to
-# exercise end to end. The search venues (Polymarket, Manifold) legitimately return
-# `[]` for a query with no hits, so those stay empty.
+# EVERY venue must return a POPULATED off-topic payload, and each must carry the liquidity
+# fields provider_health declares for it. Two reasons, both learned the hard way:
+#
+# - An EMPTY catalogue from a SUCCESSFUL fetch is a degradation in its own right (a dead response
+#   parser or a silently emptied index), and provider_health's catalogue_empty signal alerts on
+#   it by design — so an empty stub both trips that alert and skips the pool assembly this suite
+#   exists to exercise.
+# - Under ranked retrieval the two ENUMERABLE venues always contribute their whole catalogue, so
+#   a search venue returning `[]` becomes a no-contribution outlier the moment two siblings
+#   render rows. That was silent before only because a fuzzy score floor meant nothing rendered
+#   anywhere. A venue-complete payload set is what a healthy prod run actually looks like.
+#
+# The liquidity fields are equally load-bearing: `market_field_contract` fires when a declared
+# field is absent from 100% of a venue's rows, and every real open Kalshi market carries
+# volume_fp and open_interest_fp (1,504/1,504 measured), so a stub without them describes a
+# payload that does not exist.
 _OFF_TOPIC_KALSHI_EVENTS = json.dumps(
     {
         "events": [
@@ -433,6 +483,7 @@ _OFF_TOPIC_KALSHI_EVENTS = json.dumps(
                 "event_ticker": "KXWORLDCUP-26",
                 "title": "Who will win the 2026 FIFA World Cup?",
                 "sub_title": "Tournament winner",
+                "settlement_sources": [{"name": "FIFA", "url": "https://www.fifa.com/worldcup"}],
                 "markets": [
                     {
                         "ticker": "KXWORLDCUP-26-BRA",
@@ -440,6 +491,12 @@ _OFF_TOPIC_KALSHI_EVENTS = json.dumps(
                         "rules_primary": "Resolves Yes if Brazil wins the 2026 FIFA World Cup final.",
                         "status": "active",
                         "close_time": "2026-07-19T23:59:59Z",
+                        "yes_bid_dollars": "0.21",
+                        "yes_ask_dollars": "0.23",
+                        "notional_value_dollars": "1.0000",
+                        "volume_fp": "41000.00",
+                        "open_interest_fp": "9000.00",
+                        "volume_24h_fp": "150.0",
                     }
                 ],
             }
@@ -462,6 +519,7 @@ _OFF_TOPIC_PREDICTIT_MARKETS = json.dumps(
                         "name": "Brazil",
                         "shortName": "Brazil",
                         "status": "Open",
+                        "dateEnd": "2026-07-19T23:59:59",
                         "lastTradePrice": 0.22,
                         "bestBuyYesCost": 0.23,
                         "bestBuyNoCost": 0.78,
@@ -471,16 +529,67 @@ _OFF_TOPIC_PREDICTIT_MARKETS = json.dumps(
         ]
     }
 ).encode()
+_OFF_TOPIC_POLYMARKET_SEARCH = json.dumps(
+    {
+        "events": [
+            {
+                "title": "Who will win the 2026 FIFA World Cup?",
+                "slug": "world-cup-2026-winner",
+                "description": "Resolves to the winner of the 2026 FIFA World Cup final.",
+                "endDate": "2026-07-19T23:59:59Z",
+                "openInterest": 120000.0,
+                "markets": [
+                    {
+                        "question": "Will Brazil win the 2026 FIFA World Cup?",
+                        "outcomePrices": '["0.22", "0.78"]',
+                        "volumeNum": 310000.0,
+                        "liquidityNum": 40000.0,
+                    }
+                ],
+            }
+        ],
+        "markets": [],
+    }
+).encode()
+_OFF_TOPIC_MANIFOLD_SEARCH = json.dumps(
+    [
+        {
+            "id": "wc26brazil",
+            "question": "Will Brazil win the 2026 FIFA World Cup?",
+            "slug": "brazil-world-cup-2026",
+            "creatorUsername": "footyFan",
+            "probability": 0.21,
+            "volume": 4200.0,
+            "volume24Hours": 80.0,
+            "totalLiquidity": 900.0,
+            "uniqueBettorCount": 64,
+            "closeTime": 1784419199000,
+            "isResolved": False,
+        }
+    ]
+).encode()
+# The search listing carries no description, which is exactly why the enrichment fan-out exists;
+# the detail record is where the rules text comes from.
+_MANIFOLD_MARKET_DETAIL = json.dumps(
+    {
+        "id": "wc26brazil",
+        "question": "Will Brazil win the 2026 FIFA World Cup?",
+        "textDescription": "Resolves YES if Brazil lifts the trophy in the 2026 final.",
+    }
+).encode()
 
 
 class _FakeHttpSession:
     """aiohttp.ClientSession stand-in for the prediction-market + resolution-source hosts.
 
-    The SEARCH venues return a well-formed empty result (no hits for this query — the
-    formatter is still exercised). The PREFETCH venues return a populated off-topic
-    catalogue, because that is what "no relevant market" actually looks like upstream
-    (see the note above the payloads). The resolution-source host returns an
-    article-shaped HTML body so trafilatura runs.
+    Every venue returns a populated OFF-TOPIC payload, because that is what "no relevant market"
+    actually looks like upstream (see the note above the payloads) — the ranker, not the
+    transport, is what decides a candidate does not bear on the question. The resolution-source
+    host returns an article-shaped HTML body so trafilatura runs.
+
+    Manifold's two endpoints are routed separately, and the ORDER matters: the detail path
+    (`/v0/market/<id>`) is checked first, because a substring test for "manifold" alone would
+    serve it the search listing's array and leave every candidate title-only.
     """
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -490,16 +599,16 @@ class _FakeHttpSession:
         low = url.lower()
         if "example.gov" in low or "example.com" in low:
             return _FakeHttpResponse(200, body=_RESOLUTION_HTML, content_type="text/html; charset=utf-8")
+        if "manifold" in low and "/v0/market/" in low:
+            return _FakeHttpResponse(200, body=_MANIFOLD_MARKET_DETAIL, content_type="application/json")
         if "manifold" in low:
-            return _FakeHttpResponse(200, body=b"[]", content_type="application/json")
+            return _FakeHttpResponse(200, body=_OFF_TOPIC_MANIFOLD_SEARCH, content_type="application/json")
         if "predictit" in low:
             return _FakeHttpResponse(200, body=_OFF_TOPIC_PREDICTIT_MARKETS, content_type="application/json")
-        if "kalshi" in low and "series" in low:
-            return _FakeHttpResponse(200, body=b'{"series": []}', content_type="application/json")
-        if "kalshi" in low:
+        if "kalshi" in low and "/events" in low:
             return _FakeHttpResponse(200, body=_OFF_TOPIC_KALSHI_EVENTS, content_type="application/json")
         # Polymarket public-search + anything else.
-        return _FakeHttpResponse(200, body=b'{"events": [], "markets": []}', content_type="application/json")
+        return _FakeHttpResponse(200, body=_OFF_TOPIC_POLYMARKET_SEARCH, content_type="application/json")
 
     async def close(self) -> None:
         self.closed = True

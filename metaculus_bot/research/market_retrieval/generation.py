@@ -192,7 +192,7 @@ def assemble_pool(
     queries: Sequence[str],
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
-    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None]],
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
 ) -> PoolResult:
     """The synchronous, I/O-free half of pool assembly. Call it via ``build_pool``.
 
@@ -211,7 +211,9 @@ def assemble_pool(
     ``venue_search_results`` is per-venue, per-query, in the leaf fetchers' ``None``-vs-``[]``
     contract: ``None`` is an upstream failure, ``[]`` a search that parsed to nothing. That
     distinction is what separates a degraded venue from a venue with nothing to say, and it
-    cannot be recovered from the pool afterwards.
+    cannot be recovered from the pool afterwards. A raised query may be passed through as the
+    exception itself (what ``asyncio.gather(return_exceptions=True)`` hands back); it counts as
+    one lost sub-query, same as ``None``.
     """
     join_rows, domains = _settlement_join_channel(criteria_text, queries, kalshi_events)
 
@@ -283,7 +285,7 @@ async def build_pool(
     queries: Sequence[str],
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
-    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None]],
+    venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
 ) -> PoolResult:
     """``assemble_pool`` off the event loop. One hop, so the loop is yielded once, not N times.
 

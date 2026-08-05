@@ -2249,6 +2249,19 @@ class TestParsePerBaseModelForecasts:
 # These sit inside the RESEARCH blob and must never surface as MC options.
 _POLYMARKET_TRAP_LINE = "- **Polymarket** <https://polymarket.com/event/foo>: resolves YES if X happens: 55%"
 _KALSHI_TRAP_LINE = "- **Kalshi** <https://kalshi.com/markets/bar>: market settles to the higher tier: 47%"
+# Manifold's rules text is a USER-AUTHORED description, fetched per candidate by the detail
+# enrichment step, and such descriptions routinely OPEN with a percentage. Both positions are
+# pinned here because the obvious guess about this regex is WRONG: it is not anchored to
+# end-of-line, and `(.+?)` is non-greedy, so a percentage ANYWHERE after the bullet's first
+# colon matches — a leading one matches on the URL prefix alone. So there is no "safe" position
+# for a percentage inside a rules bullet, and the section boundary is genuinely the only
+# protection, not a belt on top of a shape rule.
+_MANIFOLD_LEADING_PERCENT_TRAP_LINE = (
+    "- **manifold** <https://manifold.markets/footyFan/brazil-2026>: 45% chance per the creator's own model"
+)
+_MANIFOLD_TRAILING_PERCENT_TRAP_LINE = (
+    "- **manifold** <https://manifold.markets/footyFan/tier-2026>: resolves to the tier above: 45%"
+)
 
 # A realistic STACKED multiple-choice bot comment carrying ALL FOUR new research
 # blocks. Section order mirrors the framework's unified layout
@@ -2290,6 +2303,8 @@ Recent coverage of the policy debate.
 ##### Resolution criteria / rules
 {_POLYMARKET_TRAP_LINE}
 {_KALSHI_TRAP_LINE}
+{_MANIFOLD_LEADING_PERCENT_TRAP_LINE}
+{_MANIFOLD_TRAILING_PERCENT_TRAP_LINE}
 
 ---
 
@@ -2347,6 +2362,15 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
 
         assert _MC_OPTION_LINE_RE.search(_POLYMARKET_TRAP_LINE) is not None
         assert _MC_OPTION_LINE_RE.search(_KALSHI_TRAP_LINE) is not None
+        assert _MC_OPTION_LINE_RE.search(_MANIFOLD_TRAILING_PERCENT_TRAP_LINE) is not None
+        # A LEADING percentage is option-shaped TOO, which is the correction worth carrying: the
+        # regex is unanchored at the end and non-greedy at the start, so it matches on the URL
+        # prefix plus the first `: NN%` it can find. There is therefore no safe position for a
+        # percentage in a rules bullet, venue rules text is deliberately NOT sanitized (a market
+        # whose real rules read "Threshold: 45%" renders verbatim), and the `### Research Summary`
+        # boundary asserted below is the ONLY thing standing between these lines and MC
+        # calibration.
+        assert _MC_OPTION_LINE_RE.search(_MANIFOLD_LEADING_PERCENT_TRAP_LINE) is not None
 
     def test_mc_option_probs_excludes_snapshot_rules_lines(self):
         comment = _mc_stacked_comment_with_research_blocks()
@@ -2359,8 +2383,10 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
         for options in result.values():
             assert not any("Polymarket" in opt for opt in options)
             assert not any("Kalshi" in opt for opt in options)
+            assert not any("manifold" in opt for opt in options)
             assert 0.55 not in options.values()
             assert 0.47 not in options.values()
+            assert 0.45 not in options.values()
 
     def test_per_base_model_forecasts_recovers_only_true_base_models(self):
         comment = _mc_stacked_comment_with_research_blocks()
@@ -2378,6 +2404,7 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
             assert isinstance(options, dict)
             assert not any("Polymarket" in opt for opt in options)
             assert not any("Kalshi" in opt for opt in options)
+            assert not any("manifold" in opt for opt in options)
 
     def test_per_model_forecasts_unaffected_by_new_blocks(self):
         # The binary/summary per-model parser keys off the single stacker bullet
@@ -2403,6 +2430,7 @@ class TestNewResearchBlocksDoNotLeakIntoMcParsers:
         summary_prefix = _summary_section_for_bullets(comment)
         assert _POLYMARKET_TRAP_LINE not in summary_prefix
         assert _KALSHI_TRAP_LINE not in summary_prefix
+        assert _MANIFOLD_TRAILING_PERCENT_TRAP_LINE not in summary_prefix
         # And the legitimate stacker bullet IS inside the scoped prefix.
         assert "*Forecaster 1 (stacker-claude-opus-4.5)*:" in summary_prefix
 

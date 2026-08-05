@@ -30,18 +30,15 @@ from metaculus_bot.constants import (
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
     provider_degradation_alerts_active,
 )
+from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
+from metaculus_bot.research.market_retrieval.venues import (
+    kalshi_event_match,
+    parse_manifold_matches,
+    parse_polymarket_matches,
+    predictit_market_match,
+)
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
-from metaculus_bot.research.prediction_market import (
-    KeywordExtractor,
-    MarketMatch,
-    _liquidity_label,
-    _parse_manifold_matches,
-    _parse_polymarket_matches,
-    _predictit_search_local,
-)
-from metaculus_bot.research.prediction_market import (
-    _kalshi_search_local as kalshi_search_local,
-)
+from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_label
 from metaculus_bot.research.provider_health import (
     SIGNAL_CATALOGUE_EMPTY,
     SIGNAL_MARKET_FIELD_CONTRACT,
@@ -145,11 +142,29 @@ def _observe(
     )
 
 
+def _kalshi_rows(events: list[dict]) -> list[MarketMatch]:
+    """A candidate row per catalogue event. No query and no floor.
+
+    Ranked retrieval builds a row for EVERY event and lets the ranker select, so these tests
+    read the same unfiltered rows production records field presence over — which is the point:
+    Signal A measures PARSER health, so it must be immune to which rows the ranker happened to
+    keep. A helper that took a query would be measuring a filter that no longer exists.
+    """
+    rows = [kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy") for event in events]
+    return [row for row in rows if row is not None]
+
+
+def _predictit_rows(markets: list[dict]) -> list[MarketMatch]:
+    rows = [predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy") for market in markets]
+    return [row for row in rows if row is not None]
+
+
 def _fields_present(rows: list[MarketMatch], venue: str) -> frozenset[str]:
     """Which declared liquidity fields parsed non-None on >=1 row.
 
-    Byte-identical logic to the recording site in ``_fetch_market_snapshot_impl``,
-    so these tests measure exactly what production records.
+    Byte-identical logic to the recording site in ``prediction_market._record_venue_health``,
+    so these tests measure exactly what production records — including that it reads the venue's
+    POOL rows rather than the ranked ones.
     """
     return frozenset(
         name for name in VENUE_EXPECTED_LIQUIDITY_FIELDS[venue] if any(getattr(row, name) is not None for row in rows)
@@ -185,8 +200,7 @@ class TestSignalMarketFieldContract:
         the moment the field-name fix lands. This assertion holds identically before
         and after, and it FAILS if the two sides ever drift apart.
         """
-        events = captured_payloads["kalshi_events"]["events"]
-        rows = kalshi_search_local(events, "Elon Musk Mars", top_k=5, min_score=0.0)
+        rows = _kalshi_rows(captured_payloads["kalshi_events"]["events"])
         assert rows, "captured payload must yield at least one Kalshi row"
 
         _observe("kalshi", rows=len(rows), fields_present=_fields_present(rows, "kalshi"))
@@ -204,7 +218,7 @@ class TestSignalMarketFieldContract:
         rule catches that; a rule keyed on the label going blank would not. Hence the
         assertion here is per-field rather than the label equivalence above.
         """
-        rows = _parse_polymarket_matches(captured_payloads["polymarket_search"], query="Fed rate cuts 2026")
+        rows = parse_polymarket_matches(captured_payloads["polymarket_search"], width=RETRIEVAL_WIDTH["polymarket"])
         assert rows, "captured payload must yield at least one Polymarket row"
 
         _observe("polymarket", rows=len(rows), fields_present=_fields_present(rows, "polymarket"))
@@ -224,7 +238,7 @@ class TestSignalMarketFieldContract:
         """Manifold's upstream names are the ones the builder reads, so this venue is
         healthy today and must stay silent — the control that shows Signal A is not
         simply firing on every venue."""
-        rows = _parse_manifold_matches(captured_payloads["manifold_search"], query="Fed cut rates")
+        rows = parse_manifold_matches(captured_payloads["manifold_search"], width=RETRIEVAL_WIDTH["manifold"])
         assert rows, "captured payload must yield at least one Manifold row"
 
         _observe("manifold", rows=len(rows), fields_present=_fields_present(rows, "manifold"))
@@ -239,9 +253,7 @@ class TestSignalMarketFieldContract:
         would stay silent about a field whose death should alert — this is where that
         shows up.
         """
-        rows = _predictit_search_local(
-            captured_payloads["predictit_all"]["markets"], "Republicans House seats", top_k=5, min_score=0.0
-        )
+        rows = _predictit_rows(captured_payloads["predictit_all"]["markets"])
         assert rows, "captured payload must yield at least one PredictIt row"
         assert VENUE_EXPECTED_LIQUIDITY_FIELDS["predictit"] == ()
         for row in rows:
@@ -262,11 +274,11 @@ class TestSignalMarketFieldContract:
         test fails on all three counts against the pre-fix code and passes after.
         """
         parsed = {
-            "kalshi": kalshi_search_local(
-                captured_payloads["kalshi_events"]["events"], "Elon Musk Mars", top_k=5, min_score=0.0
+            "kalshi": _kalshi_rows(captured_payloads["kalshi_events"]["events"]),
+            "polymarket": parse_polymarket_matches(
+                captured_payloads["polymarket_search"], width=RETRIEVAL_WIDTH["polymarket"]
             ),
-            "polymarket": _parse_polymarket_matches(captured_payloads["polymarket_search"], query="Fed rate cuts 2026"),
-            "manifold": _parse_manifold_matches(captured_payloads["manifold_search"], query="Fed cut rates"),
+            "manifold": parse_manifold_matches(captured_payloads["manifold_search"], width=RETRIEVAL_WIDTH["manifold"]),
         }
         for venue, rows in parsed.items():
             assert rows, f"captured payload must yield at least one {venue} row"
@@ -276,8 +288,8 @@ class TestSignalMarketFieldContract:
 
     def test_the_map_covers_exactly_the_four_venues(self) -> None:
         """A venue absent from the map is silently un-monitored, which is the failure
-        mode this whole signal exists to end. ``_fetch_market_snapshot_impl``'s
-        per-platform dicts are the authority on which venues exist."""
+        mode this whole signal exists to end. ``generation.VENUE_ORDER`` is the authority on
+        which venues exist."""
         assert set(VENUE_EXPECTED_LIQUIDITY_FIELDS) == {"polymarket", "kalshi", "manifold", "predictit"}
 
     def test_predictit_all_none_rows_are_exempt(self) -> None:
@@ -461,24 +473,40 @@ class TestSignalVenueNoContribution:
         assert len(findings) == 1
         assert findings[0].questions == 2
 
-    def test_every_venue_gets_a_superset_of_the_base_queries(self) -> None:
-        """Guards the sibling-comparison assumption named as the design's residual
-        risk. The rule treats a venue's silence as informative only because all four
-        receive the same queries; Manifold additionally gets the S2 natural-language
-        framing, so it gets MORE, which is conservative in the right direction. A
-        future change that narrowed one venue's query set would make that venue a
-        standing false positive, and this is where that shows up.
+    def test_an_enumerable_venue_with_a_healthy_catalogue_always_reports_candidates(self) -> None:
+        """Guards Signal B's sibling-comparison assumption in the form ranked retrieval leaves
+        it in.
+
+        The rule treats a venue's silence as informative only because the venue was genuinely
+        asked. Under the old design that meant "every venue receives the same query set", and
+        the guard was a superset assertion over an LLM keyword extractor's per-venue output.
+        That assertion is now FALSE by construction and would have to be deleted rather than
+        fixed: Manifold and Polymarket receive digit-stripped queries while Kalshi scores on the
+        un-stripped set, deliberately, because a year is real signal against a catalogue of
+        dated market titles and a strict conjunction it zeroes.
+
+        The invariant that replaces it is stronger, because the enumerable venues no longer
+        depend on a query at all — their whole catalogue enters the pool. So a healthy catalogue
+        ALWAYS yields candidates, which makes Signal B structurally unable to fire for Kalshi or
+        PredictIt, and `record_catalogue_size` (Signal C) their only alarm. A refactor that
+        reintroduced a per-query filter on an enumerable venue would break this and hand those
+        two venues back a standing false-positive path.
         """
+        payload = json.loads(_PAYLOADS_PATH.read_text())
+        kalshi = _kalshi_rows(payload["kalshi_events"]["events"])
+        predictit = _predictit_rows(payload["predictit_all"]["markets"])
 
-        class _Question:
-            question_text = "Will the Fed cut rates by at least 25 bps in September 2026?"
+        assert len(kalshi) == len(
+            [e for e in payload["kalshi_events"]["events"] if e.get("title") or e.get("sub_title")]
+        )
+        assert len(predictit) == len(payload["predictit_all"]["markets"])
+        for venue, rows in (("kalshi", kalshi), ("predictit", predictit)):
+            _observe(venue, candidates=len(rows), rows=0, fields_present=_fields_present(rows, venue))
+            assert rows, f"{venue}: a healthy catalogue must always reach the pool"
 
-        base = ["fed rate cut september 2026", "fomc september 2026 cut"]
-        extractor = KeywordExtractor(strategy="s4_s5_union")
-        for venue in ("polymarket", "kalshi", "manifold", "predictit"):
-            resolved = extractor.queries_for_platform(_Question(), base, venue)
-            assert set(base).issubset(set(resolved)), venue
-        assert len(extractor.queries_for_platform(_Question(), base, "manifold")) > len(base)
+        # Zero RENDERED rows on both, and still no no-contribution finding: the ranker's
+        # judgment is not a venue defect.
+        assert [f for f in provider_degradation_findings() if f.signal == SIGNAL_VENUE_NO_CONTRIBUTION] == []
 
 
 # Signal C — catalogue_empty
@@ -487,10 +515,13 @@ class TestSignalVenueNoContribution:
 class TestSignalCatalogueEmpty:
     """A prefetch reported SUCCESS and handed the local matcher an empty catalogue.
 
-    Kalshi and PredictIt fuzzy-match locally over a prefetched catalogue, so their
-    fetch tally reports success even when the catalogue is empty and there is
-    nothing to match. Signals A and B both read rows, so this is the one class they
-    share a blind spot on.
+    Kalshi and PredictIt enumerate a prefetched catalogue into the pool, so their fetch tally
+    reports success even when the catalogue is empty and there is nothing to enumerate. Signals
+    A and B both read rows, so this is the one class they share a blind spot on — and under
+    ranked retrieval it is the ONLY alarm those two venues have, since their
+    ``candidates_pre_filter`` is a whole catalogue and therefore never zero when healthy. An
+    empty Kalshi catalogue now zeroes the settlement-source join AND the fuzzy channel, so the
+    signal guards more than it used to.
     """
 
     def test_successful_empty_prefetch_fires(self) -> None:

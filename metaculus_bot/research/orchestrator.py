@@ -142,19 +142,22 @@ class ResearchOrchestrator:
 
     @property
     def prediction_market_degraded_count(self) -> int:
-        """Per-run Kalshi /series fetch failures, read from the prediction-market
+        """Per-run Kalshi CATALOGUE fetch failures, read from the prediction-market
         module counter and folded into the forecaster's alertable_count.
 
-        The prediction-market provider soft-fails internally (a dead Kalshi
-        series path still returns fuzzy-over-events matches), so this sub-path
-        failure never raises and never bumps provider_failure_count. Reading the
-        module counter here is the only way it reddens CI (the 2026-07-25 hole where
-        research_provider_failures=0 while the path was dead)."""
+        The prediction-market provider soft-fails internally (a lost catalogue pull still
+        returns whatever the venue-search channel found), so this sub-path failure never
+        raises and never bumps provider_failure_count. Reading the module counter here is
+        the only way it reddens CI (the 2026-07-25 hole where
+        research_provider_failures=0 while the path was dead). The property and marker
+        names predate the ranked pipeline, where the counter moved from the retired /series
+        index to the events catalogue — a strictly more load-bearing thing, since the
+        catalogue feeds both the settlement-source join and the fuzzy channel."""
         from metaculus_bot.research.prediction_market import (
-            kalshi_series_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+            kalshi_catalogue_fetch_failures,  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
         )
 
-        return kalshi_series_fetch_failures()
+        return kalshi_catalogue_fetch_failures()
 
     @property
     def prediction_market_source_loss_count(self) -> int:
@@ -162,14 +165,14 @@ class ResearchOrchestrator:
         counter and folded into alertable_count.
 
         A "source" is anything the snapshot depends on: one per venue whose
-        query/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
-        one when the keyword extractor produces nothing (which silences all four
-        venues without any venue failing). That last cause is why this counts
-        sources rather than venues — a dead extractor loses every venue's data
-        without any venue going down. The distinguishing detail is durable
-        per-source in ``MarketSnapshot.sources`` (``keywords:error(no_queries)`` vs
-        ``polymarket:error(...)``), which rides the published comment and the
-        schema-v2 research archive; this scalar deliberately stays one number.
+        search/prefetch fan-out lost a sub-fetch, one per whole-provider failure, and
+        one each when the query author or the RANKING call comes back unusable. Those
+        last two are why this counts sources rather than venues — a dead ranker
+        degrades every venue's contribution without any venue going down. The
+        distinguishing detail is durable per-source in ``MarketSnapshot.sources``
+        (``ranking:error(...)`` vs ``polymarket:error(...)``), which rides the
+        published comment and the schema-v2 research archive; this scalar
+        deliberately stays one number.
 
         Operator decision 2026-07-25: alert on ANY source loss, not only a total
         blackout. The provider soft-fails every venue internally, so without this the
