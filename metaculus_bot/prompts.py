@@ -429,7 +429,8 @@ _SOURCE_PROVENANCE_LADDER = """
 # The liquidity/participation weighting sentence, appended to the shared strong-evidence
 # clause so every forecaster prompt tells the model to weight a crowd signal by how
 # informative it is (the prediction-market provider emits a per-market `signal` label
-# plus volume/OI in approximate USD).
+# plus volume/OI — approximate USD on the real-money venues, play-money mana on Manifold,
+# which is why the rendered legend qualifies the unit per venue rather than venue-wide).
 #
 # The `no-liquidity-data` sentence is load-bearing and must stay in sync with
 # `prediction_market._liquidity_label`. That label means "this venue publishes no volume

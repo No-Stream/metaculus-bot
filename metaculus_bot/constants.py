@@ -791,16 +791,29 @@ MARKET_RANKER_BACKOFFS: tuple[float, ...] = ()
 # included, so pagination can never push the snapshot past its own timeout. The
 # per-page ``aiohttp.ClientTimeout`` sits under this wall, not beside it.
 #
-# ``KALSHI_PAGE_SLEEP_S = 0.0`` is the measured change, not a guess: a live probe of six
-# consecutive pages (free unauthenticated GET, 2026-08-03) returned 200 events/page at
-# 0.28-0.44s/page with no throttling, so the complete ~49-page pull runs ~17s while the
-# 1.0s-per-page sleep prod pays makes 15 pages cost more than the whole catalogue. It
-# stays a named constant so it is tunable the day Kalshi starts 429ing; the existing 429
-# path already stops pagination early and refuses to cache a truncated list.
+# ``KALSHI_PAGE_SLEEP_S`` — the REASONING behind 0.25s, which one free re-probe of a
+# full cold pull would turn into a measurement. What was probed: six consecutive pages
+# (free unauthenticated GET, 2026-08-03) at 200 events/page and 0.28-0.44s/page with no
+# throttling. What was then MEASURED at zero sleep: the 2026-08-04 dry run took an HTTP
+# 429 on 2 of 4 full cold pulls (9,400 events over 47 pages and 8,400 over 42, versus
+# 10,219 over 52 on both clean pulls — an 8-18% catalogue loss), and a prior-day capture
+# recorded page statuses ``[200 x13, 429]``. So a 42-52 page burst does get throttled and
+# a six-page probe cannot tell zero sleep from a burst allowance. Because a 429 is
+# deliberately non-retryable for this venue, the pull stops, reports incomplete, and bumps
+# BOTH degradation counters — exiting CI non-zero on a condition the sleep value CAUSES.
+#
+# Why 0.25 specifically: ~52 pages at 0.25s plus ~0.11-0.2s of fetch is ~19s against the
+# 40s wall, and it does not move ``SNAPSHOT_STAGE_BUDGET_S`` (stage 1a already takes the
+# max of the author wall, this wall, and the HTTP stage). Only the run's first question
+# pays it — the catalogue is TTL-cached. Prefer it over 0.1: one throttled pull was
+# already running at only ~5 req/s, so the limiter looks like a windowed bucket rather
+# than a rate. Do NOT exceed ~0.3: ``attempt_budget`` doubles as the per-page HTTP
+# timeout, so cumulative sleep eats the late pages' budget and 0.5s (~32s of 40s) would
+# trade throttle-loss for wall-timeout-loss, bumping the same two counters.
 # EVENT_LIMIT is a runaway guard well above the ~9,762 live open events; MAX_PAGES is
 # the real bound.
 KALSHI_CATALOGUE_WALL_TIMEOUT: float = 40.0
-KALSHI_PAGE_SLEEP_S: float = 0.0
+KALSHI_PAGE_SLEEP_S: float = 0.25
 KALSHI_PREFETCH_EVENT_LIMIT: int = 20_000
 KALSHI_PREFETCH_MAX_PAGES: int = 120
 

@@ -19,6 +19,7 @@ LAST occurrence silently changes what a degraded run publishes.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import pytest
@@ -43,7 +44,9 @@ Platform = Literal["polymarket", "kalshi", "manifold", "predictit"]
 BLS_CRITERIA = "Resolves per the release at https://data.bls.gov/timeseries/LNS14000000"
 
 
-def _kalshi_event(ticker: str, *, title: str, settles: str | None = None, rules: str = "") -> dict[str, Any]:
+def _kalshi_event(
+    ticker: str, *, title: str, settles: str | None = None, rules: str = "", closes: str = "2026-12-31T00:00:00Z"
+) -> dict[str, Any]:
     """A projected Kalshi event, in the shape the streaming projection emits."""
     return {
         "event_ticker": ticker,
@@ -54,7 +57,7 @@ def _kalshi_event(ticker: str, *, title: str, settles: str | None = None, rules:
         "markets": [
             {
                 "rules_primary": rules,
-                "close_time": "2026-12-31T00:00:00Z",
+                "close_time": closes,
                 "yes_bid_dollars": "0.40",
                 "yes_ask_dollars": "0.45",
                 "last_price_dollars": "0.42",
@@ -231,6 +234,53 @@ class TestWidths:
         result = _pool(predictit_markets=markets)
 
         assert [row.venue_market_id for row in result.candidates] == ["0", "1", "2", "3", "4"]
+
+
+class TestAsOfEligibility:
+    """The backtest leakage guard, applied where the width can still be filled.
+
+    Unreachable on the provider path (it passes None, and the provider hard-disables under
+    `is_benchmarking`), so this is the only guard the first real backtest or replay caller has.
+    """
+
+    def test_a_closed_row_frees_its_width_slot_instead_of_being_deleted_after_the_cut(self) -> None:
+        """The whole point of filtering inside `add()`. As a post-hoc filter over the
+        already-truncated pool, 150 events whose 120 highest-scoring rows close before `as_of`
+        truncated to 100 and then filtered to ZERO — while 30 eligible candidates sat unused in the
+        catalogue. It also zeroed `per_venue_counts`, which feeds `candidates_pre_filter` into
+        provider health: exactly the shape that field exists to prevent alerting on.
+
+        The closed rows score HIGHER here (they carry the query terms verbatim), so they win the
+        fuzzy ordering and would occupy every slot of the width if eligibility were checked later.
+        """
+        width = RETRIEVAL_WIDTH["kalshi"]
+        closed = [
+            _kalshi_event(f"OLD-{i}", title=f"US unemployment rate scenario {i}", closes="2026-01-31T00:00:00Z")
+            for i in range(width + 20)
+        ]
+        open_rows = [
+            _kalshi_event(f"NEW-{i}", title=f"US unemployment rate later scenario {i}", closes="2026-12-31T00:00:00Z")
+            for i in range(30)
+        ]
+
+        result = _pool(kalshi_events=[*closed, *open_rows], as_of=datetime(2026, 5, 1, tzinfo=timezone.utc))
+
+        assert result.per_venue_counts["kalshi"] == 30, "every eligible candidate must survive the width"
+        assert {row.venue_market_id for row in result.candidates} == {f"NEW-{i}" for i in range(30)}
+        assert result.channel_counts[CHANNEL_UNIVERSE_FUZZY] == 30, "counts describe the pool that exists"
+
+    def test_a_naive_as_of_is_read_as_utc(self) -> None:
+        """An explicit caller can still hand over a naive instant; it must not raise on comparison
+        against the aware close times `parse_iso` produces."""
+        events = [_kalshi_event("OLD", title="unemployment rate", closes="2026-01-31T00:00:00Z")]
+
+        assert _pool(kalshi_events=events, as_of=datetime(2026, 5, 1)).per_venue_counts["kalshi"] == 0
+
+    def test_no_as_of_keeps_every_row(self) -> None:
+        """The provider path. None must be a true no-op, not a filter with a permissive default."""
+        events = [_kalshi_event("OLD", title="unemployment rate", closes="2026-01-31T00:00:00Z")]
+
+        assert _pool(kalshi_events=events).per_venue_counts["kalshi"] == 1
 
 
 class TestDegradation:

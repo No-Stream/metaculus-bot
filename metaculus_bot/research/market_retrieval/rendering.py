@@ -64,7 +64,8 @@ TITLE_MAX_CHARS = 80
 MARKET_SIGNAL_LEGEND = (
     "The `signal` column labels each market's liquidity/participation "
     "(thin/decent/deep for real-money venues, thin/decent/high for Manifold's play-money bettor count); "
-    "`total_vol` and `OI` are that market's traded volume and open interest in approximate USD. "
+    "`total_vol` and `OI` are that market's traded volume and open interest in approximate USD on the "
+    "real-money venues, and play-money mana on Manifold. "
     "`no-liquidity-data` means the venue publishes no volume figures at all (PredictIt) — it says nothing "
     "about how liquid the market is, so treat it as unknown rather than as thin. Treat "
     "deep/high-liquidity markets as a strong anchor and discount thin ones (low volume, few participants) as noisy. "

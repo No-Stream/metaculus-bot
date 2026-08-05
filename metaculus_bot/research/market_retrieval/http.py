@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
 import aiohttp
@@ -42,30 +42,50 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 def safe_float(value: Any) -> float | None:
+    # The isfinite guard is the same one `safe_int` needs and for a sharper reason: json.loads
+    # accepts bare NaN/Infinity literals, and NaN defeats every comparison in `_liquidity_label`,
+    # so a row whose volume arrived as NaN falls through to the strongest label and renders
+    # `signal=deep` — presenting missing data to a forecaster as the best possible liquidity
+    # evidence. None renders `no-liquidity-data`, which is what a missing figure means.
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def safe_int(value: Any) -> int | None:
     number = safe_float(value)
-    # aiohttp's json.loads accepts bare NaN/Infinity literals and int(nan) raises, so a
-    # helper named safe_* has to return None on those rather than blow up.
-    if number is None or not math.isfinite(number):
+    if number is None:
         return None
     return int(number)
 
 
 def parse_iso(value: Any) -> datetime | None:
+    """An ISO timestamp as a UTC-AWARE datetime, or None.
+
+    Normalized HERE, at the one boundary all four venue parsers pass through, so no comparison
+    site downstream has to remember: ``fromisoformat`` returns an aware datetime for the ``Z``
+    form and a NAIVE one for a bare timestamp or a date-only string, and mixing the two makes
+    ``max(closes)`` over an event's nested markets raise ``TypeError: can't compare offset-naive
+    and offset-aware datetimes``. That runs inside `to_thread` with no guard, so it reaches the
+    snapshot-level net and zeroes ALL FOUR venues for the question — and the offending event
+    stays in the 6h catalogue cache, so every later question repeats it.
+
+    A naive value is TREATED as UTC — the same assumption `_filter_pool_by_as_of` already makes.
+    Not an assertion that every venue publishes UTC: PredictIt's ``dateEnd`` is historically
+    Eastern, and only the date-granular rendering makes that <=5h skew immaterial. Behaviour is
+    unchanged for rendering, since attaching a tzinfo does not shift the wall clock.
+    """
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def parse_iso_guarded(value: Any) -> datetime | None:

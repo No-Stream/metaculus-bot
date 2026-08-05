@@ -11,16 +11,27 @@ than a different pipeline.
 
 The design is recall-maximal on purpose. The bake-off measured that **selection, not
 generation, is the binding constraint**: a perfect ranker over this pool reaches 14/16
-questions while the deterministic top-4 of the same pool scores 5/16. So nothing here
-filters — there is no score floor, and the retired ``KALSHI_MIN_FUZZY_SCORE`` /
+questions while the deterministic top-4 of the same pool scores 5/16. So nothing here filters on
+RELEVANCE — there is no score floor, and the retired ``KALSHI_MIN_FUZZY_SCORE`` /
 ``PREDICTIT_MIN_FUZZY_SCORE`` floors are absent rather than defaulted, because a floor is
-what discarded the adjacent-cut markets that carry most of the evidential value.
+what discarded the adjacent-cut markets that carry most of the evidential value. The one
+exception is ELIGIBILITY: an explicit ``as_of`` drops a candidate that already closed, which is
+leakage defence rather than a relevance judgment, and it happens inside ``add()`` so the width
+still means "N eligible candidates" (as a post-hoc filter it deleted rows the width had already
+spent its slots on).
 
-Everything CPU-bound runs in ONE ``asyncio.to_thread`` hop, and that is not hygiene: the
-full-catalogue fuzzy scan measures ~0.45s of blocking CPU (9,762 events x ~16 queries), and
+Everything CPU-bound runs in ONE ``asyncio.to_thread`` hop, and that is not hygiene:
 ``publish_hardening.py`` documents how a pinned event loop misattributes forecaster
 soft-deadline drops to the forecasters. Building the settlement-domain index belongs in the
 same hop — it walks the same ~10k events and is not memoized.
+
+The hop only works because the scan itself releases the GIL. As a per-event Python loop the
+full-catalogue fuzzy scan measured ~0.45-0.59s of GIL-HOLDING bytecode (9,762 events x ~17
+queries), so the offload bought nothing — it converted one freeze into sustained starvation,
+with loop lag p50 at 15-20ms single-question and 56ms at 6 concurrent. Batched through
+``fuzzy_best_many`` (``rapidfuzz.process.cdist``, which threads internally) the same work is
+~0.06s and the loop returns to idle. The remaining ~10k match constructions and the settlement
+index walk are still real CPU, which is why the hop stays.
 """
 
 from __future__ import annotations
@@ -28,11 +39,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from metaculus_bot.research.market_retrieval import venues
 from metaculus_bot.research.market_retrieval.http import flatten_results
-from metaculus_bot.research.market_retrieval.queries import fuzzy_best
+from metaculus_bot.research.market_retrieval.queries import fuzzy_best, fuzzy_best_many
 from metaculus_bot.research.market_retrieval.settlement_join import question_domains, settlement_domain_index
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _FetchTally
 
@@ -152,18 +164,27 @@ def _settlement_join_channel(
 
 
 def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dict[str, Any]]) -> list[MarketMatch]:
-    """The full Kalshi catalogue, ``fuzzy_best``-ranked. Truncation happens at the width."""
-    scored: list[tuple[float, MarketMatch]] = []
+    """The full Kalshi catalogue, ``fuzzy_best_many``-ranked. Truncation happens at the width."""
+    usable: list[dict[str, Any]] = []
+    titles: list[str] = []
+    rules: list[str] = []
     for event in kalshi_events:
         if not isinstance(event, dict):
             continue
         title = event.get("title") or event.get("sub_title") or ""
         if not title:
             continue
-        score = fuzzy_best(list(queries), title, venues.kalshi_event_rules(event))
+        usable.append(event)
+        titles.append(title)
+        rules.append(venues.kalshi_event_rules(event))
+
+    scores = fuzzy_best_many(list(queries), titles, rules)
+    scored: list[tuple[float, MarketMatch]] = []
+    for event, score in zip(usable, scores, strict=True):
         match = venues.kalshi_event_match(event, match_confidence=score, channel=CHANNEL_UNIVERSE_FUZZY)
         if match is not None:
             scored.append((score, match))
+    # Stable, so equal scores keep catalogue order — the same tie-break the per-event loop had.
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [match for _, match in scored]
 
@@ -193,6 +214,7 @@ def assemble_pool(
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
     venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+    as_of: datetime | None = None,
 ) -> PoolResult:
     """The synchronous, I/O-free half of pool assembly. Call it via ``build_pool``.
 
@@ -214,7 +236,19 @@ def assemble_pool(
     cannot be recovered from the pool afterwards. A raised query may be passed through as the
     exception itself (what ``asyncio.gather(return_exceptions=True)`` hands back); it counts as
     one lost sub-query, same as ``None``.
+
+    ``as_of`` (backtest leakage defence; None on the provider path) drops a candidate that closed
+    at or before that instant. It is tested INSIDE ``add()``, ahead of the width slice, so
+    ``RETRIEVAL_WIDTH`` means "100 ELIGIBLE candidates" on both paths and a dropped row frees its
+    slot. As a post-hoc filter over the already-truncated pool this lost eligible evidence
+    outright: measured, 150 Kalshi events whose 120 highest-scoring rows close before ``as_of``
+    truncated to 100, then filtered to ZERO, while 30 eligible candidates sat unused in the
+    catalogue. Filtering here also keeps ``per_venue_counts`` and ``channel_counts`` describing
+    the pool that actually exists — the post-hoc filter zeroed the former, which fed
+    ``candidates_pre_filter=0`` into provider health, exactly the shape that field exists to
+    prevent alerting on.
     """
+    as_of_utc = None if as_of is None else (as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc))
     join_rows, domains = _settlement_join_channel(criteria_text, queries, kalshi_events)
 
     search_rows: list[MarketMatch] = []
@@ -242,6 +276,11 @@ def assemble_pool(
     def add(match: MarketMatch) -> None:
         if match.platform not in pools:
             logger.warning(f"pool assembly: dropping row from unknown venue {match.platform!r}")
+            return
+        # Ahead of every write below, so an ineligible row consumes no width, no dedup slot and no
+        # channel count. `parse_iso` returns aware datetimes for all four venues, and `as_of_utc`
+        # is normalized above, so the comparison cannot raise on a mixed pair.
+        if as_of_utc is not None and match.close_time is not None and match.close_time <= as_of_utc:
             return
         key = _dedup_key(match)
         if key in seen:
@@ -286,12 +325,14 @@ async def build_pool(
     kalshi_events: Sequence[dict[str, Any]],
     predictit_markets: Sequence[dict[str, Any]],
     venue_search_results: Mapping[str, Sequence[list[MarketMatch] | None | BaseException]],
+    as_of: datetime | None = None,
 ) -> PoolResult:
     """``assemble_pool`` off the event loop. One hop, so the loop is yielded once, not N times.
 
-    See the module docstring for why the offload is load-bearing rather than tidy: the
-    full-catalogue scan is ~0.45s of blocking CPU, and a pinned loop shows up as forecaster
-    soft-deadline drops somewhere else entirely.
+    See the module docstring for why the offload is load-bearing rather than tidy: a pinned loop
+    shows up as forecaster soft-deadline drops somewhere else entirely. Post-batching the fuzzy
+    scan is ~0.06s (it was ~0.45s of GIL-holding bytecode, which the hop could not hide), and the
+    ~10k match constructions plus the settlement index walk are what is left to offload.
     """
     return await asyncio.to_thread(
         assemble_pool,
@@ -300,6 +341,7 @@ async def build_pool(
         kalshi_events=kalshi_events,
         predictit_markets=predictit_markets,
         venue_search_results=venue_search_results,
+        as_of=as_of,
     )
 
 

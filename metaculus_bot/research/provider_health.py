@@ -15,9 +15,19 @@ what must not fire — a single question with no matching prediction market is
 normal. Every rule below therefore uses a denominator that exists INSIDE one
 question:
 
-* rows a venue produced (Signal A) — 3 at the per-platform cap,
-* sibling venues answering the same query set (Signal B),
+* the pool candidates a venue produced (Signal A),
 * a prefetch catalogue's own size (Signal C).
+
+A third rule (Signal B, ``venue_no_contribution``) was deleted 2026-08-04. Under
+ranked retrieval the enumerable venues enumerate whole catalogues into the pool,
+so their candidate count is never zero — they could never be the flagged venue
+but always supplied its ">=2 live siblings" leg for free, which left a search
+venue whose index legitimately returned ``[]`` satisfying the one leg meant to
+exclude correct behaviour. Replaying all 59 archived snapshots, the rule fired on
+45 healthy manifold runs and 26 polymarket ones, and the narrowest form that
+still fires at all fired on 20. The surviving intent — a venue contributing zero
+across many CONSECUTIVE runs — is inherently cross-run and unjudgeable inside one
+question; it is recorded in FUTURE.md as a check over the telemetry archive.
 
 Each rule is a 100%-of-denominator conjunction with no tunable float. A longer
 run makes every signal strictly HARDER to trip, which is the correct direction
@@ -66,32 +76,30 @@ VENUE_EXPECTED_LIQUIDITY_FIELDS: dict[str, tuple[str, ...]] = {
 
 # Signal names, also the ``signal=`` value in the marker's JSON detail.
 SIGNAL_MARKET_FIELD_CONTRACT = "market_field_contract"
-SIGNAL_VENUE_NO_CONTRIBUTION = "venue_no_contribution"
 SIGNAL_CATALOGUE_EMPTY = "catalogue_empty"
-
-# Signal B needs at least this many OTHER venues to have contributed on the same
-# question before it will call a venue an outlier. Two rather than one because a
-# lone live sibling is thin evidence that the query set was answerable at all,
-# and because at two the measured false-positive count across 47 archived runs is
-# zero (one sibling leaves Kalshi and PredictIt firing on healthy runs).
-_MIN_LIVE_SIBLINGS = 2
 
 
 @dataclass(frozen=True, slots=True)
 class VenueObservation:
     """One venue's outcome on one question, at the granularity the rules need.
 
-    ``candidates_pre_filter`` counts what the venue's fan-out actually returned,
-    BEFORE the as_of / dedup / per-platform-cap filter. It is what separates "the
-    plumbing broke or the query is unsatisfiable" (zero candidates) from "we
-    found candidates and correctly discarded them" (Polymarket routinely fetches
-    20 markets that all close before the question resolves). Without it, 20 of 47
-    archived runs would have alerted on correct behaviour.
+    ``candidates_pre_filter`` counts the rows the venue put into the POOL, i.e. what
+    its fan-out or catalogue produced before the ranker selected anything. It is
+    Signal A's gate and denominator, and reading the pool rather than the render is
+    what makes Signal A immune to the ranker's judgment: a zero-row render is
+    routine, so a rendered denominator would let the same dead parser alert or stay
+    silent on which rows the model picked.
+
+    ``rows_post_filter`` is the RENDERED count. No rule reads it — it is recorded so
+    the recording tests can pin the pool-versus-render split, and so a cross-run
+    analysis over the telemetry archive can ask how often a venue's candidates reach
+    a forecaster. Anything alerting on it inside one question would be alerting on a
+    ranker decision.
 
     ``liquidity_fields_present`` holds the declared fields that parsed non-``None``
-    on at least one row. It is computed off the parsed ``MarketMatch`` objects that
-    actually render, not the upstream payload, so Signal A cannot disagree with the
-    ``signal`` column a forecaster reads.
+    on at least one POOL row — the same rows ``candidates_pre_filter`` counts. It is
+    computed off the parsed ``MarketMatch`` objects rather than the upstream payload,
+    so Signal A cannot disagree with the ``signal`` column a forecaster reads.
     """
 
     qid: int
@@ -204,33 +212,44 @@ def recorded_observations() -> tuple[tuple[VenueObservation, ...], tuple[Catalog
 
 
 def _field_contract_findings(observations: list[VenueObservation], today: date | None) -> list[DegradationFinding]:
-    """Signal A — a declared liquidity field dead across 100% of a venue's rows.
+    """Signal A — a declared liquidity field dead across 100% of a venue's POOL rows.
 
-    Only venues that produced at least one row are examined, which is what keeps a
-    legitimately market-less question silent: zero rows means the venue is never
-    evaluated at all. ``_liquidity_label`` renders ``no-liquidity-data`` if and
-    only if the parsed value is ``None``, while a genuinely zero-volume brand-new
-    market parses to ``0.0`` and renders ``thin`` — absent and zero are already
-    distinct in the code, which is what makes 3 rows a conclusive denominator
-    rather than a noisy sample.
+    Gated and denominated on ``candidates_pre_filter``, NOT on the rendered count,
+    because the rule exists to catch a PARSER whose field names went stale and the
+    ranker's selection has nothing to do with that. ``RENDER_BUDGET`` is a global
+    ceiling of 8 across four venues against pool widths of 100/60/60/~197, and an
+    empty ranker answer is explicitly valid, so a venue rendering zero rows is the
+    routine case rather than an edge — 42% of question-runs for kalshi, 39%
+    polymarket, 25% manifold in the bake-off's own diagnostics. Gating on the
+    rendered count let the same dead parser alert or stay silent purely on which
+    rows the model happened to pick, which is the 2026-07-12 hole (Kalshi labels
+    blank on 100% of rows for weeks) reopened. The recording site measures presence
+    over the same pool rows, so numerator and denominator now come from one place.
+
+    A legitimately market-less question stays silent because a venue with no pool
+    candidates is never evaluated. ``_liquidity_label`` renders ``no-liquidity-data``
+    if and only if the parsed value is ``None``, while a genuinely zero-volume
+    brand-new market parses to ``0.0`` and renders ``thin`` — absent and zero are
+    already distinct in the code, which is what makes a small pool a conclusive
+    denominator rather than a noisy sample.
     """
     findings: list[DegradationFinding] = []
     for venue in sorted(VENUE_EXPECTED_LIQUIDITY_FIELDS):
         expected = VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]
         if not expected:
             continue
-        with_rows = [obs for obs in observations if obs.venue == venue and obs.rows_post_filter > 0]
+        with_rows = [obs for obs in observations if obs.venue == venue and obs.candidates_pre_filter > 0]
         if not with_rows:
             continue
         dead = [f for f in expected if not any(f in obs.liquidity_fields_present for obs in with_rows)]
         if not dead:
             continue
-        rows = sum(obs.rows_post_filter for obs in with_rows)
+        pool_rows = sum(obs.candidates_pre_filter for obs in with_rows)
         findings.append(
             DegradationFinding(
                 signal=SIGNAL_MARKET_FIELD_CONTRACT,
                 venue=venue,
-                detail={"fields": ",".join(dead), "rows": rows},
+                detail={"fields": ",".join(dead), "pool_rows": pool_rows},
                 questions=len(with_rows),
                 remedy=(
                     "the rendered `signal` column read no-liquidity-data on every row, and the forecaster "
@@ -244,65 +263,14 @@ def _field_contract_findings(observations: list[VenueObservation], today: date |
     return findings
 
 
-def _no_contribution_findings(observations: list[VenueObservation], today: date | None) -> list[DegradationFinding]:
-    """Signal B — a venue produced nothing while >=2 siblings did, on every question.
-
-    Three legs, each load-bearing. Zero POST-filter rows is the symptom. Zero
-    PRE-filter candidates is what excludes correct as_of drops (Polymarket's
-    ``ok(20)`` token routinely coexists with zero rendered rows because the
-    markets close before the question resolves). And >=2 live siblings is what
-    keeps a legitimately market-less day silent: if nothing matched anywhere, no
-    venue has two live siblings, so no venue can be the outlier.
-    """
-    qids = sorted({obs.qid for obs in observations})
-    if not qids:
-        return []
-
-    by_question: dict[int, dict[str, VenueObservation]] = {}
-    for obs in observations:
-        by_question.setdefault(obs.qid, {})[obs.venue] = obs
-
-    venues = sorted({obs.venue for obs in observations})
-    findings: list[DegradationFinding] = []
-    for venue in venues:
-        live_sibling_counts: list[int] = []
-        for qid in qids:
-            per_venue = by_question[qid]
-            observed = per_venue.get(venue)
-            if observed is None or observed.rows_post_filter > 0 or observed.candidates_pre_filter > 0:
-                break
-            live_siblings = sum(
-                1 for name, sibling in per_venue.items() if name != venue and sibling.rows_post_filter > 0
-            )
-            if live_siblings < _MIN_LIVE_SIBLINGS:
-                break
-            live_sibling_counts.append(live_siblings)
-        else:
-            findings.append(
-                DegradationFinding(
-                    signal=SIGNAL_VENUE_NO_CONTRIBUTION,
-                    venue=venue,
-                    detail={"candidates": 0, "min_live_siblings": min(live_sibling_counts)},
-                    questions=len(qids),
-                    remedy=(
-                        "the venue returned zero candidates on every question while siblings answering the "
-                        "same query set returned plenty, so this is about the venue, not the questions. "
-                        "Check the venue's query construction and response parsing in "
-                        "metaculus_bot/research/prediction_market.py"
-                    ),
-                    suppressed_until=_suppression_for(venue, today),
-                )
-            )
-    return findings
-
-
 def _catalogue_findings(observations: list[CatalogueObservation], today: date | None) -> list[DegradationFinding]:
     """Signal C — a prefetch reported SUCCESS and returned an empty catalogue.
 
-    Closes the hole Signals A and B share: both read rows, so a catalogue that
-    silently empties out looks to them like a venue with nothing to say. Observed
-    Kalshi series catalogues run 12,355-12,370 entries and were never once zero,
-    so success-with-empty is a contradiction needing no rate.
+    Closes the hole Signal A has: it reads a venue's pool candidates, so a
+    catalogue that silently empties out looks to it like a venue with nothing to
+    say. Observed Kalshi series catalogues run 12,355-12,370 entries and were never
+    once zero, so success-with-empty is a contradiction needing no rate. For the two
+    enumerable venues this is the only alarm that can fire on an empty catalogue.
     """
     sources = sorted({obs.source for obs in observations})
     findings: list[DegradationFinding] = []
@@ -341,14 +309,13 @@ def _suppression_for(venue: str, today: date | None) -> date | None:
 
 
 def provider_degradation_findings(today: date | None = None) -> list[DegradationFinding]:
-    """Evaluate all three rules over this run's observations.
+    """Evaluate both rules over this run's observations.
 
     ``today`` is threaded through to the per-venue suppression check so tests can
     exercise both sides of a resume date forever instead of depending on the wall
     clock; production passes ``None`` and the clock is read at CALL time.
     """
     findings = _field_contract_findings(_RUN.venue_observations, today)
-    findings.extend(_no_contribution_findings(_RUN.venue_observations, today))
     findings.extend(_catalogue_findings(_RUN.catalogue_observations, today))
     return findings
 

@@ -147,9 +147,12 @@ SUMMARIZER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # Parser: deterministic extraction of percentiles/JSON from rationales — a
 # capability-saturated task, so it rides the cheapest tier that saturates it and
 # keeps allowed_tries=3 for robustness. mini → luna 2026-08-03: the per-token
-# comparison that used to favor mini inverted when luna was marked down. Luna is
-# $0.10/$0.60 vs mini's $0.75/$4.50 per 1M (OpenRouter, verified 2026-08-03), so
-# the newer model is now also the ~7x cheaper one. Effort unchanged at low.
+# comparison that used to favor mini inverted. Luna is $0.20/$1.20 vs mini's
+# $0.75/$4.50 per 1M, so the newer model is also the ~3.75x cheaper one. (The
+# models API showed $0.10/$0.60 behind a "50% off" badge on 2026-08-03; a live
+# call on 2026-08-04 billed at double that, so the promo does not apply on this
+# route — see the ranker cost comment below. The swap still wins, by less.)
+# Effort unchanged at low.
 PARSER_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
     "openrouter/openai/gpt-5.6-luna",
     reasoning={"effort": "low"},
@@ -218,14 +221,20 @@ STACKER_FALLBACK_LLM: GeneralLlm = build_llm_with_openrouter_fallback(
 # litellm `timeout` sits ABOVE its elapsed-gated wall cap in constants.py, so the wall is the
 # binding bound.
 #
-# Luna is the cheapest tier that saturates both tasks, at $0.10/M in and $0.60/M out
-# (OpenRouter list, verified 2026-08-03 — same prices quoted in the PARSER_LLM comment above).
-# Cost per question at the measured shapes: ranker ~36k in (median, post-enrichment and
-# full-PredictIt) + ~589 out ≈ $0.0040; author ~1.4k in + ~300 out ≈ $0.0003. The two keyword
-# calls they replace measured ~170 tok in / ~50 out ≈ $0.0001, so net new is ≈ +$0.003 per
-# question — fractions of a cent per run at the prod shape of 1-2 questions. The bake-off's
-# $0.0068/question is the BYOK ceiling, where input is marked up ~2.5x list and this traffic is
-# 97% input.
+# Luna is the cheapest tier that saturates both tasks. The real rate on this route is $0.20/M in
+# and $1.20/M out — TWICE the $0.10/$0.60 the bake-off read off the models API on 2026-08-03,
+# where a "50% off" badge was displayed that has since lapsed or never applied here. A live
+# ranking call reconciled the true rates to 7 significant figures against OpenRouter's own
+# `upstream_inference_cost` (26,250 in / 685 out / a 25% cache-WRITE surcharge on the input,
+# `scratch/market_port_2026-08-04/QA_DRY_RUN.md`), so this is measured rather than quoted.
+#
+# MEASURED cost per question: ranker $0.0074 (26k in at the median post-enrichment,
+# full-PredictIt shape + ~685 out, cache write included); author ~1.4k in + ~300 out ≈ $0.0005.
+# The two keyword calls they replace measured ~170 tok in / ~50 out ≈ $0.0001, so net new is
+# ≈ +$0.008 per question — under a cent per run at the prod shape of 1-2 questions, and ~$0.24
+# of ranker spend across a 30-question tournament run. The earlier ~$0.003-0.004 arithmetic in
+# the port plan understated by 2.4x purely because of the promo price; the token shapes were
+# right. This traffic is ~97% input, so the input rate is the whole cost.
 
 # Prediction-market RANKER: one call per question over the whole ~380-440-candidate pool,
 # emitting up to 8 ranked rows with a relation tier and a one-phrase label. Measured completion

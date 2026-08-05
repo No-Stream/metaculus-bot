@@ -740,15 +740,15 @@ class TestDegradationCounters:
 PROVIDER_DEGRADATION_LINE = (
     PFX + "PROVIDER_DEGRADATION: run=30784152530 findings=2 alertable=2 suppressed=0 "
     'detail=[{"signal":"market_field_contract","venue":"kalshi","questions":1,'
-    '"fields":"total_volume,open_interest","rows":3},'
-    '{"signal":"venue_no_contribution","venue":"manifold","questions":1,"candidates":0,"min_live_siblings":3}]'
+    '"fields":"total_volume,open_interest","pool_rows":40},'
+    '{"signal":"catalogue_empty","venue":"predictit_markets","questions":1,"entries":0,"fetch_ok":true}]'
 )
 PROVIDER_DEGRADATION_CLEAN_LINE = PFX + "PROVIDER_DEGRADATION: run=local findings=0 alertable=0 suppressed=0 detail=[]"
 PROVIDER_DEGRADATION_SUPPRESSED_LINE = (
     PFX + "PROVIDER_DEGRADATION: run=local findings=1 alertable=0 suppressed=1 "
-    'detail=[{"signal":"venue_no_contribution","venue":"manifold","questions":1,"candidates":0,'
-    '"min_live_siblings":3,"suppressed_until":"2026-09-10"}] '
-    "(manifold:venue_no_contribution suppressed until 2026-09-10); run stays green on those."
+    'detail=[{"signal":"market_field_contract","venue":"manifold","questions":1,"fields":"num_bettors",'
+    '"pool_rows":12,"suppressed_until":"2026-09-10"}] '
+    "(manifold:market_field_contract suppressed until 2026-09-10); run stays green on those."
 )
 
 
@@ -773,9 +773,9 @@ class TestProviderDegradation:
         and residual analysis json.loads it, so coercion would mangle it."""
         rec = _parse_one(PROVIDER_DEGRADATION_LINE)
         payload = json.loads(rec["detail"])
-        assert [entry["signal"] for entry in payload] == ["market_field_contract", "venue_no_contribution"]
+        assert [entry["signal"] for entry in payload] == ["market_field_contract", "catalogue_empty"]
         assert payload[0]["fields"] == "total_volume,open_interest"
-        assert payload[1]["venue"] == "manifold"
+        assert payload[1]["venue"] == "predictit_markets"
 
     def test_clean_run_parses_with_an_empty_detail_array(self):
         """A measured zero is signal, so the marker fires on healthy runs too and the

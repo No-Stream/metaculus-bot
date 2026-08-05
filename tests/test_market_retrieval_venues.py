@@ -24,14 +24,20 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from metaculus_bot.research.market_retrieval import venues
-from metaculus_bot.research.market_retrieval.http import flatten_results, parse_iso_guarded, safe_float
-from metaculus_bot.research.market_retrieval.types import MarketMatch
+from metaculus_bot.research.market_retrieval.http import (
+    flatten_results,
+    parse_iso,
+    parse_iso_guarded,
+    safe_float,
+)
+from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
 from tests.test_prediction_market_provider import FakeResponse, FakeSession
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
@@ -59,12 +65,25 @@ class TestKalshiEventProjection:
     """The streamed ``/events`` projection: what it keeps, and what it refuses to cache."""
 
     @pytest.mark.asyncio
-    async def test_projection_retains_exactly_the_listed_fields(self, multi_close_page: dict[str, Any]) -> None:
+    async def test_projection_retains_exactly_the_listed_fields_per_tier(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
         """A raw market object carries ~38 keys and the catalogue is held for 6h, so the
-        projection is the memory bound. This asserts the DROP, not just the keep — which is
-        why the fixture is a raw page rather than a pre-projected one."""
+        projection is the memory bound. This asserts the DROP, not just the keep — which is why
+        the fixture is a raw page rather than a pre-projected one.
+
+        Both TIERS are pinned. Only `close_time` and `status` are read across nested markets, so
+        every market after the first keeps just those two; 87.6% of the retained price/rules
+        fields were dead weight held for the full TTL. Widening the tail silently would double the
+        cache again, and narrowing the head would break the price/liquidity legs, which read
+        `nested[0]`. The fixture's 4-market event is what makes the two tiers distinguishable.
+        """
         raw_market_keys = set(multi_close_page["events"][0]["markets"][0])
         assert len(raw_market_keys) > 20, "fixture should be a RAW page, or this proves nothing"
+        assert any(len(event["markets"]) > 1 for event in multi_close_page["events"]), (
+            "fixture needs a multi-market event, or the tail tier is never exercised"
+        )
+        assert set(venues.KALSHI_NESTED_TAIL_FIELDS) < set(venues.KALSHI_MARKET_FIELDS)
 
         session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
         pull = await venues.kalshi_prefetch_events(session)
@@ -74,8 +93,9 @@ class TestKalshiEventProjection:
         assert len(pull.events) == len(multi_close_page["events"])
         for event in pull.events:
             assert set(event) == {*venues.KALSHI_EVENT_FIELDS, "settlement_sources", "markets"}
-            for market in event["markets"]:
-                assert set(market) == set(venues.KALSHI_MARKET_FIELDS)
+            for index, market in enumerate(event["markets"]):
+                expected = venues.KALSHI_MARKET_FIELDS if index == 0 else venues.KALSHI_NESTED_TAIL_FIELDS
+                assert set(market) == set(expected), f"{event['event_ticker']} market {index}"
 
     @pytest.mark.asyncio
     async def test_settlement_sources_are_projected_from_the_event_level(
@@ -131,29 +151,120 @@ class TestKalshiEventProjection:
         assert session._call_counts[venues.KALSHI_EVENTS_URL] == 1, "a 429 must not be re-issued"
 
     @pytest.mark.asyncio
-    async def test_pagination_follows_the_cursor_and_warms_each_page(self, multi_close_page: dict[str, Any]) -> None:
+    async def test_a_page_over_the_byte_ceiling_is_dropped_and_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, multi_close_page: dict[str, Any]
+    ) -> None:
+        """The last-resort guard against a runaway or compressed-bomb body, which had no
+        behavioural test at all — neutering it (`if False`) left the whole suite green.
+
+        Non-retryability is half the invariant: a retryable size cap doubles requests against a
+        rate-limited exchange for a body that will be just as oversized the second time. The
+        other half is `complete=False`, since the seam caches on exactly that flag and a
+        `complete=True` here would pin a truncated catalogue for the 6h TTL. The real 64 MB
+        ceiling is impractical to materialize, so the constant is patched down.
+        """
+        monkeypatch.setattr(venues, "KALSHI_PAGE_MAX_BYTES", 32)
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
+
+        pull = await venues.kalshi_prefetch_events(session)
+
+        assert pull.token == "dropped(size_cap)"
+        assert pull.complete is False
+        assert pull.events == []
+        assert session._call_counts[venues.KALSHI_EVENTS_URL] == 1, "an oversized body must not be re-requested"
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_dies_mid_stream_is_a_lost_page_not_an_empty_one(self) -> None:
+        """The worst of the untested branches. Mutated to return a clean EMPTY page instead of
+        `error(parse)`, a garbled body pins an empty events list for the 6h TTL with `token="none"`
+        and the degradation counter NOT bumped — the exact failure the sibling `{"events": null}`
+        test exists to prevent, and it never reddens CI.
+
+        The truncated body fires the parse branch at the default ceiling, and it is the first and
+        only call site of the `raw_content` hook `FakeResponse` was built for.
+        """
+        truncated = b'{"events": [{"event_ticker": "A", "title": "x"'
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, raw_content=truncated)})
+
+        pull = await venues.kalshi_prefetch_events(session)
+
+        assert pull.token == "error(parse)"
+        assert pull.complete is False
+        assert pull.events == []
+        assert session._call_counts[venues.KALSHI_EVENTS_URL] == 1, "a malformed body must not be re-requested"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_would_not_fit_the_wall_is_not_taken(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The retry-budget guard: a 503 IS retryable, but sleeping the backoff would consume a
+        wall that has almost nothing left, so the pull gives up and reports the transport error
+        it actually saw.
+
+        Anchored on THIS guard rather than the loop-top deadline check, which is behaviourally
+        shadowed by the per-attempt `attempt_budget <= 0.0` branch — deleting the loop-top check
+        leaves token, complete, tally and call count byte-identical, so a test written against it
+        would pass on its own mutant. Delete the guard under test instead and the pull sleeps
+        0.5s and reports `error(wall_timeout)`, which is what the token assertion catches.
+        """
+        session = FakeSession(
+            {venues.KALSHI_EVENTS_URL: [FakeResponse(503, text="down"), FakeResponse(503, text="still down")]}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues"):
+            pull = await venues.kalshi_prefetch_events(session, wall_timeout=0.01)
+
+        assert pull.token == "error(http_503)", "the wall must not relabel the transport failure"
+        assert pull.complete is False
+        assert session._call_counts[venues.KALSHI_EVENTS_URL] == 1
+        messages = "\n".join(caplog.messages)
+        assert "retry budget exhausted" in messages
+        assert "retry 2/" not in messages, "no backoff may be taken when the wall cannot fit it"
+
+    @pytest.mark.asyncio
+    async def test_pagination_follows_the_cursor_and_accumulates_every_page(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
         first = {"events": multi_close_page["events"][:1], "cursor": "page2"}
         second = {"events": multi_close_page["events"][1:], "cursor": ""}
         session = FakeSession(
             {venues.KALSHI_EVENTS_URL: [FakeResponse(200, payload=first), FakeResponse(200, payload=second)]}
         )
-        warmed: list[int] = []
-        pull = await venues.kalshi_prefetch_events(session, page_sink=lambda events: warmed.append(len(events)))
+        pull = await venues.kalshi_prefetch_events(session)
 
         assert [event["event_ticker"] for event in pull.events] == ["KXMARRIAGESTYLESKRAVITZ-HSZK", "USCLIMATE"]
         assert pull.tally.ok == 2
         assert pull.complete is True
-        assert warmed == [1, 2], "each successful page warms the caller's cache incrementally"
 
     @pytest.mark.asyncio
-    async def test_the_page_bound_stops_a_runaway_cursor(self, multi_close_page: dict[str, Any]) -> None:
-        """A cursor that never empties must terminate on the page bound, not spin."""
+    async def test_the_page_bound_stops_a_runaway_cursor_and_reports_it_incomplete(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """A cursor that never empties must terminate on the page bound, not spin — and the
+        catalogue it leaves is TRUNCATED, so the pull is not complete. Reporting `complete=True`
+        here would pin a short universe for the 6h TTL behind a green `ok(n)`, which is reachable
+        with no code change at all: Kalshi halving its effective page size puts ~38% of the
+        universe past the 120-page bound."""
         forever = {"events": multi_close_page["events"][:1], "cursor": "always-more"}
         session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=forever)})
-        pull = await venues.kalshi_prefetch_events(session, max_pages=3)
+        # page_sleep_s=0.0: this test is about the BOUND, not the throttle courtesy the real
+        # 0.25s default buys, and three real sleeps per bound test is dead suite time.
+        pull = await venues.kalshi_prefetch_events(session, max_pages=3, page_sleep_s=0.0)
 
         assert pull.tally.ok == 3
         assert len(pull.events) == 3
+        assert pull.complete is False
+        assert pull.token == "dropped(runaway_bound)"
+
+    @pytest.mark.asyncio
+    async def test_the_event_limit_also_reports_the_pull_incomplete(self, multi_close_page: dict[str, Any]) -> None:
+        """The sibling bound. Growth past `event_limit` truncates the catalogue exactly as the
+        page bound does, and the two must not disagree on what `complete` means."""
+        forever = {"events": multi_close_page["events"][:1], "cursor": "always-more"}
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=forever)})
+        pull = await venues.kalshi_prefetch_events(session, event_limit=2, page_sleep_s=0.0)
+
+        assert len(pull.events) == 2
+        assert pull.complete is False
+        assert pull.token == "dropped(runaway_bound)"
 
 
 class TestKalshiEventDerivations:
@@ -170,6 +281,28 @@ class TestKalshiEventDerivations:
         assert match.close_time is not None
         assert match.close_time.strftime("%Y-%m-%d") == "2028-01-01"
         assert match.close_time.strftime("%Y-%m-%d") != nested_closes[0][:10]
+
+    def test_close_time_survives_a_nested_market_missing_its_zulu_suffix(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """The mixed-awareness trap, at the site that actually compares two datetimes.
+
+        `fromisoformat` returns an AWARE datetime for `...Z` and a NAIVE one for a bare
+        timestamp, and `max()` over the two raises `TypeError: can't compare offset-naive and
+        offset-aware`. It happens inside `to_thread` with no guard, so it reaches the
+        snapshot-level net and zeroes all four venues for the question — and the offending event
+        stays in the 6h cache, so every later question repeats it. `parse_iso` normalizes at the
+        boundary, which covers all four venue parsers at once.
+        """
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        latest = max(market["close_time"] for market in event["markets"])
+        event["markets"][0]["close_time"] = event["markets"][0]["close_time"].replace("Z", "")
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.close_time is not None
+        assert match.close_time.strftime("%Y-%m-%d") == latest[:10]
 
     def test_an_event_is_resolved_only_when_every_nested_market_is(self, multi_close_page: dict[str, Any]) -> None:
         """``nested[0]`` is ``finalized`` here while the other three are ``active``, so the old
@@ -376,6 +509,73 @@ class TestManifold:
         assert await venues.manifold_market_detail(session, "abc") is None
 
 
+class TestScalarCoercions:
+    """The coercions every venue parser sits on, at the boundary where they are enforced."""
+
+    def test_parse_iso_returns_an_aware_datetime_for_both_shapes(self) -> None:
+        """The `Z` form and a bare timestamp must come back mutually comparable, or a `max()`
+        over an event's nested closes raises and takes the whole snapshot down."""
+        aware = parse_iso("2026-11-01T00:00:00Z")
+        naive_input = parse_iso("2026-11-01T00:00:00")
+
+        assert aware is not None and naive_input is not None
+        assert aware.tzinfo is not None
+        assert naive_input.tzinfo is not None
+        assert naive_input == aware, "a naive value is TREATED as UTC, not shifted"
+        assert max([aware, naive_input]) == aware
+
+    def test_parse_iso_does_not_shift_the_rendered_wall_clock(self) -> None:
+        """Attaching a tzinfo must leave every `%Y-%m-%d` render byte-identical — that is what
+        makes the normalization safe to do at the boundary rather than per comparison site."""
+        parsed = parse_iso("2026-11-01T23:30:00")
+
+        assert parsed is not None
+        assert parsed.strftime("%Y-%m-%d") == "2026-11-01"
+
+    def test_a_date_only_string_is_also_aware(self) -> None:
+        """The shape `parse_iso_guarded` falls back to, which is how PredictIt rows reach the
+        pool naive today."""
+        parsed = parse_iso("2026-11-01")
+
+        assert parsed is not None and parsed.tzinfo is not None
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_safe_float_rejects_non_finite_values(self, literal: str) -> None:
+        """`json.loads` accepts these bare literals, and NaN defeats every comparison in
+        `_liquidity_label` — so a row whose volume arrived as NaN would fall through to the
+        strongest label and render `signal=deep`, presenting missing data to a forecaster as the
+        best possible liquidity evidence. None renders `no-liquidity-data` instead."""
+        value = json.loads(literal)
+
+        assert safe_float(value) is None
+        assert _liquidity_label(_row_with_volume(value)) == "no-liquidity-data"
+
+    def test_safe_float_keeps_a_real_zero(self) -> None:
+        """The distinction the liquidity signal rests on: absent is None, a genuinely
+        zero-volume brand-new market is 0.0 and renders `thin`."""
+        assert safe_float(0) == 0.0
+        assert safe_float("0.0000") == 0.0
+
+
+def _row_with_volume(volume: Any) -> MarketMatch:
+    return MarketMatch(
+        platform="kalshi",
+        market_title="M",
+        market_url="https://kalshi.com/markets/M",
+        implied_prob_yes=None,
+        bid=None,
+        ask=None,
+        spread=None,
+        volume_24h=None,
+        close_time=None,
+        is_resolved=False,
+        match_confidence=1.0,
+        raw_rules="",
+        total_volume=safe_float(volume),
+        open_interest=None,
+    )
+
+
 class TestPredictIt:
     def test_date_end_survives_both_sentinels_and_seven_digit_fractions(self) -> None:
         """The dump ships all three shapes and ``fromisoformat`` rejects two of them, which is
@@ -429,12 +629,53 @@ class TestPredictIt:
     def test_a_nameless_market_yields_no_row(self) -> None:
         assert venues.predictit_market_match({"id": 7}, match_confidence=1.0, channel="x") is None
 
-    def test_a_non_open_first_contract_marks_the_market_resolved(self) -> None:
+    def test_a_market_whose_every_contract_is_closed_is_resolved(self) -> None:
         market = {"id": 1, "name": "M", "contracts": [{"name": "c", "status": "Closed"}]}
 
         match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
 
         assert match is not None and match.is_resolved is True
+
+    @pytest.mark.parametrize("order", [("Closed", "Open"), ("Open", "Closed")])
+    def test_one_open_contract_keeps_the_market_live_in_either_order(self, order: tuple[str, str]) -> None:
+        """The `nested[0]` bug this file already fixes for Kalshi. Reading the first contract made
+        the verdict depend on the order untrusted external JSON arrived in — the SAME market read
+        RESOLVED one way and open the other — and the ranker prompt tells the model a RESOLVED
+        price is a realized outcome rather than a forecast, so it deprioritizes a live market."""
+        market = {
+            "id": 1,
+            "name": "M",
+            "contracts": [
+                {"name": "a", "status": order[0], "dateEnd": "2026-07-01T00:00:00"},
+                {"name": "b", "status": order[1], "dateEnd": "2026-12-31T00:00:00"},
+            ],
+        }
+
+        match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.is_resolved is False
+        assert match.close_time is not None
+        assert match.close_time.strftime("%Y-%m-%d") == "2026-12-31", "close_time is the max over contracts"
+
+    def test_a_contracts_block_holding_no_usable_entry_is_not_resolved(self) -> None:
+        """The empty-sequence trap: `all()` over nothing is True, so folding the dict filter
+        inside the conjunction would report a market with no readable contract as SETTLED."""
+        market = {"id": 1, "name": "M", "contracts": ["nonsense", 7, None]}
+
+        match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.is_resolved is False
+        assert match.close_time is None
+
+    def test_a_contract_with_no_status_reads_as_open(self) -> None:
+        """A missing field is not evidence of settlement."""
+        market = {"id": 1, "name": "M", "contracts": [{"name": "c"}]}
+
+        match = venues.predictit_market_match(market, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None and match.is_resolved is False
 
     @pytest.mark.asyncio
     async def test_prefetch_keeps_the_none_versus_empty_contract(self) -> None:

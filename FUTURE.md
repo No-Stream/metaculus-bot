@@ -645,19 +645,31 @@ affordable middle is more v2 rounds / parallelism, not a rebuild. The NO verdict
 
 `metaculus_bot/research/provider_health.py` gives a silently-degraded provider a same-day exit code:
 the run publishes normally, then `alertable_count` folds in a per-run provider-degradation summand and
-`cli.py` exits non-zero. Three rules today, all scoped to the prediction-market provider and all
+`cli.py` exits non-zero. Two rules today, both scoped to the prediction-market provider and both
 100%-of-denominator conjunctions with no tunable float: `market_field_contract` (a declared liquidity
-field dead across every row a venue produced), `venue_no_contribution` (a venue returned zero candidates
-while ≥2 siblings answered the same query set, on every question), `catalogue_empty` (a prefetch reported
+field dead across every POOL row a venue produced) and `catalogue_empty` (a prefetch reported
 success and returned an empty catalogue). Replayed over 47 archived runs the rules fire on exactly the two
 real degradations in 20 runs with zero confirmed false positives, and go silent on the fixed tree.
 
 **The load-bearing design constraint, for anyone extending this: prod runs carry ONE OR TWO questions**
 (median 1, verified on a 1011-run histogram of `{1: 1008, 2: 3}`). So a rate over "the questions in a run"
 IS a per-question flag, and a per-question flag must never fire — a single question with no matching
-market is normal, not a defect. Every denominator has to exist INSIDE one question (rows a venue produced,
-sibling venues, a catalogue's own size). A longer run then makes every signal strictly harder to trip,
+market is normal, not a defect. Every denominator has to exist INSIDE one question (the pool rows a venue
+produced, a catalogue's own size). A longer run then makes every signal strictly harder to trip,
 which is the correct direction and means no retuning when a `test_bot` run carries four questions.
+
+**A third rule, `venue_no_contribution` (Signal B), was DELETED 2026-08-04 — do not re-add it in
+per-question form.** It fired when a venue returned zero candidates while ≥2 siblings answered, and under
+ranked retrieval that conjunction is unsound: the enumerable venues enumerate whole catalogues, so their
+candidate count is never zero — they could never be the flagged venue but always supplied the sibling leg
+for free, leaving a search venue whose index legitimately returned `[]` satisfying the one leg meant to
+exclude correct behaviour. Replaying all 59 archived `backtests/research_archive/raw/*.jsonl` snapshots,
+the shipped rule fired on 45 healthy manifold runs and 26 polymarket ones; the narrowest surviving form
+(search venues only, one sibling) still fired on 20 manifold runs. **The surviving intent is real but
+cross-run:** a venue contributing zero across many CONSECUTIVE runs is a genuine defect and is
+unjudgeable inside one question, so it belongs in a check over `backtests/telemetry_archive/` (the
+`provider_degradation` marker plus the per-source tokens in the research archive) rather than in a
+per-run rule. That is the shape to build if the signal is wanted back.
 
 Worth extending to the other providers on the same denominator discipline: Gemini grounded search
 (grounding metadata absent on 100% of calls), the resolution-source fetcher (every URL blocked/js_wall on

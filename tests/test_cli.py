@@ -945,7 +945,9 @@ class TestCliProviderDegradationExit:
         bot = _bot_with_real_alertable_count()
         for venue in ("kalshi", "predictit", "polymarket"):
             _observe_venue(venue, candidates=3, rows=3, fields=frozenset(VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]))
-        _observe_venue("manifold", candidates=0, rows=0, fields=frozenset())
+        # Manifold's declared field (`num_bettors`) absent from every pool row: one
+        # `market_field_contract` finding on the venue whose acceptance is under test.
+        _observe_venue("manifold", candidates=3, rows=3, fields=frozenset())
 
         with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_FUTURE_RESUME}):
             assert bot.alertable_count == 0

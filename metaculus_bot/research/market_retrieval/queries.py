@@ -10,10 +10,14 @@ Three properties are load-bearing here, each with a measurement behind it:
   the author's worst case is "no gain".
 - **Digit stripping happens in code, not by asking the model nicely.** Manifold's `term` is a
   strict conjunction of content tokens, so one date token no market's text carries returns `[]`.
-  `strip_dates_and_numbers` is applied to author output at PARSE time (so a numeric synonym can
+  `strip_dates_and_numbers` is applied at PARSE time to author output (so a numeric token can
   never reach the un-stripping Kalshi channel) and by the conjunctive venues at their own call
-  site. `deterministic_queries` itself does NOT strip: a year is real signal when scoring
-  against a catalogue of dated market titles, and the enumerable venues score on the raw set.
+  site. On author output the strip DROPS the synonym rather than keeping its non-digit remnant —
+  the author cannot contribute digit-bearing vocabulary at all — because a generic remnant like
+  `"rate"` scores ~100 against thousands of off-topic events and `fuzzy_best` has no floor to
+  stop it displacing a real hit. `deterministic_queries` itself does NOT strip: a year is real
+  signal when scoring against a catalogue of dated market titles, and the enumerable venues
+  score on the raw set.
 - **`fuzzy_best` has no score floor.** It ORDERS a catalogue so its top N fits in a prompt; it
   never drops anything. The retired `KALSHI_MIN_FUZZY_SCORE` / `PREDICTIT_MIN_FUZZY_SCORE`
   floors are what discarded the adjacent-cut markets that carry most of the evidential value,
@@ -25,8 +29,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Sequence
 
-from rapidfuzz import fuzz
+import numpy as np
+from rapidfuzz import fuzz, process
+
+from metaculus_bot.structured_output_schema import extract_first_balanced_braces, extract_json_block
 
 logger = logging.getLogger(__name__)
 
@@ -198,10 +206,20 @@ def build_query_author_prompt(title: str, resolution_criteria: str) -> str:
 def _authored_strings(value: object) -> list[str]:
     """One of the author's two JSON arrays, cleaned into usable queries.
 
-    Digits are stripped HERE and not only at search time: a numeric token in a synonym would
-    otherwise survive into the Kalshi fuzzy channel, which does not strip, and dates are the
-    measured cause of the conjunction cliff. A synonym that is *entirely* numeric therefore
-    drops out, which is intended — it carries no content token to match on.
+    Digit-bearing synonyms are DROPPED here, not trimmed down to their non-digit tokens. The
+    strip has to happen at parse time — a numeric token in a synonym would otherwise survive
+    into the Kalshi fuzzy channel, which does not strip, and dates are the measured cause of the
+    conjunction cliff — but keeping the REMNANT is worse than dropping the synonym. `"U-3 rate"`
+    reduced to `"rate"`, and `fuzzy_best` maxes with no floor, so one generic word scores ~100
+    via `token_set_ratio` against every catalogue event whose rules text contains it: measured on
+    the real 9,762-event catalogue, bare `"rate"` scores >=99 on 52 events and pushed the first
+    wanted row from pool rank 2 to rank 31, replacing an entire fail-open slate with Fed-funds
+    markets. Dropping loses only what the author could not express anyway; keeping the remnant
+    actively displaces real hits before the width cut.
+
+    So the author cannot contribute digit-bearing vocabulary at all (`"U-3"`, `"S&P 500"`,
+    `"CPI-U"`, `"2026 print"`). That is the accepted cost of one query set feeding both an
+    un-stripping fuzzy channel and a strict conjunction.
     """
     if not isinstance(value, list):
         return []
@@ -209,9 +227,11 @@ def _authored_strings(value: object) -> list[str]:
     for item in value:
         if not isinstance(item, str):
             continue
-        text = strip_dates_and_numbers(item.strip())[:MAX_QUERY_CHARS].strip()
-        if text:
-            out.append(text)
+        normalized = " ".join(item.split())
+        stripped = strip_dates_and_numbers(normalized)
+        if not stripped or stripped != normalized:
+            continue
+        out.append(stripped[:MAX_QUERY_CHARS].strip())
     return out
 
 
@@ -227,16 +247,22 @@ def parse_query_author(text: str) -> tuple[str, ...]:
     if not blob:
         logger.warning("market query author: empty completion")
         return ()
-    if blob.startswith("```"):
-        blob = re.sub(r"^```[a-zA-Z]*\s*", "", blob)
-        blob = re.sub(r"\s*```\s*$", "", blob)
-    start, end = blob.find("{"), blob.rfind("}")
-    if start < 0 or end <= start:
+    # The canonical extractors rather than a local fence regex plus a widest-brace slice. The
+    # slice spanned from the first `{` to the LAST `}` anywhere in the output, so a well-formed
+    # object followed by ordinary prose containing a brace ("Note use {care}.") failed to parse
+    # and reported the additive stage lost on a usable payload. `iter_balanced_braces` (behind
+    # `extract_first_balanced_braces`) is string-literal-aware and stops at the object's own
+    # closing brace.
+    object_blob = extract_json_block(blob) or extract_first_balanced_braces(blob)
+    if object_blob is None:
         logger.warning(f"market query author: no JSON object found in {blob[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
         return ()
     try:
-        parsed = json.loads(blob[start : end + 1])
-    except json.JSONDecodeError as exc:
+        parsed = json.loads(object_blob)
+    except ValueError as exc:
+        # ValueError, not json.JSONDecodeError: CPython's 4300-digit int-conversion cap raises a
+        # BARE ValueError from `json.loads`, which JSONDecodeError does not cover — the same hole
+        # `ranking._first_usable_array` closes on the ranker side.
         logger.warning(f"market query author: object did not parse: {exc}")
         return ()
     if not isinstance(parsed, dict):
@@ -268,3 +294,37 @@ def fuzzy_best(queries: list[str], title: str, rules: str) -> float:
         rules_score = fuzz.token_set_ratio(q, rules_lower) if rules_lower else 0.0
         best = max(best, 0.7 * title_score + 0.3 * rules_score)
     return best
+
+
+def fuzzy_best_many(queries: list[str], titles: Sequence[str], rules: Sequence[str]) -> list[float]:
+    """``fuzzy_best`` over a whole catalogue at once. One score per title, same order.
+
+    Batched here beside the scalar form so the ``0.7 * title + 0.3 * rules`` weighting and the
+    scorer choice stay in ONE module: inlining them at the call site would create a second live
+    copy that silently diverges from the settlement-join channel's re-rank.
+
+    ``process.cdist`` rather than a Python loop because the loop does not actually free the event
+    loop. The whole point of ``build_pool``'s ``to_thread`` hop is to get ~9,762 events x ~17
+    queries off the loop, but every ``token_set_ratio`` call returns to Python bytecode holding
+    the GIL, so the offload converted one long freeze into sustained sub-quantum starvation:
+    measured 0.46-0.59s of scoring with loop lag p50 rising 1.3ms -> 15-20ms, and at the
+    ``DEFAULT_MAX_CONCURRENT_RESEARCH = 6`` the code actually runs at, 3.25s wall with p50 56ms
+    and the loop receiving 7.8% of its ticks — the window in which sibling questions' soft
+    deadlines advance while their tasks cannot run. ``cdist`` releases the GIL and threads
+    internally: 0.055-0.106s for the same work, loop lag back to idle, and verified BIT-identical
+    to the scalar form at ``dtype=np.float64`` (the float32 default drifts ~5e-06, which would
+    reorder ties). The win survives a 2-core runner — it is the GIL release, not the core count.
+
+    The empty guard is LOAD-BEARING, not defensive noise: ``deterministic_queries("")`` returns
+    ``[]``, and ``.max(axis=0)`` over a zero-row array raises ``ValueError``.
+    """
+    if not queries or not titles:
+        return [0.0] * len(titles)
+    lowered = [query.lower() for query in queries]
+    title_scores = process.cdist(
+        lowered, [title.lower() for title in titles], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float64
+    )
+    rules_scores = process.cdist(
+        lowered, [rule.lower() for rule in rules], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float64
+    )
+    return (0.7 * title_scores + 0.3 * rules_scores).max(axis=0).tolist()

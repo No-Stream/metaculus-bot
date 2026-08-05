@@ -42,7 +42,6 @@ from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_lab
 from metaculus_bot.research.provider_health import (
     SIGNAL_CATALOGUE_EMPTY,
     SIGNAL_MARKET_FIELD_CONTRACT,
-    SIGNAL_VENUE_NO_CONTRIBUTION,
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
     VenueObservation,
     log_provider_degradation_summary,
@@ -175,13 +174,17 @@ def _fields_present(rows: list[MarketMatch], venue: str) -> frozenset[str]:
 
 
 class TestSignalMarketFieldContract:
-    """A declared liquidity field dead across 100% of a venue's rows.
+    """A declared liquidity field dead across 100% of a venue's POOL rows.
 
     The threshold is 100%-of-rows rather than a fraction because absent and zero
     are ALREADY distinct in the code: ``_liquidity_label`` renders
     ``no-liquidity-data`` if and only if the parsed value is None, while a
     brand-new zero-volume market parses to 0.0 and renders ``thin``. So there is no
     noise floor to threshold against, and three rows is a conclusive denominator.
+
+    The denominator is the POOL, not the render. Both halves of the rule read
+    ``candidates_pre_filter``, so a broken parser is equally visible whether or not
+    the ranker kept any of that venue's rows.
     """
 
     def test_the_signal_agrees_with_the_rendered_label_on_real_kalshi_rows(self, captured_payloads: dict) -> None:
@@ -308,7 +311,7 @@ class TestSignalMarketFieldContract:
         assert findings[0].signal == SIGNAL_MARKET_FIELD_CONTRACT
         assert findings[0].venue == "kalshi"
         assert findings[0].detail["fields"] == "total_volume,open_interest"
-        assert findings[0].detail["rows"] == 3
+        assert findings[0].detail["pool_rows"] == 3
         assert provider_degradation_count() == 1
 
     def test_zero_is_not_absent(self) -> None:
@@ -336,10 +339,58 @@ class TestSignalMarketFieldContract:
         _observe("kalshi", rows=1, fields_present=_fields_present([row], "kalshi"))
         assert provider_degradation_findings() == []
 
-    def test_a_venue_with_zero_rows_is_never_evaluated(self) -> None:
-        """Why a market-less question stays silent under Signal A: the rule only
-        looks at venues that produced at least one row."""
+    def test_a_venue_with_an_empty_pool_is_never_evaluated(self) -> None:
+        """Why a market-less question stays silent under Signal A: the rule only looks
+        at venues that put at least one candidate in the pool. This is the whole
+        false-positive defence, and it is a statement about the POOL — nothing about
+        the render can silence the rule."""
         _observe("kalshi", candidates=0, rows=0, fields_present=frozenset())
+        assert provider_degradation_findings() == []
+
+    def test_a_dead_field_fires_even_when_the_ranker_rendered_nothing(self) -> None:
+        """The no-false-negative case, and the regression this gate exists for.
+
+        A zero-row render is routine under ranked selection: ``RENDER_BUDGET`` is a
+        global ceiling of 8 across four venues against pool widths of 100/60/60/~197,
+        and the bake-off's own diagnostics put a venue at zero rendered rows on 42% of
+        question-runs for kalshi. Gating on the rendered count therefore let the SAME
+        dead parser alert or stay silent purely on the model's pick — which is the
+        2026-07-12 Kalshi hole (labels blank on 100% of rows for weeks) reopened.
+        """
+        _observe("kalshi", candidates=40, rows=0, fields_present=frozenset())
+        findings = provider_degradation_findings()
+
+        assert len(findings) == 1
+        assert findings[0].signal == SIGNAL_MARKET_FIELD_CONTRACT
+        assert findings[0].venue == "kalshi"
+        assert findings[0].detail["pool_rows"] == 40
+        assert provider_degradation_count() == 1
+
+    def test_an_enumerable_venue_with_a_healthy_catalogue_always_reports_candidates(self) -> None:
+        """The enumerable venues no longer depend on a query at all — their whole
+        catalogue enters the pool — so a healthy catalogue ALWAYS yields candidates.
+
+        That is what makes Signal A's pool gate safe for Kalshi and PredictIt: their
+        denominator is a fact about the catalogue rather than about the ranker, so a
+        broken parser on either is always evaluated. A refactor that reintroduced a
+        per-query filter on an enumerable venue would break this and could silence the
+        signal on the two venues whose only other alarm (Signal C) fires solely on an
+        EMPTY catalogue.
+        """
+        payload = json.loads(_PAYLOADS_PATH.read_text())
+        kalshi = _kalshi_rows(payload["kalshi_events"]["events"])
+        predictit = _predictit_rows(payload["predictit_all"]["markets"])
+
+        assert len(kalshi) == len(
+            [e for e in payload["kalshi_events"]["events"] if e.get("title") or e.get("sub_title")]
+        )
+        assert len(predictit) == len(payload["predictit_all"]["markets"])
+        for venue, rows in (("kalshi", kalshi), ("predictit", predictit)):
+            assert rows, f"{venue}: a healthy catalogue must always reach the pool"
+            _observe(venue, candidates=len(rows), rows=0, fields_present=_fields_present(rows, venue))
+
+        # Zero RENDERED rows on both, and the signal still reads the real parser state:
+        # these captured payloads populate every declared field, so nothing fires.
         assert provider_degradation_findings() == []
 
     def test_presence_on_one_question_of_two_does_not_fire(self) -> None:
@@ -381,132 +432,6 @@ class TestSignalMarketFieldContract:
 
         assert len(findings) == 1
         assert findings[0].detail["fields"] == "open_interest"
-
-
-# Signal B — venue_no_contribution
-
-
-class TestSignalVenueNoContribution:
-    """A venue produced nothing while >=2 siblings did, on every question of the run.
-
-    The sibling leg is what makes this a statement about the VENUE rather than about
-    the question, at a run size of one. All four venues receive the same query set,
-    so a venue with zero candidates where two siblings answered is an outlier.
-    """
-
-    def test_manifold_alone_at_zero_fires(self) -> None:
-        """D2 regression, in the shape the archive measured: Manifold contributed on
-        1 of 57 question-observations while its three siblings ran at 31-82%."""
-        _observe("kalshi")
-        _observe("predictit")
-        _observe("polymarket")
-        _observe("manifold", candidates=0, rows=0, fields_present=frozenset())
-
-        findings = provider_degradation_findings()
-        assert len(findings) == 1
-        assert findings[0].signal == SIGNAL_VENUE_NO_CONTRIBUTION
-        assert findings[0].venue == "manifold"
-        assert findings[0].detail["candidates"] == 0
-        assert findings[0].detail["min_live_siblings"] == 3
-        assert provider_degradation_count() == 1
-
-    def test_market_less_day_stays_silent(self) -> None:
-        """THE false-positive test. A tournament day whose one open question is about
-        something no venue covers: all four venues return zero rows and zero
-        candidates. Nothing fires, and the run exits zero.
-
-        This is the case the naive "a venue returning zero matches across every
-        question in a run" rule would have reddened — on a run size of one, that
-        rule IS a per-question flag. The >=2-live-siblings leg exists for exactly
-        this scenario: if nothing matched anywhere, no venue has two live siblings,
-        so no venue can be the outlier.
-        """
-        for venue in ("polymarket", "kalshi", "manifold", "predictit"):
-            _observe(venue, candidates=0, rows=0, fields_present=frozenset())
-
-        assert provider_degradation_findings() == []
-        assert provider_degradation_count() == 0
-
-    def test_as_of_drops_are_not_degradation(self) -> None:
-        """The Polymarket false-positive test. Replays the measured ``ok(20)`` /
-        ``final_rows=0`` case on qid 45082: Polymarket fetched 20 markets that all
-        close before the question resolves, so the as_of filter correctly dropped
-        every one. That is right behaviour, and without the pre-filter-candidate leg
-        20 of 47 archived runs would have alerted on it.
-        """
-        _observe("kalshi")
-        _observe("predictit")
-        _observe("polymarket", candidates=20, rows=0, fields_present=frozenset())
-
-        assert provider_degradation_findings() == []
-
-    def test_one_live_sibling_is_not_enough(self) -> None:
-        """A lone live sibling is thin evidence the query set was answerable, and at
-        one sibling the archived false-positive count is non-zero for healthy
-        venues."""
-        _observe("kalshi")
-        _observe("manifold", candidates=0, rows=0, fields_present=frozenset())
-        _observe("polymarket", candidates=0, rows=0, fields_present=frozenset())
-
-        assert provider_degradation_findings() == []
-
-    def test_contributing_on_one_of_two_questions_does_not_fire(self) -> None:
-        """The conjunction over the whole run. A rule that fired here would be a
-        per-question flag with a rate's clothes on, which is what the operator ruled
-        out. It also means a longer run makes the signal strictly HARDER to trip."""
-        for qid in (1, 2):
-            _observe("kalshi", qid=qid)
-            _observe("predictit", qid=qid)
-            _observe("polymarket", qid=qid)
-        _observe("manifold", qid=1)
-        _observe("manifold", qid=2, candidates=0, rows=0, fields_present=frozenset())
-
-        assert [f for f in provider_degradation_findings() if f.signal == SIGNAL_VENUE_NO_CONTRIBUTION] == []
-
-    def test_zero_on_every_question_of_a_two_question_run_fires(self) -> None:
-        for qid in (1, 2):
-            _observe("kalshi", qid=qid)
-            _observe("predictit", qid=qid)
-            _observe("manifold", qid=qid, candidates=0, rows=0, fields_present=frozenset())
-
-        findings = [f for f in provider_degradation_findings() if f.signal == SIGNAL_VENUE_NO_CONTRIBUTION]
-        assert len(findings) == 1
-        assert findings[0].questions == 2
-
-    def test_an_enumerable_venue_with_a_healthy_catalogue_always_reports_candidates(self) -> None:
-        """Guards Signal B's sibling-comparison assumption in the form ranked retrieval leaves
-        it in.
-
-        The rule treats a venue's silence as informative only because the venue was genuinely
-        asked. Under the old design that meant "every venue receives the same query set", and
-        the guard was a superset assertion over an LLM keyword extractor's per-venue output.
-        That assertion is now FALSE by construction and would have to be deleted rather than
-        fixed: Manifold and Polymarket receive digit-stripped queries while Kalshi scores on the
-        un-stripped set, deliberately, because a year is real signal against a catalogue of
-        dated market titles and a strict conjunction it zeroes.
-
-        The invariant that replaces it is stronger, because the enumerable venues no longer
-        depend on a query at all — their whole catalogue enters the pool. So a healthy catalogue
-        ALWAYS yields candidates, which makes Signal B structurally unable to fire for Kalshi or
-        PredictIt, and `record_catalogue_size` (Signal C) their only alarm. A refactor that
-        reintroduced a per-query filter on an enumerable venue would break this and hand those
-        two venues back a standing false-positive path.
-        """
-        payload = json.loads(_PAYLOADS_PATH.read_text())
-        kalshi = _kalshi_rows(payload["kalshi_events"]["events"])
-        predictit = _predictit_rows(payload["predictit_all"]["markets"])
-
-        assert len(kalshi) == len(
-            [e for e in payload["kalshi_events"]["events"] if e.get("title") or e.get("sub_title")]
-        )
-        assert len(predictit) == len(payload["predictit_all"]["markets"])
-        for venue, rows in (("kalshi", kalshi), ("predictit", predictit)):
-            _observe(venue, candidates=len(rows), rows=0, fields_present=_fields_present(rows, venue))
-            assert rows, f"{venue}: a healthy catalogue must always reach the pool"
-
-        # Zero RENDERED rows on both, and still no no-contribution finding: the ranker's
-        # judgment is not a venue defect.
-        assert [f for f in provider_degradation_findings() if f.signal == SIGNAL_VENUE_NO_CONTRIBUTION] == []
 
 
 # Signal C — catalogue_empty
@@ -605,7 +530,7 @@ class TestSuppression:
         _observe("kalshi")
         _observe("predictit")
         _observe("polymarket")
-        _observe("manifold", candidates=0, rows=0, fields_present=frozenset())
+        _observe("manifold", fields_present=frozenset())
 
         findings = provider_degradation_findings(DURING_SUPPRESSION)
         assert len(findings) == 1
@@ -622,7 +547,7 @@ class TestSuppression:
         # record — the drained-donated-key incident is the precedent.
         marker = next(msg for msg in messages if msg.startswith("PROVIDER_DEGRADATION:"))
         assert "findings=1 alertable=0 suppressed=1" in marker
-        assert "manifold:venue_no_contribution suppressed until 2026-09-10" in marker
+        assert "manifold:market_field_contract suppressed until 2026-09-10" in marker
         assert "run stays green" in marker
         assert any("PROVIDER DEGRADATION (suppressed until 2026-09-10)" in msg for msg in messages)
 
@@ -633,7 +558,7 @@ class TestSuppression:
         _observe("kalshi")
         _observe("predictit")
         _observe("polymarket")
-        _observe("manifold", candidates=0, rows=0, fields_present=frozenset())
+        _observe("manifold", fields_present=frozenset())
 
         assert provider_degradation_count(AFTER_RESUME_DATE) == 1
 
@@ -644,7 +569,7 @@ class TestSuppression:
         _observe("kalshi", rows=3, fields_present=frozenset())
         _observe("predictit")
         _observe("polymarket")
-        _observe("manifold", candidates=0, rows=0, fields_present=frozenset())
+        _observe("manifold", fields_present=frozenset())
 
         findings = provider_degradation_findings(DURING_SUPPRESSION)
         assert {(f.venue, f.is_alertable) for f in findings} == {("kalshi", True), ("manifold", False)}
@@ -678,7 +603,7 @@ class TestSummaryLine:
                 "venue": "kalshi",
                 "questions": 1,
                 "fields": "total_volume,open_interest",
-                "rows": 3,
+                "pool_rows": 3,
             }
         ]
 

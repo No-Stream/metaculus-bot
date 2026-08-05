@@ -32,8 +32,10 @@ fuzzy scorer survives as a way to ORDER Kalshi's ~9,762 events down to a prompta
 the provider path passes `as_of=None`: the filter dropped every market closing before the
 question resolved, which is precisely the "same quantity, adjacent month" class the ranked arm
 scored most of its wins on, and 20 of 47 archived runs had Polymarket fetch candidates and
-render nothing because of it. The parameter, the filter and the cache key survive for explicit
-callers (backtests, replay tooling), where leakage defence is real.
+render nothing because of it. The parameter and the cache key survive for explicit callers
+(backtests, replay tooling), where leakage defence is real; the drop itself now happens inside
+pool assembly, so an ineligible row frees its width slot instead of being deleted after the
+width has already been spent.
 
 Soft-fail on every path. This provider returns an empty snapshot on any failure and never
 raises — a broken venue API must never break a forecast — so the degradation counters below
@@ -54,12 +56,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
-import litellm.exceptions
+import openai
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
@@ -317,7 +318,16 @@ async def _invoke_market_llm(
             label=label,
             backoffs=backoffs,
         )
-    except (litellm.exceptions.APIError, asyncio.TimeoutError, RuntimeError):
+    # `openai.APIError` and NOT `litellm.exceptions.APIError`: every litellm transport exception
+    # (Timeout, RateLimitError, APIConnectionError, InternalServerError, ServiceUnavailableError)
+    # subclasses the openai root but NOT litellm's own APIError, so catching the latter caught
+    # only a bare `APIError` and let every realistic provider blip escape — past `_rank_pool`'s
+    # `except RankingUnusable` to the snapshot-level net, discarding the WHOLE snapshot where the
+    # documented fail-open would have rendered the pool-order slate. Same idiom as
+    # `research/orchestrator.py` and `ablation/leakage_screen.py`. Deliberately NOT `Exception`:
+    # the TypeError/AttributeError family must still crash (§2 fail-fast), and `CancelledError`
+    # subclasses neither root so the `wait_for` boundary stays intact.
+    except (openai.APIError, asyncio.TimeoutError, RuntimeError):
         logger.warning(f"{label} LLM call failed", exc_info=True)
         return ""  # noqa: ASYNC910
 
@@ -331,12 +341,12 @@ async def _kalshi_catalogue(session: Any, *, qid: int | None) -> tuple[list[dict
     """The complete projected Kalshi open-events catalogue, cached ~6h.
 
     Returns ``(events, source_token)``; the token is what says whether the pull succeeded, so
-    there is nothing for a separate boolean to disagree with. The pull warms the cache INCREMENTALLY
-    through `page_sink`, so a cancelled or partly-lost pull leaves whatever pages completed
-    rather than nothing; the authoritative write happens only when pagination exits on its own
-    terms, because writing it unconditionally pinned an error-truncated — often EMPTY — list
-    for the whole TTL, and one transient blip on the first question then starved every later
-    question in the run.
+    there is nothing for a separate boolean to disagree with. The completeness-gated write below
+    is the ONLY writer, deliberately: the read path checks the TTL and nothing else, so any
+    incremental warm would pin an error-truncated — often EMPTY — list carrying a fresh
+    timestamp, and every later question in the run would then read it back as a healthy
+    `ok(N)` with no HTTP and no counter bump. A partial pull is still returned to THIS question,
+    which is what keeps a lost page from costing the caller the pages that did arrive.
     """
     cached = _KALSHI_CACHE.get("events")
     if cached is not None:
@@ -346,10 +356,7 @@ async def _kalshi_catalogue(session: Any, *, qid: int | None) -> tuple[list[dict
                 record_catalogue_size(qid=qid, source="kalshi_events", entries=len(events), fetch_ok=True)
             return events, f"ok({len(events)})" if events else "none"  # noqa: ASYNC910
 
-    def _warm(accumulated: list[dict[str, Any]]) -> None:
-        _KALSHI_CACHE["events"] = (time.monotonic(), list(accumulated))
-
-    pull = await venues.kalshi_prefetch_events(session, page_sink=_warm)
+    pull = await venues.kalshi_prefetch_events(session)
     if pull.complete:
         _KALSHI_CACHE["events"] = (time.monotonic(), pull.events)
     else:
@@ -501,31 +508,6 @@ def _as_of_cache_key(as_of: datetime | None) -> str:
     return (
         as_of.astimezone(timezone.utc).isoformat() if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc).isoformat()
     )
-
-
-def _filter_pool_by_as_of(pool: generation.PoolResult, as_of: datetime | None) -> generation.PoolResult:
-    """Drop candidates that closed at or before `as_of`, and restate the per-venue counts.
-
-    A no-op on the provider path, where `as_of` is None. It exists for explicit callers
-    (resolved-question backtests, replay tooling), where a market that closed BEFORE the as-of
-    instant holds a post-resolution price that would leak. Filtering the POOL rather than the
-    rendered rows means the ranker never sees a leaked market either, and keeps the candidate
-    indices the ranker is given identical to the ones its picks are applied against.
-    """
-    if as_of is None:
-        return pool
-    as_of_utc = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
-    kept: list[MarketMatch] = []
-    for row in pool.candidates:
-        if row.close_time is not None:
-            closes = row.close_time if row.close_time.tzinfo else row.close_time.replace(tzinfo=timezone.utc)
-            if closes <= as_of_utc:
-                continue
-        kept.append(row)
-    counts = {venue: 0 for venue in pool.per_venue_counts}
-    for row in kept:
-        counts[row.platform] = counts.get(row.platform, 0) + 1
-    return replace(pool, candidates=tuple(kept), per_venue_counts=counts)
 
 
 async def fetch_market_snapshot(
@@ -692,8 +674,8 @@ async def _fetch_market_snapshot_impl(
         kalshi_events=kalshi_events,
         predictit_markets=predictit_markets,
         venue_search_results=venue_search_results,
+        as_of=as_of,
     )
-    pool = _filter_pool_by_as_of(pool, as_of)
     pool_by_venue: dict[str, list[MarketMatch]] = {}
     for row in pool.candidates:
         pool_by_venue.setdefault(row.platform, []).append(row)
@@ -781,15 +763,16 @@ def _record_venue_health(
 ) -> None:
     """Provider-health observations, recorded where the pool and the render are both in scope.
 
-    Field presence is measured over the venue's POOL rows, not the rendered ones, and that is
-    the load-bearing choice: Signal A exists to catch a PARSER whose field names went stale, so
-    a legitimate 6-row ranked render that happens to exclude Polymarket must not record a
-    100%-dead `open_interest` and redden CI on the ranker's judgment. `rows_post_filter` stays
-    the RENDERED count, which is what Signal B reads.
+    Field presence AND `candidates_pre_filter` are both measured over the venue's POOL rows,
+    which is the load-bearing choice and has to stay a matched pair: Signal A exists to catch a
+    PARSER whose field names went stale, so a legitimate 6-row ranked render that happens to
+    exclude Polymarket must not record a 100%-dead `open_interest` and redden CI on the ranker's
+    judgment — and equally must not go UNREPORTED because the ranker declined that venue.
+    `rows_post_filter` is the RENDERED count, recorded for the archive rather than for a rule;
+    nothing alerts on it (see `VenueObservation`).
 
-    Note what that means for the two enumerable venues: their `candidates_pre_filter` is a
-    whole catalogue, so it is never zero and Signal B is structurally dead for them —
-    `record_catalogue_size` (Signal C) is their only alarm, which is why the catalogue
+    `record_catalogue_size` (Signal C) is the two enumerable venues' only alarm for an EMPTY
+    catalogue, since a healthy one always reaches the pool — which is why the catalogue
     observations in stage 1a must survive any future refactor of this function.
 
     Pure module-state writes: no I/O, no await, cannot raise, cannot alter the snapshot.

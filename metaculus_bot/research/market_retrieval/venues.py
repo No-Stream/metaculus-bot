@@ -6,10 +6,12 @@ what pool generation calls. Four differences from the originals, each with a mea
 behind it:
 
 - **Kalshi pulls the COMPLETE open-events catalogue**, not the first 3,000 of ~9,762, and
-  streams each page through a projection so peak memory tracks the ~14 retained fields
+  streams each page through a TIERED projection so peak memory tracks the retained fields
   rather than the ~3 MB/page raw body (49 pages of raw JSON is ~150 MB, and the caller
-  caches the result for 6h in the process that runs forecasters). The complete pull
-  measures FASTER than the truncated one because the original sleeps 1.0s per page.
+  caches the result for 6h in the process that runs forecasters). Each event's first nested
+  market keeps the full field set and every later one keeps only ``close_time`` and
+  ``status``, which are the only two anything reads across nested markets — 85.5 MB down to
+  43.7 MB on the frozen universe, byte-identical consumer output.
 - **Kalshi event-level derivations moved off ``nested[0]``**: ``close_time`` is the MAX over
   nested markets and ``is_resolved`` requires ALL of them resolved. On the frozen universe
   ``nested[0]`` misclassifies ~305 live event families as RESOLVED and ~72 settled ones as
@@ -30,8 +32,8 @@ Two structural rules hold throughout. **Every function takes ``session`` as a pa
 the session factory stays in the seam module, where four test files patch it. And **nothing
 here reads or writes a cache**: the caches are module globals in the seam module that the
 orchestrator imports by name, so the caller owns the TTL and this module stays pure I/O plus
-parse. That is why the catalogue pull reports ``complete`` and offers a ``page_sink`` rather
-than writing ``_KALSHI_CACHE`` itself.
+parse. That is why the catalogue pull reports ``complete`` rather than writing
+``_KALSHI_CACHE`` itself.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 import ijson
@@ -98,10 +100,12 @@ _KALSHI_RETRYABLE_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 # ijson structural events, i.e. the ones carrying no scalar `value` to keep.
 _IJSON_CONTAINER_EVENTS = frozenset({"start_map", "map_key", "end_map", "start_array", "end_array"})
 
-# The projection. Everything outside these two tuples (plus `settlement_sources`) is dropped
-# as the page streams in, which is the whole point: a raw market object carries ~38 keys and
-# the catalogue is held for 6h.
+# The projection. Everything outside these tuples (plus `settlement_sources`) is dropped as the
+# page streams in, which is the whole point: a raw market object carries ~38 keys and the
+# catalogue is held for 6h in the process that runs forecasters.
 KALSHI_EVENT_FIELDS: tuple[str, ...] = ("event_ticker", "series_ticker", "title", "sub_title")
+# The full nested-market set, kept for the FIRST nested market of each event. It stays the
+# accurate union of what any consumer can read off a market object.
 KALSHI_MARKET_FIELDS: tuple[str, ...] = (
     "rules_primary",
     "close_time",
@@ -114,6 +118,20 @@ KALSHI_MARKET_FIELDS: tuple[str, ...] = (
     "volume_24h_fp",
     "status",
 )
+# Nested markets AFTER the first keep only these two, because only these two are ever read
+# across nested markets — `close_time` by the max-over-nested derivation and `status` by the
+# all-resolved one. Every other field is read exclusively off `nested[0]` (`kalshi_event_match`
+# and `kalshi_event_rules`), so on the frozen universe 69,207 of 78,969 nested markets' worth of
+# price/rules fields were dead weight: measured through the real collector, 85.5 MB as shipped
+# versus 43.7 MB tiered, with `rules_primary` on the tail alone accounting for 13.2 MB. At the
+# `KALSHI_PREFETCH_EVENT_LIMIT` guard that is ~175 MB versus ~90 MB.
+#
+# A NEW field has to pick a tier deliberately: put it here only if something reads it off a
+# nested market other than the first. The saving requires genuinely OMITTING the keys — seeding
+# the tail with all ten set to None recovers only 35.7 of the 41.8 MB. `sys.intern` is NOT the
+# alternative: it saves 34.9 MB but PEP-683 makes interned strings effectively permanent, so a
+# 6h cache refresh would never reclaim them.
+KALSHI_NESTED_TAIL_FIELDS: tuple[str, ...] = ("close_time", "status")
 
 # A Kalshi market whose status is one of these has settled. Verbatim from the original
 # parser, and now load-bearing on the EVENT: an event is resolved only when every nested
@@ -140,8 +158,10 @@ class CataloguePull:
     """The outcome of one paginated Kalshi catalogue fetch.
 
     ``token`` is a provider-diagnostics source token, empty exactly when the pull finished
-    clean. ``complete`` says whether pagination exited on its own terms (cursor exhausted or
-    a bound reached) and therefore whether the result is safe to cache for the TTL.
+    clean. ``complete`` says whether pagination exited on its own terms — the cursor was
+    exhausted — and therefore whether the result is safe to cache for the TTL. Stopping at
+    ``max_pages`` or ``event_limit`` with a cursor still open is NOT complete: the catalogue is
+    truncated, so pinning it for 6h would serve a short universe to every later question.
 
     The pair is why this does NOT use the ``None``-vs-``[]`` contract the leaf fetchers use:
     a pull that lost page 30 of 49 still holds 29 pages of usable catalogue, and neither
@@ -215,7 +235,10 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
                 continue
             if prefix == "events.item.markets.item":
                 if parse_event == "start_map":
-                    market = {field: None for field in KALSHI_MARKET_FIELDS}
+                    # Tiered off the list already being built, which reads the index for free:
+                    # the first nested market gets the full set, every later one the tail.
+                    fields = KALSHI_MARKET_FIELDS if not event["markets"] else KALSHI_NESTED_TAIL_FIELDS
+                    market = {field: None for field in fields}
                 elif parse_event == "end_map":
                     if market is not None:
                         event["markets"].append(market)
@@ -223,7 +246,9 @@ def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) ->
                 continue
             if market is not None:
                 key = prefix.removeprefix("events.item.markets.item.")
-                if key in KALSHI_MARKET_FIELDS and parse_event not in _IJSON_CONTAINER_EVENTS:
+                # The pre-seeded dict IS the membership set, so the tier decided at `start_map`
+                # decides what this market retains without a second tuple lookup.
+                if key in market and parse_event not in _IJSON_CONTAINER_EVENTS:
                     market[key] = value
                 continue
             key = prefix.removeprefix("events.item.")
@@ -292,7 +317,6 @@ async def kalshi_prefetch_events(
     max_pages: int = KALSHI_PREFETCH_MAX_PAGES,
     page_sleep_s: float = KALSHI_PAGE_SLEEP_S,
     wall_timeout: float = KALSHI_CATALOGUE_WALL_TIMEOUT,
-    page_sink: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> CataloguePull:
     """Paginate the COMPLETE open-events catalogue, projected down per page.
 
@@ -302,11 +326,11 @@ async def kalshi_prefetch_events(
     pagination can never overrun the snapshot's own timeout.
 
     A 429 stops pagination and reports the pull incomplete, so a rate-limited exchange can
-    never be cached as a short catalogue for the TTL. ``page_sink`` receives the accumulated
-    list after each successful page, so a caller that caches can warm incrementally and a
-    cancelled pull still leaves whatever completed — while ``complete=False`` tells it not
-    to pin that partial list for 6h. Caching a truncated (often empty) list is how one
-    transient blip on the first question starved every later question in the run.
+    never be cached as a short catalogue for the TTL. The events accumulated up to a failure
+    are still returned, so the question that paid for the partial pull keeps it — but
+    ``complete=False`` tells the caller not to pin that partial list for 6h. Caching a
+    truncated (often empty) list is how one transient blip on the first question starved every
+    later question in the run.
     """
     params = {"status": "open", "limit": "200", "with_nested_markets": "true"}
     deadline = time.monotonic() + wall_timeout
@@ -359,18 +383,24 @@ async def kalshi_prefetch_events(
 
         pages_ok += 1
         all_events.extend(events)
-        if page_sink is not None:
-            page_sink(all_events)
         if not cursor or not events:
             break
         if page_sleep_s > 0:
             await asyncio.sleep(page_sleep_s)
 
     if complete and cursor and (pages_ok >= max_pages or len(all_events) >= event_limit):
+        # A bound reached with the cursor still open means the catalogue is TRUNCATED, so the
+        # pull is not complete: Kalshi halving its effective page size, or the open-events count
+        # growing past `event_limit`, would otherwise pin a short universe for the 6h TTL and
+        # report `ok(n)` with `fetch_ok=True`. Signal C cannot see it either — it skips any
+        # source whose successful observation has entries > 0, and there is no size floor. The
+        # token rides with the flag because the seam treats the token as the verdict, so a
+        # token-only variant would put the two in contradiction.
         logger.warning(
             f"Kalshi catalogue stopped at a runaway bound (pages={pages_ok}, events={len(all_events)}) "
             f"with a cursor still open"
         )
+        token, complete = "dropped(runaway_bound)", False
     logger.info(
         f"Kalshi catalogue: events={len(all_events)} pages={pages_ok} complete={complete} token={token or 'ok'}"
     )
@@ -857,21 +887,35 @@ def predictit_market_match(market: dict[str, Any], *, match_confidence: float, c
     universe to a ranker has no per-question query to select on. Relevance is the ranker's
     job, and pricing an arbitrary contract would misreport the market.
 
-    ``close_time`` comes from ``contracts[0].dateEnd``, which the original hardcoded to None
+    ``close_time`` comes from the contracts' ``dateEnd``, which the original hardcoded to None
     — so a faithful copy would render ``closes:`` on 0% of PredictIt rows. Expect rendered
     close coverage to read ~26% (the universe's rate) rather than the old 64%, which was a
     selection effect of the fuzzy pre-filter.
+
+    Both event-level derivations read EVERY contract rather than ``contracts[0]``, mirroring
+    ``kalshi_event_match`` four functions up: a market whose contracts are ``[Closed, Open]`` is
+    live, and reading the first one made the verdict depend on the order untrusted external JSON
+    happened to arrive in — reverse the list and the same market flipped. That matters more than
+    it used to because ``status`` is now a rendered column AND a ranker prompt signal telling the
+    model a RESOLVED price is a realized outcome rather than a forecast, and because the whole
+    ~197-market universe reaches the pool instead of three fuzzy-selected rows. Derived from the
+    contracts rather than from the market-level ``status`` field (present on 197/197 live markets
+    and ignored here) so the two venues answer the question the same way, in one place.
     """
     name = market.get("name") or ""
     short_name = market.get("shortName") or ""
     if not name and not short_name:
         return None
 
-    contracts = market.get("contracts")
-    if not isinstance(contracts, list):
-        contracts = []
-    first = contracts[0] if contracts and isinstance(contracts[0], dict) else {}
-    status = (first.get("status") or "").lower()
+    raw_contracts = market.get("contracts")
+    # Filtered to dicts ONCE and gated on the filtered list. Folding the isinstance check inside
+    # the `all()` instead would take `all()` over an EMPTY sequence when every contract is a
+    # non-dict — reporting RESOLVED where an unusable contracts block must stay unresolved.
+    contracts = [entry for entry in raw_contracts if isinstance(entry, dict)] if isinstance(raw_contracts, list) else []
+    statuses = [(entry.get("status") or "").lower() for entry in contracts]
+    # A missing status is not evidence of settlement, so it reads as open.
+    is_resolved = bool(statuses) and all(status not in ("", "open") for status in statuses)
+    closes = [parsed for entry in contracts if (parsed := parse_iso_guarded(entry.get("dateEnd"))) is not None]
 
     contract_names = predictit_contract_names(market)
     market_id = market.get("id")
@@ -884,8 +928,8 @@ def predictit_market_match(market: dict[str, Any], *, match_confidence: float, c
         ask=None,
         spread=None,
         volume_24h=None,
-        close_time=parse_iso_guarded(first.get("dateEnd")),
-        is_resolved=status != "" and status != "open",
+        close_time=max(closes) if closes else None,
+        is_resolved=is_resolved,
         match_confidence=match_confidence,
         raw_rules=f"contracts: {contract_names}" if contract_names else "",
         venue_market_id="" if market_id is None else str(market_id),

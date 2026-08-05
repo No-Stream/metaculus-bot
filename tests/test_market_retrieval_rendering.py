@@ -231,6 +231,20 @@ class TestColumns:
 
         assert cells["signal"] == "high"
 
+    def test_a_manifold_total_vol_renders_its_mana_figure_unconverted(self) -> None:
+        """The unit the legend has to qualify. `parse_manifold_matches` populates `total_volume`
+        from Manifold's `volume`, which is MANA (play money) with no conversion anywhere, and
+        22.1% of measured Manifold rows exceed the $5k thin ceiling in mana terms. Rendering `-`
+        instead would add the only per-platform branch in `_row_cells` and delete a real
+        participation signal, so the number stays and the LEGEND carries the caveat. `OI` is
+        genuinely absent for Manifold, which is why it reads `-`."""
+        row = _row("manifold", volume=107_943.0, oi=None, bettors=250)
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["total_vol"] == "107943"
+        assert cells["OI"] == "-"
+
 
 class TestRankedOrder:
     def test_the_ranked_order_is_preserved_verbatim(self) -> None:
@@ -289,6 +303,13 @@ class TestLegend:
     def test_every_relation_tier_the_cells_can_hold_is_explained(self) -> None:
         for tier in (*TIERS, TIER_UNSPECIFIED):
             assert tier in MARKET_SIGNAL_LEGEND
+
+    def test_the_volume_columns_units_are_qualified_per_venue(self) -> None:
+        """`total_vol` holds USD on Kalshi/Polymarket and play-money MANA on Manifold, with no
+        conversion anywhere, so a venue-wide "approximate USD" claim is simply false — and it is
+        a claim the expensive forecaster models read on every rendered snapshot."""
+        assert "real-money venues" in MARKET_SIGNAL_LEGEND
+        assert "mana" in MARKET_SIGNAL_LEGEND
 
     def test_the_legend_explains_the_new_columns_and_not_the_retired_one(self) -> None:
         assert "`relation`" in MARKET_SIGNAL_LEGEND

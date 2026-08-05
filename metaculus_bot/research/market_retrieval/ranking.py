@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, replace
-from typing import Sequence
+from typing import Any, Sequence
 
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
+from metaculus_bot.structured_output_schema import extract_json_block
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,7 @@ RULES_CHARS: dict[str, int] = {
 # evidential order, because the prompt otherwise tells them the first row is the best.
 DEGRADED_RANKING_MARKER = "[ranking unavailable — showing retrieval order]"
 
-_FENCE_OPEN_RE = re.compile(r"^```[a-zA-Z]*\s*")
-_FENCE_CLOSE_RE = re.compile(r"\s*```\s*$")
+_DECODER = json.JSONDecoder()
 
 
 # The prompt. Two deliberate departures from the version the bake-off measured, both of them
@@ -268,11 +267,47 @@ def build_ranker_prompt(question: RankerQuestion, pool: Sequence[MarketMatch]) -
     )
 
 
+def _first_usable_array(text: str) -> list[Any]:
+    """The first JSON array in ``text`` that could be a ranking. Raises ``RankingUnusable``.
+
+    ``raw_decode`` from each ``[`` rather than a widest-bracket ``find``/``rfind`` slice: the
+    decoder is string-literal-aware by construction, so trailing prose containing brackets no
+    longer breaks the parse. The old slice spanned from the first ``[`` to the LAST ``]``
+    anywhere in the output, so ``'[{"i":1}]\\nExcluded: [3] and [7].'`` — a well-formed ranking
+    followed by ordinary narration — failed outright.
+
+    "Usable" means a list that is either EMPTY (the model's valid "nothing bears on this") or
+    carries at least one dict. Anything else advances to the next ``[``, which is what keeps a
+    bracket inside a narrated string from shadowing the real array: on
+    ``{"note": "see [3]", "picks": [{"i": 1}]}`` the first decode yields ``[3]``, and the scan
+    moves on to the array that actually holds picks.
+    """
+    index = text.find("[")
+    saw_array = False
+    while index >= 0:
+        try:
+            value, _ = _DECODER.raw_decode(text, index)
+        except ValueError:
+            # ValueError, NOT json.JSONDecodeError. CPython caps int-from-string conversion at
+            # 4300 digits and raises a BARE ValueError for a longer integer literal, which
+            # JSONDecodeError does not cover — so the narrower catch would let a 5000-digit
+            # index escape to the snapshot-level net exactly as the OverflowError above did.
+            value = None
+        if isinstance(value, list):
+            saw_array = True
+            if not value or any(isinstance(entry, dict) for entry in value):
+                return value
+        index = text.find("[", index + 1)
+    if saw_array:
+        raise RankingUnusable(f"no array of ranking objects in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+    raise RankingUnusable(f"no JSON array found in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
+
+
 def parse_ranking(text: str, pool_size: int) -> list[Pick]:
     """``[{"i": 12, "tier": "...", "why": "..."}]`` -> picks in the MODEL's order.
 
     ``[]`` returns ``[]``: an empty array is a valid answer and the whole adaptive-width
-    mechanism, so only output that cannot be read as a JSON array at all raises
+    mechanism, so only output that cannot be read as an array of ranking objects at all raises
     ``RankingUnusable`` and fails open.
 
     Out-of-range indices are dropped, repeats collapse to their first (best-ranked)
@@ -282,18 +317,10 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
     blob = (text or "").strip()
     if not blob:
         raise RankingUnusable("empty completion")
-    if blob.startswith("```"):
-        blob = _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", blob))
-    # The widest bracket pair, so a model that wraps its array in an object or narrates around
-    # it is still read. The slice always starts with `[` and ends with `]`, so `json.loads`
-    # either raises or returns a list — there is no third outcome to guard against.
-    start, end = blob.find("["), blob.rfind("]")
-    if start < 0 or end <= start:
-        raise RankingUnusable(f"no JSON array found in {blob[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling
-    try:
-        parsed = json.loads(blob[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise RankingUnusable(f"array did not parse: {exc}") from exc
+    # The canonical fenced-block extractor rather than a local fence regex, so a fence the rest
+    # of the bot can read is a fence this parser can read. It returns None on unfenced output,
+    # where the raw text is already what the array scan wants.
+    parsed = _first_usable_array(extract_json_block(blob) or blob)
 
     picks: list[Pick] = []
     seen: set[int] = set()
@@ -302,7 +329,14 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
             continue
         try:
             index = int(entry["i"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError is NOT covered by the other two: `json.loads` accepts the bare
+            # literals `Infinity` / `-Infinity` / `NaN` and overflowing float literals like
+            # `1e400`, and `int(inf)` raises OverflowError (an ArithmeticError). Without it the
+            # exception escapes `_rank_pool`'s `except RankingUnusable` to the snapshot-level
+            # net and discards the WHOLE prediction-market snapshot, where dropping this one
+            # entry keeps every valid sibling and the fail-open intact. `http.safe_int` guards
+            # the same hazard with `math.isfinite`.
             continue
         if not 0 <= index < pool_size or index in seen:
             continue
@@ -314,6 +348,16 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
                 tier=tier if tier in TIERS else TIER_UNSPECIFIED,
                 why=str(entry.get("why") or "")[:WHY_CHARS],
             )
+        )
+    if parsed and not picks:
+        # A non-empty array yielding no usable pick is a SHAPE regression (a renamed key, all
+        # indices hallucinated past the pool), NOT the adaptive-width `[]`. Both reach the caller
+        # as `ok(0)`, which `_is_contributed` treats as a non-loss, so nothing else in the
+        # pipeline can tell them apart: the token, the `MARKET_RANKING:` line and the empty
+        # render are byte-identical. The WARN has to live HERE because `_rank_pool` only ever
+        # sees `picks`, never `parsed`.
+        logger.warning(
+            f"market ranker: {len(parsed)} entries yielded no usable pick; first={repr(parsed[0])[:160]}"  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
         )
     return picks[:RENDER_BUDGET]
 

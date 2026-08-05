@@ -32,6 +32,7 @@ from metaculus_bot.research.market_retrieval.queries import (
     build_query_author_prompt,
     deterministic_queries,
     fuzzy_best,
+    fuzzy_best_many,
     manifold_relaxation_terms,
     parse_query_author,
     strip_dates_and_numbers,
@@ -107,13 +108,26 @@ class TestParseQueryAuthor:
         text = '```json\n{"synonyms": ["ABS labour force"], "framings": []}\n```'
         assert parse_query_author(text) == ("ABS labour force",)
 
-    def test_strips_digits_and_caps_query_length(self):
-        """Digits are stripped at PARSE time, not only at search time: a numeric token in a
-        synonym would otherwise survive into the Kalshi fuzzy channel, which does not strip."""
+    def test_a_well_formed_object_followed_by_brace_bearing_prose_still_parses(self):
+        """The measured weakness of the retired widest-brace slice: it ran from the first `{` to
+        the LAST `}` anywhere in the output, so ordinary trailing prose containing a brace made a
+        perfectly good payload unreadable and reported this additive stage lost for nothing. The
+        canonical extractor is string-literal-aware and stops at the object's own closing brace."""
+        text = '{"synonyms": ["jobless rate"], "framings": []}\nNote: use {care} with these.'
+
+        assert parse_query_author(text) == ("jobless rate",)
+
+    def test_drops_digit_bearing_synonyms_and_caps_query_length(self):
+        """Digits are handled at PARSE time, not only at search time: a numeric token in a synonym
+        would otherwise survive into the Kalshi fuzzy channel, which does not strip. The synonym
+        is DROPPED rather than trimmed — see the drop-the-remnant test below for why."""
         long_synonym = "unemployment " * 20
         out = parse_query_author(f'{{"synonyms": ["CPI 2026 print", "{long_synonym}"], "framings": []}}')
-        assert out[0] == "CPI print"
-        assert all(len(q) <= 80 for q in out)
+
+        assert "CPI print" not in out, "a digit-bearing synonym must not survive as a generic remnant"
+        assert len(out) == 1
+        assert out[0].startswith("unemployment unemployment")
+        assert len(out[0]) <= 80
 
     def test_caps_at_eight_synonyms_and_three_framings(self):
         """The prompt states both ceilings; they are enforced in code so a runaway completion
@@ -132,14 +146,22 @@ class TestParseQueryAuthor:
         out = parse_query_author('{"synonyms": ["jobless rate", "Jobless Rate"], "framings": ["JOBLESS RATE"]}')
         assert out == ("jobless rate",)
 
-    def test_a_synonym_whose_content_is_numeric_drops_out(self):
-        """The known cost of stripping at parse time, pinned so nobody discovers it in prod: a
-        series-code synonym like "U-3" is ONE token containing a digit, so the whole synonym
-        disappears rather than being trimmed. Accepted — the alternative is a date token reaching
-        the conjunctive venues, which measurably zeroes their result set — but it does mean the
-        author cannot contribute ticker-shaped vocabulary ("U-3", "S&P 500", "CPI-U")."""
+    def test_a_synonym_carrying_any_digit_drops_rather_than_leaving_a_remnant(self):
+        """The known cost of handling digits at parse time, pinned so nobody discovers it in prod:
+        the author cannot contribute ticker-shaped vocabulary at all ("U-3", "S&P 500", "CPI-U").
+
+        Dropping is the LESSER cost. The remnant this used to keep ("S&P 500 index" → "S&P index",
+        "U-3 rate" → "rate") pollutes the query set the Kalshi fuzzy channel scores on: that
+        channel does not strip, `fuzzy_best` maxes with no floor, and `token_set_ratio` gives a
+        bare generic word ~100 against every event whose rules text contains it. Measured on the
+        real 9,762-event catalogue, `"rate"` scores >=99 on 52 events and moved the first wanted
+        row from pool rank 2 to rank 31, replacing the whole 8-row slate with Fed-funds markets.
+        Passing digit-bearing synonyms through verbatim instead is worse still — a bare "2026"
+        scores 100 against every dated Kalshi title.
+        """
         assert parse_query_author('{"synonyms": ["U-3", "unemployment"], "framings": []}') == ("unemployment",)
-        assert parse_query_author('{"synonyms": ["S&P 500 index"], "framings": []}') == ("S&P index",)
+        assert parse_query_author('{"synonyms": ["U-3 rate", "jobless"], "framings": []}') == ("jobless",)
+        assert parse_query_author('{"synonyms": ["S&P 500 index"], "framings": []}') == ()
 
     @pytest.mark.parametrize(
         ("shape", "text"),
@@ -220,6 +242,41 @@ class TestFuzzyBest:
     def test_takes_no_min_score_argument(self):
         """Pinned so the retired floor cannot return by way of a defaulted parameter."""
         assert "min_score" not in inspect.signature(fuzzy_best).parameters
+
+
+class TestFuzzyBestMany:
+    """The batched form the full-catalogue scan runs on. The equivalence is what the whole
+    optimization rests on: `process.cdist` at `dtype=np.float64` is bit-identical to the scalar
+    loop, while the float32 default drifts ~5e-06 — enough to reorder ties in a 9,762-event sort
+    and silently change which 100 candidates reach the ranker."""
+
+    def test_it_agrees_with_the_scalar_form_exactly(self):
+        queries = ["Australian unemployment rate", "ABS labour force", "jobless"]
+        titles = [
+            "Australia unemployment rate July",
+            "US CPI year over year",
+            "zzzz",
+            "Will the RBA cut rates?",
+        ]
+        rules = [
+            "Settles on the ABS seasonally adjusted rate",
+            "Settles on the BLS CPI print",
+            "",  # an empty rules row: the scalar form special-cases it, cdist must agree
+            "Resolves on the RBA cash rate decision",
+        ]
+
+        batched = fuzzy_best_many(queries, titles, rules)
+        scalar = [fuzzy_best(queries, title, rule) for title, rule in zip(titles, rules, strict=True)]
+
+        assert batched == scalar
+
+    def test_an_empty_query_set_scores_every_title_zero(self):
+        """`deterministic_queries("")` returns `[]`, and `.max(axis=0)` over a zero-row array
+        raises `ValueError` — so the guard is load-bearing rather than defensive noise."""
+        assert fuzzy_best_many([], ["a title", "another"], ["", ""]) == [0.0, 0.0]
+
+    def test_an_empty_catalogue_scores_nothing(self):
+        assert fuzzy_best_many(["a query"], [], []) == []
 
 
 class TestManifoldRelaxationLadder:

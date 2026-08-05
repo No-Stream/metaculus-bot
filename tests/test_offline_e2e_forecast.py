@@ -467,15 +467,14 @@ _RESOLUTION_HTML = (
 #   parser or a silently emptied index), and provider_health's catalogue_empty signal alerts on
 #   it by design — so an empty stub both trips that alert and skips the pool assembly this suite
 #   exists to exercise.
-# - Under ranked retrieval the two ENUMERABLE venues always contribute their whole catalogue, so
-#   a search venue returning `[]` becomes a no-contribution outlier the moment two siblings
-#   render rows. That was silent before only because a fuzzy score floor meant nothing rendered
-#   anywhere. A venue-complete payload set is what a healthy prod run actually looks like.
+# - A venue-complete payload set is what a healthy prod run actually looks like, so the pipeline
+#   under test is the one prod runs rather than a degraded corner of it.
 #
 # The liquidity fields are equally load-bearing: `market_field_contract` fires when a declared
-# field is absent from 100% of a venue's rows, and every real open Kalshi market carries
-# volume_fp and open_interest_fp (1,504/1,504 measured), so a stub without them describes a
-# payload that does not exist.
+# field is absent from 100% of a venue's POOL rows — which is every row a populated payload
+# produces, whether or not the ranker keeps any of them — and every real open Kalshi market
+# carries volume_fp and open_interest_fp (1,504/1,504 measured), so a stub without them describes
+# a payload that does not exist.
 _OFF_TOPIC_KALSHI_EVENTS = json.dumps(
     {
         "events": [

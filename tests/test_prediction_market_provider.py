@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import litellm.exceptions
 import pytest
 
 from metaculus_bot.constants import (
@@ -41,6 +42,7 @@ from metaculus_bot.research import prediction_market as pmp
 from metaculus_bot.research.http_fetch import ERROR_SNIPPET_BYTES
 from metaculus_bot.research.market_retrieval import generation, venues
 from metaculus_bot.research.market_retrieval.http import MAX_RESPONSE_BYTES
+from metaculus_bot.research.market_retrieval.queries import dedupe_queries, strip_dates_and_numbers
 from metaculus_bot.research.market_retrieval.ranking import DEGRADED_RANKING_MARKER, RENDER_BUDGET
 from metaculus_bot.research.market_retrieval.rendering import TABLE_COLUMNS
 from metaculus_bot.research.prediction_market import (
@@ -430,7 +432,22 @@ def _handlers(**overrides: Any) -> dict[str, Any]:
 _OFF_TOPIC_KALSHI_EVENT = {
     "event_ticker": "KXWORLDCUP-26",
     "title": "Who wins the 2026 World Cup?",
-    "markets": [{"ticker": "KXWORLDCUP-26-BRA", "title": "Brazil", "status": "active"}],
+    # The liquidity keys are not decoration: every real open Kalshi market carries `volume_fp` and
+    # `open_interest_fp` (1,504/1,504 measured), and Signal A fires when a declared field is
+    # absent from 100% of a venue's POOL rows. Without them this file's self-described HEALTHY
+    # baseline parses to a 100%-dead Kalshi row, which is a `market_field_contract` finding in
+    # every test that uses `_handlers()`.
+    "markets": [
+        {
+            "ticker": "KXWORLDCUP-26-BRA",
+            "title": "Brazil",
+            "status": "active",
+            "volume_fp": "1000000",
+            "open_interest_fp": "500000",
+            "last_price_dollars": "0.30",
+            "notional_value_dollars": "1.0000",
+        }
+    ],
 }
 _OFF_TOPIC_PREDICTIT_MARKET = {
     "id": 9001,
@@ -552,16 +569,47 @@ class TestCatalogueCaching:
         assert cached_ts <= time.monotonic()
 
     @pytest.mark.asyncio
-    async def test_pagination_warms_the_cache_page_by_page(self, mock_question):
-        """A cancelled or partly-lost pull must leave whatever pages completed, so the next
-        question picks up where this one stopped."""
+    async def test_a_pull_that_loses_a_LATER_page_caches_nothing(self, mock_question, kalshi_events_payload):
+        """The regression that let the cache bug ship: both sibling "does not poison" tests fail
+        on page ONE, so a per-page cache warm never fired in them at all.
+
+        Page 1 succeeds with a cursor and page 2 is throttled, so the pull holds a real, truncated
+        catalogue. That partial still serves THIS question — the pages it paid for are not thrown
+        away — but nothing may be pinned for the 6h TTL, because the read path checks only the TTL
+        and every later question would then report `ok(1)` against a true catalogue of two, with
+        zero HTTP and no counter bump. Measured live in the Stage-D dry run: questions 2 and 3
+        reported `kalshi: ok(8400)` against a true 10,219.
+        """
         page_one = {"events": [{"event_ticker": "A", "title": "A", "markets": []}], "cursor": "next"}
-        page_two = {"events": [{"event_ticker": "B", "title": "B", "markets": []}], "cursor": ""}
-        handlers = _handlers(**{_KALSHI_EVENTS_URL: [FakeResponse(200, page_one), FakeResponse(200, page_two)]})
+        handlers = _handlers(
+            **{
+                _KALSHI_EVENTS_URL: [
+                    FakeResponse(200, page_one),
+                    FakeResponse(429, text="slow down"),
+                    FakeResponse(200, kalshi_events_payload),
+                ]
+            }
+        )
+        second = MagicMock(id_of_question=54321, title=mock_question.title, question_text=mock_question.question_text)
+        second.resolution_criteria = mock_question.resolution_criteria
+        second.fine_print = ""
+        second.unit_of_measure = ""
 
-        await _fetch(mock_question, handlers)
+        session = FakeSession(handlers)
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", _market_llm(ranking=_rank_one_per_venue)),
+            patch.object(pmp, "_get_session", lambda: session),
+        ):
+            first = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+            # Checked BETWEEN the two questions: question 2's own pull succeeds and legitimately
+            # caches, so a post-hoc check would read its entry and pass either way.
+            assert "events" not in pmp._KALSHI_CACHE, "a truncated catalogue must not be pinned for the TTL"
+            got_second = await pmp.fetch_market_snapshot(second, timeout=5.0)
 
-        assert [event["event_ticker"] for event in pmp._KALSHI_CACHE["events"][1]] == ["A", "B"]
+        assert first.sources["kalshi"] == "error(http_429)", "question 1 pays for the partial and reports it"
+        assert session._call_counts[_KALSHI_EVENTS_URL] == 3, "question 2 must re-issue HTTP, not ride the partial"
+        assert got_second.sources["kalshi"].startswith("ok(")
+        assert [event["event_ticker"] for event in pmp._KALSHI_CACHE["events"][1]] == ["KXSPACEX-26", "KXOTHER-1"]
 
     @pytest.mark.asyncio
     async def test_a_failed_pull_does_not_poison_the_next_question(
@@ -817,6 +865,67 @@ class TestFetchMarketSnapshot:
         assert pmp.prediction_market_source_losses() == 1
         assert DEGRADED_RANKING_MARKER in format_snapshot_for_research(snapshot)
 
+    @pytest.mark.parametrize(
+        "exception_factory",
+        [
+            pytest.param(
+                lambda: litellm.exceptions.Timeout(message="stalled", model="m", llm_provider="openrouter"),
+                id="timeout",
+            ),
+            pytest.param(
+                lambda: litellm.exceptions.RateLimitError(message="429", model="m", llm_provider="openrouter"),
+                id="rate_limit",
+            ),
+            pytest.param(
+                lambda: litellm.exceptions.APIConnectionError(message="reset", model="m", llm_provider="openrouter"),
+                id="connection",
+            ),
+            pytest.param(
+                lambda: litellm.exceptions.InternalServerError(message="500", model="m", llm_provider="openrouter"),
+                id="internal_server",
+            ),
+            pytest.param(
+                lambda: litellm.exceptions.ServiceUnavailableError(message="503", model="m", llm_provider="openrouter"),
+                id="service_unavailable",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_transient_ranker_failure_degrades_one_stage_not_the_whole_snapshot(
+        self, mock_question, kalshi_events_payload, exception_factory
+    ):
+        """A routine provider blip on the ranking call must fail OPEN, not discard the snapshot.
+
+        Every litellm transport exception except a bare `APIError` subclasses `openai.APIError`
+        and NOT `litellm.exceptions.APIError`, so a catch written against the latter let all five
+        of these escape `_invoke_market_llm`, sail past `_rank_pool`'s `except RankingUnusable`
+        (which wraps only the parse), and land on the snapshot-level net — returning zero rows
+        with `sources={'snapshot': 'error(...)'}` where the pool-order slate was due. A
+        string-only unusable-ranking test cannot catch this class, which is why these are raised
+        from `invoke` at the real seam.
+        """
+
+        class RaisingLlm:
+            def __init__(self, **_kwargs: Any) -> None:
+                pass
+
+            async def invoke(self, prompt: str) -> str:
+                if _RANKER_CUE in prompt:
+                    raise exception_factory()
+                return _AUTHOR_JSON  # noqa: ASYNC910
+
+        handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", RaisingLlm),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+        ):
+            snapshot = await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert "snapshot" not in snapshot.sources, "a ranker blip took the whole snapshot down"
+        assert snapshot.sources["ranking"].startswith("error("), snapshot.sources
+        assert snapshot.matches, "the fail-open slate must still render the pool-order top rows"
+        assert snapshot.sources["kalshi"].startswith("ok(")
+
     @pytest.mark.asyncio
     async def test_an_empty_pool_skips_the_ranking_call_entirely(self, mock_question):
         """With nothing to rank there is no LLM call to make, so the stage reports a benign
@@ -977,6 +1086,64 @@ class TestFetchMarketSnapshot:
 
         assert "kalshi" not in {row.platform for row in snapshot.matches}
         assert not any("KXSTAR-PAST" in prompt or "reach orbit in 2026" in prompt for prompt in captured)
+
+    @pytest.mark.asyncio
+    async def test_the_conjunctive_venues_get_stripped_queries_and_the_pool_gets_raw_ones(
+        self, mock_question, kalshi_events_payload
+    ):
+        """The digit-strip split, pinned end to end, because both inversions are silent in prod.
+
+        Both halves are load-bearing in opposite directions. The RAW set is what the enumerable
+        catalogues are fuzzy-scored against, where a year is real signal against a corpus of dated
+        market titles — stripping it measurably reorders Kalshi's top rows (48.7/45.0/43.2 →
+        44.7/44.3/44.2 over the live fixture). The STRIPPED set is what Manifold's `term` needs,
+        because it is a strict conjunction that one date token no market's text carries zeroes
+        outright — the cliff that hid the Manifold breakage for 17+ days.
+
+        Neither inversion raises, logs, or changes a source token, and the two call sites sit ~20
+        lines apart with near-identical names, so an accidental swap is the realistic refactor.
+        Both directions passed the full suite before this test existed; the only adjacent guard is
+        skip-gated out of CI. The expectation is DERIVED from the observed raw set rather than
+        probed for absence of digits, so a partial strip or a wrong dedupe fails too.
+        """
+        dispatched: dict[str, list[str]] = {"manifold": [], "polymarket": []}
+
+        def _recorder(venue: str, param: str, payload: Any):
+            def _handler(params: dict[str, Any]) -> FakeResponse:
+                dispatched[venue].append(params.get(param) or "")
+                return FakeResponse(200, payload)
+
+            return _handler
+
+        handlers = _handlers(
+            **{
+                _KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload),
+                _MANIFOLD_SEARCH_URL: _recorder("manifold", "term", []),
+                _POLY_URL: _recorder("polymarket", "q", {"events": [], "markets": []}),
+            }
+        )
+        pool_queries: list[list[str]] = []
+        real_build_pool = generation.build_pool
+
+        async def _spy(*, queries, **kwargs: Any):
+            pool_queries.append(list(queries))
+            return await real_build_pool(queries=queries, **kwargs)
+
+        with (
+            patch.object(pmp, "build_llm_with_openrouter_fallback", _market_llm(ranking=_rank_one_per_venue)),
+            patch.object(pmp, "_get_session", lambda: FakeSession(handlers)),
+            patch.object(pmp.generation, "build_pool", _spy),
+        ):
+            await pmp.fetch_market_snapshot(mock_question, timeout=5.0)
+
+        assert len(pool_queries) == 1, pool_queries
+        raw = pool_queries[0]
+        assert any(any(char.isdigit() for char in query) for query in raw), (
+            "pool assembly must receive the RAW query set — the year is what the catalogues score on"
+        )
+        expected_stripped = dedupe_queries([strip_dates_and_numbers(query) for query in raw])
+        for venue, terms in dispatched.items():
+            assert terms == expected_stripped, venue
 
     @pytest.mark.asyncio
     async def test_the_ranking_telemetry_names_every_rendered_rows_pool_index(
@@ -1537,6 +1704,11 @@ class TestProviderHealthRecording:
         rendered = [row for row in snapshot.matches if row.platform == "kalshi"]
         observed = next(obs for obs in recorded_observations()[0] if obs.venue == "kalshi")
         assert observed.rows_post_filter == len(rendered)
+        # Asserted here and in `test_recording_does_not_alter_the_snapshot` so a future signal
+        # cannot start firing on this healthy shape unnoticed: both tests previously left two
+        # live alertable findings and passed anyway, which is how the deleted Signal B's false
+        # positive reached review with the suite demonstrating it.
+        assert provider_degradation_findings() == []
 
     @pytest.mark.asyncio
     async def test_a_market_less_question_records_zero_rows_and_finds_nothing(self, mock_question):
@@ -1638,6 +1810,7 @@ class TestProviderHealthRecording:
             (row.platform, row.market_title) for row in second.matches
         ]
         assert first.sources == second.sources
+        assert provider_degradation_findings() == [], "recording a healthy run must leave nothing alertable"
 
 
 # ---------------------------------------------------------------------------

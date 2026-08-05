@@ -14,6 +14,8 @@ right answer is silence, and would delete the adaptive-width mechanism the desig
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
@@ -135,9 +137,67 @@ class TestParseRanking:
             parse_ranking(text, 10)
 
     def test_an_array_wrapped_in_an_object_is_still_read(self) -> None:
-        """Leniently, and on purpose: the widest bracket pair is extracted, so a model that
-        wraps its answer does not cost the question its whole ranking."""
+        """Leniently, and on purpose: the first array of ranking objects is decoded, so a model
+        that wraps its answer does not cost the question its whole ranking."""
         assert [pick.index for pick in parse_ranking('{"picks": [{"i": 0}, {"i": 2}]}', 10)] == [0, 2]
+
+    def test_a_bracket_inside_a_narrated_string_does_not_shadow_the_real_array(self) -> None:
+        """The array scan walks candidates instead of taking the first `[` it sees, because a
+        bracket inside a JSON string literal is a `[` like any other. `[3]` decodes to a list of
+        ints, which cannot be a ranking, so the scan advances to the array that holds picks."""
+        assert [pick.index for pick in parse_ranking('{"note": "see [3]", "picks": [{"i": 1}]}', 10)] == [1]
+
+    @pytest.mark.parametrize("literal", ["Infinity", "-Infinity", "1e400"])
+    def test_a_non_finite_index_skips_that_entry_and_keeps_its_siblings(self, literal: str) -> None:
+        """`json.loads` accepts the bare literals `Infinity` / `-Infinity` and overflowing float
+        literals, and `int(inf)` raises OverflowError — which is neither TypeError nor ValueError,
+        so it escaped `_rank_pool`'s `except RankingUnusable`, reached the snapshot-level net and
+        discarded the WHOLE prediction-market snapshot. One bad entry must cost that entry."""
+        picks = parse_ranking(f'[{{"i": {literal}}}, {{"i": 2}}]', 10)
+
+        assert [pick.index for pick in picks] == [2]
+
+    def test_an_index_past_the_int_conversion_cap_fails_open_rather_than_raising_valueerror(self) -> None:
+        """CPython caps int-from-string conversion at 4300 digits and raises a BARE ValueError
+        from `json.loads` itself — which `json.JSONDecodeError` does not cover, so a narrower
+        catch on the decode rung would let it escape exactly as the OverflowError above did.
+        Fail-open is the correct outcome: the array never decoded, so there are no picks."""
+        with pytest.raises(RankingUnusable):
+            parse_ranking('[{"i": ' + "9" * 5000 + "}]", 10)
+
+    def test_a_well_formed_array_followed_by_bracket_bearing_prose_still_parses(self) -> None:
+        """The measured weakness of the retired widest-bracket slice: it ran from the first `[`
+        to the LAST `]` anywhere in the output, so ordinary narration citing indices made a
+        perfectly good ranking unreadable and cost the question its whole snapshot."""
+        text = '[{"i": 1}, {"i": 4}]\nExcluded: [3] and [7] as off-topic.'
+
+        assert [pick.index for pick in parse_ranking(text, 10)] == [1, 4]
+
+    def test_an_array_of_bare_indices_is_unusable_rather_than_an_empty_answer(self) -> None:
+        """A shape regression, and one the "usable array" rule catches outright: bare ints carry
+        no tier and no `i`, so the scan finds no array of ranking objects and fails open to the
+        deterministic slate. That is strictly better than the old behaviour, where it returned
+        `[]` and was indistinguishable from the model's valid "nothing bears on this"."""
+        with pytest.raises(RankingUnusable):
+            parse_ranking("[0, 1, 2]", 10)
+
+    def test_a_renamed_index_key_warns_instead_of_passing_as_an_empty_answer(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The residue the fail-open cannot catch. An array of OBJECTS with the wrong key is a
+        usable array, so it parses, yields no pick, and reaches the caller as `ok(0)` — byte
+        identical to a genuine `[]` in the token, the telemetry line and the render. The WARN is
+        the only place the two are distinguishable."""
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
+            assert parse_ranking('[{"index": 0}, {"index": 1}]', 10) == []
+        assert any("yielded no usable pick" in message for message in caplog.messages)
+
+    def test_a_genuinely_empty_array_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The control. `[]` is the adaptive-width mechanism working, so it must stay silent —
+        a WARN on every true negative is how an operator learns to ignore the channel."""
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
+            assert parse_ranking("[]", 10) == []
+        assert caplog.messages == []
 
     def test_order_is_preserved_exactly(self) -> None:
         """THE regression guard: nothing may re-sort the model's ranking, not by tier, not by
