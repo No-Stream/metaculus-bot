@@ -39,7 +39,12 @@ from metaculus_bot.research.market_retrieval.queries import (
     deterministic_queries,
     manifold_relaxation_terms,
 )
-from metaculus_bot.research.market_retrieval.venues import kalshi_event_match, parse_polymarket_matches
+from metaculus_bot.research.market_retrieval.venues import (
+    kalshi_event_match,
+    kalshi_event_usd_liquidity,
+    kalshi_usd_liquidity,
+    parse_polymarket_matches,
+)
 from metaculus_bot.research.prediction_market import (
     LIQUIDITY_DEEP_USD,
     LIQUIDITY_THIN_USD,
@@ -167,6 +172,95 @@ class TestKalshiLiquidityFieldNames:
     def test_thresholds_are_the_shared_usd_pair(self):
         """No per-venue threshold split — one USD pair for both real-money venues."""
         assert LIQUIDITY_THIN_USD < LIQUIDITY_DEEP_USD
+
+
+# D1 sibling — the same units contract at EVENT-FAMILY scope
+
+
+@pytest.fixture(scope="module")
+def kalshi_family_events() -> list[dict]:
+    """Two real multi-strike Kalshi events (2026-08-05), captured for the family-scope legs."""
+    payload = json.loads((_DATA / "kalshi_family_liquidity_2026_08_05.json").read_text())
+    return payload["events"]
+
+
+def _family(events: list[dict], ticker: str) -> dict:
+    for event in events:
+        if event.get("event_ticker") == ticker:
+            return event
+    raise AssertionError(f"fixture lost {ticker!r} — regenerate it from a live payload")
+
+
+class TestKalshiFamilyLiquidityUnits:
+    """Every event above is single-strike, so they pin the units on ONE market. A Kalshi event is
+    normally a threshold FAMILY (86.5% of the catalogue), and on 2026-08-05 the liquidity legs
+    stopped reading ``nested[0]`` and became a per-strike sum. These pin the same field-name and
+    multiplier contract at that wider scope, off a payload captured for it.
+
+    The rendered consequence of the scope change — a family whose label flips from ``thin`` to
+    ``deep`` — is pinned in ``test_market_retrieval_venues.py``. What is here is the arithmetic."""
+
+    def test_each_strike_converts_at_its_own_price_and_notional(self, kalshi_family_events):
+        """The sum is over per-strike DOLLARS, not over counts.
+
+        ``KXGOVWINS-27JAN01`` trades its three strikes at $0.335, $0.12 and $0.535, so the shortcut
+        of adding the contract counts and multiplying once is off by a third ($69,204 at the first
+        strike's price against a true $107,079) while still producing a plausible-looking figure in
+        a rendered column. Recomputed from the raw strings rather than asserted against a constant,
+        so a fixture edit cannot quietly move the expectation with the code.
+        """
+        event = _family(kalshi_family_events, "KXGOVWINS-27JAN01")
+        strikes = event["markets"]
+        assert [market["status"] for market in strikes] == ["active"] * 3, "fixture must be all-open here"
+
+        expected_volume = sum(
+            float(market["volume_fp"]) * (float(market["yes_bid_dollars"]) + float(market["yes_ask_dollars"])) / 2.0
+            for market in strikes
+        )
+        expected_open_interest = sum(
+            float(market["open_interest_fp"]) * float(market["notional_value_dollars"]) for market in strikes
+        )
+        volume, open_interest = kalshi_event_usd_liquidity(strikes)
+
+        assert volume == pytest.approx(expected_volume)
+        assert open_interest == pytest.approx(expected_open_interest)
+
+        summed_counts = sum(float(market["volume_fp"]) for market in strikes)
+        first_price = (float(strikes[0]["yes_bid_dollars"]) + float(strikes[0]["yes_ask_dollars"])) / 2.0
+        assert volume != pytest.approx(summed_counts * first_price), "counts were summed before conversion"
+
+    def test_a_single_strike_family_is_exactly_its_one_strike(self, kalshi_live_events):
+        """The n==1 case, which is what ties this class to the rest of the file.
+
+        Every fixture in ``TestKalshiLiquidityFieldNames`` is a one-strike event, so the sum has to
+        reduce to ``kalshi_usd_liquidity`` on that strike or those tests are pinning arithmetic the
+        shipped path no longer runs. Asserted as an identity across all three roles rather than
+        against copied numbers.
+        """
+        for role in ("deep", "v24h_trap", "oi_only"):
+            event = _event_by_role(kalshi_live_events, role)
+            (only,) = event["markets"]
+            assert kalshi_event_usd_liquidity(event["markets"]) == kalshi_usd_liquidity(only), role
+
+    def test_a_family_publishing_no_counts_still_reports_no_data(self, kalshi_family_events):
+        """The ``None`` vs ``0.0`` distinction ``_liquidity_label`` needs, preserved through the sum.
+
+        ``sum([])`` is ``0``, so the obvious implementation turns "upstream sent no volume field" into
+        a real zero — which relabels ``no-liquidity-data`` as ``thin``, i.e. tells the forecaster the
+        market is illiquid rather than unmeasured. Uses the real payload with the two count fields
+        removed, so only the absence differs from the case above.
+        """
+        event = _family(kalshi_family_events, "KXGOVWINS-27JAN01")
+        countless = [
+            {key: value for key, value in market.items() if key not in {"volume_fp", "open_interest_fp"}}
+            for market in event["markets"]
+        ]
+
+        assert kalshi_event_usd_liquidity(countless) == (None, None)
+
+        match = kalshi_event_match({**event, "markets": countless}, match_confidence=1.0, channel="universe_fuzzy")
+        assert match is not None
+        assert _liquidity_label(match) == "no-liquidity-data"
 
 
 # D1 sibling — Polymarket open interest nesting level

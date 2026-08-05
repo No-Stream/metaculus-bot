@@ -1,0 +1,1035 @@
+{
+  "_provenance": {
+    "captured": "2026-08-05",
+    "why": "Manifold's search was pinned to contractType=BINARY, which made 30% of its labeled-wanted universe (MULTIPLE_CHOICE / MULTI_NUMERIC / NUMBER / DATE) structurally unreachable. This file pins the two facts that flip together: a contractType=ALL search returns multi-outcome rows with probability NULL and no per-answer data at all, and the per-candidate detail GET the enrichment hook already fires is where the `answers` array lives. Captured live rather than hand-built because the whole point is that the search response and the detail response disagree about what a multi-outcome market publishes.",
+    "endpoints": {
+      "manifold": "https://api.manifold.markets/v0/search-markets?term=US+national+average+gas+price&contractType=ALL&limit=10 and https://api.manifold.markets/v0/market/{id}"
+    },
+    "edits": "Search rows cut to 4 of 8 (the first two BINARY and both MULTIPLE_CHOICE, in the venue's own rank order, which parse_manifold_matches scores on); string values over 300 chars truncated, which includes each detail's textDescription. No key was renamed, added or removed and no probability was touched - key PRESENCE is what the search assertions read, and the expected top-answer tuples are hand-copied FROM these figures.",
+    "payloads": {
+      "search_all": "The same live term the ENRICHMENT_SPEC measured: 6 BINARY + 2 MULTIPLE_CHOICE under contractType=ALL, 6 BINARY under BINARY. Every row carries outcomeType, closeTime, totalLiquidity, volume and uniqueBettorCount; the two MULTIPLE_CHOICE rows carry probability=null and NO `answers` key, so a multi-outcome row reaching the pool off the search alone has no price to render.",
+      "detail_multiple_choice": "E0ONq9czPd, 'How high will the US national average gas price get in 2026?' - one of the labeled-wanted rows the BINARY pin excluded. 17 answers, shouldAnswersSumToOne=false, and 10 already resolved YES at probability exactly 1.0, so the top three are a TIE: the fixture only pins a deterministic top-3 because the sort is stable and keeps the array's own order among equals. Market-level probability is null while isResolved is false.",
+      "detail_multi_numeric": "85NS9Ut65L, a bucketed MULTI_NUMERIC market on the same quantity: 7 answers, shouldAnswersSumToOne=true, answers carrying an extra `midpoint` key, top three at 0.508 / 0.247 / 0.160. This is the receipt that ONE code path covers all four non-BINARY types - the array shape is the same as MULTIPLE_CHOICE's, and NUMBER ('9000-10000' buckets) and DATE ('Nov-Dec 2026' buckets) were spot-checked live to match.",
+      "detail_binary": "sZzIqycRcS, a BINARY market's detail, present to prove the discriminator is real rather than cosmetic: a BINARY detail carries NO `answers` key at all and a populated market-level probability, so reading the array is enough to tell the two shapes apart without a second outcomeType read."
+    }
+  },
+  "search_all": [
+    {
+      "id": "sZzIqycRcS",
+      "creatorId": "5jnObN7AkoYBQY3LlsstEDrDpp63",
+      "creatorUsername": "StaceyVanekSmith",
+      "creatorName": "Stacey Vanek Smith",
+      "createdTime": 1779468404289,
+      "creatorAvatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocLHQvlkLJfTqj9JmaUqzwcUfHtH23ssNyyDVPImEMzbj4Xlx8hJ=s96-c",
+      "closeTime": 1793376000000,
+      "question": "Will national gas prices in the US average above $3.60",
+      "slug": "will-national-gas-prices-in-the-us",
+      "url": "https://manifold.markets/StaceyVanekSmith/will-national-gas-prices-in-the-us",
+      "pool": {
+        "NO": 2481.046316164898,
+        "YES": 403.05575655103667
+      },
+      "probability": 0.8602491359914038,
+      "p": 0.5000000000000012,
+      "totalLiquidity": 1000,
+      "outcomeType": "BINARY",
+      "mechanism": "cpmm-1",
+      "volume": 3863.657937197043,
+      "volume24Hours": 0,
+      "isResolved": false,
+      "uniqueBettorCount": 32,
+      "lastUpdatedTime": 1785846105894,
+      "lastBetTime": 1785846105894,
+      "lastCommentTime": 1781286327902,
+      "token": "MANA"
+    },
+    {
+      "id": "E0ONq9czPd",
+      "creatorId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+      "creatorUsername": "Drifting",
+      "creatorName": "Drift",
+      "createdTime": 1774433874763,
+      "creatorAvatarUrl": "https://firebasestorage.googleapis.com/v0/b/mantic-markets.appspot.com/o/user-images%2FDrifting%2F9U5QcZzugg.jpg?alt=media&token=4c01317c-bd16-4132-b20f-5c7f313fedca",
+      "closeTime": 1798761540000,
+      "question": "How high will the US national average gas price get in 2026?",
+      "slug": "how-high-will-the-national-average",
+      "url": "https://manifold.markets/Drifting/how-high-will-the-national-average",
+      "totalLiquidity": 2250,
+      "outcomeType": "MULTIPLE_CHOICE",
+      "mechanism": "cpmm-multi-1",
+      "volume": 30503.187835309127,
+      "volume24Hours": 0,
+      "isResolved": false,
+      "uniqueBettorCount": 47,
+      "lastUpdatedTime": 1785846078694,
+      "lastBetTime": 1785846078694,
+      "lastCommentTime": 1777706623325,
+      "token": "MANA"
+    },
+    {
+      "id": "UNI96QlSSl",
+      "creatorId": "Y2biJCPzfgehpcQXUQoMwXShS6j2",
+      "creatorUsername": "CalibratedGhosts",
+      "creatorName": "Calibrated Ghosts",
+      "createdTime": 1772371387696,
+      "creatorAvatarUrl": "https://firebasestorage.googleapis.com/v0/b/mantic-markets.appspot.com/o/user-images%2FAIForecastingLeague%2FIZhhShgALU.jpg?alt=media&token=9c9370b1-83fd-4533-a4e7-688fd2d75f04",
+      "closeTime": 1775001540000,
+      "question": "Will US average gas price exceed $4/gallon in March 2026?",
+      "slug": "will-us-average-gas-price-exceed-4g",
+      "url": "https://manifold.markets/CalibratedGhosts/will-us-average-gas-price-exceed-4g",
+      "pool": {
+        "NO": 1349.6563375330277,
+        "YES": 4.155431149050287
+      },
+      "probability": 0.9962510309753283,
+      "p": 0.45000000000001733,
+      "totalLiquidity": 100,
+      "outcomeType": "BINARY",
+      "mechanism": "cpmm-1",
+      "volume": 12400.465347291287,
+      "volume24Hours": 0,
+      "isResolved": true,
+      "resolution": "YES",
+      "resolutionTime": 1775147662759,
+      "resolutionProbability": 0.9962510309753283,
+      "resolverId": "Y2biJCPzfgehpcQXUQoMwXShS6j2",
+      "uniqueBettorCount": 129,
+      "lastUpdatedTime": 1775001540000,
+      "lastBetTime": 1774989339258,
+      "lastCommentTime": 1775130708562,
+      "token": "MANA"
+    },
+    {
+      "id": "htRQd2z6uA",
+      "creatorId": "GaAhU9jUqpYfe7TYxIXBZMwIB273",
+      "creatorUsername": "Zyansheep",
+      "creatorName": "Zyansheep",
+      "createdTime": 1737478812669,
+      "creatorAvatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocL6m-12jRNDUVtr8eCt_XyFacEuok0BEjASonygWBQxBn-5TdjA=s96-c",
+      "closeTime": 1767139200000,
+      "question": "National Average Gas Price in the US by EOY 2025",
+      "slug": "national-average-gas-price-in-the-u",
+      "url": "https://manifold.markets/Zyansheep/national-average-gas-price-in-the-u",
+      "totalLiquidity": 100,
+      "outcomeType": "MULTIPLE_CHOICE",
+      "mechanism": "cpmm-multi-1",
+      "volume": 1007.893452222933,
+      "volume24Hours": 0,
+      "isResolved": true,
+      "resolution": "lcsC5sz85N",
+      "resolutionTime": 1768677166188,
+      "resolverId": "GaAhU9jUqpYfe7TYxIXBZMwIB273",
+      "uniqueBettorCount": 3,
+      "lastUpdatedTime": 1768677202275,
+      "lastBetTime": 1765229485160,
+      "lastCommentTime": 1768677202254,
+      "token": "MANA"
+    }
+  ],
+  "detail_multiple_choice": {
+    "id": "E0ONq9czPd",
+    "creatorId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+    "creatorUsername": "Drifting",
+    "creatorName": "Drift",
+    "createdTime": 1774433874763,
+    "creatorAvatarUrl": "https://firebasestorage.googleapis.com/v0/b/mantic-markets.appspot.com/o/user-images%2FDrifting%2F9U5QcZzugg.jpg?alt=media&token=4c01317c-bd16-4132-b20f-5c7f313fedca",
+    "closeTime": 1798761540000,
+    "question": "How high will the US national average gas price get in 2026?",
+    "slug": "how-high-will-the-national-average",
+    "url": "https://manifold.markets/Drifting/how-high-will-the-national-average",
+    "totalLiquidity": 2250,
+    "outcomeType": "MULTIPLE_CHOICE",
+    "mechanism": "cpmm-multi-1",
+    "volume": 30503.187835309127,
+    "volume24Hours": 0,
+    "isResolved": false,
+    "uniqueBettorCount": 47,
+    "lastUpdatedTime": 1785846078694,
+    "lastBetTime": 1785846078694,
+    "lastCommentTime": 1777706623325,
+    "token": "MANA",
+    "shouldAnswersSumToOne": false,
+    "addAnswersMode": "ONLY_CREATOR",
+    "answers": [
+      {
+        "id": "2NILzI0dI0",
+        "index": 0,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.00",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1774951705834,
+        "resolutionProbability": 0.9762375058268441,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 417.0418058189119,
+        "pool": {
+          "YES": 12.22317637641795,
+          "NO": 502.1662764877624
+        },
+        "probability": 1
+      },
+      {
+        "id": "OP25Oquz9p",
+        "index": 1,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.10",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1775300628233,
+        "resolutionProbability": 0.95,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1911.6151641815961,
+        "pool": {
+          "YES": 25.09398220154885,
+          "NO": 476.78566182942734
+        },
+        "probability": 1
+      },
+      {
+        "id": "pZEyS5qUQQ",
+        "index": 2,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.20",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777457094430,
+        "resolutionProbability": 0.99,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 3228.7280660659953,
+        "pool": {
+          "YES": 11.021317002037094,
+          "NO": 1091.1103832016734
+        },
+        "probability": 1
+      },
+      {
+        "id": "g8OLAA6Zq6",
+        "index": 3,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.30",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777546335979,
+        "resolutionProbability": 0.9899999999999999,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 2122.3926016313953,
+        "pool": {
+          "YES": 11.05842634288955,
+          "NO": 1094.7842079460625
+        },
+        "probability": 1
+      },
+      {
+        "id": "9A62Atsp9q",
+        "index": 4,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.40",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777723553553,
+        "resolutionProbability": 0.99,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 2269.6546844787845,
+        "pool": {
+          "YES": 10.925833953145911,
+          "NO": 1081.6575613614418
+        },
+        "probability": 1
+      },
+      {
+        "id": "RUOOqhyI8L",
+        "index": 5,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.50",
+        "createdTime": 1774433874763,
+        "totalLiquidity": 25,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1778057138786,
+        "resolutionProbability": 0.9899999999999999,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1952.397151126514,
+        "pool": {
+          "YES": 10.392056461490398,
+          "NO": 1028.8135896875492
+        },
+        "probability": 1
+      },
+      {
+        "id": "y2z0sIn8yN",
+        "index": 6,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.60",
+        "createdTime": 1774951737711,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": -0.01995983801860257,
+          "month": 0.3421408241956881
+        },
+        "volume": 1939.1350343460012,
+        "pool": {
+          "YES": 127.70963048701675,
+          "NO": 127.28220026466136
+        },
+        "probability": 0.4991618746743859
+      },
+      {
+        "id": "qtqEnghsgl",
+        "index": 7,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.70",
+        "createdTime": 1775300669758,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0.22875988819375384
+        },
+        "volume": 2089.5225159608144,
+        "pool": {
+          "YES": 211.96465553621826,
+          "NO": 80.99737588980403
+        },
+        "probability": 0.27647738341907696
+      },
+      {
+        "id": "58tA0R0EPO",
+        "index": 8,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.25",
+        "createdTime": 1775353702845,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777546337772,
+        "resolutionProbability": 0.99,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1455.675294296812,
+        "pool": {
+          "YES": 10.38707848929242,
+          "NO": 1028.3207704399517
+        },
+        "probability": 1
+      },
+      {
+        "id": "PRpS06S6NL",
+        "index": 9,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.35",
+        "createdTime": 1775353715527,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777632763572,
+        "resolutionProbability": 0.9899999999999999,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1463.6495824020635,
+        "pool": {
+          "YES": 10.38707848929248,
+          "NO": 1028.320770439954
+        },
+        "probability": 1
+      },
+      {
+        "id": "OlySnz2cy6",
+        "index": 10,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.45",
+        "createdTime": 1775353726491,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1777888438592,
+        "resolutionProbability": 0.99,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1749.5385421457045,
+        "pool": {
+          "YES": 11.412863852803412,
+          "NO": 1129.873521427535
+        },
+        "probability": 1
+      },
+      {
+        "id": "0CuQLcEcQh",
+        "index": 11,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.55",
+        "createdTime": 1775353736108,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "resolution": "YES",
+        "resolutionTime": 1778154259953,
+        "resolutionProbability": 0.99,
+        "resolverId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0
+        },
+        "volume": 1887.5847775873387,
+        "pool": {
+          "YES": 12.309936141752132,
+          "NO": 1218.6836780334625
+        },
+        "probability": 1
+      },
+      {
+        "id": "dIOtPlCgUc",
+        "index": 12,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.65",
+        "createdTime": 1775353750937,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -5.551115123125783e-17,
+          "week": -0.014112704920168584,
+          "month": 0.24477961963509282
+        },
+        "volume": 1820.4470534266725,
+        "pool": {
+          "YES": 169.3224356147193,
+          "NO": 100.40953439686368
+        },
+        "probability": 0.3722567050266672
+      },
+      {
+        "id": "9gZs9ucnIZ",
+        "index": 13,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.75",
+        "createdTime": 1777632808489,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": -0.015425402856799997,
+          "month": 0.2080368731954587
+        },
+        "volume": 1028.0561341041584,
+        "pool": {
+          "YES": 239.2239448782158,
+          "NO": 71.0481751658287
+        },
+        "probability": 0.22898665582889977
+      },
+      {
+        "id": "U90CQ08CZO",
+        "index": 14,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.80",
+        "createdTime": 1777632819969,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": -0.0029047918429389308,
+          "month": 0.19034347179895908
+        },
+        "volume": 2343.723100116402,
+        "pool": {
+          "YES": 279.57741633494135,
+          "NO": 60.312701622314215
+        },
+        "probability": 0.17744764685950393
+      },
+      {
+        "id": "ylsl5O9LSq",
+        "index": 15,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.85",
+        "createdTime": 1778057161682,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0.13999999999999999
+        },
+        "volume": 2276.8259278648184,
+        "pool": {
+          "YES": 237.62498962776547,
+          "NO": 42.083115987358
+        },
+        "probability": 0.150453687764287
+      },
+      {
+        "id": "08ntPEZyIy",
+        "index": 16,
+        "contractId": "E0ONq9czPd",
+        "userId": "QsefS6Qw8AdHoJKcughNUrCc0rt2",
+        "text": "Over $4.90",
+        "createdTime": 1778154306545,
+        "totalLiquidity": 100,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0,
+          "week": 0,
+          "month": 0.1009035108589435
+        },
+        "volume": 547.2003997551551,
+        "pool": {
+          "YES": 269.25143476240765,
+          "NO": 37.140006361801476
+        },
+        "probability": 0.12121750602930569
+      }
+    ],
+    "description": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 4
+          },
+          "content": [
+            {
+              "text": "Resolution criteria",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "The national average for regular gasoline is tracked by AAA, which publishes weekly updates at ",
+              "type": "text"
+            },
+            {
+              "text": "gasprices.aaa.com",
+              "type": "text",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "https://gasprices.aaa.com/",
+                    "class": null,
+                    "target": "_blank"
+                  }
+                }
+              ]
+            },
+            {
+              "text": ". Each answer resolves YES if the national average price reaches or exceeds that threshold at any point during 2026, and NO if it does not. Resolution will be determined by the highest daily average reported by AAA for the year.",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 4
+          },
+          "content": [
+            {
+              "text": "Background",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "As of March 19, 2026, the national average gas price was $3.81 per gallon, up from $3.53 on March 12. The recent spike was driven by Middle East geopolitical tensions, with the national average up 60 cents in two weeks as Iran closed the Strait of Hormuz and crude oil prices surged to $119 per barre",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "GasBuddy's 2026 forecast projects a yearly average of $2.97 per gallon, though prices may briefly reach the low $3.20s during the spring switch to summer gasoline. The highest national average on record was $4.99 per gallon in June 2022.",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "heading",
+          "attrs": {
+            "level": 4
+          },
+          "content": [
+            {
+              "text": "Considerations",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "Gas prices vary significantly by region. As of mid-March 2026, only California, Washington, Hawaii, Nevada, Oregon, and Arizona were at or above $4 per gallon, while much of the central U.S. remained in the low-$3 range. The national average reflects a weighted combination across all states. Geopoli",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "type": "paragraph"
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "This description was generated by AI.",
+              "type": "text",
+              "marks": [
+                {
+                  "type": "italic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "paragraph"
+        },
+        {
+          "type": "bulletList",
+          "content": [
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "text": "Update 2026-04-09 (PST) (AI summary of ",
+                      "type": "text"
+                    },
+                    {
+                      "text": "creator comment",
+                      "type": "text",
+                      "marks": [
+                        {
+                          "type": "link",
+                          "attrs": {
+                            "href": "/Drifting/how-high-will-the-national-average#07mrcd93xy0t",
+                            "class": null,
+                            "target": "_blank"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "text": "): Resolution will be based on ",
+                      "type": "text"
+                    },
+                    {
+                      "text": "daily averages",
+                      "type": "text",
+                      "marks": [
+                        {
+                          "type": "bold"
+                        }
+                      ]
+                    },
+                    {
+                      "text": " reported by AAA (not weekly averages).",
+                      "type": "text"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "groupSlugs": [
+      "us-economy",
+      "inflation",
+      "economics-default",
+      "climate",
+      "energy"
+    ],
+    "textDescription": "Resolution criteria\n\nThe national average for regular gasoline is tracked by AAA, which publishes weekly updates at gasprices.aaa.com. Each answer resolves YES if the national average price reaches or exceeds that threshold at any point during 2026, and NO if it does not. Resolution will be determin"
+  },
+  "detail_multi_numeric": {
+    "id": "85NS9Ut65L",
+    "creatorId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+    "creatorUsername": "dfish",
+    "creatorName": "dfish",
+    "createdTime": 1785320555652,
+    "creatorAvatarUrl": "https://firebasestorage.googleapis.com/v0/b/mantic-markets.appspot.com/o/user-images%2Fdfish%2FZg9sZPZCl8.jpeg?alt=media&token=ee5781ec-dc1c-499a-9554-56805bc829ed",
+    "closeTime": 1819771140000,
+    "question": "What will the national average gas price be on September 1st?",
+    "slug": "what-will-the-national-average-gas-d8CCqctCSR",
+    "url": "https://manifold.markets/dfish/what-will-the-national-average-gas-d8CCqctCSR",
+    "totalLiquidity": 1000,
+    "outcomeType": "MULTI_NUMERIC",
+    "mechanism": "cpmm-multi-1",
+    "volume": 3345.645823159641,
+    "volume24Hours": 50,
+    "isResolved": false,
+    "uniqueBettorCount": 8,
+    "lastUpdatedTime": 1785920638158,
+    "lastBetTime": 1785920638158,
+    "token": "MANA",
+    "shouldAnswersSumToOne": true,
+    "addAnswersMode": "DISABLED",
+    "answers": [
+      {
+        "id": "5NZnldpCUO",
+        "index": 0,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "Below $3.00",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.0005321066839921625,
+          "week": -0.02069255527111892,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 2.8,
+        "volume": 2468.974356431269,
+        "pool": {
+          "YES": 2125.7859026572023,
+          "NO": 19.60059412125366
+        },
+        "probability": 0.009136159918357927
+      },
+      {
+        "id": "uNd5I6P0LO",
+        "index": 1,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "$3.00 - $3.39",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.003061459466741301,
+          "week": 0.0008045947004748262,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 3.2,
+        "volume": 4,
+        "pool": {
+          "YES": 1173.9230781304054,
+          "NO": 35.49352376053906
+        },
+        "probability": 0.029347640593856826
+      },
+      {
+        "id": "UuqzngQAZq",
+        "index": 2,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "$3.40 - $3.79",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": 0.10184723313277352,
+          "week": 0.19557899096425158,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 3.6,
+        "volume": 106.78823111032695,
+        "pool": {
+          "YES": 356.859417353814,
+          "NO": 116.75933053871361
+        },
+        "probability": 0.24652598964517417
+      },
+      {
+        "id": "AUyLsSSZyS",
+        "index": 3,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "$3.80 - $4.19",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.06122885294317271,
+          "week": 0.04163750991061893,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 4,
+        "volume": 258,
+        "pool": {
+          "YES": 200.77559838446072,
+          "NO": 207.52853933414767
+        },
+        "probability": 0.5082694985500501
+      },
+      {
+        "id": "558uSSQnpy",
+        "index": 4,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "$4.20 - $4.59",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.03269133269442362,
+          "week": -0.20887361902109974,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 4.4,
+        "volume": 384.5409970074923,
+        "pool": {
+          "YES": 467.3543687575721,
+          "NO": 89.15433224136608
+        },
+        "probability": 0.16020294396355933
+      },
+      {
+        "id": "N6t9PQUlIL",
+        "index": 5,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "$4.60 - $5.00",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.0023188098940372763,
+          "week": -0.004529452676329749,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 4.8,
+        "volume": 73.34223861055318,
+        "pool": {
+          "YES": 1292.011420759076,
+          "NO": 32.2494569298674
+        },
+        "probability": 0.02435279745343538
+      },
+      {
+        "id": "ptLOS996cE",
+        "index": 6,
+        "contractId": "85NS9Ut65L",
+        "userId": "d11eZkeFMUTUcgpFEkcjTNdRddx1",
+        "text": "Above $5.00",
+        "createdTime": 1785320555652,
+        "totalLiquidity": 204.12414523193152,
+        "subsidyPool": 0,
+        "isOther": false,
+        "probChanges": {
+          "day": -0.0020146714504063676,
+          "week": -0.0039254686067968746,
+          "month": 0.14285714285714285
+        },
+        "midpoint": 5.2,
+        "volume": 50,
+        "pool": {
+          "YES": 1355.7936707864692,
+          "NO": 30.732306518658344
+        },
+        "probability": 0.022164969875566348
+      }
+    ],
+    "description": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "What will the national average gas price be for regular grade on September 1st 2026? This market will be resolved according to ",
+              "type": "text"
+            },
+            {
+              "text": "https://gasprices.aaa.com/",
+              "type": "text",
+              "marks": [
+                {
+                  "type": "link",
+                  "attrs": {
+                    "href": "https://gasprices.aaa.com/",
+                    "class": "break-anywhere hover:underline hover:decoration-primary-400 hover:decoration-2 active:underline active:decoration-primary-400",
+                    "target": "_blank"
+                  }
+                }
+              ]
+            },
+            {
+              "text": ". The average price will be rounded to the nearest $0.01. ",
+              "type": "text"
+            }
+          ]
+        }
+      ]
+    },
+    "groupSlugs": [
+      "energy",
+      "economics-default",
+      "gas-prices"
+    ],
+    "textDescription": "What will the national average gas price be for regular grade on September 1st 2026? This market will be resolved according to https://gasprices.aaa.com/. The average price will be rounded to the nearest $0.01. "
+  },
+  "detail_binary": {
+    "id": "sZzIqycRcS",
+    "creatorId": "5jnObN7AkoYBQY3LlsstEDrDpp63",
+    "creatorUsername": "StaceyVanekSmith",
+    "creatorName": "Stacey Vanek Smith",
+    "createdTime": 1779468404289,
+    "creatorAvatarUrl": "https://lh3.googleusercontent.com/a/ACg8ocLHQvlkLJfTqj9JmaUqzwcUfHtH23ssNyyDVPImEMzbj4Xlx8hJ=s96-c",
+    "closeTime": 1793376000000,
+    "question": "Will national gas prices in the US average above $3.60",
+    "slug": "will-national-gas-prices-in-the-us",
+    "url": "https://manifold.markets/StaceyVanekSmith/will-national-gas-prices-in-the-us",
+    "pool": {
+      "NO": 2481.046316164898,
+      "YES": 403.05575655103667
+    },
+    "probability": 0.8602491359914038,
+    "p": 0.5000000000000012,
+    "totalLiquidity": 1000,
+    "outcomeType": "BINARY",
+    "mechanism": "cpmm-1",
+    "volume": 3863.657937197043,
+    "volume24Hours": 0,
+    "isResolved": false,
+    "uniqueBettorCount": 32,
+    "lastUpdatedTime": 1785846105894,
+    "lastBetTime": 1785846105894,
+    "lastCommentTime": 1781286327902,
+    "token": "MANA",
+    "description": {
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "text": "Official bet with economist Justin Wolfers of the University of Michigan and Platypus Media about national gas prices. The bet has to do with the average price of gas in the US the Friday before election day, aka October 30th, 2026 (12pm est). I officially bet the average gas price (as dictated by G",
+              "type": "text"
+            },
+            {
+              "type": "hardBreak"
+            },
+            {
+              "type": "hardBreak"
+            },
+            {
+              "text": "At stake: $200 each to be donated to a Platypus charity of Justin's choosing",
+              "type": "text"
+            },
+            {
+              "type": "hardBreak"
+            },
+            {
+              "type": "hardBreak"
+            },
+            {
+              "text": "If your guess is the closest to the actual price, you will get free Platypus merch! (TBC - to be created)",
+              "type": "text"
+            }
+          ]
+        }
+      ]
+    },
+    "groupSlugs": [
+      "gas-prices"
+    ],
+    "textDescription": "Official bet with economist Justin Wolfers of the University of Michigan and Platypus Media about national gas prices. The bet has to do with the average price of gas in the US the Friday before election day, aka October 30th, 2026 (12pm est). I officially bet the average gas price (as dictated by G"
+  }
+}

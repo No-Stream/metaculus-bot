@@ -63,6 +63,7 @@ class TestMarketMatchShape:
         assert match.retrieval_channel == ""
         assert match.sub_title == ""
         assert match.settlement_sources == ()
+        assert match.top_answers == ()
 
 
 class TestArchiveRoundTrip:
@@ -100,3 +101,19 @@ class TestArchiveRoundTrip:
         assert encoded["matches"][0]["close_time"].startswith("2026-08-31")
         assert encoded["matches"][0]["settlement_sources"] == [{"name": "BLS", "url": "https://www.bls.gov/cpi/"}]
         assert encoded["sources"] == {}
+
+    def test_multi_outcome_answers_survive_asdict_and_json_as_pairs(self):
+        """A multi-outcome row's answers are its ONLY price, so losing them in the archive would
+        make every such row read as priceless in residual analysis. Nested plain tuples, so
+        `asdict` leaves them alone and JSON writes them as arrays of two."""
+        match = _positional_row()
+        match.platform = "manifold"
+        match.implied_prob_yes = None  # what Manifold publishes for a multi-outcome market
+        match.top_answers = (("Over $4.60", 0.4992), ("Over $4.65", 0.3723))
+
+        as_dict = dataclasses.asdict(MarketSnapshot(matches=[match]))
+        assert as_dict["matches"][0]["top_answers"] == (("Over $4.60", 0.4992), ("Over $4.65", 0.3723))
+
+        encoded = json.loads(json.dumps(as_dict, default=str))
+        assert encoded["matches"][0]["top_answers"] == [["Over $4.60", 0.4992], ["Over $4.65", 0.3723]]
+        assert encoded["matches"][0]["implied_prob_yes"] is None

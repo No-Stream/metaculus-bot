@@ -54,6 +54,8 @@ from metaculus_bot.research.provider_health import (
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
 _MULTI_CLOSE_PATH = Path(__file__).parent / "data" / "kalshi_multi_close_event_2026_08_04.json"
+_FAMILY_LIQUIDITY_PATH = Path(__file__).parent / "data" / "kalshi_family_liquidity_2026_08_05.json"
+_MANIFOLD_MULTI_OUTCOME_PATH = Path(__file__).parent / "data" / "manifold_multi_outcome_2026_08_05.json"
 
 DURING_SUPPRESSION = date(2026, 8, 3)
 AFTER_RESUME_DATE = date(2027, 1, 1)
@@ -117,6 +119,80 @@ def test_the_multi_close_kalshi_fixture_is_committed_and_still_divergent() -> No
     assert nested[0]["status"] not in {market["status"] for market in nested[1:]}
     assert divergent["settlement_sources"], "the event-level settlement sources are read by the join"
     assert all(market.get("settlement_sources") is None for market in nested)
+
+
+def test_the_family_liquidity_kalshi_fixture_is_committed_and_still_straddles_its_boundaries() -> None:
+    """Same tracked-ness check, for the fixture the family-scope liquidity change added.
+
+    Both of its events were captured because they sit ON a boundary, and a capture that drifted off
+    one would leave the tests reading it green while proving nothing. ``KXGOVWINS-27JAN01`` has to
+    keep all three strikes OPEN and keep its first strike in a different liquidity bucket from the
+    family sum — that straddle is the whole reason a live capture was needed rather than a hand-built
+    dict, and only 2 frozen-universe events offer it. ``KXNETANYAHUPARDON-26`` has to keep exactly
+    one strike live and that strike must not be ``nested[0]``, which is what makes a positional price
+    read demonstrably wrong rather than merely unprincipled.
+    """
+    assert _FAMILY_LIQUIDITY_PATH.exists(), (
+        f"{_FAMILY_LIQUIDITY_PATH} missing. If it exists locally but not in CI, check .gitignore — "
+        "the blanket *.json rule needs the !tests/data/*.json negation."
+    )
+    payload = json.loads(_FAMILY_LIQUIDITY_PATH.read_text())
+    assert set(payload) >= {"events", "_provenance"}
+    assert payload["_provenance"]["endpoints"].keys() == {"kalshi"}
+
+    straddle = next(event for event in payload["events"] if event["event_ticker"] == "KXGOVWINS-27JAN01")
+    assert [market["status"] for market in straddle["markets"]] == ["active"] * 3
+    family = kalshi_event_match(straddle, match_confidence=1.0, channel="universe_fuzzy")
+    assert family is not None
+    first_strike_only = kalshi_event_match(
+        {**straddle, "markets": straddle["markets"][:1]}, match_confidence=1.0, channel="universe_fuzzy"
+    )
+    assert first_strike_only is not None
+    assert _liquidity_label(first_strike_only) != _liquidity_label(family), (
+        "the fixture no longer straddles a liquidity-label boundary, so the tests reading it "
+        "can no longer tell the family sum from its first strike"
+    )
+
+    collapsed = next(event for event in payload["events"] if event["event_ticker"] == "KXNETANYAHUPARDON-26")
+    live = [market for market in collapsed["markets"] if market["status"] == "active"]
+    assert len(live) == 1 and live[0] is not collapsed["markets"][0], (
+        "the fixture's collapsed family must keep its ONE live strike out of position 0"
+    )
+
+
+def test_the_manifold_multi_outcome_fixture_is_committed_and_still_splits_search_from_detail() -> None:
+    """Same tracked-ness check, for the fixture the ``contractType=ALL`` flip added.
+
+    The property it exists for is a DISAGREEMENT between two endpoints, so both halves have to
+    keep holding or the tests reading it go vacuous. The search half must keep multi-outcome rows
+    that carry no probability and no ``answers`` key — that absence is why a detail GET is the only
+    render path. The detail half must keep an ``answers`` array on the multi-outcome markets and
+    keep NONE on the BINARY control, which is what makes the array a real outcome-type
+    discriminator rather than a convention. The tie in the MULTIPLE_CHOICE ladder is asserted where
+    it is read, in ``test_tied_leading_answers_keep_the_arrays_own_order``.
+    """
+    assert _MANIFOLD_MULTI_OUTCOME_PATH.exists(), (
+        f"{_MANIFOLD_MULTI_OUTCOME_PATH} missing. If it exists locally but not in CI, check .gitignore — "
+        "the blanket *.json rule needs the !tests/data/*.json negation."
+    )
+    payload = json.loads(_MANIFOLD_MULTI_OUTCOME_PATH.read_text())
+    assert set(payload) >= {"search_all", "detail_multiple_choice", "detail_multi_numeric", "detail_binary"}
+    assert payload["_provenance"]["endpoints"].keys() == {"manifold"}
+
+    multi = [row for row in payload["search_all"] if row["outcomeType"] != "BINARY"]
+    assert len(multi) >= 2 and [row["outcomeType"] for row in payload["search_all"]].count("BINARY") >= 1, (
+        "the search capture must keep BOTH shapes, or it cannot show what the flip admits"
+    )
+    for row in multi:
+        assert row.get("probability") is None and "answers" not in row
+        assert row.get("uniqueBettorCount") is not None, "the liquidity label must stay measurable on these rows"
+
+    for key in ("detail_multiple_choice", "detail_multi_numeric"):
+        answers = payload[key]["answers"]
+        assert len(answers) >= 3, f"{key} must keep enough answers to exercise the cap"
+        assert all({"text", "probability"} <= set(answer) for answer in answers)
+    assert "answers" not in payload["detail_binary"], "the BINARY control is the whole discriminator"
+    assert payload["detail_binary"]["probability"] is not None
 
 
 def _observe(

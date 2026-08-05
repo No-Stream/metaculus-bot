@@ -513,3 +513,96 @@ class TestManifoldEnrichment:
         outcome = await enrich_manifold([_search_row("manifold", "", "row")], object())
 
         assert outcome.n_attempted == 0
+
+
+class TestManifoldMultiOutcomeEnrichment:
+    """A multi-outcome row's ANSWERS ride the same detail GET as its rules text.
+
+    That coincidence is why lifting the ``contractType=BINARY`` recall ceiling cost no extra
+    request: the search response publishes no probability and no answer array for these rows, so
+    the fan-out that was already fetching descriptions is the only place their price can come
+    from. Which also means the soft-fail matters more than it did — a lost GET now costs a row its
+    price, not just its rules text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_answers_and_the_rules_text_come_from_one_get(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        row = _search_row("manifold", "m1", "How high will the US national average gas price get in 2026?")
+        calls: list[str] = []
+
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+            calls.append(market_id)
+            return {  # noqa: ASYNC910
+                "textDescription": "Resolves per the AAA national average.",
+                "answers": [
+                    {"text": "Over $4.60", "probability": 0.4992},
+                    {"text": "Over $4.65", "probability": 0.3723},
+                    {"text": "Over $4.70", "probability": 0.2765},
+                    {"text": "Over $4.90", "probability": 0.1212},
+                ],
+            }
+
+        monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
+
+        outcome = await enrich_manifold([row], object())
+
+        assert calls == ["m1"], "one request must carry both fields"
+        assert row.raw_rules == "Resolves per the AAA national average."
+        assert row.top_answers == (("Over $4.60", 0.4992), ("Over $4.65", 0.3723), ("Over $4.70", 0.2765))
+        assert outcome.n_ok == 1
+
+    @pytest.mark.asyncio
+    async def test_a_binary_row_gains_no_answers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The write is unconditional, so this pins that a BINARY detail leaves the field empty on
+        its own evidence — no ``answers`` key — rather than needing a branch to say so."""
+        row = _search_row("manifold", "m1", "Will gas prices exceed $4?")
+
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+            return {"textDescription": "Resolves per AAA.", "probability": 0.86}  # noqa: ASYNC910
+
+        monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
+
+        await enrich_manifold([row], object())
+
+        assert row.raw_rules == "Resolves per AAA."
+        assert row.top_answers == ()
+
+    @pytest.mark.asyncio
+    async def test_a_lost_detail_leaves_a_multi_outcome_row_priceless_rather_than_wrong(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The per-row soft-fail, at the case it now costs the most: the row keeps its title,
+        liquidity and close date, renders ``-`` for its price, and must not take its sibling down.
+        A guessed stand-in price would be worse than the dash — nothing here has one to guess."""
+        rows = [_search_row("manifold", "m1", "lost"), _search_row("manifold", "m2", "kept")]
+
+        kept = {"answers": [{"text": "$3.80 - $4.19", "probability": 0.5083}]}
+
+        async def fake_detail(_session: Any, market_id: str) -> dict[str, Any] | None:  # noqa: ASYNC124
+            return None if market_id == "m1" else kept  # noqa: ASYNC910
+
+        monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
+
+        outcome = await enrich_manifold(rows, object())
+
+        assert (rows[0].raw_rules, rows[0].top_answers) == ("", ())
+        assert rows[1].top_answers == (("$3.80 - $4.19", 0.5083),)
+        assert (outcome.n_attempted, outcome.n_ok) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_detail_carrying_answers_but_no_description_still_populates_the_price(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The two fields are independent: 5 of 40 measured markets publish an empty description,
+        and one of those must not lose its answers to a shared early return."""
+        row = _search_row("manifold", "m1", "Price of Ethereum (ETH) by 2030?")
+
+        async def fake_detail(_session: Any, _market_id: str) -> dict[str, Any]:  # noqa: ASYNC124
+            return {"textDescription": "", "answers": [{"text": "9000-10000", "probability": 0.224}]}  # noqa: ASYNC910
+
+        monkeypatch.setattr(generation.venues, "manifold_market_detail", fake_detail)
+
+        await enrich_manifold([row], object())
+
+        assert row.raw_rules == ""
+        assert row.top_answers == (("9000-10000", 0.224),)

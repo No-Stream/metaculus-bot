@@ -8,16 +8,19 @@ Three properties are load-bearing here, each with a measurement behind it:
   silent failure that hid the Manifold breakage for 17+ days. So `parse_query_author` returns
   `()` on every unreadable shape and the caller unions onto `deterministic_queries`, which means
   the author's worst case is "no gain".
-- **Digit stripping happens in code, not by asking the model nicely.** Manifold's `term` is a
-  strict conjunction of content tokens, so one date token no market's text carries returns `[]`.
-  `strip_dates_and_numbers` is applied at PARSE time to author output (so a numeric token can
-  never reach the un-stripping Kalshi channel) and by the conjunctive venues at their own call
-  site. On author output the strip DROPS the synonym rather than keeping its non-digit remnant —
-  the author cannot contribute digit-bearing vocabulary at all — because a generic remnant like
-  `"rate"` scores ~100 against thousands of off-topic events and `fuzzy_best` has no floor to
-  stop it displacing a real hit. `deterministic_queries` itself does NOT strip: a year is real
-  signal when scoring against a catalogue of dated market titles, and the enumerable venues
-  score on the raw set.
+- **Digits are handled in code rather than by asking the model nicely, and the two channels
+  handle them differently.** Manifold's `term` is a strict conjunction of content tokens, so one
+  date token no market's text carries returns `[]`. Two mechanisms enforce that, scoped
+  differently on purpose. The conjunctive venues strip EVERY digit-bearing token at their own call
+  site (`strip_dates_and_numbers`), because theirs is the channel with the cliff. Author output is
+  filtered at PARSE time by `has_date_like_token` instead: a synonym carrying a DATE (a year, a
+  bare number, a month-and-day) is dropped whole rather than trimmed to its non-digit remnant,
+  because a remnant like `"rate"` scores ~100 against thousands of off-topic events and
+  `fuzzy_best` has no floor to stop it displacing a real hit. A synonym whose digits sit inside an
+  identifier (`"U-3"`, `"S&P 500"`, `"10-K"`) is KEPT: series codes and tickers are the vocabulary
+  the author exists to contribute, and the un-stripping fuzzy channel is where they pay off.
+  `deterministic_queries` itself does NOT strip: a year is real signal when scoring against a
+  catalogue of dated market titles, and the enumerable venues score on the raw set.
 - **`fuzzy_best` has no score floor.** It ORDERS a catalogue so its top N fits in a prompt; it
   never drops anything. The retired `KALSHI_MIN_FUZZY_SCORE` / `PREDICTIT_MIN_FUZZY_SCORE`
   floors are what discarded the adjacent-cut markets that carry most of the evidential value,
@@ -52,6 +55,18 @@ MANIFOLD_RELAXATION_MAX_TOKENS = 3
 
 _DIGIT_RE = re.compile(r"\d")
 _MANIFOLD_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'À-ɏ&.\-]*")
+
+# `has_date_like_token`'s vocabulary. A day number carries an optional ordinal suffix so
+# "June 30th" reads as a date rather than as an identifier ending in letters.
+_TOKEN_EDGE_PUNCTUATION = "\"'“”‘’.,;:!?()[]{}"
+_DIGIT_GROUP_RE = re.compile(r"\d+")
+_DAY_NUMBER_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?", re.IGNORECASE)
+_PLAUSIBLE_YEARS = range(1900, 2100)
+_MONTH_WORDS: frozenset[str] = frozenset(
+    """january february march april may june july august september october november december
+    jan feb mar apr jun jul aug sep sept oct nov dec
+    """.split()
+)
 
 # Content-word stopwords for Manifold's conjunction-relaxation ladder. Kept byte-identical to
 # the tuning script (scratch/new_analyses_2026-07-18/market_match_precision.py `_overlap`) it was
@@ -143,6 +158,58 @@ def strip_dates_and_numbers(query: str) -> str:
     return " ".join(kept).strip()
 
 
+def has_date_like_token(query: str) -> bool:
+    """True when a query carries a DATE, as opposed to digits sitting inside an identifier.
+
+    The distinction exists because the two are worth opposite things to the fuzzy channel, which
+    scores queries against a whole catalogue with no floor. A date token is high-frequency and
+    low-information: a bare `"2026"` is a token-set subset of every dated market title, so it
+    scores ~100 on thousands of them and displaces real hits. A series code is the reverse —
+    `"U-3"`, `"S&P 500"`, `"10-K"` match almost nothing except the market that actually tracks the
+    quantity, which is exactly why the query author is asked for them.
+
+    A token is DATE-LIKE when, ignoring edge punctuation:
+
+    - it is numeric (no letters) and one of its digit groups is a plausible calendar year, i.e.
+      four digits in 1900-2099 — `"2026"`, `"2026-07-31"`, `"07/2026"`; or
+    - it is numeric and the query names nothing else: a query with no alphabetic token at all is a
+      number, not vocabulary — `"2026"`, `"44796"`, `"500"` standing alone; or
+    - it is a 1-2 digit day number (with or without an ordinal suffix) next to a month word —
+      `"June 30"`, `"30th June"`.
+
+    Everything else digit-bearing is IDENTIFIER-LIKE and survives: digits attached to letters
+    (`"U-3"`, `"CPI-U"`, `"10-K"`, `"50bp"`, `"ISO-8601"`) and a number qualifying a name in a
+    query that has one (`"S&P 500"`, `"Nikkei 225"`, `"Brent above $90.50"`).
+
+    Two boundary calls, both taken deliberately:
+
+    - The year test fires on index names built from a year-shaped number, so `"Russell 2000"` and
+      `"Nasdaq 100"` split — 2000 is in range, 100 is not. The year test wins: a bare in-range
+      four-digit token is the measured ranking hazard, and the question's own words already reach
+      the venues through `deterministic_queries`.
+    - Fiscal shapes glued to letters (`"FY2026"`, `"H1"`, `"Q3"`) read as identifiers. They are
+      low-frequency, so they cannot subset many titles, and the conjunctive venues strip them at
+      their own call site regardless — the cliff this whole rule protects is not exposed to them.
+    """
+    cores = [token.strip(_TOKEN_EDGE_PUNCTUATION) for token in query.split()]
+    query_names_something = any(any(char.isalpha() for char in core) for core in cores)
+
+    for position, core in enumerate(cores):
+        if not _DIGIT_RE.search(core):
+            continue
+        if _DAY_NUMBER_RE.fullmatch(core):
+            neighbors = cores[max(0, position - 1) : position] + cores[position + 1 : position + 2]
+            if any(neighbor.lower() in _MONTH_WORDS for neighbor in neighbors):
+                return True
+        if any(char.isalpha() for char in core):
+            continue
+        if not query_names_something:
+            return True
+        if any(len(group) == 4 and int(group) in _PLAUSIBLE_YEARS for group in _DIGIT_GROUP_RE.findall(core)):
+            return True
+    return False
+
+
 def dedupe_queries(values: list[str]) -> list[str]:
     """Order-preserving, case-insensitive dedup, dropping blanks."""
     seen: set[str] = set()
@@ -169,10 +236,13 @@ def deterministic_queries(title: str) -> list[str]:
 
 # The query author's prompt. It carries the recall framing, the additive framing ("your
 # queries are ADDED to a set that already has the question's own words") and the no-dates
-# rule. The digit ban is ASKED for here and ENFORCED in `_authored_strings`; the code is the
+# rule. The date ban is ASKED for here and ENFORCED in `_authored_strings`; the code is the
 # guarantee, since a model that ignores the instruction would otherwise zero a Manifold
-# conjunction. Substituted with `.replace`, matching the ranker prompt, so a brace in a
-# question title can never raise.
+# conjunction. The ban has to be scoped exactly as `has_date_like_token` scopes it: a prompt
+# banning digits outright would suppress the series codes the parser now keeps, which is the
+# same silent drift as a ceiling raised in code while the prompt still asks for the old one.
+# Substituted with `.replace`, matching the ranker prompt, so a brace in a question title can
+# never raise.
 QUERY_AUTHOR_PROMPT = """You are writing search queries to find prediction markets RELATED to a forecasting question.
 
 Recall is the objective: a market on the same subject with a different resolution date or a different threshold is a WANTED hit, not a miss.
@@ -183,7 +253,7 @@ Return JSON with exactly two keys:
   "synonyms":  domain vocabulary absent from the question -- alternate names for the measured quantity, the agency or index that publishes it, the ticker, trader slang. Up to 8 short strings.
   "framings":  2-3 alternate short phrasings of the whole question, each at most 4 words.
 
-Do NOT include dates, years, or numbers in any string: the venues we query treat a query as a strict conjunction, so a date token zeroes the result set.
+Do NOT include dates, years, or standalone numbers in any string: some venues treat a query as a strict conjunction, so a date token zeroes the result set. Digits INSIDE a name are wanted -- "U-3", "S&P 500", "10-K" are series codes a token match on the question could never reach, so emit them when they name the quantity.
 
 QUESTION
 title: {title}
@@ -206,20 +276,21 @@ def build_query_author_prompt(title: str, resolution_criteria: str) -> str:
 def _authored_strings(value: object) -> list[str]:
     """One of the author's two JSON arrays, cleaned into usable queries.
 
-    Digit-bearing synonyms are DROPPED here, not trimmed down to their non-digit tokens. The
-    strip has to happen at parse time — a numeric token in a synonym would otherwise survive
-    into the Kalshi fuzzy channel, which does not strip, and dates are the measured cause of the
-    conjunction cliff — but keeping the REMNANT is worse than dropping the synonym. `"U-3 rate"`
-    reduced to `"rate"`, and `fuzzy_best` maxes with no floor, so one generic word scores ~100
-    via `token_set_ratio` against every catalogue event whose rules text contains it: measured on
-    the real 9,762-event catalogue, bare `"rate"` scores >=99 on 52 events and pushed the first
-    wanted row from pool rank 2 to rank 31, replacing an entire fail-open slate with Fed-funds
-    markets. Dropping loses only what the author could not express anyway; keeping the remnant
-    actively displaces real hits before the width cut.
+    Date-bearing synonyms are DROPPED whole here, not trimmed down to their non-digit tokens.
+    Filtering has to happen at parse time — a date token in a synonym would otherwise survive into
+    the Kalshi fuzzy channel, which does not strip — but keeping the REMNANT is worse than dropping
+    the synonym. `"2026 rate print"` reduced to `"rate print"`, and `fuzzy_best` maxes with no
+    floor, so one generic word scores ~100 via `token_set_ratio` against every catalogue event
+    whose rules text contains it: measured on the real 9,762-event catalogue, bare `"rate"` scores
+    >=99 on 52 events and pushed the first wanted row from pool rank 2 to rank 31, replacing an
+    entire fail-open slate with Fed-funds markets.
 
-    So the author cannot contribute digit-bearing vocabulary at all (`"U-3"`, `"S&P 500"`,
-    `"CPI-U"`, `"2026 print"`). That is the accepted cost of one query set feeding both an
-    un-stripping fuzzy channel and a strict conjunction.
+    Identifier-shaped digits survive instead of being dropped with the dates (see
+    `has_date_like_token` for where the line falls), because series codes and tickers are the whole
+    reason this stage exists: `"U-3"` and `"S&P 500"` are precisely the vocabulary a token match on
+    the question cannot reach. They reach the fuzzy channel verbatim, and the conjunctive venues
+    still see them stripped, since that strip runs on the whole query set at the venues' own call
+    site — the same treatment the question's own title already gets.
     """
     if not isinstance(value, list):
         return []
@@ -228,10 +299,9 @@ def _authored_strings(value: object) -> list[str]:
         if not isinstance(item, str):
             continue
         normalized = " ".join(item.split())
-        stripped = strip_dates_and_numbers(normalized)
-        if not stripped or stripped != normalized:
+        if not normalized or has_date_like_token(normalized):
             continue
-        out.append(stripped[:MAX_QUERY_CHARS].strip())
+        out.append(normalized[:MAX_QUERY_CHARS].strip())
     return out
 
 

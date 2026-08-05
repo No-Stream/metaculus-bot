@@ -57,6 +57,15 @@ SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", "metaculus.com
 # downloads the list at runtime, which the tests' egress guard blocks and which would be a new
 # prod failure mode. Refreshing it is a deliberate commit, so a suffix-list change can never
 # silently move a measured pool.
+#
+# `uv_build` ships the `.dat` with NO packaging configuration — MEASURED 2026-08-04 (uv 0.9.18),
+# not assumed. `uv build` puts it in both artifacts (wheel and sdist), and installing the wheel
+# `--no-deps` into a bare venv resolves this very expression to a real 332,855-byte file parsing
+# to the same 10,239 rules, SHA-256 identical to the checked-in copy. So the module-relative
+# read works installed, not just under the editable `uv sync` prod runs from. If a future
+# `[tool.uv.build-backend]` block adds an include/exclude list, this file has to be on it —
+# a dropped `.dat` fails at first PSL use with FileNotFoundError, and the suite would not
+# catch it because tests run from the checkout where the file is always there.
 _PUBLIC_SUFFIX_LIST_PATH = Path(__file__).parent / "data/public_suffix_list.dat"
 
 _WWW_PREFIX_RE = re.compile(r"^www\d*\.")

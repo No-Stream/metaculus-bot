@@ -39,6 +39,10 @@ from metaculus_bot.research.market_retrieval.ranking import (
     render_candidate_line,
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, SettlementSource
+from metaculus_bot.research.market_retrieval.venues import (
+    MANIFOLD_ANSWER_TEXT_MAX_CHARS,
+    MANIFOLD_TOP_ANSWERS_RENDERED,
+)
 from tests.test_market_retrieval_generation import Platform
 
 # Chars per token, the measured calibration for this prompt shape. Used instead of a tokenizer
@@ -48,8 +52,9 @@ CHARS_PER_TOKEN = 3.88
 # Ceiling on the ranker prompt at the pool scale the design was MEASURED at: ~100 Kalshi + ~30
 # Polymarket + ~15 Manifold (the venue searches return ~10 rows per query and dedup hard, so
 # their width-60 ceilings are rarely approached) + the full 197-market PredictIt universe. That
-# pool measures 35,760 estimated tokens (2026-08-04), which lands inside the spec's own
-# 36.3k-median / 39.4k-worst arithmetic — so 50,000 is ~40% headroom and catches silent
+# pool measures 35,875 estimated tokens (2026-08-05, was 35,760 before the multi-outcome answers
+# segment: 5 of the 15 Manifold rows now carry one, for +84 tokens), which lands inside the spec's
+# own 36.3k-median / 39.4k-worst arithmetic — so 50,000 is ~39% headroom and catches silent
 # line-format growth.
 #
 # For scale, not as the binding constraint: luna's context window is 1,050,000 tokens (verified
@@ -58,11 +63,18 @@ CHARS_PER_TOKEN = 3.88
 MARKET_RANKER_PROMPT_TOKEN_CEILING = 50_000
 
 # Ceiling on the degenerate case: every per-venue width saturated (100/60/60) AND every field at
-# its cap simultaneously. That measures 83,022 estimated tokens — 2.3x the measured-scale pool —
+# its cap simultaneously. That measures 86,316 estimated tokens — 2.4x the measured-scale pool —
 # because the caps sit well above the real distributions on purpose (Kalshi `rules_primary` is
 # p50=134 / p90=174 against a 700 cap, so the cap "truncates nothing real" rather than describing
 # a typical row). This bound pins the CAPS and the widths themselves, which the measured-scale
-# assertion above cannot see; 90,000 is ~8% headroom.
+# assertion above cannot see.
+#
+# 90,000 is now only ~4% headroom, down from ~8%: the multi-outcome answers segment costs 3,294
+# tokens here (all 60 Manifold rows multi-outcome, 3 answers each at the 60-char cap) against 84
+# at measured scale, because the saturation assumption is 20x the real 30% multi-outcome share and
+# 5x the real 10-13-char answer texts. The bound was left at 90,000 deliberately rather than
+# nudged, so it stays a live tripwire — but it is close enough now that the next raised cap or
+# width has to RE-DERIVE it from a measurement, not add slack to clear itself.
 #
 # Worth knowing before either number is edited: the two assertions catch different regressions. A
 # new candidate-line segment moves both. Raising a rules cap or a retrieval width moves only this
@@ -90,12 +102,13 @@ def _row(
     sources: tuple[SettlementSource, ...] = (),
     volume: float | None = None,
     bettors: int | None = None,
+    answers: tuple[tuple[str, float], ...] = (),
 ) -> MarketMatch:
     return MarketMatch(
         platform=platform,
         market_title=title,
         market_url=f"https://example.test/{market_id}",
-        implied_prob_yes=0.5,
+        implied_prob_yes=None if answers else 0.5,
         bid=None,
         ask=None,
         spread=None,
@@ -109,6 +122,7 @@ def _row(
         venue_market_id=market_id,
         sub_title=sub_title,
         settlement_sources=sources,
+        top_answers=answers,
     )
 
 
@@ -382,6 +396,39 @@ class TestCandidateLine:
 
         assert "liquidity: thin" in line
 
+    def test_a_multi_outcome_row_carries_its_leading_answers(self) -> None:
+        """The one segment on this line that quotes a price, and the only thing a multi-outcome
+        row has to offer beyond its title: Manifold publishes no market-level probability for one,
+        so without this the ranker sees a bare question and no evidence of what it measures."""
+        row = _row(
+            "manifold",
+            title="How high will the US gas price get in 2026?",
+            bettors=47,
+            rules="Per AAA.",
+            answers=(("Over $4.60", 0.4992), ("Over $4.65", 0.3723), ("Over $4.70", 0.2765)),
+        )
+
+        line = render_candidate_line(0, row)
+
+        assert "answers: Over $4.60 50% | Over $4.65 37% | Over $4.70 28%" in line
+        segments = [segment.strip() for segment in line.split("|")]
+        assert segments.index("answers: Over $4.60 50%") < segments.index("rules: Per AAA.")
+
+    def test_a_binary_row_gains_no_answers_segment(self) -> None:
+        """The flip must be invisible on the ~97% of the pool that is not multi-outcome, or every
+        Kalshi, Polymarket and PredictIt line pays for it."""
+        for platform in ("kalshi", "polymarket", "manifold", "predictit"):
+            line = render_candidate_line(0, _row(platform, rules="r"))  # type: ignore[arg-type]
+
+            assert "answers:" not in line
+
+    def test_an_integral_answer_probability_renders_without_a_decimal_tail(self) -> None:
+        """A resolved ladder rung prices at exactly 1.0, which is most of the answers on a real
+        threshold market — `100%`, not `100.0%`, so the segment stays one glanceable phrase."""
+        row = _row("manifold", bettors=47, answers=(("Over $4.00", 1.0), ("Over $4.60", 0.4992)))
+
+        assert "answers: Over $4.00 100% | Over $4.60 50%" in render_candidate_line(0, row)
+
 
 class TestRankerPrompt:
     def test_the_operator_relevance_rule_is_present(self) -> None:
@@ -521,6 +568,7 @@ class TestRankerPromptTokenBudget:
         rules: str,
         sub_title: str = "",
         sources: tuple[SettlementSource, ...] = (),
+        answers: tuple[tuple[str, float], ...] = (),
     ) -> MarketMatch:
         return _row(
             platform,
@@ -528,6 +576,7 @@ class TestRankerPromptTokenBudget:
             rules=rules,
             sub_title=sub_title,
             sources=sources,
+            answers=answers,
             volume=123456.0,
             bettors=250 if platform == "manifold" else None,
         )
@@ -564,9 +613,21 @@ class TestRankerPromptTokenBudget:
             )
             for _ in range(30)
         ]
+        # 30% of Manifold's labeled-wanted universe is multi-outcome (the share the contractType
+        # flip admits), so ~5 of 15 carry an answers segment, at MEASURED answer texts: 10-13 chars
+        # each on the committed live fixture, not the 60-char cap.
         pool += [
             self._row_at("manifold", title="Will unemployment top 4.5%?", rules="R" * RULES_CHARS["manifold"])
-            for _ in range(15)
+            for _ in range(10)
+        ]
+        pool += [
+            self._row_at(
+                "manifold",
+                title="How high will the US unemployment rate get in 2026?",
+                rules="R" * RULES_CHARS["manifold"],
+                answers=(("Over $4.60", 0.4992), ("$3.80 - $4.19", 0.5083), ("Nov-Dec 2026", 0.445)),
+            )
+            for _ in range(5)
         ]
         pool += [
             self._row_at(
@@ -594,8 +655,17 @@ class TestRankerPromptTokenBudget:
             self._row_at("polymarket", title="M" * 80, rules="R" * RULES_CHARS["polymarket"], sub_title="S" * 60)
             for _ in range(RETRIEVAL_WIDTH["polymarket"])
         ]
+        # Every Manifold row multi-outcome with its answers at the cap too — the flip's worst case,
+        # since a real pool is ~30% multi-outcome and real answer texts are 10-13 chars.
+        maxed_answers = tuple(("A" * MANIFOLD_ANSWER_TEXT_MAX_CHARS, 1.0) for _ in range(MANIFOLD_TOP_ANSWERS_RENDERED))
         pool += [
-            self._row_at("manifold", title="M" * 80, rules="R" * RULES_CHARS["manifold"], sub_title="S" * 60)
+            self._row_at(
+                "manifold",
+                title="M" * 80,
+                rules="R" * RULES_CHARS["manifold"],
+                sub_title="S" * 60,
+                answers=maxed_answers,
+            )
             for _ in range(RETRIEVAL_WIDTH["manifold"])
         ]
         pool += [

@@ -1,0 +1,345 @@
+{
+  "_provenance": {
+    "captured": "2026-08-05",
+    "why": "A Kalshi EVENT is a family of threshold strikes, and every event-level derivation must read all of them. kalshi_multi_close_event_2026_08_04.json pins close_time=max and is_resolved=all; this file pins the two derivations that moved off nested[0] on 2026-08-05 — the liquidity SUM and the withheld family price — at the point where each CHANGES A RENDERED CELL, which a fixture whose family sum lands in the same liquidity bucket as its first strike could not do.",
+    "endpoints": {
+      "kalshi": "https://api.elections.kalshi.com/trade-api/v2/events/{event_ticker}?with_nested_markets=true"
+    },
+    "edits": "Each event lifted verbatim from the free unauthenticated single-event endpoint; string values over 300 chars truncated. No key was renamed, added or removed, and no numeric value was touched — the sums the contract tests pin are hand-computed FROM these figures, so an edited number would silently move the expected value with it.",
+    "events": {
+      "KXGOVWINS-27JAN01": "3 all-active strikes whose family liquidity crosses a LABEL boundary: nested[0] alone is $3,387 volume / $3,130 OI (thin), the family sums to $107,079 / $31,470 (deep). The single clearest demonstration that the old read misreported the rendered `signal` column, and one of only 2 such 2-4-strike all-open events on the frozen universe. Also multi-strike, so `prob` must be withheld.",
+      "KXNETANYAHUPARDON-26": "A COLLAPSED family: nested[0] is finalized and exactly one strike (index 1) is still active, so the price legs come from a strike that is NOT the first. A positional read here quotes the settled strike's realized $0.031 as a live price instead of the open strike's $0.175 midpoint. Its family liquidity EXCLUDES the settled strike's $16,234 of turnover ($3,791 rather than $20,026), which is the deliberate scope choice kalshi_tradeable_strikes documents: a settled strike publishes an empty book, so its midpoint is a synthetic $0.50 rather than a traded price."
+    }
+  },
+  "events": [
+    {
+      "available_on_brokers": true,
+      "category": "Elections",
+      "collateral_return_type": "MECNET",
+      "event_ticker": "KXGOVWINS-27JAN01",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+        {
+          "can_close_early": true,
+          "close_time": "2027-01-01T14:59:00Z",
+          "created_time": "2026-03-16T18:28:37.370372Z",
+          "event_ticker": "KXGOVWINS-27JAN01",
+          "exchange_index": 0,
+          "expected_expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_value": "",
+          "last_price_dollars": "0.3100",
+          "latest_expiration_time": "2027-04-01T15:00:00Z",
+          "liquidity_dollars": "0.0000",
+          "market_type": "binary",
+          "no_ask_dollars": "0.6700",
+          "no_bid_dollars": "0.6600",
+          "no_sub_title": "Republican Party",
+          "notional_value_dollars": "1.0000",
+          "open_interest_fp": "3130.17",
+          "open_time": "2026-03-17T14:00:00Z",
+          "previous_price_dollars": "0.3100",
+          "previous_yes_ask_dollars": "0.3400",
+          "previous_yes_bid_dollars": "0.3100",
+          "price_level_structure": "tapered_deci_cent",
+          "price_ranges": [
+            {
+              "end": "0.1000",
+              "start": "0.0000",
+              "step": "0.0010"
+            },
+            {
+              "end": "0.9000",
+              "start": "0.1000",
+              "step": "0.0100"
+            },
+            {
+              "end": "1.0000",
+              "start": "0.9000",
+              "step": "0.0010"
+            }
+          ],
+          "result": "",
+          "rules_primary": "If Republicans hold more state governorships than Democrats after the 2026 midterm elections, the market resolves to Yes.",
+          "rules_secondary": "For the purposes of this Contract, the total number of governorships held by a party is calculated by counting (i) uncontested governorships (those without a scheduled election in 2026) plus (ii) contested governorships won by that party's candidate as determined under the resolution criteria of the",
+          "settlement_timer_seconds": 1800,
+          "status": "active",
+          "subtitle": "Republican Party",
+          "ticker": "KXGOVWINS-27JAN01-R1",
+          "title": "Will the difference between the number of Republican governors and the number of Democratic governors be between 1 and 50 governors after the 2026 midterms?",
+          "updated_time": "2026-07-21T18:49:13.471536Z",
+          "volume_24h_fp": "0.00",
+          "volume_fp": "10111.56",
+          "yes_ask_dollars": "0.3400",
+          "yes_ask_size_fp": "802.03",
+          "yes_bid_dollars": "0.3300",
+          "yes_bid_size_fp": "100.00",
+          "yes_sub_title": "Republican Party"
+        },
+        {
+          "can_close_early": true,
+          "close_time": "2027-01-01T14:59:00Z",
+          "created_time": "2026-03-16T18:28:37.370372Z",
+          "event_ticker": "KXGOVWINS-27JAN01",
+          "exchange_index": 0,
+          "expected_expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_value": "",
+          "last_price_dollars": "0.0960",
+          "latest_expiration_time": "2027-04-01T15:00:00Z",
+          "liquidity_dollars": "0.0000",
+          "market_type": "binary",
+          "no_ask_dollars": "0.9100",
+          "no_bid_dollars": "0.8500",
+          "no_sub_title": "Tie",
+          "notional_value_dollars": "1.0000",
+          "open_interest_fp": "2418.00",
+          "open_time": "2026-03-17T14:00:00Z",
+          "previous_price_dollars": "0.0960",
+          "previous_yes_ask_dollars": "0.1500",
+          "previous_yes_bid_dollars": "0.0900",
+          "price_level_structure": "tapered_deci_cent",
+          "price_ranges": [
+            {
+              "end": "0.1000",
+              "start": "0.0000",
+              "step": "0.0010"
+            },
+            {
+              "end": "0.9000",
+              "start": "0.1000",
+              "step": "0.0100"
+            },
+            {
+              "end": "1.0000",
+              "start": "0.9000",
+              "step": "0.0010"
+            }
+          ],
+          "result": "",
+          "rules_primary": "If neither party holds more governorships after the 2026 midterm elections, the market resolves to Yes.",
+          "rules_secondary": "For the purposes of this Contract, the total number of governorships held by a party is calculated by counting (i) uncontested governorships (those without a scheduled election in 2026) plus (ii) contested governorships won by that party's candidate as determined under the resolution criteria of the",
+          "settlement_timer_seconds": 1800,
+          "status": "active",
+          "ticker": "KXGOVWINS-27JAN01-E0",
+          "title": "Will the difference between the number of Republican governors and the number of Democratic governors be exactly 0 governors after the 2026 midterms?",
+          "updated_time": "2026-07-21T18:49:13.475973Z",
+          "volume_24h_fp": "0.00",
+          "volume_fp": "3419.00",
+          "yes_ask_dollars": "0.1500",
+          "yes_ask_size_fp": "2209.00",
+          "yes_bid_dollars": "0.0900",
+          "yes_bid_size_fp": "1.00",
+          "yes_sub_title": "Tie"
+        },
+        {
+          "can_close_early": true,
+          "close_time": "2027-01-01T14:59:00Z",
+          "created_time": "2026-03-16T18:28:37.370372Z",
+          "event_ticker": "KXGOVWINS-27JAN01",
+          "exchange_index": 0,
+          "expected_expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_time": "2027-04-01T15:00:00Z",
+          "expiration_value": "",
+          "last_price_dollars": "0.5200",
+          "latest_expiration_time": "2027-04-01T15:00:00Z",
+          "liquidity_dollars": "0.0000",
+          "market_type": "binary",
+          "no_ask_dollars": "0.4800",
+          "no_bid_dollars": "0.4500",
+          "no_sub_title": "Democratic Party",
+          "notional_value_dollars": "1.0000",
+          "open_interest_fp": "25921.97",
+          "open_time": "2026-03-17T14:00:00Z",
+          "previous_price_dollars": "0.5300",
+          "previous_yes_ask_dollars": "0.5500",
+          "previous_yes_bid_dollars": "0.5300",
+          "price_level_structure": "tapered_deci_cent",
+          "price_ranges": [
+            {
+              "end": "0.1000",
+              "start": "0.0000",
+              "step": "0.0010"
+            },
+            {
+              "end": "0.9000",
+              "start": "0.1000",
+              "step": "0.0100"
+            },
+            {
+              "end": "1.0000",
+              "start": "0.9000",
+              "step": "0.0010"
+            }
+          ],
+          "result": "",
+          "rules_primary": "If Democrats hold more governorships than Republicans after the 2026 midterm elections, the market resolves to Yes.",
+          "rules_secondary": "For the purposes of this Contract, the total number of governorships held by a party is calculated by counting (i) uncontested governorships (those without a scheduled election in 2026) plus (ii) contested governorships won by that party's candidate as determined under the resolution criteria of the",
+          "settlement_timer_seconds": 1800,
+          "status": "active",
+          "ticker": "KXGOVWINS-27JAN01-R-50",
+          "title": "Will the difference between the number of Republican governors and the number of Democratic governors be between -50 and -1 governors after the 2026 midterms?",
+          "updated_time": "2026-07-21T18:49:13.480401Z",
+          "volume_24h_fp": "116.92",
+          "volume_fp": "193049.29",
+          "yes_ask_dollars": "0.5500",
+          "yes_ask_size_fp": "7744.04",
+          "yes_bid_dollars": "0.5200",
+          "yes_bid_size_fp": "5.19",
+          "yes_sub_title": "Democratic Party"
+        }
+      ],
+      "mutually_exclusive": true,
+      "series_ticker": "KXGOVWINS",
+      "settlement_sources": [
+        {
+          "name": "state governments",
+          "url": "https://www.usa.gov/state-governments"
+        }
+      ],
+      "strike_period": "",
+      "sub_title": "after the 2026 midterms",
+      "title": "Who will hold more governorships after the midterms?"
+    },
+    {
+      "available_on_brokers": true,
+      "category": "Politics",
+      "collateral_return_type": "",
+      "event_ticker": "KXNETANYAHUPARDON-26",
+      "exchange_index": 0,
+      "last_updated_ts": "0001-01-01T00:00:00Z",
+      "markets": [
+        {
+          "can_close_early": true,
+          "close_time": "2026-07-01T14:00:00Z",
+          "created_time": "2026-03-09T23:25:04.292876Z",
+          "early_close_condition": "This market will close and expire early if the pardon is officially granted or announced.",
+          "event_ticker": "KXNETANYAHUPARDON-26",
+          "exchange_index": 0,
+          "expected_expiration_time": "2027-01-15T04:59:00Z",
+          "expiration_time": "2026-07-15T14:00:00Z",
+          "expiration_value": "No",
+          "last_price_dollars": "0.0310",
+          "latest_expiration_time": "2026-07-15T14:00:00Z",
+          "liquidity_dollars": "0.0000",
+          "market_type": "binary",
+          "no_ask_dollars": "1.0000",
+          "no_bid_dollars": "0.0000",
+          "no_sub_title": "Before Jul 1, 2026",
+          "notional_value_dollars": "1.0000",
+          "occurrence_datetime": "2026-07-01T14:35:49.048Z",
+          "open_interest_fp": "11439.96",
+          "open_time": "2026-03-10T14:00:00Z",
+          "previous_price_dollars": "0.0310",
+          "previous_yes_ask_dollars": "1.0000",
+          "previous_yes_bid_dollars": "0.0000",
+          "price_level_structure": "tapered_deci_cent",
+          "price_ranges": [
+            {
+              "end": "0.1000",
+              "start": "0.0000",
+              "step": "0.0010"
+            },
+            {
+              "end": "0.9000",
+              "start": "0.1000",
+              "step": "0.0100"
+            },
+            {
+              "end": "1.0000",
+              "start": "0.9000",
+              "step": "0.0010"
+            }
+          ],
+          "result": "no",
+          "rules_primary": "If Benjamin Netanyahu receives a pardon, clemency, or substantially equivalent official act of legal forgiveness from a competent authority in before Jul 1, 2026, then the market resolves to Yes.",
+          "rules_secondary": "",
+          "settlement_timer_seconds": 1800,
+          "settlement_ts": "2026-07-01T15:20:23.13027Z",
+          "settlement_value_dollars": "0.0000",
+          "status": "finalized",
+          "ticker": "KXNETANYAHUPARDON-26-JUL01",
+          "title": "Will Benjamin Netanyahu be pardoned before Jul 1, 2026?",
+          "updated_time": "2026-07-01T15:20:23.189983Z",
+          "volume_24h_fp": "0.00",
+          "volume_fp": "32469.16",
+          "yes_ask_dollars": "1.0000",
+          "yes_ask_size_fp": "0.00",
+          "yes_bid_dollars": "0.0000",
+          "yes_bid_size_fp": "0.00",
+          "yes_sub_title": "Before Jul 1, 2026"
+        },
+        {
+          "can_close_early": true,
+          "close_time": "2026-11-01T15:00:00Z",
+          "created_time": "2026-03-09T23:25:04.292876Z",
+          "early_close_condition": "This market will close and expire early if the pardon is officially granted or announced.",
+          "event_ticker": "KXNETANYAHUPARDON-26",
+          "exchange_index": 0,
+          "expected_expiration_time": "2027-01-15T04:59:00Z",
+          "expiration_time": "2026-11-15T15:00:00Z",
+          "expiration_value": "",
+          "last_price_dollars": "0.2000",
+          "latest_expiration_time": "2026-11-15T15:00:00Z",
+          "liquidity_dollars": "0.0000",
+          "market_type": "binary",
+          "no_ask_dollars": "0.8500",
+          "no_bid_dollars": "0.8000",
+          "no_sub_title": "Before Nov 1, 2026",
+          "notional_value_dollars": "1.0000",
+          "open_interest_fp": "6138.18",
+          "open_time": "2026-03-10T14:00:00Z",
+          "previous_price_dollars": "0.2000",
+          "previous_yes_ask_dollars": "0.2100",
+          "previous_yes_bid_dollars": "0.1800",
+          "price_level_structure": "tapered_deci_cent",
+          "price_ranges": [
+            {
+              "end": "0.1000",
+              "start": "0.0000",
+              "step": "0.0010"
+            },
+            {
+              "end": "0.9000",
+              "start": "0.1000",
+              "step": "0.0100"
+            },
+            {
+              "end": "1.0000",
+              "start": "0.9000",
+              "step": "0.0010"
+            }
+          ],
+          "result": "",
+          "rules_primary": "If Benjamin Netanyahu receives a pardon, clemency, or substantially equivalent official act of legal forgiveness from a competent authority in before Nov 1, 2026, then the market resolves to Yes.",
+          "rules_secondary": "",
+          "settlement_timer_seconds": 1800,
+          "status": "active",
+          "ticker": "KXNETANYAHUPARDON-26-NOV01",
+          "title": "Will Benjamin Netanyahu be pardoned before Nov 1, 2026?",
+          "updated_time": "2026-04-09T10:49:23.983578Z",
+          "volume_24h_fp": "0.00",
+          "volume_fp": "21665.10",
+          "yes_ask_dollars": "0.2000",
+          "yes_ask_size_fp": "5.00",
+          "yes_bid_dollars": "0.1500",
+          "yes_bid_size_fp": "200.00",
+          "yes_sub_title": "Before Nov 1, 2026"
+        }
+      ],
+      "mutually_exclusive": false,
+      "series_ticker": "KXNETANYAHUPARDON",
+      "settlement_sources": [
+        {
+          "name": "the Office of the President of Israel",
+          "url": "https://www.president.gov.il/"
+        }
+      ],
+      "strike_period": "",
+      "sub_title": "Pardon timeline",
+      "title": "Will Benjamin Netanyahu be pardoned?"
+    }
+  ],
+  "cursor": ""
+}

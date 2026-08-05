@@ -5,22 +5,26 @@ which is what makes the four decisions below the shape they are. Recall is gener
 selection is the ranker's, and no path here fuzzy-selects, score-floors or width-caps on the
 venue's behalf.
 
-- **Kalshi pulls the COMPLETE open-events catalogue** (~9,762 events, ~49 pages) and streams
-  each page through a TIERED projection, so peak memory tracks the retained fields rather
-  than the ~3 MB/page raw body — 49 pages of raw JSON is ~150 MB, and the caller holds the
-  result for 6h in the process that runs forecasters. Each event's first nested market keeps
-  the full field set and every later one keeps only ``close_time`` and ``status``, the only
-  two fields anything reads across nested markets: 85.5 MB down to 43.7 MB on the frozen
-  universe, with byte-identical consumer output.
-- **Kalshi's event-level derivations read EVERY nested market**: ``close_time`` is the MAX
-  over them and ``is_resolved`` requires ALL of them resolved. Reading ``nested[0]`` instead
-  misclassifies ~305 live event families as RESOLVED and ~72 settled ones as open on the
-  frozen universe, and both fields are now a rendered column and a ranker input. Liquidity
-  and the price legs DO stay on ``nested[0]``, deliberately: they describe one tradeable
-  contract, and there is no defensible way to add up four strikes' worth of open interest.
+- **Kalshi pulls the COMPLETE open-events catalogue** (~9,762 events, ~49 pages) and streams each
+  page through a TIERED projection, so peak memory tracks the retained fields rather than the ~3
+  MB/page raw body — 49 pages of raw JSON is ~150 MB, and the caller holds the result for 6h in the
+  process that runs forecasters. Only the rules text is head-only; see
+  ``KALSHI_NESTED_TAIL_FIELDS``.
+- **EVERY Kalshi event-level derivation reads EVERY nested market.** An event is a threshold FAMILY
+  (86.5% of the catalogue is multi-strike), so ``close_time`` is the MAX over its strikes,
+  ``is_resolved`` requires ALL of them resolved, and the liquidity legs SUM each live strike's own
+  dollar conversion. Reading ``nested[0]`` instead misclassifies ~305 live families as RESOLVED, ~72
+  settled ones as open, and mislabels the liquidity of 1,634 events. ``implied_prob_yes`` and its
+  bid/ask/spread legs are the one thing that CANNOT be aggregated: a family has no single
+  probability, so they populate only for a one-tradeable-strike event and are ``None`` otherwise.
 - **Polymarket sends ``events_status=active``**, and it is load-bearing rather than tidy:
   nothing downstream filters on close date any more (the pipeline passes ``as_of=None``), so
   without the parameter ``Ethereum`` puts 7 closed events out of 10 straight into the pool.
+- **Manifold sends ``contractType=ALL``, and a multi-outcome row's price arrives from a second
+  request.** ``BINARY`` was a measured ~30% recall ceiling (27 of 89 labeled-wanted markets are
+  MULTIPLE_CHOICE / MULTI_NUMERIC / NUMBER / DATE). Those rows come back with ``probability``
+  null and no ``answers`` key, so their whole price lives in the per-candidate detail GET the
+  enrichment hook already fires; see ``manifold_top_answers``.
 - **PredictIt parses ``dateEnd`` into ``close_time``, renders contract names, and quotes no
   price.** The whole ~197-market universe reaches the pool, so there is no per-question query
   to select a contract with and pricing an arbitrary one would misreport the market; the
@@ -41,6 +45,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -99,12 +104,12 @@ _KALSHI_RETRYABLE_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 # ijson structural events, i.e. the ones carrying no scalar `value` to keep.
 _IJSON_CONTAINER_EVENTS = frozenset({"start_map", "map_key", "end_map", "start_array", "end_array"})
 
-# The projection. Everything outside these tuples (plus `settlement_sources`) is dropped as the
-# page streams in, which is the whole point: a raw market object carries ~38 keys and the
-# catalogue is held for 6h in the process that runs forecasters.
+# The projection. Everything outside these tuples (plus `settlement_sources`) is dropped as the page
+# streams in, which is the whole point: a raw market object carries ~38 keys and the catalogue is held
+# for 6h in the process that runs forecasters.
 KALSHI_EVENT_FIELDS: tuple[str, ...] = ("event_ticker", "series_ticker", "title", "sub_title")
-# The full nested-market set, kept for the FIRST nested market of each event. It stays the
-# accurate union of what any consumer can read off a market object.
+# The full nested-market set, kept for the FIRST nested market of each event. It stays the accurate
+# union of what any consumer can read off a market object.
 KALSHI_MARKET_FIELDS: tuple[str, ...] = (
     "rules_primary",
     "close_time",
@@ -117,32 +122,49 @@ KALSHI_MARKET_FIELDS: tuple[str, ...] = (
     "volume_24h_fp",
     "status",
 )
-# Nested markets AFTER the first keep only these two, because only these two are ever read
-# across nested markets — `close_time` by the max-over-nested derivation and `status` by the
-# all-resolved one. Every other field is read exclusively off `nested[0]` (`kalshi_event_match`
-# and `kalshi_event_rules`), so on the frozen universe 69,207 of 78,969 nested markets' worth of
-# price/rules fields would be dead weight: measured through the real collector, 85.5 MB untiered
-# versus 43.7 MB tiered, with `rules_primary` on the tail alone accounting for 13.2 MB. At the
-# `KALSHI_PREFETCH_EVENT_LIMIT` guard that is ~175 MB versus ~90 MB.
+# Nested markets AFTER the first keep everything EXCEPT `rules_primary`, DERIVED by subtraction so a
+# new field joins the tail by default. Every field but the rules text IS read across nested markets:
+# `close_time` by the max-over-nested derivation, `status` by the all-resolved one and by
+# `kalshi_tradeable_strikes`, and the money fields by the per-strike conversion the liquidity sum runs
+# over the family (`volume_24h_fp` included — it rides with whichever strike the price legs quote,
+# often not the first). `rules_primary` earns head-only status twice over: every strike shares one
+# settlement rule, so tail copies say nothing new, and it is by far the largest field.
 #
-# A NEW field has to pick a tier deliberately: put it here only if something reads it off a
-# nested market other than the first. The saving requires genuinely OMITTING the keys — seeding
-# the tail with all ten set to None recovers only 35.7 of the 41.8 MB. `sys.intern` is NOT the
-# alternative: it saves 34.9 MB but PEP-683 makes interned strings effectively permanent, so a
-# 6h cache refresh would never reclaim them.
-KALSHI_NESTED_TAIL_FIELDS: tuple[str, ...] = ("close_time", "status")
+# The tail was `("close_time", "status")` until 2026-08-05, when the liquidity legs moved off
+# `nested[0]` onto a family sum and needed the money fields on every strike. Measured through the real
+# collector on the frozen universe (9,417 events / 72,479 nested markets): 75.6 MB untiered, 39.1 MB
+# at the old tail, 64.0 MB now — correctness re-spent 24.9 of the 36.5 MB the tiering saved, and
+# `rules_primary`'s 11.6 MB is what the tier still buys. At the `KALSHI_PREFETCH_EVENT_LIMIT` runaway
+# guard that is ~136 MB rather than ~83 MB. Worth paying: the cheaper tail was cheap because it fed a
+# derivation that mislabelled 1,634 events. The saving requires genuinely OMITTING the key — seeding
+# the tail with every field set to None recovers only 35.7 of the 41.8 MB the omission does.
+# `sys.intern` is NOT the alternative: it saves 34.9 MB but PEP-683 makes interned strings effectively
+# permanent, so a 6h refresh never reclaims them.
+KALSHI_NESTED_HEAD_ONLY_FIELDS: frozenset[str] = frozenset({"rules_primary"})
+KALSHI_NESTED_TAIL_FIELDS: tuple[str, ...] = tuple(
+    field for field in KALSHI_MARKET_FIELDS if field not in KALSHI_NESTED_HEAD_ONLY_FIELDS
+)
 
-# A Kalshi market whose status is one of these has settled. Load-bearing on the EVENT too: an
-# event is resolved only when every nested market is.
+# A Kalshi market whose status is one of these has settled. Load-bearing on the EVENT twice over: an
+# event is resolved only when every nested market is, and its money/price legs read only the rest.
 KALSHI_RESOLVED_STATUSES: frozenset[str] = frozenset({"settled", "finalized", "closed"})
 
-# PredictIt bundles several binary contracts per market, and the contract names are most of
-# its semantic content. Eight covers a crowded primary field without letting one market's
-# ballot dominate the ranker prompt.
+# PredictIt bundles several binary contracts per market, and the contract names are most of its
+# semantic content. Eight covers a crowded primary field without letting one market's ballot dominate
+# the ranker prompt.
 PREDICTIT_CONTRACTS_RENDERED = 8
 
-# Rules-text retention at parse time. Generous here and tightened per venue in the ranker
-# prompt: this bound only stops a pathological row from being carried around.
+# A multi-outcome Manifold market's leading answers, kept off its detail payload. Three, because
+# the leaders carry the shape of the distribution and the tail is where a threshold ladder's 17
+# rungs live; 60 chars because measured answer texts are short (10-13 on the committed fixture:
+# `Over $4.60`, `$3.80 - $4.19`, `Nov-Dec 2026`), so the cap only bounds a pathological answer.
+# Both are load-bearing on the RENDER budget: three answers at the cap displace the whole rules
+# text inside the bullet's `RAW_BULLET_BODY_MAX_CHARS`, where three realistic ones cost ~60 chars.
+MANIFOLD_TOP_ANSWERS_RENDERED = 3
+MANIFOLD_ANSWER_TEXT_MAX_CHARS = 60
+
+# Rules-text retention at parse time. Generous here and tightened per venue in the ranker prompt:
+# this bound only stops a pathological row from being carried around.
 RULES_TEXT_MAX_CHARS = 2000
 
 
@@ -409,33 +431,33 @@ async def kalshi_prefetch_events(
 def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | None]:
     """Convert a Kalshi market's contract counts to the USD the thresholds expect.
 
-    Returns ``(volume_usd, open_interest_usd)``, either leg ``None`` when its count is absent
-    — the distinction ``_liquidity_label`` needs to tell "upstream sent no field"
-    (``no-liquidity-data``) from "a real zero" (``thin``).
+    ONE strike's arithmetic. ``kalshi_event_usd_liquidity`` is what an event-level caller wants; a
+    caller reaching here directly reports one threshold as a whole family.
 
-    Field names and units are from the Kalshi OpenAPI spec (docs.kalshi.com, re-read
-    2026-08-03). Two details drive the arithmetic:
+    Returns ``(volume_usd, open_interest_usd)``, either leg ``None`` when its count is absent — the
+    distinction ``_liquidity_label`` needs to tell "upstream sent no field" (``no-liquidity-data``)
+    from "a real zero" (``thin``).
 
-    - ``volume_fp`` and ``open_interest_fp`` are ``FixedPointCount`` — "market volume in
-      contracts" and "number of contracts bought ... disconsidering netting". They are
-      COUNTS, not dollars. The bare names ``volume`` / ``open_interest`` appear nowhere in
-      the spec and were absent from every archived payload, which is why reading them
-      blanked the label on 100% of Kalshi rows.
-    - The two counts convert with DIFFERENT multipliers, because they measure different
-      things. Volume is turnover, so it scales by trade price. Open interest is collateral:
-      both sides of a contract together post the full settlement value, so it scales by
-      ``notional_value_dollars``. Using trade price for both would call a market holding
-      119k contracts of open interest at $0.001 "thin" when ~$119k of capital is locked in
-      it.
+    Field names and units are from the Kalshi OpenAPI spec (docs.kalshi.com, re-read 2026-08-03).
+    Two details drive the arithmetic:
 
-    ``liquidity_dollars`` is deliberately not consulted: upstream marks it deprecated and
-    documents it to "always return 0.0000" (confirmed on 1,504 live markets and all 127
-    archived rows). Scoring off it would wire in a constant zero.
+    - ``volume_fp`` and ``open_interest_fp`` are ``FixedPointCount`` — "market volume in contracts"
+      and "number of contracts bought ... disconsidering netting". They are COUNTS, not dollars. The
+      bare names ``volume`` / ``open_interest`` appear nowhere in the spec and were absent from every
+      archived payload, which is why reading them blanked the label on 100% of Kalshi rows.
+    - The two counts convert with DIFFERENT multipliers, because they measure different things.
+      Volume is turnover, so it scales by trade price. Open interest is collateral: both sides of a
+      contract together post the full settlement value, so it scales by ``notional_value_dollars``.
+      Using trade price for both would call a market holding 119k contracts of open interest at
+      $0.001 "thin" when ~$119k of capital is locked in it.
 
-    Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the
-    ``or 1.0`` notional default, and the ``if not price:`` truthiness (which routes a genuine
-    0.0 midpoint to the last trade). "Simplifying" any of them blanks or misstates labels with
-    a green suite.
+    ``liquidity_dollars`` is deliberately not consulted: upstream marks it deprecated and documents
+    it to "always return 0.0000" (confirmed on 1,504 live markets and all 127 archived rows).
+    Scoring off it would wire in a constant zero.
+
+    Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the ``or 1.0``
+    notional default, and the ``if not price:`` truthiness (which routes a genuine 0.0 midpoint to
+    the last trade). "Simplifying" any of them blanks or misstates labels with a green suite.
     """
     volume = safe_float(market.get("volume_fp"))
     open_interest = safe_float(market.get("open_interest_fp"))
@@ -456,12 +478,72 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
     return volume_usd, open_interest_usd
 
 
+def kalshi_tradeable_strikes(nested: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The strikes an event's money and price legs may be read off: the LIVE ones.
+
+    One scope shared by both legs, because a settled strike misreports both the same way. A settled
+    Kalshi market publishes an EMPTY book — ``yes_bid 0.0000`` / ``yes_ask 1.0000`` on 1,063 of the
+    1,066 settled strikes inside open events, versus 44 of 71,413 live ones — so
+    ``kalshi_usd_liquidity``'s midpoint reads a synthetic $0.50 for it rather than a price anybody
+    traded at, overstating its own last trade by 71x at the 90th percentile and moving 9 events'
+    rendered liquidity label on the frozen universe. Dropping settled strikes costs a family's
+    traded history, which is real evidence, but a $0.50 stand-in for a $0.007 market is not the way
+    to keep it.
+
+    An all-settled family falls back to its own strikes rather than reporting nothing: the event is
+    genuinely over, the render marks it ``RESOLVED``, and its realized figures are the honest
+    answer. Zero frozen-universe events take that branch (a fully-settled family leaves the
+    open-events catalogue), so it serves resolved rows arriving by other channels.
+    """
+    live = [market for market in nested if (market.get("status") or "").lower() not in KALSHI_RESOLVED_STATUSES]
+    return live or list(nested)
+
+
+def kalshi_event_usd_liquidity(nested: Sequence[dict[str, Any]]) -> tuple[float | None, float | None]:
+    """The event FAMILY's liquidity: each tradeable strike's own USD conversion, summed.
+
+    Each strike converts at its OWN price and notional, so this sums the per-market output of
+    ``kalshi_usd_liquidity`` rather than adding counts and multiplying once — a threshold at $0.02
+    and one at $0.90 turn the same contract count into wildly different dollars. The ``nested[0]``
+    read this replaced on 2026-08-05 reported one strike's money as the family's, mislabelling
+    1,634 of 9,417 frozen-universe events; the sum runs a median 2.6x its first strike's volume and
+    140x at the 90th percentile.
+
+    Either leg is ``None`` when NO strike published its count, preserving the "upstream sent no
+    field" vs. "a real zero" distinction ``_liquidity_label`` needs; a strike publishing one leg and
+    not the other contributes only the leg it has. No frozen-universe row ends up without a label.
+    """
+    legs = [kalshi_usd_liquidity(market) for market in kalshi_tradeable_strikes(nested)]
+    volumes = [volume for volume, _ in legs if volume is not None]
+    open_interests = [open_interest for _, open_interest in legs if open_interest is not None]
+    return (sum(volumes) if volumes else None), (sum(open_interests) if open_interests else None)
+
+
+def kalshi_price_strike(nested: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The one strike whose price may be quoted as the event's, or ``None`` when there is none.
+
+    A strike family has no single probability: quoting one threshold's price under the event's title
+    says "72%" about a question the row's own title never asked. So a price is reported only when the
+    family has ONE tradeable strike — exactly when event and strike ask the same question — and is
+    withheld otherwise, rendering as ``-``. That keeps a price on the 1,271 single-strike frozen
+    universe events (13.5%) plus 43 families whose siblings have all settled, and drops it from the
+    other 8,103. Withheld beats wrong: the ``prob`` column has no room to name which threshold it
+    came from, and a forecaster anchoring on the wrong strike is worse off than one reading ``-`` and
+    going to the market. The liquidity columns still populate, so the row keeps its weight.
+
+    The strike is found by STATUS, not position: on a collapsed family ``nested[0]`` is usually the
+    settled one, so a positional read would quote a realized outcome as a live price.
+    """
+    tradeable = kalshi_tradeable_strikes(nested)
+    return tradeable[0] if len(tradeable) == 1 else None
+
+
 def kalshi_event_rules(event: dict[str, Any]) -> str:
     """``rules_primary`` off the first nested market — the event's settlement clause.
 
-    Every strike inside one event shares a settlement rule and differs only in the
-    threshold, so ``nested[0]`` is representative here in a way it is not for close time or
-    status.
+    Every strike inside one event shares a settlement rule and differs only in the threshold, so
+    ``nested[0]`` is representative here in a way it is not for close time, status, or money — which
+    is also why the projection keeps this field on the head alone.
     """
     nested = event.get("markets") or []
     if nested and isinstance(nested[0], dict):
@@ -472,30 +554,33 @@ def kalshi_event_rules(event: dict[str, Any]) -> str:
 def kalshi_event_match(event: dict[str, Any], *, match_confidence: float, channel: str) -> MarketMatch | None:
     """One projected Kalshi event as a candidate row. None when it has no usable title.
 
-    ``close_time`` is the MAX over nested markets and ``is_resolved`` requires ALL of them
-    resolved. Prices and liquidity stay on ``nested[0]``, which describes one tradeable
-    contract and is the only thing a single ``prob`` cell can honestly report.
+    EVERY field here is derived across the whole strike family, because the row's title is the
+    EVENT's: ``close_time`` is the max, ``is_resolved`` the all-resolved conjunction, the liquidity
+    legs the per-strike USD sum, and the price legs one tradeable strike's or nothing
+    (``kalshi_event_usd_liquidity`` and ``kalshi_price_strike`` carry the reasoning). ``volume_24h``
+    rides with the price legs rather than the sum: it is a display column saying how much traded
+    lately, so it belongs to the quoted strike and is ``None`` on the families that quote none.
     """
     title = event.get("title") or event.get("sub_title") or ""
     if not title:
         return None
 
     nested = [market for market in (event.get("markets") or []) if isinstance(market, dict)]
-    first = nested[0] if nested else {}
 
     closes = [parsed for market in nested if (parsed := parse_iso(market.get("close_time") or ""))]
     is_resolved = bool(nested) and all(
         (market.get("status") or "").lower() in KALSHI_RESOLVED_STATUSES for market in nested
     )
 
-    yes_bid = safe_float(first.get("yes_bid_dollars"))
-    yes_ask = safe_float(first.get("yes_ask_dollars"))
+    priced = kalshi_price_strike(nested) or {}
+    yes_bid = safe_float(priced.get("yes_bid_dollars"))
+    yes_ask = safe_float(priced.get("yes_ask_dollars"))
     implied: float | None = None
     spread: float | None = None
     if yes_bid is not None and yes_ask is not None:
         implied = (yes_bid + yes_ask) / 2.0
         spread = yes_ask - yes_bid
-    total_volume, open_interest = kalshi_usd_liquidity(first)
+    total_volume, open_interest = kalshi_event_usd_liquidity(nested)
 
     event_ticker = str(event.get("event_ticker") or "")
     return MarketMatch(
@@ -506,7 +591,7 @@ def kalshi_event_match(event: dict[str, Any], *, match_confidence: float, channe
         bid=yes_bid,
         ask=yes_ask,
         spread=spread,
-        volume_24h=safe_float(first.get("volume_24h_fp")),
+        volume_24h=safe_float(priced.get("volume_24h_fp")),
         close_time=max(closes) if closes else None,
         is_resolved=is_resolved,
         match_confidence=match_confidence,
@@ -788,15 +873,22 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch]:
 async def manifold_search(session: Any, query: str, *, width: int) -> list[MarketMatch] | None:
     """Search Manifold for one query. ``None`` when the fetch itself failed.
 
-    ``contractType=BINARY`` costs a known ~30% recall ceiling — multi-outcome markets are
-    invisible — and is kept with eyes open, because flipping to ALL needs a multi-outcome
-    render path: the search response carries no per-answer data, so every row would need a
-    detail GET, which the enrichment hook below makes nearly free later. Tracked in FUTURE.md.
+    ``contractType=ALL`` rather than ``BINARY``, which was a ~30% recall ceiling: 27 of the 89
+    labeled-wanted Manifold markets are MULTIPLE_CHOICE / MULTI_NUMERIC / NUMBER / DATE, and no
+    query, width or enrichment could reach them while the parameter was pinned. On this module's
+    own fixture term the same search returns 6 BINARY under ``BINARY`` and 6 BINARY + 2
+    MULTIPLE_CHOICE under ``ALL``.
+
+    A multi-outcome row arrives with ``probability`` NULL and NO ``answers`` key — the search
+    response carries no per-answer data at all — so it would reach the ranker priceless. The
+    answers come from the per-candidate detail GET the enrichment hook already fires
+    (``manifold_top_answers`` below); a row whose detail was lost stays title-only and renders
+    ``-`` for its price, the same soft-fail the rules text has.
     """
     payload = await http_get_with_backoff(
         session,
         MANIFOLD_SEARCH_URL,
-        {"term": query, "contractType": "BINARY", "limit": str(VENUE_SEARCH_LIMIT)},
+        {"term": query, "contractType": "ALL", "limit": str(VENUE_SEARCH_LIMIT)},
         max_attempts=MANIFOLD_MAX_ATTEMPTS,
         retryable_statuses=(429, 500, 502, 503, 504),
         label=f"Manifold q={query[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
@@ -807,12 +899,12 @@ async def manifold_search(session: Any, query: str, *, width: int) -> list[Marke
 
 
 async def manifold_market_detail(session: Any, market_id: str) -> dict[str, Any] | None:
-    """One market's full record, for the ``textDescription`` the search listing omits.
+    """One market's full record, for the ``textDescription`` and ``answers`` the listing omits.
 
     ``None`` on any failure, which the enrichment hook treats as "leave the row title-only":
-    a lost detail GET costs no recall, only rules text. One attempt, no retry — 60 of these
-    fire per question under a 10s fan-out wall, and a row's description is not worth
-    spending that wall on twice.
+    a lost detail GET costs no recall, only rules text and — on a multi-outcome row — its only
+    price. One attempt, no retry — 60 of these fire per question under a 10s fan-out wall, and a
+    row's description is not worth spending that wall on twice.
     """
     payload = await http_get_with_backoff(
         session,
@@ -823,6 +915,49 @@ async def manifold_market_detail(session: Any, market_id: str) -> dict[str, Any]
         label=f"Manifold detail id={market_id[:40]!r}",  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log-label truncation
     )
     return payload if isinstance(payload, dict) else None
+
+
+def manifold_top_answers(detail: dict[str, Any]) -> tuple[tuple[str, float], ...]:
+    """A multi-outcome market's leading ``(answer_text, probability)`` pairs, highest first.
+
+    The detail payload's ``answers`` array is where ALL of a non-BINARY market's price
+    information lives: the search listing omits the array entirely and its market-level
+    ``probability`` is null, so before this a multi-outcome row reached the forecaster with a
+    title and nothing else.
+
+    The array IS the outcome-type discriminator, which is why nothing here reads
+    ``outcomeType``: a BINARY detail carries no ``answers`` key at all, while MULTIPLE_CHOICE,
+    MULTI_NUMERIC, NUMBER and DATE all publish the same ``{text, probability}`` answer shape
+    (live-verified across all five, 2026-08-05), so one read covers the whole ~30% of Manifold
+    the ``contractType`` flip reaches without a second field to keep in sync.
+
+    The sort's STABILITY is load-bearing rather than incidental. A threshold ladder resolves its
+    crossed rungs to probability exactly 1.0 — 10 of 17 answers on the committed fixture — so the
+    leaders are routinely a tie, and only keeping the array's own order among equals makes the
+    pick deterministic across runs. ``reverse=True`` preserves that order rather than inverting
+    it, per the sort's documented guarantee.
+
+    An answer without usable text or a readable probability is dropped rather than rendered
+    blank, mirroring ``predictit_contract_names``: an empty label spends chars and, in the bullet,
+    is the one shape that could read as a bare ``: NN%`` option line.
+    """
+    answers = detail.get("answers")
+    if not isinstance(answers, list):
+        return ()
+
+    scored: list[tuple[str, float]] = []
+    for answer in answers:
+        if not isinstance(answer, dict):
+            continue
+        # Answer text is user-authored, so whitespace is collapsed here at the boundary — a
+        # newline would break both the one-line candidate line and the one-line rules bullet.
+        text = " ".join(str(answer.get("text") or "").split())
+        probability = safe_float(answer.get("probability"))
+        if not text or probability is None:
+            continue
+        scored.append((text[:MANIFOLD_ANSWER_TEXT_MAX_CHARS], probability))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return tuple(scored[:MANIFOLD_TOP_ANSWERS_RENDERED])
 
 
 # ---------------------------------------------------------------------------

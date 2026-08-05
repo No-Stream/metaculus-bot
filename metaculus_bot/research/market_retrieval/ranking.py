@@ -204,6 +204,7 @@ def render_candidate_line(index: int, match: MarketMatch) -> str:
     """One pipe-joined candidate line, segments omitted when they carry nothing.
 
     PredictIt lines omit the ``liquidity`` segment entirely — see ``_PREDICTIT_LIQUIDITY_NOTE``.
+    Multi-outcome Manifold rows gain an ``answers:`` segment; every other row is unchanged.
     """
     parts = [f"[{index}] ({match.platform}) {match.market_title}"]
     sub_title = (match.sub_title or "").strip()
@@ -218,6 +219,11 @@ def render_candidate_line(index: int, match: MarketMatch) -> str:
     settles_via = _settlement_sources_text(match)
     if settles_via:
         parts.append(f"settles via: {settles_via}")
+    # Multi-outcome rows only, and the one segment on this line that quotes a price: the line
+    # carries no probability for any venue, but a multi-outcome market's ANSWERS are most of what
+    # it measures, the way PredictIt's contract names are. Empty on every BINARY row.
+    if match.top_answers:
+        parts.append("answers: " + " | ".join(f"{text} {prob:.0%}" for text, prob in match.top_answers))
     rules = (match.raw_rules or "").strip().replace("\n", " ")
     cap = RULES_CHARS.get(match.platform)
     if cap is not None:

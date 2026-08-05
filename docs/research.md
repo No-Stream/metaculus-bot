@@ -264,17 +264,31 @@ Four stages per question:
    per-query failure isolation, and every query is stripped of digit-bearing tokens
    first because Manifold's `term` is a strict conjunction that one date token
    zeroes. The enumerable venues score against the UN-stripped set, where a year is
-   real signal against a catalogue of dated market titles. An authored string
-   carrying a digit is **dropped** at parse time rather than trimmed down to its
-   remaining words, so the author contributes no ticker-shaped vocabulary at all
-   (`U-3`, `S&P 500`): the remnant would reach the un-stripping fuzzy channel, where
-   one generic word scores ~100 against every event whose rules mention it.
+   real signal against a catalogue of dated market titles. Manifold is asked for
+   `contractType=ALL` rather than `BINARY`: multi-outcome markets are ~30% of its
+   catalogue and were structurally unreachable before, and their price arrives from
+   the stage-3 detail fan-out rather than the search listing, which carries no
+   per-answer data at all.
+
+   At PARSE time the author's own synonyms are filtered by a narrower rule than the
+   blanket digit strip: a synonym is **dropped whole** (never trimmed to a remnant,
+   which would reach the floorless fuzzy channel and score ~100 against every event
+   whose rules mention one generic word) only when it carries a DATE-like token — a
+   four-digit group in 1900-2099, a bare number in a synonym that names nothing else,
+   or a 1-2 digit day beside a month word. Digits belonging to a name survive
+   verbatim (`U-3`, `S&P 500`, `10-K`, `50bp`), because series-code vocabulary is
+   most of what the author exists to contribute and the conjunction cliff is a
+   property of the enumerable venues' call site, which still strips. The rule
+   knowingly mistakes `Russell 2000` for a year: a bare in-range four-digit token is
+   the measured hazard, and the question's own words reach the venues regardless.
 3. **Pool assembly**, three channels unioned, with channel order as the ranking: a
    settlement-source join (Kalshi events settling on a publisher the question's own
    resolution text names — the recall channel a word-overlap scorer structurally
    cannot see), then the venue-index hits, then the enumerable universes ranked by
    a fuzzy scorer with NO floor. A bounded Manifold detail fan-out then fills in the
-   rules text the search listing omits.
+   rules text the search listing omits, and on a multi-outcome row its leading
+   answers — the only price such a row has, since the search reports none. A row
+   whose detail GET failed stays title-only rather than costing the snapshot.
 4. **Ranking**: one call (`MARKET_RANKER_LLM_CONFIG`) over the whole ~380-440
    candidate pool, returning up to 8 rows in ranked order with a relation tier and a
    one-phrase reason. Width is the model's choice in 0..8 — an empty array is a
@@ -292,7 +306,15 @@ the legend says which, since the two are not comparable), a liquidity/participat
 `signal` label (thin / decent / deep for real-money venues, thin / decent / high by
 bettor count for Manifold, `no-liquidity-data` for PredictIt), close date,
 `open`/`RESOLVED` status, and the ranker's `relation` + `why`, followed by each
-market's resolution rules. The
+market's resolution rules.
+
+Two row shapes have **no single probability** and render `-` rather than a number:
+a Kalshi event that is a threshold FAMILY (86.5% of that catalogue), where one
+strike's price under the event's own title would answer a question the row never
+asked, and a Manifold multi-outcome market, whose leading answers ride inside the
+rules bullet instead. Both keep their liquidity figures, which is what keeps the row
+worth its width — and on a Kalshi family those figures are the SUM over its live
+strikes, each converted at its own price, rather than the first strike's alone. The
 forecaster prompts tell models to weight by both axes — the liquidity label and the
 relation tier — and to read a RESOLVED price as a realized outcome rather than a
 forecast.

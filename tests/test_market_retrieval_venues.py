@@ -38,10 +38,12 @@ from metaculus_bot.research.market_retrieval.http import (
     safe_float,
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
-from tests.test_prediction_market_provider import FakeResponse, FakeSession
+from tests.market_retrieval_fakes import FakeResponse, FakeSession
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
 _MULTI_CLOSE_PATH = Path(__file__).parent / "data" / "kalshi_multi_close_event_2026_08_04.json"
+_FAMILY_LIQUIDITY_PATH = Path(__file__).parent / "data" / "kalshi_family_liquidity_2026_08_05.json"
+_MANIFOLD_MULTI_OUTCOME_PATH = Path(__file__).parent / "data" / "manifold_multi_outcome_2026_08_05.json"
 
 
 @pytest.fixture(scope="module")
@@ -50,8 +52,30 @@ def captured_payloads() -> dict[str, Any]:
 
 
 @pytest.fixture(scope="module")
+def manifold_multi_outcome() -> dict[str, Any]:
+    """A live ``contractType=ALL`` search plus three market details, one per shape that matters.
+
+    The search half shows what a multi-outcome row arrives WITHOUT (a probability, an answers
+    array); the detail half shows where its price actually lives, across a MULTIPLE_CHOICE
+    ladder, a bucketed MULTI_NUMERIC market, and a BINARY control that carries no answers at all.
+    """
+    return json.loads(_MANIFOLD_MULTI_OUTCOME_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
 def multi_close_page() -> dict[str, Any]:
     return json.loads(_MULTI_CLOSE_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def family_liquidity_page() -> dict[str, Any]:
+    """Two live events pinning the family-scope derivations where they change a RENDERED cell.
+
+    ``KXGOVWINS-27JAN01`` is thin on ``nested[0]`` and deep as a family; ``KXNETANYAHUPARDON-26``
+    has collapsed to one live strike that is NOT the first, so a positional price read quotes a
+    settled strike's realized figure.
+    """
+    return json.loads(_FAMILY_LIQUIDITY_PATH.read_text())
 
 
 def _event(page: dict[str, Any], ticker: str) -> dict[str, Any]:
@@ -72,18 +96,20 @@ class TestKalshiEventProjection:
         projection is the memory bound. This asserts the DROP, not just the keep — which is why
         the fixture is a raw page rather than a pre-projected one.
 
-        Both TIERS are pinned. Only `close_time` and `status` are read across nested markets, so
-        every market after the first keeps just those two; 87.6% of the retained price/rules
-        fields were dead weight held for the full TTL. Widening the tail silently would double the
-        cache again, and narrowing the head would break the price/liquidity legs, which read
-        `nested[0]`. The fixture's 4-market event is what makes the two tiers distinguishable.
+        Both TIERS are pinned, and the tail is the head MINUS the rules text: every other field is
+        read across nested markets (`close_time` by the max derivation, `status` by all-resolved and
+        by the tradeable-strike rule, the money fields by the family liquidity sum). The two tuples
+        are asserted against the literal `rules_primary` rather than against each other, so the
+        derivation cannot vacuously satisfy its own test — a tail that lost the money fields (the
+        pre-2026-08-05 shape) would keep the subset relation and re-break the liquidity sum. The
+        fixture's 4-market event is what makes the tiers distinguishable at all.
         """
         raw_market_keys = set(multi_close_page["events"][0]["markets"][0])
         assert len(raw_market_keys) > 20, "fixture should be a RAW page, or this proves nothing"
         assert any(len(event["markets"]) > 1 for event in multi_close_page["events"]), (
             "fixture needs a multi-market event, or the tail tier is never exercised"
         )
-        assert set(venues.KALSHI_NESTED_TAIL_FIELDS) < set(venues.KALSHI_MARKET_FIELDS)
+        assert set(venues.KALSHI_NESTED_TAIL_FIELDS) == set(venues.KALSHI_MARKET_FIELDS) - {"rules_primary"}
 
         session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
         pull = await venues.kalshi_prefetch_events(session)
@@ -96,6 +122,29 @@ class TestKalshiEventProjection:
             for index, market in enumerate(event["markets"]):
                 expected = venues.KALSHI_MARKET_FIELDS if index == 0 else venues.KALSHI_NESTED_TAIL_FIELDS
                 assert set(market) == set(expected), f"{event['event_ticker']} market {index}"
+
+    @pytest.mark.asyncio
+    async def test_the_tail_tier_retains_every_field_the_family_liquidity_sum_reads(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """The projection and the liquidity sum are one contract, and this is where they meet.
+
+        `kalshi_event_usd_liquidity` converts EVERY tradeable strike at its own price and notional,
+        so a tail missing any money field silently zeroes that strike's contribution — no error, no
+        log, just a smaller number in a rendered column. The check is behavioural rather than a
+        field-list comparison: it runs the real streamed projection and asserts the sum computed
+        off the PROJECTED events equals the one computed off the raw fixture. That is what a
+        field-list assertion cannot do, because it cannot know which fields the arithmetic reads.
+        """
+        session = FakeSession({venues.KALSHI_EVENTS_URL: FakeResponse(200, payload=multi_close_page)})
+        pull = await venues.kalshi_prefetch_events(session)
+
+        for projected in pull.events:
+            raw = _event(multi_close_page, projected["event_ticker"])
+            assert len(raw["markets"]) == len(projected["markets"])
+            assert venues.kalshi_event_usd_liquidity(projected["markets"]) == venues.kalshi_event_usd_liquidity(
+                raw["markets"]
+            ), f"{projected['event_ticker']}: the projection dropped a field the liquidity sum reads"
 
     @pytest.mark.asyncio
     async def test_settlement_sources_are_projected_from_the_event_level(
@@ -268,7 +317,7 @@ class TestKalshiEventProjection:
 
 
 class TestKalshiEventDerivations:
-    """The two derivations that moved off ``nested[0]``."""
+    """The four event-level derivations, none of which may read ``nested[0]``."""
 
     def test_close_time_is_the_max_over_nested_markets(self, multi_close_page: dict[str, Any]) -> None:
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
@@ -326,20 +375,168 @@ class TestKalshiEventDerivations:
         assert match is not None
         assert match.is_resolved is True
 
-    def test_liquidity_and_prices_stay_on_the_first_nested_market(self, multi_close_page: dict[str, Any]) -> None:
-        """Deliberately NOT aggregated: the legs describe one tradeable contract, and the
-        divergence from the max-over-nested close time is what this fixture pins."""
+    def test_liquidity_sums_every_tradeable_strike_rather_than_reading_the_first(
+        self, multi_close_page: dict[str, Any]
+    ) -> None:
+        """An event is a threshold family, so its money is the family's, summed per strike.
+
+        `nested[0]` here holds $155 of the family's $201 volume — a 1.3x understatement, mild by
+        catalogue standards (median 2.6x, 140x at p90). The magnitude is not the point on this
+        fixture; the SCOPE is, and `test_the_family_liquidity_sum_changes_the_rendered_label` pins a
+        case where the same scope difference moves a rendered cell.
+
+        The expected values are computed from the per-strike legs rather than hardcoded, because
+        `kalshi_usd_liquidity`'s arithmetic is pinned exhaustively in
+        `test_prediction_market_liquidity_contract.py` and duplicating it here would just give a
+        formula change two places to be wrong in. What this asserts is which strikes are IN, and
+        `> nested[0]` alone is what makes it fail on the old read.
+        """
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
-        first = event["markets"][0]
-        expected_volume, expected_oi = venues.kalshi_usd_liquidity(first)
+        tradeable = event["markets"][1:]  # nested[0] is `finalized`, the other three `active`
+        assert [market["status"] for market in tradeable] == ["active"] * 3
+        expected_volume = sum(venues.kalshi_usd_liquidity(market)[0] or 0.0 for market in tradeable)
+        expected_oi = sum(venues.kalshi_usd_liquidity(market)[1] or 0.0 for market in tradeable)
+        first_volume, first_oi = venues.kalshi_usd_liquidity(event["markets"][0])
 
         match = venues.kalshi_event_match(event, match_confidence=0.5, channel="universe_fuzzy")
 
         assert match is not None
-        assert match.total_volume == expected_volume
-        assert match.open_interest == expected_oi
-        assert match.bid == safe_float(first["yes_bid_dollars"])
-        assert match.ask == safe_float(first["yes_ask_dollars"])
+        assert match.total_volume is not None and match.open_interest is not None
+        assert match.total_volume == pytest.approx(expected_volume)
+        assert match.open_interest == pytest.approx(expected_oi)
+        assert first_volume is not None and first_oi is not None
+        assert match.total_volume > first_volume, "the sum must exceed its own first strike"
+        assert match.open_interest > first_oi
+
+    def test_a_settled_strikes_empty_book_is_kept_out_of_the_sum(self, multi_close_page: dict[str, Any]) -> None:
+        """The reason the sum's scope is LIVE strikes rather than all of them.
+
+        A settled Kalshi market publishes an empty book (`yes_bid 0.0000` / `yes_ask 1.0000` on
+        1,063 of 1,066 settled strikes inside open events), so the bid/ask midpoint reads a
+        fabricated $0.50 for it — 16x this strike's own $0.031 last trade. Including it would put
+        $155 of invented turnover into a $201 family and move 9 events' rendered liquidity label,
+        which is the same class of error as the `nested[0]` read this replaced.
+
+        Asserted through the difference an all-strikes sum WOULD produce, so a scope regression
+        fails rather than merely changing a number nobody pinned.
+        """
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        settled = event["markets"][0]
+        assert settled["status"] == "finalized"
+        assert (settled["yes_bid_dollars"], settled["yes_ask_dollars"]) == ("0.0000", "1.0000")
+        settled_volume, settled_oi = venues.kalshi_usd_liquidity(settled)
+        assert settled_volume is not None and settled_oi is not None
+
+        all_strikes = venues.kalshi_event_usd_liquidity(event["markets"])
+        live_only = venues.kalshi_event_usd_liquidity(event["markets"][1:])
+
+        assert venues.kalshi_event_usd_liquidity(event["markets"]) == live_only
+        assert all_strikes[0] is not None and live_only[0] is not None
+        assert all_strikes[0] == pytest.approx(live_only[0]), (
+            "a settled strike's $0.50 phantom midpoint reached the family sum"
+        )
+
+    def test_an_all_settled_family_falls_back_to_its_own_strikes(self, multi_close_page: dict[str, Any]) -> None:
+        """The empty-set branch: dropping settled strikes must not blank a resolved row's columns.
+
+        No frozen-universe event takes this path (a fully-settled family leaves the open-events
+        catalogue), so it is reachable only through the other retrieval channels — which is exactly
+        why it needs a test rather than an assumption. `no-liquidity-data` on a market that traded
+        $200 would tell a forecaster the venue publishes no figures.
+        """
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        for market in event["markets"]:
+            market["status"] = "settled"
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.is_resolved is True
+        assert match.total_volume == pytest.approx(venues.kalshi_event_usd_liquidity(event["markets"])[0])
+        assert match.total_volume is not None and match.total_volume > 0.0
+        assert _liquidity_label(match) != "no-liquidity-data"
+
+    def test_a_multi_strike_family_quotes_no_price(self, multi_close_page: dict[str, Any]) -> None:
+        """Three live strikes at $0.285, $0.35 and $0.445 have no single probability, so the row
+        reports none — the `prob` column renders `-` rather than one threshold's price under the
+        event's title. The liquidity legs still populate, which is what keeps the row useful."""
+        event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
+        assert sum(1 for market in event["markets"] if market["status"] == "active") == 3
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert (match.implied_prob_yes, match.bid, match.ask, match.spread) == (None, None, None, None)
+        assert match.volume_24h is None, "24h volume belongs to the quoted strike, and none is quoted"
+        assert match.total_volume is not None, "withholding the price must not withhold the money"
+
+    def test_a_collapsed_family_quotes_its_live_strike_not_the_first(
+        self, family_liquidity_page: dict[str, Any]
+    ) -> None:
+        """The case a positional read gets exactly backwards.
+
+        `KXNETANYAHUPARDON-26` has settled its July strike and left the November one trading, so the
+        family asks one live question again and a price is honest. But the live strike is
+        `nested[1]`: reading position 0 quotes the settled strike's realized $0.031 as the row's
+        current probability, when the market is actually at $0.175. `nested[0]` is the settled one on
+        essentially every collapsed family, because Kalshi orders strikes by date — so the positional
+        read is not merely unreliable here, it is reliably wrong.
+        """
+        event = _event(family_liquidity_page, "KXNETANYAHUPARDON-26")
+        settled, live = event["markets"]
+        assert (settled["status"], live["status"]) == ("finalized", "active")
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.bid == safe_float(live["yes_bid_dollars"])
+        assert match.ask == safe_float(live["yes_ask_dollars"])
+        assert match.implied_prob_yes == pytest.approx(0.175)
+        assert match.implied_prob_yes != pytest.approx(safe_float(settled["last_price_dollars"]))
+        assert match.is_resolved is False, "one live strike means the family is still open"
+
+    def test_the_family_liquidity_sum_changes_the_rendered_label(self, family_liquidity_page: dict[str, Any]) -> None:
+        """Where the scope change stops being an arithmetic detail and becomes a forecaster-visible
+        claim.
+
+        `KXGOVWINS-27JAN01` carries $3,387 of volume on its first strike and $107,079 across the
+        three, all live. The `signal` column reads `thin` on the first and `deep` on the family, and
+        the prompt tells forecasters to discount thin markets as noisy and anchor on deep ones — so
+        the old read told them to discount a $107k market. Only 2 events on the frozen universe make
+        that flip at 2-4 all-open strikes, which is why this is a committed live capture rather than
+        a hand-built dict.
+        """
+        event = _event(family_liquidity_page, "KXGOVWINS-27JAN01")
+        assert [market["status"] for market in event["markets"]] == ["active"] * 3
+        first_volume, first_oi = venues.kalshi_usd_liquidity(event["markets"][0])
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        assert match is not None
+        assert match.total_volume == pytest.approx(107_079.02, rel=1e-6)
+        assert match.open_interest == pytest.approx(31_470.14, rel=1e-6)
+        assert _liquidity_label(match) == "deep"
+
+        first_only = copy.deepcopy(match)
+        first_only.total_volume, first_only.open_interest = first_volume, first_oi
+        assert _liquidity_label(first_only) == "thin", "fixture no longer straddles a label boundary"
+
+    def test_a_single_strike_event_still_quotes_its_price(self, captured_payloads: dict[str, Any]) -> None:
+        """The other side of the rule: a one-strike event and its strike ask the same question, so
+        the price is honest and must survive. 13.5% of the catalogue is single-strike."""
+        event = copy.deepcopy(captured_payloads["kalshi_events"]["events"][0])
+        assert len(event["markets"]) == 1, "fixture must be single-market or this proves nothing"
+        only = event["markets"][0]
+
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="universe_fuzzy")
+
+        bid, ask = safe_float(only["yes_bid_dollars"]), safe_float(only["yes_ask_dollars"])
+        assert bid is not None and ask is not None, "fixture must quote a two-sided book"
+
+        assert match is not None
+        assert (match.bid, match.ask) == (bid, ask)
+        assert match.implied_prob_yes == pytest.approx((bid + ask) / 2.0)
+        assert match.spread == pytest.approx(ask - bid)
 
     def test_the_row_carries_the_ranked_retrieval_fields(self, multi_close_page: dict[str, Any]) -> None:
         event = _event(multi_close_page, "USCLIMATE")
@@ -477,9 +674,14 @@ class TestManifold:
         assert len(venues.parse_manifold_matches(payload, width=4)) == 4
 
     @pytest.mark.asyncio
-    async def test_the_search_keeps_the_binary_contract_type(self, captured_payloads: dict[str, Any]) -> None:
-        """Retained with eyes open: a known ~30% recall ceiling, accepted for this port because
-        multi-outcome rows have no render path yet."""
+    async def test_the_search_asks_for_every_contract_type(self, captured_payloads: dict[str, Any]) -> None:
+        """The parameter that lifts a measured ~30% recall ceiling.
+
+        ``BINARY`` made 27 of 89 labeled-wanted Manifold markets — every MULTIPLE_CHOICE,
+        MULTI_NUMERIC, NUMBER and DATE one — unreachable by any query or width, so this single
+        literal is the whole lever. It is asserted rather than left to the fixture because a
+        revert to ``BINARY`` would still return rows and would still look healthy everywhere else.
+        """
         seen: dict[str, Any] = {}
 
         def handler(params: dict[str, Any]) -> FakeResponse:
@@ -490,7 +692,7 @@ class TestManifold:
 
         await venues.manifold_search(session, "gas prices", width=60)
 
-        assert seen["contractType"] == "BINARY"
+        assert seen["contractType"] == "ALL"
         assert seen["term"] == "gas prices"
 
     def test_rules_text_does_not_fall_back_to_the_title(self) -> None:
@@ -508,6 +710,142 @@ class TestManifold:
         session = FakeSession({venues.MANIFOLD_MARKET_URL: FakeResponse(200, payload=["not", "a", "dict"])})
 
         assert await venues.manifold_market_detail(session, "abc") is None
+
+
+class TestManifoldMultiOutcome:
+    """The rows the ``contractType=BINARY`` pin used to hide, and where their price comes from.
+
+    Two halves of one contract. The SEARCH response is what the pool is built from, and a
+    multi-outcome row arrives from it with no probability and no answers — so a parser that read
+    only the search would put a priceless row in front of a forecaster. The DETAIL response is
+    where the answers live, which is why the enrichment hook (already firing once per Manifold
+    candidate for rules text) is the whole render path.
+    """
+
+    def test_a_multi_outcome_search_row_parses_with_no_probability_but_keeps_its_liquidity(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """The rows the flip admits, straight off a live ``contractType=ALL`` response.
+
+        ``probability`` is null on every one, so ``implied_prob_yes`` stays None and the rendered
+        ``prob`` column reads ``-``: a multi-outcome market has no single yes-price to quote, and
+        inventing one (the first answer's, say) would put a threshold's probability under the
+        market's own title. Everything the liquidity label keys on is present regardless, so these
+        rows are labelled exactly like the BINARY ones.
+        """
+        payload = manifold_multi_outcome["search_all"]
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        multi = [(row, raw) for row, raw in zip(rows, payload) if raw["outcomeType"] != "BINARY"]
+        assert len(multi) == 2, "fixture must carry multi-outcome rows, or this proves nothing"
+        for row, raw in multi:
+            assert raw.get("probability") is None and "answers" not in raw
+            assert row.implied_prob_yes is None
+            assert row.num_bettors == raw["uniqueBettorCount"]
+            assert row.close_time is not None
+            assert _liquidity_label(row) != "no-liquidity-data"
+            assert row.top_answers == (), "the search response has no answer data to populate from"
+
+    def test_a_multi_outcome_row_is_scored_and_ordered_exactly_like_a_binary_one(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """No venue-rank penalty for being multi-outcome: `match_confidence` is the venue's own
+        inverted rank, and re-scoring these rows down would reintroduce the local re-ranking the
+        ranked design exists to remove."""
+        payload = manifold_multi_outcome["search_all"]
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert [row.match_confidence for row in rows] == [100.0 - rank for rank in range(len(rows))]
+        assert [row.market_title for row in rows] == [raw["question"] for raw in payload]
+
+    def test_the_top_answers_come_off_the_detail_payload_highest_first(
+        self, manifold_multi_outcome: dict[str, Any]
+    ) -> None:
+        """A bucketed MULTI_NUMERIC market, whose leaders are distinct — so this pins the ORDER
+        as well as the values, which the tied MULTIPLE_CHOICE ladder below cannot."""
+        answers = venues.manifold_top_answers(manifold_multi_outcome["detail_multi_numeric"])
+
+        assert [text for text, _ in answers] == ["$3.80 - $4.19", "$3.40 - $3.79", "$4.20 - $4.59"]
+        assert [round(prob, 4) for _, prob in answers] == [0.5083, 0.2465, 0.1602]
+
+    def test_the_answer_count_is_capped_at_the_leaders(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """17 answers reach a 3-answer segment: a threshold ladder would otherwise spend the
+        bullet's whole character budget on rungs nobody is trading."""
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+
+        assert len(detail["answers"]) > venues.MANIFOLD_TOP_ANSWERS_RENDERED
+        assert len(venues.manifold_top_answers(detail)) == venues.MANIFOLD_TOP_ANSWERS_RENDERED
+
+    def test_tied_leading_answers_keep_the_arrays_own_order(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """A resolved threshold ladder prices its crossed rungs at exactly 1.0 — 10 of 17 here —
+        so the leaders are a TIE and the pick is only deterministic because the sort is stable and
+        `reverse=True` preserves the order of equals rather than inverting it. A `sorted(...)[::-1]`
+        or a set-based dedup would pass a values-only assertion and reorder the segment run to run.
+        """
+        detail = manifold_multi_outcome["detail_multiple_choice"]
+        tied = [answer["text"] for answer in detail["answers"] if answer["probability"] == 1]
+
+        assert len(tied) > venues.MANIFOLD_TOP_ANSWERS_RENDERED, "fixture lost its tie"
+        answers = venues.manifold_top_answers(detail)
+        assert [text for text, _ in answers] == tied[: venues.MANIFOLD_TOP_ANSWERS_RENDERED]
+        assert {prob for _, prob in answers} == {1.0}
+        assert venues.manifold_top_answers(detail) == answers, "the pick must not vary between calls"
+
+    def test_a_binary_detail_yields_no_answers_at_all(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """The discriminator, on a real BINARY detail: no ``answers`` key exists, so reading the
+        array is enough to tell the shapes apart and nothing needs to consult ``outcomeType``."""
+        detail = manifold_multi_outcome["detail_binary"]
+
+        assert "answers" not in detail and detail["probability"] is not None
+        assert venues.manifold_top_answers(detail) == ()
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            {},
+            {"answers": None},
+            {"answers": []},
+            {"answers": "not a list"},
+            {"answers": ["not a dict"]},
+            {"answers": [{"text": "No price", "probability": None}]},
+            {"answers": [{"text": "", "probability": 0.5}]},
+            {"answers": [{"text": "   ", "probability": 0.5}]},
+            {"answers": [{"probability": 0.5}]},
+        ],
+    )
+    def test_an_unusable_answers_block_yields_nothing_rather_than_a_blank_row(self, detail: dict[str, Any]) -> None:
+        """An answer with no label or no readable probability is dropped, not rendered empty.
+
+        The empty-label case is the one with teeth: ``answers: (50%)`` would be tolerable, but the
+        un-parenthesised form of it is exactly the ``: NN%`` shape the per-model MC option parser
+        reads, so a blank label is worth refusing at the boundary rather than downstream.
+        """
+        assert venues.manifold_top_answers(detail) == ()
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_answer_probability_is_dropped(self, literal: str) -> None:
+        """`json.loads` accepts these bare literals, and NaN defeats every comparison in the
+        sort — so one would silently decide the order and then render as `nan%`."""
+        detail = {
+            "answers": [
+                {"text": "Poisoned", "probability": json.loads(literal)},
+                {"text": "Real", "probability": 0.25},
+            ]
+        }
+
+        assert venues.manifold_top_answers(detail) == (("Real", 0.25),)
+
+    def test_answer_text_is_capped_and_flattened(self) -> None:
+        """Answer text is user-authored: a newline would break both the one-line candidate line
+        and the one-line rules bullet, and an essay-length answer would eat the bullet budget."""
+        detail = {
+            "answers": [{"text": "A" * 500, "probability": 0.9}, {"text": "two\nlines\there", "probability": 0.8}]
+        }
+
+        answers = venues.manifold_top_answers(detail)
+
+        assert answers[0] == ("A" * venues.MANIFOLD_ANSWER_TEXT_MAX_CHARS, 0.9)
+        assert answers[1] == ("two lines here", 0.8)
 
 
 class TestScalarCoercions:

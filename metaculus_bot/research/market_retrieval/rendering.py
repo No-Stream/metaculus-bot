@@ -10,10 +10,11 @@ Three things here are contracts rather than formatting choices:
 - **The rows are rendered in the ranker's order, verbatim.** No venue interleave, no
   fairness pass, no per-venue cap, no re-scoring. Round-robin venue fairness is exactly what
   lost 43 of 58 wanted rows in the measurement this port is built on.
-- **The rules-bullet section keeps its byte shape** (``- **{platform}** <{url}>: {rules}`` at
+- **The rules-bullet section keeps its byte shape** (``- **{platform}** <{url}>: {body}`` at
   h3). The MC per-model option parser scans for ``- <name>: NN%`` and the bullets sit close
   enough to a per-model region for that to matter, so nothing percentage-shaped may ever be
-  APPENDED to a bullet.
+  APPENDED to a bullet. A multi-outcome row's answer probabilities do ride INSIDE the body, and
+  they are parenthesised for exactly that reason — see ``_bullet_body``.
 
 The preamble/legend strings mirror the ones the provider ships today, minus the fuzzy-match
 vocabulary the ranker replaces. Their asserted substrings are load-bearing: the ranked design
@@ -32,10 +33,11 @@ from metaculus_bot.research.market_retrieval.ranking import (
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot, _liquidity_label
 
-# Raw-rules truncation in the bullet section. Separate from, and smaller than, the ranker
-# prompt's per-venue caps: this text ships to the forecaster inside a research section that
-# has its own character budget, and the two must not be collapsed into one constant.
-RAW_RULES_MAX_CHARS = 200
+# Separate from, and smaller than, the ranker prompt's per-venue caps: this text ships to the
+# forecaster inside a research section that has its own character budget, and the two must not be
+# collapsed into one constant. The cap is on the BODY (a multi-outcome row's answers plus its rules
+# text) rather than the rules alone, so the answers — which lead — cannot be the part that is cut.
+RAW_BULLET_BODY_MAX_CHARS = 200
 
 TABLE_COLUMNS: tuple[str, ...] = (
     "platform",
@@ -123,6 +125,27 @@ def _row_cells(match: MarketMatch) -> dict[str, str]:
     }
 
 
+def _bullet_body(match: MarketMatch) -> str:
+    """A bullet's text: a multi-outcome row's leading answers, then its rules text.
+
+    The answers LEAD, so the ``RAW_BULLET_BODY_MAX_CHARS`` truncation falls on the description rather
+    than on them. They are the row's only price — ``prob`` renders ``-`` on every multi-outcome
+    row, since Manifold publishes no market-level probability for one — and a description is the
+    cheaper thing to lose. Realistic answer texts are short (10-13 chars measured), so three of
+    them cost ~60 of the 200; three at their cap would displace the description entirely, which
+    is the bound rather than the expectation.
+
+    The probabilities are PARENTHESISED deliberately, not decoratively. The per-model MC option
+    parser reads ``- <name>: NN%``, so a bullet may never carry that shape; ``(50%)`` cannot,
+    whereas a bare ``50%`` after a colon could.
+    """
+    rules = (match.raw_rules or "").strip().replace("\n", " ")
+    if not match.top_answers:
+        return rules
+    answers = "answers: " + ", ".join(f"{text} ({prob:.0%})" for text, prob in match.top_answers)
+    return f"{answers}. {rules}" if rules else answers
+
+
 def _preamble(matches: Sequence[MarketMatch]) -> str:
     """Strong when any rendered row measures the same quantity, neutral otherwise.
 
@@ -159,10 +182,10 @@ def render_snapshot(snapshot: MarketSnapshot, *, ranking_degraded: bool = False)
     lines.append("")
     lines.append("### Resolution criteria / rules")
     for match in matches:
-        rules = (match.raw_rules or "").strip().replace("\n", " ")
-        if len(rules) > RAW_RULES_MAX_CHARS:
-            rules = rules[:RAW_RULES_MAX_CHARS] + "..."
+        body = _bullet_body(match)
+        if len(body) > RAW_BULLET_BODY_MAX_CHARS:
+            body = body[:RAW_BULLET_BODY_MAX_CHARS] + "..."
         link = f" <{match.market_url}>" if match.market_url else ""
-        lines.append(f"- **{match.platform}**{link}: {rules}")
+        lines.append(f"- **{match.platform}**{link}: {body}")
 
     return "\n".join(lines)

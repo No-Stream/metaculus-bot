@@ -33,33 +33,45 @@ from metaculus_bot.research.market_retrieval.rendering import (
     MARKET_PREAMBLE_NEUTRAL,
     MARKET_PREAMBLE_STRONG,
     MARKET_SIGNAL_LEGEND,
-    RAW_RULES_MAX_CHARS,
+    RAW_BULLET_BODY_MAX_CHARS,
     TABLE_COLUMNS,
     TITLE_MAX_CHARS,
     render_snapshot,
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot
+from metaculus_bot.research.market_retrieval.venues import (
+    MANIFOLD_ANSWER_TEXT_MAX_CHARS,
+    MANIFOLD_TOP_ANSWERS_RENDERED,
+)
 from tests.test_market_retrieval_generation import Platform
 
 _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 
 # Char budget for the WORST-CASE rendered snapshot: 8 rows with every field simultaneously at
-# its cap. Measured at 6,246 chars (2026-08-04). The operator's directive names ~6,000, "roughly
-# today's 12-row render", and all 246 chars of the overshoot are the degenerate simultaneous-max
-# assumption rather than real content — a realistic 8-row snapshot measures 4,590 and is asserted
-# below against the operator's 6,000 exactly. 6,500 leaves ~4% headroom over the measured worst
+# its cap. Measured at 6,304 chars (2026-08-05). The operator's directive names ~6,000, "roughly
+# today's 12-row render", and all 304 chars of the overshoot are the degenerate simultaneous-max
+# assumption rather than real content — a realistic 8-row snapshot measures 4,648 and is asserted
+# below against the operator's 6,000 exactly. 6,500 leaves ~3% headroom over the measured worst
 # case, deliberately tight: this section goes to the expensive forecaster models, so adding a
-# column, lengthening the legend, or raising RAW_RULES_MAX_CHARS has to trip it.
+# column, lengthening the legend, or raising RAW_BULLET_BODY_MAX_CHARS has to trip it.
+#
+# The three figures moved +58 chars each on 2026-08-05 and multi-outcome rows are NOT why: 5541db3
+# lengthened MARKET_SIGNAL_LEGEND to qualify `total_vol`/`OI` per venue without re-measuring, so
+# the old 6,246 / 4,590 / 1,386 had been stale for two commits. Multi-outcome answers cost the
+# render nothing at all — they ride INSIDE the existing bullet body cap, and a maxed multi-outcome
+# snapshot measures 5,888, BELOW the single-outcome 6,304, because three capped answers displace
+# more description than they add.
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 6_500
 
 # The operator's figure, asserted where it describes something real: 8 rows of realistic content,
-# using shapes measured off live payloads rather than chosen. Measured at 4,590 chars.
+# using shapes measured off live payloads rather than chosen. Measured at 4,648 chars.
 MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 6_000
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 1,386 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 1,444 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed.
+# otherwise absorb an added paragraph unnoticed. At 1,444 of 1,500 this is now the tightest budget
+# in the file, which is the point: the next legend sentence has to earn a re-derivation.
 MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 1_500
 
 _REAL_TITLE = "Will the US unemployment rate be above 4.5% in June 2026?"
@@ -85,6 +97,7 @@ def _row(
     close: datetime | None = None,
     rules: str = "rules text",
     url: str = "https://example.test/m",
+    answers: tuple[tuple[str, float], ...] = (),
 ) -> MarketMatch:
     return MarketMatch(
         platform=platform,
@@ -104,6 +117,7 @@ def _row(
         num_bettors=bettors,
         relation_tier=tier,
         relevance_label=why,
+        top_answers=answers,
     )
 
 
@@ -347,7 +361,7 @@ class TestRenderBudget:
     to a cheap model and recall lives there. This snapshot goes to the expensive forecaster and
     reasoning models on every question, so it is the one that has to stay lean. These assertions
     are the regression guard: a future edit that adds a column, pads the legend, or raises
-    RAW_RULES_MAX_CHARS cannot bloat the section silently.
+    RAW_BULLET_BODY_MAX_CHARS cannot bloat the section silently.
     """
 
     def _maxed_rows(self) -> list[MarketMatch]:
@@ -357,7 +371,7 @@ class TestRenderBudget:
                 title="M" * TITLE_MAX_CHARS,
                 tier="same_quantity_other_cut",
                 why="W" * WHY_CHARS,
-                rules="R" * RAW_RULES_MAX_CHARS,
+                rules="R" * RAW_BULLET_BODY_MAX_CHARS,
                 url="https://kalshi.com/markets/" + "T" * 40,
                 prob=0.4237,
                 volume=123456789.0,
@@ -447,7 +461,7 @@ class TestRulesBullets:
 
         bullet = _bullets(rendered)[0]
         assert bullet.endswith("...")
-        assert bullet.count("r") == RAW_RULES_MAX_CHARS
+        assert bullet.count("r") == RAW_BULLET_BODY_MAX_CHARS
 
     def test_a_missing_url_omits_the_link(self) -> None:
         rendered = render_snapshot(MarketSnapshot(matches=[_row(url="", rules="text")]))
@@ -495,3 +509,116 @@ class TestRulesBullets:
         rendered = render_snapshot(MarketSnapshot(matches=[_row(rules="line one\nline two")]))
 
         assert _bullets(rendered) == ["- **kalshi** <https://example.test/m>: line one line two"]
+
+
+class TestMultiOutcomeRows:
+    """A multi-outcome Manifold row: dash in the ``prob`` column, answers inside the bullet.
+
+    These rows only exist here since the search flipped to ``contractType=ALL``, which lifted a
+    measured ~30% Manifold recall ceiling. Manifold publishes no market-level probability for one,
+    so the price cannot go in the table — and the answers must not be allowed to arm the
+    ``- <name>: NN%`` shape the per-model MC option parser reads.
+    """
+
+    _ANSWERS = (("Over $4.60", 0.4992), ("Over $4.65", 0.3723), ("Over $4.70", 0.2765))
+    _RULES = "Resolves per the AAA national average at gasprices.aaa.com."
+
+    def _mc_row(
+        self,
+        *,
+        rules: str = _RULES,
+        answers: tuple[tuple[str, float], ...] = _ANSWERS,
+        title: str = "How high will the US national average gas price get in 2026?",
+        tier: str = "",
+        why: str = "",
+        close: datetime | None = None,
+    ) -> MarketMatch:
+        """A live-shaped multi-outcome row: no probability, real bettor count, real answer texts."""
+        return _row(
+            "manifold",
+            title=title,
+            tier=tier,
+            why=why,
+            prob=None,
+            volume=30503.0,
+            oi=None,
+            bettors=47,
+            close=close,
+            rules=rules,
+            answers=answers,
+        )
+
+    def test_the_prob_cell_is_a_dash_and_never_a_number(self) -> None:
+        """The one thing the design forbids outright: quoting an answer's probability as the
+        market's yes-price would put a threshold's number under the market's own title. The
+        liquidity columns still populate, so the row keeps its weight."""
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[self._mc_row()])))[0]
+
+        assert cells["prob"] == "-"
+        assert cells["signal"] == "decent"
+        assert cells["total_vol"] == "30503"
+
+    def test_the_answers_ride_inside_the_bullet_body_parenthesised(self) -> None:
+        rendered = render_snapshot(MarketSnapshot(matches=[self._mc_row()]))
+
+        assert _bullets(rendered) == [
+            "- **manifold** <https://example.test/m>: answers: Over $4.60 (50%), Over $4.65 (37%), "
+            "Over $4.70 (28%). Resolves per the AAA national average at gasprices.aaa.com."
+        ]
+
+    @pytest.mark.parametrize("rules", ["", "Resolves per AAA.", "45% of forecasters expect a hike."])
+    def test_no_multi_outcome_bullet_ends_in_a_percentage_tail(self, rules: str) -> None:
+        """The empty-rules case is the one with teeth: the answers ARE the tail there, and the
+        parentheses are what stop `Over $4.70 (28%)` reading as `- <name>: NN%`. An unparenthesised
+        `28%` would end the bullet in exactly the option-line shape.
+
+        A venue whose OWN rules text ends in `Threshold: 45%` is deliberately out of scope — the
+        binding rule is about what the formatter adds, and that case is pinned as tolerated in
+        `test_the_formatter_appends_nothing_percentage_shaped` above, where the section boundary
+        rather than sanitisation is the protection.
+        """
+        bullet = _bullets(render_snapshot(MarketSnapshot(matches=[self._mc_row(rules=rules)])))[0]
+
+        assert not _PERCENT_TAIL_RE.search(bullet)
+        assert "answers: Over $4.60 (50%)" in bullet
+
+    def test_the_answers_lead_so_a_long_description_is_what_gets_truncated(self) -> None:
+        """Order matters: the answers are the row's only price and the description is recoverable
+        from the linked market, so the truncation has to fall on the description."""
+        bullet = _bullets(render_snapshot(MarketSnapshot(matches=[self._mc_row(rules="r" * 5000)])))[0]
+
+        assert "answers: Over $4.60 (50%), Over $4.65 (37%), Over $4.70 (28%). rrr" in bullet
+        assert bullet.endswith("...")
+
+    def test_a_bullet_with_maxed_answers_still_fits_the_body_budget(self) -> None:
+        """Three answers at the 60-char cap displace the description entirely, which is the bound
+        rather than the expectation (real answer texts measure 10-13 chars). What must hold either
+        way is that the BODY is capped, so the forecaster-facing budget cannot grow by this route."""
+        maxed = tuple(("A" * MANIFOLD_ANSWER_TEXT_MAX_CHARS, 1.0) for _ in range(MANIFOLD_TOP_ANSWERS_RENDERED))
+        bullet = _bullets(render_snapshot(MarketSnapshot(matches=[self._mc_row(answers=maxed, rules="r" * 5000)])))[0]
+
+        body = bullet.split(">: ", 1)[1]
+        assert len(body) == RAW_BULLET_BODY_MAX_CHARS + len("...")
+        assert not _PERCENT_TAIL_RE.search(bullet)
+
+    def test_an_eight_row_multi_outcome_snapshot_fits_the_same_render_budget(self) -> None:
+        """The flip must not move the forecaster-facing budget, and it cannot: the answers ride
+        INSIDE the existing body cap, so a maxed multi-outcome snapshot is the same size as a maxed
+        single-outcome one."""
+        maxed = tuple(("A" * MANIFOLD_ANSWER_TEXT_MAX_CHARS, 1.0) for _ in range(MANIFOLD_TOP_ANSWERS_RENDERED))
+        rows = [
+            self._mc_row(
+                title="M" * TITLE_MAX_CHARS,
+                tier="same_quantity_other_cut",
+                why="W" * WHY_CHARS,
+                answers=maxed,
+                rules="r" * 5000,
+                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+            )
+            for _ in range(RENDER_BUDGET)
+        ]
+
+        rendered = render_snapshot(MarketSnapshot(matches=rows))
+
+        assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET
+        assert all(cells["prob"] == "-" for cells in _table_rows(rendered))

@@ -791,26 +791,36 @@ MARKET_RANKER_BACKOFFS: tuple[float, ...] = ()
 # included, so pagination can never push the snapshot past its own timeout. The
 # per-page ``aiohttp.ClientTimeout`` sits under this wall, not beside it.
 #
-# ``KALSHI_PAGE_SLEEP_S`` — the REASONING behind 0.25s, which one free re-probe of a
-# full cold pull would turn into a measurement. What was probed: six consecutive pages
-# (free unauthenticated GET, 2026-08-03) at 200 events/page and 0.28-0.44s/page with no
-# throttling. What was then MEASURED at zero sleep: the 2026-08-04 dry run took an HTTP
-# 429 on 2 of 4 full cold pulls (9,400 events over 47 pages and 8,400 over 42, versus
-# 10,219 over 52 on both clean pulls — an 8-18% catalogue loss), and a prior-day capture
-# recorded page statuses ``[200 x13, 429]``. So a 42-52 page burst does get throttled and
-# a six-page probe cannot tell zero sleep from a burst allowance. Because a 429 is
-# deliberately non-retryable for this venue, the pull stops, reports incomplete, and bumps
-# BOTH degradation counters — exiting CI non-zero on a condition the sleep value CAUSES.
+# ``KALSHI_PAGE_SLEEP_S`` = 0.25 is MEASURED, on the value itself. Six full cold pulls
+# through the real ``kalshi_prefetch_events`` (2026-08-04/05, free unauthenticated GETs,
+# ``scratch/market_port_2026-08-04/kalshi_page_sleep_probe.py``, receipts in that
+# directory's ``qa_artifacts/``) all completed: 10,083-10,093 events over 51 pages every
+# time, ZERO 429s, wall 16.90-25.37s against this 40s cap. Compare the zero-sleep baseline
+# it replaced — an HTTP 429 on 2 of 4 pulls, 8-18% of the catalogue lost — and the
+# 0.25 value is doing the work it was introduced for. That matters because a 429 is
+# deliberately non-retryable for this venue: the pull stops, reports incomplete, and bumps
+# BOTH degradation counters, so the sleep value can redden CI on a condition it causes.
 #
-# Why 0.25 specifically: ~52 pages at 0.25s plus ~0.11-0.2s of fetch is ~19s against the
-# 40s wall, and it does not move ``SNAPSHOT_STAGE_BUDGET_S`` (stage 1a already takes the
-# max of the author wall, this wall, and the HTTP stage). Only the run's first question
-# pays it — the catalogue is TTL-cached. Prefer it over 0.1: one throttled pull was
-# already running at only ~5 req/s, so the limiter looks like a windowed bucket rather
-# than a rate. Do NOT exceed ~0.3: ``attempt_budget`` doubles as the per-page HTTP
-# timeout, so cumulative sleep eats the late pages' budget and 0.5s (~32s of 40s) would
-# trade throttle-loss for wall-timeout-loss, bumping the same two counters.
-# EVENT_LIMIT is a runaway guard well above the ~9,762 live open events; MAX_PAGES is
+# The wall decomposes exactly, which is what makes the headroom trustworthy rather than
+# lucky: 50 sleeps x 0.25 = 12.50s fixed, plus 4.29-12.77s of actual fetch, residual
+# ~0.10s. So the sleep is HALF to THREE-QUARTERS of the elapsed pull and the worst
+# observed case used 63% of the wall. Only the run's first question pays it (6h TTL cache),
+# and it does not move ``SNAPSHOT_STAGE_BUDGET_S`` (stage 1a already takes the max of the
+# author wall, this wall, and the HTTP stage).
+#
+# Headroom to raise it if a 429 ever returns: 0.3 projects to ~27.8s and 0.4 to ~32.8s at
+# the worst measured fetch, so 0.4 is the practical ceiling under this wall — beyond it
+# ``attempt_budget`` (which doubles as the per-page HTTP timeout) starves the late pages
+# and trades throttle-loss for wall-timeout-loss, bumping the same two counters. Raising
+# the wall alongside is the other lever.
+#
+# One residual observation, benign but worth knowing before re-probing: back-to-back pulls
+# 60s apart got monotonically slower (fetch 4.47 -> 8.15 -> 12.77s), and the same cadence
+# at 120s gaps stayed flat (4.29 / 4.41 / 7.11s). That looks like soft rate pressure that
+# drains, never a 429, and prod pulls the catalogue once per run — so it constrains probe
+# design (space pulls out, or a probe's own cadence manufactures the slowdown it reports)
+# rather than the constant.
+# EVENT_LIMIT is a runaway guard well above the ~10.1k live open events; MAX_PAGES is
 # the real bound.
 KALSHI_CATALOGUE_WALL_TIMEOUT: float = 40.0
 KALSHI_PAGE_SLEEP_S: float = 0.25

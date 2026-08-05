@@ -373,17 +373,23 @@ async def enrich_manifold(
     concurrency: int = MANIFOLD_DETAIL_CONCURRENCY,
     wall_s: float = MANIFOLD_DETAIL_WALL_S,
 ) -> EnrichmentResult:
-    """Fill in Manifold rules text from each candidate's detail record, in place.
+    """Fill in Manifold rules text and multi-outcome answers from each candidate's detail record.
 
-    The Manifold search listing carries no description, so without this every Manifold
-    candidate reaches the ranker title-only — and the ranker's stated "single most reliable
-    cue" is the settlement/rules text. Runs post-dedup, on the pool, which bounds it at the
-    Manifold width by construction; running it inside the search would scale with the query
-    count instead.
+    In place, on the pool rows. The Manifold search listing carries neither field, so without
+    this every Manifold candidate reaches the ranker title-only — and the ranker's stated "single
+    most reliable cue" is the settlement/rules text. Runs post-dedup, on the pool, which bounds
+    it at the Manifold width by construction; running it inside the search would scale with the
+    query count instead.
 
-    Soft-fails at every level. A lost detail GET leaves that row title-only, and the whole
-    fan-out sits under ``wall_s`` returning whatever completed, because rules text is worth a
-    bounded wait and never worth the snapshot.
+    The answers matter more than the rules text now that the search sends
+    ``contractType=ALL``: a multi-outcome row's ``probability`` is null, so this fan-out is the
+    ONLY place its price can come from. Both fields ride the same GET, so lifting the
+    ``BINARY`` recall ceiling cost no extra request.
+
+    Soft-fails at every level. A lost detail GET leaves that row title-only — no rules text, no
+    answers, a ``-`` in the rendered ``prob`` column — and the whole fan-out sits under
+    ``wall_s`` returning whatever completed, because both fields are worth a bounded wait and
+    neither is worth the snapshot.
     """
     rows = [row for row in candidates if row.platform == "manifold" and row.venue_market_id]
     if not rows:
@@ -404,6 +410,9 @@ async def enrich_manifold(
         # would spend ranker tokens repeating the same line's own title back at it.
         if text and not row.market_title.strip().startswith(text):
             row.raw_rules = text[:MANIFOLD_DETAIL_RULES_CHARS]
+        # Unconditional: a BINARY detail carries no answers array, so this writes the `()` the
+        # field already holds rather than needing a branch to say so.
+        row.top_answers = venues.manifold_top_answers(detail)
 
     gathered = asyncio.gather(*(_enrich_one(row) for row in rows), return_exceptions=True)
     try:

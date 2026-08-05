@@ -91,6 +91,14 @@ class MarketMatch:
     retrieval_channel: str = ""
     sub_title: str = ""
     settlement_sources: tuple[SettlementSource, ...] = ()
+    # A multi-outcome market's leading `(answer_text, probability)` pairs, and the ONLY price
+    # information such a row has: `implied_prob_yes` is null on every non-BINARY Manifold market,
+    # so the `prob` column renders `-` and this field is what stands in for it. Empty on every
+    # BINARY row and on a row whose detail GET was lost, which is also what makes it the
+    # multi-outcome discriminator downstream — nothing else on the row records the outcome type.
+    # Plain pairs rather than a nested dataclass because the archive walks them into JSON arrays
+    # either way and there is no venue payload here to guard against extra keys.
+    top_answers: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass
