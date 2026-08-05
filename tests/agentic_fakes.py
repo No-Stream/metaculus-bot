@@ -1,9 +1,10 @@
 """Shared fake-LLM scaffolding for the agentic gap-fill v2 tests.
 
 litellm-shaped response doubles (choices[0].message with optional tool_calls)
-plus a scripted ``FakeLlm`` used by both ``tests/test_agentic_loop.py`` and
-``tests/test_agentic_gap_fill.py``. One copy here so the two suites can't
-drift.
+plus a scripted ``FakeLlm`` used by ``tests/test_agentic_loop.py``,
+``tests/test_agentic_gates.py`` and ``tests/test_agentic_gap_fill.py``. Also the
+loop-driving helpers (``tool_spec`` / ``loop_config`` / ``tool_messages`` /
+``gap_accounting``) those suites share. One copy here so they can't drift.
 """
 
 from __future__ import annotations
@@ -12,6 +13,53 @@ import copy
 import json
 from dataclasses import dataclass
 from typing import Any
+
+from metaculus_bot.research.agentic.types import LoopConfig, ToolSpec
+
+
+def tool_spec(name: str, handler: Any, *, timeout_s: float = 0.1) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=f"{name} description",
+        parameters={"type": "object", "properties": {}, "additionalProperties": True},
+        handler=handler,
+        timeout_s=timeout_s,
+    )
+
+
+def loop_config(
+    *,
+    model: str = "openai/gpt-5.6-luna",
+    reasoning_effort: str = "medium",
+    max_tool_calls: int = 14,
+    wall_deadline_s: float = 1.0,
+    conclude_threshold_s: float = 0.1,
+    max_result_chars: int = 8000,
+    max_steps: int = 5,
+    max_conclude_gate_rejections: int = 2,
+) -> LoopConfig:
+    return LoopConfig(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        max_tool_calls=max_tool_calls,
+        wall_deadline_s=wall_deadline_s,
+        conclude_threshold_s=conclude_threshold_s,
+        max_result_chars=max_result_chars,
+        max_steps=max_steps,
+        max_conclude_gate_rejections=max_conclude_gate_rejections,
+    )
+
+
+def tool_messages(result: Any) -> list[dict[str, Any]]:
+    return [message for message in result.transcript if message["role"] == "tool"]
+
+
+def gap_accounting(
+    *gap_ids: str, actions: str = "searched and fetched the source", status: str = "resolved"
+) -> list[dict[str, str]]:
+    """gap_accounting entries for the given gap ids (default actions cite a fetch,
+    satisfying the per-gap fetch-floor clause)."""
+    return [{"gap_id": gap_id, "actions_taken": actions, "status": status} for gap_id in gap_ids]
 
 
 @dataclass
