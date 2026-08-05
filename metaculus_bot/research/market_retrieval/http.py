@@ -91,12 +91,16 @@ def parse_iso(value: Any) -> datetime | None:
 def parse_iso_guarded(value: Any) -> datetime | None:
     """``parse_iso`` behind a ``YYYY-MM-DD`` prefix guard, for a field with sentinels.
 
-    ``fromisoformat`` rejects both shapes PredictIt actually ships in ``dateEnd``: the
-    literal ``"NA"`` and ``"N/A"`` no-close sentinels, and 7-digit fractional seconds. The
-    guard admits only strings that begin with a real calendar date, and falls back to that
-    date alone when the rest of the timestamp is unparseable — a close DATE is all the
-    ranker needs to tell same-window from different-window, so truncating to it loses
-    nothing and never raises.
+    PredictIt's ``dateEnd`` ships the literal ``"NA"`` and ``"N/A"`` no-close sentinels, which
+    the prefix guard rejects outright — nothing without a real calendar date in front reaches
+    the parser. (7-digit fractional seconds, the other odd shape in that dump, need no help:
+    ``fromisoformat`` has accepted arbitrary fraction lengths since 3.11 and truncates to
+    microseconds.)
+
+    Anything else with a valid date prefix but an unparseable tail — a named-zone suffix, an
+    out-of-range field — falls back to the DATE alone rather than to nothing. That is all the
+    ranker needs to tell same-window from different-window, so the truncation loses nothing
+    and the field never raises.
     """
     text = str(value or "").strip()
     if len(text) < 10 or text[4] != "-" or text[7] != "-":
@@ -134,24 +138,22 @@ def settlement_sources(raw: Any) -> tuple[SettlementSource, ...]:
 async def read_json_capped(resp: Any, label: str) -> Any | None:
     """Parse a body as JSON, rejecting anything over MAX_RESPONSE_BYTES.
 
-    Test stubs that only implement ``.json()`` take the fallback path. Returns None on a
-    decode failure or an oversized body; the caller logs.
+    ONE read path, deliberately: the bounded stream off ``resp.content``, never
+    ``resp.json()``. A second branch keyed on which methods the response happens to expose
+    would decide the production read by what a test double implements — and it did: gating on
+    ``.read`` sent every stubbed venue response down an uncapped ``.json()``, leaving the one
+    thing standing between a runaway upstream and the heap unreachable from any test.
+
+    Returns None on a decode failure or an oversized body; the caller logs.
     """
-    read_method = getattr(resp, "read", None)
-    if read_method is not None and callable(read_method):
-        raw = await read_body_capped(resp, max_bytes=MAX_RESPONSE_BYTES, label=label)
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
-            logger.warning(f"{label} JSON decode failed: {exc}")
-            return None
+    raw = await read_body_capped(resp, max_bytes=MAX_RESPONSE_BYTES, label=label)
+    if raw is None:
+        return None
     try:
-        return await resp.json()
-    except (json.JSONDecodeError, ValueError) as exc:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
         logger.warning(f"{label} JSON decode failed: {exc}")
-        return None  # noqa: ASYNC910
+        return None
 
 
 async def http_get_with_backoff(
@@ -166,14 +168,17 @@ async def http_get_with_backoff(
     """GET ``url`` with ``max_attempts`` and one bounded backoff between retries.
 
     Returns the parsed JSON body on 200, or None on retry exhaustion / a non-200. Caps the
-    body at MAX_RESPONSE_BYTES so a runaway upstream cannot blow up memory, and caps
-    cumulative sleep so retries cannot exceed the per-platform budget.
+    body at MAX_RESPONSE_BYTES so a runaway upstream cannot blow up memory.
+
+    Elapsed time is bounded by ``max_attempts`` alone — ``max_attempts * PLATFORM_HTTP_TIMEOUT``
+    plus ``(max_attempts - 1)`` backoffs, which is what ``_HTTP_STAGE_WORST`` in the seam
+    module computes and folds into the snapshot budget. A separate cumulative-sleep budget
+    would add nothing over that: at every call site here the backoff total is one 0.5s sleep.
 
     ``retryable_statuses`` defaults to (403, 429, 500, 502, 503, 504); anything >= 500 is
     retryable regardless.
     """
     retryable: set[int] = set(retryable_statuses or (403, 429, 500, 502, 503, 504))
-    cumulative_sleep = 0.0
     timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
 
     for attempt in range(max_attempts):
@@ -184,13 +189,11 @@ async def http_get_with_backoff(
                     if attempt + 1 >= max_attempts:
                         logger.warning(f"{label} HTTP {status} after {attempt + 1} attempts; giving up")
                         return None
-                    sleep_for = HTTP_RETRY_BACKOFF_SECS
-                    if cumulative_sleep + sleep_for + PLATFORM_HTTP_TIMEOUT > PLATFORM_HTTP_TIMEOUT * max_attempts:
-                        logger.warning(f"{label} HTTP {status}: sleep budget exhausted; giving up")
-                        return None
-                    logger.warning(f"{label} HTTP {status}; retry {attempt + 2}/{max_attempts} after {sleep_for:.2f}s")
-                    await asyncio.sleep(sleep_for)
-                    cumulative_sleep += sleep_for
+                    logger.warning(
+                        f"{label} HTTP {status}; retry {attempt + 2}/{max_attempts} "
+                        f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+                    )
+                    await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
                     continue
                 if status != 200:
                     snippet = await read_body_snippet(resp)
@@ -201,10 +204,11 @@ async def http_get_with_backoff(
             if attempt + 1 >= max_attempts:
                 logger.warning(f"{label} transient error after {attempt + 1} attempts: {exc}")
                 return None  # noqa: ASYNC910
-            sleep_for = HTTP_RETRY_BACKOFF_SECS
-            logger.warning(f"{label} transient error: {exc}; retry {attempt + 2}/{max_attempts} after {sleep_for:.2f}s")
-            await asyncio.sleep(sleep_for)
-            cumulative_sleep += sleep_for
+            logger.warning(
+                f"{label} transient error: {exc}; retry {attempt + 2}/{max_attempts} "
+                f"after {HTTP_RETRY_BACKOFF_SECS:.2f}s"
+            )
+            await asyncio.sleep(HTTP_RETRY_BACKOFF_SECS)
     return None  # noqa: ASYNC910
 
 

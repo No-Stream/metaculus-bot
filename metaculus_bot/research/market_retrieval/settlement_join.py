@@ -133,12 +133,22 @@ def registrable_domain(host: str) -> str | None:
     return ".".join(labels[-(suffix_len + 1) :])
 
 
+@lru_cache(maxsize=4096)
 def _publisher_domain(url: str) -> str | None:
     """The registrable domain a URL publishes under, or None when there is nothing to join on.
 
     None covers all four uninteresting cases in one place: no host, a bare public suffix, and
     either self-reference. Both callers go through this so the question side and the venue side
     cannot drift on what counts as a publisher.
+
+    Memoized because Kalshi's catalogue repeats a small set of settlement URLs across a large
+    set of events: the frozen universe carries 21,721 ``settlement_sources[].url`` values over
+    only 1,378 distinct strings, so `settlement_domain_index` spends 52ms re-deriving the same
+    ~1,378 answers where 3ms would do. Cache safety is trivial — the PSL is vendored and frozen,
+    so every input maps to one answer for the process's life. Caching HERE and not on the index
+    (see `settlement_domain_index`, which deliberately isn't cached) because the entries are
+    short strings rather than whole event dicts, and `maxsize` bounds them well above the
+    distinct-URL count a 6h catalogue refresh can churn through.
     """
     if is_metaculus_self_ref(url):
         return None

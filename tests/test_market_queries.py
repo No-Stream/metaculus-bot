@@ -28,6 +28,10 @@ import pytest
 from metaculus_bot.research.market_retrieval.queries import (
     _RELEVANCE_STOPWORDS,
     MANIFOLD_RELAXATION_MAX_TOKENS,
+    MAX_FRAMINGS,
+    MAX_QUERY_CHARS,
+    MAX_SYNONYMS,
+    QUERY_AUTHOR_PROMPT,
     QUERY_AUTHOR_RC_CHARS,
     build_query_author_prompt,
     deterministic_queries,
@@ -127,20 +131,22 @@ class TestParseQueryAuthor:
         assert "CPI print" not in out, "a digit-bearing synonym must not survive as a generic remnant"
         assert len(out) == 1
         assert out[0].startswith("unemployment unemployment")
-        assert len(out[0]) <= 80
+        assert len(out[0]) <= MAX_QUERY_CHARS
 
     def test_caps_at_eight_synonyms_and_three_framings(self):
         """The prompt states both ceilings; they are enforced in code so a runaway completion
-        cannot blow up the pool."""
+        cannot blow up the pool. Asserted against the constants, and the PROMPT's own stated
+        numbers are checked against them below — a ceiling raised in code while the prompt still
+        asks for the old one silently discards the extra strings the model was invited to send."""
         payload = json.dumps(
             {
-                "synonyms": [f"synonym {chr(ord('a') + i)}" for i in range(12)],
-                "framings": [f"framing {chr(ord('a') + i)}" for i in range(6)],
+                "synonyms": [f"synonym {chr(ord('a') + i)}" for i in range(MAX_SYNONYMS + 4)],
+                "framings": [f"framing {chr(ord('a') + i)}" for i in range(MAX_FRAMINGS + 3)],
             }
         )
         out = parse_query_author(payload)
-        assert len(out) == 8 + 3
-        assert out[8].startswith("framing")
+        assert len(out) == MAX_SYNONYMS + MAX_FRAMINGS
+        assert out[MAX_SYNONYMS].startswith("framing")
 
     def test_dedupes_case_insensitively_across_both_keys(self):
         out = parse_query_author('{"synonyms": ["jobless rate", "Jobless Rate"], "framings": ["JOBLESS RATE"]}')
@@ -208,6 +214,13 @@ class TestQueryAuthorPrompt:
         prompt = build_query_author_prompt("Will {x} happen?", "")
 
         assert "title: Will {x} happen?" in prompt
+
+    def test_the_stated_ceilings_match_the_enforced_ones(self):
+        """The prompt asks for the ceilings in prose and the parser enforces them in code, so the
+        two can drift apart silently — raising ``MAX_SYNONYMS`` alone wastes the extra slots the
+        model was never invited to fill, and lowering it alone discards strings it was."""
+        assert f"Up to {MAX_SYNONYMS} short strings" in QUERY_AUTHOR_PROMPT
+        assert f"{MAX_FRAMINGS} alternate short phrasings" in QUERY_AUTHOR_PROMPT
 
 
 class TestFuzzyBest:

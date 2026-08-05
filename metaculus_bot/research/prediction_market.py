@@ -56,7 +56,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -102,7 +102,7 @@ from metaculus_bot.research.market_retrieval.types import (
     _FetchTally,
     _liquidity_label,  # noqa: F401  # re-export
 )
-from metaculus_bot.research.provider_diagnostics import record_provider_detail
+from metaculus_bot.research.provider_diagnostics import is_lost_source, record_provider_detail
 from metaculus_bot.research.provider_health import (
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
     VenueObservation,
@@ -111,6 +111,7 @@ from metaculus_bot.research.provider_health import (
 )
 from metaculus_bot.research.providers import ResearchCallable
 from metaculus_bot.research.raw_log import record_raw_research
+from metaculus_bot.time_utils import _as_utc
 
 logger = logging.getLogger(__name__)
 
@@ -154,23 +155,11 @@ SNAPSHOT_STAGE_BUDGET_S: float = (
 # ---------------------------------------------------------------------------
 
 
-def _is_contributed(token: str) -> bool:
-    """A source token that is NOT a loss.
-
-    `ok...` contributed something; `none` means the source was reached successfully and had
-    nothing to give. Everything else is a lost source. One predicate for all seven sources so
-    the module cannot end up with several inline notions of "loss" — it mirrors
-    `provider_diagnostics._is_lost_source`, which is the consumer-side authority, without
-    importing another module's private.
-    """
-    return token.startswith(("ok", "none"))
-
-
 def _platform_source_token(matches: list[MarketMatch], tally: _FetchTally) -> str:
     """Classify one platform's outcome as an `ok(N)` / `none` / loss source token.
 
     `none` is reserved for "every sub-fetch succeeded and nothing matched" — the one benign
-    empty outcome `provider_diagnostics._is_lost_source` does not flag. So a lost sub-fetch has
+    empty outcome `provider_diagnostics.is_lost_source` does not flag. So a lost sub-fetch has
     to produce a loss token even when other sub-fetches returned matches: otherwise a total
     outage reads as a healthy `none`, and a platform that lost one of two queries reads as a
     clean `ok(N)`.
@@ -503,24 +492,34 @@ async def _rank_pool(question: Any, pool: generation.PoolResult) -> tuple[list[M
 
 
 def _as_of_cache_key(as_of: datetime | None) -> str:
+    """Render `as_of` as a cache-key string, normalizing through the shared `_as_utc`.
+
+    Two callers passing the same instant spelled differently (naive-UTC vs `+00:00`) must
+    collide on one key, so the normalization has to match the one `assemble_pool` applies
+    to the same value — hence both going through `time_utils._as_utc` rather than each
+    respelling the naive-vs-aware branch.
+    """
     if as_of is None:
         return "none"
-    return (
-        as_of.astimezone(timezone.utc).isoformat() if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc).isoformat()
-    )
+    return _as_utc(as_of).isoformat()
 
 
 async def fetch_market_snapshot(
     question: Any,
     *,
     platforms: tuple[str, ...] = ("polymarket", "kalshi", "manifold", "predictit"),
-    timeout: float = 5.0,  # noqa: ASYNC109
+    timeout: float = PREDICTION_MARKET_TIMEOUT,  # noqa: ASYNC109
     as_of: datetime | None = None,
 ) -> MarketSnapshot:
     """Run the four-stage pipeline and return the ranked snapshot.
 
     Soft-fails on any error: returns an empty `MarketSnapshot` + a WARNING. A broken
     prediction-market API should never break a forecast run.
+
+    The `timeout` default is the same constant the provider path passes, because any lower
+    default is one the pipeline cannot succeed under — stage 1a alone outruns the 5.0s this
+    carried while `SNAPSHOT_STAGE_BUDGET_S` grew past 130s, so a direct caller (backtest,
+    replay tool) omitting the argument got a guaranteed `error(timeout)` and a source-loss bump.
 
     `as_of` (backtest leakage defence) drops candidates whose `close_time` is at or before it.
     The provider path passes None — see the module docstring for why that filter was actively
@@ -632,10 +631,10 @@ async def _fetch_market_snapshot_impl(
         """
         if name in sources:
             return
-        if _is_contributed(token):
-            sources[name] = token
-        else:
+        if is_lost_source(token):
             _record_loss(name, token)
+        else:
+            sources[name] = token
 
     _report("query_author", author_token)
     if "kalshi" in platforms:
@@ -789,7 +788,7 @@ def _record_venue_health(
         # A venue that lost a sub-fetch is already alertable via _bump_source_loss, so
         # provider_health skips it rather than counting one outage twice (and "check the query
         # construction" would be the wrong remedy for a 503 anyway).
-        if not _is_contributed(sources.get(venue, "")):
+        if is_lost_source(sources.get(venue, "")):
             continue
         rows = pool_by_venue.get(venue, [])
         present = {
@@ -820,9 +819,7 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     the snapshot's own `ranking` source token rather than passed in, so the render is
     reproducible from an archived snapshot alone.
     """
-    return rendering.render_snapshot(
-        snapshot, ranking_degraded=not _is_contributed(snapshot.sources.get("ranking", ""))
-    )
+    return rendering.render_snapshot(snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", "")))
 
 
 # ---------------------------------------------------------------------------

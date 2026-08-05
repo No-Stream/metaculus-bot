@@ -1,19 +1,18 @@
-"""The four venue fetch/parse paths in their ranked-retrieval form.
+"""The four venue fetch/parse paths, at the four decisions the ranked pipeline rests on.
 
-The tests that matter most here are the ones pinning what CHANGED from the shipped provider,
-because a modified copy that quietly behaves like the original would leave the port looking
-done while measuring nothing:
+Each of these is a place where a plausible-looking simplification stays green while quietly
+costing recall or misreporting a row:
 
 - The Kalshi ``/events`` stream projects each page down to exactly the retained fields, and a
   200 carrying ``{"events": null}`` reads as a LOST catalogue rather than an empty one — the
   failure that would otherwise pin an empty index for a 6h TTL.
 - An event's ``close_time`` is the MAX over its nested markets and it is resolved only when
-  ALL of them are. ``nested[0]`` misclassifies ~305 live event families as RESOLVED on the
-  frozen universe, and both fields are now a rendered column and a ranker input.
-- PredictIt parses ``dateEnd``, which the original hardcoded to None, through a guard that
-  survives the two sentinels and the 7-digit fractional seconds its dump actually ships.
-- Polymarket sends ``events_status=active``; without it a search returns mostly closed events
-  and the ``as_of`` filter that used to discard them is gone.
+  ALL of them are. Reading ``nested[0]`` instead misclassifies ~305 live event families as
+  RESOLVED on the frozen universe, and both fields are a rendered column and a ranker input.
+- PredictIt derives ``close_time`` and ``is_resolved`` from EVERY contract, through a date
+  guard that survives the ``NA``/``N/A`` sentinels the dump ships.
+- Polymarket sends ``events_status=active``; nothing downstream filters on close date any
+  more, so without it a search puts mostly-closed events straight into the pool.
 
 Payload fixtures are real captures, deliberately: the 2026-07-12 Kalshi liquidity regression
 shipped because a hand-written fixture was authored from the same wrong belief as the parser,
@@ -25,6 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -380,8 +380,9 @@ class TestKalshiEventDerivations:
 class TestPolymarket:
     @pytest.mark.asyncio
     async def test_the_search_sends_events_status_active(self, captured_payloads: dict[str, Any]) -> None:
-        """Prod omits it, and with the ``as_of`` filter gone that pushes resolved markets into
-        the render: ``Ethereum`` returns 7 closed events out of 10 without this parameter."""
+        """Nothing downstream filters on close date, so this parameter is the only thing keeping
+        resolved markets out of the pool: ``Ethereum`` returns 7 closed events out of 10 without
+        it."""
         seen: dict[str, Any] = {}
 
         def handler(params: dict[str, Any]) -> FakeResponse:
@@ -467,9 +468,9 @@ class TestManifold:
 
         assert [row.match_confidence for row in rows] == [100.0 - rank for rank in range(len(rows))]
 
-    def test_width_replaces_the_hard_ten_row_slice(self) -> None:
-        """The original hard-sliced ``payload[:10]``, so shipping "width 60" without removing
-        it silently caps the pool at 10 per query."""
+    def test_the_caller_owns_the_row_width(self) -> None:
+        """Width is the caller's, never a slice inside the parser: a ``payload[:10]`` here would
+        make "width 60" mean 10 per query, with nothing to see at the call site."""
         payload = [{"id": f"m{i}", "question": f"Q{i}", "probability": 0.5} for i in range(25)]
 
         assert len(venues.parse_manifold_matches(payload, width=25)) == 25
@@ -577,20 +578,45 @@ def _row_with_volume(volume: Any) -> MarketMatch:
 
 
 class TestPredictIt:
-    def test_date_end_survives_both_sentinels_and_seven_digit_fractions(self) -> None:
-        """The dump ships all three shapes and ``fromisoformat`` rejects two of them, which is
-        why the original hardcoded ``close_time=None`` and rendered ``closes:`` on 0% of rows."""
-        assert parse_iso_guarded("NA") is None
-        assert parse_iso_guarded("N/A") is None
-        assert parse_iso_guarded(None) is None
-        assert parse_iso_guarded("") is None
+    @pytest.mark.parametrize("sentinel", ["NA", "N/A", None, "", "not-a-date", "2026-11", "20261103"])
+    def test_a_value_with_no_calendar_date_prefix_yields_no_close_time(self, sentinel: Any) -> None:
+        """The prefix guard is what keeps PredictIt's ``NA``/``N/A`` no-close sentinels — and any
+        other non-date the dump might ship — from reaching the parser at all."""
+        assert parse_iso_guarded(sentinel) is None
 
-        fractional = parse_iso_guarded("2026-11-03T23:59:59.1234567")
-        assert fractional is not None
-        assert fractional.strftime("%Y-%m-%d") == "2026-11-03"
+    def test_a_seven_digit_fraction_keeps_its_FULL_timestamp(self) -> None:
+        """``fromisoformat`` has accepted arbitrary fraction lengths since 3.11, so this shape
+        parses whole rather than degrading to the date — asserting only ``%Y-%m-%d`` here would
+        hold for BOTH outcomes and so pin neither.
 
-        plain = parse_iso_guarded("2026-11-03T23:59:59")
-        assert plain is not None and plain.strftime("%Y-%m-%d") == "2026-11-03"
+        Pinned because the fallback is lossy on purpose: if a future guard tightened the tail and
+        pushed this shape down to the date rung, `close_time` on every fractional PredictIt row
+        would silently jump backwards by up to a day.
+        """
+        parsed = parse_iso_guarded("2026-11-03T23:59:59.1234567")
+
+        assert parsed == datetime(2026, 11, 3, 23, 59, 59, 123456, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "unparseable_tail",
+        [
+            "2026-11-03T23:59:59 EST",  # a named zone, which fromisoformat has never accepted
+            "2026-11-03T25:00:00",  # hour out of range
+            "2026-11-03T23:59:60",  # leap second
+            "2026-11-03T23:59:59.",  # a truncated fraction
+        ],
+    )
+    def test_a_valid_date_with_an_unparseable_tail_degrades_to_the_date(self, unparseable_tail: str) -> None:
+        """The rung the guard exists for, and the only one that can actually fire: a real
+        calendar date whose TAIL `fromisoformat` refuses. Truncating to the date keeps the row's
+        close window — all the ranker reads — where returning None would render `closes:` blank
+        and losing the guard would raise inside `to_thread` and zero all four venues."""
+        parsed = parse_iso_guarded(unparseable_tail)
+
+        assert parsed == datetime(2026, 11, 3, tzinfo=timezone.utc)
+
+    def test_a_plain_timestamp_keeps_its_time_of_day(self) -> None:
+        assert parse_iso_guarded("2026-11-03T23:59:59") == datetime(2026, 11, 3, 23, 59, 59, tzinfo=timezone.utc)
 
     def test_the_row_carries_the_parsed_close_time(self, captured_payloads: dict[str, Any]) -> None:
         market = copy.deepcopy(captured_payloads["predictit_all"]["markets"][0])
@@ -684,6 +710,94 @@ class TestPredictIt:
 
         shapeless = FakeSession({venues.PREDICTIT_URL: FakeResponse(200, payload={"nope": []})})
         assert await venues.predictit_prefetch(shapeless) == []
+
+
+class TestVenueRetryBudget:
+    """Each buffered venue gets a SECOND attempt, pinned on a literal 2.
+
+    The sibling assertion in the provider suite compares the call count to
+    ``*_MAX_ATTEMPTS`` itself, which is tautological: dropping all three constants to 1
+    leaves it — and the whole suite — green while silently retiring every venue retry. A
+    transient blip on a single query then costs that query's rows outright.
+    """
+
+    @pytest.mark.parametrize(
+        ("url", "fetch", "attempts", "empty_body"),
+        [
+            (
+                venues.MANIFOLD_SEARCH_URL,
+                lambda session: venues.manifold_search(session, "q", width=60),
+                venues.MANIFOLD_MAX_ATTEMPTS,
+                [],
+            ),
+            (
+                venues.POLYMARKET_SEARCH_URL,
+                lambda session: venues.polymarket_search(session, "q", width=60),
+                venues.POLYMARKET_MAX_ATTEMPTS,
+                {"events": [], "markets": []},
+            ),
+            (venues.PREDICTIT_URL, venues.predictit_prefetch, venues.PREDICTIT_MAX_ATTEMPTS, {"markets": []}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_transient_first_attempt_is_retried_and_the_second_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch, url: str, fetch: Any, attempts: int, empty_body: Any
+    ) -> None:
+        monkeypatch.setattr("metaculus_bot.research.market_retrieval.http.HTTP_RETRY_BACKOFF_SECS", 0.0)
+        session = FakeSession({url: [FakeResponse(503, text="down"), FakeResponse(200, payload=empty_body)]})
+
+        assert await fetch(session) == [], "the second attempt's body must reach the parser"
+        assert session._call_counts[url] == 2, "a transient first attempt must be retried"
+        assert attempts >= 2, "the constant must permit the retry this test just took"
+
+
+class TestBufferedBodyCap:
+    """``MAX_RESPONSE_BYTES``, driven through the three venues that buffer a whole body.
+
+    Previously unreachable from any test: ``read_json_capped`` chose between the capped stream
+    and a bare ``resp.json()`` on whether the response exposed ``.read``, and the fake did not,
+    so every stubbed venue took the UNCAPPED branch — production's memory ceiling was decided
+    by what a test double implemented, and neutering the cap left the suite green.
+    """
+
+    @pytest.mark.parametrize(
+        ("url", "fetch"),
+        [
+            (venues.MANIFOLD_SEARCH_URL, lambda session: venues.manifold_search(session, "q", width=60)),
+            (venues.POLYMARKET_SEARCH_URL, lambda session: venues.polymarket_search(session, "q", width=60)),
+            (venues.PREDICTIT_URL, venues.predictit_prefetch),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_oversized_body_reads_as_a_failed_fetch_not_an_empty_one(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, url: str, fetch: Any
+    ) -> None:
+        """Every buffered venue sits on the one cap, and a breach must return ``None``: as ``[]``
+        it would publish as a benign ``none`` token and read as a venue whose index found
+        nothing. The 10 MiB ceiling is impractical to materialize, so it is patched down."""
+        monkeypatch.setattr("metaculus_bot.research.market_retrieval.http.MAX_RESPONSE_BYTES", 64)
+        session = FakeSession({url: FakeResponse(200, payload=[{"id": "m", "question": "x" * 500}])})
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.http_fetch"):
+            assert await fetch(session) is None
+
+        assert "response too large" in "\n".join(caplog.messages)
+
+    @pytest.mark.asyncio
+    async def test_a_body_under_the_cap_parses_whole(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The other half of the cap: it must not truncate a legitimate body. A capped read that
+        returned its partial buffer instead of None would hand `json.loads` a half object and
+        surface as an unexplained decode failure on the largest real payloads."""
+        payload = [{"id": f"m{index}", "question": f"Q{index}", "probability": 0.5} for index in range(40)]
+        monkeypatch.setattr(
+            "metaculus_bot.research.market_retrieval.http.MAX_RESPONSE_BYTES", len(json.dumps(payload).encode())
+        )
+        session = FakeSession({venues.MANIFOLD_SEARCH_URL: FakeResponse(200, payload=payload)})
+
+        rows = await venues.manifold_search(session, "q", width=60)
+
+        assert rows is not None
+        assert [row.venue_market_id for row in rows] == [str(entry["id"]) for entry in payload]
 
 
 def _manifold_row(title: str) -> MarketMatch:

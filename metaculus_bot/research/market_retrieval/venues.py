@@ -1,32 +1,31 @@
-"""The four venue fetch/parse paths, as the ranked pipeline needs them.
+"""The four venue fetch/parse paths: raw venue JSON in, ``MarketMatch`` rows out.
 
-Modified copies of the paths in ``metaculus_bot.research.prediction_market``. The originals
-stay in place until the cutover deletes them, so the two coexist for one stage; these are
-what pool generation calls. Four differences from the originals, each with a measurement
-behind it:
+Every path here serves a pipeline that hands its WHOLE candidate pool to one ranking call,
+which is what makes the four decisions below the shape they are. Recall is generation's job,
+selection is the ranker's, and no path here fuzzy-selects, score-floors or width-caps on the
+venue's behalf.
 
-- **Kalshi pulls the COMPLETE open-events catalogue**, not the first 3,000 of ~9,762, and
-  streams each page through a TIERED projection so peak memory tracks the retained fields
-  rather than the ~3 MB/page raw body (49 pages of raw JSON is ~150 MB, and the caller
-  caches the result for 6h in the process that runs forecasters). Each event's first nested
-  market keeps the full field set and every later one keeps only ``close_time`` and
-  ``status``, which are the only two anything reads across nested markets — 85.5 MB down to
-  43.7 MB on the frozen universe, byte-identical consumer output.
-- **Kalshi event-level derivations moved off ``nested[0]``**: ``close_time`` is the MAX over
-  nested markets and ``is_resolved`` requires ALL of them resolved. On the frozen universe
-  ``nested[0]`` misclassifies ~305 live event families as RESOLVED and ~72 settled ones as
-  open — tolerable while those fields were invisible, not tolerable now that both are a
-  rendered column and a ranker input. Liquidity and the price legs stay on ``nested[0]``,
-  deliberately: they describe one tradeable contract, and there is no defensible way to add
-  up four strikes' worth of open interest.
-- **Polymarket sends ``events_status=active``**, which the original omits. Without it
-  ``Ethereum`` returns 7 closed events out of 10; the original gets away with it only
-  because the ``as_of`` filter throws those rows away, and ``as_of`` is going.
-- **PredictIt parses ``closes:`` and renders contract names.** The original hardcodes
-  ``close_time=None`` and prices one fuzzy-selected contract; the ranked design shows the
-  whole 197-market universe, so per-query contract selection has nothing to select on, and
-  the contract NAMES are most of a PredictIt market's semantic content ("Which party will
-  win ..." says nothing on its own).
+- **Kalshi pulls the COMPLETE open-events catalogue** (~9,762 events, ~49 pages) and streams
+  each page through a TIERED projection, so peak memory tracks the retained fields rather
+  than the ~3 MB/page raw body — 49 pages of raw JSON is ~150 MB, and the caller holds the
+  result for 6h in the process that runs forecasters. Each event's first nested market keeps
+  the full field set and every later one keeps only ``close_time`` and ``status``, the only
+  two fields anything reads across nested markets: 85.5 MB down to 43.7 MB on the frozen
+  universe, with byte-identical consumer output.
+- **Kalshi's event-level derivations read EVERY nested market**: ``close_time`` is the MAX
+  over them and ``is_resolved`` requires ALL of them resolved. Reading ``nested[0]`` instead
+  misclassifies ~305 live event families as RESOLVED and ~72 settled ones as open on the
+  frozen universe, and both fields are now a rendered column and a ranker input. Liquidity
+  and the price legs DO stay on ``nested[0]``, deliberately: they describe one tradeable
+  contract, and there is no defensible way to add up four strikes' worth of open interest.
+- **Polymarket sends ``events_status=active``**, and it is load-bearing rather than tidy:
+  nothing downstream filters on close date any more (the pipeline passes ``as_of=None``), so
+  without the parameter ``Ethereum`` puts 7 closed events out of 10 straight into the pool.
+- **PredictIt parses ``dateEnd`` into ``close_time``, renders contract names, and quotes no
+  price.** The whole ~197-market universe reaches the pool, so there is no per-question query
+  to select a contract with and pricing an arbitrary one would misreport the market; the
+  contract NAMES are most of a PredictIt market's semantic content, since its own title is
+  often just "Which party will win ...".
 
 Two structural rules hold throughout. **Every function takes ``session`` as a parameter** —
 the session factory stays in the seam module, where four test files patch it. And **nothing
@@ -84,9 +83,9 @@ MANIFOLD_MAX_ATTEMPTS = 2
 PREDICTIT_MAX_ATTEMPTS = 2
 
 # The venue-search endpoints' own `limit`. NOT a retrieval width: the pool's per-venue width
-# is generation's business, and the parsers take theirs as an explicit argument so a hard
-# slice here can never silently cap a wider pool (the original's `payload[:10]` did exactly
-# that — shipping "width 60" without removing it caps at 10 per query).
+# is generation's business, and the parsers take theirs as an explicit argument, so no hard
+# slice in a parser can silently cap a wider pool — a `payload[:10]` left in one would make
+# "width 60" mean 10 per query with nothing to see at the call site.
 VENUE_SEARCH_LIMIT = 10
 
 # Kalshi catalogue streaming bounds. The size ceiling is a last-resort guard against a
@@ -122,7 +121,7 @@ KALSHI_MARKET_FIELDS: tuple[str, ...] = (
 # across nested markets — `close_time` by the max-over-nested derivation and `status` by the
 # all-resolved one. Every other field is read exclusively off `nested[0]` (`kalshi_event_match`
 # and `kalshi_event_rules`), so on the frozen universe 69,207 of 78,969 nested markets' worth of
-# price/rules fields were dead weight: measured through the real collector, 85.5 MB as shipped
+# price/rules fields would be dead weight: measured through the real collector, 85.5 MB untiered
 # versus 43.7 MB tiered, with `rules_primary` on the tail alone accounting for 13.2 MB. At the
 # `KALSHI_PREFETCH_EVENT_LIMIT` guard that is ~175 MB versus ~90 MB.
 #
@@ -133,9 +132,8 @@ KALSHI_MARKET_FIELDS: tuple[str, ...] = (
 # 6h cache refresh would never reclaim them.
 KALSHI_NESTED_TAIL_FIELDS: tuple[str, ...] = ("close_time", "status")
 
-# A Kalshi market whose status is one of these has settled. Verbatim from the original
-# parser, and now load-bearing on the EVENT: an event is resolved only when every nested
-# market is.
+# A Kalshi market whose status is one of these has settled. Load-bearing on the EVENT too: an
+# event is resolved only when every nested market is.
 KALSHI_RESOLVED_STATUSES: frozenset[str] = frozenset({"settled", "finalized", "closed"})
 
 # PredictIt bundles several binary contracts per market, and the contract names are most of
@@ -178,13 +176,12 @@ class CataloguePull:
 def _kalshi_page_collector(kept: list[dict[str, Any]], state: dict[str, Any]) -> Any:
     """An ijson push target that projects an ``/events`` page down as it streams.
 
-    Parses at the EVENT level rather than materializing each event object, for the two
-    reasons the ``/series`` fetcher this is adapted from documents. Peak memory tracks the
-    kept fields (~14 per event) instead of a ~3 MB page. And the parse events expose the
-    TOP-LEVEL shape, which item-level extraction cannot see: an HTTP 200 carrying
-    ``{"events": null}`` or ``{"error": "temporarily unavailable"}`` yields zero items,
-    exactly like a legitimately empty catalogue, and without ``saw_events_array`` that lands
-    in the 6h cache as a valid empty index.
+    Parses at the EVENT level rather than materializing each event object, for two reasons.
+    Peak memory tracks the kept fields (~14 per event) instead of a ~3 MB page. And the parse
+    events expose the TOP-LEVEL shape, which item-level extraction cannot see: an HTTP 200
+    carrying ``{"events": null}`` or ``{"error": "temporarily unavailable"}`` yields zero
+    items, exactly like a legitimately empty catalogue, and without ``saw_events_array`` that
+    lands in the 6h cache as a valid empty index.
 
     ``state`` carries ``saw_events_array`` and ``cursor`` back out, because the caller needs
     both after the stream has closed.
@@ -268,7 +265,7 @@ async def _kalshi_fetch_events_page(
     such a body is tiny). It is False for the size ceiling and for malformed JSON, where a
     second identical request only burns budget — and for a 429: re-asking a rate limiter
     0.5s later is not a retry, it is a second violation, so the pull stops early and refuses
-    to cache exactly as the original does.
+    to cache.
     """
     kept: list[dict[str, Any]] = []
     state: dict[str, Any] = {"saw_events_array": False, "cursor": None}
@@ -435,9 +432,10 @@ def kalshi_usd_liquidity(market: dict[str, Any]) -> tuple[float | None, float | 
     documents it to "always return 0.0000" (confirmed on 1,504 live markets and all 127
     archived rows). Scoring off it would wire in a constant zero.
 
-    Carried across from the original unchanged. Nothing pins the ``last_price_dollars``
-    fallback, the ``or 1.0`` notional default or the ``if not price:`` truthiness, so
-    "simplifying" any of the three here would blank or misstate labels with a green suite.
+    Three details here are UNPINNED by any test: the ``last_price_dollars`` fallback, the
+    ``or 1.0`` notional default, and the ``if not price:`` truthiness (which routes a genuine
+    0.0 midpoint to the last trade). "Simplifying" any of them blanks or misstates labels with
+    a green suite.
     """
     volume = safe_float(market.get("volume_fp"))
     open_interest = safe_float(market.get("open_interest_fp"))
@@ -671,9 +669,9 @@ def parse_polymarket_matches(payload: Any, *, width: int) -> list[MarketMatch]:
 async def polymarket_search(session: Any, query: str, *, width: int) -> list[MarketMatch] | None:
     """Search Polymarket for one query. ``None`` when the fetch itself failed.
 
-    ``events_status=active`` is the one added parameter and it is load-bearing now: without
-    it ``Ethereum`` returns 7 closed events out of 10, and the ``as_of`` filter that used to
-    discard them is gone.
+    ``events_status=active`` is load-bearing, not tidiness: nothing downstream filters on
+    close date any more, so without it ``Ethereum`` puts 7 closed events out of 10 into the
+    pool.
 
     The None-vs-``[]`` split is the whole degradation contract: a retry-exhausted 503 would
     otherwise arrive at the caller as an ordinary empty result and publish as a benign
@@ -716,10 +714,10 @@ def _walk_tiptap_text(node: Any) -> list[str]:
 def manifold_rules_text(market: dict[str, Any]) -> str:
     """A Manifold market's rules text: ``textDescription``, else the flattened doc, else "".
 
-    Unlike the original this does NOT fall back to the question title. A title-as-rules row
-    renders a candidate line whose ``rules:`` segment repeats its own title, spending ranker
-    tokens on nothing; the enrichment hook is what fills real description text in, and a
-    blank here is the honest signal that it has not run or found nothing.
+    Deliberately NO fall back to the question title: that renders a candidate line whose
+    ``rules:`` segment repeats its own title, spending ranker tokens on nothing. The
+    enrichment hook is what fills real description text in, and a blank here is the honest
+    signal that it has not run or found nothing.
     """
     text_description = market.get("textDescription")
     if isinstance(text_description, str) and text_description.strip():
@@ -790,11 +788,10 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch]:
 async def manifold_search(session: Any, query: str, *, width: int) -> list[MarketMatch] | None:
     """Search Manifold for one query. ``None`` when the fetch itself failed.
 
-    ``contractType=BINARY`` is retained with eyes open rather than because it matches the
-    original: it costs a known ~30% recall ceiling (multi-outcome markets are invisible),
-    accepted for this port because flipping to ALL needs a multi-outcome render path — the
-    search response carries no per-answer data, so every row would need a detail GET, which
-    the enrichment hook below makes nearly free later. Tracked in FUTURE.md.
+    ``contractType=BINARY`` costs a known ~30% recall ceiling — multi-outcome markets are
+    invisible — and is kept with eyes open, because flipping to ALL needs a multi-outcome
+    render path: the search response carries no per-answer data, so every row would need a
+    detail GET, which the enrichment hook below makes nearly free later. Tracked in FUTURE.md.
     """
     payload = await http_get_with_backoff(
         session,
@@ -882,25 +879,20 @@ def predictit_contract_names(market: dict[str, Any]) -> str:
 def predictit_market_match(market: dict[str, Any], *, match_confidence: float, channel: str) -> MarketMatch | None:
     """One PredictIt market as a candidate row. None when it has no usable name.
 
-    One row per market, matching Kalshi's one-row-per-event, and NO price: the original
-    priced the contract whose name best matched the query, and a design that hands the whole
-    universe to a ranker has no per-question query to select on. Relevance is the ranker's
-    job, and pricing an arbitrary contract would misreport the market.
-
-    ``close_time`` comes from the contracts' ``dateEnd``, which the original hardcoded to None
-    — so a faithful copy would render ``closes:`` on 0% of PredictIt rows. Expect rendered
-    close coverage to read ~26% (the universe's rate) rather than the old 64%, which was a
-    selection effect of the fuzzy pre-filter.
+    One row per market, matching Kalshi's one-row-per-event, and NO price. The whole
+    ~197-market universe reaches the pool, so there is no per-question query to pick a
+    contract with; relevance is the ranker's job, and quoting one arbitrary contract's price
+    on a multi-contract ballot would misreport the market. Rendered close coverage therefore
+    reads ~26% — the universe's own rate, not the ~64% a fuzzy pre-filter selects for.
 
     Both event-level derivations read EVERY contract rather than ``contracts[0]``, mirroring
-    ``kalshi_event_match`` four functions up: a market whose contracts are ``[Closed, Open]`` is
-    live, and reading the first one made the verdict depend on the order untrusted external JSON
-    happened to arrive in — reverse the list and the same market flipped. That matters more than
-    it used to because ``status`` is now a rendered column AND a ranker prompt signal telling the
-    model a RESOLVED price is a realized outcome rather than a forecast, and because the whole
-    ~197-market universe reaches the pool instead of three fuzzy-selected rows. Derived from the
-    contracts rather than from the market-level ``status`` field (present on 197/197 live markets
-    and ignored here) so the two venues answer the question the same way, in one place.
+    ``kalshi_event_match`` four functions up: a market whose contracts are ``[Closed, Open]``
+    is live, and reading the first one makes the verdict depend on the order untrusted
+    external JSON happened to arrive in — reverse the list and the same market flips. Both
+    fields are load-bearing now: ``status`` is a rendered column AND a ranker prompt signal,
+    telling the model a RESOLVED price is a realized outcome rather than a forecast. Derived
+    from the contracts rather than the market-level ``status`` field (present on 197/197 live
+    markets, ignored here) so both venues answer the question the same way, in one place.
     """
     name = market.get("name") or ""
     short_name = market.get("shortName") or ""

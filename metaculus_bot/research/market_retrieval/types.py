@@ -126,9 +126,6 @@ class _FetchTally:
     ok: int = 0
     failed: int = 0
 
-    def __add__(self, other: _FetchTally) -> _FetchTally:
-        return _FetchTally(self.ok + other.ok, self.failed + other.failed)
-
 
 def _liquidity_label(m: MarketMatch) -> str:
     """Label how informative a market's price is, given its liquidity/participation.

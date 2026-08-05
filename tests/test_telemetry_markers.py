@@ -1,3 +1,4 @@
+# noqa: HARNESS-SCAN-EXEMPT-monolithic-file-loc  # one class per MARKER_SPECS entry; a split fragments the registry
 """Tests for the run-log telemetry marker parser (scripts/telemetry/markers.py).
 
 Each example line below is copied from the format string in the emitting code
@@ -10,6 +11,7 @@ tests loudly instead of silently dropping records from the archive:
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
+* MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
   -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
@@ -95,6 +97,24 @@ CLOSE_MARGIN_LINE = (
 CLOSE_MARGIN_NA_LINE = (
     PFX + "CLOSE_MARGIN: question=44620 close_time=2026-07-20T00:00:00+00:00 "
     "submitted_at=2026-07-19T00:00:00+00:00 window_s=n/a margin_s=86400 margin_frac=n/a"
+)
+# Captured by calling metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
+# under the prod log format, so these are emitted bytes rather than a transcription. The
+# four shapes are the four the emitter can produce: a normal ranked slate, an empty pool,
+# a fail-open, and a row whose pool index could not be recovered.
+MARKET_RANKING_RANKED_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=2 prompt_chars=36412 "
+    "rendered=polymarket:2@0,kalshi:0@1"
+)
+MARKET_RANKING_EMPTY_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=0 outcome=empty rows=0 prompt_chars=0 rendered=none"
+)
+MARKET_RANKING_FAILOPEN_LINE = (
+    PFX + "MARKET_RANKING: question=None pool=4 outcome=failopen rows=2 prompt_chars=36412 "
+    "rendered=polymarket:2@0,kalshi:0@1"
+)
+MARKET_RANKING_UNTRACEABLE_INDEX_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=1 prompt_chars=36412 rendered=manifold:-1@0"
 )
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
@@ -387,6 +407,59 @@ class TestCloseMargin:
         assert rec["window_s"] is None
         assert rec["margin_frac"] is None
         assert rec["margin_s"] == 86400
+
+
+class TestMarketRanking:
+    """The ranked-retrieval port's own post-ship instrument, so it has to reach the archive.
+
+    `rendered`'s pool indices are what answer the two questions the port left open (ranker
+    attention decay down a ~400-candidate prompt, and whether Manifold detail enrichment
+    changes the picks); `prompt_chars` is the free prod distribution against the prompt
+    ceiling. Run logs leave GHA at 90 days, so anything unharvested is unanswerable later.
+    """
+
+    def test_ranked_run_fields(self):
+        rec = _parse_one(MARKET_RANKING_RANKED_LINE)
+        assert rec["marker"] == "market_ranking"
+        assert rec["pool"] == 4
+        assert rec["outcome"] == "ranked"
+        assert rec["rows"] == 2
+        assert rec["prompt_chars"] == 36412
+        # The venue:pool_index@rank list survives whole — the indices are the instrument.
+        assert rec["rendered"] == "polymarket:2@0,kalshi:0@1"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_RANKING_RANKED_LINE)
+        # prediction_market.py emits question.id_of_question, not the post id.
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+    def test_empty_pool_run_is_distinguishable_from_a_declining_ranker(self):
+        # `empty` means the pool had nothing to rank (a retrieval story), while a ranker
+        # that legitimately returned zero rows reads `outcome=ranked rows=0` — the two
+        # must not collapse, since only the first implicates the venues.
+        rec = _parse_one(MARKET_RANKING_EMPTY_LINE)
+        assert rec["outcome"] == "empty"
+        assert rec["pool"] == 0
+        assert rec["rows"] == 0
+        assert rec["prompt_chars"] == 0
+        # "none" is a _NONE_SENTINELS value, so an unrendered slate reads as None.
+        assert rec["rendered"] is None
+
+    def test_failopen_run_and_absent_qid(self):
+        # A fail-open renders the head of the ranker's own input, so its rows are still
+        # worth measuring; qid is Optional at the call site and renders as "None".
+        rec = _parse_one(MARKET_RANKING_FAILOPEN_LINE)
+        assert rec["outcome"] == "failopen"
+        assert rec["rows"] == 2
+        assert rec["qid"] is None
+
+    def test_untraceable_pool_index_sentinel_survives(self):
+        # -1 means the rendered row could not be matched back to a pool entry, which is a
+        # defect in the index recovery rather than a real position — it must stay visible
+        # in the archive rather than coercing into the index distribution as a 0.
+        rec = _parse_one(MARKET_RANKING_UNTRACEABLE_INDEX_LINE)
+        assert rec["rendered"] == "manifold:-1@0"
 
 
 class TestCredit:

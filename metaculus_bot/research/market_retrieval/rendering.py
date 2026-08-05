@@ -22,7 +22,6 @@ changes how a row is chosen, not what a forecaster is told to verify.
 
 from __future__ import annotations
 
-import logging
 from typing import Sequence
 
 from metaculus_bot.research.market_retrieval.ranking import (
@@ -32,8 +31,6 @@ from metaculus_bot.research.market_retrieval.ranking import (
     WHY_CHARS,
 )
 from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot, _liquidity_label
-
-logger = logging.getLogger(__name__)
 
 # Raw-rules truncation in the bullet section. Separate from, and smaller than, the ranker
 # prompt's per-venue caps: this text ships to the forecaster inside a research section that

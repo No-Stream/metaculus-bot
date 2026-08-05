@@ -30,8 +30,9 @@ full-catalogue fuzzy scan measured ~0.45-0.59s of GIL-HOLDING bytecode (9,762 ev
 queries), so the offload bought nothing — it converted one freeze into sustained starvation,
 with loop lag p50 at 15-20ms single-question and 56ms at 6 concurrent. Batched through
 ``fuzzy_best_many`` (``rapidfuzz.process.cdist``, which threads internally) the same work is
-~0.06s and the loop returns to idle. The remaining ~10k match constructions and the settlement
-index walk are still real CPU, which is why the hop stays.
+~0.06s and the loop returns to idle. The settlement index walk and the catalogue sort are still
+real CPU, which is why the hop stays; row CONSTRUCTION is not, since the universe channel yields
+lazily and only the rows inside the width are ever built.
 """
 
 from __future__ import annotations
@@ -39,14 +40,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from datetime import datetime
+from typing import Any, Iterator, Mapping, Sequence
 
 from metaculus_bot.research.market_retrieval import venues
 from metaculus_bot.research.market_retrieval.http import flatten_results
 from metaculus_bot.research.market_retrieval.queries import fuzzy_best, fuzzy_best_many
+from metaculus_bot.research.market_retrieval.ranking import RULES_CHARS
 from metaculus_bot.research.market_retrieval.settlement_join import question_domains, settlement_domain_index
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _FetchTally
+from metaculus_bot.time_utils import _as_utc
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +78,10 @@ RETRIEVAL_WIDTH: dict[str, int] = {
 # case is 6 waves x 10s = 60s, which blows the snapshot's time budget on rules text.
 MANIFOLD_DETAIL_CONCURRENCY = 10
 MANIFOLD_DETAIL_WALL_S = 10.0
-# Matches the Manifold rules cap in the ranker prompt. Kept here as well as there because
-# this is where the text is stored: a longer store would be silently truncated downstream
-# and the render path has its own, separate, smaller cap.
-MANIFOLD_DETAIL_RULES_CHARS = 300
+# Derived from the ranker's own Manifold cap rather than restated: this is where the text is
+# STORED, so a store cap below the prompt cap silently caps the prompt too — declaring both as
+# 300 made raising only the ranker's a no-op. The render path has its own, separate, smaller cap.
+MANIFOLD_DETAIL_RULES_CHARS = RULES_CHARS["manifold"]
 
 CHANNEL_SETTLEMENT_JOIN = "settlement_join"
 CHANNEL_VENUE_SEARCH = "venue_search"
@@ -97,12 +100,20 @@ class PoolResult:
     pool rather than over the ranked rows, or a legitimate 6-row render that happens to
     exclude Polymarket records a 100%-dead ``open_interest`` field and reddens CI on the
     ranker's judgment.
+
+    ``per_venue_tally`` is the one degradation signal: a venue is degraded iff its tally has a
+    failed sub-fetch, and the caller turns that into the source token. There is deliberately no
+    separate ``degraded_venues`` list — two spellings of the same predicate is how they drift.
+
+    ``channel_counts`` and ``settlement_domains`` are TELEMETRY, read by the ``market pool:`` log
+    line and the tests, never by a decision. ``channel_counts`` counts what entered the pool
+    pre-width, so on a venue whose search overfills its width it exceeds the candidate count by
+    design; the Kalshi universe channel is the exception, since it is consumed only to the width.
     """
 
     candidates: tuple[MarketMatch, ...] = ()
     per_venue_counts: dict[str, int] = field(default_factory=dict)
     per_venue_tally: dict[str, _FetchTally] = field(default_factory=dict)
-    degraded_venues: tuple[str, ...] = ()
     channel_counts: dict[str, int] = field(default_factory=dict)
     settlement_domains: tuple[str, ...] = ()
 
@@ -163,8 +174,19 @@ def _settlement_join_channel(
     return [match for _, match in scored], tuple(sorted(domains))
 
 
-def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dict[str, Any]]) -> list[MarketMatch]:
-    """The full Kalshi catalogue, ``fuzzy_best_many``-ranked. Truncation happens at the width."""
+def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dict[str, Any]]) -> Iterator[MarketMatch]:
+    """The full Kalshi catalogue in ``fuzzy_best_many`` order, yielded LAZILY.
+
+    Scoring is whole-catalogue (that is what makes the ordering global), but construction is
+    not: building a ``MarketMatch`` for all ~9,762 events spent it on the ~9,662 rows the width
+    then discarded. Yielding lets the caller stop at the width instead, which over a synthetic
+    9,762-event catalogue measured 0.162s -> 0.028s and 6.7 MB -> 1.3 MB peak for the same
+    100-row pool, with the yielded order verified identical to the eager list's.
+
+    The generator carries no cap of its own, deliberately — the join channel's rows dedup
+    against these BEFORE the width slice, so a cap here could leave the pool under-filled.
+    Truncation stays where it was, in ``assemble_pool``.
+    """
     usable: list[dict[str, Any]] = []
     titles: list[str] = []
     rules: list[str] = []
@@ -179,14 +201,12 @@ def _kalshi_universe_channel(queries: Sequence[str], kalshi_events: Sequence[dic
         rules.append(venues.kalshi_event_rules(event))
 
     scores = fuzzy_best_many(list(queries), titles, rules)
-    scored: list[tuple[float, MarketMatch]] = []
-    for event, score in zip(usable, scores, strict=True):
+    # Stable, so equal scores keep catalogue order — the same tie-break the per-event loop had.
+    # Keyed on the score alone so the sort never compares two event dicts.
+    for score, event in sorted(zip(scores, usable, strict=True), key=lambda pair: pair[0], reverse=True):
         match = venues.kalshi_event_match(event, match_confidence=score, channel=CHANNEL_UNIVERSE_FUZZY)
         if match is not None:
-            scored.append((score, match))
-    # Stable, so equal scores keep catalogue order — the same tie-break the per-event loop had.
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [match for _, match in scored]
+            yield match
 
 
 def _predictit_universe_channel(predictit_markets: Sequence[dict[str, Any]]) -> list[MarketMatch]:
@@ -248,12 +268,11 @@ def assemble_pool(
     ``candidates_pre_filter=0`` into provider health, exactly the shape that field exists to
     prevent alerting on.
     """
-    as_of_utc = None if as_of is None else (as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc))
+    as_of_utc = None if as_of is None else _as_utc(as_of)
     join_rows, domains = _settlement_join_channel(criteria_text, queries, kalshi_events)
 
     search_rows: list[MarketMatch] = []
     tallies: dict[str, _FetchTally] = {}
-    degraded: list[str] = []
     for venue in VENUE_ORDER:
         results = venue_search_results.get(venue)
         if results is None:
@@ -261,13 +280,6 @@ def assemble_pool(
         matches, tally = flatten_results(list(results), venue)
         search_rows.extend(matches)
         tallies[venue] = tally
-        if tally.failed:
-            degraded.append(venue)
-
-    universe_rows = [
-        *_kalshi_universe_channel(queries, kalshi_events),
-        *_predictit_universe_channel(predictit_markets),
-    ]
 
     pools: dict[str, list[MarketMatch]] = {venue: [] for venue in VENUE_ORDER}
     seen: set[tuple[str, str]] = set()
@@ -279,7 +291,7 @@ def assemble_pool(
             return
         # Ahead of every write below, so an ineligible row consumes no width, no dedup slot and no
         # channel count. `parse_iso` returns aware datetimes for all four venues, and `as_of_utc`
-        # is normalized above, so the comparison cannot raise on a mixed pair.
+        # went through `_as_utc` above, so the comparison cannot raise on a mixed pair.
         if as_of_utc is not None and match.close_time is not None and match.close_time <= as_of_utc:
             return
         key = _dedup_key(match)
@@ -293,7 +305,16 @@ def assemble_pool(
         add(match)
     for match in search_rows:
         add(match)
-    for match in universe_rows:
+    # The Kalshi universe generator is consumed only as far as the width; see the channel's own
+    # docstring for the measurement. The stop condition reads the POOL count rather than the rows
+    # consumed, so a dedup hit or an `as_of` drop still frees its slot — and a venue absent from
+    # `RETRIEVAL_WIDTH` stays unbounded here too.
+    kalshi_width = RETRIEVAL_WIDTH.get("kalshi")
+    for match in _kalshi_universe_channel(queries, kalshi_events):
+        if kalshi_width is not None and len(pools["kalshi"]) >= kalshi_width:
+            break
+        add(match)
+    for match in _predictit_universe_channel(predictit_markets):
         add(match)
 
     candidates: list[MarketMatch] = []
@@ -304,6 +325,7 @@ def assemble_pool(
         per_venue_counts[venue] = len(rows)
         candidates.extend(rows)
 
+    degraded = [venue for venue, tally in tallies.items() if tally.failed]
     logger.info(
         f"market pool: n={len(candidates)} per_venue={per_venue_counts} channels={channel_counts} "
         f"domains={list(domains)} degraded={degraded or 'none'}"
@@ -312,7 +334,6 @@ def assemble_pool(
         candidates=tuple(candidates),
         per_venue_counts=per_venue_counts,
         per_venue_tally=tallies,
-        degraded_venues=tuple(degraded),
         channel_counts=channel_counts,
         settlement_domains=domains,
     )
@@ -332,7 +353,7 @@ async def build_pool(
     See the module docstring for why the offload is load-bearing rather than tidy: a pinned loop
     shows up as forecaster soft-deadline drops somewhere else entirely. Post-batching the fuzzy
     scan is ~0.06s (it was ~0.45s of GIL-holding bytecode, which the hop could not hide), and the
-    ~10k match constructions plus the settlement index walk are what is left to offload.
+    settlement index walk plus the catalogue sort are what is left to offload.
     """
     return await asyncio.to_thread(
         assemble_pool,

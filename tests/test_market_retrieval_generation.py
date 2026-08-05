@@ -35,6 +35,7 @@ from metaculus_bot.research.market_retrieval.generation import (
     build_pool,
     enrich_manifold,
 )
+from metaculus_bot.research.market_retrieval.ranking import RULES_CHARS
 from metaculus_bot.research.market_retrieval.types import MarketMatch, _FetchTally
 
 Platform = Literal["polymarket", "kalshi", "manifold", "predictit"]
@@ -207,6 +208,36 @@ class TestWidths:
         assert result.per_venue_counts["kalshi"] == RETRIEVAL_WIDTH["kalshi"] == 100
         assert result.per_venue_counts["kalshi"] > 20, "far wider than the old render-cap-derived width"
 
+    def test_only_the_kept_width_of_kalshi_rows_is_ever_constructed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Scoring is whole-catalogue; construction is not. Building a row for every event spent
+        it on the ~9,662 the width discards — measured 0.162s / 6.7 MB against 0.028s / 1.3 MB over
+        a 9,762-event catalogue — so the channel yields and the caller stops at the width."""
+        events = [_kalshi_event(f"K-{i}", title=f"US unemployment rate scenario {i}") for i in range(400)]
+        real_match = generation.venues.kalshi_event_match
+        calls = 0
+
+        def counting_match(event: dict[str, Any], **kwargs: Any) -> MarketMatch | None:
+            nonlocal calls
+            calls += 1
+            return real_match(event, **kwargs)
+
+        monkeypatch.setattr(generation.venues, "kalshi_event_match", counting_match)
+
+        result = _pool(kalshi_events=events)
+
+        assert result.per_venue_counts["kalshi"] == RETRIEVAL_WIDTH["kalshi"]
+        assert calls <= RETRIEVAL_WIDTH["kalshi"] + 1, "one row past the width at most, not 400"
+
+    def test_the_lazy_channel_still_scores_the_whole_catalogue(self) -> None:
+        """The laziness must not become a truncated SCAN: the ordering is only global because
+        every event is scored, so the best row has to win even when it sits last in the dump."""
+        events = [_kalshi_event(f"K-{i}", title=f"Something unrelated {i}") for i in range(300)]
+        events.append(_kalshi_event("BEST", title="US unemployment rate above 4%"))
+
+        result = _pool(kalshi_events=events)
+
+        assert result.candidates[0].venue_market_id == "BEST"
+
     def test_the_venue_search_widths_bound_the_union_across_queries(self) -> None:
         per_query = [[_search_row("manifold", f"m{i}", f"row {i}") for i in range(10)] for _ in range(10)]
         distinct = [[_search_row("manifold", f"q{q}-{i}", f"row {q}-{i}") for i in range(10)] for q in range(10)]
@@ -284,13 +315,15 @@ class TestAsOfEligibility:
 
 
 class TestDegradation:
+    """`per_venue_tally` is the only degradation signal the pool carries — a venue is degraded
+    iff its tally holds a failed sub-fetch, which is what the caller turns into a source token."""
+
     def test_a_venue_whose_search_failed_contributes_nothing_and_reports_degraded(self) -> None:
         """A lost sub-fetch and a genuine no-match both arrive as an empty list, so the
         distinction has to be carried around the pool rather than inferred from it."""
         result = _pool(venue_search_results={"manifold": [None], "polymarket": [[]]})
 
         assert result.per_venue_counts["manifold"] == 0
-        assert result.degraded_venues == ("manifold",)
         assert result.per_venue_tally["manifold"] == _FetchTally(ok=0, failed=1)
         assert result.per_venue_tally["polymarket"] == _FetchTally(ok=1, failed=0)
 
@@ -300,14 +333,14 @@ class TestDegradation:
         result = _pool(venue_search_results={"manifold": [rows, None]})
 
         assert [row.venue_market_id for row in result.candidates] == ["m1"]
-        assert result.degraded_venues == ("manifold",)
+        assert result.per_venue_tally["manifold"] == _FetchTally(ok=1, failed=1)
 
     def test_an_empty_catalogue_yields_an_empty_pool_without_raising(self) -> None:
         result = _pool(criteria_text=BLS_CRITERIA)
 
         assert result.candidates == ()
         assert result.per_venue_counts == {venue: 0 for venue in VENUE_ORDER}
-        assert result.degraded_venues == ()
+        assert result.per_venue_tally == {}
 
     def test_no_question_urls_means_no_settlement_channel(self) -> None:
         event = _kalshi_event("K-1", title="unemployment", settles="https://data.bls.gov/x")
@@ -390,7 +423,9 @@ class TestManifoldEnrichment:
 
         await enrich_manifold([row], object())
 
-        assert len(row.raw_rules) == generation.MANIFOLD_DETAIL_RULES_CHARS
+        # The store cap IS the ranker's, not a second 300: this is where the text is stored, so a
+        # store cap below the prompt cap silently caps the prompt too.
+        assert len(row.raw_rules) == generation.MANIFOLD_DETAIL_RULES_CHARS == RULES_CHARS["manifold"]
 
     @pytest.mark.asyncio
     async def test_a_lost_detail_leaves_that_row_title_only(self, monkeypatch: pytest.MonkeyPatch) -> None:

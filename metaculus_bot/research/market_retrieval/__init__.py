@@ -1,63 +1,20 @@
 """Ranked prediction-market retrieval: pool generation, one LLM ranking call, render.
 
-The package holds the retrieval machinery; `metaculus_bot.research.prediction_market` stays the
-seam module every consumer imports from (the provider factory, the caches and degradation
-counters, the aiohttp session factory, and the row types it re-exports from here).
+Import the submodule you need — this package root deliberately re-exports nothing, so there is
+one export surface per name instead of a second one drifting from `types`/`queries`. Every
+consumer already imports the submodules directly:
 
-`types` imports nothing else in this repo, which is what keeps the graph acyclic: the venue and
-pipeline modules depend on the row type, and the seam module depends on them.
+- `types` — the `MarketMatch` / `MarketSnapshot` rows and the liquidity vocabulary. Imports
+  nothing else in this repo, which is what keeps the graph acyclic.
+- `http` — the bounded GET, the body caps, the field coercions.
+- `queries` — the deterministic query set plus the LLM query author's prompt and parser.
+- `venues` — the four venue fetch/parse paths.
+- `settlement_join` — the who-settles-this provenance join onto Kalshi events.
+- `generation` — the three retrieval channels unioned into one candidate pool.
+- `ranking` — the ranker prompt, the parser, and the deterministic fail-open slate.
+- `rendering` — the markdown snapshot in the ranker's order.
+
+`metaculus_bot.research.prediction_market` stays the seam module every consumer OUTSIDE this
+package imports from: it owns the provider factory, the caches and degradation counters, the
+aiohttp session factory, and it re-exports the row types from `types`.
 """
-
-from metaculus_bot.research.market_retrieval.queries import (
-    MANIFOLD_RELAXATION_MAX_TOKENS,
-    MAX_FRAMINGS,
-    MAX_QUERY_CHARS,
-    MAX_SYNONYMS,
-    dedupe_queries,
-    deterministic_queries,
-    fuzzy_best,
-    manifold_relaxation_terms,
-    parse_query_author,
-    strip_dates_and_numbers,
-)
-from metaculus_bot.research.market_retrieval.settlement_join import (
-    SELF_REFERENCE_DOMAINS,
-    normalize_host,
-    question_domains,
-    registrable_domain,
-    settlement_domain_index,
-)
-from metaculus_bot.research.market_retrieval.types import (
-    LIQUIDITY_DEEP_USD,
-    LIQUIDITY_THIN_USD,
-    MANIFOLD_HIGH_BETTORS,
-    MANIFOLD_THIN_BETTORS,
-    MarketMatch,
-    MarketSnapshot,
-    SettlementSource,
-)
-
-__all__ = [
-    "LIQUIDITY_DEEP_USD",
-    "LIQUIDITY_THIN_USD",
-    "MANIFOLD_HIGH_BETTORS",
-    "MANIFOLD_RELAXATION_MAX_TOKENS",
-    "MANIFOLD_THIN_BETTORS",
-    "MAX_FRAMINGS",
-    "MAX_QUERY_CHARS",
-    "MAX_SYNONYMS",
-    "MarketMatch",
-    "MarketSnapshot",
-    "SELF_REFERENCE_DOMAINS",
-    "SettlementSource",
-    "dedupe_queries",
-    "deterministic_queries",
-    "fuzzy_best",
-    "manifold_relaxation_terms",
-    "normalize_host",
-    "parse_query_author",
-    "question_domains",
-    "registrable_domain",
-    "settlement_domain_index",
-    "strip_dates_and_numbers",
-]

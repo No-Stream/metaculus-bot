@@ -49,8 +49,13 @@ TIERS: tuple[str, ...] = (
 )
 TIER_UNSPECIFIED = "unspecified"
 
-# The tiers that earn the strong-evidence preamble on the rendered snapshot.
-STRONG_TIERS: frozenset[str] = frozenset({"same_quantity_same_date", "same_quantity_other_cut"})
+# The tiers that earn the strong-evidence preamble on the rendered snapshot: the leading two,
+# and only those, measure the quantity the question asks about — tier 1 on the same date, tier 2
+# on another cut of the same subject — which is precisely what that preamble asserts. Tiers 3
+# and 4 are things a forecaster reasons FROM, not the quantity itself. Sliced out of TIERS
+# instead of respelled so the vocabulary cannot drift between the two; the legend's "only the
+# first two measure the quantity asked about" states the same fact to the forecaster.
+STRONG_TIERS: frozenset[str] = frozenset(TIERS[:2])  # noqa: HARNESS-SCAN-EXEMPT-subsampling
 
 # Per-row phrase cap. The label is one glanceable phrase a forecaster prompt can weight, not
 # a second rationale.
@@ -352,8 +357,8 @@ def parse_ranking(text: str, pool_size: int) -> list[Pick]:
     if parsed and not picks:
         # A non-empty array yielding no usable pick is a SHAPE regression (a renamed key, all
         # indices hallucinated past the pool), NOT the adaptive-width `[]`. Both reach the caller
-        # as `ok(0)`, which `_is_contributed` treats as a non-loss, so nothing else in the
-        # pipeline can tell them apart: the token, the `MARKET_RANKING:` line and the empty
+        # as `ok(0)`, which `provider_diagnostics.is_lost_source` does not flag, so nothing else
+        # in the pipeline can tell them apart: the token, the `MARKET_RANKING:` line and the empty
         # render are byte-identical. The WARN has to live HERE because `_rank_pool` only ever
         # sees `picks`, never `parsed`.
         logger.warning(

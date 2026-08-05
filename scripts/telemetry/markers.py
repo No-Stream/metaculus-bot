@@ -23,6 +23,9 @@ against the ACTUAL emitted format strings (the source of truth):
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
+* ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
+  ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
+  ranker outcome, and every rendered row's ``venue:pool_index@rank``)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -53,7 +56,7 @@ both work).
 POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
-``CLOSE_MARGIN`` emit ``question.id_of_question`` (the QUESTION id) while
+``CLOSE_MARGIN`` / ``MARKET_RANKING`` emit ``question.id_of_question`` (the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
 ``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
 ``qid_kind`` and every harvested record carries it, so a residual join keyed on one
@@ -161,7 +164,7 @@ def _parse_line_ts(line: str) -> str | None:
 # GHOST_FORECAST_JSON comes from ``log_prefix`` (see ``agentic_gap_fill.py``:
 # ``f"question={ref} "``) and is prepended BEFORE the marker token, so it's an
 # optional leading group there. On EXTRACTION_RUNG / OPEN_BOUND_PILING /
-# CLOSE_MARGIN the ``question=`` is a normal field AFTER the token.
+# CLOSE_MARGIN / MARKET_RANKING the ``question=`` is a normal field AFTER the token.
 MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "extraction_rung",
@@ -251,6 +254,28 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+margin_s=(?P<margin_s>\S+)\s+margin_frac=(?P<margin_frac>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # close_margin.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "market_ranking",
+        # Per-question ranked market-retrieval outcome
+        # (research/prediction_market.py:_log_ranking_telemetry). This is the port's own
+        # post-ship instrument and the reason it needs a spec rather than a manual grep:
+        # `rendered`'s pool INDICES answer whether the ranker's attention decays down a
+        # ~400-candidate prompt and whether Manifold detail enrichment shifts which rows
+        # get picked, and `prompt_chars` gives the free prod distribution against the
+        # ranker's prompt ceiling. Run logs expire from GHA at 90 days, so an unharvested
+        # line is an unanswerable question later.
+        #
+        # `rendered` is a comma-joined `venue:pool_index@rank` list with no spaces, so
+        # `\S+` takes the whole field; the "none" sentinel (no rows rendered) coerces to
+        # None, which reads correctly alongside rows=0. A pool index of -1 means the row
+        # could not be traced back to a pool entry.
+        re.compile(
+            r"MARKET_RANKING:\s*question=(?P<question>\S+)\s+pool=(?P<pool>\S+)"
+            r"\s+outcome=(?P<outcome>\S+)\s+rows=(?P<rows>\S+)"
+            r"\s+prompt_chars=(?P<prompt_chars>\S+)\s+rendered=(?P<rendered>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
     ),
     MarkerSpec(
         "forecaster_drops",

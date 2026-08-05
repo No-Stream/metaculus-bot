@@ -73,9 +73,19 @@ _LOST_TOKEN_MAX_CHARS: int = 40
 _MAX_LOST_SOURCES_RENDERED: int = 8
 
 
-def _is_lost_source(token: str) -> bool:
-    """A source token signals a lost/failed upstream (not contributed, not benign-empty)."""
+def is_lost_source(token: str) -> bool:
+    """A source token signals a lost/failed upstream (not contributed, not benign-empty).
+
+    Public because the multi-source PROVIDERS classify their own tokens with it before the
+    orchestrator ever sees them (`prediction_market` routes seven sources through it), and a
+    provider-side copy of the prefix tuple is exactly the drift this module exists to prevent.
+    """
     return not token.startswith(_SOURCE_NON_LOSS_PREFIXES)
+
+
+# Historical private name, still imported by name in the provider test modules. An alias rather
+# than a second body, so there is one definition of "lost".
+_is_lost_source = is_lost_source
 
 
 def _partial_loss_suffix(details: dict) -> str:

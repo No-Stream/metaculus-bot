@@ -32,6 +32,7 @@ import pytest
 
 from metaculus_bot.research.market_retrieval.settlement_join import (
     SELF_REFERENCE_DOMAINS,
+    _publisher_domain,
     normalize_host,
     question_domains,
     registrable_domain,
@@ -189,3 +190,21 @@ class TestSettlementDomainIndex:
 
     def test_returns_an_empty_index_for_an_empty_catalogue(self):
         assert settlement_domain_index([]) == {}
+
+    def test_repeated_settlement_urls_are_derived_once(self):
+        """The index is the hot path for ``_publisher_domain``: the frozen Kalshi universe carries
+        21,721 ``settlement_sources[].url`` values over only 1,378 distinct strings, so without the
+        cache it re-derives the same answer ~15x per URL (52ms of PSL work versus 3ms). Pinned
+        because the cache is invisible at the call site and a well-meaning "remove the unused
+        decorator" would put the 49ms back with a green suite."""
+        repeated = "https://www.bls.gov/news.release/empsit.htm"
+        events = [
+            {"event_ticker": f"KXJOBS-{i}", "settlement_sources": [{"name": "BLS", "url": repeated}]} for i in range(50)
+        ]
+
+        _publisher_domain.cache_clear()
+        settlement_domain_index(events)
+        info = _publisher_domain.cache_info()
+
+        assert info.misses == 1, "the same URL must be reduced to a publisher exactly once"
+        assert info.hits == 49

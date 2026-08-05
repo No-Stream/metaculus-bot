@@ -18,12 +18,13 @@ socket or bills a key.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1052,6 +1053,25 @@ class TestFetchMarketSnapshot:
         assert (mock_question.id_of_question, as_of_b.isoformat()) in pmp._SNAPSHOT_CACHE
         assert (mock_question.id_of_question, "none") in pmp._SNAPSHOT_CACHE
 
+    def test_one_instant_spelled_three_ways_is_one_cache_key(self) -> None:
+        """The key normalizes through `time_utils._as_utc`, so equal instants cannot miss.
+
+        Naive-UTC, explicit `+00:00` and an offset-aware spelling of the SAME instant are one
+        cache entry, and a genuinely different instant is a different one. Worth pinning
+        because the naive-vs-aware branch used to be respelled here rather than shared with
+        the copy `assemble_pool` applies to the same value; two spellings drifting apart
+        would silently re-fetch (a wasted pull) or, if they drifted the other way, serve a
+        snapshot computed at the wrong `as_of`.
+        """
+        naive = datetime(2026, 8, 4, 12, 0, 0)
+        utc = datetime(2026, 8, 4, 12, 0, 0, tzinfo=timezone.utc)
+        offset = datetime(2026, 8, 4, 5, 0, 0, tzinfo=timezone(timedelta(hours=-7)))
+
+        keys = {pmp._as_of_cache_key(moment) for moment in (naive, utc, offset)}
+        assert len(keys) == 1, f"one instant must yield one key; got {keys}"
+        assert pmp._as_of_cache_key(None) == "none"
+        assert pmp._as_of_cache_key(utc) != pmp._as_of_cache_key(datetime(2026, 8, 4, 13, tzinfo=timezone.utc))
+
     @pytest.mark.asyncio
     async def test_an_explicit_as_of_filters_the_pool_before_the_ranker_sees_it(self, mock_question):
         """The leakage filter survives for explicit callers, and it filters the POOL.
@@ -1155,11 +1175,23 @@ class TestFetchMarketSnapshot:
         port deliberately left open — whether ranker attention decays down a ~400-candidate
         prompt, and whether Manifold detail enrichment changes which rows get picked. Both then
         answer themselves from prod logs instead of another bake-off.
+
+        So the expectation is the EXACT index string, derived from the prompt the ranker was
+        actually shown rather than pattern-matched as `\\d+`: an index that is merely well-formed
+        answers neither question. `_pool_positions` recovers the index by the venue-native id
+        after `apply_picks` has already copied the rows, and every way that recovery can go
+        wrong — keying on the title so two same-titled rows collide, or missing entirely and
+        yielding the `-1` sentinel — produces a well-formed line that a lax pattern accepts.
         """
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
+        prompts: list[str] = []
+
+        def _capture(prompt: str) -> str:
+            prompts.append(prompt)
+            return _rank_one_per_venue(prompt)
 
         with caplog.at_level(logging.INFO):
-            snapshot = await _fetch(mock_question, handlers, ranking=_rank_one_per_venue)
+            snapshot = await _fetch(mock_question, handlers, ranking=_capture)
 
         lines = [rec.getMessage() for rec in caplog.records if "MARKET_RANKING:" in rec.getMessage()]
         assert len(lines) == 1, lines
@@ -1169,8 +1201,38 @@ class TestFetchMarketSnapshot:
         assert f"rows={len(snapshot.matches)}" in line
         assert re.search(r"pool=[1-9]\d*", line), line
         assert re.search(r"prompt_chars=[1-9]\d*", line), line
-        for rank, row in enumerate(snapshot.matches):
-            assert re.search(rf"{row.platform}:\d+@{rank}", line), line
+
+        # The prompt's candidate indices ARE the pool indices, and the stub picks the first
+        # candidate of each venue block in block order, which is the rank order `apply_picks`
+        # stamps. So the whole `rendered=` field is predictable from the prompt alone.
+        first_of: dict[str, int] = {}
+        for match in _CANDIDATE_LINE_RE.finditer(prompts[0]):
+            first_of.setdefault(match.group(2), int(match.group(1)))
+        expected = ",".join(f"{venue}:{index}@{rank}" for rank, (venue, index) in enumerate(first_of.items()))
+
+        assert f"rendered={expected}" in line, line
+        assert len(first_of) > 1 and any(index > 0 for index in first_of.values()), (
+            f"the fixture must span several venue blocks so a nonzero index is under test; got {first_of}"
+        )
+
+    def test_the_pool_index_recovery_falls_back_to_the_title_then_to_a_minus_one_sentinel(self):
+        """The recovery's two edge cases, driven directly because no live payload can reach them.
+
+        `_pool_positions` recovers an index by venue-native id, falling back to the title for a
+        row a venue shipped without one. Every venue in the fixtures ships an id, so the fallback
+        and the `-1` miss are unreachable end to end — and a silent `-1` in prod would read as a
+        real index to anyone eyeballing the line, so both halves need pinning here.
+        """
+        in_pool = _row("In the pool", platform="kalshi")
+        in_pool.venue_market_id = "KX-1"
+        id_less = _row("No id anywhere", platform="manifold")
+        pool = generation.PoolResult(candidates=(in_pool, id_less))
+
+        orphan = _row("Never assembled", platform="polymarket")
+        orphan.venue_market_id = "not-in-pool"
+        positions = pmp._pool_positions(pool, [in_pool, id_less, orphan])
+
+        assert [index for index, _ in positions] == [0, 1, -1]
 
 
 # ---------------------------------------------------------------------------
@@ -1274,6 +1336,20 @@ class TestProviderFactory:
 
     def test_the_default_timeout_clears_the_stage_budget(self):
         assert PREDICTION_MARKET_TIMEOUT >= pmp.SNAPSHOT_STAGE_BUDGET_S
+
+    def test_the_snapshot_timeout_default_is_the_same_constant_the_provider_passes(self):
+        """Read off the signature, because a literal default here is a guaranteed timeout.
+
+        The provider path always passes `timeout=` explicitly, so a stale default degrades
+        nothing in prod and nothing else would catch it — but a direct caller (backtest, replay
+        tool) omitting the argument gets `error(timeout)` on every question plus a source-loss
+        bump, since stage 1a alone outruns the 5.0s this default carried while
+        `SNAPSHOT_STAGE_BUDGET_S` grew past 130s.
+        """
+        default = inspect.signature(pmp.fetch_market_snapshot).parameters["timeout"].default
+
+        assert default == PREDICTION_MARKET_TIMEOUT
+        assert default >= pmp.SNAPSHOT_STAGE_BUDGET_S
 
 
 # ---------------------------------------------------------------------------
