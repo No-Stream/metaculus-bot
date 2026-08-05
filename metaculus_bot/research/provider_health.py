@@ -78,6 +78,26 @@ VENUE_EXPECTED_LIQUIDITY_FIELDS: dict[str, tuple[str, ...]] = {
 SIGNAL_MARKET_FIELD_CONTRACT = "market_field_contract"
 SIGNAL_CATALOGUE_EMPTY = "catalogue_empty"
 
+# Where a finding's remedy sends the operator. The match builders and the prefetch parsing live
+# one module per venue in the venues package; `prediction_market.py` is only the seam that calls
+# them, so naming it sent the reader to a file with no parsing in it. Signal C's key is a
+# catalogue SOURCE (`kalshi_events`) rather than a venue, hence both spellings here.
+_VENUES_PACKAGE_PATH = "metaculus_bot/research/market_retrieval/venues/"
+_VENUE_MODULES: dict[str, str] = {
+    "polymarket": "polymarket.py",
+    "kalshi": "kalshi.py",
+    "kalshi_events": "kalshi.py",
+    "manifold": "manifold.py",
+    "predictit": "predictit.py",
+    "predictit_markets": "predictit.py",
+}
+
+
+def _venue_module_path(venue: str) -> str:
+    """The file to open for ``venue``, or the package when the name is not one we know."""
+    module = _VENUE_MODULES.get(venue)
+    return f"{_VENUES_PACKAGE_PATH}{module}" if module else _VENUES_PACKAGE_PATH
+
 
 @dataclass(frozen=True, slots=True)
 class VenueObservation:
@@ -255,7 +275,7 @@ def _field_contract_findings(observations: list[VenueObservation], today: date |
                     "the rendered `signal` column read no-liquidity-data on every row, and the forecaster "
                     "prompt tells models to weight market signals by it. Likely an upstream field rename; "
                     "check the venue's API payload against the match builder in "
-                    "metaculus_bot/research/prediction_market.py"
+                    f"{_venue_module_path(venue)}"
                 ),
                 suppressed_until=_suppression_for(venue, today),
             )
@@ -288,7 +308,7 @@ def _catalogue_findings(observations: list[CatalogueObservation], today: date | 
                 remedy=(
                     "the prefetch reported success and returned an empty catalogue, so the local fuzzy "
                     "matcher had nothing to match against on any question. Check the prefetch's response "
-                    "parsing in metaculus_bot/research/prediction_market.py"
+                    f"parsing in {_venue_module_path(source)}"
                 ),
                 suppressed_until=_suppression_for(source, today),
             )

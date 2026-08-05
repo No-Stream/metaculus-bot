@@ -27,6 +27,15 @@ gracefully on transient network errors (aiohttp.ClientError, asyncio.TimeoutErro
 5xx blip or slow upstream doesn't break a dev loop. Genuine schema breaks — a renamed
 field, a moved nesting level, a changed search contract — are NOT caught and fail loud,
 which is the point.
+
+**A skip is for a lost FETCH, never for an empty RESULT.** Every leg splits the two on the
+venue's own contract — `None` from the search fetchers, a non-empty `token` or `complete=False`
+from the Kalshi catalogue pull — and a SUCCESSFUL fetch that parsed to zero rows is asserted
+against, not skipped. `if not matches: pytest.skip(...)` is what let Manifold return nothing for
+17 straight days with the one live check reporting green: it treated the failure mode as a reason
+not to run. Each query here is chosen to have a guaranteed non-empty answer (a 3-token query
+about the sitting US president; two unfiltered whole-universe dumps), so zero rows is a defect
+rather than a fact about today's market listings.
 """
 
 from __future__ import annotations
@@ -91,8 +100,14 @@ async def test_polymarket_real_search_returns_parseable_response():
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Polymarket transient error: {e}")
 
-    if not matches:
-        pytest.skip("No matches from Polymarket (transient or zero-result)")
+    # `None` and `[]` are different answers and only one of them is a reason not to run. A lost
+    # fetch (retry-exhausted 5xx, a 200 whose top-level shape changed) is transient and skips; a
+    # SUCCESSFUL search that parsed to zero rows for a 3-token query about the sitting US
+    # president is the query-contract regression this file exists to catch, and skipping on it is
+    # how a venue that had returned nothing for 17 straight days stayed invisible.
+    if matches is None:
+        pytest.skip("Polymarket fetch failed (transient)")
+    assert matches, "Polymarket returned zero rows for 'Trump president 2026' — the search contract changed"
 
     m0 = matches[0]
     assert m0.platform == "polymarket"
@@ -127,7 +142,11 @@ async def test_manifold_real_search_returns_parseable_response():
     # a venue that had returned zero rows for 17 straight days stayed invisible: the one
     # live check treated the failure mode as a reason not to run. "Trump president 2026"
     # is 3 content tokens, comfortably inside Manifold's strict-conjunction limit, so an
-    # empty result here is a real defect.
+    # empty result here is a real defect. A lost FETCH is still transient, and it is split off
+    # explicitly rather than left to `assert matches` — a bare truthiness check reports a 503 as
+    # "the search contract changed", which sends the reader after a defect that isn't there.
+    if matches is None:
+        pytest.skip("Manifold fetch failed (transient)")
     assert matches, "Manifold returned nothing for a 3-token query — the search contract changed"
 
     m0 = matches[0]
@@ -182,8 +201,16 @@ async def test_kalshi_real_prefetch_and_search_returns_parseable_response():
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"Kalshi prefetch transient error: {e}")
 
-    if not pull.events:
-        pytest.skip("Kalshi prefetch returned no events (transient)")
+    # The catalogue pull carries RICHER discriminators than the None-vs-`[]` leaf contract, so the
+    # transient-versus-regression split reads them rather than the row count. A non-empty `.token`
+    # or `complete=False` means pagination did not finish on its own terms (a 5xx, a 429, the wall,
+    # a truncating bound) — transient, skip. An empty catalogue that reports itself COMPLETE with
+    # no token is Kalshi claiming it lists no open events at all, which is the "success with an
+    # empty universe" contradiction Signal C exists for; skipping on it is how a dead catalogue
+    # would stay invisible here.
+    if pull.token or not pull.complete:
+        pytest.skip(f"Kalshi prefetch did not complete (transient): token={pull.token or 'none'}")
+    assert pull.events, "Kalshi reported a COMPLETE pull of an empty open-events catalogue — the /events contract broke"
 
     # Liquidity-field contract, checked against the LIVE payload rather than a fixture.
     # This is the check that was missing: the previous version asserted only `platform`
@@ -231,8 +258,13 @@ async def test_predictit_real_prefetch_and_search_returns_parseable_response():
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             pytest.skip(f"PredictIt prefetch transient error: {e}")
 
-    if not markets:
-        pytest.skip("PredictIt prefetch returned no markets (transient)")
+    # Same split as the Polymarket leg. `None` is a lost fetch (retry-exhausted 5xx, or a 200
+    # whose top-level shape is no longer `{markets: [...]}`) and skips; a successful fetch of an
+    # EMPTY dump is a real defect — `/marketdata/all/` is an unfiltered ~197-market universe with
+    # no query to return nothing for, so zero markets means the endpoint's contract changed.
+    if markets is None:
+        pytest.skip("PredictIt prefetch failed (transient)")
+    assert markets, "PredictIt's unfiltered /marketdata/all/ dump came back empty — the endpoint contract changed"
 
     # Schema contract: every market carries a name and a contract list; contracts
     # carry lastTradePrice. Fail loud on a schema break.

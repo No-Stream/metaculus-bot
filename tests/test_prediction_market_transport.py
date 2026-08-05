@@ -4,7 +4,7 @@ Two seams the venue-level unit tests cannot reach:
 
 - the one bounded-GET helper every venue path sits on, exercised THROUGH a venue so the
   retry/`None`-vs-`[]` degradation contract is under test rather than the parser,
-- the 6h catalogue cache, which the seam owns outright (`venues.py` is cache-free) and whose
+- the 6h catalogue cache, which the seam owns outright (the `venues` package is cache-free) and whose
   failure modes are all about what must NOT be pinned for the TTL.
 
 Fakes, payload fixtures and the `handlers()` baseline live in `tests/market_retrieval_fakes.py`.

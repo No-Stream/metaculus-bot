@@ -9,6 +9,11 @@ PRESENTED to the ranker in, and the deterministic fail-open slate. Presenting in
 fail-open order is what makes a fail-open a truncation of what the model was shown rather
 than a different pipeline.
 
+WITHIN a channel every venue's rows carry that channel's own ordering signal, so each is sorted
+by it before the width can cut: ``fuzzy_best`` for the settlement join, the venue's inverted
+rank for venue search, ``fuzzy_best_many`` for the Kalshi universe, dump order for PredictIt
+(which has no width). No channel is compared against another.
+
 The design is recall-maximal on purpose. The bake-off measured that **selection, not
 generation, is the binding constraint**: a perfect ranker over this pool reaches 14/16
 questions while the deterministic top-4 of the same pool scores 5/16. So nothing here filters on
@@ -278,6 +283,14 @@ def assemble_pool(
         if results is None:
             continue
         matches, tally = flatten_results(list(results), venue)
+        # Ordered by the venue's OWN inverted rank before anything can cut it. `flatten_results`
+        # concatenates the per-query lists in QUERY order, so an early query's rank-9 row sat ahead
+        # of a later query's rank-0 exact hit and took its width slot — a truncation bias keyed on
+        # which query happened to be issued first. Stable, so equal ranks keep query precedence:
+        # the deterministic query set is ordered precision-descending and that tiebreak is worth
+        # keeping. Only this channel is re-ordered; the settlement join has already re-ranked
+        # itself with `fuzzy_best`, and re-ordering a whole venue POOL would break channel order.
+        matches.sort(key=lambda match: match.match_confidence, reverse=True)
         search_rows.extend(matches)
         tallies[venue] = tally
 
@@ -410,9 +423,13 @@ async def enrich_manifold(
         # would spend ranker tokens repeating the same line's own title back at it.
         if text and not row.market_title.strip().startswith(text):
             row.raw_rules = text[:MANIFOLD_DETAIL_RULES_CHARS]
-        # Unconditional: a BINARY detail carries no answers array, so this writes the `()` the
-        # field already holds rather than needing a branch to say so.
+        # Unconditional: a BINARY detail carries no answers array, so these write the `()` the
+        # fields already hold rather than needing a branch to say so. Two reads of one array,
+        # because the two consumers want different slices of it: `top_answers` is the ranker's
+        # one-line segment (three leaders, no volume) and `children` is the render's sub-rows
+        # (every answer, with its own volume).
         row.top_answers = venues.manifold_top_answers(detail)
+        row.children = venues.manifold_answer_children(detail)
 
     gathered = asyncio.gather(*(_enrich_one(row) for row in rows), return_exceptions=True)
     try:

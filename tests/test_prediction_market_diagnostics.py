@@ -148,6 +148,44 @@ class TestSnapshotSourceDiagnostics:
         assert "events" not in pmp._KALSHI_CACHE
 
     @pytest.mark.asyncio
+    async def test_a_shapeless_200_reads_as_a_LOSS_at_every_venue_and_caches_nothing(
+        self, mock_question, kalshi_events_payload
+    ):
+        """A 200 whose top-level shape changed is a loss at the seam, not a benign `none`.
+
+        The transport already converts every non-200 and every undecodable body to `None`, so
+        this shape is exactly "the endpoint still answers, but not with its documented contract".
+        Parsing it to `[]` made each venue publish `none` and bump nothing, and on PredictIt it
+        was worse than a lost signal: `_predictit_universe` caches a successful dump for 6h, so
+        one malformed response pinned an EMPTY universe as healthy and every later question read
+        it back with no HTTP at all. The cache assertion is the load-bearing half.
+        """
+        handlers = _handlers(
+            **{
+                _KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload),
+                _POLY_URL: FakeResponse(200, ["not", "an", "object"]),
+                _MANIFOLD_SEARCH_URL: FakeResponse(200, {"markets": []}),
+                _PREDICTIT_URL: FakeResponse(200, {"nope": []}),
+            }
+        )
+        # Only the provider-health class carries a reset fixture, and the catalogue assertion
+        # below reads the module-scoped store, so this test resets it itself rather than reading
+        # an earlier test's healthy PredictIt observation back as its own.
+        reset_provider_health()
+
+        snapshot = await _fetch(mock_question, handlers, ranking=_rank_one_per_venue)
+
+        assert snapshot.sources["polymarket"] == "error(all_queries_failed)"
+        assert snapshot.sources["manifold"] == "error(all_queries_failed)"
+        assert snapshot.sources["predictit"] == "error(all_queries_failed)"
+        assert "markets" not in pmp._PREDICTIT_CACHE, "a malformed dump must not be pinned as a healthy universe"
+        assert pmp.prediction_market_source_losses() == 3
+        # Signal C must not ALSO fire: a failed fetch is the source-loss counter's business, and
+        # counting it here would report one outage twice.
+        _, catalogues = recorded_observations()
+        assert "predictit_markets" not in {observation.source for observation in catalogues}
+
+    @pytest.mark.asyncio
     async def test_a_dead_query_author_is_an_additive_loss_not_a_silenced_pipeline(
         self, mock_question, kalshi_events_payload
     ):

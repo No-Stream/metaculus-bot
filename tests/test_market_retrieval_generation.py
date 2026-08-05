@@ -248,6 +248,51 @@ class TestWidths:
             == RETRIEVAL_WIDTH["manifold"]
         )
 
+    def test_the_venue_search_width_cuts_on_venue_RANK_not_on_query_order(self) -> None:
+        """Which query was issued first must not decide which rows survive the width.
+
+        `flatten_results` concatenates the per-query lists in query order, so before the sort an
+        early query's rank-9 rows sat ahead of a later query's rank-0 exact hit and took its slot.
+        The width here is filled entirely by query one, so the second query's top hit is the row
+        that gets evicted — the exact defect, and the one row a forecaster most wants to see.
+
+        The first query starts at rank 1 so its rows never TIE the second query's rank-0 hit:
+        equal ranks legitimately keep query precedence (the sibling test pins that), and a tie
+        here would make the assertion depend on the tiebreak instead of on the rank ordering.
+        """
+        width = RETRIEVAL_WIDTH["manifold"]
+        first_query = [_search_row("manifold", f"q1-{i}", f"weak row {i}", rank=i + 1) for i in range(width)]
+        second_query = [_search_row("manifold", "exact", "the exact match", rank=0)]
+
+        result = _pool(venue_search_results={"manifold": [first_query, second_query]})
+
+        ids = [row.venue_market_id for row in result.candidates]
+        assert result.per_venue_counts["manifold"] == width
+        assert "exact" in ids, "a later query's rank-0 hit was truncated behind an earlier query's tail"
+        assert ids[0] == "exact", "the highest venue rank leads the venue's block"
+        assert ids[-1] != f"q1-{width - 1}", "the weakest row must be the one the width evicts"
+
+    def test_equal_venue_ranks_keep_query_precedence(self) -> None:
+        """The sort is STABLE, deliberately: the deterministic query set is ordered
+        precision-descending, so among rows the venue ranked equally the earlier query's row is
+        the better bet and that tiebreak is worth keeping."""
+        first_query = [_search_row("manifold", "from-q1", "row", rank=0)]
+        second_query = [_search_row("manifold", "from-q2", "row", rank=0)]
+
+        result = _pool(venue_search_results={"manifold": [first_query, second_query]})
+
+        assert [row.venue_market_id for row in result.candidates] == ["from-q1", "from-q2"]
+
+    def test_the_settlement_join_channel_still_leads_the_higher_ranked_search_rows(self) -> None:
+        """The re-order is WITHIN the venue-search channel: it must not promote a search row past
+        a structural settlement hit, which is the one cross-channel ordering guarantee."""
+        joined = _kalshi_event("JOINED", title="Nonsense nobody queried", settles="https://data.bls.gov/x")
+        search = [_search_row("kalshi", "SEARCHED", "US unemployment rate", rank=0)]
+
+        result = _pool(criteria_text=BLS_CRITERIA, kalshi_events=[joined], venue_search_results={"kalshi": [search]})
+
+        assert [row.venue_market_id for row in result.candidates] == ["JOINED", "SEARCHED"]
+
     def test_predictit_has_no_width_and_the_whole_universe_reaches_the_pool(self) -> None:
         """197 markets from one GET: there is nothing to select, so a width would only discard
         evidence. Its absence from RETRIEVAL_WIDTH is the statement."""

@@ -30,6 +30,7 @@ from metaculus_bot.constants import (
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
     provider_degradation_alerts_active,
 )
+from metaculus_bot.research.market_retrieval import venues as venues_package
 from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
 from metaculus_bot.research.market_retrieval.venues import (
     kalshi_event_match,
@@ -695,4 +696,61 @@ class TestSummaryLine:
         warning = next(msg for msg in caplog.messages if msg.startswith("PROVIDER DEGRADATION"))
         assert "(alertable)" in warning
         assert "total_volume,open_interest" in warning
-        assert "prediction_market.py" in warning
+        assert "market_retrieval/venues/kalshi.py" in warning
+
+
+def _venues_module_exists(filename: str) -> bool:
+    """Whether ``filename`` is a real module inside the venues package.
+
+    Resolved off the imported package's own ``__file__`` rather than a path derived from this
+    test's location, so the check holds wherever the repo is checked out (an absolute path built
+    from the developer's tree passes locally by construction and fails on first push).
+    """
+    package_dir = Path(str(venues_package.__file__)).parent
+    return (package_dir / filename).is_file()
+
+
+class TestRemedyPathsPointAtRealFiles:
+    """The remedy string is the whole payoff of a signal, so the file it names has to exist.
+
+    Both remedies used to send the operator to ``prediction_market.py``, which is the provider
+    SEAM: it holds the caches, the counters and the stage orchestration, and not one line of
+    payload parsing. The match builders and the prefetch parsers moved to a module per venue, so
+    a reader following the old remedy opened a file with nothing to check.
+    """
+
+    @pytest.mark.parametrize("venue", sorted(VENUE_EXPECTED_LIQUIDITY_FIELDS))
+    def test_every_venues_field_contract_remedy_names_its_own_module(self, venue: str) -> None:
+        if not VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]:
+            pytest.skip(f"{venue} declares no liquidity fields, so Signal A never evaluates it")
+        _observe(venue, rows=2, fields_present=frozenset())
+
+        findings = provider_degradation_findings()
+
+        assert len(findings) == 1
+        assert f"market_retrieval/venues/{venue}.py" in findings[0].remedy
+        assert _venues_module_exists(f"{venue}.py")
+
+    @pytest.mark.parametrize(
+        ("source", "module"), [("kalshi_events", "kalshi.py"), ("predictit_markets", "predictit.py")]
+    )
+    def test_the_catalogue_remedy_maps_a_source_name_to_its_module(self, source: str, module: str) -> None:
+        """Signal C keys on a catalogue SOURCE (``kalshi_events``), not on a venue name, so the
+        mapping has to carry both spellings or the remedy degrades to the bare package path."""
+        record_catalogue_size(qid=1, source=source, entries=0, fetch_ok=True)
+
+        findings = provider_degradation_findings()
+
+        assert len(findings) == 1
+        assert f"market_retrieval/venues/{module}" in findings[0].remedy
+        assert _venues_module_exists(module)
+
+    def test_an_unknown_source_falls_back_to_the_package(self) -> None:
+        """A catalogue source nobody mapped still gets a real directory rather than a broken
+        path — the venues package is where every parser lives, so it is always a true answer."""
+        record_catalogue_size(qid=1, source="some_future_venue", entries=0, fetch_ok=True)
+
+        findings = provider_degradation_findings()
+
+        assert len(findings) == 1
+        assert findings[0].remedy.endswith("metaculus_bot/research/market_retrieval/venues/")
