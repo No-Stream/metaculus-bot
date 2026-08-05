@@ -96,6 +96,7 @@ from metaculus_bot.research.market_retrieval.types import (
     LIQUIDITY_THIN_USD,  # noqa: F401  # re-export
     MANIFOLD_HIGH_BETTORS,  # noqa: F401  # re-export
     MANIFOLD_THIN_BETTORS,  # noqa: F401  # re-export
+    MarketChild,  # noqa: F401  # re-export: the multi-outcome sub-row, archived inside MarketMatch
     MarketMatch,
     MarketSnapshot,
     SettlementSource,  # noqa: F401  # re-export: archive shape + test constructions

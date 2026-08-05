@@ -100,6 +100,31 @@ class TestFetchMarketSnapshot:
         assert all(row.relevance_label for row in snapshot.matches)
 
     @pytest.mark.asyncio
+    async def test_a_multi_outcome_markets_prices_survive_the_whole_pipeline_into_the_render(
+        self, mock_question, predictit_payload
+    ):
+        """The plumbing test for the sub-row expansion: a venue parser builds the outcomes, the pool
+        carries them, the ranker never sees them, and the renderer emits one row each.
+
+        Worth an end-to-end test rather than only unit coverage because the outcomes cross four
+        stages and the ranker layer deliberately ignores them — a stage that rebuilt rows from the
+        ranker's own view, or a pool truncation that dropped the field, would leave every
+        multi-outcome market priceless again with the venue unit tests still green. PredictIt is the
+        venue that proves it, since its market level has never quoted a price at all.
+        """
+        handlers = _handlers(**{_PREDICTIT_URL: FakeResponse(200, predictit_payload)})
+
+        snapshot = await _fetch(mock_question, handlers, ranking=_rank_one_per_venue)
+
+        rendered = format_snapshot_for_research(snapshot)
+        predictit_rows = [row for row in snapshot.matches if row.platform == "predictit"]
+        assert predictit_rows, "the ranker must have picked the PredictIt row"
+        assert predictit_rows[0].implied_prob_yes is None, "a ballot has no single probability"
+        assert [(child.title, child.implied_prob_yes) for child in predictit_rows[0].children] == [("Yes", 0.58)]
+        assert "| ↳ | Yes | 0.58 |" in rendered
+        assert _RANKER_CUE not in rendered
+
+    @pytest.mark.asyncio
     async def test_an_empty_ranking_is_a_valid_answer_and_not_a_degradation(self, mock_question, kalshi_events_payload):
         """`[]` means "nothing here bears on the question", which is the whole adaptive-width
         mechanism. Conflating it with a failure would delete that mechanism AND redden CI on a

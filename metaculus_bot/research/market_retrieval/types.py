@@ -42,6 +42,39 @@ class SettlementSource:
     url: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class MarketChild:
+    """One tradeable OUTCOME inside a multi-outcome parent, with its own correctly-matched price.
+
+    A Polymarket event, a Kalshi strike family, a multi-outcome Manifold market and a PredictIt
+    ballot are all one *market* to the ranker and several *prices* to a forecaster. The parent row
+    carries no probability in every one of those cases — there is no single number that answers the
+    parent's own title — so before this type existed the prices were either withheld or, on
+    Polymarket, taken from ``markets[0]`` and rendered under the EVENT's title: the row read
+    "How many Fed rate cuts in 2026? 0.89" where 0.89 was the "will no cuts happen" child.
+
+    Deliberately leaner than ``MarketMatch``: a child is never ranked, never deduped and never
+    joined on a settlement source, so it carries no id, url, tier or channel — the renderer fills
+    the ``relation`` and ``why`` cells with a dash for exactly that reason. What it does carry is
+    every cell that describes a PRICE: the number itself, the liquidity behind it, when it closes
+    and whether it has already settled.
+
+    ``num_bettors`` is the one field that is legitimately the PARENT's rather than the child's.
+    Manifold scores participation on unique bettors and publishes no per-answer count, so its
+    children inherit the market's — every answer really does share one bettor pool, and inheriting
+    it renders each child the same honest label as its parent instead of a false
+    ``no-liquidity-data`` on a venue that does publish per-answer volume.
+    """
+
+    title: str
+    implied_prob_yes: float | None = None
+    total_volume: float | None = None
+    open_interest: float | None = None
+    num_bettors: int | None = None
+    is_resolved: bool = False
+    close_time: datetime | None = None
+
+
 @dataclass
 class MarketMatch:
     """One market a forecaster might read as a peer cross-check.
@@ -91,14 +124,29 @@ class MarketMatch:
     retrieval_channel: str = ""
     sub_title: str = ""
     settlement_sources: tuple[SettlementSource, ...] = ()
-    # A multi-outcome market's leading `(answer_text, probability)` pairs, and the ONLY price
-    # information such a row has: `implied_prob_yes` is null on every non-BINARY Manifold market,
-    # so the `prob` column renders `-` and this field is what stands in for it. Empty on every
-    # BINARY row and on a row whose detail GET was lost, which is also what makes it the
-    # multi-outcome discriminator downstream — nothing else on the row records the outcome type.
-    # Plain pairs rather than a nested dataclass because the archive walks them into JSON arrays
-    # either way and there is no venue payload here to guard against extra keys.
+    # A multi-outcome Manifold market's leading `(answer_text, probability)` pairs, for the RANKER's
+    # one-line candidate line: `implied_prob_yes` is null on every non-BINARY Manifold market, so
+    # without these the candidate reaches the ranker with a title and nothing else. Empty on every
+    # BINARY row and on a row whose detail GET was lost. Plain pairs rather than a nested dataclass
+    # because the archive walks them into JSON arrays either way and there is no venue payload here
+    # to guard against extra keys.
+    #
+    # Deliberately NOT what the render reads — `children` is, and it keeps the whole answer array
+    # with each answer's own volume. Two reads of one payload, because a one-line prompt segment and
+    # a table row want different slices; see `manifold_answer_children`.
     top_answers: tuple[tuple[str, float], ...] = ()
+    # The multi-outcome expansion. A venue adapter fills this when the market has SEVERAL prices and
+    # the parent title has none, and the renderer emits one indented sub-row per entry. The ranker's
+    # view stays flat — a candidate line describes the parent alone and a pick costs one slot — so
+    # this field is written by the venue parsers and read only by `rendering`.
+    #
+    # ADAPTER ORDER IS THE RENDER ORDER, verbatim, exactly as the ranker's order is for parents: the
+    # renderer truncates a long list from the END, so each adapter orders by what its own venue
+    # makes worth keeping (traded size on the real-money venues, probability on Manifold, ballot
+    # order on PredictIt) and documents that choice. A row with children carries
+    # `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no single
+    # probability" a fact about the data rather than a rendering convention.
+    children: tuple[MarketChild, ...] = ()
 
 
 @dataclass
@@ -135,33 +183,63 @@ class _FetchTally:
     failed: int = 0
 
 
-def _liquidity_label(m: MarketMatch) -> str:
-    """Label how informative a market's price is, given its liquidity/participation.
+def liquidity_label_from_fields(
+    platform: str,
+    *,
+    total_volume: float | None,
+    open_interest: float | None,
+    num_bettors: int | None,
+) -> str:
+    """Label how informative a price is, given its liquidity/participation.
 
     Real-money venues (Polymarket, Kalshi) score on dollar volume / open interest;
     Manifold (play-money) scores on unique bettor count instead. A thin market is
     a noise warning: sub-$10k volume is often bot-dominated, so its price should be
     discounted relative to a deep, actively-traded market. Thresholds are tunable.
+
+    Takes loose fields rather than a row so a ``MarketChild`` sub-row is labelled by the SAME rule
+    as its parent. Two labelling paths would let a Kalshi strike and its family disagree about what
+    "thin" means.
     """
-    if m.platform == "predictit":
+    if platform == "predictit":
         # PredictIt exposes no volume/liquidity/OI fields in its all-markets dump.
         return "no-liquidity-data"
 
-    if m.platform == "manifold":
-        if m.num_bettors is None:
+    if platform == "manifold":
+        if num_bettors is None:
             return "no-liquidity-data"
-        if m.num_bettors < MANIFOLD_THIN_BETTORS:
+        if num_bettors < MANIFOLD_THIN_BETTORS:
             return "thin"
-        if m.num_bettors <= MANIFOLD_HIGH_BETTORS:
+        if num_bettors <= MANIFOLD_HIGH_BETTORS:
             return "decent"
         return "high"
 
     # Real-money venues: score on the larger of total volume and open interest.
-    if m.total_volume is None and m.open_interest is None:
+    if total_volume is None and open_interest is None:
         return "no-liquidity-data"
-    score = max(m.total_volume or 0.0, m.open_interest or 0.0)
+    score = max(total_volume or 0.0, open_interest or 0.0)
     if score < LIQUIDITY_THIN_USD:
         return "thin"
     if score <= LIQUIDITY_DEEP_USD:
         return "decent"
     return "deep"
+
+
+def _liquidity_label(m: MarketMatch) -> str:
+    """``liquidity_label_from_fields`` for a whole row. The name every consumer already imports."""
+    return liquidity_label_from_fields(
+        m.platform,
+        total_volume=m.total_volume,
+        open_interest=m.open_interest,
+        num_bettors=m.num_bettors,
+    )
+
+
+def _child_liquidity_label(platform: str, child: MarketChild) -> str:
+    """``liquidity_label_from_fields`` for one sub-row, under its parent's platform rule."""
+    return liquidity_label_from_fields(
+        platform,
+        total_volume=child.total_volume,
+        open_interest=child.open_interest,
+        num_bettors=child.num_bettors,
+    )

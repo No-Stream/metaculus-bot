@@ -451,6 +451,13 @@ _MARKET_LIQUIDITY_WEIGHTING_SENTENCE = (
 # what the comment block above exists to protect. The four tier names are verbatim from
 # `market_retrieval.ranking.TIERS`; renaming one there without renaming it here silently teaches
 # forecasters a vocabulary the table no longer uses.
+#
+# The closing `↳` sentence is POLICY, not notation — the glyph itself is explained in the rendered
+# table's own legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`), beside the table where it
+# appears. What belongs here is the anchoring rule it changes: a multi-outcome market (a Kalshi
+# strike family, a Polymarket event, a PredictIt ballot) has no single price, so the row a forecaster
+# is told to anchor on renders an empty `prob` cell, and without this clause the strongest available
+# evidence can read as priceless. One sentence; this constant ships in all three prompts.
 _MARKET_RELATION_WEIGHTING_SENTENCE = (
     "The markets are listed in order of evidential value, most valuable first, and each row carries a "
     "`relation` label saying how it relates to this question: `same_quantity_same_date` measures the same "
@@ -458,7 +465,9 @@ _MARKET_RELATION_WEIGHTING_SENTENCE = (
     "same thing at a different date, threshold, or source, so extrapolate from it rather than discounting it "
     "vaguely; `driver_or_consequence` and `weak` are context to reason from, not anchors. A row marked "
     "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
-    "evidence about what happened, not as a probability."
+    "evidence about what happened, not as a probability. A market with several outcomes has no single price, so "
+    "its own `prob` cell is blank and each outcome is listed beneath it on a `↳` row with its own price — anchor "
+    "on the outcome matching this question, and do not read the blank parent cell as a missing market."
 )
 
 

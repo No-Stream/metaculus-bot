@@ -15,7 +15,12 @@ import dataclasses
 import json
 from datetime import datetime, timezone
 
-from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot, SettlementSource
+from metaculus_bot.research.market_retrieval.types import (
+    MarketChild,
+    MarketMatch,
+    MarketSnapshot,
+    SettlementSource,
+)
 
 _CLOSE = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
@@ -64,6 +69,7 @@ class TestMarketMatchShape:
         assert match.sub_title == ""
         assert match.settlement_sources == ()
         assert match.top_answers == ()
+        assert match.children == ()
 
 
 class TestArchiveRoundTrip:
@@ -117,3 +123,34 @@ class TestArchiveRoundTrip:
         encoded = json.loads(json.dumps(as_dict, default=str))
         assert encoded["matches"][0]["top_answers"] == [["Over $4.60", 0.4992], ["Over $4.65", 0.3723]]
         assert encoded["matches"][0]["implied_prob_yes"] is None
+
+    def test_multi_outcome_children_survive_asdict_and_json_as_objects(self):
+        """The sub-rows are where a multi-outcome market's prices live, so losing them in the archive
+        would make residual analysis read every strike family, event and ballot as priceless — the
+        exact blind spot the rendering change exists to end. A nested dataclass rather than plain
+        pairs, because a child carries seven fields; `asdict` walks it the way it walks
+        `SettlementSource`."""
+        match = _positional_row()
+        match.implied_prob_yes = None  # what a market with several outcomes publishes
+        match.children = (
+            MarketChild(title="Before Nov 1, 2026", implied_prob_yes=0.175, total_volume=45_000.0, close_time=_CLOSE),
+            MarketChild(title="Before Jul 1, 2026", implied_prob_yes=0.031, is_resolved=True),
+        )
+
+        as_dict = dataclasses.asdict(MarketSnapshot(matches=[match]))
+        assert as_dict["matches"][0]["children"][0]["title"] == "Before Nov 1, 2026"
+        assert as_dict["matches"][0]["children"][0]["implied_prob_yes"] == 0.175
+
+        encoded = json.loads(json.dumps(as_dict, default=str))
+        assert encoded["matches"][0]["children"][1] == {
+            "title": "Before Jul 1, 2026",
+            "implied_prob_yes": 0.031,
+            "total_volume": None,
+            "open_interest": None,
+            "num_bettors": None,
+            "is_resolved": True,
+            # `json.dumps(default=...)` is only consulted for values the encoder cannot handle, so a
+            # `None` close date encodes as JSON null while a real one goes through `str`.
+            "close_time": None,
+        }
+        assert encoded["matches"][0]["children"][0]["close_time"].startswith("2026-08-31")

@@ -283,6 +283,7 @@ class TestPolymarketOpenInterestNesting:
         ev = payload["events"][0]
         ev["markets"][0]["openInterest"] = 4242.0
         matches = parse_polymarket_matches(payload, width=10)
+        assert matches is not None
         assert matches[0].open_interest == pytest.approx(4242.0)
 
     def test_top_level_markets_fallback_branch_also_reads_open_interest(self):
@@ -302,6 +303,7 @@ class TestPolymarketOpenInterestNesting:
             ],
         }
         matches = parse_polymarket_matches(payload, width=10)
+        assert matches is not None
         assert matches[0].open_interest == pytest.approx(90000.0)
         assert _liquidity_label(matches[0]) == "deep"
 
