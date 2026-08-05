@@ -292,9 +292,17 @@ def _first_usable_array(text: str) -> list[Any]:
     bracket inside a narrated string from shadowing the real array: on
     ``{"note": "see [3]", "picks": [{"i": 1}]}`` the first decode yields ``[3]``, and the scan
     moves on to the array that actually holds picks.
+
+    An empty array is DEFERRED rather than returned where it is found, because it is a valid
+    answer but not evidence that no better one follows. Returning it eagerly meant a wrapped
+    completion like ``{"excluded": [], "picks": [{"i": 1}]}`` rendered zero markets while its
+    picks sat unread two keys later — and the mirror-image ``{"picks": [...], "excluded": []}``
+    parsed fine, so the whole ranking turned on JSON key order. So the scan runs to the end,
+    prefers any dict-bearing array, and falls back to the empty one only when there is none.
     """
     index = text.find("[")
     saw_array = False
+    saw_empty_array = False
     while index >= 0:
         try:
             value, _ = _DECODER.raw_decode(text, index)
@@ -306,9 +314,12 @@ def _first_usable_array(text: str) -> list[Any]:
             value = None
         if isinstance(value, list):
             saw_array = True
-            if not value or any(isinstance(entry, dict) for entry in value):
+            if any(isinstance(entry, dict) for entry in value):
                 return value
+            saw_empty_array = saw_empty_array or not value
         index = text.find("[", index + 1)
+    if saw_empty_array:
+        return []
     if saw_array:
         raise RankingUnusable(f"no array of ranking objects in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling
     raise RankingUnusable(f"no JSON array found in {text[:160]!r}")  # noqa: HARNESS-SCAN-EXEMPT-subsampling  # log truncation, not data sampling

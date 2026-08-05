@@ -161,6 +161,35 @@ class TestParseRanking:
         ints, which cannot be a ranking, so the scan advances to the array that holds picks."""
         assert [pick.index for pick in parse_ranking('{"note": "see [3]", "picks": [{"i": 1}]}', 10)] == [1]
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"excluded": [], "picks": [{"i": 1}, {"i": 4}]}',
+            '{"picks": [{"i": 1}, {"i": 4}], "excluded": []}',
+        ],
+    )
+    def test_an_empty_helper_array_does_not_shadow_the_real_picks(self, text: str) -> None:
+        """An empty array is a valid ANSWER but it is not evidence there is no better one.
+
+        The scan used to return the first empty array the moment it decoded one, so a wrapped
+        completion carrying a helper key rendered ZERO markets whenever that key happened to sort
+        before the picks — the two orderings here returned `[]` and `[1, 4]` respectively off the
+        same content. Silent, total, and decided by nothing but JSON key order, which is why both
+        orderings are pinned rather than just the broken one.
+        """
+        assert [pick.index for pick in parse_ranking(text, 10)] == [1, 4]
+
+    @pytest.mark.parametrize("text", ["[]", '{"picks": []}', '{"excluded": [], "picks": []}'])
+    def test_a_completion_whose_arrays_are_all_empty_is_the_valid_empty_answer(self, text: str) -> None:
+        """The other half of the contract, and the reason the fix cannot simply skip empties.
+
+        Deferring an empty array must not DISCARD it: when no dict-bearing array turns up, the
+        remembered empty one is the model's "nothing bears on this" and has to parse rather than
+        raise, because raising is what triggers fail-open and a fail-open on a true negative
+        renders 8 near-misses.
+        """
+        assert parse_ranking(text, 10) == []
+
     @pytest.mark.parametrize("literal", ["Infinity", "-Infinity", "1e400"])
     def test_a_non_finite_index_skips_that_entry_and_keeps_its_siblings(self, literal: str) -> None:
         """`json.loads` accepts the bare literals `Infinity` / `-Infinity` and overflowing float
