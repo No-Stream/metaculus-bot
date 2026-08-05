@@ -287,25 +287,41 @@ def _first_usable_array(text: str) -> list[Any]:
     anywhere in the output, so ``'[{"i":1}]\\nExcluded: [3] and [7].'`` — a well-formed ranking
     followed by ordinary narration — failed outright.
 
-    "Usable" comes in two TIERS, and the scan runs to the end of the text rather than stopping at
-    the first hit. A list carrying at least one dict wins outright and returns immediately. An
-    EMPTY list — the model's valid "nothing bears on this" — is only the fallback, returned once
-    the scan finishes without finding a dict-bearing one. Anything else is passed over, which is
-    what keeps a bracket inside a narrated string from shadowing the real array: on
-    ``{"note": "see [3]", "picks": [{"i": 1}]}`` the first decode yields ``[3]``, and the scan
-    moves on to the array that actually holds picks.
+    "Usable" comes in three TIERS, and the scan runs to the end of the text rather than stopping
+    at the first hit:
 
-    The tiers exist because an empty array is a valid ANSWER but not evidence that no better one
-    follows. Returning it where it was found meant a wrapped completion like
-    ``{"excluded": [], "picks": [{"i": 1}]}`` rendered zero markets while its picks sat unread two
-    keys later, and the mirror-image ``{"picks": [...], "excluded": []}`` parsed fine off the same
-    content — so the whole ranking turned on JSON key order. Deferring it rather than discarding
-    it is equally load-bearing: raising on an all-empty completion would trip the fail-open and
-    render 8 near-misses on a true negative.
+    1. A list holding a dict with an ``"i"`` key wins outright and returns immediately — only the
+       ranking rows carry that key, so such a list is unambiguously the picks array.
+    2. Otherwise the FIRST list holding a dict without ``"i"`` is remembered as the fallback,
+       because a renamed index key has to reach ``parse_ranking``'s shape-regression WARN rather
+       than pass as a valid empty answer.
+    3. Otherwise an EMPTY list — the model's valid "nothing bears on this" — is remembered, and
+       returned once the scan finishes with neither of the above.
+
+    Anything else is passed over, which is what keeps a bracket inside a narrated string from
+    shadowing the real array: on ``{"note": "see [3]", "picks": [{"i": 1}]}`` the first decode
+    yields ``[3]``, and the scan moves on to the array that actually holds picks.
+
+    The tiers exist because neither an empty array nor a dict-bearing helper array is evidence
+    that no better one follows, and returning either where it was found made the whole ranking
+    turn on JSON key order. Both halves were measured: ``{"excluded": [], "picks": [{"i": 1}]}``
+    rendered zero markets while its picks sat unread two keys later, and the dict-bearing sibling
+    ``{"excluded": [{"reason": "different country"}], "picks": [{"i": 0, ...}]}`` was worse still
+    — the helper array won on the old any-dict test, ``parse_ranking`` then skipped every entry
+    for want of an ``"i"`` key, and the question lost its whole market snapshot as ``ranked`` with
+    zero rows. The mirror-image key order parsed fine off the same content in both cases.
+    Deferring the empty array rather than discarding it is equally load-bearing: raising on an
+    all-empty completion would trip the fail-open and render 8 near-misses on a true negative.
+
+    One ambiguity is unresolvable here: if a helper array's dicts ALSO carry ``"i"`` (say
+    ``{"excluded": [{"i": 3}], "picks": [{"i": 1}]}``) the first one still wins, since telling
+    them apart needs schema knowledge this scan does not have. Acceptable because the prompt asks
+    for a BARE array, so every wrapper shape is already off-spec.
     """
     index = text.find("[")
     saw_array = False
     saw_empty_array = False
+    dict_bearing_fallback: list[Any] | None = None
     while index >= 0:
         try:
             value, _ = _DECODER.raw_decode(text, index)
@@ -317,10 +333,16 @@ def _first_usable_array(text: str) -> list[Any]:
             value = None
         if isinstance(value, list):
             saw_array = True
-            if any(isinstance(entry, dict) for entry in value):
+            dicts = [entry for entry in value if isinstance(entry, dict)]
+            if any("i" in entry for entry in dicts):
                 return value
-            saw_empty_array = saw_empty_array or not value
+            if dicts and dict_bearing_fallback is None:
+                dict_bearing_fallback = value
+            elif not value:
+                saw_empty_array = True
         index = text.find("[", index + 1)
+    if dict_bearing_fallback is not None:
+        return dict_bearing_fallback
     if saw_empty_array:
         return []
     if saw_array:

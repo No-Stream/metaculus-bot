@@ -179,6 +179,37 @@ class TestParseRanking:
         """
         assert [pick.index for pick in parse_ranking(text, 10)] == [1, 4]
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"excluded": [{"reason": "different country"}], "picks": [{"i": 1, "tier": "weak"}, {"i": 4}]}',
+            '{"picks": [{"i": 1, "tier": "weak"}, {"i": 4}], "excluded": [{"reason": "different country"}]}',
+        ],
+    )
+    def test_a_dict_bearing_helper_array_does_not_shadow_the_real_picks(self, text: str) -> None:
+        """The dict-bearing sibling of the empty-helper bug, and the worse of the two.
+
+        A helper array of REASON objects satisfies any "holds a dict" test, so the old scan
+        returned it the moment it decoded one and `parse_ranking` then skipped every entry for
+        want of an `"i"` key: the question reached the caller as `ranked` with zero rows and lost
+        its whole market snapshot, with only the "yielded no usable pick" WARN as a trace. An
+        `"i"` key is what makes an array unambiguously the picks, so the scan holds a dict-bearing
+        array as a mere fallback and keeps looking. Both key orders are pinned because key order
+        is the only thing that decided the outcome.
+        """
+        assert [pick.index for pick in parse_ranking(text, 10)] == [1, 4]
+
+    def test_a_dict_bearing_array_without_an_index_key_is_still_the_fallback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Deferring the dict-bearing array must not DISCARD it either. When nothing carrying
+        `"i"` turns up, the remembered one has to reach the shape-regression WARN — a renamed
+        index key is a genuine defect and must not pass silently as the valid empty answer, which
+        is what returning `[]` from here would look like downstream."""
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.ranking"):
+            assert parse_ranking('{"picks": [{"index": 0}, {"index": 1}]}', 10) == []
+        assert any("yielded no usable pick" in message for message in caplog.messages)
+
     @pytest.mark.parametrize("text", ["[]", '{"picks": []}', '{"excluded": [], "picks": []}'])
     def test_a_completion_whose_arrays_are_all_empty_is_the_valid_empty_answer(self, text: str) -> None:
         """The other half of the contract, and the reason the fix cannot simply skip empties.
