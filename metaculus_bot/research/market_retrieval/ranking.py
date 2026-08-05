@@ -287,18 +287,21 @@ def _first_usable_array(text: str) -> list[Any]:
     anywhere in the output, so ``'[{"i":1}]\\nExcluded: [3] and [7].'`` — a well-formed ranking
     followed by ordinary narration — failed outright.
 
-    "Usable" means a list that is either EMPTY (the model's valid "nothing bears on this") or
-    carries at least one dict. Anything else advances to the next ``[``, which is what keeps a
-    bracket inside a narrated string from shadowing the real array: on
+    "Usable" comes in two TIERS, and the scan runs to the end of the text rather than stopping at
+    the first hit. A list carrying at least one dict wins outright and returns immediately. An
+    EMPTY list — the model's valid "nothing bears on this" — is only the fallback, returned once
+    the scan finishes without finding a dict-bearing one. Anything else is passed over, which is
+    what keeps a bracket inside a narrated string from shadowing the real array: on
     ``{"note": "see [3]", "picks": [{"i": 1}]}`` the first decode yields ``[3]``, and the scan
     moves on to the array that actually holds picks.
 
-    An empty array is DEFERRED rather than returned where it is found, because it is a valid
-    answer but not evidence that no better one follows. Returning it eagerly meant a wrapped
-    completion like ``{"excluded": [], "picks": [{"i": 1}]}`` rendered zero markets while its
-    picks sat unread two keys later — and the mirror-image ``{"picks": [...], "excluded": []}``
-    parsed fine, so the whole ranking turned on JSON key order. So the scan runs to the end,
-    prefers any dict-bearing array, and falls back to the empty one only when there is none.
+    The tiers exist because an empty array is a valid ANSWER but not evidence that no better one
+    follows. Returning it where it was found meant a wrapped completion like
+    ``{"excluded": [], "picks": [{"i": 1}]}`` rendered zero markets while its picks sat unread two
+    keys later, and the mirror-image ``{"picks": [...], "excluded": []}`` parsed fine off the same
+    content — so the whole ranking turned on JSON key order. Deferring it rather than discarding
+    it is equally load-bearing: raising on an all-empty completion would trip the fail-open and
+    render 8 near-misses on a true negative.
     """
     index = text.find("[")
     saw_array = False
