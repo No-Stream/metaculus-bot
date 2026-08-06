@@ -1,3 +1,4 @@
+# noqa: HARNESS-SCAN-EXEMPT-monolithic-file-loc  # one class per MARKER_SPECS entry; a split fragments the registry
 """Tests for the run-log telemetry marker parser (scripts/telemetry/markers.py).
 
 Each example line below is copied from the format string in the emitting code
@@ -10,6 +11,7 @@ tests loudly instead of silently dropping records from the archive:
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
+* MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * STACKER_OUTCOME/TOOLS_USED/ANCHOR_OVERSHOOT_PP/CLAUSE_PRODUCT_DIVERGENCE_PP
   -> metaculus_bot/comment/markers.py (HTML-comment markers; see module docstring
@@ -95,6 +97,24 @@ CLOSE_MARGIN_LINE = (
 CLOSE_MARGIN_NA_LINE = (
     PFX + "CLOSE_MARGIN: question=44620 close_time=2026-07-20T00:00:00+00:00 "
     "submitted_at=2026-07-19T00:00:00+00:00 window_s=n/a margin_s=86400 margin_frac=n/a"
+)
+# Captured by calling metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
+# under the prod log format, so these are emitted bytes rather than a transcription. The
+# four shapes are the four the emitter can produce: a normal ranked slate, an empty pool,
+# a fail-open, and a row whose pool index could not be recovered.
+MARKET_RANKING_RANKED_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=2 prompt_chars=36412 "
+    "rendered=polymarket:2@0,kalshi:0@1"
+)
+MARKET_RANKING_EMPTY_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=0 outcome=empty rows=0 prompt_chars=0 rendered=none"
+)
+MARKET_RANKING_FAILOPEN_LINE = (
+    PFX + "MARKET_RANKING: question=None pool=4 outcome=failopen rows=2 prompt_chars=36412 "
+    "rendered=polymarket:2@0,kalshi:0@1"
+)
+MARKET_RANKING_UNTRACEABLE_INDEX_LINE = (
+    PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=1 prompt_chars=36412 rendered=manifold:-1@0"
 )
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
@@ -389,6 +409,59 @@ class TestCloseMargin:
         assert rec["margin_s"] == 86400
 
 
+class TestMarketRanking:
+    """The ranked-retrieval port's own post-ship instrument, so it has to reach the archive.
+
+    `rendered`'s pool indices are what answer the two questions the port left open (ranker
+    attention decay down a ~400-candidate prompt, and whether Manifold detail enrichment
+    changes the picks); `prompt_chars` is the free prod distribution against the prompt
+    ceiling. Run logs leave GHA at 90 days, so anything unharvested is unanswerable later.
+    """
+
+    def test_ranked_run_fields(self):
+        rec = _parse_one(MARKET_RANKING_RANKED_LINE)
+        assert rec["marker"] == "market_ranking"
+        assert rec["pool"] == 4
+        assert rec["outcome"] == "ranked"
+        assert rec["rows"] == 2
+        assert rec["prompt_chars"] == 36412
+        # The venue:pool_index@rank list survives whole — the indices are the instrument.
+        assert rec["rendered"] == "polymarket:2@0,kalshi:0@1"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_RANKING_RANKED_LINE)
+        # prediction_market.py emits question.id_of_question, not the post id.
+        assert rec["qid"] == 44620
+        assert rec["qid_kind"] == "question_id"
+
+    def test_empty_pool_run_is_distinguishable_from_a_declining_ranker(self):
+        # `empty` means the pool had nothing to rank (a retrieval story), while a ranker
+        # that legitimately returned zero rows reads `outcome=ranked rows=0` — the two
+        # must not collapse, since only the first implicates the venues.
+        rec = _parse_one(MARKET_RANKING_EMPTY_LINE)
+        assert rec["outcome"] == "empty"
+        assert rec["pool"] == 0
+        assert rec["rows"] == 0
+        assert rec["prompt_chars"] == 0
+        # "none" is a _NONE_SENTINELS value, so an unrendered slate reads as None.
+        assert rec["rendered"] is None
+
+    def test_failopen_run_and_absent_qid(self):
+        # A fail-open renders the head of the ranker's own input, so its rows are still
+        # worth measuring; qid is Optional at the call site and renders as "None".
+        rec = _parse_one(MARKET_RANKING_FAILOPEN_LINE)
+        assert rec["outcome"] == "failopen"
+        assert rec["rows"] == 2
+        assert rec["qid"] is None
+
+    def test_untraceable_pool_index_sentinel_survives(self):
+        # -1 means the rendered row could not be matched back to a pool entry, which is a
+        # defect in the index recovery rather than a real position — it must stay visible
+        # in the archive rather than coercing into the index distribution as a 0.
+        rec = _parse_one(MARKET_RANKING_UNTRACEABLE_INDEX_LINE)
+        assert rec["rendered"] == "manifold:-1@0"
+
+
 class TestCredit:
     def test_balance(self):
         rec = _parse_one(CREDIT_BALANCE_LINE)
@@ -551,7 +624,7 @@ class TestParseLogText:
 
 
 # Example lines copied from the emitting format string
-# (metaculus_bot/forecaster.py:_emit_forecaster_drop_telemetry) — the source of
+# (metaculus_bot/drop_telemetry.py:emit_drop_telemetry) — the source of
 # truth, so a producer-side shape change breaks these loudly.
 FORECASTER_DROPS_LINE = (
     PFX + "FORECASTER_DROPS: total=3 systematic=openrouter/anthropic/claude-opus-4.8 "
@@ -646,7 +719,8 @@ class TestForecastersUsed:
 
 # The per-run degradation summary — the single line that decides CI color, since
 # cli.py exits non-zero whenever alertable_count is positive. Copied from the
-# format string in metaculus_bot/forecaster.py (forecast_questions), the source of
+# format string in metaculus_bot/degradation_counters.py
+# (format_degradation_summary), the source of
 # truth. Without a spec here the archive held no record of the counter that reddens
 # every run: the 2026-07-26 research_provider_timeouts -> research_provider_failures
 # rename would have been invisible to a replay.
@@ -654,7 +728,17 @@ DEGRADATION_COUNTERS_LINE = (
     PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
-    "prediction_market_degraded=0, prediction_market_source_losses=4"
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1"
+)
+# The shape every one of the 290 archived records carries: the same keys as the
+# line above but ending at prediction_market_source_losses, i.e. no
+# provider_degradation tail. Replace-by-run re-harvesting replays these logs, so a
+# MANDATORY new group would drop all 290 records wholesale on the next sync.
+DEGRADATION_COUNTERS_NO_PROVIDER_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=0, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=0, summarizer_failures=0, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=0"
 )
 # Pre-rename shape (research_provider_timeouts, no summarizer_failures, and
 # prediction_market_platform_failures as the trailing key). Replace-by-run
@@ -669,7 +753,7 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_ten_current_keys_parse(self):
+    def test_all_eleven_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
         assert rec["forecasters_dropped"] == 2
@@ -682,6 +766,24 @@ class TestDegradationCounters:
         assert rec["gap_fill_v2_errors"] == 0
         assert rec["prediction_market_degraded"] == 0
         assert rec["prediction_market_source_losses"] == 4
+        assert rec["provider_degradation"] == 1
+
+    def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
+        """The load-bearing back-compat case. All 290 archived records end at
+        prediction_market_source_losses, so the new tail has to be optional-group
+        wrapped — a mandatory group would drop every one of them on the next
+        replace-by-run re-harvest rather than harvesting the ten counters it carries.
+        """
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_PROVIDER_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["forecasters_dropped"] == 0
+        assert rec["research_provider_failures"] == 0
+        assert rec["summarizer_failures"] == 0
+        assert rec["gap_fill_v2_errors"] == 0
+        assert rec["prediction_market_degraded"] == 0
+        assert rec["prediction_market_source_losses"] == 0
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert rec["provider_degradation"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -703,6 +805,160 @@ class TestDegradationCounters:
         assert rec["research_provider_failures"] is None
         assert rec["summarizer_failures"] is None
         assert rec["prediction_market_source_losses"] is None
+
+
+# The per-run provider-degradation summary (metaculus_bot/research/provider_health.py
+# log_provider_degradation_summary), the marker counterpart to the
+# provider_degradation counter above. Two shapes: findings, and the healthy zero
+# (emitted anyway, so "no provider degraded" is recorded rather than absent).
+PROVIDER_DEGRADATION_LINE = (
+    PFX + "PROVIDER_DEGRADATION: run=30784152530 findings=2 alertable=2 suppressed=0 "
+    'detail=[{"signal":"market_field_contract","venue":"kalshi","questions":1,'
+    '"fields":"total_volume,open_interest","pool_rows":40},'
+    '{"signal":"catalogue_empty","venue":"predictit_markets","questions":1,"entries":0,"fetch_ok":true}]'
+)
+PROVIDER_DEGRADATION_CLEAN_LINE = PFX + "PROVIDER_DEGRADATION: run=local findings=0 alertable=0 suppressed=0 detail=[]"
+PROVIDER_DEGRADATION_SUPPRESSED_LINE = (
+    PFX + "PROVIDER_DEGRADATION: run=local findings=1 alertable=0 suppressed=1 "
+    'detail=[{"signal":"market_field_contract","venue":"manifold","questions":1,"fields":"num_bettors",'
+    '"pool_rows":12,"suppressed_until":"2026-09-10"}] '
+    "(manifold:market_field_contract suppressed until 2026-09-10); run stays green on those."
+)
+
+
+class TestProviderDegradation:
+    def test_fields(self):
+        rec = _parse_one(PROVIDER_DEGRADATION_LINE)
+        assert rec["marker"] == "provider_degradation"
+        # A GHA run id is integer-looking so coerce_value makes it an int, while the
+        # local sentinel stays a str (below). The archive's own ``run_id`` metadata
+        # field is the join key either way; this group is the in-line cross-check.
+        assert rec["run"] == 30784152530
+        assert rec["findings"] == 2
+        assert rec["alertable"] == 2
+        assert rec["suppressed"] == 0
+
+    def test_local_run_sentinel_stays_a_string(self):
+        assert _parse_one(PROVIDER_DEGRADATION_CLEAN_LINE)["run"] == "local"
+
+    def test_detail_json_round_trips(self):
+        """``detail`` is a JSON array captured verbatim (it belongs to _RAW_FIELDS
+        beside FORECASTER_DROPS' detail): venue and field names are delimiter-hostile
+        and residual analysis json.loads it, so coercion would mangle it."""
+        rec = _parse_one(PROVIDER_DEGRADATION_LINE)
+        payload = json.loads(rec["detail"])
+        assert [entry["signal"] for entry in payload] == ["market_field_contract", "catalogue_empty"]
+        assert payload[0]["fields"] == "total_volume,open_interest"
+        assert payload[1]["venue"] == "predictit_markets"
+
+    def test_clean_run_parses_with_an_empty_detail_array(self):
+        """A measured zero is signal, so the marker fires on healthy runs too and the
+        parser has to accept the empty array rather than skipping the line."""
+        rec = _parse_one(PROVIDER_DEGRADATION_CLEAN_LINE)
+        assert rec["findings"] == 0
+        assert json.loads(rec["detail"]) == []
+
+    def test_suppressed_run_keeps_its_arithmetic_and_resume_date(self):
+        """The suppression clause is free text AFTER the JSON, so ``detail`` must stop
+        at the closing bracket instead of swallowing it."""
+        rec = _parse_one(PROVIDER_DEGRADATION_SUPPRESSED_LINE)
+        assert rec["findings"] == 1
+        assert rec["alertable"] == 0
+        assert rec["suppressed"] == 1
+        assert json.loads(rec["detail"])[0]["suppressed_until"] == "2026-09-10"
+
+    def test_per_run_summary_carries_no_question_ref(self):
+        rec = _parse_one(PROVIDER_DEGRADATION_LINE)
+        assert "qid" not in rec
+
+
+# The per-CALL donated->personal key fallback WARN (fallback_openrouter.py
+# _log_fallback). Its counters already ride degradation_counters and the cli
+# summary, but only this line names WHICH model fell back — the difference between
+# one flaky Gemini call and every forecaster running on the operator's paid key.
+PAID_FALLBACK_LINE = (
+    PFX_WARN + "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=openai/gpt-5.6-sol, "
+    "so this call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
+    "Run will complete, then exit non-zero to alert. error=APIError: litellm.APIError: "
+    'OpenrouterException - {"error":{"message":"Key limit exceeded (total limit)","code":403}}'
+)
+PAID_FALLBACK_SUPPRESSED_LINE = (
+    PFX_WARN + "PAID PERSONAL-KEY FALLBACK: donated OpenRouter key failed for model=anthropic/claude-opus-4.8, "
+    "so this call billed to the personal OPENROUTER_API_KEY instead of the free donated key. "
+    "Cause is a credit shortfall, so it is NOT counted as alertable until 2026-09-10 "
+    "(operator is self-funding the season). error=APIError: insufficient credit"
+)
+
+
+class TestPaidPersonalKeyFallback:
+    def test_model_and_error_are_captured(self):
+        rec = _parse_one(PAID_FALLBACK_LINE)
+        assert rec["marker"] == "paid_personal_key_fallback"
+        assert rec["model"] == "openai/gpt-5.6-sol"
+        assert rec["error_type"] == "APIError"
+        # ``error`` holds the exception's str, which carries the 403 spend-cap phrase
+        # that distinguishes a drained key from a moderation refusal.
+        assert "Key limit exceeded" in rec["error"]
+
+    def test_suppressed_variant_parses_the_same(self):
+        """The alert-note clause between the model and the error differs by cause, so
+        the spec must not depend on its wording."""
+        rec = _parse_one(PAID_FALLBACK_SUPPRESSED_LINE)
+        assert rec["model"] == "anthropic/claude-opus-4.8"
+        assert rec["error"] == "insufficient credit"
+
+    def test_the_404_variant_is_not_captured_as_this_marker(self):
+        """The 404 no-allowed-providers branch logs a DIFFERENT line with no
+        ``PAID PERSONAL-KEY FALLBACK`` token, and it means something else (the
+        donated key's provider list doesn't cover the model, not a spend problem),
+        so it must not be harvested here."""
+        line = (
+            PFX_WARN + "Donated OpenRouter key returned 404 'no allowed providers' for model=x-ai/grok-4.5; "
+            "falling back to general (paid personal) key. error=APIError: 404"
+        )
+        harvested = parse_log_text(line + "\n", **_META)
+        assert harvested["paid_personal_key_fallback"] == []
+
+
+# The end-of-run alertable breakdown (cli.py). Emitted on BOTH exit paths — the
+# fully-suppressed green run is exactly the one that would otherwise leave no
+# record, since the credit subset can cancel the whole generic total and read
+# alertable=0 alongside real degradation.
+RUN_ALERTABLE_RED_LINE = (
+    PFX_WARN + "Run completed with 3 alertable degradation event(s) (bot=2, personal_key_fallback=1 "
+    "of which donated_404=1, credit=0); exiting non-zero so CI marks this run red."
+)
+RUN_ALERTABLE_SUPPRESSED_LINE = (
+    PFX + "Run completed with 0 alertable degradation event(s) (bot=0, personal_key_fallback=7 "
+    "of which donated_404=0, credit=7 with 7 credit event(s) suppressed until 2026-09-10, "
+    "donated_key=drained); every fallback was a suppressed credit event, so this run stays green."
+)
+
+
+class TestRunAlertableSummary:
+    def test_red_run_fields(self):
+        rec = _parse_one(RUN_ALERTABLE_RED_LINE)
+        assert rec["marker"] == "run_alertable_summary"
+        assert rec["alertable"] == 3
+        assert rec["bot"] == 2
+        assert rec["personal_key_fallback"] == 1
+        assert rec["donated_404"] == 1
+        assert rec["credit"] == 0
+        # No suppression mid-clause and no probe ran, so both are absent rather than
+        # zero — "never needed a probe" must not read as "the probe said unknown".
+        assert rec["suppressed_credit"] is None
+        assert rec["donated_key"] is None
+
+    def test_suppressed_green_run_carries_the_probe_verdict(self):
+        """The shape the drained-donated-key incident produced: alertable=0 with seven
+        real fallbacks. The verdict is what tells a reader why nothing was counted."""
+        rec = _parse_one(RUN_ALERTABLE_SUPPRESSED_LINE)
+        assert rec["alertable"] == 0
+        assert rec["personal_key_fallback"] == 7
+        assert rec["credit"] == 7
+        assert rec["suppressed_credit"] == 7
+        assert rec["resume_date"] == "2026-09-10"
+        assert rec["donated_key"] == "drained"
 
 
 # Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py

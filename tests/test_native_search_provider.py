@@ -278,9 +278,9 @@ class TestBuildNativeSearchLlmOverrides:
         """Explicit reasoning_effort="medium" beats NATIVE_SEARCH_REASONING_EFFORT=low."""
         monkeypatch.setenv("NATIVE_SEARCH_REASONING_EFFORT", "low")
 
-        captured = self._captured_kwargs(model_slug="openai/gpt-5.4-mini", reasoning_effort="medium")
+        captured = self._captured_kwargs(model_slug="openai/gpt-5.6-luna", reasoning_effort="medium")
 
-        assert "gpt-5.4-mini" in captured["model"]
+        assert "gpt-5.6-luna" in captured["model"]
         assert captured.get("reasoning") == {"effort": "medium"}
 
     def test_verbosity_override_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:

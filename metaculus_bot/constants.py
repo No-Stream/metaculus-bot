@@ -263,6 +263,34 @@ def credit_alerts_active(today: date | None = None) -> bool:
     return (today or date.today()) >= CREDIT_ALERT_RESUME_DATE
 
 
+# Prediction-market venues (or prefetch catalogues) whose degradation is KNOWN and
+# ACCEPTED, each with a dated resume. Same contract as CREDIT_ALERT_RESUME_DATE
+# above: the finding is still logged in full, still rides the PROVIDER_DEGRADATION
+# marker, and still names its resume date in the end-of-run summary — only its
+# contribution to ``alertable`` is dropped, and only until the date. Dated rather
+# than a bare boolean so a stale acceptance cannot outlive the season unnoticed,
+# and per-venue rather than global so accepting a dead Manifold does not blind the
+# operator to a dead Kalshi.
+#
+# Ships EMPTY on purpose. Both degradations this machinery was built for (Kalshi's
+# blank liquidity labels, Manifold's zero contribution) are being FIXED in the same
+# round, so suppressing either would hide the fix's own verification. The mechanism
+# exists to give the operator a documented, dated lever instead of reaching for a
+# code deletion when a venue is genuinely dead for good.
+PROVIDER_DEGRADATION_SUPPRESSED_UNTIL: dict[str, date] = {}
+
+
+def provider_degradation_alerts_active(venue: str, today: date | None = None) -> bool:
+    """Whether ``venue``'s provider-degradation findings should still exit non-zero.
+
+    ``today`` defaults to the system clock read at CALL time (not at import), so a
+    resume needs no redeploy and tests can inject a fixed date. A venue with no
+    entry is always alertable.
+    """
+    resume = PROVIDER_DEGRADATION_SUPPRESSED_UNTIL.get(venue)
+    return resume is None or (today or date.today()) >= resume
+
+
 # --- Forecasting clamps and numeric smoothing ---
 # Binary prediction clamp. Mirrors Preseen-Atlas's clip-only tail protection
 # (Atlas publishes `0.96 * estimate + 0.02`; we adopt the clip portion only).
@@ -556,8 +584,9 @@ GAP_FILL_V2_MAX_GAPS: int = _int_env("GAP_FILL_V2_MAX_GAPS", 4)
 FINANCIAL_DATA_ENABLED_ENV: str = "FINANCIAL_DATA_ENABLED"
 FRED_API_KEY_ENV: str = "FRED_API_KEY"
 # Binary-ish routing classification (is this a financial/economic question?)
-# under a 30s timeout — capability-saturated, so mini stays the cheapest capable tier.
-FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.4-mini"
+# under a 30s timeout — capability-saturated, so it rides the cheapest capable
+# tier (mini → luna 2026-08-03, when luna's markdown made it cheaper than mini).
+FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.6-luna"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
 FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
@@ -689,8 +718,8 @@ BACKTEST_DEFAULT_TOURNAMENT: str = "fall-aib-2025"
 BACKTEST_DEFAULT_MIN_FORECASTERS: int = 40
 BACKTEST_OVERFETCH_RATIO: int = 3
 # Mechanical leakage screen over research text, backtest-only — saturated task,
-# mini is the cheapest capable tier.
-LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5.4-mini"
+# luna is the cheapest capable tier (mini → luna 2026-08-03).
+LEAKAGE_DETECTOR_MODEL: str = "openrouter/openai/gpt-5.6-luna"
 
 # --- Per-type stacking gates ---
 # Each question type has an independent enable/disable flag. All three default
@@ -720,45 +749,83 @@ NUMERIC_STACKING_ENABLED_ENV: str = "NUMERIC_STACKING_ENABLED"
 # instead. See atlas_inspired_improvements.md §G.
 PREDICTION_MARKETS_ENABLED_ENV: str = "PREDICTION_MARKETS_ENABLED"
 
-# Outer wall-clock timeout for the full prediction-market snapshot (keyword
-# extraction + HTTP fan-out to all platforms). Runs inside asyncio.gather
-# alongside other research providers, so increasing this does not add
-# wall-clock time to the overall research phase.
-PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "30.0"))
+# Outer wall-clock timeout for the full prediction-market snapshot (both LLM stages, the
+# catalogue pulls, the venue fan-out and the Manifold detail enrichment). Runs inside
+# asyncio.gather alongside the other research providers, so raising it adds no wall-clock time
+# to the research phase — for scale, NATIVE_SEARCH_WALL_TIMEOUT is 420, Gemini 360, AskNews 300.
+# 150 is the ranked pipeline's 131.5s worst case (table below) plus margin; it was 30.0 under
+# the keyword/fuzzy design, which a ~36k-token ranking call and a full catalogue pull do not
+# fit inside. `prediction_market.SNAPSHOT_STAGE_BUDGET_S` recomputes that worst case from these
+# constants and WARNs loudly at provider init when an env override sits below it, so a stale
+# `PREDICTION_MARKET_TIMEOUT=30` in a .env cannot masquerade as a generic snapshot timeout.
+PREDICTION_MARKET_TIMEOUT: float = float(os.environ.get("PREDICTION_MARKET_TIMEOUT", "150.0"))
 
-# Per-attempt wall cap and backoff ladder for the keyword-extraction LLM call, which
-# is the FIRST stage of the snapshot above. Before these existed the call's only
-# bound was the snapshot-level wait_for, so a stalled extractor killed the whole
-# snapshot instead of just itself, and its retries came from forecasting-tools'
-# un-gated ``random.uniform(5, 10)`` tenacity sleep. A single short backoff (two
-# attempts, matching the effective budget the un-gated tenacity gave) rather than the
-# shared ``llm_retry.DEFAULT_TRANSIENT_BACKOFFS``, whose sleeps alone exceed the
-# snapshot budget. The wall is PER ATTEMPT, so the ceiling both values must fit under
-# is (len(backoffs) + 1) * wall + sum(backoffs), which has to stay below
-# PREDICTION_MARKET_TIMEOUT with room left for the four-platform fan-out. Redo that
-# arithmetic when changing either value — tests/test_llm_retry.py pins it.
-PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT: float = 12.0
-PREDICTION_MARKET_KEYWORD_BACKOFFS: tuple[float, ...] = (1.0,)
+# --- Ranked market retrieval (the two LLM stages and the catalogue pull) ---
+# Wall caps and backoff ladders for the snapshot's two new LLM stages, plus the bounds
+# on the full Kalshi events catalogue pull. Each stage's worst case is
+# ``(len(backoffs) + 1) * wall + sum(backoffs)``, and the SERIAL chain of those worst
+# cases has to fit under PREDICTION_MARKET_TIMEOUT. Stages 1a and 1b run concurrently,
+# so the chain takes the max of them:
+#
+#   | stage                                   | cap                    | worst |
+#   |-----------------------------------------|------------------------|-------|
+#   | 1a Kalshi catalogue (wall)              | 40.0                   |  40   |
+#   | 1b query author (concurrent with 1a)    | wall 20, backoffs (1,) |  41   |
+#   | 1a PredictIt dump (concurrent)          | 10 x 2 + 0.5           |  20.5 |
+#   | 2  venue search                         | 10 x 2 + 0.5           |  20.5 |
+#   | 2.5 manifold detail fan-out (wall)      | 10.0                   |  10   |
+#   | 4  ranking                              | wall 60, backoffs ()   |  60   |
+#   | total  max(41, 40, 20.5) + 20.5 + 10 + 60                       | 131.5 |
+#
+# The ranker gets NO retry: 36 of 36 measured calls parsed first try, a retry on a
+# ~36k-token prompt is expensive latency, and the deterministic pool-order fail-open
+# slate is a good fallback sitting right there. Its wall is 60 rather than the
+# originally specced 45 because the prompt grew ~50% (full PredictIt universe +
+# Manifold enrichment) and prefill scales with it.
+MARKET_QUERY_AUTHOR_WALL_TIMEOUT: float = 20.0
+MARKET_QUERY_AUTHOR_BACKOFFS: tuple[float, ...] = (1.0,)
+MARKET_RANKER_WALL_TIMEOUT: float = 60.0
+MARKET_RANKER_BACKOFFS: tuple[float, ...] = ()
 
-# Keyword-extraction strategy for matching Metaculus questions to market
-# listings. Default ``s4_s5_union`` is the empirical best on a 15-question
-# G0 study (67% hit rate vs 33% naive baseline; see
-# scratch_docs_and_planning/prediction_market_keyword_extraction_experiment.md).
-# ``s5_only`` is cheaper at 60%; ``simple`` is the cost-floor baseline.
-PREDICTION_MARKET_KEYWORD_STRATEGY_ENV: str = "PREDICTION_MARKET_KEYWORD_STRATEGY"
-PREDICTION_MARKET_KEYWORD_STRATEGY_VALID: frozenset[str] = frozenset({"s4_s5_union", "s5_only", "simple"})
-
-# Relevance gate for the prediction-market snapshot. A matched contract is labelled
-# ``likely-relevant`` (and its question earns the strong-evidence preamble) only when the
-# content-word overlap between the question (title + resolution criteria) and the contract
-# (title + rules) is >= MARKET_RELEVANCE_OVERLAP_MIN AND the matcher confidence is
-# >= MARKET_RELEVANCE_CONF_MIN; otherwise it is ``verify-carefully`` and the question gets a
-# neutral "fuzzy-matched, verify before weighting" preamble. Nothing is dropped — the gate only
-# governs labels + the header. Tuned on 403 hand-graded contracts (2026-07-19): 60% contract
-# precision / 57% recall, question-level header precision 34%->68%, false-strong 100%->17%. See
-# scratch/new_analyses_2026-07-18/threshold_sanity.md and market_match_precision.md §d.
-MARKET_RELEVANCE_OVERLAP_MIN: int = 3
-MARKET_RELEVANCE_CONF_MIN: float = 0.50
+# Kalshi catalogue pull: a WALL-CLOCK budget for the whole paginated fetch, retries
+# included, so pagination can never push the snapshot past its own timeout. The
+# per-page ``aiohttp.ClientTimeout`` sits under this wall, not beside it.
+#
+# ``KALSHI_PAGE_SLEEP_S`` = 0.25 is MEASURED, on the value itself. Six full cold pulls
+# through the real ``kalshi_prefetch_events`` (2026-08-04/05, free unauthenticated GETs,
+# ``scratch/market_port_2026-08-04/kalshi_page_sleep_probe.py``, receipts in that
+# directory's ``qa_artifacts/``) all completed: 10,083-10,093 events over 51 pages every
+# time, ZERO 429s, wall 16.90-25.37s against this 40s cap. Compare the zero-sleep baseline
+# it replaced — an HTTP 429 on 2 of 4 pulls, 8-18% of the catalogue lost — and the
+# 0.25 value is doing the work it was introduced for. That matters because a 429 is
+# deliberately non-retryable for this venue: the pull stops, reports incomplete, and bumps
+# BOTH degradation counters, so the sleep value can redden CI on a condition it causes.
+#
+# The wall decomposes exactly, which is what makes the headroom trustworthy rather than
+# lucky: 50 sleeps x 0.25 = 12.50s fixed, plus 4.29-12.77s of actual fetch, residual
+# ~0.10s. So the sleep is HALF to THREE-QUARTERS of the elapsed pull and the worst
+# observed case used 63% of the wall. Only the run's first question pays it (6h TTL cache),
+# and it does not move ``SNAPSHOT_STAGE_BUDGET_S`` (stage 1a already takes the max of the
+# author wall, this wall, and the HTTP stage).
+#
+# Headroom to raise it if a 429 ever returns: 0.3 projects to ~27.8s and 0.4 to ~32.8s at
+# the worst measured fetch, so 0.4 is the practical ceiling under this wall — beyond it
+# ``attempt_budget`` (which doubles as the per-page HTTP timeout) starves the late pages
+# and trades throttle-loss for wall-timeout-loss, bumping the same two counters. Raising
+# the wall alongside is the other lever.
+#
+# One residual observation, benign but worth knowing before re-probing: back-to-back pulls
+# 60s apart got monotonically slower (fetch 4.47 -> 8.15 -> 12.77s), and the same cadence
+# at 120s gaps stayed flat (4.29 / 4.41 / 7.11s). That looks like soft rate pressure that
+# drains, never a 429, and prod pulls the catalogue once per run — so it constrains probe
+# design (space pulls out, or a probe's own cadence manufactures the slowdown it reports)
+# rather than the constant.
+# EVENT_LIMIT is a runaway guard well above the ~10.1k live open events; MAX_PAGES is
+# the real bound.
+KALSHI_CATALOGUE_WALL_TIMEOUT: float = 40.0
+KALSHI_PAGE_SLEEP_S: float = 0.25
+KALSHI_PREFETCH_EVENT_LIMIT: int = 20_000
+KALSHI_PREFETCH_MAX_PAGES: int = 120
 
 # --- Time-Series Anchor Provider (Phase B) ---
 # Env-gated OFF by default. Renders a deterministic empirical-band anchor grounded
@@ -799,6 +866,22 @@ TS_ANCHOR_SECTION_MAX_CHARS: int = 6000
 TS_ANCHOR_NATIVE_TABLE_ROWS: int = 10
 TS_ANCHOR_WEEKLY_TABLE_ROWS: int = 13
 TS_ANCHOR_MONTHLY_TABLE_ROWS: int = 24
+# How far past an OPEN displayed edge a rendered band may sit before the magnitude backstop
+# treats it as a wrong-quantity anchor, measured in multiples of the displayed span. An open
+# edge means the outcome genuinely can settle beyond it, so the constraint has to loosen
+# there — but treating open as "no constraint at all" disarmed the backstop entirely on the
+# ~95% of numeric questions that carry two open bounds.
+#
+# The measured window is wide, and BOTH ends are pinned by tests so a future tweak has to
+# confront the evidence. The rule compares the NEAREST BAND EDGE (not the P50) against the
+# range, which is what makes the window wide: every band the anchor has actually published
+# overlaps its own range, so it scores 0.00 spans outside and no tolerance below 1.0 can
+# suppress it. Meanwhile the wrong-quantity shapes this exists to catch — a percent-unit band
+# on a basis-point question — sit 0.63-0.73 outside, so anything at or above ~0.63 stops
+# catching them (a 1.0 tolerance catches nothing, which is why the value is well under it).
+# Closed edges get no tolerance at all: the outcome cannot settle past them, so the original
+# zero-overlap rule stands there unchanged and this whole knob is inert.
+TS_ANCHOR_OPEN_BOUND_SPAN_TOLERANCE: float = 0.25
 
 # --- Research persistence (write path for backtest replay) ---
 PERSIST_RESEARCH_ENABLED_ENV: str = "PERSIST_RESEARCH_ENABLED"

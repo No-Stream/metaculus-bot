@@ -13,6 +13,7 @@ import pytest
 from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
+from pydantic import ValidationError
 
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import _apply_jitter_and_clamp as apply_jitter_and_clamp
@@ -228,8 +229,24 @@ async def test_numeric_percentile_set_validation():
         )
     ]
 
-    with patch("metaculus_bot.forecaster_runners.parse_structured", return_value=bad):
-        with pytest.raises(Exception):  # pydantic ValidationError via from_exception_data
+    # The bad set must arrive through the EXTRACTION LADDER, and parse_structured must
+    # return an OutcomeTypeResult. This test previously patched parse_structured with the
+    # percentile list, but at that point in run_numeric_forecast that call serves the C3
+    # outcome_type read, so production died on `outcome_result.is_discrete_integer` with an
+    # AttributeError before validation ran — which the bare `raises(Exception)` absorbed,
+    # leaving the test green while asserting nothing about percentile validation. Assert the
+    # specific ValidationError, not Exception, so an unrelated crash can't satisfy it again.
+    with (
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            return_value=OutcomeTypeResult(is_discrete_integer=False),
+        ),
+        patch(
+            "metaculus_bot.forecaster_runners.extract_numeric",
+            new=AsyncMock(return_value=ExtractionOutcome(value=bad, rung="block", block_present=True)),
+        ),
+    ):
+        with pytest.raises(ValidationError):
             await f._run_forecast_on_numeric(_as_numeric_question(q), "", _as_general_llm(DummyLLM()))
 
 

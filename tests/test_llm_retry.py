@@ -31,10 +31,13 @@ from metaculus_bot import fetch_hardening
 from metaculus_bot.constants import (
     CRUX_SOFT_DEADLINE,
     FORECASTER_SOFT_DEADLINE,
+    KALSHI_CATALOGUE_WALL_TIMEOUT,
+    MARKET_QUERY_AUTHOR_BACKOFFS,
+    MARKET_QUERY_AUTHOR_WALL_TIMEOUT,
+    MARKET_RANKER_BACKOFFS,
+    MARKET_RANKER_WALL_TIMEOUT,
     METACULUS_CLOSE_WINDOW_SECONDS,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
-    PREDICTION_MARKET_KEYWORD_BACKOFFS,
-    PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT,
     PREDICTION_MARKET_TIMEOUT,
     PUBLISH_POST_RETRIES,
     PUBLISH_POST_TIMEOUT,
@@ -55,6 +58,9 @@ from metaculus_bot.llm_retry import (
     is_broadly_retryable,
     llm_status_code,
 )
+from metaculus_bot.research.market_retrieval.generation import MANIFOLD_DETAIL_WALL_S
+from metaculus_bot.research.market_retrieval.http import HTTP_RETRY_BACKOFF_SECS, PLATFORM_HTTP_TIMEOUT
+from metaculus_bot.research.prediction_market import SNAPSHOT_STAGE_BUDGET_S
 from tests.conftest import PRODUCTION_KEY_LIMIT_403
 
 # A wall_timeout comfortably larger than any simulated call duration in these
@@ -323,9 +329,9 @@ def test_wall_timeout_is_per_attempt_not_a_total_budget() -> None:
     individually — the worst case for a call site is
     ``(len(backoffs) + 1) * wall_timeout + sum(backoffs)``, NOT ``wall_timeout``.
     Callers that size the value to fit inside an outer ``wait_for`` (see
-    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` against ``PREDICTION_MARKET_TIMEOUT``)
-    read it the other way round and silently overrun, so make the semantics explicit
-    here rather than leaving them implied by the loop body.
+    ``MARKET_QUERY_AUTHOR_WALL_TIMEOUT`` against ``PREDICTION_MARKET_TIMEOUT``) read it
+    the other way round and silently overrun, so make the semantics explicit here
+    rather than leaving them implied by the loop body.
 
     Two attempts each hitting the wall must therefore consume ~2x the wall, and the
     per-attempt ``asyncio.TimeoutError`` must not be retried (it is a SLOW failure).
@@ -363,33 +369,61 @@ def test_wall_timeout_is_per_attempt_not_a_total_budget() -> None:
     )
 
 
-def test_prediction_market_keyword_retry_budget_fits_the_snapshot_timeout() -> None:
-    """The keyword extractor's WORST CASE must fit inside the snapshot budget.
+def _stage_worst(wall: float, backoffs: tuple[float, ...]) -> float:
+    """One retried stage's worst-case wall clock.
 
-    ``PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT`` is per-attempt (see the test above), so
-    the real ceiling is ``(len(backoffs) + 1) * wall + sum(backoffs)``. At 15.0s that
-    was 31.0s against a 30.0s ``PREDICTION_MARKET_TIMEOUT`` — the exact overrun the
-    per-attempt cap was added to prevent stayed reachable, without either attempt
-    hitting its own wall: a fast ``litellm.Timeout`` at ~14.9s is retryable and under
-    the 30s elapsed gate, then the 1s backoff, then a second attempt to the wall.
-    The snapshot-level ``wait_for`` then cancels all four venues and mis-attributes
-    the loss to ``snapshot`` rather than ``keywords``.
-
-    Asserting the product (not the two halves separately) is the point: ``sum(backoffs)
-    < T`` and ``wall <= T`` both held true at 31.0s.
+    The wall is PER ATTEMPT (see the test above), so the ceiling is
+    ``(len(backoffs) + 1) * wall + sum(backoffs)`` and NOT the wall itself. At a 15.0s keyword
+    wall that product was 31.0s against a 30.0s ``PREDICTION_MARKET_TIMEOUT`` — the overrun the
+    per-attempt cap existed to prevent stayed reachable without either attempt hitting its own
+    wall, because ``sum(backoffs) < T`` and ``wall <= T`` both held true at 31.0s. Asserting
+    the product rather than the two halves separately is the whole point of this file's copy of
+    the arithmetic.
     """
-    worst_case = (len(PREDICTION_MARKET_KEYWORD_BACKOFFS) + 1) * PREDICTION_MARKET_KEYWORD_WALL_TIMEOUT + sum(
-        PREDICTION_MARKET_KEYWORD_BACKOFFS
+    return (len(backoffs) + 1) * wall + sum(backoffs)
+
+
+def test_market_retrieval_stage_budgets_fit_the_snapshot_timeout() -> None:
+    """The ranked pipeline's SERIAL CHAIN of worst cases must fit the snapshot budget.
+
+    Recomputed here from the raw constants rather than read off the module, so this is an
+    independent derivation of the arithmetic and not a restatement of it: stages 1a (Kalshi
+    catalogue, PredictIt dump) and 1b (query author) run concurrently, so the chain takes their
+    max, then venue search, then the Manifold detail fan-out, then ranking, all serial. If the
+    chain overran, the snapshot-level ``wait_for`` would cancel every stage and mis-attribute
+    the loss to ``snapshot`` rather than to whichever stage actually ran long.
+
+    The INEQUALITY is what is asserted, deliberately — not equality with a precomputed number,
+    which would have to be edited every time a wall moves and would therefore stop being a
+    check.
+    """
+    http_stage = PLATFORM_HTTP_TIMEOUT * 2 + HTTP_RETRY_BACKOFF_SECS
+    author = _stage_worst(MARKET_QUERY_AUTHOR_WALL_TIMEOUT, MARKET_QUERY_AUTHOR_BACKOFFS)
+    ranker = _stage_worst(MARKET_RANKER_WALL_TIMEOUT, MARKET_RANKER_BACKOFFS)
+    chain = max(author, KALSHI_CATALOGUE_WALL_TIMEOUT, http_stage) + http_stage + MANIFOLD_DETAIL_WALL_S + ranker
+
+    assert chain < PREDICTION_MARKET_TIMEOUT, (
+        f"the pipeline's worst-case chain of {chain}s must fit inside the {PREDICTION_MARKET_TIMEOUT}s snapshot budget"
+    )
+    # The provider recomputes the same chain to WARN when an env override sits below it, so the
+    # two derivations must agree — otherwise the warning fires (or stays silent) on a number
+    # nothing else in the codebase believes.
+    assert SNAPSHOT_STAGE_BUDGET_S == chain, (
+        f"prediction_market.SNAPSHOT_STAGE_BUDGET_S ({SNAPSHOT_STAGE_BUDGET_S}s) disagrees with the "
+        f"independently derived chain ({chain}s)"
     )
 
-    assert worst_case < PREDICTION_MARKET_TIMEOUT, (
-        f"keyword retry worst case {worst_case}s must fit inside the {PREDICTION_MARKET_TIMEOUT}s snapshot budget"
-    )
-    # Leave real room for the four-platform fan-out that runs after extraction, not
-    # merely a hair under the cap.
-    assert PREDICTION_MARKET_TIMEOUT - worst_case >= 5.0, (
-        "at least 5s of the snapshot budget must remain for the platform fan-out"
-    )
+
+def test_the_ranker_gets_no_retry() -> None:
+    """One attempt for the ranking call, by design rather than by omission.
+
+    36 of 36 measured calls parsed on the first try, a retry on a ~36k-token prompt is expensive
+    latency, and there is a good deterministic fallback sitting right there (the pool-order
+    fail-open slate). The query author DOES get one retry, because its worst case is cheap and
+    its output is additive.
+    """
+    assert MARKET_RANKER_BACKOFFS == ()
+    assert len(MARKET_QUERY_AUTHOR_BACKOFFS) == 1
 
 
 # ---------------------------------------------------------------------------

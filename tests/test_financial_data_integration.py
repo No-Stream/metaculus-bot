@@ -14,7 +14,14 @@ must contain the documented sections. We use stronger asserts than "doesn't
 crash" precisely because the provider is permissive.
 
 FRED tests skip if `FRED_API_KEY` is not set in the environment.
-yfinance has no auth requirement.
+yfinance has no auth requirement. Both APIs are free — FRED's key is free to obtain
+and its calls are unmetered — so these are outside the repo's cost gate.
+
+`allow_network` is REQUIRED alongside the env gate. The autouse `_block_network_egress`
+guard in `tests/conftest.py` blocks every non-localhost connect for a test carrying
+neither `allow_network` nor `live`, so without the marker these died on a blocked socket
+even with `RUN_INTEGRATION_TESTS=1` set and the whole file was unrunnable. Same defect
+found and fixed in `test_prediction_market_integration.py` on 2026-08-03.
 """
 
 from __future__ import annotations
@@ -23,7 +30,20 @@ import os
 
 import pytest
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.allow_network]
+
+# Spelled out so a run log states WHY this is off rather than just that it is: both
+# upstreams are free (yfinance needs no auth; a FRED key is free and its calls are
+# unmetered), so the gate keeps a network round-trip out of the dev loop and out of
+# CI's failure surface, NOT cost or credentials. Markdown-shape coverage over stubbed
+# responses runs unconditionally in tests/test_financial_data_provider.py, so what
+# this file uniquely adds is "the live API still answers this shape TODAY".
+_SKIP_REASON = (
+    "opt-in live-API check: set RUN_INTEGRATION_TESTS=1 to enable. Free (yfinance needs "
+    "no auth, FRED keys are free and unmetered) but network-dependent, so it is off by "
+    "default; provider parsing coverage runs unconditionally in "
+    "tests/test_financial_data_provider.py."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +51,7 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 def test_yfinance_real_fetch_returns_parseable_markdown():
     """yfinance returns markdown with all standard sections for AAPL."""
     from metaculus_bot.research.financial_data import _fetch_yfinance_data
@@ -50,7 +70,7 @@ def test_yfinance_real_fetch_returns_parseable_markdown():
     assert "30-day annualized volatility:" in md, "Missing volatility line"
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 def test_yfinance_real_fetch_index_symbol():
     """yfinance handles index symbols (^GSPC) the same way it handles equities."""
     from metaculus_bot.research.financial_data import _fetch_yfinance_data
@@ -65,7 +85,7 @@ def test_yfinance_real_fetch_index_symbol():
     assert "52-week range:" in md
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 def test_yfinance_real_fetch_unknown_ticker_returns_empty():
     """Unknown tickers return empty string, not a crash. Soft-fail behavior."""
     from metaculus_bot.research.financial_data import _fetch_yfinance_data
@@ -86,7 +106,7 @@ def _fred_api_key() -> str | None:
     return os.getenv("FRED_API_KEY")
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_returns_parseable_markdown():
     """FRED returns markdown with all standard sections for UNRATE (unemployment)."""
@@ -107,7 +127,7 @@ def test_fred_real_fetch_returns_parseable_markdown():
     assert "Recent observations:" in md, "Missing 'Recent observations' section"
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_includes_series_title():
     """FRED's get_series_info path populates a human-readable title in the header."""
@@ -130,7 +150,7 @@ def test_fred_real_fetch_includes_series_title():
     assert header_line.startswith("### CPIAUCSL ("), f"Header missing parenthetical title: {header_line!r}"
 
 
-@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason="set RUN_INTEGRATION_TESTS=1 to enable")
+@pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)
 @pytest.mark.skipif(not _fred_api_key(), reason="set FRED_API_KEY to enable")
 def test_fred_real_fetch_unknown_series_returns_empty():
     """Unknown FRED series return empty string. Soft-fail behavior."""

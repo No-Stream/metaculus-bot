@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
+.PHONY: install lock test test_verbose all lint format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch backtest_with_cache
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -181,10 +181,11 @@ test_fast:
 # ORDERING IS LOAD-BEARING: the comment backfill runs FIRST so it writes
 # comments_backfill.jsonl into the backfill dir, then download_research.py does ONE
 # authoritative build — download artifacts, load ALL backfill (incl. the fresh
-# comments), dedup by (qid, run_id), build. A separate --skip-download rebuild at the
-# end would CLOBBER the just-downloaded artifact records (they live only in the
-# build's in-memory records, never in the backfill dir), so we do exactly one build
-# that sees both sources.
+# comments), dedup by (qid, run_id), build. One build that sees both sources is still
+# the right shape: a separate rebuild pass used to CLOBBER the just-downloaded artifact
+# records, since they live only in the build's in-memory list and never in the backfill
+# dir. Since 2026-08-03 a rebuild also re-ingests by_qid/, so that pass is survivable
+# rather than destructive — but there is no reason to run two builds.
 sync_research:
 	@echo "=== Backfilling from Metaculus comments (historical; non-fatal — see sync_all) ==="
 	-uv run python scripts/backfill_research_from_comments.py
@@ -196,8 +197,8 @@ sync_research:
 
 # Harvest run-log telemetry markers (EXTRACTION_RUNG, GAP_FILL_V2, GHOST_PRE[_JSON],
 # GHOST_FORECAST[_JSON], OPEN_BOUND_PILING, CREDIT_*) from GHA artifacts into the durable local archive
-# (backtests/telemetry_archive/). Prod runs bundle run_logs/ inside research-* and
-# test_bot uploads a separate logs-* artifact, so the downloader pulls both families.
+# (backtests/telemetry_archive/). Every bot run bundles run_logs/ inside research-*; the
+# downloader also pulls the logs-* family the test workflows used before 2026-08-03.
 # Read-only + free (GitHub API only) and idempotent (replace-by-run), so it's safe on
 # the weekly schedule. Pass ARGS="--since-days N" to scope the pull.
 sync_telemetry:
@@ -208,7 +209,8 @@ sync_telemetry:
 
 # Archive the raw research-provider payload logs (raw_research_<run_id>.jsonl) that
 # metaculus_bot.research.raw_log appends to run_logs/. Pulls both artifact families
-# (prod runs bundle run_logs/ inside research-*; test_bot uploads a separate logs-*),
+# (every bot run bundles run_logs/ inside research-*; the test workflows used a separate
+# logs-* before 2026-08-03),
 # harvests the raw JSONL, and writes one file per run to backtests/research_archive/raw/
 # (replace-by-run, idempotent). Read-only + free; safe on the weekly schedule.
 sync_raw_research:
@@ -223,9 +225,11 @@ sync_raw_research:
 #
 # SINGLE-PASS: unlike running the three sync_* targets in sequence (which each
 # re-enumerate every artifact and re-download the overlapping research-*/logs-* families
-# into their own temp dir — ~300 downloads for ~100 artifacts), scripts/sync_all.py
-# enumerates ONCE over the union family and downloads each artifact ONCE, then runs all
-# three harvests over the shared run dirs. The Metaculus-comment backfill runs FIRST
+# — ~300 downloads for ~100 artifacts), scripts/sync_all.py enumerates ONCE over the
+# union family and downloads each artifact ONCE into the PERSISTED STORE
+# (backtests/gha_artifact_store/), then runs all three harvests over those persisted run
+# dirs. An artifact already in the store is never re-downloaded. The Metaculus-comment
+# backfill runs FIRST
 # (it hits Metaculus, not GHA) so its comments_backfill.jsonl is on disk when the
 # driver's research build loads it. NOTE: ARGS is forwarded only to sync_all.py, which
 # accepts --repo / --since-days (and the per-archive --*-dir overrides).
@@ -250,6 +254,19 @@ sync_all:
 	uv run python scripts/sync_all.py $(ARGS)
 	@echo ""
 	@echo "=== sync_all complete: research + telemetry + raw-research archives refreshed ==="
+
+# OFFLINE re-parse: rebuild all three archives from the persisted artifact store
+# (backtests/gha_artifact_store/) with ZERO network calls. This is the payoff of
+# persisting downloads — after fixing an ingest/parse bug, the artifacts' bytes are
+# already on local disk, so the corrected harvest re-runs for free and works on artifacts
+# GHA has since deleted (90-day retention). Skips the Metaculus backfill for the same
+# reason: comments_backfill.jsonl from the last sync is already on disk and the research
+# build loads it. Free, and safe to run repeatedly (every archive build is replace-by-run).
+resync_from_store:
+	@echo "=== Offline re-harvest of all three archives from backtests/gha_artifact_store/ ==="
+	uv run python scripts/sync_all.py --from-store $(ARGS)
+	@echo ""
+	@echo "=== resync_from_store complete (no network was used) ==="
 
 # Score gap-fill v2 GHOST_FORECAST markers vs published forecasts on resolved questions
 # (paired log-score deltas — the retire-v1 gate). Read-only + free. Expects ~0
@@ -283,7 +300,8 @@ backfill_research:
 # Download research artifacts into the local archive + rebuild. Enumerates EVERY
 # research-* artifact (all run-workflows) via the complete paginated artifacts REST
 # endpoint, merges with backfill, dedups, and builds. Pass ARGS="--since-days N" to
-# scope, or ARGS="--skip-download" to rebuild from backfill only (no artifact fetch).
+# scope, or ARGS="--rebuild-only" to rebuild from local data with no artifact fetch
+# (by_qid/ + backfill/ — offline and free, and it keeps the artifact records).
 download_research:
 	uv run python scripts/download_research.py $(ARGS)
 

@@ -543,8 +543,23 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
-        # The new liquidity-weighting sentence: weight a crowd signal by how informative it is.
+        # The liquidity-weighting sentence: weight a crowd signal by how informative it is.
         assert "weight each market/crowd signal by its stated liquidity/participation label" in lowered
+        # The relation axis, which ranked retrieval added alongside liquidity. The table now
+        # arrives in evidential order with a per-row `relation` grade, so the prompt has to name
+        # the ORDER, name every tier a cell can hold, and say what RESOLVED means about a price —
+        # a forecaster told to weight by a label it was never taught will guess at it.
+        assert "listed in order of evidential value" in lowered
+        for tier in ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence"):
+            assert f"`{tier}`" in lowered, tier
+        assert "realized outcome rather than a forecast" in lowered
+        # A multi-outcome market (Kalshi strike family, Polymarket event, PredictIt ballot) has no
+        # single price, so the row the forecaster is told to anchor on renders a blank `prob` cell
+        # and its outcomes carry the prices on indented sub-rows. Without this the strongest
+        # available evidence reads as a market with no price. The glyph itself is explained in the
+        # rendered table's legend; what belongs in the prompt is the anchoring rule.
+        assert "a market with several outcomes has no single price" in lowered
+        assert "anchor on the outcome matching this question" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —

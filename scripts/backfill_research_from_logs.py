@@ -13,6 +13,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The archive's source-classification vocabulary lives with the merge stage that reads it,
+# so writer and classifier can't drift into disagreeing about this writer's name.
+from scripts.download_research import LOG_BACKFILL_RUN_MODE
+
 logger = logging.getLogger(__name__)
 
 # --- Regex patterns for parsing GHA log lines ---
@@ -119,7 +123,13 @@ def parse_research_blocks(log_text: str, run_id: str) -> list[dict]:
                     "question_text": "",
                     "research_text": research_text,
                     "providers_used": detect_providers(research_text),
-                    "run_mode": "tournament",
+                    # Name this writer honestly. It used to claim "tournament", which made a
+                    # log-parsed record indistinguishable from a live capture on every field
+                    # a reader would check — and since `qid` here is a POST id (parsed from
+                    # the URL below) while live capture keys on the QUESTION id, that
+                    # ambiguity let these records win `latest/<question_id>.json` and serve
+                    # a different question's research. See download_research.record_source.
+                    "run_mode": LOG_BACKFILL_RUN_MODE,
                     "tournament_id": "",
                     "timestamp": normalize_timestamp(gha_timestamp),
                     "run_id": run_id,

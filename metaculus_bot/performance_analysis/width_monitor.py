@@ -1,17 +1,24 @@
 """Era-bucketed numeric-width / calibration monitor (READ-ONLY, free).
 
 Tracks how wide the bot's published numeric distributions are, and how well
-that width is calibrated, split by config era. The bot has historically
-oscillated between too-wide and too-narrow numeric forecasts:
+that width is calibrated, split by config era. Era boundaries are
+**merge-to-main timestamps**, not authoring dates — see the constants below.
+The bot has historically oscillated between too-wide and too-narrow numeric
+forecasts:
 
-  * Until 2026-05-12 the pipeline INTENTIONALLY widened tails (``k_tail=1.25``
+  * Until 2026-05-18 the pipeline INTENTIONALLY widened tails (``k_tail=1.25``
     in the tail-widening pass).
-  * On 2026-05-12 widening was turned off (``k_tail=1.0``, identity) after a
+  * On 2026-05-18 widening was turned off (``k_tail=1.0``, identity) after a
     calibration study showed the widened tails were too fat.
-  * On 2026-07-17 the Time-Series-Anchor prompt clause landed. It pushes
-    "sharpen, don't widen" (published low-tail coverage was ~0.03 vs a 0.10
-    target — badly too wide), so the forward risk flips toward over-sharpening.
-    This monitor is the loop-closer for that transition.
+  * On 2026-07-21 the july15 bundle landed, whose width-relevant piece is the
+    Time-Series-Anchor prompt clause. It pushes "sharpen, don't widen"
+    (published low-tail coverage was ~0.03 vs a 0.10 target — badly too wide),
+    so the forward risk flips toward over-sharpening. This monitor is the
+    loop-closer for that transition. The same merge dropped the forecaster
+    roster from six models to the latest-per-vendor triple and lowered
+    ``MIN_FORECASTERS_TO_PUBLISH``, so a width shift across this boundary
+    cannot be attributed to the anchor alone. The bucket stays empty until a
+    post-bundle numeric question resolves and is pulled.
 
 Per era it reports, on the bot's PUBLISHED 201-point CDF:
 
@@ -28,6 +35,12 @@ Per era it reports, on the bot's PUBLISHED 201-point CDF:
     read off the published CDF. This is the RAW sharpness metric and does not
     depend on resolutions — it answers "how wide are we, in absolute terms",
     complementing the coverage metrics which answer "is that width calibrated".
+  * band_miss, split into its low and high tails. ``band_miss`` is the
+    out-of-band rate (P(PIT < 0.10) + P(PIT > 0.90), i.e. 1 - raw cov80); the
+    split is what separates a band that is too TIGHT (both tails high) from one
+    that is the right width but MIS-CENTERED (one tail carries the misses).
+    ``cov80`` alone cannot express that distinction, and the two call for
+    opposite corrections.
 
 PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
 (``build_cdf_value_grid``); out-of-bounds resolutions map to PIT 0.0 (below
@@ -82,18 +95,54 @@ class Era:
 # Config-flip boundaries that plausibly shift the numeric width distribution.
 # These are the ONLY width-relevant flips (per CLAUDE.md era-bucketing guidance:
 # bucket by pipeline-behavior changes, not every git hash).
-WIDENING_FLIP = datetime(2026, 5, 12, tzinfo=timezone.utc)  # k_tail 1.25 -> 1.0
-TS_ANCHOR_ENABLE = datetime(2026, 7, 17, tzinfo=timezone.utc)  # "sharpen, don't widen" clause landed
+#
+# Each value is the committer timestamp of the MERGE COMMIT that carried the
+# change onto `main`, never the authoring date of the commit on its branch:
+# prod runs from `main`, so a change is live only from the moment it lands
+# there. A branch can sit for days, and keying on the authoring date files every
+# run in that gap under the wrong config. Re-derive with
+# `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
+WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1b: k_tail 1.25 -> 1.0
+TS_ANCHOR_ENABLE = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)  # b4e9df0: july15 bundle
+
+# Questions excluded from headline calibration rows by every other dimension of
+# the residual analysis: 43746 (Minions & Monsters) and 43747 (Toy Story 5)
+# opening-weekend gross, both mis-forecast by the pre-2026-07-07 open-bound
+# arithmetic bug rather than by judgment. Not excluded by default — callers pass
+# the set explicitly so an exclusion is always a visible choice.
+KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747"})
+
+# The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
+KNOWN_BUG_SHORTHAND = "known_bug"
+
+
+def parse_exclude_qids(raw: str) -> frozenset[str]:
+    """A ``--exclude-qids`` comma list, with the ``known_bug`` shorthand expanded in place.
+
+    The shorthand COMPOSES with explicit ids rather than only standing alone. It used to be
+    recognized only as the whole argument, so ``--exclude-qids known_bug,43800`` produced the
+    literal set ``{"known_bug", "43800"}``: no question id matches the word, so the bug pair
+    stayed in every row while the table's ``excl`` column reported one exclusion and looked
+    like it had worked.
+    """
+    tokens = {token.strip() for token in raw.split(",") if token.strip()}
+    if KNOWN_BUG_SHORTHAND not in tokens:
+        return frozenset(tokens)
+    return frozenset((tokens - {KNOWN_BUG_SHORTHAND}) | KNOWN_BUG_QIDS)
 
 
 def default_eras() -> list[Era]:
     """The three width-relevant config eras, oldest first.
 
-    ``ts_anchor`` is the active era from 2026-07-17 onward: the timeseries-anchor
-    "sharpen, don't widen" clause is enabled in prod as of that date, so records
-    published on/after it land in this bucket instead of contaminating the
-    ``widening_off`` baseline. (It stays empty only for as long as no post-enable
-    question has resolved and been pulled.)
+    ``ts_anchor`` is the active era from 2026-07-21T17:07Z (``b4e9df0``) onward.
+    That merge landed the timeseries-anchor "sharpen, don't widen" clause
+    alongside the 6-model-to-triple roster drop and gap-fill v2, so it is the
+    july15 bundle's boundary rather than the anchor's alone. It stays empty for
+    as long as no post-bundle numeric question has resolved and been pulled, and
+    ``compute_all_eras`` omits empty eras — so until then the table carries the
+    two populated eras only, and the ``ts_anchor`` row is absent rather than
+    present-and-empty. (Alongside those it still emits ``no_timestamp`` when any
+    record lacks a comment timestamp, plus the spanning ``all`` row.)
     """
     return [
         Era("widening_on (k_tail=1.25)", None, WIDENING_FLIP),
@@ -206,6 +255,7 @@ class EraWidthMetrics:
     n_pit: int
     n_eff: int
     n_width: int
+    n_excluded: int
     n_oob_low: int
     n_oob_high: int
     cov80: tuple[float, float, float]
@@ -216,6 +266,9 @@ class EraWidthMetrics:
     pit_std: float
     mean_pit: float
     median_rel_width: float | None
+    band_miss: float
+    band_lo: float
+    band_hi: float
 
     def to_dict(self) -> dict:
         return {
@@ -223,6 +276,7 @@ class EraWidthMetrics:
             "n_pit": self.n_pit,
             "n_eff": self.n_eff,
             "n_width": self.n_width,
+            "n_excluded": self.n_excluded,
             "n_oob_low": self.n_oob_low,
             "n_oob_high": self.n_oob_high,
             "cov80": {"mean": self.cov80[0], "lo": self.cov80[1], "hi": self.cov80[2]},
@@ -233,6 +287,9 @@ class EraWidthMetrics:
             "pit_std": self.pit_std,
             "mean_pit": self.mean_pit,
             "median_rel_width": self.median_rel_width,
+            "band_miss": self.band_miss,
+            "band_lo": self.band_lo,
+            "band_hi": self.band_hi,
         }
 
 
@@ -251,9 +308,14 @@ def _n_effective_clusters(post_ids: list[object]) -> int:
     return len(clusters)
 
 
-def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | None:
+def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) -> EraWidthMetrics | None:
     """Compute width/calibration metrics for one era's records. Returns None if
-    no numeric/discrete records in the era yield a PIT."""
+    no numeric/discrete records in the era yield a PIT.
+
+    ``n_excluded`` is carried through for reporting only — the caller has
+    already filtered those records out. It exists so the rendered table can say
+    that rows were dropped rather than silently reporting a smaller n.
+    """
     pits: list[float] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
@@ -290,11 +352,20 @@ def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | No
     cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
     cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
 
+    # Out-of-band rate, split by tail. band_miss == 1 - raw cov80, so it adds no
+    # information on its own; the low/high split is the point — it distinguishes
+    # a band that is too tight (both tails elevated) from one of roughly the
+    # right width that is mis-centered (misses piled in one tail), which cov80
+    # cannot, and which call for opposite corrections.
+    band_lo = float((arr < 0.10).mean())
+    band_hi = float((arr > 0.90).mean())
+
     return EraWidthMetrics(
         label=label,
         n_pit=n,
         n_eff=n_eff,
         n_width=len(widths),
+        n_excluded=n_excluded,
         n_oob_low=n_oob_low,
         n_oob_high=n_oob_high,
         cov80=cov80,
@@ -305,29 +376,53 @@ def compute_era_metrics(label: str, records: list[dict]) -> EraWidthMetrics | No
         pit_std=float(arr.std()),
         mean_pit=float(arr.mean()),
         median_rel_width=(float(np.median(widths)) if widths else None),
+        band_miss=band_lo + band_hi,
+        band_lo=band_lo,
+        band_hi=band_hi,
     )
 
 
-def compute_all_eras(data: list[dict], eras: list[Era] | None = None) -> list[EraWidthMetrics]:
+def compute_all_eras(
+    data: list[dict],
+    eras: list[Era] | None = None,
+    exclude_qids: frozenset[str] | None = None,
+) -> list[EraWidthMetrics]:
     """Bucket records by era and compute per-era metrics. Eras with no scorable
-    numeric records are omitted. Emits an ``all`` row spanning every era."""
+    numeric records are omitted. Emits an ``all`` row spanning every era.
+
+    ``exclude_qids`` drops the named questions from every row and reports the
+    dropped count per row (``EraWidthMetrics.n_excluded``, rendered in the
+    table), so an exclusion is never silent. Pass ``KNOWN_BUG_QIDS`` for the
+    documented open-bound bug pair, which every other dimension of the residual
+    analysis already excludes.
+    """
     if eras is None:
         eras = default_eras()
+    excluded = exclude_qids or frozenset()
     order = [e.label for e in eras] + [NO_TIMESTAMP_LABEL]
     buckets: dict[str, list[dict]] = {lbl: [] for lbl in order}
+    excluded_counts: dict[str, int] = {lbl: 0 for lbl in order}
     numeric_records: list[dict] = []
+    n_excluded_total = 0
     for r in data:
         if r.get("type") not in NUMERIC_TYPES:
             continue
+        label = assign_era(r, eras)
+        # The collector writes question_id straight from the API (an int), so
+        # coerce rather than compare an int against a string set and no-op.
+        if str(r.get("question_id")) in excluded:
+            excluded_counts[label] += 1
+            n_excluded_total += 1
+            continue
         numeric_records.append(r)
-        buckets[assign_era(r, eras)].append(r)
+        buckets[label].append(r)
 
     results: list[EraWidthMetrics] = []
     for lbl in order:
-        m = compute_era_metrics(lbl, buckets[lbl])
+        m = compute_era_metrics(lbl, buckets[lbl], n_excluded=excluded_counts[lbl])
         if m is not None:
             results.append(m)
-    overall = compute_era_metrics("all", numeric_records)
+    overall = compute_era_metrics("all", numeric_records, n_excluded=n_excluded_total)
     if overall is not None:
         results.append(overall)
     return results
@@ -352,19 +447,28 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "correlated families (multiple sub-questions per post), so a naive n-based CI is too narrow."
     )
     lines.append("")
-    header = (
-        "| era | n | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
-        "| PIT std | mean PIT | med rel width (n) | OOB lo/hi |"
+    lines.append(
+        "band_miss = P(PIT<0.10) + P(PIT>0.90), target 0.20 with lo ~= hi ~= 0.10. Well above 0.20 => "
+        "band too TIGHT; a lo/hi skew at roughly the target => band roughly the right width but "
+        "MIS-CENTERED (misses piled in one tail), which calls for shifting the band rather than "
+        "widening it. Distinct from OOB lo/hi, which counts resolutions outside the QUESTION's own "
+        "declared range (PIT exactly 0.0 / 1.0). excl = records dropped by --exclude-qids."
     )
-    sep = "|" + "|".join(["---"] * 12) + "|"
+    lines.append("")
+    header = (
+        "| era | n | excl | n_eff | cov80 [95% CI] | cov50 [95% CI] | cov@10 | cov@50 | cov@90 "
+        "| PIT std | mean PIT | med rel width (n) | band_miss (lo/hi) | OOB lo/hi |"
+    )
+    sep = "|" + "|".join(["---"] * 14) + "|"
     lines.append(header)
     lines.append(sep)
     for m in metrics:
         rel = f"{m.median_rel_width:.3f} ({m.n_width})" if m.median_rel_width is not None else f"n/a ({m.n_width})"
         lines.append(
-            f"| {m.label} | {m.n_pit} | {m.n_eff} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
+            f"| {m.label} | {m.n_pit} | {m.n_excluded} | {m.n_eff} | {_fmt_ci(m.cov80)} | {_fmt_ci(m.cov50)} "
             f"| {m.cov_at_10:.3f} | {m.cov_at_50:.3f} | {m.cov_at_90:.3f} "
-            f"| {m.pit_std:.3f} | {m.mean_pit:.3f} | {rel} | {m.n_oob_low}/{m.n_oob_high} |"
+            f"| {m.pit_std:.3f} | {m.mean_pit:.3f} | {rel} "
+            f"| {m.band_miss:.3f} ({m.band_lo:.3f}/{m.band_hi:.3f}) | {m.n_oob_low}/{m.n_oob_high} |"
         )
     return "\n".join(lines)
 
@@ -382,9 +486,22 @@ def main(argv: list[str] | None = None) -> None:
         help="Instead of --cached, pull a tournament live (read-only, free). Overrides --cached when set.",
     )
     parser.add_argument("--output-json", default=None, help="Optional path to also write the metrics as JSON.")
+    parser.add_argument(
+        "--exclude-qids",
+        default="",
+        help=(
+            "Comma-separated question ids to drop from every row (the count is rendered in the table "
+            f"so the exclusion is visible). The documented open-bound bug pair is {','.join(sorted(KNOWN_BUG_QIDS))}; "
+            f"pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, anywhere in the list — it composes with "
+            f"explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' excludes the pair AND 43800. "
+            "Default: exclude nothing."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
+
+    exclude_qids = parse_exclude_qids(args.exclude_qids)
 
     if args.tournament:
         # Confirm the host is the real Metaculus before the token-sending pull.
@@ -393,7 +510,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         data = load_dataset(args.cached)
 
-    metrics = compute_all_eras(data)
+    metrics = compute_all_eras(data, exclude_qids=exclude_qids)
+    if exclude_qids:
+        logger.info(f"Excluding question ids from every row: {sorted(exclude_qids)}")
     print(render_markdown(metrics))
 
     if args.output_json:

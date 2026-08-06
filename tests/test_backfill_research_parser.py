@@ -292,7 +292,12 @@ class TestParseResearchBlocks:
         assert record["gap_fill_used"] is False
         assert record["schema_version"] == 1
         assert record["question_text"] == ""
-        assert record["run_mode"] == "tournament"
+        # This writer used to claim run_mode="tournament", which made a log-parsed record
+        # indistinguishable from a live capture on every field a reader checks — and since
+        # its qid is a POST id while live capture keys on the QUESTION id, that ambiguity let
+        # these records win latest/<question_id>.json and serve a different question's
+        # research. It now names itself, which is what download_research.record_source reads.
+        assert record["run_mode"] == "backfill_from_logs"
         assert record["tournament_id"] == ""
         assert record["research_chars"] == len(record["research_text"])
 

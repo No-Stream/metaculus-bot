@@ -282,15 +282,36 @@ def _make_kalshi_events_payload() -> dict:
                         "yes_ask_dollars": "0.72",
                         "volume_24h_fp": "2500.0",
                         "close_time": "2026-12-31T23:59:59Z",
+                        "status": "active",
                     }
                 ],
             }
-        ]
+        ],
+        "cursor": "",
     }
 
 
+# The two market-retrieval LLM stages, in the shapes their parsers accept. A prose stub fails
+# BOTH: `parse_query_author` returns `()` (an additive loss) and `parse_ranking` raises, which
+# fails open to an untiered slate and therefore to the NEUTRAL preamble — so the research-content
+# assertions below would be measuring a degraded pipeline.
+_CANNED_QUERY_AUTHOR = json.dumps({"synonyms": ["orbital launch"], "framings": ["Starship orbit"]})
+_CANNED_RANKING = json.dumps([{"i": 0, "tier": "same_quantity_same_date", "why": "same event, same window"}])
+
+
+class _FakeMarketLlm:
+    """Covers both market stages, routed on the prompt each one builds."""
+
+    def __init__(self, **_kwargs):
+        pass
+
+    async def invoke(self, prompt: str) -> str:
+        await asyncio.sleep(0)
+        return _CANNED_RANKING if "Rank the candidates by EVIDENTIAL VALUE" in prompt else _CANNED_QUERY_AUTHOR
+
+
 class _FakeContent:
-    """Streams the payload as JSON bytes for the Kalshi /series stream-parse path."""
+    """Streams the payload as JSON bytes for the Kalshi catalogue stream-parse path."""
 
     def __init__(self, payload):
         self._data = b"" if payload is None else json.dumps(payload).encode()
@@ -410,17 +431,9 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
         "https://gamma-api.polymarket.com/public-search": _FakeResponse(200, _make_polymarket_payload()),
         "https://api.manifold.markets/v0/search-markets": _FakeResponse(200, _make_manifold_payload()),
         "https://api.elections.kalshi.com/trade-api/v2/events": _FakeResponse(200, _make_kalshi_events_payload()),
-        "https://api.elections.kalshi.com/trade-api/v2/series": _FakeResponse(200, {"series": []}),
+        "https://api.manifold.markets/v0/market": _FakeResponse(200, {}),
         "https://www.predictit.org/api/marketdata/all/": _FakeResponse(200, {"markets": []}),
     }
-
-    class _FakeKwLlm:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def invoke(self, _prompt: str) -> str:
-            await asyncio.sleep(0)
-            return "Starship orbit"
 
     captured_questions: list = []
     from metaculus_bot.research import prediction_market as pmp
@@ -443,7 +456,7 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
             return_value=_fake_gemini,
         ):
             with (
-                patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeKwLlm),
+                patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeMarketLlm),
                 patch.object(pmp, "_get_session", lambda: _FakeSession(handlers)),
                 patch.object(pmp, "fetch_market_snapshot", _capturing_fetch),
             ):
@@ -466,8 +479,9 @@ async def test_prediction_market_provider_integrates_with_run_providers_parallel
     # AskNews returns no articles → its block is the "No articles" message.
     assert "Gemini grounded research output" in research
     assert "## News Articles (AskNews)" in research
-    # Prediction-market formatter starts with the conditioned-relevance header
-    # (fuzzy match — verify criteria/date/topic before weighting).
+    # Prediction-market formatter leads with the strong-evidence header, which the canned
+    # ranking earns by grading its one row `same_quantity_same_date` — verify criteria, date and
+    # topic before weighting.
     assert "MAY be relevant" in research
     assert "verify each market's resolution criteria" in research
 
@@ -521,10 +535,17 @@ async def test_prediction_market_provider_disabled_flag_excludes_from_parallel(m
 
 
 @pytest.mark.asyncio
-async def test_prediction_market_provider_as_of_derives_from_question(mock_os_getenv, _reset_pm_caches):
-    """F1 + F2: when ``scheduled_resolution_time`` is present on the question,
-    the prediction-market provider derives ``as_of`` from it (with the 1-day
-    backward buffer) so the leakage filter is active."""
+async def test_prediction_market_provider_passes_no_as_of_through_the_orchestrator(mock_os_getenv, _reset_pm_caches):
+    """The provider path passes ``as_of=None``, even for a question that HAS a scheduled
+    resolution — asserted here at the orchestrator level, where a future caller might inject one.
+
+    The old derivation (``scheduled_resolution_time - 1 day``) was worse than inert. It dropped
+    every market closing before the question resolved, which is precisely the "same quantity,
+    adjacent month" class that supplied most of the ranked arm's near-identical rows, and prod
+    telemetry recorded the cost: 20 of 47 archived runs had Polymarket fetch candidates and render
+    nothing because of it. Backtest leakage is defended by the ``is_benchmarking`` guard, which
+    hard-disables the provider outright; ``as_of`` survives only for explicit callers.
+    """
     mock_os_getenv.side_effect = lambda x, default=None: {
         "RESEARCH_PROVIDER": "asknews",
         "ASKNEWS_CLIENT_ID": "client",
@@ -548,18 +569,10 @@ async def test_prediction_market_provider_as_of_derives_from_question(mock_os_ge
     handlers = {
         "https://gamma-api.polymarket.com/public-search": _FakeResponse(200, _make_polymarket_payload()),
         "https://api.manifold.markets/v0/search-markets": _FakeResponse(200, _make_manifold_payload()),
+        "https://api.manifold.markets/v0/market": _FakeResponse(200, {}),
         "https://api.elections.kalshi.com/trade-api/v2/events": _FakeResponse(200, _make_kalshi_events_payload()),
-        "https://api.elections.kalshi.com/trade-api/v2/series": _FakeResponse(200, {"series": []}),
         "https://www.predictit.org/api/marketdata/all/": _FakeResponse(200, {"markets": []}),
     }
-
-    class _FakeKwLlm:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def invoke(self, _prompt: str) -> str:
-            await asyncio.sleep(0)
-            return "Event X"
 
     from metaculus_bot.research import prediction_market as pmp
 
@@ -578,17 +591,10 @@ async def test_prediction_market_provider_as_of_derives_from_question(mock_os_ge
         mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
 
         with (
-            patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeKwLlm),
+            patch.object(pmp, "build_llm_with_openrouter_fallback", _FakeMarketLlm),
             patch.object(pmp, "_get_session", lambda: _FakeSession(handlers)),
             patch.object(pmp, "fetch_market_snapshot", _capturing_fetch),
         ):
             await bot.run_research(q)
 
-    assert len(captured_as_ofs) == 1
-    derived = captured_as_ofs[0]
-    # Buffer: as_of is strictly before scheduled_resolution_time.
-    assert derived is not None
-    assert derived < q.scheduled_resolution_time
-    # The buffer is documented as 1 day; allow a small tolerance.
-    delta = q.scheduled_resolution_time - derived
-    assert 0 < delta.total_seconds() <= 24 * 3600 * 2
+    assert captured_as_ofs == [None]

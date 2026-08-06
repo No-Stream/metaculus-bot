@@ -237,38 +237,107 @@ unrecognized (fetched-anyway-but-flagged) IDs.
 
 ### Prediction-market snapshot — `PREDICTION_MARKETS_ENABLED`
 
-A crowd-forecast cross-check (`research/prediction_market.py`). Fans out to four
-venues concurrently:
+A crowd-forecast cross-check (`research/prediction_market.py`, with the retrieval
+machinery in `research/market_retrieval/`). Generation is deliberately
+recall-maximal and ALL the judgment sits in one LLM ranking call, because the
+bake-off measured that selection, not generation, is the binding constraint: a
+perfect ranker over the pool that already exists reaches 14/16 questions while the
+same pool's deterministic top-4 reaches 5/16.
 
-- **Polymarket** (Gamma public-search, bounded retry on 403 IP rate limits).
-- **Kalshi** (no keyword endpoint — prefetch open events once per session up to
-  `KALSHI_PREFETCH_EVENT_LIMIT`, cached for `KALSHI_CACHE_TTL_S`, fuzzy-match
-  client-side with rapidfuzz).
-- **Manifold** (search endpoint, plus an extra natural-language query since its
-  search prefers that framing).
-- **PredictIt** (prefetch the full market dump, fuzzy-match locally, and pick the
-  *contract* whose name best matches the query so a "Trump 2028?" query surfaces
-  the Trump contract's price, not whichever contract is listed first).
+Four stages per question:
 
-Keyword extraction defaults to `s4_s5_union`: two LLM prompts (noun phrases +
-entity/event/deadline) run in parallel via a small model, unioned and deduped
-(`PREDICTION_MARKET_KEYWORD_STRATEGY`, valid: `s4_s5_union` / `s5_only` /
-`simple`). The result is rendered as a markdown table: implied probability, total
-volume, open interest, a liquidity/participation `signal` label (thin / decent /
-deep for real-money venues, thin / decent / high by bettor count for Manifold,
-`no-liquidity-data` for PredictIt), close date, and match confidence, followed by
-each market's resolution rules. The prompt tells forecasters to verify each
-market's criteria and date against the question — a matched market is strong
-evidence, a mismatched one is discounted proportionally — and to weight by the
-liquidity label.
+1. **Catalogue prefetch**, concurrent with a **query author**. Kalshi's complete
+   open-events catalogue is paginated (`KALSHI_CATALOGUE_WALL_TIMEOUT`,
+   `KALSHI_PREFETCH_MAX_PAGES`, `KALSHI_PAGE_SLEEP_S` between pages) and projected
+   down as each page streams in, tiered so that only the fields read across an
+   event's nested markets are kept past the first one. It is cached for
+   `KALSHI_CACHE_TTL_S` only if it **completed**: a pull cut short by a 429, the wall
+   or a runaway bound still serves the question that paid for it, but pinning that
+   partial list would let one blip on the first question starve the whole run.
+   PredictIt's whole ~197-market dump is one GET. Neither needs a query, which is
+   what makes the concurrency free. The query author is one LLM call
+   (`MARKET_QUERY_AUTHOR_LLM_CONFIG`) emitting domain vocabulary the question's own
+   tokens cannot reach; its output is ADDITIVE to a deterministic query set, so its
+   failure costs no recall.
+2. **Venue-native search** for Manifold and Polymarket — the two venues whose own
+   index is the only way in. Every deduped query is issued in parallel, with
+   per-query failure isolation, and every query is stripped of digit-bearing tokens
+   first because Manifold's `term` is a strict conjunction that one date token
+   zeroes. The enumerable venues score against the UN-stripped set, where a year is
+   real signal against a catalogue of dated market titles. Manifold is asked for
+   `contractType=ALL` rather than `BINARY`: multi-outcome markets are ~30% of its
+   catalogue and were structurally unreachable before, and their price arrives from
+   the stage-3 detail fan-out rather than the search listing, which carries no
+   per-answer data at all.
+
+   At PARSE time the author's own synonyms are filtered by a narrower rule than the
+   blanket digit strip: a synonym is **dropped whole** (never trimmed to a remnant,
+   which would reach the floorless fuzzy channel and score ~100 against every event
+   whose rules mention one generic word) only when it carries a DATE-like token — a
+   four-digit group in 1900-2099, a bare number in a synonym that names nothing else,
+   or a 1-2 digit day beside a month word. Digits belonging to a name survive
+   verbatim (`U-3`, `S&P 500`, `10-K`, `50bp`), because series-code vocabulary is
+   most of what the author exists to contribute and the conjunction cliff is a
+   property of the enumerable venues' call site, which still strips. The rule
+   knowingly mistakes `Russell 2000` for a year: a bare in-range four-digit token is
+   the measured hazard, and the question's own words reach the venues regardless.
+3. **Pool assembly**, three channels unioned, with channel order as the ranking: a
+   settlement-source join (Kalshi events settling on a publisher the question's own
+   resolution text names — the recall channel a word-overlap scorer structurally
+   cannot see), then the venue-index hits, then the enumerable universes ranked by
+   a fuzzy scorer with NO floor. A bounded Manifold detail fan-out then fills in the
+   rules text the search listing omits, and on a multi-outcome row its leading
+   answers — the only price such a row has, since the search reports none. A row
+   whose detail GET failed stays title-only rather than costing the snapshot.
+4. **Ranking**: one call (`MARKET_RANKER_LLM_CONFIG`) over the whole ~380-440
+   candidate pool, returning up to 8 rows in ranked order with a relation tier and a
+   one-phrase reason. Width is the model's choice in 0..8 — an empty array is a
+   VALID answer, not a failure — and nothing downstream re-orders, re-scores or
+   caps per venue. Everything else falls open to the pool-order top rows, marked as
+   such: unreadable output, and equally a transient LLM error on the call itself
+   (the retry wrapper catches the `openai.APIError` family, which is what every
+   litellm transport exception subclasses, and returns an empty completion the
+   parser then reports unusable). Both land on the fail-open slate rather than
+   costing the whole snapshot.
+
+The render is that order verbatim: implied probability, total volume and open
+interest (approximate USD on the real-money venues, play-money mana on Manifold —
+the legend says which, since the two are not comparable), a liquidity/participation
+`signal` label (thin / decent / deep for real-money venues, thin / decent / high by
+bettor count for Manifold, `no-liquidity-data` for PredictIt), close date,
+`open`/`RESOLVED` status, and the ranker's `relation` + `why`, followed by each
+market's resolution rules.
+
+Two row shapes have **no single probability** and render `-` rather than a number:
+a Kalshi event that is a threshold FAMILY (86.5% of that catalogue), where one
+strike's price under the event's own title would answer a question the row never
+asked, and a Manifold multi-outcome market, whose leading answers ride inside the
+rules bullet instead. Both keep their liquidity figures, which is what keeps the row
+worth its width — and on a Kalshi family those figures are the SUM over its live
+strikes, each converted at its own price, rather than the first strike's alone. The
+forecaster prompts tell models to weight by both axes — the liquidity label and the
+relation tier — and to read a RESOLVED price as a realized outcome rather than a
+forecast.
 
 This provider is **hard-disabled under benchmarking** (`is_benchmarking=True`
-returns `""`), regardless of the env flag. The `as_of` filter only drops markets
-that closed *before* `as_of`; still-open markets would leak post-`as_of`
-information into a backtest, so the benchmarking guard is the only safe defense.
-That guard is why its forecasting value can't be measured by the standard
-backtest gate — it was validated with live `test_bot.yaml` runs and opt-in live
-integration tests.
+returns `""`), regardless of the env flag, and that guard is the ONLY leakage
+defence: markets retain their last-trade price after resolution, so a market that
+closes between an `as_of` instant and now leaks either way. The provider path
+therefore passes `as_of=None`. The filter itself survives for explicit callers
+(backtests, replay tooling) and runs INSIDE pool assembly, ahead of the per-venue
+width slice, so a leaked market never reaches the ranker and an ineligible row
+frees its slot for an eligible one instead of consuming it. As a post-hoc filter
+over the already-truncated pool it deleted rows the width had spent its slots on
+and zeroed the per-venue counts provider health reads. Prod ran with a derived
+`as_of` until 2026-08-04, and it cost real recall: it dropped every market closing
+before the question resolved — the "same quantity, adjacent month" class that
+carries most of the evidential value —
+and prod telemetry recorded 20 of 47 archived runs where Polymarket fetched
+candidates and rendered nothing because of it.
+
+The benchmarking guard is also why this provider's forecasting value can't be
+measured by the standard backtest gate — it was validated with live
+`test_bot.yaml` runs and opt-in live integration tests.
 
 ### Resolution-source fetcher — `RESOLUTION_SOURCE_ENABLED`
 

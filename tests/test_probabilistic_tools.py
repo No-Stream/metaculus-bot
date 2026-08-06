@@ -1778,3 +1778,35 @@ class TestPercentilesToMetaculusCdfViaMixture:
         probs = [p.percentile for p in cdf]
         assert probs[0] >= 0.001 - 1e-12
         assert probs[-1] <= 0.999 + 1e-12
+
+    def test_coarse_grid_retains_bin_above_020(self):
+        """Grid-scaled max-step regression (sibling of the discrete-CDF fix, commit 9f1175c).
+
+        ``safe_cdf_bounds``'s default ``max_step`` is the 201-grid constant 0.2. On a coarse
+        grid that cap is far tighter than the server's own ``0.2 * 200 / (num_points - 1)``,
+        so applying it would clip a concentrated mixture's peak bin to 20% and shove the
+        excess onto higher bins. The builder must pass ``grid_step_constraints(num_points)``
+        instead, letting the peak stand while still honouring the grid's min-step.
+        """
+        from metaculus_bot.numeric.config import grid_step_constraints
+        from metaculus_bot.probabilistic_tools import (
+            MixtureComponent,
+            MixtureOfNormals,
+            percentiles_to_metaculus_cdf_via_mixture,
+        )
+
+        # Nearly all mass inside the single bin [-0.5, 0.5] of a 9-point grid on [-0.5, 7.5].
+        mix = MixtureOfNormals((MixtureComponent(weight=1.0, mean=0.0, sd=0.25),))
+        q = make_mock_numeric_question(lower_bound=-0.5, upper_bound=7.5, open_upper_bound=True, cdf_size=9)
+
+        cdf = percentiles_to_metaculus_cdf_via_mixture(mix, q, num_points=9)
+
+        assert len(cdf) == 9
+        probs = np.array([p.percentile for p in cdf], dtype=float)
+        steps = np.diff(probs)
+        grid_min_step, grid_max_step = grid_step_constraints(9)
+        assert float(steps.max()) > 0.2, f"peak bin {float(steps.max())} was clipped to the 201-grid cap"
+        assert float(steps.min()) >= grid_min_step - 1e-10
+        assert float(steps.max()) <= grid_max_step + 1e-9
+        assert probs[0] == pytest.approx(0.0, abs=1e-9)  # closed lower
+        assert probs[-1] <= 0.999 + 1e-12  # open upper

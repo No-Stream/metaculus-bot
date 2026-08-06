@@ -15,14 +15,26 @@ against the ACTUAL emitted format strings (the source of truth):
   (additive full-fidelity companion to ``GHOST_FORECAST``; the ``forecast_json``
   field is a compact single-line JSON blob the ghost scorer ``json.loads``)
 * ``OPEN_BOUND_PILING`` — ``metaculus_bot/numeric/diagnostics.py``
-* ``FORECASTER_DROPS`` / ``Degradation counters`` — ``metaculus_bot/forecaster.py``
-  (per-RUN summaries: which models dropped and why, and the counter set that
-  decides CI color)
+* ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
+  (per-RUN summary: which models dropped and why)
+* ``Degradation counters`` — ``metaculus_bot/degradation_counters.py``
+  ``format_degradation_summary`` (per-RUN counter set that decides CI color)
 * ``FORECASTERS_SURVIVED`` — ``metaculus_bot/forecaster.py``
   ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
+* ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
+  ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
+  ranker outcome, and every rendered row's ``venue:pool_index@rank``)
+* ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
+  ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
+  whether it counted toward the exit code)
+* ``PAID PERSONAL-KEY FALLBACK`` — ``metaculus_bot/fallback_openrouter.py``
+  ``_log_fallback`` (per-CALL: which model fell back off the donated key, and why)
+* ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
+  breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
+  recorded)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
   ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
@@ -45,7 +57,7 @@ both work).
 POST-ID vs QUESTION-ID (the ``qid_kind`` field): Metaculus posts contain questions,
 and the two ids DIVERGE on newer posts (post 38880 wraps question 38195). Marker
 types are keyed in DIFFERENT spaces — ``EXTRACTION_RUNG`` / ``OPEN_BOUND_PILING`` /
-``CLOSE_MARGIN`` emit ``question.id_of_question`` (the QUESTION id) while
+``CLOSE_MARGIN`` / ``MARKET_RANKING`` emit ``question.id_of_question`` (the QUESTION id) while
 ``GAP_FILL_V2`` / ``GHOST_PRE`` / ``GHOST_PRE_JSON`` / ``GHOST_FORECAST`` /
 ``GHOST_FORECAST_JSON`` emit ``question.page_url`` (a POST id). Each :class:`MarkerSpec` therefore declares
 ``qid_kind`` and every harvested record carries it, so a residual join keyed on one
@@ -153,7 +165,7 @@ def _parse_line_ts(line: str) -> str | None:
 # GHOST_FORECAST_JSON comes from ``log_prefix`` (see ``agentic_gap_fill.py``:
 # ``f"question={ref} "``) and is prepended BEFORE the marker token, so it's an
 # optional leading group there. On EXTRACTION_RUNG / OPEN_BOUND_PILING /
-# CLOSE_MARGIN the ``question=`` is a normal field AFTER the token.
+# CLOSE_MARGIN / MARKET_RANKING the ``question=`` is a normal field AFTER the token.
 MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "extraction_rung",
@@ -245,9 +257,31 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # close_margin.py emits question.id_of_question
     ),
     MarkerSpec(
+        "market_ranking",
+        # Per-question ranked market-retrieval outcome
+        # (research/prediction_market.py:_log_ranking_telemetry). This is the port's own
+        # post-ship instrument and the reason it needs a spec rather than a manual grep:
+        # `rendered`'s pool INDICES answer whether the ranker's attention decays down a
+        # ~400-candidate prompt and whether Manifold detail enrichment shifts which rows
+        # get picked, and `prompt_chars` gives the free prod distribution against the
+        # ranker's prompt ceiling. Run logs expire from GHA at 90 days, so an unharvested
+        # line is an unanswerable question later.
+        #
+        # `rendered` is a comma-joined `venue:pool_index@rank` list with no spaces, so
+        # `\S+` takes the whole field; the "none" sentinel (no rows rendered) coerces to
+        # None, which reads correctly alongside rows=0. A pool index of -1 means the row
+        # could not be traced back to a pool entry.
+        re.compile(
+            r"MARKET_RANKING:\s*question=(?P<question>\S+)\s+pool=(?P<pool>\S+)"
+            r"\s+outcome=(?P<outcome>\S+)\s+rows=(?P<rows>\S+)"
+            r"\s+prompt_chars=(?P<prompt_chars>\S+)\s+rendered=(?P<rendered>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
         "forecaster_drops",
         # Per-run ensemble-drop summary emitted by
-        # forecaster.py:_emit_forecaster_drop_telemetry. No per-question ref (it
+        # drop_telemetry.py:emit_drop_telemetry. No per-question ref (it
         # aggregates a whole run), so qid_kind stays None. ``detail`` is a compact
         # model->cause->count JSON blob captured verbatim (it is in _RAW_FIELDS) so
         # the '/'-laden OpenRouter slugs and nested counts survive; ``systematic`` is
@@ -301,9 +335,57 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:\s*summarizer_failures=(?P<summarizer_failures>\S+?),)?"
             r"\s*gap_fill_v2_errors=(?P<gap_fill_v2_errors>\S+?)"
             r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
-            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+)"
-            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+)))?"
+            r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
+            r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
+            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+))?"
             r"\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "provider_degradation",
+        # Per-run provider-degradation summary (metaculus_bot/research/provider_health.py
+        # log_provider_degradation_summary), the positive/negative counterpart to the
+        # ``provider_degradation`` counter in the line above. Aggregates a whole run, so
+        # qid_kind stays None. Emitted even at ``findings=0``, which makes a measured
+        # zero a recorded fact rather than an absent line.
+        #
+        # ``detail`` is a compact JSON ARRAY of findings captured verbatim (it is in
+        # _RAW_FIELDS): venue and field names are delimiter-hostile, and residual
+        # analysis json.loads it. The trailing suppression clause is free text after
+        # the JSON, so ``detail`` stops at the array's closing bracket.
+        re.compile(
+            r"PROVIDER_DEGRADATION:\s*run=(?P<run>\S+)\s+findings=(?P<findings>\d+)"
+            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)\s+detail=(?P<detail>\[.*?\])"
+        ),
+    ),
+    MarkerSpec(
+        "paid_personal_key_fallback",
+        # Per-CALL donated->personal key fallback WARN (fallback_openrouter.py
+        # _log_fallback). The counters it feeds are already in degradation_counters /
+        # the cli summary, but only this line names WHICH MODEL fell back and with
+        # what error, which is what separates "one flaky Gemini call" from "every
+        # forecaster ran on the paid key". ``error`` captures greedily to end-of-line
+        # because it holds the exception's str.
+        re.compile(
+            r"PAID PERSONAL-KEY FALLBACK:\s*donated OpenRouter key failed for model=(?P<model>\S+?),"
+            r".*?error=(?P<error_type>[^:]+):\s*(?P<error>.*)$"
+        ),
+    ),
+    MarkerSpec(
+        "run_alertable_summary",
+        # The end-of-run alertable breakdown (cli.py), emitted on BOTH exit paths —
+        # the green fully-suppressed case is exactly the one that would otherwise
+        # leave no record (the 2026-07-26 drained-key run read alertable=0 alongside
+        # real degradation). ``donated_key`` is the /auth/key probe verdict and is
+        # OPTIONAL-group wrapped twice over: it is omitted entirely when no spend-cap
+        # failure made the wrapper probe, and the suppression clause between it and
+        # ``credit`` only appears mid-window.
+        re.compile(
+            r"Run completed with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
+            r"\(bot=(?P<bot>\S+?), personal_key_fallback=(?P<personal_key_fallback>\S+?) of which "
+            r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
+            r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
+            r"(?:, donated_key=(?P<donated_key>\S+?))?\);"
         ),
     ),
     MarkerSpec(

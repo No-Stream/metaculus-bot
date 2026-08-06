@@ -188,9 +188,15 @@ def main() -> None:
             raise ValueError(f"Invalid run mode: {run_mode}")
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
-
-    if research_writer is not None:
-        research_writer.flush()
+        # Flush inside the finally: records accumulate in memory for the whole run,
+        # so an exception escaping asyncio.run (an OSError, the invalid-run-mode
+        # ValueError above, a KeyboardInterrupt, the 300-minute timeout-minutes
+        # SIGTERM) would otherwise discard every question's research — a 40-question
+        # run that dies on the last question would archive nothing. The workflows'
+        # upload step is `if: always()`, so a crashed run's partial batch still
+        # reaches the GHA artifact.
+        if research_writer is not None:
+            research_writer.flush()
 
     TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
 

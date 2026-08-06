@@ -14,6 +14,7 @@ from forecasting_tools import ReasonedPrediction
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from tests.conftest import gather_predictions_stub
 from tests.pipeline_test_helpers import make_e2e_bot, make_real_binary_question
 
 
@@ -43,7 +44,11 @@ class TestBinaryLowSpreadSkipsStacking:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -51,7 +56,6 @@ class TestBinaryLowSpreadSkipsStacking:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -80,22 +84,29 @@ class TestBinaryHighSpreadTriggersStacking:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text"
+                "metaculus_bot.stacking_route.extract_disagreement_crux",
+                new_callable=AsyncMock,
+                return_value="Crux text",
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results"
+                "metaculus_bot.stacking_route.run_targeted_search",
+                new_callable=AsyncMock,
+                return_value="Targeted results",
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=0.45) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -134,7 +145,11 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -143,7 +158,6 @@ class TestBinaryStackerPrimaryFailsFallbackSucceeds:
             patch.object(bot, "_run_stacking", side_effect=stacking_side_effect),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             await bot._research_and_make_predictions(question)
 
@@ -174,7 +188,11 @@ class TestBinaryBothStackersFailMedianFallback:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -183,7 +201,6 @@ class TestBinaryBothStackersFailMedianFallback:
             patch.object(bot, "_run_stacking", side_effect=always_fail),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -214,7 +231,13 @@ class TestMinForecasterGuardRaises:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                # Two of three forecasters failed: one survivor plus two error strings
+                # is exactly the shape that must trip the min-forecasters guard.
+                new=gather_predictions_stub((single_prediction, ["error1", "error2"], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -222,7 +245,6 @@ class TestMinForecasterGuardRaises:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (single_prediction, ["error1", "error2"], None)
 
             with pytest.raises(RuntimeError, match="Only 1/3 forecasters succeeded"):
                 await bot._research_and_make_predictions(question)

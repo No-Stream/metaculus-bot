@@ -1,0 +1,360 @@
+"""Section rendering for the time-series-anchor provider.
+
+Turns a routed series (``ts_routing._Route``) plus its fetched history into the markdown
+``## Time Series Anchor`` section a forecaster reads: a headline latest value, a
+multi-resolution history, a 52-week range, and the horizon-matched empirical band from
+``ts_estimators``. Self-budgeted — the per-resolution row caps and
+``TS_ANCHOR_SECTION_MAX_CHARS`` in ``constants.py`` cap table and section sizes.
+
+Both renderers return ``(text, band)``: the band is the P10/P50/P90 actually rendered (the
+floor-lifted one for a max-window question), so ``timeseries_anchor``'s bounds-overlap
+backstop checks exactly what the forecaster sees. ``_render_single`` returns ``None`` for the
+band when none was emitted — not a model target, or the horizon exceeds available history.
+
+Also owns the derived-target transforms (``_apply_derivation``): every question resolves on
+some derivation of the raw series, and the level case (scale 1.0) is the identity.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import numpy as np
+import pandas as pd
+
+from metaculus_bot.constants import (
+    TS_ANCHOR_LOOKBACK_YEARS,
+    TS_ANCHOR_MONTHLY_TABLE_ROWS,
+    TS_ANCHOR_NATIVE_TABLE_ROWS,
+    TS_ANCHOR_SECTION_MAX_CHARS,
+    TS_ANCHOR_SPREAD_LOOKBACK_YEARS,
+    TS_ANCHOR_WEEKLY_TABLE_ROWS,
+)
+from metaculus_bot.research.ts_estimators import (
+    TRADING_DAYS_PER_YEAR,
+    Freq,
+    _build_spread_series,
+    _detect_freq,
+    _empirical_change_band,
+    _empirical_max_band,
+    _n_eff,
+    horizon_steps,
+)
+from metaculus_bot.research.ts_routing import Derivation, _Route
+
+REALIZED_VOL_WINDOW = 30  # trailing daily returns for the annualized-vol note
+
+PROVENANCE_FOOTER = (
+    "Statistical extrapolation of the resolution series' own history; blind to news, "
+    "events, and policy — weigh against the rest of the research."
+)
+
+_FREQ_UNIT: dict[Freq, str] = {"daily": "trading-day", "weekly": "week", "monthly": "month"}
+
+# Human phrasing for the derived-quantity label line and the history-block header.
+_DERIVED_TARGET_DESC: dict[Derivation, str] = {
+    "mom_diff": "month-over-month change (first difference of the level)",
+    "mom_pct": "month-over-month % change",
+    "monthly_avg": "monthly average of the higher-frequency series",
+}
+_DERIVED_HISTORY_HEADER: dict[Derivation, str] = {
+    "mom_diff": "Last monthly MoM changes (derived)",
+    "mom_pct": "Last monthly MoM % changes (derived)",
+    "monthly_avg": "Last monthly averages (derived)",
+}
+
+
+def _fmt(v: float) -> str:
+    """Sensible sig figs: thousands-separated for large magnitudes, 4 sig figs otherwise."""
+    a = abs(float(v))
+    if a >= 10000:
+        return f"{v:,.0f}"
+    if a >= 100:
+        return f"{v:,.1f}"
+    return f"{v:.4g}"
+
+
+def _history_lines(series: pd.Series, n: int, header: str) -> str:
+    tail = series.tail(n)
+    dates = pd.DatetimeIndex(tail.index).strftime("%Y-%m-%d")
+    values = tail.to_numpy(dtype="float64")
+    rows = [f"  - {d}: {_fmt(v)}" for d, v in zip(dates, values, strict=True)]
+    return f"- {header}:\n" + "\n".join(rows)
+
+
+def _downsample_last(series: pd.Series, rule: str) -> pd.Series:
+    """Keep the last real observation within each calendar period, KEEPING its true
+    observation date. Unlike ``resample(...).last()`` this never labels a row by a
+    bucket-end date that postdates the ceiling — load-bearing for a leakage-safe
+    provider (a Sunday week-end or a month-end label after the fetch ceiling would
+    look like future data even though the value is genuine)."""
+    periods = pd.DatetimeIndex(series.index).to_period(rule)
+    keep = ~periods.duplicated(keep="last")
+    return series[keep]
+
+
+def _multi_res_history(series: pd.Series, freq: Freq, monthly_header: str = "Last monthly observations") -> list[str]:
+    """Native + coarser down-samples per frequency, using the per-resolution row caps.
+
+    ``monthly_header`` overrides the native-monthly block header so derived-quantity
+    questions (which collapse to a monthly series) label their history as the derived
+    values, not raw observations."""
+    blocks: list[str] = []
+    if freq == "daily":
+        blocks.append(_history_lines(series, TS_ANCHOR_NATIVE_TABLE_ROWS, "Last daily observations"))
+        weekly = _downsample_last(series, "W")
+        blocks.append(_history_lines(weekly, TS_ANCHOR_WEEKLY_TABLE_ROWS, "Weekly (last obs of week)"))
+        monthly = _downsample_last(series, "M")
+        blocks.append(_history_lines(monthly, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Monthly (last obs of month)"))
+    elif freq == "weekly":
+        blocks.append(_history_lines(series, TS_ANCHOR_WEEKLY_TABLE_ROWS, "Last weekly observations"))
+        monthly = _downsample_last(series, "M")
+        blocks.append(_history_lines(monthly, TS_ANCHOR_MONTHLY_TABLE_ROWS, "Monthly (last obs of month)"))
+    else:  # monthly
+        blocks.append(_history_lines(series, TS_ANCHOR_MONTHLY_TABLE_ROWS, monthly_header))
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Derived-target transforms (ported from the replay's build_target_series)
+# ---------------------------------------------------------------------------
+
+
+def _apply_derivation(series: pd.Series, derivation: Derivation, scale: float) -> pd.Series:
+    """Turn the raw fetched series into the quantity the question resolves on.
+
+    Mirrors the Phase-A replay's ``build_target_series`` level family:
+      - level        → raw × scale (scale=1.0 is a no-op; BOPGTB uses 0.001, millions→billions).
+      - mom_diff      → month-over-month first difference × scale (PAYEMS ×1000, thousands→persons).
+      - mom_pct       → month-over-month % change (×100), first NaN dropped.
+      - monthly_avg   → calendar-month mean of a higher-frequency series (weekly gasoline → month).
+    """
+    if derivation == "level":
+        return series * scale if scale != 1.0 else series
+    if derivation == "mom_diff":
+        return series.diff().dropna() * scale
+    if derivation == "mom_pct":
+        return ((series / series.shift(1) - 1.0) * 100.0).dropna()
+    if derivation == "monthly_avg":
+        return series.resample("MS").mean().dropna()
+    raise ValueError(f"unhandled derivation {derivation!r}")  # unreachable via Literal
+
+
+def _realized_max_floor(series: pd.Series, window_start: date | None, ceiling: date) -> float | None:
+    """Max already observed within the elapsed part of a max-window question's window.
+
+    A forward max can only rise, so the max over ``[window_start, ceiling]`` is a hard
+    lower bound on the answer once the window has started (live case: window opened in the
+    past, ``ceiling`` = now). Returns None when the window hasn't opened yet (benchmark
+    case: ``ceiling`` = open_time, no elapsed portion) or no observation falls inside it.
+    Uses ``open_time`` as ``window_start``; for calendar-scoped questions (e.g. 'highest in
+    2025') that understates the true window, giving a looser — but still valid — lower bound.
+    """
+    if window_start is None or window_start >= ceiling:
+        return None
+    idx = pd.DatetimeIndex(series.index)
+    elapsed = series[(idx >= pd.Timestamp(window_start)) & (idx <= pd.Timestamp(ceiling))]
+    if elapsed.empty:
+        return None
+    return float(elapsed.max())
+
+
+def _fifty_two_week_line(series: pd.Series, ceiling: date, last: float) -> str:
+    cutoff = pd.Timestamp(ceiling) - pd.Timedelta(days=365)
+    window = series[series.index >= cutoff]
+    if window.empty:
+        window = series
+    low = float(window.min())
+    high = float(window.max())
+    span = high - low
+    pct = f"{(last - low) / span * 100:.0f}% of the way up the range" if span > 0 else "range is flat"
+    return f"- 52-week range: {_fmt(low)} – {_fmt(high)} (latest sits {pct})"
+
+
+def _realized_vol_line(series: pd.Series) -> str | None:
+    """30-day annualized realized volatility (daily financial series only)."""
+    returns = series.pct_change().dropna()
+    if len(returns) < REALIZED_VOL_WINDOW:
+        return None
+    recent = returns.tail(REALIZED_VOL_WINDOW)
+    annualized = float(recent.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0)
+    return f"- 30-day annualized realized volatility: {annualized:.1f}%"
+
+
+def _band_line(
+    kind: str,
+    freq: Freq,
+    h: int,
+    lookback_years: int,
+    band: tuple[float, float, float],
+    last: float,
+    *,
+    n_windows: int,
+    n_eff: int,
+) -> str:
+    unit = _FREQ_UNIT[freq]
+    p10, p50, p90 = band
+    return (
+        f"- Horizon-matched empirical band (empirical P10/P50/P90 of all {h}-{unit} {kind} windows "
+        f"in the last ~{lookback_years} years — {n_windows:,} overlapping windows, ~{n_eff:,} "
+        f"independent — applied to the latest value {_fmt(last)}):\n"
+        f"  - P10 / P50 / P90 → {_fmt(p10)} / {_fmt(p50)} / {_fmt(p90)}"
+    )
+
+
+def _render_single(
+    series: pd.Series,
+    *,
+    route: _Route,
+    ceiling: date,
+    calendar_days: int,
+    window_start: date | None = None,
+) -> tuple[str, tuple[float, float, float] | None]:
+    """Return the rendered section text and the P10/P50/P90 band actually rendered (the
+    floor-lifted band for a max-window question), or ``None`` when no band was emitted
+    (not a model target, or the horizon exceeds available history). The caller uses the
+    band for the bounds-overlap backstop so it checks exactly what the forecaster sees."""
+    # Everything downstream operates on the DERIVED quantity the question resolves on
+    # (level×scale for plain/unit-converted levels; MoM change / MoM % / monthly average
+    # for the derived shapes). For plain level (scale=1.0) `derived` IS `series`, so the
+    # level path is byte-identical to before.
+    raw_last = float(series.iloc[-1])
+    raw_last_date = pd.DatetimeIndex(series.index)[-1].strftime("%Y-%m-%d")
+    derived = _apply_derivation(series, route.derivation, route.scale)
+    is_derived = route.derivation != "level"
+    # MoM change / MoM % / monthly-average all collapse to a monthly effective frequency;
+    # the horizon and band are computed on that, matching the replay's build_target_series.
+    freq: Freq = "monthly" if is_derived else _detect_freq(pd.DatetimeIndex(derived.index))
+    last = float(derived.iloc[-1])
+    h = horizon_steps(freq, calendar_days)
+    y = derived.to_numpy(dtype="float64")
+    use_log = bool(np.all(y > 0.0))
+    # A forward-window-max question (from title framing OR a High-column yfinance spec)
+    # resolves on the max over the window, not the period-end level.
+    is_max = route.is_max or route.spec.column == "High"
+
+    if is_derived:
+        parts: list[str] = [
+            f"**{route.label}** — latest derived value {_fmt(last)} "
+            f"({_DERIVED_TARGET_DESC[route.derivation]}; from raw level {_fmt(raw_last)} "
+            f"as of {raw_last_date}; effective series frequency: {freq})"
+        ]
+    else:
+        parts = [f"**{route.label}** — latest {_fmt(last)} (as of {raw_last_date}; series frequency: {freq})"]
+    if route.note:
+        parts.append(f"- Note: {route.note}")
+
+    if is_derived:
+        parts.extend(_multi_res_history(derived, freq, monthly_header=_DERIVED_HISTORY_HEADER[route.derivation]))
+    else:
+        parts.extend(_multi_res_history(derived, freq))
+        parts.append(_fifty_two_week_line(derived, ceiling, last))
+
+    band: tuple[float, float, float] | None = None
+    if route.model_target and y.size > h:
+        n_eff = _n_eff(int(y.size), h)
+        if is_max:
+            band = _empirical_max_band(y, h, use_log=use_log, last=last)
+            floor = _realized_max_floor(derived, window_start, ceiling)
+            if floor is not None:
+                band = (max(band[0], floor), max(band[1], floor), max(band[2], floor))
+                parts.append(
+                    f"- Realized max so far this window: {_fmt(floor)} — a HARD LOWER BOUND on the answer "
+                    f"(the resolution window has already started; a forward max can only rise from here)."
+                )
+            # sliding_window_view over length-(h+1) windows yields y.size - h forward windows.
+            parts.append(
+                _band_line(
+                    "forward-max",
+                    freq,
+                    h,
+                    TS_ANCHOR_LOOKBACK_YEARS,
+                    band,
+                    last,
+                    n_windows=int(y.size) - h,
+                    n_eff=n_eff,
+                )
+            )
+        else:
+            band = _empirical_change_band(y, h, use_log=use_log, anchor=last)
+            # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
+            parts.append(
+                _band_line(
+                    "change",
+                    freq,
+                    h,
+                    TS_ANCHOR_LOOKBACK_YEARS,
+                    band,
+                    last,
+                    n_windows=int(y.size) - h,
+                    n_eff=n_eff,
+                )
+            )
+    elif route.model_target:
+        parts.append(f"- (Horizon {h} exceeds available history; empirical band withheld.)")
+
+    if freq == "daily" and use_log:
+        vol_line = _realized_vol_line(derived)
+        if vol_line:
+            parts.append(vol_line)
+
+    parts.append(f"\n_{PROVENANCE_FOOTER}_")
+    return "\n".join(parts), band
+
+
+def _render_spread(
+    series_a: pd.Series,
+    series_b: pd.Series,
+    *,
+    route: _Route,
+    calendar_days: int,
+) -> tuple[str, tuple[float, float, float]]:
+    """Return the rendered spread section text and its P10/P50/P90 relative-return band
+    (pp). Mirrors ``_render_single``'s (text, band) shape so ``build_anchor_section`` can
+    run the same ``_band_misses_bounds`` bounds-overlap backstop on the spread path. The
+    spread always emits a band (a too-short history raises ValueError first), so the band
+    is never None here."""
+    spread_series = _build_spread_series(series_a, series_b)  # raises ValueError on bad legs
+    freq = _detect_freq(pd.DatetimeIndex(spread_series.index))
+    h = horizon_steps(freq, calendar_days)
+    y = spread_series.to_numpy(dtype="float64")
+    if y.size <= h:
+        raise ValueError(f"spread history length {y.size} too short for horizon {h}")
+    # Re-anchor to 0 at the forecast ceiling: the band is the forward-window
+    # relative return (pp), which is what the question resolves on.
+    band = _empirical_change_band(y, h, use_log=False, anchor=0.0)
+
+    last_a = float(series_a.iloc[-1])
+    last_b = float(series_b.iloc[-1])
+    date_a = pd.DatetimeIndex(series_a.index)[-1].strftime("%Y-%m-%d")
+    date_b = pd.DatetimeIndex(series_b.index)[-1].strftime("%Y-%m-%d")
+    parts: list[str] = [
+        f"**Relative-return spread: {route.label} vs {route.label_b}** "
+        f"(ret[{route.label}] − ret[{route.label_b}] over the forecast window, in percentage points)",
+        f"- {route.label} latest: {_fmt(last_a)} (as of {date_a})",
+        f"- {route.label_b} latest: {_fmt(last_b)} (as of {date_b})",
+    ]
+    parts.append(_history_lines(series_a, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label} recent"))
+    parts.append(_history_lines(series_b, TS_ANCHOR_NATIVE_TABLE_ROWS, f"{route.label_b} recent"))
+    unit = _FREQ_UNIT[freq]
+    # y[:-h] vs y[h:] pairs yield y.size - h overlapping h-step changes.
+    parts.append(
+        f"- Forward {h}-{unit} relative-return band (pp, empirical over the last "
+        f"~{TS_ANCHOR_SPREAD_LOOKBACK_YEARS} years — {int(y.size) - h:,} overlapping windows, "
+        f"~{_n_eff(int(y.size), h):,} independent):\n"
+        f"  - P10 / P50 / P90 → {_fmt(band[0])} / {_fmt(band[1])} / {_fmt(band[2])}"
+    )
+    parts.append(
+        "- Relative-return spreads are ~mean-zero by construction; the band is an honest prior, "
+        "not a directional signal."
+    )
+    parts.append(f"\n_{PROVENANCE_FOOTER}_")
+    return "\n".join(parts), band
+
+
+def _truncate_section(text: str) -> str:
+    """Hard char-budget backstop (row caps normally keep it well under)."""
+    if len(text) <= TS_ANCHOR_SECTION_MAX_CHARS:
+        return text
+    marker = "\n[truncated — time-series anchor section budget]"
+    return text[: TS_ANCHOR_SECTION_MAX_CHARS - len(marker)].rstrip() + marker

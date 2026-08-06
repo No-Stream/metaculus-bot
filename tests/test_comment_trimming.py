@@ -571,6 +571,12 @@ class TestAgainstRealHistoricalData:
     trimming them shouldn't produce behavior meaningfully different from what
     production emitted. This catches environment-specific edge cases that
     synthetic comments might miss.
+
+    LOCAL-ONLY, and that is acceptable only because ``TestAgainstCheckedInMiniComments``
+    below replays the same inflate-trim-reparse invariants over the checked-in
+    miniature on every PR. This class is the breadth cohort (~90k-char real
+    comments, dozens of them); the miniature is the floor that cannot skip. Do not
+    let this be the only home for an invariant.
     """
 
     def _load_real_comments(self) -> list[str]:
@@ -580,7 +586,11 @@ class TestAgainstRealHistoricalData:
 
         path = Path(__file__).parent.parent / "scratch" / "analysis_2026-04" / "performance_data.json"
         if not path.exists():
-            pytest.skip(f"real data not available at {path}")
+            pytest.skip(
+                f"local-only breadth cohort: {path} is a gitignored Q2-2026 collector pull, absent in CI. "
+                "The same trim/reparse invariants run unconditionally in "
+                "TestAgainstCheckedInMiniComments over tests/data/performance_comments_mini.jsonl."
+            )
         with path.open() as f:
             records = json.load(f)
         return [r["comment_text"] for r in records if isinstance(r.get("comment_text"), str)]

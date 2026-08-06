@@ -54,6 +54,7 @@ dev = [
     "arviz>=1.2.0",
     "h5netcdf>=1.8.1",
     "h5py>=3.16.0",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.uv]

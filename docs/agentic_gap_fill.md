@@ -8,7 +8,8 @@ artifact that gets appended to the bundle every forecaster reads.
 
 It is the newest and largest research subsystem on this branch. It runs
 alongside the older v1 gap-fill pass (`research/targeted.py`), not instead of
-it. Both are on in production as of 2026-07-17, and both feed the same bundle.
+it. Both are on in production as of 2026-07-21 (v2 was authored 2026-07-17 and reached
+`main` in merge `b4e9df0` four days later), and both feed the same bundle.
 
 The code lives under `metaculus_bot/research/agentic/`, with a thin seam at
 `metaculus_bot/research/agentic_gap_fill.py` that wires it into the research
@@ -318,7 +319,7 @@ Defaults are deliberately not reproduced here — read them off the definitions 
 
 | Env var | What it controls |
 | --- | --- |
-| `GAP_FILL_V2_ENABLED` | Master switch. Off unless set; on in all four workflow yamls since 2026-07-17. |
+| `GAP_FILL_V2_ENABLED` | Master switch. Off unless set; on in all four workflow yamls, live in prod since 2026-07-21 (`b4e9df0`). |
 | `GAP_FILL_V2_DRIVER_MODEL` | The driver LLM. Picked by the 2026-07-17 blind 5-arm replay eval. |
 | `GAP_FILL_V2_DRIVER_EFFORT` | Driver reasoning effort. |
 | `GAP_FILL_V2_READER_MODEL` | The `read_document` backend model on the native google-genai path. |

@@ -19,9 +19,10 @@ Both are harvested into ``backtests/telemetry_archive/`` by ``make sync_telemetr
 Resolved-question records come from a pre-built performance-analysis dataset JSON
 (``--perf-json``) or a live read-only pull (``--tournament``, free).
 
-This is scaffold quality by design. v2 shipped to prod 2026-07-17, so there are ~0
-resolved v2-era questions today; the scorer must run cleanly and report ``n=0, waiting
-on resolutions`` rather than error. It will be hardened once real deltas exist.
+This is scaffold quality by design. v2 reached prod 2026-07-21 (merge ``b4e9df0``; it was
+authored 2026-07-17 on the july15 branch), so there are ~0 resolved v2-era questions today;
+the scorer must run cleanly and report ``n=0, waiting on resolutions`` rather than error. It
+will be hardened once real deltas exist.
 """
 
 from __future__ import annotations
@@ -407,7 +408,7 @@ def render_report(summary: dict) -> str:
         f"Joined to resolved-question dataset: {summary['n_joined']}",
     ]
     if summary["n_scored"] == 0:
-        lines.append("Scored ghosts: n=0 — waiting on resolutions (v2 shipped 2026-07-17; expected today).")
+        lines.append("Scored ghosts: n=0 — waiting on resolutions (v2 live in prod 2026-07-21; expected today).")
     else:
         lines.append(f"Scored ghosts: {summary['n_scored']}")
     for qtype in ("binary", "multiple_choice", "numeric"):

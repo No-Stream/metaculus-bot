@@ -6,8 +6,9 @@ THREE times (research + telemetry + raw), ``logs-*`` twice, and the enumeration 
 3×. With ~100 live artifacts that's ~300 subprocess+unzip invocations.
 
 This driver enumerates ONCE over the UNION family (``research-*`` + ``logs-*``),
-downloads each unique artifact ONCE, and runs all three harvests over the same
-downloaded run dirs before writing the three archives:
+downloads each unique artifact ONCE into the PERSISTED artifact store
+(``backtests/gha_artifact_store/``, see ``scripts/gha_artifacts``), and runs all three
+harvests over the same persisted run dirs before writing the three archives:
 
 * research JSONL           -> backtests/research_archive/     (research-* dirs only)
 * run-log telemetry markers -> backtests/telemetry_archive/
@@ -38,7 +39,9 @@ from scripts.download_research import (
     RESEARCH_ARTIFACT_PREFIX,
     build_archive,
     deduplicate_records,
+    guard_against_truncation,
     load_backfill,
+    load_existing_by_qid,
     load_jsonl_records,
     research_jsonl_files,
 )
@@ -48,9 +51,10 @@ from scripts.download_run_logs import (
     build_workflow_map,
     harvest_run_logs_from_dir,
     infer_workflow,
+    workflow_map_from_archive,
 )
 from scripts.download_run_logs import merge_and_write as merge_telemetry
-from scripts.gha_artifacts import download_run_dirs, select_run_artifacts
+from scripts.gha_artifacts import add_store_arguments, persisted_run_dirs, select_artifacts
 from scripts.telemetry.archive import HarvestedRun
 
 logger = logging.getLogger(__name__)
@@ -60,16 +64,39 @@ DEFAULT_REPO = "No-Stream/metaculus-bot"
 
 @dataclass
 class SyncSummary:
-    """Rolled-up results of one single-pass sync, for the final report + tests."""
+    """Rolled-up results of one single-pass sync, for the final report + tests.
+
+    ``harvested`` counts run dirs READ from the store, which is not the number downloaded:
+    the grab is skip-if-present, so a re-run harvests everything and downloads nothing (and
+    ``--from-store`` downloads nothing by construction). ``ensure_store_current`` logs the
+    download side.
+    """
 
     total_artifacts: int
-    downloaded: int
+    harvested: int
     expired: list[dict]
     research_questions: int
     research_records: int
     telemetry_totals: dict[str, int]
     telemetry_runs: int
     raw_totals: dict[str, int] = field(default_factory=dict)
+
+
+def _resolve_workflow_map(repo: str, *, telemetry_dir: Path, from_store: bool) -> dict[int, str]:
+    """``{run_id: workflow_slug}`` from the GitHub runs endpoint, or offline from the archive.
+
+    The offline path cannot ask GitHub, and falling back to prefix inference would read
+    ``unknown`` for every ``research-*`` run — which the replace-by-run merge would then
+    write over the good attribution already in ``runs.jsonl``. Replaying the archive's own
+    manifest keeps it.
+    """
+    if from_store:
+        workflow_map = workflow_map_from_archive(telemetry_dir)
+        logger.info(f"Offline harvest: recovered {len(workflow_map)} run->workflow mappings from {telemetry_dir}")
+        return workflow_map
+    workflow_map = build_workflow_map(repo)
+    logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
+    return workflow_map
 
 
 def run_sync(
@@ -80,29 +107,42 @@ def run_sync(
     backfill_dir: Path,
     telemetry_dir: Path,
     raw_dir: Path,
+    store_dir: Path | str | None = None,
+    from_store: bool = False,
 ) -> SyncSummary:
-    """Enumerate + download the union family ONCE, then harvest + build all three archives."""
-    selection = select_run_artifacts(
-        repo, family_prefixes=RUN_LOG_ARTIFACT_PREFIXES, since_days=since_days, family_label="run-log"
+    """Persist the union family ONCE, then harvest + build all three archives from the store.
+
+    ``from_store=True`` makes the whole sync offline: the selection comes from the
+    persisted store's ``_meta.json``s instead of the artifacts endpoint and nothing is
+    downloaded, so an ingest fix can be re-run over the same bytes for free.
+    """
+    selection = select_artifacts(
+        repo,
+        family_prefixes=RUN_LOG_ARTIFACT_PREFIXES,
+        since_days=since_days,
+        family_label="run-log",
+        store_dir=store_dir,
+        from_store=from_store,
     )
 
-    workflow_map = build_workflow_map(repo)
-    logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
+    workflow_map = _resolve_workflow_map(repo, telemetry_dir=telemetry_dir, from_store=from_store)
 
     research_records: list[dict] = []
     telemetry_runs: list[HarvestedRun] = []
     raw_harvested: dict[str, list[dict]] = {}
-    downloaded = 0
+    harvested_dirs = 0
 
-    for run_id, art, run_dir in download_run_dirs(
-        selection, repo, tmp_prefix="sync_all_dl_", progress_noun="artifacts"
+    for run_id, art, run_dir in persisted_run_dirs(
+        selection, repo, store_dir=store_dir, from_store=from_store, progress_noun="artifacts"
     ):
-        downloaded += 1
+        harvested_dirs += 1
         name = art.get("name", "")
 
-        # (a) Research JSONL — research-* dirs only. test_bot's logs-* artifacts carry
-        # only run_logs/ (no research_outputs/), so they never contribute research
-        # records; gating on the prefix keeps test runs out of the research archive.
+        # (a) Research JSONL — research-* dirs only. Every bot workflow (three prod plus
+        # test_bot and test_bot_basic) uploads under that name as of 2026-08-03, when the
+        # test pair moved off logs-* so their research gets archived too; the surviving
+        # pre-rename logs-* artifacts carry only run_logs/, so they contribute telemetry
+        # below but no research records.
         if name.startswith(RESEARCH_ARTIFACT_PREFIX):
             for jsonl_file in research_jsonl_files(run_dir):
                 research_records.extend(load_jsonl_records(jsonl_file))
@@ -128,7 +168,7 @@ def run_sync(
 
     return SyncSummary(
         total_artifacts=selection.total_artifacts,
-        downloaded=downloaded,
+        harvested=harvested_dirs,
         expired=selection.expired,
         research_questions=research_questions,
         research_records=research_count,
@@ -139,15 +179,19 @@ def run_sync(
 
 
 def _build_research_archive(downloaded_records: list[dict], backfill_dir: Path, research_dir: Path) -> tuple[int, int]:
-    """Merge downloaded research records + backfill, dedup, and build the archive.
+    """Merge downloaded research records + what's on disk + backfill, dedup, and build.
 
-    Mirrors ``download_research.main``'s Phase 2/3 exactly (load backfill, dedup by
-    (qid, run_id), build) so both the standalone script and this driver end up with an
-    archive holding BOTH artifact and comment-backfill records. Returns
-    ``(distinct_questions, unique_records)``; leaves the archive untouched when there is
-    nothing to build (no artifacts + no backfill).
+    Mirrors ``download_research.main``'s Phase 2/3 exactly (re-ingest the existing
+    ``by_qid/`` records, load backfill, dedup by (qid, run_id), guard against
+    truncation, build) so both the standalone script and this driver end up with an
+    archive holding BOTH artifact and comment-backfill records. Re-ingesting the
+    existing records is what keeps a download that came back short of last time from
+    silently deleting artifacts: ``build_archive`` overwrites ``by_qid/`` wholesale and
+    artifact records live nowhere else. Returns ``(distinct_questions, unique_records)``;
+    leaves the archive untouched when there is nothing to build.
     """
     all_records = list(downloaded_records)
+    all_records.extend(load_existing_by_qid(research_dir))
     all_records.extend(load_backfill(backfill_dir))
     if not all_records:
         logger.warning("Research: no records (no artifacts downloaded and no backfill). Archive not rebuilt.")
@@ -155,6 +199,7 @@ def _build_research_archive(downloaded_records: list[dict], backfill_dir: Path, 
 
     deduped = deduplicate_records(all_records)
     logger.info(f"Research: {len(deduped)} unique records (from {len(all_records)} total)")
+    guard_against_truncation(research_dir, deduped)
     build_archive(deduped, research_dir)
     questions = len({r["qid"] for r in deduped if r.get("qid") is not None})
     return questions, len(deduped)
@@ -171,7 +216,8 @@ def _report(summary: SyncSummary, *, research_dir: Path, telemetry_dir: Path, ra
     logger.info("=" * 60)
     logger.info("sync_all single-pass harvest complete")
     logger.info(
-        f"Enumerated {summary.total_artifacts} artifact(s); downloaded {summary.downloaded} run dir(s); "
+        f"Enumerated {summary.total_artifacts} artifact(s); harvested {summary.harvested} run dir(s) from the "
+        f"store (the grab itself reports its own downloaded/skipped counts); "
         f"{len(summary.expired)} expired/lost ({expired_research} research-*, {expired_logs} logs-*)"
     )
     logger.info(
@@ -200,6 +246,7 @@ def main() -> None:
     parser.add_argument("--backfill-dir", default=DEFAULT_BACKFILL_DIR, help="Where the research backfill JSONL lives")
     parser.add_argument("--telemetry-dir", default=TELEMETRY_ARCHIVE_DIR, help="Where to write the telemetry archive")
     parser.add_argument("--raw-dir", default=RAW_ARCHIVE_DIR, help="Where to write the raw-research archive")
+    add_store_arguments(parser)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -214,6 +261,8 @@ def main() -> None:
         backfill_dir=Path(args.backfill_dir),
         telemetry_dir=telemetry_dir,
         raw_dir=raw_dir,
+        store_dir=args.store_dir,
+        from_store=args.from_store,
     )
     _report(summary, research_dir=research_dir, telemetry_dir=telemetry_dir, raw_dir=raw_dir)
 

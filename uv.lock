@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-07-19T02:02:08.174293Z"
+exclude-newer = "2026-07-28T01:31:50.966948Z"
 exclude-newer-span = "P1W"
 
 [manifest]
@@ -2398,6 +2398,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "scipy-stubs" },
     { name = "statsmodels" },
@@ -2447,6 +2448,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.15.1" },
     { name = "scipy-stubs", specifier = ">=1.17.1.5" },
     { name = "statsmodels", specifier = ">=0.14.6" },

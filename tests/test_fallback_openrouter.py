@@ -243,9 +243,18 @@ class TestFallbackOpenRouterLlm:
             "_invoke_once_using_primary",
             AsyncMock(side_effect=Exception("403 Forbidden moderation")),
         )
+        # Stubbing the secondary is what makes "no fallback" assertable. Left
+        # unpatched, a regression that DID fall back would hit the autouse
+        # network-egress guard and raise its own RuntimeError, which the bare
+        # `raises(Exception)` would happily accept — so the test would still pass
+        # while the behavior it guards had inverted. The call-count assertion is
+        # the real content; the raise is secondary.
+        secondary = AsyncMock(return_value="fallback_ok")
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", secondary)
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="403 Forbidden moderation"):
             await llm.invoke("hi")
+        secondary.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_fallback_on_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -283,9 +292,18 @@ class TestFallbackOpenRouterLlm:
             "_invoke_once_using_primary",
             AsyncMock(side_effect=Exception("401 Unauthorized")),
         )
+        # A 401 IS a fallback-worthy cause, so what this test pins is that the
+        # missing secondary key — not the error class — is what stops the retry.
+        # Stubbing the secondary keeps the assertion honest: without it, a
+        # regression that attempted the fallback anyway would raise the
+        # network-egress guard's RuntimeError and still satisfy a bare
+        # `raises(Exception)`. The original 401 must be what propagates.
+        secondary = AsyncMock(return_value="fallback_ok")
+        monkeypatch.setattr(llm, "_invoke_once_using_secondary", secondary)
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="401 Unauthorized"):
             await llm.invoke("hi")
+        secondary.assert_not_called()
 
 
 class TestKeyLimitExceeded403:

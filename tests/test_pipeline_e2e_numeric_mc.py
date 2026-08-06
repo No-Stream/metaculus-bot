@@ -29,6 +29,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from tests.conftest import gather_predictions_stub
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -213,7 +214,11 @@ class TestNumericPercentileBranch:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -221,7 +226,6 @@ class TestNumericPercentileBranch:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -281,7 +285,11 @@ class TestNumericDiscreteIntegerSnap:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -289,7 +297,6 @@ class TestNumericDiscreteIntegerSnap:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -353,22 +360,29 @@ class TestNumericHighSpreadTriggersStacking:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="Crux text"
+                "metaculus_bot.stacking_route.extract_disagreement_crux",
+                new_callable=AsyncMock,
+                return_value="Crux text",
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="Targeted results"
+                "metaculus_bot.stacking_route.run_targeted_search",
+                new_callable=AsyncMock,
+                return_value="Targeted results",
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_dist) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -412,7 +426,11 @@ class TestMCLowSpreadMedianPath:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -420,7 +438,6 @@ class TestMCLowSpreadMedianPath:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -486,22 +503,25 @@ class TestMCHighSpreadTriggersStacking:
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="Canned research") as _,
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub((predictions, [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
                 new=AsyncMock(return_value=predictions[0]),
             ),
             patch(
-                "metaculus_bot.forecaster.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux"
+                "metaculus_bot.stacking_route.extract_disagreement_crux", new_callable=AsyncMock, return_value="MC Crux"
             ) as mock_crux,
             patch(
-                "metaculus_bot.forecaster.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
+                "metaculus_bot.stacking_route.run_targeted_search", new_callable=AsyncMock, return_value="MC Targeted"
             ) as mock_search,
             patch.object(bot, "_run_stacking", return_value=stacked_result) as mock_stacking,
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            mock_gather.return_value = (predictions, [], None)
 
             result = await bot._research_and_make_predictions(question)
 

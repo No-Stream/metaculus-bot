@@ -95,8 +95,10 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 # (``.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml``),
 # so these HTML-comment markers are currently DORMANT in published prod
 # comments. NOTE: the ``base_rate_anchor`` / ``criteria_clauses`` fields are
-# live in the binary prompt (added ``30bca2f``, 2026-07-08) — they land
-# unconditionally in every prod binary comment's STRUCTURED FORECAST block.
+# live in the binary prompt (authored ``30bca2f`` 2026-07-08, live on main
+# 2026-07-11T16:37Z in merge ``642b027`` — the merge date is the one to split a
+# replay on, per AGENTS.md era-bucketing) — they land unconditionally in every
+# prod binary comment's STRUCTURED FORECAST block.
 # The COMPUTED markers below (``ANCHOR_OVERSHOOT_PP`` /
 # ``CLAUSE_PRODUCT_DIVERGENCE_PP``) are dormant only because they emit from
 # ``tool_runner``, which is gated behind ``PROBABILISTIC_TOOLS_ENABLED`` (all
@@ -107,7 +109,8 @@ TOOLS_USED_MARKER_RE: re.Pattern[str] = re.compile(
 # Workstream C2 — that retirement covered the prior/base_rate/hazard/evidence/
 # scenario tier-2 fields; the anchor/clause fields shipped the next day as a
 # separate, still-live channel. The "0/2203 archived rows" reading was a
-# data-window artifact: the archive ended 2026-07-01, before ``30bca2f``.)
+# data-window artifact: the archive ended 2026-07-01, before both the authoring
+# and the merge date, so the argument holds on either.)
 # TELEMETRY ONLY either way: nothing in the pipeline reads these
 # back to clamp or mutate a forecast.
 ANCHOR_OVERSHOOT_MARKER_PREFIX: str = "ANCHOR_OVERSHOOT_PP"

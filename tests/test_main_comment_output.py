@@ -61,6 +61,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacker_outcome_marker,
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
+from tests.conftest import gather_predictions_stub
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -664,10 +665,10 @@ class TestForecastersUsedDisclosure:
                 new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
             ),
             patch.object(
-                bot, "_gather_predictions_with_wall_clock", new=AsyncMock(return_value=(predictions, [], None))
+                bot, "_gather_predictions_with_wall_clock", new=gather_predictions_stub((predictions, [], None))
             ),
-            patch("metaculus_bot.forecaster.extract_disagreement_crux", new=AsyncMock(return_value="the crux")),
-            patch("metaculus_bot.forecaster.run_targeted_search", new=AsyncMock(return_value="targeted research")),
+            patch("metaculus_bot.stacking_route.extract_disagreement_crux", new=AsyncMock(return_value="the crux")),
+            patch("metaculus_bot.stacking_route.run_targeted_search", new=AsyncMock(return_value="targeted research")),
             patch.object(bot, "_aggregate_predictions", new=AsyncMock(return_value=0.6)),
         ):
             collection = await bot._research_and_make_predictions(question)

@@ -26,6 +26,7 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+from tests.conftest import gather_predictions_stub
 
 # Type alias matching ForecastBot.__init__'s `llms` parameter. The bot also accepts a
 # "forecasters" list value at runtime (see TemplateForecaster setup), which the upstream
@@ -809,14 +810,23 @@ class TestStackingResearchAndMakePredictions:
 
         question = Mock()
 
-        # Mock the necessary methods. _forecaster_with_soft_deadline is
-        # stubbed so the coroutines created inline in _research_and_make_predictions
-        # don't leak as "never awaited" warnings when _gather_predictions_with_wall_clock
-        # (mocked below) never touches them.
+        # Mock predictions from forecasters. Declared before the patch block because
+        # the gather stub is built from them (see gather_predictions_stub in conftest:
+        # stubbing _forecaster_with_soft_deadline with an AsyncMock makes each inline
+        # call in _research_and_make_predictions create a real coroutine, and the
+        # gather stand-in has to close them or they surface as "never awaited"
+        # RuntimeWarnings pinned to an unrelated test).
+        pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
+        pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
+
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub(([pred1, pred2], [], None)),
+            ),
             patch.object(bot, "_aggregate_predictions", return_value=0.7) as mock_aggregate,
             patch.object(
                 bot,
@@ -824,13 +834,7 @@ class TestStackingResearchAndMakePredictions:
                 new=AsyncMock(return_value=ReasonedPrediction(prediction_value=0.5, reasoning="stub")),
             ),
         ):
-            # Setup mock returns
             mock_notepad.return_value = Mock(total_research_reports_attempted=0)
-
-            # Mock predictions from forecasters
-            pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
-            pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
-            mock_gather.return_value = ([pred1, pred2], [], None)
 
             # Call the method
             result = await bot._research_and_make_predictions(question)
@@ -871,10 +875,17 @@ class TestStackingResearchAndMakePredictions:
 
         question = Mock()
 
+        pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
+        pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
+
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub(([pred1, pred2], [], None)),
+            ),
             patch.object(
                 bot,
                 "_forecaster_with_soft_deadline",
@@ -882,9 +893,6 @@ class TestStackingResearchAndMakePredictions:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0)
-            pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
-            pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
-            mock_gather.return_value = ([pred1, pred2], [], None)
 
             result = await bot._research_and_make_predictions(question)
 
@@ -1107,11 +1115,18 @@ class TestStackingGuardsAndReasoning:
         question = Mock(spec=BinaryQuestion)
         setattr(question, "id_of_question", 999)
 
+        pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
+        pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
+
         # Mock internals to avoid network
         with (
             patch.object(bot, "_get_notepad") as mock_notepad,
             patch.object(bot, "run_research", return_value="test research"),
-            patch.object(bot, "_gather_predictions_with_wall_clock") as mock_gather,
+            patch.object(
+                bot,
+                "_gather_predictions_with_wall_clock",
+                new=gather_predictions_stub(([pred1, pred2], [], None)),
+            ),
             patch.object(bot, "_run_stacking", return_value=0.7),
             patch.object(
                 bot,
@@ -1120,9 +1135,6 @@ class TestStackingGuardsAndReasoning:
             ),
         ):
             mock_notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
-            pred1 = ReasonedPrediction(prediction_value=0.6, reasoning="Analysis 1")
-            pred2 = ReasonedPrediction(prediction_value=0.8, reasoning="Analysis 2")
-            mock_gather.return_value = ([pred1, pred2], [], None)
 
             # Pre-store meta-analysis as if produced by stacker LLM
             bot._stack_meta_reasoning[999] = "Meta-analysis text"

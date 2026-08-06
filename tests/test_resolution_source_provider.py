@@ -45,7 +45,7 @@ from metaculus_bot.research.resolution_source import (
 )
 
 # ---------------------------------------------------------------------------
-# Fake aiohttp session (copied + extended from tests/test_prediction_market_provider.py).
+# Fake aiohttp session (copied + extended from tests/market_retrieval_fakes.py).
 # Extensions vs. the prediction-market template:
 #   * FakeResponse gets an async .read() -> bytes, a `.content.iter_chunked`
 #     stream (what `read_body_capped` consumes), and a `headers` dict

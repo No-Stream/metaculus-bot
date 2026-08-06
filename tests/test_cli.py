@@ -29,22 +29,37 @@ balance all go unnoticed.
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from metaculus_bot.cli import main as cli_main
-from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, credit_alerts_active
+from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
+    PERSIST_RESEARCH_ENABLED_ENV,
+    PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
+    credit_alerts_active,
+)
 from metaculus_bot.credit_telemetry import DonatedKeyState, reset_donated_key_state_cache
 from metaculus_bot.fallback_openrouter import (
     reset_credit_key_fallback_count,
     reset_donated_404_fallback_count,
     reset_generic_key_fallback_count,
+)
+from metaculus_bot.forecaster import TemplateForecaster
+from metaculus_bot.research.provider_health import (
+    VENUE_EXPECTED_LIQUIDITY_FIELDS,
+    VenueObservation,
+    record_venue_observation,
+    reset_provider_health,
 )
 
 # Dates on either side of the suppression boundary. Injected instead of read from
@@ -52,6 +67,37 @@ from metaculus_bot.fallback_openrouter import (
 DURING_SUPPRESSION = date(2026, 7, 25)
 ON_RESUME_DATE = CREDIT_ALERT_RESUME_DATE
 AFTER_RESUME_DATE = date(2026, 10, 1)
+
+# Provider-degradation suppression takes no injected date on the property path
+# (``alertable_count`` is a plain sum), so its two branches are pinned by choosing
+# resume dates that can never fall on the wrong side of the real clock.
+PERMANENTLY_FUTURE_RESUME = date(2099, 1, 1)
+PERMANENTLY_PAST_RESUME = date(2000, 1, 1)
+
+
+def asyncio_run_stub(side_effect):
+    """A ``metaculus_bot.cli.asyncio.run`` stand-in that closes the coroutine it is given.
+
+    ``cli.main`` calls ``asyncio.run(template_bot.forecast_questions(...))``, so the
+    coroutine is constructed by the inner call and handed to ``asyncio.run``, which
+    owns it. Patching ``asyncio.run`` with a bare ``side_effect`` drops it, and since
+    ``forecast_questions`` is an ``AsyncMock`` on the stub bot, the dropped object is a
+    real coroutine: it is later garbage-collected unawaited and emits ``RuntimeWarning:
+    coroutine ... was never awaited``, attributed to whichever unrelated test happened
+    to trigger the collection.
+
+    Closing it honors the ownership contract without executing it, then defers to
+    ``side_effect`` for the behavior each test is actually pinning (crash, or return a
+    report list).
+    """
+
+    def _close_then_apply(*args: object, **kwargs: object):
+        for arg in args:
+            if inspect.iscoroutine(arg):
+                arg.close()
+        return side_effect(*args, **kwargs)
+
+    return _close_then_apply
 
 
 @pytest.fixture(autouse=True)
@@ -63,12 +109,14 @@ def _reset_fallback_counters() -> None:
 
     The donated-key probe verdict is process-global for the same reason (probe
     once per run), and cli renders it in the end-of-run summary, so it is reset
-    here too.
+    here too. Same for the provider-health observation store, which feeds the
+    provider-degradation summand of ``alertable_count``.
     """
     reset_generic_key_fallback_count()
     reset_donated_404_fallback_count()
     reset_credit_key_fallback_count()
     reset_donated_key_state_cache()
+    reset_provider_health()
 
 
 @contextmanager
@@ -77,6 +125,7 @@ def _cli_main_test_mode(
     *,
     donated_below_floor: bool = False,
     today: date | None = None,
+    stub_bot: MagicMock | None = None,
 ) -> Iterator[MagicMock]:
     """Run ``cli.main`` with all external dependencies stubbed; yields the
     CreditTelemetry stub for call assertions.
@@ -93,9 +142,15 @@ def _cli_main_test_mode(
     ``credit_alerts_active``, which we re-bind to evaluate against the injected
     date. ``None`` leaves the real system clock in place (the production path),
     which is what the tests that don't care about credit state want.
+
+    ``stub_bot`` overrides the whole bot object, for tests that need
+    ``alertable_count`` COMPUTED through the real property chain rather than
+    pinned to a literal (see ``_bot_with_real_alertable_count``). ``alertable_count``
+    is ignored when it is supplied.
     """
-    stub_bot = MagicMock()
-    stub_bot.alertable_count = alertable_count
+    if stub_bot is None:
+        stub_bot = MagicMock()
+        stub_bot.alertable_count = alertable_count
     stub_bot.forecast_questions = AsyncMock(return_value=[])
     stub_bot.forecast_on_tournament = AsyncMock(return_value=[])
 
@@ -275,14 +330,123 @@ class TestCliCreditFloor:
         spend (the original exception propagates, not a floor SystemExit).
         """
         with _cli_main_test_mode(alertable_count=0, donated_below_floor=True, today=AFTER_RESUME_DATE) as telemetry:
-            with patch(
-                "metaculus_bot.cli.asyncio.run",
-                side_effect=RuntimeError("forecasting blew up"),
-            ):
+
+            def _crash(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("forecasting blew up")
+
+            with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
                 with pytest.raises(RuntimeError, match="forecasting blew up"):
                     cli_main()
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
+
+
+class TestCliResearchFlush:
+    """The research batch reaches disk on BOTH exit paths.
+
+    Records accumulate in memory for the whole run and are written once at the end, so
+    before the flush moved inside the ``finally`` any exception escaping ``asyncio.run``
+    — an OSError, the invalid-run-mode ValueError, a ``timeout-minutes`` SIGTERM —
+    discarded every question's research. A 40-question tournament run that died on the
+    last question archived nothing, and since GHA deletes artifacts at 90 days that hole
+    is permanent. The same ``finally`` already protected the credit telemetry, which is
+    what made the omission easy to miss.
+
+    Both tests drive the REAL ``ResearchPersistenceWriter`` through the sink cli hands the
+    forecaster, so they cover the whole write path (sink -> accumulate -> flush -> JSONL)
+    rather than asserting that a mock got called.
+    """
+
+    @staticmethod
+    def _forecaster_class() -> MagicMock:
+        """A ``TemplateForecaster`` class stub that also exposes the constructor kwargs.
+
+        The helper's own patch discards its mock, and these tests need the
+        ``research_sink`` cli built and passed in. ``alertable_count`` is pinned to a real
+        int because the normal-path test runs off the end of ``main``, into the
+        ``alertable > 0`` comparison.
+        """
+        forecaster_class = MagicMock()
+        forecaster_class.return_value.alertable_count = 0
+        return forecaster_class
+
+    @staticmethod
+    def _record_two(sink: Callable[..., None]) -> None:
+        """Record two questions' research through cli's own sink callback."""
+        for qid in (43613, 50001):
+            sink(
+                qid=qid,
+                page_url=f"https://www.metaculus.com/questions/{qid}/",
+                question_text=f"Question {qid}?",
+                research_text=f"## News Articles (AskNews)\nResearch for {qid}.",
+                providers_used=["asknews"],
+                gap_fill_used=False,
+            )
+
+    @staticmethod
+    def _flushed_records(tmp_path: Path) -> list[dict]:
+        """Every record in the JSONL the writer flushed into ``research_outputs/``."""
+        written = sorted((tmp_path / "research_outputs").glob("research_*.jsonl"))
+        assert len(written) == 1, f"expected exactly one flushed JSONL, got {written}"
+        return [json.loads(line) for line in written[0].read_text().strip().splitlines()]
+
+    def test_flush_runs_when_the_forecast_loop_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
+        monkeypatch.chdir(tmp_path)  # writer.flush() writes research_outputs/ under CWD
+
+        forecaster_class = self._forecaster_class()
+
+        def _record_then_crash(*_args: object, **_kwargs: object) -> None:
+            # Two questions researched, then the run dies before returning — the shape
+            # that used to lose the whole batch.
+            self._record_two(forecaster_class.call_args.kwargs["research_sink"])
+            raise RuntimeError("forecast loop blew up")
+
+        with _cli_main_test_mode(alertable_count=0):
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)):
+                    # The original exception must still propagate: the flush is a rescue,
+                    # not a swallow.
+                    with pytest.raises(RuntimeError, match="forecast loop blew up"):
+                        cli_main()
+
+        assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
+
+    def test_flush_still_runs_on_the_normal_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
+        monkeypatch.chdir(tmp_path)
+
+        forecaster_class = self._forecaster_class()
+
+        def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
+            self._record_two(forecaster_class.call_args.kwargs["research_sink"])
+            return []
+
+        with _cli_main_test_mode(alertable_count=0):
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)):
+                    cli_main()
+
+        assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
+
+    def test_nothing_is_written_when_the_flag_is_off(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No writer, no sink: the forecaster is handed None and the run leaves no
+        # research_outputs/ at all. Pins that the finally-block flush is guarded.
+        monkeypatch.delenv(PERSIST_RESEARCH_ENABLED_ENV, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        def _crash(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
+
+        forecaster_class = self._forecaster_class()
+        with _cli_main_test_mode(alertable_count=0):
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)):
+                    with pytest.raises(RuntimeError, match="boom"):
+                        cli_main()
+
+        assert forecaster_class.call_args.kwargs["research_sink"] is None
+        assert not (tmp_path / "research_outputs").exists()
 
 
 class TestCliCreditAlertSuppression:
@@ -616,3 +780,214 @@ class TestCliCreditAlertSuppression:
         finally:
             fb_module._generic_key_fallback_count = 0
             fb_module._credit_key_fallback_count = 0
+
+
+class _RealAlertableCountBot(MagicMock):
+    """A cli stub whose ``alertable_count`` is COMPUTED, not pinned to a literal.
+
+    The provider-degradation summand has to travel the whole real chain — module
+    observation store, then ``ResearchOrchestrator.provider_degradation_count``, then
+    ``TemplateForecaster._provider_degradation_count``, then ``alertable_count``, then
+    the ``sys.exit`` in cli — or the test proves only that cli exits on a number the
+    test handed it. A plain ``MagicMock`` attribute set to an int proves exactly that,
+    which is how a broken summand ships green.
+
+    A dedicated SUBCLASS rather than assignments onto ``type(mock)``: for a
+    ``MagicMock`` instance that expression is ``MagicMock`` itself, so binding the
+    properties there would mutate the class for every mock in the session and leak
+    into unrelated tests.
+    """
+
+    alertable_count = TemplateForecaster.alertable_count
+    _research_provider_failure_count = TemplateForecaster._research_provider_failure_count
+    _summarizer_failure_count = TemplateForecaster._summarizer_failure_count
+    _gap_fill_v2_error_count = TemplateForecaster._gap_fill_v2_error_count
+    _prediction_market_degraded_count = TemplateForecaster._prediction_market_degraded_count
+    _prediction_market_source_loss_count = TemplateForecaster._prediction_market_source_loss_count
+    _provider_degradation_count = TemplateForecaster._provider_degradation_count
+
+
+def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
+    """Build the computed-``alertable_count`` stub with a REAL orchestrator attached.
+
+    Only what cli touches is real: the orchestrator supplies the provider-degradation
+    and prediction-market properties, and the bot-side counters start at zero so the
+    provider-degradation summand is the only thing that can move the total.
+    """
+    from metaculus_bot.research.orchestrator import (  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+        ResearchOrchestrator,
+    )
+
+    stub_bot = _RealAlertableCountBot()
+    stub_bot._research = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+    for counter in (
+        "_forecasters_dropped_count",
+        "_questions_failed_to_publish",
+        "_stacker_primary_failed_count",
+        "_stacker_fallback_used_count",
+        "_stacker_fallback_failed_count",
+    ):
+        setattr(stub_bot, counter, 0)
+    return stub_bot
+
+
+def _observe_venue(venue: str, *, candidates: int, rows: int, fields: frozenset[str]) -> None:
+    record_venue_observation(
+        VenueObservation(
+            qid=45082,
+            venue=venue,
+            candidates_pre_filter=candidates,
+            rows_post_filter=rows,
+            liquidity_fields_present=fields,
+        )
+    )
+
+
+class TestCliProviderDegradationExit:
+    """Provider degradation reaches the exit code, and publishing is untouched.
+
+    The operator's ask: if a provider doesn't populate properly, still submit the
+    forecast, but exit non-zero so it doesn't take a residual round weeks later to
+    surface. Both halves are load-bearing, and the second is the invariant that must
+    never regress — the exit lives in cli AFTER the forecasting call returns, so every
+    publishable question is already on Metaculus by the time the status is decided.
+    """
+
+    @staticmethod
+    def _degrade_kalshi_liquidity_fields() -> None:
+        """Record the shape the Kalshi defect produced: three rows with both declared
+        liquidity fields absent, so every row renders ``no-liquidity-data``."""
+        _observe_venue("kalshi", candidates=3, rows=3, fields=frozenset())
+
+    def test_one_finding_exits_non_zero(self) -> None:
+        """The end-to-end wiring, with alertable_count computed rather than pinned."""
+        bot = _bot_with_real_alertable_count()
+        self._degrade_kalshi_liquidity_fields()
+        assert bot.alertable_count == 1
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+
+    def test_no_findings_returns_normally(self) -> None:
+        """A healthy run stays green: the store is empty, so nothing is evaluable."""
+        bot = _bot_with_real_alertable_count()
+        assert bot.alertable_count == 0
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            # Must NOT raise SystemExit.
+            cli_main()
+
+    def test_a_market_less_run_stays_green(self) -> None:
+        """THE false-positive test, at the exit-code level. Every venue returned zero
+        rows and zero candidates because the run's one open question is about
+        something no prediction market covers. That is normal operation and must not
+        redden CI — an alert the operator learns to ignore is worse than silence.
+        """
+        bot = _bot_with_real_alertable_count()
+        for venue in ("polymarket", "kalshi", "manifold", "predictit"):
+            _observe_venue(venue, candidates=0, rows=0, fields=frozenset())
+        assert bot.alertable_count == 0
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            # Must NOT raise SystemExit.
+            cli_main()
+
+    def test_publishing_completes_before_the_exit(self) -> None:
+        """The sacrosanct invariant. Forecasting — which publishes per question, deep
+        inside the call — has to have finished, and the report summary has to have been
+        logged, before the SystemExit propagates. A degradation alert that suppressed a
+        publication would be strictly worse than the silence it replaces.
+
+        Asserted as an ORDERED event log rather than two independent "was it called"
+        checks: the ordering is the whole invariant, and two ``assert_called_once``
+        calls would pass just as happily if the exit came first.
+
+        ``log_report_summary`` is invoked as ``TemplateForecaster.log_report_summary``
+        on the CLASS, so it lands on the class mock cli holds, not on the bot instance.
+        This test re-patches that name to keep a handle on it — the helper's own patch
+        discards it.
+        """
+        bot = _bot_with_real_alertable_count()
+        self._degrade_kalshi_liquidity_fields()
+        events: list[str] = []
+
+        forecaster_class = MagicMock(return_value=bot)
+        forecaster_class.log_report_summary.side_effect = lambda *a, **k: events.append("report_summary")
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            # Set INSIDE the context: the helper installs its own forecast stub while
+            # entering, so an assignment made beforehand is silently clobbered.
+            async def _record_forecast(*_args: object, **_kwargs: object) -> list[object]:
+                events.append("forecast")
+                return []
+
+            bot.forecast_questions = AsyncMock(side_effect=_record_forecast)
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli_main()
+                assert exc_info.value.code == 1
+
+        events.append("exit")
+        assert events == ["forecast", "report_summary", "exit"]
+
+    def test_suppression_keeps_the_run_green_and_still_logs_the_finding(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A dated per-venue acceptance drops the finding out of ``alertable`` while
+        keeping every log line, following ``credit_alerts_active``'s contract.
+
+        ``alertable_count`` is a plain property with nowhere to inject a date, so the
+        window is pinned through the DICT instead of the clock: a resume date
+        permanently in the future is inside the window, one permanently in the past is
+        past it. Both branches therefore keep running forever without patching
+        ``date.today``.
+        """
+        bot = _bot_with_real_alertable_count()
+        for venue in ("kalshi", "predictit", "polymarket"):
+            _observe_venue(venue, candidates=3, rows=3, fields=frozenset(VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]))
+        # Manifold's declared field (`num_bettors`) absent from every pool row: one
+        # `market_field_contract` finding on the venue whose acceptance is under test.
+        _observe_venue("manifold", candidates=3, rows=3, fields=frozenset())
+
+        with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_FUTURE_RESUME}):
+            assert bot.alertable_count == 0
+            with (
+                _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE),
+                caplog.at_level(logging.INFO, logger="metaculus_bot.research.provider_health"),
+            ):
+                # Must NOT raise SystemExit.
+                cli_main()
+                # The marker is emitted by the REAL forecast_questions, which this
+                # helper stubs out (it pins cli's exit wiring, not the forecast loop),
+                # so drive the orchestrator seam cli's bot exposes. That the forecaster
+                # calls it per run is pinned in test_template_forecaster.py.
+                bot._research.log_provider_degradation_summary()
+
+            messages = [record.getMessage() for record in caplog.records]
+            marker = next(msg for msg in messages if msg.startswith("PROVIDER_DEGRADATION:"))
+            assert "findings=1 alertable=0 suppressed=1" in marker
+            assert f"suppressed until {PERMANENTLY_FUTURE_RESUME.isoformat()}" in marker
+            assert "run stays green" in marker
+
+        with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_PAST_RESUME}):
+            # Past the resume date, the same state is alertable again — a stale
+            # acceptance cannot outlive its date unnoticed.
+            assert bot.alertable_count == 1
+
+    def test_a_snapshot_timeout_is_not_double_counted(self) -> None:
+        """A whole-provider timeout bumps ``prediction_market_source_losses`` and
+        records NO venue observations, so provider-degradation stays 0 and the run
+        reports one event rather than two. The exit code can't distinguish 1 from 2, so
+        assert the counters directly — the same reasoning as
+        ``test_donated_404_fallback_triggers_sys_exit_without_double_counting``.
+        """
+        import metaculus_bot.research.prediction_market as pmp  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        bot = _bot_with_real_alertable_count()
+        pmp._bump_source_loss()
+        try:
+            assert bot._prediction_market_source_loss_count == 1
+            assert bot._provider_degradation_count == 0
+            assert bot.alertable_count == 1
+        finally:
+            pmp.reset_source_loss_counter()

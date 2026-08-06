@@ -4,11 +4,14 @@ The coverage math is verified against hand-computed values on synthetic
 records with linear CDFs (so PIT = (resolution - lower) / (upper - lower)).
 """
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pytest
 
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.performance_analysis.width_monitor import (
+    KNOWN_BUG_QIDS,
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,
     _cdf_and_grid,
@@ -19,6 +22,8 @@ from metaculus_bot.performance_analysis.width_monitor import (
     compute_pit,
     default_eras,
     jeffreys_ci,
+    main,
+    parse_exclude_qids,
     relative_band_width,
     render_markdown,
 )
@@ -33,6 +38,7 @@ def _linear_cdf_record(
     upper: float = 100.0,
     created_at: str | None = "2026-01-01T00:00:00Z",
     q_type: str = "numeric",
+    question_id: object = None,
 ) -> dict:
     """A numeric record whose published CDF is the identity ramp on a linear
     grid over ``[lower, upper]``. For such a CDF, F(x) = (x - lower) / (upper -
@@ -48,7 +54,13 @@ def _linear_cdf_record(
         "open_lower_bound": True,
         "open_upper_bound": True,
         "bot_comment_created_at": created_at,
+        "question_id": question_id,
     }
+
+
+def _record_with_pit(pit: float, **kwargs) -> dict:
+    """A record whose PIT is exactly ``pit`` (identity ramp over [0, 100])."""
+    return _linear_cdf_record(resolution=pit * 100.0, **kwargs)
 
 
 class TestPit:
@@ -100,19 +112,123 @@ class TestJeffreysCi:
 
 class TestEraAssignment:
     def test_boundaries(self):
+        """Bucketing at literal wall-clock instants either side of each boundary.
+
+        These used ``WIDENING_FLIP.isoformat()`` / ``TS_ANCHOR_ENABLE.isoformat()``
+        as inputs, which fed each constant back to itself and made the assertion
+        pass for any value the constants happened to hold (2099-01-01 included).
+        That is how the wrong TS-anchor boundary survived a green suite. Literal
+        timestamps here; the constants' own values are pinned to their merge
+        commits in ``TestEraBoundariesAreMergeDates``.
+        """
         eras = default_eras()
-        # Strictly before the widening flip -> widening_on.
         assert assign_era({"bot_comment_created_at": "2026-05-11T23:59:59Z"}, eras) == "widening_on (k_tail=1.25)"
-        # On the flip instant -> widening_off (half-open [start, end)).
-        assert assign_era({"bot_comment_created_at": WIDENING_FLIP.isoformat()}, eras) == "widening_off (k_tail=1.0)"
-        # Between the two flips -> widening_off.
+        assert assign_era({"bot_comment_created_at": "2026-05-18T17:21:19Z"}, eras) == "widening_off (k_tail=1.0)"
         assert assign_era({"bot_comment_created_at": "2026-07-01T00:00:00Z"}, eras) == "widening_off (k_tail=1.0)"
-        # On/after the TS-anchor enable -> ts_anchor.
-        assert assign_era({"bot_comment_created_at": TS_ANCHOR_ENABLE.isoformat()}, eras) == "ts_anchor (sharpen)"
+        assert assign_era({"bot_comment_created_at": "2026-07-21T17:07:37Z"}, eras) == "ts_anchor (sharpen)"
+        assert assign_era({"bot_comment_created_at": "2026-08-01T00:00:00Z"}, eras) == "ts_anchor (sharpen)"
+
+    def test_boundary_instant_is_half_open(self):
+        """``[start, end)``: the boundary instant itself belongs to the LATER era,
+        and one microsecond earlier to the earlier one.
+
+        Value-independent by construction — it asserts the interval convention,
+        not the dates — so it is deliberately kept separate from the assertions
+        that pin the dates themselves.
+        """
+        eras = default_eras()
+        for boundary, earlier_label, later_label in (
+            (WIDENING_FLIP, "widening_on (k_tail=1.25)", "widening_off (k_tail=1.0)"),
+            (TS_ANCHOR_ENABLE, "widening_off (k_tail=1.0)", "ts_anchor (sharpen)"),
+        ):
+            assert assign_era({"bot_comment_created_at": boundary.isoformat()}, eras) == later_label
+            just_before = boundary - timedelta(microseconds=1)
+            assert assign_era({"bot_comment_created_at": just_before.isoformat()}, eras) == earlier_label
 
     def test_missing_timestamp(self):
         assert assign_era({"bot_comment_created_at": None}, default_eras()) == "no_timestamp"
         assert assign_era({}, default_eras()) == "no_timestamp"
+
+
+class TestEraBoundariesAreMergeDates:
+    """Era boundaries must be MERGE-TO-MAIN timestamps, never authoring dates.
+
+    Prod runs from ``main``, so a config change is live only once its merge
+    commit lands there. Every assertion here anchors to a fact the constant
+    cannot define — either the merge commit's committer timestamp or the roster
+    that the same merge retired — because the pre-existing boundary test fed the
+    constant back to itself and therefore passed for any value (including
+    2099-01-01).
+    """
+
+    def test_boundaries_equal_merge_commit_timestamps(self):
+        """Both constants equal the committer date of the merge that landed them.
+
+        Re-derive with ``TZ=UTC git log -1 --date=iso-local --format='%h %cd' <sha>``:
+
+          * ``0e85e1b`` 2026-05-18 17:21:19 +0000 — flipped ``TAIL_WIDEN_K_TAIL``
+            1.25 -> 1.0 (confirmed by value across ``0e85e1b^1``/``0e85e1b``).
+            Authored ``b8d730f`` 2026-05-12, six days earlier.
+          * ``b4e9df0`` 2026-07-21 17:07:37 +0000 — the july15 bundle: TS anchor
+            provider + prompt clause + the ``TS_ANCHOR_ENABLED: 'true'`` yaml
+            flip, all authored 2026-07-17, four days earlier.
+        """
+        assert WIDENING_FLIP == datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)
+        assert TS_ANCHOR_ENABLE == datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+
+    def test_pre_merge_roster_record_is_not_in_post_merge_era(self):
+        """A record that provably ran the retired 6-model roster cannot be in the
+        post-``b4e9df0`` era.
+
+        This is qid 44795 verbatim: published 2026-07-17T21:16:47Z, four days
+        after the anchor was authored and four days before it reached ``main``.
+        Its own comment names ``gpt-5.5``, ``claude-opus-4.6`` and ``grok-4.5``
+        — and ``b4e9df0`` dropped the roster from six models to the
+        latest-per-vendor triple in the same merge that landed the anchor, so
+        that combination is impossible post-merge. The assertion therefore holds
+        independently of what value the constant happens to carry.
+        """
+        record = {
+            "bot_comment_created_at": "2026-07-17T21:16:47.573093+00:00",
+            "bot_comment": (
+                "*Forecaster 1 (gpt-5.6-sol)*: 12.0\n"
+                "*Forecaster 2 (gpt-5.5)*: 13.0\n"
+                "*Forecaster 3 (claude-opus-4.8)*: 11.5\n"
+                "*Forecaster 4 (claude-opus-4.6)*: 12.5\n"
+                "*Forecaster 5 (gemini-3.1-pro-preview)*: 12.2\n"
+                "*Forecaster 6 (grok-4.5)*: 14.0\n"
+            ),
+        }
+        assert assign_era(record, default_eras()) == "widening_off (k_tail=1.0)"
+
+    @pytest.mark.parametrize(
+        "created_at",
+        [
+            "2026-07-17T03:24:24Z",  # the anchor provider's own authoring instant
+            "2026-07-19T12:00:00Z",
+            "2026-07-21T00:00:00Z",
+            "2026-07-21T17:07:36Z",  # one second before the merge landed
+        ],
+    )
+    def test_july15_gap_window_buckets_pre_anchor(self, created_at):
+        """Nothing on ``main`` changed between the 2026-07-12 merge (``f084bf7``)
+        and ``b4e9df0``, so every run in the author-to-merge gap used the
+        identical pre-anchor config and belongs in ``widening_off``."""
+        assert assign_era({"bot_comment_created_at": created_at}, default_eras()) == "widening_off (k_tail=1.0)"
+
+    @pytest.mark.parametrize(
+        "created_at",
+        [
+            "2026-05-12T10:32:02Z",  # b8d730f authoring instant
+            "2026-05-15T12:00:00Z",
+            "2026-05-18T17:21:18Z",  # one second before 0e85e1b landed
+        ],
+    )
+    def test_widening_gap_window_buckets_pre_flip(self, created_at):
+        """Same defect class as the TS-anchor boundary, six days wide. Zero
+        resolved records fall in this window today, so it is latent — a future
+        backfill recovering May 12-18 records would activate it silently."""
+        assert assign_era({"bot_comment_created_at": created_at}, default_eras()) == "widening_on (k_tail=1.25)"
 
 
 class TestEraMetrics:
@@ -231,6 +347,159 @@ class TestComputeAllEras:
         assert "Numeric width / calibration monitor" in md
         assert "cov@10" in md
         assert "| all |" in md
+
+
+class TestExcludeQids:
+    """``exclude_qids`` drops named questions from every row, and says so.
+
+    The bug pair 43746/43747 (Minions / Toy Story 5 opening-weekend gross) is
+    excluded from every other dimension of the residual analysis; the width
+    monitor was the one place that still counted it. Both records are
+    PIT-extreme and sit in opposite tails, so leaving them in makes the active
+    era read mildly too narrow.
+    """
+
+    def test_known_bug_qids_names_the_documented_pair(self):
+        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747"})
+
+    def test_default_keeps_every_record(self):
+        """Exclusion is opt-in: callers pass the set explicitly."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-06-01T00:00:00Z", question_id=43746),
+            _record_with_pit(0.975, created_at="2026-06-01T00:00:00Z", question_id=43747),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data)}
+        assert by_label["widening_off (k_tail=1.0)"].n_pit == 3
+        assert by_label["all"].n_pit == 3
+        assert by_label["all"].n_excluded == 0
+
+    def test_excluded_qids_drop_from_era_and_all_rows(self):
+        """Integer ``question_id`` is the real dataset shape — the collector
+        writes ``q["id"]`` straight through — so the match must coerce rather
+        than compare an int against a string set and silently no-op."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-01T00:00:00Z"),
+            _record_with_pit(0.5, created_at="2026-03-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-06-01T00:00:00Z", question_id=43746),
+            _record_with_pit(0.975, created_at="2026-06-01T00:00:00Z", question_id="43747"),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data, exclude_qids=KNOWN_BUG_QIDS)}
+        assert by_label["widening_off (k_tail=1.0)"].n_pit == 1
+        assert by_label["widening_off (k_tail=1.0)"].n_excluded == 2
+        assert by_label["all"].n_pit == 2
+        assert by_label["all"].n_excluded == 2
+        # The untouched era is unaffected and reports no exclusions.
+        assert by_label["widening_on (k_tail=1.25)"].n_pit == 1
+        assert by_label["widening_on (k_tail=1.25)"].n_excluded == 0
+
+    def test_excluded_count_surfaces_in_rendered_table(self):
+        """A silent exclusion is the same failure mode as a silent degradation:
+        the reader must be able to see that rows were dropped."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-06-01T00:00:00Z", question_id=43746),
+        ]
+        md = render_markdown(compute_all_eras(data, exclude_qids=KNOWN_BUG_QIDS))
+        assert "excl" in md
+        # The dropped record is visible as a count, not just absent.
+        assert "| 1 | 1 |" in md
+
+
+class TestParseExcludeQids:
+    """The ``known_bug`` shorthand COMPOSES with explicit ids.
+
+    It used to expand only as the whole argument, so ``--exclude-qids known_bug,43800``
+    produced the literal ``{"known_bug", "43800"}``: no question id matches the word, so the
+    bug pair stayed in every row while the ``excl`` column reported one exclusion and made the
+    run look like the shorthand had worked. That is exactly the silent-exclusion failure the
+    column exists to prevent.
+    """
+
+    def test_empty_excludes_nothing(self):
+        assert parse_exclude_qids("") == frozenset()
+        assert parse_exclude_qids("  ,  ") == frozenset()
+
+    def test_shorthand_alone_expands_to_the_pair(self):
+        assert parse_exclude_qids("known_bug") == KNOWN_BUG_QIDS
+        assert parse_exclude_qids("  known_bug  ") == KNOWN_BUG_QIDS
+
+    def test_shorthand_mixed_with_explicit_ids_expands_and_keeps_both(self):
+        assert parse_exclude_qids("known_bug,43800") == KNOWN_BUG_QIDS | {"43800"}
+        assert parse_exclude_qids("43800, known_bug ,43801") == KNOWN_BUG_QIDS | {"43800", "43801"}
+
+    def test_the_shorthand_token_never_survives_as_a_literal_id(self):
+        """The word itself must not reach ``compute_all_eras`` — it matches no question id, so
+        its only effect there is an exclusion the table reports and never performs."""
+        assert "known_bug" not in parse_exclude_qids("known_bug,43800")
+
+    def test_explicit_ids_alone_are_passed_through(self):
+        assert parse_exclude_qids("43800,43801") == frozenset({"43800", "43801"})
+
+    def test_the_mixed_form_actually_drops_all_three_questions(self):
+        """End-to-end through the metrics, not just the parse: the shorthand's ids and the
+        explicit id all leave the rows."""
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-01T00:00:00Z"),
+            _record_with_pit(0.025, created_at="2026-06-01T00:00:00Z", question_id=43746),
+            _record_with_pit(0.975, created_at="2026-06-01T00:00:00Z", question_id=43747),
+            _record_with_pit(0.1, created_at="2026-06-01T00:00:00Z", question_id=43800),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data, exclude_qids=parse_exclude_qids("known_bug,43800"))}
+
+        assert by_label["all"].n_pit == 1
+        assert by_label["all"].n_excluded == 3
+
+    def test_the_help_text_states_that_the_shorthand_composes(self, capsys):
+        """The composing behavior is only discoverable from ``--help``, and a help string that
+        still described the sole-value form is what made the old bug invisible."""
+        with pytest.raises(SystemExit):
+            main(["--help"])
+
+        help_text = capsys.readouterr().out
+        assert "composes" in help_text
+        assert "known_bug,43800" in help_text
+
+
+class TestBandMissSplit:
+    """``band_miss`` splits the out-of-band rate into tails, which separates a
+    band that is too TIGHT from one that is the right width but MIS-CENTERED.
+    ``cov80`` alone cannot express that distinction.
+    """
+
+    @staticmethod
+    def _records(n_low: int, n_high: int, n_inside: int) -> list[dict]:
+        pits = [0.05] * n_low + [0.95] * n_high + [0.50] * n_inside
+        return [_record_with_pit(p) for p in pits]
+
+    def test_band_miss_equals_one_minus_raw_cov80(self):
+        m = compute_era_metrics("test", self._records(n_low=1, n_high=1, n_inside=18))
+        assert m is not None
+        assert m.band_miss == pytest.approx(0.10, abs=1e-9)
+        assert m.band_lo == pytest.approx(0.05, abs=1e-9)
+        assert m.band_hi == pytest.approx(0.05, abs=1e-9)
+
+    def test_split_discriminates_tight_from_miscentered_at_identical_cov80(self):
+        tight = compute_era_metrics("tight", self._records(n_low=3, n_high=3, n_inside=14))
+        miscentered = compute_era_metrics("miscentered", self._records(n_low=0, n_high=6, n_inside=14))
+        assert tight is not None and miscentered is not None
+        # The point of the new column: cov80 is IDENTICAL between the two cases,
+        # so no cov80-based read can tell them apart.
+        assert tight.cov80 == pytest.approx(miscentered.cov80)
+        assert tight.band_miss == pytest.approx(miscentered.band_miss, abs=1e-9)
+        assert tight.band_miss == pytest.approx(0.30, abs=1e-9)
+        # The tails do tell them apart: symmetric misses vs. all-high misses.
+        assert tight.band_lo == pytest.approx(tight.band_hi, abs=1e-9)
+        assert miscentered.band_lo == pytest.approx(0.0, abs=1e-9)
+        assert miscentered.band_hi == pytest.approx(0.30, abs=1e-9)
+
+    def test_band_miss_rendered_and_serialized(self):
+        data = [_record_with_pit(p) for p in (0.05, 0.50, 0.95)]
+        metrics = compute_all_eras(data)
+        md = render_markdown(metrics)
+        assert "band_miss" in md
+        d = metrics[0].to_dict()
+        assert {"band_miss", "band_lo", "band_hi"} <= set(d)
 
 
 class TestLogScaleGrid:
