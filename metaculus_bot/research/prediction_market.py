@@ -99,6 +99,7 @@ from metaculus_bot.research.market_retrieval.types import (
     MarketChild,  # noqa: F401  # re-export: the multi-outcome sub-row, archived inside MarketMatch
     MarketMatch,
     MarketSnapshot,
+    ScalarEstimate,  # noqa: F401  # re-export: a scalar market's value, archived inside MarketMatch
     SettlementSource,  # noqa: F401  # re-export: archive shape + test constructions
     _FetchTally,
     _liquidity_label,  # noqa: F401  # re-export

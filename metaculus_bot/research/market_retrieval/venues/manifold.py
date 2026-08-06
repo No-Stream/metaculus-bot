@@ -8,6 +8,22 @@ key, so their whole price lives in the per-candidate detail GET the enrichment h
 That one array is read TWICE, for two surfaces with different room: ``manifold_top_answers`` takes
 three leaders for the ranker's one-line candidate, and ``manifold_answer_children`` takes every
 answer with its own volume for the rendered ``↳`` sub-rows.
+
+``outcomeType`` IS read, in exactly one place: the price read in ``parse_manifold_matches``, as an
+ALLOW-LIST on ``BINARY``. A ``PSEUDO_NUMERIC`` market is why. It trades a VALUE on a ``[min, max]``
+scale, publishes no ``answers`` array — so the discriminator above reads it as BINARY — and still
+publishes a market-level ``probability``, which on that contract is the value's normalized POSITION
+on the scale rather than a probability of anything. Live 2026-08-05, the market Metaculus Q14333's
+ranker graded ``same_quantity_same_date`` rendered ``prob`` 0.48 where its ``value`` was 120.97
+years, and ``probability * max == value`` to full float precision.
+
+An allow-list rather than a ``PSEUDO_NUMERIC`` deny-list because the two failures are not
+symmetric. A type this parser has not met yet loses a real price VISIBLY — ``prob`` renders ``-``,
+and a WARN fires whenever a non-null ``probability`` is declined with no readable ``value`` to show
+instead — where a deny-list would print the next such type's scale position as a probability,
+silently, exactly as this one did. ``STONK`` is the standing evidence that "the next such type"
+is not hypothetical: it is a share-price contract that also carries no ``answers``, and it only
+escapes this bug because it happens to publish ``probability`` null today.
 """
 
 from __future__ import annotations
@@ -17,7 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, safe_float, safe_int
-from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch
+from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch, ScalarEstimate
 from metaculus_bot.research.market_retrieval.venues._shared import RULES_TEXT_MAX_CHARS, VENUE_SEARCH_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -26,6 +42,12 @@ MANIFOLD_SEARCH_URL = "https://api.manifold.markets/v0/search-markets"
 MANIFOLD_MARKET_URL = "https://api.manifold.markets/v0/market"
 
 MANIFOLD_MAX_ATTEMPTS = 2
+
+# The ONE ``outcomeType`` whose market-level ``probability`` is a probability — see the module
+# docstring for why this is an allow-list. Every other type either publishes that field as null
+# (MULTIPLE_CHOICE, MULTI_NUMERIC, NUMBER, DATE, POLL, STONK) or publishes it as a scale position
+# (PSEUDO_NUMERIC), and neither belongs in a column headed `prob`.
+MANIFOLD_PRICED_OUTCOME_TYPE = "BINARY"
 
 # A multi-outcome Manifold market's leading answers, kept off its detail payload for the RANKER's
 # candidate line. Three, because they become one pipe-separated segment of a one-line candidate and
@@ -78,6 +100,35 @@ def manifold_rules_text(market: dict[str, Any]) -> str:
     return ""
 
 
+def manifold_scalar_estimate(market: dict[str, Any]) -> ScalarEstimate | None:
+    """A scalar market's traded value and its scale, or ``None`` when there is no value to show.
+
+    Read straight off the SEARCH listing, which was the surprise: a ``PSEUDO_NUMERIC`` row arrives
+    from ``/search-markets`` carrying ``value``, ``min``, ``max`` and ``isLogScale`` alongside the
+    misleading ``probability`` (live-verified 2026-08-05), so both detecting the shape and pricing it
+    are free — this adds no request, and the detail GET the enrichment hook fires is not involved.
+
+    ``value`` is taken verbatim and NEVER derived from ``probability``. That is safe arithmetic on a
+    linear market (``probability * max == value`` exactly) and catastrophic on a log one, where the
+    same product overstates the venue's own figure by 29x on a 2000-250000 scale and 6554x on a
+    1-10000000 one. Reading the field is correct on both and needs no branch on the scale, so
+    ``is_log_scale`` is carried for the FORECASTER's benefit — where a value sits between its bounds
+    means something different on a log axis — and not for any computation here.
+
+    A row with no readable ``value`` returns ``None`` and renders no price at all, rather than
+    falling back to the one number that is definitely wrong.
+    """
+    value = safe_float(market.get("value"))
+    if value is None:
+        return None
+    return ScalarEstimate(
+        value=value,
+        minimum=safe_float(market.get("min")),
+        maximum=safe_float(market.get("max")),
+        is_log_scale=bool(market.get("isLogScale")),
+    )
+
+
 def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | None:
     """Parse a Manifold search response into candidate rows, venue-rank order.
 
@@ -114,12 +165,30 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
             except (OverflowError, OSError, ValueError):
                 close_time = None
 
+        # Either a probability or a scalar value, never both — the whole point of the allow-list.
+        if market.get("outcomeType") == MANIFOLD_PRICED_OUTCOME_TYPE:
+            implied_prob_yes = safe_float(market.get("probability"))
+            scalar_estimate = None
+        else:
+            implied_prob_yes = None
+            scalar_estimate = manifold_scalar_estimate(market)
+            if scalar_estimate is None and market.get("probability") is not None:
+                # The unhandled shape, and the reason the allow-list is safe to prefer: a type
+                # publishing a market-level number this parser cannot interpret loses its price
+                # LOUDLY here rather than rendering it under a `prob` header. No type does this
+                # today (PSEUDO_NUMERIC ships `value`; every other non-BINARY type ships
+                # `probability` null), so a line in the run log means Manifold shipped a new one.
+                logger.warning(
+                    f"Manifold {market.get('outcomeType')!r} market carries a market-level probability "
+                    f"but no readable value; rendering no price for {market.get('id')!r}"
+                )
+
         out.append(
             MarketMatch(
                 platform="manifold",
                 market_title=market.get("question") or "",
                 market_url=url,
-                implied_prob_yes=safe_float(market.get("probability")),
+                implied_prob_yes=implied_prob_yes,
                 bid=None,
                 ask=None,
                 spread=None,
@@ -133,6 +202,7 @@ def parse_manifold_matches(payload: Any, *, width: int) -> list[MarketMatch] | N
                 num_bettors=safe_int(market.get("uniqueBettorCount")),
                 venue_market_id=str(market.get("id") or ""),
                 retrieval_channel="venue_search",
+                scalar_estimate=scalar_estimate,
             )
         )
     return out
@@ -193,11 +263,17 @@ def manifold_top_answers(detail: dict[str, Any]) -> tuple[tuple[str, float], ...
     ``probability`` is null, so before this a multi-outcome row reached the forecaster with a
     title and nothing else.
 
-    The array IS the outcome-type discriminator, which is why nothing here reads
-    ``outcomeType``: a BINARY detail carries no ``answers`` key at all, while MULTIPLE_CHOICE,
+    The array IS the outcome-type discriminator for the ANSWERS path, which is why nothing here
+    reads ``outcomeType``: a BINARY detail carries no ``answers`` key at all, while MULTIPLE_CHOICE,
     MULTI_NUMERIC, NUMBER and DATE all publish the same ``{text, probability}`` answer shape
     (live-verified across all five, 2026-08-05), so one read covers the whole ~30% of Manifold
     the ``contractType`` flip reaches without a second field to keep in sync.
+
+    That still holds, and it is now the narrower of two claims: the PRICE read in
+    ``parse_manifold_matches`` does consult ``outcomeType``, because a scalar ``PSEUDO_NUMERIC``
+    market publishes no answers either and would otherwise pass for BINARY. The distinction is that
+    the discriminator here is asked "are there several prices?", which the array answers exactly,
+    while the price read is asked "is this one number a probability?", which it cannot.
 
     The sort's STABILITY is load-bearing rather than incidental. A threshold ladder resolves its
     crossed rungs to probability exactly 1.0 — 10 of 17 answers on the committed fixture — so the

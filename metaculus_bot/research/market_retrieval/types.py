@@ -28,6 +28,36 @@ LIQUIDITY_DEEP_USD = 50_000.0
 MANIFOLD_THIN_BETTORS = 20
 MANIFOLD_HIGH_BETTORS = 100
 
+# Significant digits for a scalar market's BOUNDS, wherever they render. Wide enough to stay exact on
+# any author-chosen scale: a real Manifold scale runs as high as `max` 20,000,000,000 (11 digits), and
+# rounding a bound misstates the market's own scale. The VALUE beside them is formatted separately and
+# shorter (`rendering.SCALAR_VALUE_SIG_DIGITS`) because it is a noisy estimate rather than a chosen
+# parameter.
+SCALAR_BOUND_SIG_DIGITS = 12
+
+
+def format_scalar_number(value: float, *, sig_digits: int) -> str:
+    """One scalar figure for a forecaster: rounded to ``sig_digits``, grouped, never in exponent form.
+
+    Significant digits rather than decimal places, because these scales span four orders of magnitude
+    in each direction — live Manifold markets run from ``0.5 to 2.5`` up to ``1e6 to 2e10`` — and any
+    fixed decimal precision serves one end while making nonsense of the other.
+
+    Plain grouped decimal rather than ``%g``'s automatic exponent, because a cell reading
+    ``value 7.84859e+09 (log scale 1000000 to 2e+10)`` writes the same scale two ways and asks a
+    reader to parse exponents; ``value 7,848,590,000 (log scale 1,000,000 to 20,000,000,000)`` is the
+    world population, legibly. The trailing zeros are a rounding artefact rather than a precision
+    claim, which is the accepted cost — nobody reads a population ending in five zeros as exact, and
+    the alternative asks every reader to do the exponent arithmetic instead.
+
+    ``is_integer`` rather than ``value == int(value)``: it returns ``False`` for a non-finite float
+    instead of raising ``OverflowError``, so a hand-built estimate carrying ``inf`` degrades to the
+    string ``inf`` rather than taking down the whole rendered snapshot. Nothing the venue parser
+    builds can be non-finite (``safe_float`` filters it), so this is about not being the crash site.
+    """
+    rounded = float(f"{value:.{sig_digits}g}")
+    return f"{int(rounded):,}" if rounded.is_integer() else f"{rounded:,}"
+
 
 @dataclass(frozen=True, slots=True)
 class SettlementSource:
@@ -40,6 +70,60 @@ class SettlementSource:
 
     name: str = ""
     url: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarEstimate:
+    """A scalar market's traded VALUE in the question's own units — never a probability.
+
+    Manifold's ``PSEUDO_NUMERIC`` contracts trade a number on a bounded ``[minimum, maximum]``
+    scale: an age in years, a stock price, a seat count. Such a market publishes a market-level
+    ``probability`` like a BINARY one does, but it means something entirely different — the value's
+    normalized POSITION on that scale (0.4839 on a 0-250 age market whose value is 120.97) — so
+    reading it as a price rendered a meaningless 0.48 under a title asking for an age.
+
+    Deliberately NOT stored in ``MarketMatch.implied_prob_yes``, and this type exists to make that
+    impossible rather than merely discouraged: the two numbers answer different questions, share no
+    units, and only one of them belongs in a column a forecaster is told to anchor on. A row carries
+    one or the other, never both.
+
+    ``value`` is the venue's own computed figure, read verbatim and never recomputed from
+    ``probability``. On a log-scale market the two disagree by 29x-6554x (measured live 2026-08-05;
+    see the committed ``manifold_pseudo_numeric`` fixture), and no interpolation between the bounds
+    reproduces the venue's mapping either — so the field is the only honest source. It is built only
+    from ``safe_float`` output, so it is finite.
+
+    The bounds are the market author's own choice of scale and carry real forecasting information —
+    a value of 121 against a maximum of 250 is a different signal from the same value against a
+    maximum of 130 — so they are rendered beside it. They are optional because they are the venue's
+    to omit, and the value stands alone without them.
+    """
+
+    value: float
+    minimum: float | None = None
+    maximum: float | None = None
+    is_log_scale: bool = False
+
+    @property
+    def scale_label(self) -> str:
+        """The word that precedes the bounds. ``log`` changes how a value's POSITION between them
+        reads, which is the only thing the scale type affects downstream — the value itself is in
+        question units either way."""
+        return "log scale" if self.is_log_scale else "scale"
+
+    def bounds_text(self) -> str:
+        """``"0 to 250"``, or ``""`` when the venue omitted either bound.
+
+        Lives on the type because two surfaces render it — the table's ``prob`` cell and the ranker's
+        candidate line — and the same market's scale must not read two ways depending on which one is
+        looking. Joined with ``to`` rather than a hyphen because Manifold's scales are routinely
+        negative (live: -15 to 2, -48 to 48, -4 to 4), and ``-15--2`` is unreadable.
+        """
+        if self.minimum is None or self.maximum is None:
+            return ""
+        low = format_scalar_number(self.minimum, sig_digits=SCALAR_BOUND_SIG_DIGITS)
+        high = format_scalar_number(self.maximum, sig_digits=SCALAR_BOUND_SIG_DIGITS)
+        return f"{low} to {high}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +231,12 @@ class MarketMatch:
     # `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no single
     # probability" a fact about the data rather than a rendering convention.
     children: tuple[MarketChild, ...] = ()
+    # A SCALAR market's traded value, on the only venue that has one (Manifold `PSEUDO_NUMERIC`).
+    # Mutually exclusive with `implied_prob_yes` by construction in the venue parser, for the reason
+    # `ScalarEstimate` documents: the same payload field carries a probability on a BINARY market and
+    # a scale position on a scalar one, and a row that carried both would put two incompatible
+    # numbers in one `prob` cell. Empty on every other row and every other venue.
+    scalar_estimate: ScalarEstimate | None = None
 
 
 @dataclass

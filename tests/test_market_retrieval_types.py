@@ -19,6 +19,7 @@ from metaculus_bot.research.market_retrieval.types import (
     MarketChild,
     MarketMatch,
     MarketSnapshot,
+    ScalarEstimate,
     SettlementSource,
 )
 
@@ -70,6 +71,7 @@ class TestMarketMatchShape:
         assert match.settlement_sources == ()
         assert match.top_answers == ()
         assert match.children == ()
+        assert match.scalar_estimate is None
 
 
 class TestArchiveRoundTrip:
@@ -154,3 +156,46 @@ class TestArchiveRoundTrip:
             "close_time": None,
         }
         assert encoded["matches"][0]["children"][0]["close_time"].startswith("2026-08-31")
+
+    def test_a_scalar_estimate_survives_asdict_and_json_as_an_object(self):
+        """A scalar market's value is its ONLY price — `implied_prob_yes` is empty on such a row by
+        construction — so losing this field in the archive would make residual analysis read every
+        scalar market as priceless, the same blind spot the children fix closed. A nested dataclass
+        like `SettlementSource`, so `asdict` walks it without help.
+
+        The bounds ride along because they are what makes the value interpretable after the fact:
+        121 against a maximum of 250 and 121 against a maximum of 130 are different signals, and the
+        archive is the only place a later reader can recover which one it was.
+        """
+        match = _positional_row()
+        match.platform = "manifold"
+        match.implied_prob_yes = None  # what a scalar market's row carries instead of a price
+        match.scalar_estimate = ScalarEstimate(value=120.96691732988944, minimum=0.0, maximum=250.0, is_log_scale=False)
+
+        as_dict = dataclasses.asdict(MarketSnapshot(matches=[match]))
+        assert as_dict["matches"][0]["scalar_estimate"] == {
+            "value": 120.96691732988944,
+            "minimum": 0.0,
+            "maximum": 250.0,
+            "is_log_scale": False,
+        }
+
+        encoded = json.loads(json.dumps(as_dict, default=str))
+        assert encoded["matches"][0]["scalar_estimate"]["value"] == 120.96691732988944
+        assert encoded["matches"][0]["implied_prob_yes"] is None
+
+    def test_a_row_never_archives_both_a_probability_and_a_scalar_value(self):
+        """The invariant the venue parser enforces, asserted where the archive would expose a break.
+
+        Two numbers in one row's price slot is exactly the ambiguity this type split exists to
+        remove: a reader could not tell which one the forecaster saw. `parse_manifold_matches` fills
+        one branch or the other, so a row carrying both would mean that branch had been flattened.
+        """
+        priced = _positional_row()
+        scalar = _positional_row()
+        scalar.implied_prob_yes = None
+        scalar.scalar_estimate = ScalarEstimate(value=120.967, minimum=0.0, maximum=250.0)
+
+        for match in (priced, scalar):
+            row = dataclasses.asdict(MarketSnapshot(matches=[match]))["matches"][0]
+            assert (row["implied_prob_yes"] is None) != (row["scalar_estimate"] is None)

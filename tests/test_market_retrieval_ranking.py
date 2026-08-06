@@ -15,12 +15,15 @@ right answer is silence, and would delete the adaptive-width mechanism the desig
 from __future__ import annotations
 
 import logging
+import re
 
 import pytest
 
 from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
 from metaculus_bot.research.market_retrieval.ranking import (
     FP_CHARS,
+    RANKER_PLACEHOLDERS,
+    RANKER_PROMPT,
     RC_CHARS,
     RENDER_BUDGET,
     RULES_CHARS,
@@ -38,7 +41,7 @@ from metaculus_bot.research.market_retrieval.ranking import (
     parse_ranking,
     render_candidate_line,
 )
-from metaculus_bot.research.market_retrieval.types import MarketMatch, SettlementSource
+from metaculus_bot.research.market_retrieval.types import MarketMatch, ScalarEstimate, SettlementSource
 from metaculus_bot.research.market_retrieval.venues import (
     MANIFOLD_ANSWER_TEXT_MAX_CHARS,
     MANIFOLD_TOP_ANSWERS_RENDERED,
@@ -489,6 +492,47 @@ class TestCandidateLine:
 
         assert "answers: Over $4.00 100% | Over $4.60 50%" in render_candidate_line(0, row)
 
+    def test_a_scalar_row_names_its_scale_and_never_its_value(self) -> None:
+        """A scalar market's BOUNDS are a relevance signal the way answer labels are — "0 to 250" on
+        a market titled for an age confirms it trades years, and it is the only hint that this
+        candidate is scalar at all rather than a binary whose price went missing. Its VALUE is a
+        price, and this line quotes no venue's price, so the value stays out.
+        """
+        row = _row("manifold", title="Age of the oldest person alive in 2100?", bettors=12, rules="Per Wikipedia.")
+        row.scalar_estimate = ScalarEstimate(value=120.96691732988944, minimum=0.0, maximum=250.0)
+
+        line = render_candidate_line(0, row)
+
+        assert "scale: 0 to 250" in line
+        assert "120" not in line and "0.48" not in line, "the value is a price and this line quotes none"
+        segments = [segment.strip() for segment in line.split("|")]
+        assert segments.index("scale: 0 to 250") < segments.index("rules: Per Wikipedia.")
+
+    def test_a_log_scale_row_labels_the_scale_as_logarithmic(self) -> None:
+        """Where a value sits between the bounds reads differently on a log axis; the ranker is
+        judging what the market measures, and a 1-to-10-million log scale is a different quantity
+        shape from a linear one."""
+        row = _row("manifold", bettors=12)
+        row.scalar_estimate = ScalarEstimate(value=609.0, minimum=1.0, maximum=10_000_000.0, is_log_scale=True)
+
+        assert "log scale: 1 to 10,000,000" in render_candidate_line(0, row)
+
+    def test_a_scalar_row_with_no_bounds_gains_no_segment(self) -> None:
+        """Nothing to say about a scale the venue omitted, and an empty `scale:` segment would spend
+        prompt tokens saying it — the same rule every other segment on this line follows."""
+        row = _row("manifold", bettors=12)
+        row.scalar_estimate = ScalarEstimate(value=42.5)
+
+        assert "scale:" not in render_candidate_line(0, row)
+
+    def test_a_non_scalar_row_gains_no_scale_segment(self) -> None:
+        """The regression guard: the segment must be invisible on every row that is not scalar, or
+        all four venues pay for a shape one of them has."""
+        for platform in ("kalshi", "polymarket", "manifold", "predictit"):
+            line = render_candidate_line(0, _row(platform, rules="r"))  # type: ignore[arg-type]
+
+            assert "scale:" not in line
+
 
 class TestRankerPrompt:
     def test_the_operator_relevance_rule_is_present(self) -> None:
@@ -593,8 +637,10 @@ class TestRankerPrompt:
         assert "2 candidates from 1 venue(s)" in prompt
 
     def test_a_brace_in_a_question_title_does_not_break_substitution(self) -> None:
-        """`.replace` rather than `.format`, because the emitted-object example is literal JSON
-        braces and a question title is arbitrary text."""
+        """An explicit slot list rather than `.format`, because the emitted-object example is
+        literal JSON braces and a question title is arbitrary text. `{x}` is not one of the
+        template's slots, so this covers only the unknown-brace case — a title naming a REAL slot
+        is ``TestRankerPromptPlaceholderInjection``."""
         prompt = build_ranker_prompt(RankerQuestion(title="Will {x} happen?"), _pool(1))
 
         assert "Will {x} happen?" in prompt
@@ -604,6 +650,124 @@ class TestRankerPrompt:
         prompt = build_ranker_prompt(QUESTION, [])
 
         assert "0 candidates from 0 venue(s)" in prompt
+
+
+class TestRankerPromptPlaceholderInjection:
+    """A placeholder token appearing in QUESTION TEXT must reach the model as literal characters.
+
+    Metaculus titles and resolution criteria quote JSON, API payloads and template syntax, so this
+    is ordinary input rather than an exotic one. Under the sequential `.replace` chain this module
+    used to fill the template with, a title containing `{candidates}` was rewritten by the LATER
+    candidates call: the whole pool was spliced into the question header, every market was listed
+    twice, and the ranker graded relevance against a question nobody asked. Nothing downstream
+    could notice, because indices were still in range — the corrupted picks parsed as valid and
+    published as a confident ranked snapshot with no `failopen` and no WARN.
+
+    The two guards in ``TestRankerPrompt`` cannot see that, which is why these exist rather than
+    replace them. ``test_no_placeholder_survives_substitution`` asserts no `{...}` token REMAINS,
+    and a corrupting substitution leaves none either, so it passed vacuously on the broken output.
+    ``test_a_brace_in_a_question_title_does_not_break_substitution`` uses `{x}`, which is not one
+    of the template's slot names and so never reaches the substitution at all.
+    """
+
+    def test_a_title_naming_the_candidates_slot_stays_verbatim_and_the_pool_is_listed_once(self) -> None:
+        question = RankerQuestion(
+            title="Will {candidates} exceed 5?",
+            qtype="binary",
+            resolution_criteria="SECRET_RC_CLAUSE",
+        )
+
+        prompt = build_ranker_prompt(question, _pool(3))
+
+        assert "title: Will {candidates} exceed 5?" in prompt
+        assert prompt.count("Market 0") == 1
+        assert prompt.count("SECRET_RC_CLAUSE") == 1
+
+    def test_a_title_naming_the_rc_slot_does_not_absorb_the_resolution_criteria(self) -> None:
+        """The cross-field leak: the title read `Will the SECRET_RC_CLAUSE field change?`, so the
+        model was asked a question whose subject came out of a different field."""
+        question = RankerQuestion(title="Will the {rc} field change?", resolution_criteria="SECRET_RC_CLAUSE")
+
+        prompt = build_ranker_prompt(question, _pool(1))
+
+        assert "title: Will the {rc} field change?" in prompt
+        assert prompt.count("SECRET_RC_CLAUSE") == 1
+
+    def test_resolution_criteria_and_fine_print_naming_slots_stay_verbatim(self) -> None:
+        """Every question field is arbitrary text, not just the title."""
+        question = RankerQuestion(
+            title="A question",
+            resolution_criteria="Resolves when {candidates} settles.",
+            fine_print="See {venue_summary} for the list.",
+        )
+
+        prompt = build_ranker_prompt(question, _pool(2))
+
+        assert "resolution criteria: Resolves when {candidates} settles." in prompt
+        assert "fine print: See {venue_summary} for the list." in prompt
+        assert prompt.count("Market 0") == 1
+        assert prompt.count("kalshi 2") == 1
+
+    @pytest.mark.parametrize("placeholder", RANKER_PLACEHOLDERS)
+    def test_every_template_slot_is_inert_as_question_text(self, placeholder: str) -> None:
+        """Parametrized over the module's OWN slot list, so an eleventh slot is covered the day it
+        is added. This is the test that forecloses the class of defect; the cases above only pin
+        the two instances that were measured.
+        """
+        question = RankerQuestion(
+            title=f"Will {placeholder} happen?",
+            qtype="binary",
+            unit="percent",
+            resolution_criteria="SECRET_RC_CLAUSE",
+            fine_print="SECRET_FP_CLAUSE",
+        )
+
+        prompt = build_ranker_prompt(question, _pool(3))
+
+        assert f"title: Will {placeholder} happen?" in prompt
+        # The template's own slots are all filled, so the title's copy is the only one left.
+        assert prompt.count(placeholder) == 1
+        assert prompt.count("Market 0") == 1
+        assert prompt.count("SECRET_RC_CLAUSE") == 1
+        assert prompt.count("SECRET_FP_CLAUSE") == 1
+
+    def test_the_literal_json_example_survives_substitution(self) -> None:
+        """Why the alternation names the ten slots explicitly instead of matching `{...}`
+        generically: the emitted-object example is literal JSON braces the model must read as JSON.
+        """
+        prompt = build_ranker_prompt(RankerQuestion(title="Will {candidates} happen?"), _pool(2))
+
+        assert '{"i": <index>, "tier": "<one of the four tier names above>"' in prompt
+
+    def test_the_template_names_no_slot_the_substitution_does_not_fill(self) -> None:
+        """Drift guard from the TEMPLATE side. A new slot added to the prompt but not to
+        ``RANKER_PLACEHOLDERS`` would survive into the model's input as literal template syntax,
+        which is the one failure the substitution itself cannot detect. Scoped to
+        lowercase-and-underscore tokens so the JSON example does not match.
+        """
+        assert set(re.findall(r"\{[a-z_]+\}", RANKER_PROMPT)) == set(RANKER_PLACEHOLDERS)
+
+    def test_a_replacement_escape_in_the_question_reaches_the_model_verbatim(self) -> None:
+        """The substitution is given a FUNCTION, not a replacement string, so `\\g<0>` and `\\1` in
+        question text are ordinary characters. A string replacement would expand them — `\\g<0>`
+        into the slot name itself — or raise `error: invalid group reference` on a group that the
+        pattern does not have.
+        """
+        question = RankerQuestion(title=r"Will \g<0> and \1 resolve?", resolution_criteria=r"Per \2 of the rule.")
+
+        prompt = build_ranker_prompt(question, _pool(1))
+
+        assert r"title: Will \g<0> and \1 resolve?" in prompt
+        assert r"resolution criteria: Per \2 of the rule." in prompt
+
+    def test_a_replacement_escape_in_market_rules_reaches_the_model_verbatim(self) -> None:
+        """Venue rules text is the other arbitrary-text input, and it arrives inside the
+        `{candidates}` value rather than from the question."""
+        pool = [_row(title="Market 0", rules=r"settles per \g<0> of the filing, see \1")]
+
+        prompt = build_ranker_prompt(RankerQuestion(title="A question"), pool)
+
+        assert r"rules: settles per \g<0> of the filing, see \1" in prompt
 
 
 class TestRankerPromptTokenBudget:

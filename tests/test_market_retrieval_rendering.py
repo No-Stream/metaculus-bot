@@ -1,6 +1,6 @@
 """The rendered snapshot: the empty-render contract, the columns, and the MC-parser trap.
 
-Three of these guard things that break quietly rather than loudly:
+Four of these guard things that break quietly rather than loudly:
 
 - **``""`` before any preamble on zero rows.** That early return is what produces
   ``status="empty"`` downstream and the attempted-vs-succeeded distinction residual analysis
@@ -12,6 +12,10 @@ Three of these guard things that break quietly rather than loudly:
 - **No rules bullet ends in ``: NN%``.** The per-model MC option parser scans for
   ``- <name>: NN%``, and Manifold descriptions are user-generated and routinely open with a
   percentage, so nothing percentage-shaped may be appended to a bullet.
+- **A ``prob`` cell holding something other than a probability says so.** The forecaster prompts
+  point a model at that column to anchor on, and Manifold's scalar markets publish a scale position
+  in the field a probability normally comes from — which rendered as ``0.48`` on a market whose
+  estimate was 121 years. ``TestScalarPriceCell`` asserts the property, not just the string.
 """
 
 from __future__ import annotations
@@ -42,14 +46,19 @@ from metaculus_bot.research.market_retrieval.rendering import (
     TITLE_MAX_CHARS,
     render_snapshot,
 )
-from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch, MarketSnapshot
+from metaculus_bot.research.market_retrieval.types import (
+    MarketChild,
+    MarketMatch,
+    MarketSnapshot,
+    ScalarEstimate,
+)
 from tests.test_market_retrieval_generation import Platform
 
 _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 
 # Char budget for the WORST-CASE rendered snapshot: 8 rows with every field simultaneously at its
 # cap, EVERY row multi-outcome, and every one of its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too.
-# Measured at 10,137 chars. 10,600 leaves ~4% headroom, the same deliberate tightness the
+# Measured at 10,298 chars. 10,600 leaves ~3% headroom, the same deliberate tightness the
 # pre-expansion budget had: this section goes to the expensive forecaster models, so adding a
 # column, lengthening the legend, or raising a child cap has to trip it.
 #
@@ -65,18 +74,30 @@ _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 # "roughly today's 12-row render" BEFORE maximum-info expansion was chosen, and expansion that
 # renders every outcome's own price cannot fit a budget set for rendering none of them. What did NOT
 # change is the reason the budgets exist, so they are re-derived tight rather than loosened.
+#
+# The scalar-market `prob` cell added one legend sentence, +161 chars on all three figures.
+# Only the fixed-overhead ceiling moved with it: the two whole-render budgets absorbed the growth
+# and are deliberately LEFT where they were, so this change spent their headroom rather than
+# raising them. That is why maxed now sits at ~3% and realistic at ~1% — a guard that is nearly
+# touching is doing its job, and the next thing that widens the section re-derives all three.
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
 
 # 8 rows of realistic content, using shapes measured off live payloads rather than chosen — the
-# figure that describes what a real question renders. Measured at 7,465 chars.
+# figure that describes what a real question renders. Measured at 7,626 chars.
 MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 7_700
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
-# 1,621 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
+# 1,782 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
 # the only part with no data to justify it — the whole-snapshot budget has slack that would
-# otherwise absorb an added paragraph unnoticed. At 1,621 of 1,700 this is still the tightest
+# otherwise absorb an added paragraph unnoticed. At 1,782 of 1,850 this is still the tightest
 # budget in the file, which is the point: the next legend sentence has to earn a re-derivation.
-MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 1_700
+#
+# This one WAS re-derived, from 1,700, and what it bought is on the record: a `prob` cell may now
+# hold a scalar market's value, and a forecaster told to anchor on that column needs the legend to
+# say so. The sentence was cut to its contract (the `value` prefix, the units, "not a probability")
+# rather than paid for at full length, because it explains a shape that appears on a small minority
+# of questions while the legend ships on every one.
+MARKET_SNAPSHOT_FIXED_OVERHEAD_CHAR_BUDGET = 1_850
 
 _REAL_TITLE = "Will the US unemployment rate be above 4.5% in June 2026?"
 _REAL_RULES = (
@@ -103,6 +124,7 @@ def _row(
     url: str = "https://example.test/m",
     answers: tuple[tuple[str, float], ...] = (),
     children: tuple[MarketChild, ...] = (),
+    scalar: ScalarEstimate | None = None,
 ) -> MarketMatch:
     return MarketMatch(
         platform=platform,
@@ -124,6 +146,7 @@ def _row(
         relevance_label=why,
         top_answers=answers,
         children=children,
+        scalar_estimate=scalar,
     )
 
 
@@ -279,6 +302,163 @@ class TestColumns:
 
         assert cells["total_vol"] == "107943"
         assert cells["OI"] == "-"
+
+
+class TestScalarPriceCell:
+    """A scalar market's ``prob`` cell: what it says, and what it can never be mistaken for.
+
+    Manifold's ``PSEUDO_NUMERIC`` markets trade a VALUE on a bounded scale, and their payload's
+    ``probability`` field is that value's position on it. The parser now keeps the two apart, so this
+    is the render half of the same fix: the cell holds a labelled value, and the forecaster prompts
+    that tell a model to anchor on this column can no longer point it at a scale position.
+
+    Asserted on the rendered markdown rather than on ``_price_cell``, because the defect was only
+    visible in the table — the intermediate object read ``implied_prob_yes=0.4839``, which looks
+    entirely reasonable until it reaches a column headed ``prob``.
+    """
+
+    _AGE_ESTIMATE = ScalarEstimate(value=120.96691732988944, minimum=0.0, maximum=250.0, is_log_scale=False)
+
+    def test_a_scalar_row_shows_its_labelled_value_and_scale(self) -> None:
+        """The production row that exposed this rendered `0.48` for a market whose estimate was
+        ~121 years. Same market, same figures, straight off the live payload."""
+        row = _row(
+            "manifold",
+            title="What will be the age of the oldest person alive in 2100?",
+            prob=None,
+            scalar=self._AGE_ESTIMATE,
+        )
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["prob"] == "value 120.967 (scale 0 to 250)"
+        assert "0.48" not in cells["prob"], "the scale position must not survive anywhere in the cell"
+
+    def test_the_scalar_cell_cannot_be_read_as_a_probability(self) -> None:
+        """The property that actually matters, stated as a property rather than a string match.
+
+        A bare number would not be enough — the whole reason `0.48` got through is that it is a
+        perfectly plausible probability — and magnitude is no defence either. That second half is a
+        measurement, not a worry: `min=0, max=1` scalar markets exist on Manifold, and the one used
+        here is real (it trades 0.468 on a 0-to-1 scale, captured live in the venue fixture). Pre-fix
+        it rendered `0.47` under a `prob` header with nothing to distinguish it from a price. So the
+        guard is that no scalar cell ever parses as the two-decimal form this column uses for prices.
+        """
+        probability_shaped = re.compile(r"^-?[0-9]+\.[0-9]{2}$")
+        on_a_probability_like_scale = ScalarEstimate(value=0.4680001051790792, minimum=0.0, maximum=1.0)
+        rows = [
+            _row("manifold", prob=None, scalar=self._AGE_ESTIMATE),
+            _row("manifold", prob=None, scalar=on_a_probability_like_scale),
+        ]
+
+        for cells in _table_rows(render_snapshot(MarketSnapshot(matches=rows))):
+            assert not probability_shaped.match(cells["prob"])
+            assert cells["prob"].startswith("value ")
+
+    def test_a_log_scale_row_says_so(self) -> None:
+        """Where a value sits between its bounds reads differently on a log axis, and it is the one
+        thing about the scale type a forecaster needs. Nothing here computes with it — the venue's
+        own `value` is in question units on either scale."""
+        row = _row(
+            "manifold",
+            prob=None,
+            scalar=ScalarEstimate(value=609.0, minimum=1.0, maximum=10_000_000.0, is_log_scale=True),
+        )
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["prob"] == "value 609 (log scale 1 to 10,000,000)"
+
+    def test_a_large_magnitude_value_reads_as_a_number_rather_than_an_exponent(self) -> None:
+        """The real 2040 world-population market: ``min=1e6, max=2e10``, trading 7.85 billion.
+
+        Significant-digit rounding is what makes one rule serve both this and a ``0.5 to 2.5`` market,
+        but `%g`'s automatic exponent would render this cell as
+        ``value 7.84859e+09 (log scale 1000000 to 2e+10)`` — one scale written two ways, with the
+        reader doing exponent arithmetic to find the population. Grouped decimal instead, and the
+        bounds stay exact because 11 significant digits is what this market's own ceiling needs.
+        """
+        row = _row(
+            "manifold",
+            prob=None,
+            scalar=ScalarEstimate(
+                value=7848589347.056932, minimum=1_000_000.0, maximum=20_000_000_000.0, is_log_scale=True
+            ),
+        )
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["prob"] == "value 7,848,590,000 (log scale 1,000,000 to 20,000,000,000)"
+        assert "e+" not in cells["prob"]
+
+    def test_a_scalar_row_without_bounds_still_shows_its_value(self) -> None:
+        """The bounds are the venue's to omit; the value is the market's answer. Dropping the number
+        because its scale is missing would trade a real datum for a dash."""
+        row = _row("manifold", prob=None, scalar=ScalarEstimate(value=42.5))
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["prob"] == "value 42.5"
+
+    def test_a_negative_scale_reads_with_to_rather_than_a_hyphen(self) -> None:
+        """Live Manifold scales run negative (-15 to 2, -48 to 48, -4 to 4), and `-15--2` is
+        unreadable. The `to` is a correctness choice, not a style one."""
+        row = _row("manifold", prob=None, scalar=ScalarEstimate(value=-1.0, minimum=-15.0, maximum=2.0))
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=[row])))[0]
+
+        assert cells["prob"] == "value -1 (scale -15 to 2)"
+
+    def test_an_ordinary_probability_row_is_untouched(self) -> None:
+        """The regression guard. Every other venue and every BINARY Manifold row keeps the
+        two-decimal price, and a `↳` sub-row keeps it too — the scalar branch is reachable only from
+        a parent row carrying an estimate."""
+        parent = _row("kalshi", prob=None, children=(MarketChild(title="Above 4.2%", implied_prob_yes=0.31),))
+        rows = [_row(prob=0.42), parent]
+
+        cells = _table_rows(render_snapshot(MarketSnapshot(matches=rows)))
+
+        assert cells[0]["prob"] == "0.42"
+        assert cells[1]["prob"] == "-", "a multi-outcome parent still has no single price"
+        assert cells[2]["prob"] == "0.31"
+
+    def test_the_legend_names_the_scalar_cell(self) -> None:
+        """The legend is a forecaster-facing contract and names every label a cell can hold — a cell
+        shape it omits is one a forecaster has to guess at. This is the one that was guessed wrong
+        for real."""
+        rendered = render_snapshot(MarketSnapshot(matches=[_row("manifold", prob=None, scalar=self._AGE_ESTIMATE)]))
+
+        assert "prefixed `value`" in rendered
+        assert "not a probability" in rendered
+
+    def test_a_slate_of_scalar_rows_fits_the_maxed_budget(self) -> None:
+        """A scalar cell is the widest the `prob` column gets, so the section budget is re-checked
+        against a slate made entirely of them.
+
+        Kept separate from `_maxed_rows` rather than folded into it: that slate makes every row
+        multi-outcome, and a market cannot be both (a row with outcomes carries no single value), so
+        one slate cannot be the worst case for both shapes.
+        """
+        widest = ScalarEstimate(value=-123456.789, minimum=-1_000_000.0, maximum=10_000_000.0, is_log_scale=True)
+        rows = [
+            _row(
+                "manifold",
+                title="T" * TITLE_MAX_CHARS,
+                tier=TIERS[0],
+                why="W" * WHY_CHARS,
+                prob=None,
+                scalar=widest,
+                rules="R" * RAW_BULLET_BODY_MAX_CHARS,
+                close=datetime(2026, 12, 31, tzinfo=timezone.utc),
+                bettors=250,
+            )
+            for _ in range(RENDER_BUDGET)
+        ]
+
+        rendered = render_snapshot(MarketSnapshot(matches=rows))
+
+        assert len(rendered) < MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET
+        assert _table_rows(rendered)[0]["prob"] == "value -123,457 (log scale -1,000,000 to 10,000,000)"
 
 
 class TestRankedOrder:

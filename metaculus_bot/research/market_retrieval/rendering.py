@@ -1,6 +1,6 @@
 """The rendered snapshot: a markdown table in the ranker's order, plus the rules bullets.
 
-Three things here are contracts rather than formatting choices:
+Five things here are contracts rather than formatting choices:
 
 - **Zero rendered rows returns ``""`` before any preamble is emitted.** That early return is
   what produces ``status="empty"`` downstream and the attempted-vs-succeeded distinction
@@ -15,6 +15,12 @@ Three things here are contracts rather than formatting choices:
   keeping (traded size on the real-money venues, probability on Manifold, ballot order on
   PredictIt) and the renderer truncates from the END, so re-sorting here would silently change
   what survives the budget.
+- **Every number in the ``prob`` column is a probability, unless it is labelled as something
+  else.** The one exception is a scalar market's own value, and it renders as ``value N (scale LOW
+  to HIGH)`` for exactly that reason — the forecaster prompts tell a model to anchor on this cell,
+  so an unlabelled non-probability here is not a cosmetic defect. Manifold shipped one: a
+  ``PSEUDO_NUMERIC`` market's ``probability`` field is a position on its value scale, and the cell
+  read ``0.48`` on a market whose estimate was 120.97 years. ``_price_cell`` is the only writer.
 - **The rules-bullet section keeps its byte shape** (``- **{platform}** <{url}>: {body}`` at
   h3). The MC per-model option parser scans for ``- <name>: NN%`` and the bullets sit close
   enough to a per-model region for that to matter, so nothing percentage-shaped may ever be
@@ -42,9 +48,19 @@ from metaculus_bot.research.market_retrieval.types import (
     MarketChild,
     MarketMatch,
     MarketSnapshot,
+    ScalarEstimate,
     _child_liquidity_label,
     _liquidity_label,
+    format_scalar_number,
 )
+
+# Significant digits for a scalar market's VALUE, which is deliberately shorter than the bounds
+# beside it (`types.SCALAR_BOUND_SIG_DIGITS`, which lives there because the ranker's candidate line
+# renders the same bounds). The two differ because the numbers do: a value is a noisy crowd estimate,
+# so six digits already say more than it means (120.96691732988944 -> `120.967`) and a short cell
+# reads better, while a bound is a parameter the market's author chose and rounding it would
+# misstate the market's own scale.
+SCALAR_VALUE_SIG_DIGITS = 6
 
 # Separate from, and smaller than, the ranker prompt's per-venue caps: this text ships to the
 # forecaster inside a research section that has its own character budget, and the two must not be
@@ -115,7 +131,9 @@ MARKET_SIGNAL_LEGEND = (
     "(`unspecified` if ungraded); only the first two measure the quantity asked about, and `why` is the "
     "one-phrase reason. `status` is `open` or `RESOLVED`; a RESOLVED price is a realized outcome, not a forecast. "
     "A `↳` row is one OUTCOME of the market above it (strike, bracket, ballot line) with its own price; the parent "
-    "row has none, so anchor on the outcome that matches this question."
+    "row has none, so anchor on the outcome that matches this question. "
+    "A `prob` cell prefixed `value` is a SCALAR market's estimate of the quantity itself, in the market's own units "
+    "on the scale shown beside it — not a probability."
 )
 
 # Strong-evidence framing — used when at least one rendered row measures the same quantity
@@ -154,6 +172,29 @@ def _cell(text: str, *, limit: int | None = None) -> str:
     return cleaned if limit is None else cleaned[:limit]
 
 
+def _price_cell(implied_prob_yes: float | None, scalar_estimate: ScalarEstimate | None) -> str:
+    """The ``prob`` cell: a two-decimal probability, a labelled scalar value, or ``-``.
+
+    A scalar market's number is prefixed with ``value`` and followed by its scale precisely so it
+    CANNOT be read as a probability. A bare figure would not be enough: the failure this fixes
+    rendered ``0.48`` for a market whose value was 120.97, and the reason that got through is that
+    ``0.48`` is a perfectly plausible probability. Magnitude alone does not save the general case
+    either — a scalar market on a 0-to-1 scale trades values that look exactly like probabilities —
+    so the label does the work rather than the reader's arithmetic.
+
+    A row can never hold both numbers — the venue parser fills one or the other — so the ordering of
+    these branches is not a precedence rule. A value whose venue omitted the bounds still renders,
+    labelled and without them: the number is the market's answer and the scale is context for it.
+    """
+    if implied_prob_yes is not None:
+        return f"{implied_prob_yes:.2f}"
+    if scalar_estimate is None:
+        return "-"
+    value = format_scalar_number(scalar_estimate.value, sig_digits=SCALAR_VALUE_SIG_DIGITS)
+    bounds = scalar_estimate.bounds_text()
+    return f"value {value} ({scalar_estimate.scale_label} {bounds})" if bounds else f"value {value}"
+
+
 def _priced_cells(
     *,
     implied_prob_yes: float | None,
@@ -162,15 +203,21 @@ def _priced_cells(
     close_time: datetime | None,
     is_resolved: bool,
     signal: str,
+    scalar_estimate: ScalarEstimate | None = None,
 ) -> dict[str, str]:
     """The six columns a parent row and a ``↳`` sub-row format identically.
 
     Shared so the two can never disagree about how a price or a date reads: a sub-row that rounded
     its probability to three places, or wrote its dates the other way round, would look like a
     different kind of number rather than the same measurement one level down.
+
+    ``scalar_estimate`` defaults to absent because only a parent row can carry one — no venue
+    publishes a scalar OUTCOME inside a multi-outcome market — but it is formatted here rather than
+    at the parent's call site so there stays exactly one place that decides what the ``prob`` column
+    may contain.
     """
     return {
-        "prob": f"{implied_prob_yes:.2f}" if implied_prob_yes is not None else "-",
+        "prob": _price_cell(implied_prob_yes, scalar_estimate),
         "total_vol": f"{total_volume:.0f}" if total_volume is not None else "-",
         "OI": f"{open_interest:.0f}" if open_interest is not None else "-",
         "signal": signal,
@@ -190,6 +237,7 @@ def _row_cells(match: MarketMatch) -> dict[str, str]:
             close_time=match.close_time,
             is_resolved=match.is_resolved,
             signal=_liquidity_label(match),
+            scalar_estimate=match.scalar_estimate,
         ),
         "relation": _cell(match.relation_tier) or TIER_UNSPECIFIED,
         "why": _cell(match.relevance_label, limit=WHY_CHARS) or "-",

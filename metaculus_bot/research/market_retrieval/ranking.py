@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
@@ -107,8 +108,8 @@ _DECODER = json.JSONDecoder()
 #    gained the RESOLVED bullet, because resolved markets now reach the ranker (the `as_of`
 #    filter that used to drop them is gone).
 #
-# Do not touch the four tier names. Substituted with `.replace`, not `.format`, because the
-# emitted-object example is literal JSON braces.
+# Do not touch the four tier names. Filled by `build_ranker_prompt`, never `.format`, because the
+# emitted-object example below is literal JSON braces that `.format` would read as a field name.
 RANKER_PROMPT = """You are selecting prediction markets for a forecaster working on the Metaculus question below.
 
 Rank the candidates by EVIDENTIAL VALUE for forecasting this question, most valuable first.
@@ -160,6 +161,28 @@ For each row you keep, emit exactly one object, IN RANKED ORDER, best first:
 Return ONLY a JSON array of at most {budget} objects, ranked best first. No prose before or after it. An empty array is a valid and sometimes correct answer.
 JSON array:"""
 
+# Every slot `RANKER_PROMPT` declares. Named EXPLICITLY rather than matched as a generic `{...}`
+# because the emitted-object example two lines above the end of the template is literal JSON
+# braces: a generic pattern would eat `{"i": <index>, ...}` and hand the model an example it
+# cannot read as JSON. Public so the tests can parametrize over this list instead of restating it,
+# which is what makes an eleventh slot covered the day it is added.
+RANKER_PLACEHOLDERS: tuple[str, ...] = (
+    "{budget}",
+    "{title}",
+    "{qtype}",
+    "{unit}",
+    "{rc}",
+    "{fp}",
+    "{n_candidates}",
+    "{n_venues}",
+    "{venue_summary}",
+    "{candidates}",
+)
+
+# Alternation order is irrelevant here: every alternative is brace-delimited, so none can be a
+# proper prefix of another and no longest-match tie-break is needed.
+_RANKER_PLACEHOLDER_RE = re.compile("|".join(re.escape(name) for name in RANKER_PLACEHOLDERS))
+
 # Stated once in the venue-block header rather than on all ~197 of its candidate lines. The
 # segment is a constant for this venue, so repeating it per line spends ~1.6k prompt tokens
 # carrying zero information. The RENDERED snapshot table still shows it per row.
@@ -204,7 +227,14 @@ def render_candidate_line(index: int, match: MarketMatch) -> str:
     """One pipe-joined candidate line, segments omitted when they carry nothing.
 
     PredictIt lines omit the ``liquidity`` segment entirely — see ``_PREDICTIT_LIQUIDITY_NOTE``.
-    Multi-outcome Manifold rows gain an ``answers:`` segment; every other row is unchanged.
+    Multi-outcome Manifold rows gain an ``answers:`` segment; scalar ones gain a ``scale:`` segment;
+    every other row is unchanged.
+
+    The ``scale:`` segment names the market's BOUNDS and deliberately not its value. It is here for
+    the same reason the answer LABELS are — it says what the market measures, which is a relevance
+    signal ("0 to 250" on a market titled for an age confirms it trades years, and it is the only
+    hint that this candidate is scalar at all rather than a binary whose price was withheld) —
+    whereas the value itself is a price, and this line quotes no venue's price.
     """
     parts = [f"[{index}] ({match.platform}) {match.market_title}"]
     sub_title = (match.sub_title or "").strip()
@@ -224,6 +254,9 @@ def render_candidate_line(index: int, match: MarketMatch) -> str:
     # it measures, the way PredictIt's contract names are. Empty on every BINARY row.
     if match.top_answers:
         parts.append("answers: " + " | ".join(f"{text} {prob:.0%}" for text, prob in match.top_answers))
+    scalar = match.scalar_estimate
+    if scalar is not None and (bounds := scalar.bounds_text()):
+        parts.append(f"{scalar.scale_label}: {bounds}")
     rules = (match.raw_rules or "").strip().replace("\n", " ")
     cap = RULES_CHARS.get(match.platform)
     if cap is not None:
@@ -261,21 +294,36 @@ def _venue_blocks(pool: Sequence[MarketMatch]) -> tuple[list[str], dict[str, int
 
 def build_ranker_prompt(question: RankerQuestion, pool: Sequence[MarketMatch]) -> str:
     """The full ranker prompt. Candidate indices are positions in ``pool``, so the parser's
-    indices and the pool's order are the same thing by construction."""
+    indices and the pool's order are the same thing by construction.
+
+    Every slot is filled in ONE pass, for the same reason ``build_query_author_prompt`` is: a
+    chain of ``.replace`` calls substitutes in a fixed order, so question text is exposed to
+    every LATER call in the chain. Metaculus titles quote JSON and template syntax routinely, and
+    a title containing the literal ``"{candidates}"`` had the whole candidate pool spliced into
+    the question header by the last call — the model then read every market twice and graded
+    relevance against a question nobody asked. Nothing downstream could catch it: ``parse_ranking``
+    bounds-checks an index against ``pool_size`` and never against WHICH market it names, so the
+    corrupted picks parsed as valid and published as a confident ranked snapshot. One ``re.sub``
+    visits each slot exactly once and never looks at what it substituted.
+
+    The replacement is a FUNCTION, not a string, so a backslash in venue rules text or in question
+    text stays literal — ``re.sub`` expands ``\\g<0>`` and ``\\1`` in a string replacement, and
+    market rules and resolution criteria are arbitrary text we do not control.
+    """
     blocks, counts = _venue_blocks(pool)
-    venue_summary = ", ".join(f"{venue} {count}" for venue, count in counts.items())
-    return (
-        RANKER_PROMPT.replace("{budget}", str(RENDER_BUDGET))
-        .replace("{title}", question.title)
-        .replace("{qtype}", question.qtype or "(none)")
-        .replace("{unit}", question.unit or "(none)")
-        .replace("{rc}", (question.resolution_criteria or "")[:RC_CHARS])
-        .replace("{fp}", (question.fine_print or "")[:FP_CHARS])
-        .replace("{n_candidates}", str(len(pool)))
-        .replace("{n_venues}", str(len(counts)))
-        .replace("{venue_summary}", venue_summary)
-        .replace("{candidates}", "\n".join(blocks))
-    )
+    substitutions = {
+        "{budget}": str(RENDER_BUDGET),
+        "{title}": question.title,
+        "{qtype}": question.qtype or "(none)",
+        "{unit}": question.unit or "(none)",
+        "{rc}": (question.resolution_criteria or "")[:RC_CHARS],
+        "{fp}": (question.fine_print or "")[:FP_CHARS],
+        "{n_candidates}": str(len(pool)),
+        "{n_venues}": str(len(counts)),
+        "{venue_summary}": ", ".join(f"{venue} {count}" for venue, count in counts.items()),
+        "{candidates}": "\n".join(blocks),
+    }
+    return _RANKER_PLACEHOLDER_RE.sub(lambda match: substitutions[match.group(0)], RANKER_PROMPT)
 
 
 def _first_usable_array(text: str) -> list[Any]:

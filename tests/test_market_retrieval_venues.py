@@ -37,13 +37,14 @@ from metaculus_bot.research.market_retrieval.http import (
     parse_iso_guarded,
     safe_float,
 )
-from metaculus_bot.research.market_retrieval.types import MarketMatch, _liquidity_label
+from metaculus_bot.research.market_retrieval.types import MarketMatch, ScalarEstimate, _liquidity_label
 from tests.market_retrieval_fakes import FakeResponse, FakeSession
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
 _MULTI_CLOSE_PATH = Path(__file__).parent / "data" / "kalshi_multi_close_event_2026_08_04.json"
 _FAMILY_LIQUIDITY_PATH = Path(__file__).parent / "data" / "kalshi_family_liquidity_2026_08_05.json"
 _MANIFOLD_MULTI_OUTCOME_PATH = Path(__file__).parent / "data" / "manifold_multi_outcome_2026_08_05.json"
+_MANIFOLD_PSEUDO_NUMERIC_PATH = Path(__file__).parent / "data" / "manifold_pseudo_numeric_2026_08_05.json"
 
 
 @pytest.fixture(scope="module")
@@ -60,6 +61,24 @@ def manifold_multi_outcome() -> dict[str, Any]:
     ladder, a bucketed MULTI_NUMERIC market, and a BINARY control that carries no answers at all.
     """
     return json.loads(_MANIFOLD_MULTI_OUTCOME_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def manifold_pseudo_numeric() -> dict[str, Any]:
+    """Live search rows for the scalar shape, kept OUT of the multi-outcome capture above.
+
+    A sibling file rather than two more rows in ``manifold_multi_outcome``, because that fixture
+    documents itself as ONE search response for one term, in the venue's own rank order, and four
+    assertions across two suites read it that way (``{"BINARY", "MULTIPLE_CHOICE"}``, the
+    every-non-BINARY-row-is-priceless sweep, its venue-rank ordering, and provider-health's
+    multi-outcome count). Splicing a row from a different search into it would have broken all four
+    and made its provenance false.
+
+    Three shapes: the linear market that exposed the bug, two log-scale markets (the receipt that
+    the value must be READ rather than recomputed), and a ``STONK`` row for the type that publishes
+    neither answers nor a price.
+    """
+    return json.loads(_MANIFOLD_PSEUDO_NUMERIC_PATH.read_text())
 
 
 @pytest.fixture(scope="module")
@@ -1212,19 +1231,28 @@ class TestManifoldMultiOutcome:
         """The venue convention the render invariant rests on, pinned against the live capture.
 
         Three of the four adapters enforce "a row with outcomes has no single price" structurally.
-        Manifold does not — the enrichment hook attaches children without touching
-        `implied_prob_yes` — because the venue itself guarantees it: a multi-outcome market arrives
-        with `probability` null and a BINARY one carries no `answers` key. If a payload refresh ever
-        shipped both, a row would render its own price AND its outcomes', which is two answers to one
-        question and makes the table's legend false. This is where that would be caught.
+        Manifold's ANSWERS path still does not — the enrichment hook attaches children without
+        touching `implied_prob_yes` — because the venue itself guarantees it: a multi-outcome market
+        arrives with `probability` null and a BINARY one carries no `answers` key. If a payload
+        refresh ever shipped both, a row would render its own price AND its outcomes', which is two
+        answers to one question and makes the table's legend false. This is where that would be
+        caught.
+
+        The PRICE side is no longer left to the venue's convention: `parse_manifold_matches` reads a
+        market-level `probability` only on a BINARY row. That is what `PSEUDO_NUMERIC` forced — a
+        scalar market publishes no answers AND a non-null `probability`, so it satisfied this
+        convention while still carrying a number that is not a price (see
+        `TestManifoldScalarValueMarkets`).
         """
         for key in ("detail_multiple_choice", "detail_multi_numeric", "detail_binary"):
             detail = manifold_multi_outcome[key]
             has_answers = isinstance(detail.get("answers"), list)
             assert has_answers is (detail.get("probability") is None), key
 
-        # And the same convention on the SEARCH side, which is where the row's `implied_prob_yes`
-        # actually comes from: keyed on `outcomeType`, the field the parsers deliberately never read.
+        # And on the SEARCH side, which is where the row's `implied_prob_yes` actually comes from.
+        # Keyed on `outcomeType`, which the price read now consults — so for the non-BINARY rows this
+        # pins the parser's own allow-list, while for the BINARY ones it still pins a payload fact
+        # (that Manifold ships them a real probability, without which the venue would go priceless).
         search = manifold_multi_outcome["search_all"]
         assert {market["outcomeType"] for market in search} == {"BINARY", "MULTIPLE_CHOICE"}
         for row, market in zip(venues.parse_manifold_matches(search, width=60) or [], search):
@@ -1265,6 +1293,267 @@ class TestManifoldMultiOutcome:
         assert "answers" not in detail
 
         assert venues.manifold_answer_children(detail) == ()
+
+
+class TestManifoldScalarValueMarkets:
+    """``PSEUDO_NUMERIC``: the market whose ``probability`` field is not a probability.
+
+    It trades a VALUE on a ``[min, max]`` scale, publishes no ``answers`` array — so the
+    array-presence discriminator the multi-outcome path rests on reads it as BINARY — and still
+    ships a market-level ``probability``, which on this contract is the value's normalized position
+    on that scale. In production the row Metaculus Q14333's ranker graded ``same_quantity_same_date``
+    rendered ``prob`` 0.48 on a market whose estimate was 121 years.
+
+    Two of these tests assert arithmetic over the fixture's own figures rather than parser output.
+    That is the point: they establish what the payload MEANS, so the parser and the fixture cannot
+    agree on a wrong reading the way the 2026-07-12 Kalshi liquidity regression's hand-built pair did.
+    """
+
+    def test_the_probability_field_is_the_values_position_on_the_scale(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """The receipt, exact to the last bit: ``probability * max == value``.
+
+        And the two facts that let it through — no ``answers`` key, so the multi-outcome
+        discriminator sees a BINARY market, and a non-null ``probability``, so it prices.
+        """
+        market = manifold_pseudo_numeric["search_pseudo_numeric"][0]
+
+        assert market["outcomeType"] == "PSEUDO_NUMERIC"
+        assert market["probability"] * market["max"] == market["value"]
+        assert "answers" not in market
+        assert market["probability"] is not None
+
+    def test_a_scalar_row_carries_its_value_and_no_probability(self, manifold_pseudo_numeric: dict[str, Any]) -> None:
+        """The fix. ``implied_prob_yes`` stays empty — nothing here is a yes-price — and the value
+        rides its own field, where no formatter can render it as one."""
+        payload = manifold_pseudo_numeric["search_pseudo_numeric"]
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None and len(rows) == 1
+        row = rows[0]
+        assert row.implied_prob_yes is None
+        assert row.scalar_estimate == ScalarEstimate(
+            value=120.96691732988944, minimum=0.0, maximum=250.0, is_log_scale=False
+        )
+        # Everything that is NOT the price is untouched by the allow-list, so a scalar row is still a
+        # first-class candidate: same venue rank, same liquidity label, same close date.
+        assert row.match_confidence == 100.0
+        assert row.num_bettors == payload[0]["uniqueBettorCount"]
+        assert _liquidity_label(row) == "thin"
+        assert row.close_time is not None
+
+    def test_the_value_is_read_from_the_venue_and_never_recomputed(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """Why ``value`` is read rather than derived, on the two live log-scale markets.
+
+        ``probability * max`` is exact on a linear market, which is what makes it a tempting
+        one-liner. On these it overstates the venue's own figure by 29x and 6554x, and interpolating
+        between the bounds in log space does not reproduce it either — the mapping is Manifold's, so
+        the field is the only honest source and no branch on ``isLogScale`` can rescue arithmetic.
+        """
+        payload = manifold_pseudo_numeric["search_log_scale"]
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None and len(rows) == 2
+        for row, market in zip(rows, payload):
+            assert market["isLogScale"] is True
+            assert row.implied_prob_yes is None
+            estimate = row.scalar_estimate
+            assert estimate is not None
+            assert estimate.value == market["value"]
+            assert estimate.is_log_scale is True
+            assert estimate.scale_label == "log scale"
+            # The number the arithmetic shortcut would have produced, and how far off it is.
+            assert market["probability"] * market["max"] > 20 * estimate.value
+
+    def test_the_naive_linear_map_reproduces_value_exactly_on_every_linear_market(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """The trap, stated as a passing assertion. This is the test that explains the next one.
+
+        ``min + probability * (max - min)`` IS what Manifold computes for a LINEAR market — exactly,
+        to the last bit, on every one of the 11 linear markets in the captured listing (worst relative
+        error 2.2e-16). So the one-line recompute looks correct under any test written from linear
+        payloads, which is how a wrong implementation of this would ship. Pinned deliberately: if
+        someone reads only the log-scale test below, this one tells them why reading `value` is not
+        merely a style preference.
+        """
+        linear = [
+            market
+            for market in manifold_pseudo_numeric["search_scale_extremes"]
+            if not market["isLogScale"] and market["value"]
+        ]
+        assert len(linear) == 2, "fixture must carry linear markets, or this proves nothing"
+
+        for market in linear:
+            naive = market["min"] + market["probability"] * (market["max"] - market["min"])
+            assert naive == pytest.approx(market["value"], rel=1e-12)
+
+    def test_a_log_scale_value_is_nothing_like_the_naive_linear_map(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """The regression guard against a future "simplification" into a recompute.
+
+        On the real markets captured here the naive map that is exact on linear markets is off by
+        2.4x on the 2040 world-population market — showing a forecaster 19 billion people where the
+        market says 7.8 billion — and by 389,585x on a log market whose value is 1. Manifold's log
+        mapping is its own: interpolating between the bounds in log space does not reproduce it
+        either (see the fixture's provenance).
+
+        Concretely: this fails the moment `manifold_scalar_estimate` stops reading `value` and starts
+        computing one, which no amount of linear-market coverage would catch.
+        """
+        payload = [market for market in manifold_pseudo_numeric["search_scale_extremes"] if market["isLogScale"]]
+        assert len(payload) == 2, "fixture must carry log-scale markets, or this proves nothing"
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        for row, market in zip(rows, payload):
+            estimate = row.scalar_estimate
+            assert estimate is not None
+            assert estimate.value == market["value"], "the venue's own figure, verbatim"
+            naive = market["min"] + market["probability"] * (market["max"] - market["min"])
+            assert naive != pytest.approx(estimate.value, rel=0.1)
+            assert naive > 2 * estimate.value
+
+        # The two extremes those rows represent, named so a future reader sees the range of the hazard.
+        by_value = {row.scalar_estimate.value: row for row in rows if row.scalar_estimate is not None}
+        assert 7_848_589_347.056932 in by_value, "the world-population market (2.4x)"
+        assert 1.0 in by_value, "the market whose value is 1 against a naive 389,585"
+
+    def test_a_scalar_market_on_a_unit_scale_is_indistinguishable_by_magnitude(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """A REAL live market on ``min=0, max=1``, trading a value of 0.468.
+
+        This is why the rendered cell carries a `value` label instead of relying on the number
+        looking too large to be a probability. Pre-fix this row rendered `0.47` in a column headed
+        `prob`, and no forecaster — and no reviewer — could have told from the number that it was not
+        one. It is also the reason the parser's allow-list keys on `outcomeType` rather than on any
+        property of the value itself: there is no such property.
+        """
+        payload = [
+            market
+            for market in manifold_pseudo_numeric["search_scale_extremes"]
+            if market["min"] == 0 and market["max"] == 1
+        ]
+        assert len(payload) == 1, "fixture must carry the unit-scale market, or this proves nothing"
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        estimate = rows[0].scalar_estimate
+        assert rows[0].implied_prob_yes is None
+        assert estimate is not None
+        assert estimate.value == 0.4680001051790792
+        assert 0.0 <= estimate.value <= 1.0, "shaped exactly like a probability, and not one"
+
+    def test_a_type_with_neither_answers_nor_a_value_stays_priceless(
+        self, manifold_pseudo_numeric: dict[str, Any]
+    ) -> None:
+        """A live ``STONK`` row: the second Manifold type that looks BINARY to the array
+        discriminator. It publishes ``probability`` null today, so it renders ``-`` under any design
+        — but it is the standing reason the price read is an allow-list rather than a
+        ``PSEUDO_NUMERIC`` deny-list, since a deny-list would price it the day that changes."""
+        payload = manifold_pseudo_numeric["search_stonk"]
+        assert payload[0]["outcomeType"] == "STONK" and "answers" not in payload[0]
+
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None and len(rows) == 1
+        assert rows[0].implied_prob_yes is None
+        assert rows[0].scalar_estimate is None
+
+    def test_a_binary_row_still_prices_off_its_probability(self, manifold_multi_outcome: dict[str, Any]) -> None:
+        """The regression guard on the 688-in-1000 case. The allow-list narrows which rows carry a
+        price; it must not change the price a BINARY row carries, or the whole venue goes dark."""
+        payload = manifold_multi_outcome["search_all"]
+        rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        binary = [
+            (row, raw) for row, raw in zip(rows, payload) if raw["outcomeType"] == venues.MANIFOLD_PRICED_OUTCOME_TYPE
+        ]
+        assert len(binary) == 2, "fixture must carry BINARY rows, or this proves nothing"
+        for row, raw in binary:
+            assert row.implied_prob_yes == raw["probability"]
+            assert row.scalar_estimate is None
+
+    def test_a_market_level_number_this_parser_cannot_read_is_declined_loudly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The allow-list's visible-failure half, on the shape no live type has yet.
+
+        This is what makes the allow-list the safe default: a future scalar type loses its price
+        with a line in the run log, where a deny-list would have printed its scale position under
+        the `prob` header and said nothing. No shape in the fixtures reaches this branch.
+        """
+        payload = [{"id": "future1", "question": "Q", "outcomeType": "SOMETHING_NEW", "probability": 0.7}]
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues.manifold"):
+            rows = venues.parse_manifold_matches(payload, width=60)
+
+        assert rows is not None
+        assert rows[0].implied_prob_yes is None and rows[0].scalar_estimate is None
+        assert "market-level probability" in caplog.text and "SOMETHING_NEW" in caplog.text
+
+    def test_the_live_payloads_reach_that_warning_on_no_row(
+        self,
+        manifold_pseudo_numeric: dict[str, Any],
+        manifold_multi_outcome: dict[str, Any],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The warning above is a signal, so it has to be silent on every shape that exists: a
+        PSEUDO_NUMERIC row has a value to show, and every other non-BINARY type ships `probability`
+        null. One line per Manifold row would make the whole marker unreadable."""
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.market_retrieval.venues.manifold"):
+            for key, fixture in (
+                ("search_pseudo_numeric", manifold_pseudo_numeric),
+                ("search_log_scale", manifold_pseudo_numeric),
+                ("search_stonk", manifold_pseudo_numeric),
+                ("search_all", manifold_multi_outcome),
+            ):
+                assert venues.parse_manifold_matches(fixture[key], width=60) is not None
+
+        assert caplog.text == ""
+
+    @pytest.mark.parametrize("market", [{}, {"value": None}, {"value": "not a number"}, {"value": float("nan")}])
+    def test_an_unreadable_value_yields_no_estimate_rather_than_a_blank_one(self, market: dict[str, Any]) -> None:
+        """No value means no price. A `ScalarEstimate` holding None, or NaN, would render `value nan`
+        in a column a forecaster is told to anchor on — `safe_float` is what keeps the field finite."""
+        assert venues.manifold_scalar_estimate(market) is None
+
+    def test_an_estimate_keeps_its_value_when_the_venue_omits_the_bounds(self) -> None:
+        """The bounds are the venue's to omit and the value stands without them, so a missing scale
+        costs the scale note and not the number."""
+        estimate = venues.manifold_scalar_estimate({"value": 42.5})
+
+        assert estimate is not None
+        assert estimate == ScalarEstimate(value=42.5, minimum=None, maximum=None, is_log_scale=False)
+        assert estimate.bounds_text() == ""
+
+    def test_negative_bounds_are_joined_with_to_rather_than_a_hyphen(self) -> None:
+        """Manifold's scales are routinely negative (live: -15 to 2, -48 to 48, -4 to 4), and
+        `-15--2` is unreadable. Asserted on the type because both the table cell and the ranker's
+        candidate line render it from here."""
+        estimate = venues.manifold_scalar_estimate({"value": -1, "min": -15, "max": 2})
+
+        assert estimate is not None
+        assert estimate.bounds_text() == "-15 to 2"
+
+    def test_wide_bounds_stay_exact_and_grouped_rather_than_becoming_an_exponent(self) -> None:
+        """A bound is a parameter the market's author chose, so it is printed exact and grouped.
+
+        Both halves matter on the scales that exist. Rounding would misstate the scale — a live `max`
+        of 20,000,000,000 needs 11 significant digits — and `%g`'s automatic exponent would print one
+        bound of the same scale as `1e+07` while its sibling reads `1`, which is one scale written two
+        ways.
+        """
+        estimate = venues.manifold_scalar_estimate({"value": 609, "min": 1, "max": 10_000_000})
+
+        assert estimate is not None
+        assert estimate.bounds_text() == "1 to 10,000,000"
 
 
 class TestScalarCoercions:
