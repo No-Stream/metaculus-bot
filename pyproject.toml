@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Multi-LLM ensemble forecasting bot for Metaculus."
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "Vasile Popescu", email = "elisescu@elisescu.com" }]
+authors = [{ name = "No-Stream" }]
 dependencies = [
     "requests>=2.32.3",
     "asknews>=0.11.2",

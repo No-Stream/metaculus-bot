@@ -331,26 +331,26 @@ async def _invoke_claude_redactor(
 
     Flags:
       -p / --print                 headless single-shot
-      --output-format text         plain text output (canonical pattern from
-                                   ``~/workspace/fraud_research/scripts/autoresearch_loop.sh``;
-                                   the redactor's response IS JSON because we
-                                   ask for it in the prompt — we don't need an
-                                   outer JSON envelope wrapping it).
+      --output-format text         plain text output (canonical pattern from a
+                                   sibling headless-Claude research harness; the
+                                   redactor's response IS JSON because we ask
+                                   for it in the prompt — we don't need an outer
+                                   JSON envelope wrapping it).
       --max-turns 1                one shot
       --permission-mode bypassPermissions   no permission prompts
-      --settings '{...}'           force-disable prompt-caching 1H beta
-                                   (Mantle's headless gateway rejects the
+      --settings '{...}'           force-disable prompt-caching 1H beta (the
+                                   headless gateway rejects the
                                    ``prompt-caching-2025-XX-XX`` beta header,
                                    producing 400 invalid-beta-flag → exit 1).
-                                   Diagnosed by fraud_research team 2026-05-06.
+                                   Diagnosed 2026-05-06.
       --append-system-prompt <s>   redactor system prompt
 
     NOTE: we deliberately do NOT pass ``--bare``. The successful run #5 of this
     pipeline DID use ``--bare`` but a follow-up run with the same flag set
-    failed — the precise cause is unclear, but the canonical pattern in
-    fraud_research/autoresearch_loop.sh runs without ``--bare`` and is known to
-    work for thousands of headless invocations against the same Mantle gateway.
-    Cargo-culting that pattern.
+    failed — the precise cause is unclear, but the canonical pattern in that
+    sibling harness runs without ``--bare`` and is known to work for thousands
+    of headless invocations against the same gateway. Cargo-culting that
+    pattern.
 
     Tools are NOT explicitly disabled here either — ``--max-turns 1`` already
     constrains the model to one shot, and the system prompt instructs it to

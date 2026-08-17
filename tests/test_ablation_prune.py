@@ -499,7 +499,7 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
 
     argv = captured["argv"]
     assert any("claude" in str(a) for a in argv)
-    # Deliberately NOT --bare (cargo-cult fraud_research's known-good pattern).
+    # Deliberately NOT --bare (cargo-cult a sibling harness's known-good pattern).
     assert "--bare" not in argv
     # Deliberately NOT --allowedTools (known-fragile in non-interactive mode).
     assert "--allowedTools" not in argv
@@ -515,8 +515,8 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
     assert "--permission-mode" in argv
     perm_idx = argv.index("--permission-mode")
     assert argv[perm_idx + 1] == "bypassPermissions"
-    # Force-disable prompt-caching beta (Mantle gateway rejects it in headless;
-    # diagnosed by fraud_research team 2026-05-06).
+    # Force-disable prompt-caching beta (the headless gateway rejects it;
+    # diagnosed 2026-05-06).
     assert "--settings" in argv
     settings_idx = argv.index("--settings")
     settings_payload = argv[settings_idx + 1]
