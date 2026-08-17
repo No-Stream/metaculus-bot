@@ -133,17 +133,23 @@ LLM/research calls and no publishing.
 ## Install
 
 `run_sync.sh` self-locates the repo root relative to its own path, so it needs no
-edits. The **plist** still hardcodes the absolute path to `run_sync.sh` (launchd
-requires an absolute `ProgramArguments` path) and the log locations — **if your repo
-path differs, edit the paths in the plist first.** `run_sync.sh` is already executable
-(`chmod +x`).
+edits. The **plist** cannot: launchd requires an absolute `ProgramArguments` path and
+absolute log paths, so only a placeholder template
+(`com.metaculusbot.research-sync.plist.template`, carrying `__REPO_ROOT__`) is
+committed. Substituting the placeholder is the install step below; the generated
+`.plist` is gitignored because it is machine-specific. `run_sync.sh` is already
+executable (`chmod +x`).
 
-Copy the plist into your per-user `LaunchAgents` directory and bootstrap it:
+Generate the plist from the template and bootstrap it:
 
 ```bash
-# 1. Install the plist into the per-user LaunchAgents dir.
-cp /Users/flatljan/personal/metaculus-bot/scripts/research_sync/com.metaculusbot.research-sync.plist \
-   ~/Library/LaunchAgents/com.metaculusbot.research-sync.plist
+# Run from anywhere inside the checkout.
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# 1. Substitute __REPO_ROOT__ and write the plist straight into LaunchAgents.
+sed "s|__REPO_ROOT__|${REPO_ROOT}|g" \
+   "${REPO_ROOT}/scripts/research_sync/com.metaculusbot.research-sync.plist.template" \
+   > ~/Library/LaunchAgents/com.metaculusbot.research-sync.plist
 
 # 2. Bootstrap (load) it into your GUI login session. `gui/$(id -u)` is the
 #    per-user domain; `id -u` resolves to your numeric uid.
@@ -168,6 +174,8 @@ runs end-to-end without waiting for the next scheduled wake.
 ## Verify it's installed and ran
 
 ```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)   # run from inside the checkout
+
 # Is the job registered? (prints the label with its last exit status / PID)
 launchctl list | grep com.metaculusbot.research-sync
 
@@ -175,10 +183,10 @@ launchctl list | grep com.metaculusbot.research-sync
 launchctl print gui/$(id -u)/com.metaculusbot.research-sync
 
 # Did the last run succeed? Tail the most recent dated logfile.
-ls -t /Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/sync_*.log | head -1 | xargs tail -n 40
+ls -t "${REPO_ROOT}"/scripts/research_sync/logs/sync_*.log | head -1 | xargs tail -n 40
 
 # launchd's own stdout/stderr (job-start failures land here, before run_sync.sh runs):
-tail -n 40 /Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/launchd.err.log
+tail -n 40 "${REPO_ROOT}/scripts/research_sync/logs/launchd.err.log"
 ```
 
 A healthy run ends with `research-sync finished OK at ...` and the manifest under
