@@ -252,7 +252,7 @@ metaculus-bot/
 
 ## Framework Integration
 
-This project builds on the [`forecasting-tools`](forecasting_tools_readme.md) framework:
+This project builds on the [`forecasting-tools`](https://github.com/Metaculus/forecasting-tools) framework:
 
 - `GeneralLlm` for model interfaces
 - `MetaculusApi` for platform integration
@@ -263,8 +263,8 @@ This project builds on the [`forecasting-tools`](forecasting_tools_readme.md) fr
 ## Additional Resources
 
 - **[AGENTS.md](AGENTS.md)** — detailed, current-state repository guidelines (the maintained map of the codebase).
-- **[starter_guide.md](starter_guide.md)** — original template setup notes.
-- **[forecasting_tools_readme.md](forecasting_tools_readme.md)** — framework documentation.
+- **[metac-bot-template](https://github.com/Metaculus/metac-bot-template)** — the upstream starter template this repo forked from.
+- **[forecasting-tools](https://github.com/Metaculus/forecasting-tools)** — framework documentation.
 
 ## Environment Notes
 

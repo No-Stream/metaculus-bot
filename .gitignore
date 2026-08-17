@@ -1,7 +1,86 @@
 ###  Specific to Project ###
-benchmarks/
+
+# Local benchmark / backtest / analysis outputs. Per-operator state, never committed.
+/benchmarks/
+/backtests/
+/research_outputs/
+# jscpd output dir (report/jscpd-report.json is ~2.7MB)
+/report/
 sandbox.py
+scorecard.png
+# Local-only reference trees; AGENTS.md cites them, they are not in git.
 REFERENCE_COPY_OF_*
+
+# Bot run logs. Every run_bot_on_*.yaml does `mkdir -p run_logs` and tees stdout into it
+# (.github/workflows/run_bot_on_tournament.yaml:57-58); a local `make run` writes there too.
+# Run logs embed full research bundles and forecaster rationales -> never commit on a public fork.
+/run_logs/
+*.log
+
+# Scratch, plans, audits, handoffs -- local research state, never committed.
+# `scratch*/` covers both scratch/ and scratch_docs_and_planning/ in one rule.
+scratch*/
+notes/
+handoff-*.md
+HANDOFF*.md
+*.handoff.md
+*.plan.md
+
+# The launchd sync job is per-machine: launchd requires an absolute ProgramArguments path,
+# which has already broken a CI test once. Only the placeholder template ships; the concrete
+# plist produced by the README's sed step stays local.
+scripts/research_sync/*.plist
+!scripts/research_sync/*.plist.template
+
+# Secrets. Exact-name rules used to miss backups like .env.bak, so glob then negate.
+.env
+.env.*
+!.env.template
+
+# Analysis dumps, jscpd reports and ablation/calibration artifacts are all JSON, so this
+# blanket ignore is deliberate belt-and-suspenders on top of the directory rules above.
+# FOOTGUN: it matches at ANY depth. Every JSON that MUST ship needs an explicit negation
+# here. The negation is recursive on purpose -- the old `!tests/data/*.json` was one level
+# deep, so tests/data/<subdir>/*.json and tests/fixtures/*.json were silently dropped.
+# The fixtures are real captured venue payloads that the parsers' field-name contract is
+# pinned against; without the negation they exist locally, are absent on a fresh checkout,
+# the fixture-backed tests never run in CI, and the suite is green on the developer's
+# machine by construction (the local-green-proves-nothing trap in AGENTS.md).
+# NOTE: tests/data/performance_comments_mini.jsonl escapes this by extension. If anyone
+# ever adds `*.jsonl`, add `!tests/data/**/*.jsonl` in the SAME edit.
+# NOTE: dropping the blanket `*.json` means re-adding `gha-creds-*.json` in the same edit,
+# since that name guards a credentials file.
+*.json
+!tests/data/**/*.json
+
+# Merge / rebase leftovers
+*.orig
+*.rej
+
+# Agent tooling: steering files and caches. The reference AGENTS.md stays TRACKED.
+# `.claude` has no trailing slash on purpose -- catches both file and directory forms.
+# CLAUDE.md is a symlink to the tracked AGENTS.md, so ignoring it hides the node, not the
+# content: treat AGENTS.md as fully published.
+.claude
+.roo/
+.cursor*
+.gemini/
+.serena/
+.desloppify/
+.pre-commit-cache/
+GEMINI.md*
+CLAUDE.md
+*Zone.Identifier
+
+# macOS
+.DS_Store
+._*
+
+# JS tooling (gemini-cli / npx can drop this)
+node_modules/
+
+# uv writes this on `uv python pin`; requires-python in pyproject.toml is the source of truth.
+.python-version
 
 
 ### General gitignore ###
@@ -15,24 +94,26 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# Anchored to the repo root: unanchored, these match inside the flat-layout package
+# (metaculus_bot/lib/, .../var/), and core.ignoreCase differs between macOS and Linux CI.
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
+/MANIFEST
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -64,7 +145,6 @@ cover/
 *.pot
 
 # Django stuff:
-# *.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -81,7 +161,7 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
-target/
+/target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -89,11 +169,6 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
 
 # pipenv
 #   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
@@ -110,8 +185,6 @@ ipython_config.py
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
-# uv
-
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
@@ -123,14 +196,12 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
-.env.local
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+/.venv/
+/env/
+/venv/
+/ENV/
+/env.bak/
+/venv.bak/
 
 # Spyder project settings
 .spyderproject
@@ -144,8 +215,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
 
 # Pyre type checker
 .pyre/
@@ -165,40 +234,3 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 # .idea/
-
-# MacOS
-.DS_Store
-
-*.json
-
-# Checked-in test fixtures, un-ignored from the blanket *.json above. These are real
-# captured venue payloads that the parsers' field-name contract is pinned against, so CI
-# must have them: without the negation the file exists locally and is absent on a fresh
-# checkout, the fixture-backed tests never run in CI, and the suite is green on the
-# developer's machine by construction (the local-green-proves-nothing trap in CLAUDE.md).
-!tests/data/*.json
-
-# Benchmark and ablation outputs — never committed; per-operator local state
-backtests/
-
-# Research persistence outputs (uploaded as GHA artifacts, not committed)
-research_outputs/
-
-# Agentic coding tool steering files other than reference AGENTS.md
-AGENTS.md:Zone.Identifier
-.roo/*
-.cursor*
-GEMINI.md
-CLAUDE.md
-scratch_docs_and_planning/
-.serena/
-GEMINI.md.OLD
-*Zone.Identifier
-.pre-commit-cache/*
-
-.gemini/
-.desloppify/
-gha-creds-*.json
-scratch/*
-scorecard.png
-.claude
