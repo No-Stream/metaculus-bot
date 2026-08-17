@@ -1,0 +1,54 @@
+# gitleaks config for the CI secret-scan job (.github/workflows/ci.yaml).
+#
+# The filename must be exactly `.gitleaks.toml` (with the leading dot) — that is what the
+# gitleaks CLI stats for. An undotted `gitleaks.toml` is NOT found and the failure is silent:
+# the scan just falls back to the default rules and every allowlist below stops applying.
+# The workflow also passes GITLEAKS_CONFIG explicitly so discovery cannot drift.
+#
+# Schema note: `[[allowlists]]` (array of tables) is the 8.25.0+ form. The workflow pins the
+# CLI to 8.30.1 because gitleaks-action otherwise defaults to 8.24.3, which predates this key
+# and would ignore this file's allowlists without warning. Do not mix in a singular
+# `[allowlist]` table — gitleaks hard-errors when both are present.
+
+title = "metaculus-bot secret scan"
+
+[extend]
+useDefault = true
+
+# Every entry below is `condition = "AND"` (paths AND regexes), so a pattern is forgiven only
+# inside the test files that legitimately contain it — never repo-wide. Deliberately NOT a
+# blanket path allowlist over tests/data/: that would also hide a real key committed there.
+
+[[allowlists]]
+description = "Manifold's play-currency denomination, not a credential"
+condition = "AND"
+paths = ['''^tests/data/''']
+regexTarget = "line"
+regexes = ['''"token"\s*:\s*"MANA"''']
+
+[[allowlists]]
+description = "Firebase Storage download tokens in captured Manifold avatar URLs (public third-party media handles)"
+condition = "AND"
+paths = ['''^tests/data/''']
+regexTarget = "line"
+regexes = ['''firebasestorage\.googleapis\.com/.*[?&]alt=media&token=''']
+
+[[allowlists]]
+description = "Intentional fake OpenRouter key placeholders — non-hex and far too short to be valid"
+condition = "AND"
+paths = [
+  '''^tests/test_check_openrouter_credits\.py$''',
+  '''^tests/test_credit_telemetry\.py$''',
+]
+regexTarget = "line"
+regexes = ['''sk-or-v1-(DONATED|PERSONAL)secret[A-Z0-9]{4}''']
+
+[[allowlists]]
+description = "Fake userinfo-in-URL literals asserted on by the SSRF and host-normalization tests"
+condition = "AND"
+paths = [
+  '''^tests/test_market_settlement_join\.py$''',
+  '''^tests/test_resolution_source_provider\.py$''',
+]
+regexTarget = "line"
+regexes = ['''https://user:(pw|pass)@''']

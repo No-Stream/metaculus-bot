@@ -36,6 +36,34 @@ jobs:
       - name: Run tests
         run: uv run --frozen pytest --cov=metaculus_bot
 
+  # Secret scan. This repo is a public fork, so a committed credential is exposed the
+  # moment it lands, and nothing in pre-commit or CI caught that before. Findings are
+  # redacted in the SARIF artifact the action uploads.
+  secret_scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The action scans a commit RANGE (`<base>^..<head>`), so the base commit's
+          # parent has to be in the clone; the default shallow fetch breaks it.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin the CLI. The action's own default is 8.24.3, which predates the
+          # [[allowlists]] schema .gitleaks.toml uses and would silently ignore the
+          # whole allowlist, drowning the job in fixture false positives.
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # PR review comments would need pull-requests: write; the job summary and the
+          # non-zero exit are signal enough, so keep the token read-only.
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+      # No GITLEAKS_LICENSE above: the action requires one only for repos owned by an
+      # organization. It resolves that by looking up the owner's account type, so this
+      # stays license-free only while the repo lives under a personal account.
+
   # Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
   # PyPI package), so it runs via Google's published container action rather
   # than uvx.

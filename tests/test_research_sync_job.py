@@ -40,8 +40,8 @@ _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 # Every workflow that runs the bot: three scheduled prod tournaments plus the two
 # dispatch-only test workflows (test_bot / test_bot_basic both match *bot*).
 # .y*ml, not .yaml: the exact-set assertion below is what forces a NEW bot workflow to
-# satisfy this invariant, and a .yml-suffixed one would slip past it (six .yml workflows
-# already exist here, all non-bot).
+# satisfy this invariant, and a .yml-suffixed one would slip past it (claude.yml already
+# uses that suffix, and both spellings are live here).
 _BOT_WORKFLOWS = sorted(p.relative_to(_REPO_ROOT).as_posix() for p in _WORKFLOW_DIR.glob("*bot*.y*ml"))
 
 
