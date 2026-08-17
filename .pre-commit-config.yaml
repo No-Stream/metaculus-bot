@@ -39,3 +39,17 @@ repos:
         stages: [pre-commit]
         pass_filenames: false
         always_run: true
+
+      # GitHub's "block command line pushes that expose my email" only guards emails
+      # registered on the pushing account — a stray identity inherited from a global
+      # gitconfig (the usual way a wrong email reaches a public repo) is invisible to
+      # it. This guard travels with the repo: wherever it is cloned, commits must
+      # carry a pseudonymous noreply identity. `stages` pinned for the same reason
+      # as above.
+      - id: require-noreply-email
+        name: require a GitHub noreply commit identity
+        entry: scripts/hooks/require_noreply_email.sh
+        language: script
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true
