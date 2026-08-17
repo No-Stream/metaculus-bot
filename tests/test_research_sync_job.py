@@ -30,14 +30,18 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MAKEFILE = _REPO_ROOT / "Makefile"
 _SYNC_DIR = _REPO_ROOT / "scripts" / "research_sync"
 _RUN_SYNC = _SYNC_DIR / "run_sync.sh"
-_PLIST = _SYNC_DIR / "com.metaculusbot.research-sync.plist"
+# The committed artifact is the placeholder TEMPLATE, never a concrete plist: launchd needs an
+# absolute ProgramArguments path, so any installable plist names one machine's checkout. Only the
+# template is in git; the README's sed step generates the real file, which is gitignored.
+_PLIST_TEMPLATE = _SYNC_DIR / "com.metaculusbot.research-sync.plist.template"
+_REPO_ROOT_PLACEHOLDER = "__REPO_ROOT__"
 _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 
 # Every workflow that runs the bot: three scheduled prod tournaments plus the two
 # dispatch-only test workflows (test_bot / test_bot_basic both match *bot*).
 # .y*ml, not .yaml: the exact-set assertion below is what forces a NEW bot workflow to
-# satisfy this invariant, and a .yml-suffixed one would slip past it (six .yml workflows
-# already exist here, all non-bot).
+# satisfy this invariant, and a .yml-suffixed one would slip past it (claude.yml already
+# uses that suffix, and both spellings are live here).
 _BOT_WORKFLOWS = sorted(p.relative_to(_REPO_ROOT).as_posix() for p in _WORKFLOW_DIR.glob("*bot*.y*ml"))
 
 
@@ -228,7 +232,7 @@ class TestBotWorkflowsArchiveTheirResearch:
 
 class TestPlistSurvivesOneBadWake:
     def test_two_wakes_per_week(self) -> None:
-        with _PLIST.open("rb") as handle:
+        with _PLIST_TEMPLATE.open("rb") as handle:
             plist = plistlib.load(handle)
         intervals = plist["StartCalendarInterval"]
         assert isinstance(intervals, list), (
@@ -239,30 +243,43 @@ class TestPlistSurvivesOneBadWake:
         assert {interval["Weekday"] for interval in intervals} == {0, 3}, "expect Sun + Wed wakes"
 
     def test_throttle_interval_prevents_a_relaunch_loop(self) -> None:
-        with _PLIST.open("rb") as handle:
+        with _PLIST_TEMPLATE.open("rb") as handle:
             plist = plistlib.load(handle)
         # run_sync.sh now exits non-zero on failure, and launchd relaunches a failed job
         # promptly by default. Throttle so a network outage gets a real retry, not a loop.
         assert plist["ThrottleInterval"] >= 600
 
-    def test_plist_points_at_the_wrapper_this_suite_checks(self) -> None:
-        with _PLIST.open("rb") as handle:
+    def test_template_points_at_the_wrapper_this_suite_checks(self) -> None:
+        with _PLIST_TEMPLATE.open("rb") as handle:
             plist = plistlib.load(handle)
         # Otherwise every assertion above could pass while launchd runs something else.
         #
-        # SUFFIX, not equality, and do not "tighten" this back: the plist is a
-        # machine-specific launchd artifact carrying an absolute path to the operator's
+        # Asserted as PLACEHOLDER + repo-relative suffix, and do not "tighten" this to a
+        # real path: an installable plist must carry an absolute path to one machine's
         # checkout (launchd has no notion of a repo-relative path), while _RUN_SYNC is
-        # derived from __file__. Comparing them for equality passes only on the machine
+        # derived from __file__. Comparing those for equality passes only on the machine
         # that wrote the plist and can never pass in CI, where the checkout lives
         # somewhere else — which is exactly how this test shipped red (CI run
-        # 30321344705, 2026-07-27).
+        # 30321344705, 2026-07-27). The template sidesteps that: the placeholder is
+        # machine-independent, so this assertion means the same thing everywhere.
         program_arguments = plist["ProgramArguments"]
         assert len(program_arguments) == 1, f"expect a bare wrapper invocation, got {program_arguments}"
         invoked = program_arguments[0]
-        assert invoked.startswith("/"), f"launchd requires an absolute program path, got {invoked!r}"
         wrapper_suffix = _RUN_SYNC.relative_to(_REPO_ROOT).as_posix()
-        assert invoked.endswith(wrapper_suffix), (
-            f"the plist must invoke {wrapper_suffix} — the wrapper whose contents the rest of this "
-            f"class asserts on — under whatever absolute prefix the install machine uses; got {invoked!r}"
+        assert invoked == f"{_REPO_ROOT_PLACEHOLDER}/{wrapper_suffix}", (
+            f"the template must invoke {_REPO_ROOT_PLACEHOLDER}/{wrapper_suffix} — the wrapper whose "
+            f"contents the rest of this class asserts on, under the placeholder the README's sed step "
+            f"substitutes; got {invoked!r}"
         )
+
+    def test_template_carries_no_developer_path(self) -> None:
+        # The whole point of the template: a committed absolute path leaks the operator's
+        # home directory on a public fork AND is the local-green-proves-nothing trap, since
+        # a path derived from one checkout passes locally by construction.
+        text = _PLIST_TEMPLATE.read_text()
+        assert _REPO_ROOT_PLACEHOLDER in text, "the template must keep the placeholder unsubstituted"
+        for absolute_prefix in ("/Users/", "/home/"):
+            assert absolute_prefix not in text, (
+                f"the committed template must not contain {absolute_prefix!r} — substitute "
+                f"{_REPO_ROOT_PLACEHOLDER} at install time instead (the generated .plist is gitignored)"
+            )

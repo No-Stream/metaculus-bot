@@ -1,5 +1,0 @@
-{
-  "qtype": "numeric",
-  "raw_text": "```json\n{\n  \"question_type\": \"numeric\",\n  \"declared_percentiles\": {\n    \"0.01\": 38.2,\n    \"0.025\": 41.0,\n    \"0.05\": 43.5,\n    \"0.1\": 46.2,\n    \"0.2\": 49.5,\n    \"0.4\": 53.4,\n    \"0.5\": 55.1,\n    \"0.6\": 56.8,\n    \"0.8\": 60.5,\n    \"0.9\": 63.7,\n    \"0.95\": 66.5,\n    \"0.975\": 69.6,\n    \"0.99\": 73.2\n  },\n  \"outcome_type\": \"continuous\"\n}\n```",
-  "parsed_summary": "median=55.1"
-}

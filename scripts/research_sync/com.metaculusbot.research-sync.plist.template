@@ -6,9 +6,10 @@
   Pulls GHA research artifacts into backtests/research_archive/ before they expire
   (GHA retention-days: 90). Weekly cadence leaves wide margin inside the 90-day window.
 
-  EDIT BEFORE INSTALL: the paths below assume the repo lives at
-  /Users/flatljan/personal/metaculus-bot. Adjust ProgramArguments / log paths if
-  your username or repo location differs. See README.md for the install command.
+  TEMPLATE — not installable as-is. Every __REPO_ROOT__ below stands for the absolute path
+  to your checkout; launchd has no notion of a repo-relative path, so it must be substituted
+  before install. README.md's install step does that with a one-line sed. Only this template
+  is committed: the generated .plist is machine-specific and gitignored.
 -->
 <plist version="1.0">
 <dict>
@@ -17,7 +18,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/run_sync.sh</string>
+        <string>__REPO_ROOT__/scripts/research_sync/run_sync.sh</string>
     </array>
 
     <!-- TWO wakes a week (Sun + Wed 03:00 local), not one. launchd runs a job missed
@@ -56,9 +57,9 @@
     <!-- launchd's own stdout/stderr for the job (separate from run_sync.sh's dated
          logfiles). Useful for diagnosing a job that never starts. -->
     <key>StandardOutPath</key>
-    <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/launchd.out.log</string>
+    <string>__REPO_ROOT__/scripts/research_sync/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/flatljan/personal/metaculus-bot/scripts/research_sync/logs/launchd.err.log</string>
+    <string>__REPO_ROOT__/scripts/research_sync/logs/launchd.err.log</string>
 
     <key>RunAtLoad</key>
     <false/>

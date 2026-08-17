@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 #
 # URLs enter this module from question resolution_criteria / fine_print — user-
-# authored fields that anyone can craft. Fetches run from CI runners on AWS,
+# authored fields that anyone can craft. Fetches run from CI runners,
 # where hitting http://169.254.169.254/latest/meta-data/ (or any RFC1918 host,
 # any private IP, ::1, fe80::/10, etc.) would exfiltrate instance identity into
 # the research prompt AND into the public Metaculus comment. Legitimate

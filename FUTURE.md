@@ -2,6 +2,13 @@
 
 Ideas for improving the forecasting bot, roughly ordered by expected impact and feasibility.
 
+> **On `scratch/...` citations.** Entries below cite dated analysis receipts under `scratch/`.
+> Those are the operator's local research artifacts and are deliberately NOT committed
+> (`scratch*/` is gitignored) — they run to hundreds of megabytes of captured research text and
+> per-question payloads. A citation names which analysis produced a finding and when, so the
+> claim is attributable even though a reader of this repo cannot open the file. The same
+> convention applies to `scratch/` paths cited from AGENTS.md and from code comments.
+
 > **Status as of 2026-05-10** (closing residual on spring-aib-2026, n=189; receipts
 > `scratch/analysis_2026-05/{analysis_synthesis,extended_hits_misses_postmortem,NEXT_SESSION_QUEUE}.md`).
 > Two findings then reshaped priorities: (1) 17/20 worst misses were high-spread (>0.15) with a base
@@ -712,7 +719,7 @@ is undecided. Full design (source of truth): `scratch_docs_and_planning/agentic_
 Summary: a bounded agentic tool loop is the second-pass research stage — a driver LLM briefed with
 the forecaster prompt template privately dry-runs the forecast to find fill/verify targets, then
 iterates over four tools: `search_news` (AskNews rate-limit machinery), `search_web` (Exa direct,
-key `~/.keys/exa_key` / GHA secret `exa_key`), `fetch` (ladder plain → headless Chromium → Gemini
+key stored locally / GHA secret `exa_key`), `fetch` (ladder plain → headless Chromium → Gemini
 url_context), `read_document` (Gemini flash url_context). Output: a detached citation-only findings
 artifact appended to the bundle; a ghost forecast logged for telemetry only. DIY litellm-direct,
 append-only message array for prompt-cache discipline.
@@ -969,8 +976,8 @@ key are unaffected.
 Metaculus fixes the BYOK routing (pick one, account-side): (1) enable Cloud billing on the BYOK GCP
 project → Tier 1 quota; (2) remove the Google AI Studio BYOK integration so `google/*` uses native
 OpenRouter Google credits; (3) disable "Always use for this provider" on that BYOK key. Does NOT help:
-raising OpenRouter-side native limits (the 429 is Google-side). Pinged Ben; after a fix, re-verify with
-one live call and delete the entry.
+raising OpenRouter-side native limits (the 429 is Google-side). Raised with Metaculus support; after a
+fix, re-verify with one live call and delete the entry.
 
 ### ✅ RESOLVED 2026-05-29 — `OAI_ANTH_OPENROUTER_KEY` data-policy block for OpenAI native search
 
@@ -1427,7 +1434,7 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
 Source: dissection of 12 high-scoring outputs from GreeneiBot2 / Preseen-Atlas / SynapseSeer
-(`/Users/flatljan/Documents/prompts/metac-examples-strong-bots-june-2026.md`; report + grounding-critic
+(a local corpus of competitor outputs, not committed; report + grounding-critic
 verdict `scratch/competitor_analysis_2026-06-26/REPORT.md`). **Caveat: the corpus has NO resolution
 outcomes**, so every "why it helps" is a mechanism argument, not outcome-validated. Only the
 source-provenance trust ladder shipped (`prompts.py:_SOURCE_PROVENANCE_LADDER`); the rest is gated on a

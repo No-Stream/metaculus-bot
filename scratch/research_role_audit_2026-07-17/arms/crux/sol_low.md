@@ -1,1 +1,0 @@
-How much of the ZEREN survey’s 26–32% undecided/refusal bloc is opposition-leaning, and how accurately does its 55–56% Hichilema support measure current voting intentions? How fully will Mundubile consolidate Lungu/PF-aligned voters, and how will cost-of-living dissatisfaction versus improving macroeconomic conditions and opposition fragmentation affect turnout and vote choice?

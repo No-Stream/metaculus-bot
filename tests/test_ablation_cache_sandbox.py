@@ -65,8 +65,8 @@ def test_ablation_cache_constructor_signals_relative_default_for_audit() -> None
     future change that hard-codes the absolute repo path triggers test failure."""
     cache = AblationCache()
     assert str(cache.root).endswith("backtests/ablation")
-    # MUST be relative — operators rely on cwd-relative resolution; absolute
-    # would break on Brazil/conductor builds.
+    # MUST be relative — operators rely on cwd-relative resolution; an absolute
+    # path would break checkouts at a different root.
     assert not Path(cache.root).is_absolute()
 
 

@@ -358,7 +358,7 @@ per redirect hop). Content is extracted with trafilatura (HTML), or read raw
 unread.
 
 It is **SSRF-hardened** because these URLs are user-authored and fetches run from
-CI on AWS: a preflight `is_public_http_url` check rejects private / loopback /
+CI: a preflight `is_public_http_url` check rejects private / loopback /
 link-local / non-global IPs, userinfo tricks, and non-HTTP schemes, and a
 connect-time `FilteringResolver` (the actual DNS-rebinding boundary, not the
 preflight) re-checks every resolved IP. Redirects are followed manually under the

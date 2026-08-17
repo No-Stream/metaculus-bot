@@ -230,8 +230,8 @@ provider payloads and telemetry markers, but not the briefing the forecasters
 read. Test runs now contribute to the archive on purpose; they forecast the
 evergreen questions, so their records are the ones backtest replay wants most.
 
-`ci.yaml` is the pull-request check (lint + tests); the `gemini-*` and
-`claude.yml` workflows are repo automation unrelated to forecasting.
+`ci.yaml` is the pull-request check (lint + tests); the `claude.yml` workflow is
+repo automation unrelated to forecasting.
 
 ### The one-question smoke test (`test_bot_basic.yaml`)
 
@@ -312,9 +312,6 @@ tee'd from `run_logs/` during the run, alongside the run's
 
 The general telemetry markers under "Reading run logs" below apply too; those
 are just the money-shaped ones.
-
-`ci.yaml` is the pull-request check (lint + tests); the `gemini-*` and
-`claude.yml` workflows are repo automation unrelated to forecasting.
 
 ## Cost discipline
 

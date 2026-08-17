@@ -1,7 +1,7 @@
 # Metaculus Forecasting Bot — Agent Guidelines
 
-General coding guidelines (style, testing, error handling, etc.) are in `~/.claude/CLAUDE.md`.
-This file covers **repo-specific** context only.
+General coding guidelines (style, testing, error handling, etc.) live in the operator's private
+global config; this file covers **repo-specific** context only.
 
 ## ⚠️ Cost discipline — every credit spend goes through the operator
 
