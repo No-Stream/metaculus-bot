@@ -13,7 +13,18 @@
 #     dependencies) were deleted from pyproject.toml at the bump; none of those packages
 #     resolve to a vulnerable version anymore.
 #
-# The scan stays LIVE for any NEW CVE not listed here — only these two enumerated,
+# 2026-08-17: three further cryptography advisories (CVE-2026-69247/69248/69249) disclosed
+# against 46.0.6, blocked by the SAME asknews cap and waived below. asknews 0.13.56 (latest
+# on PyPI as of this date) still declares `cryptography<46.0.7,>=40.0.0`, so bumping asknews
+# does NOT lift the cap — re-check its metadata, not just its version, before retrying.
+# The cap is the only blocker: 49.0.0 (2026-06-12) and 50.0.0 (2026-07-31) both predate the
+# lock-time `exclude-newer` freshness window, and `uv lock --upgrade-package cryptography`
+# leaves 46.0.6 in place. cryptography is not a direct dependency and this repo imports it
+# nowhere; it arrives transitively via asknews, google-auth, and pyjwt[crypto].
+# The concurrently-disclosed aiohttp advisories were NOT waived — aiohttp went 3.14.1 ->
+# 3.14.3, which fixes all three outright.
+#
+# The scan stays LIVE for any NEW CVE not listed here — only these five enumerated,
 # accepted advisories are suppressed. Re-evaluate this list at the next forecasting-tools
 # or asknews bump (re-run `make audit` and prune resolved IDs).
 #
@@ -28,3 +39,12 @@ reason = "cryptography 46.0.6 buffer overflow when non-contiguous buffers are pa
 [[IgnoredVulns]]
 id = "GHSA-537c-gmf6-5ccf"
 reason = "cryptography 46.0.6 wheels bundle a vulnerable OpenSSL (CVSS 7.5); fix 48.0.1 unreachable while asknews 0.13.54 caps cryptography <46.0.7"
+[[IgnoredVulns]]
+id = "GHSA-jwv3-5hgf-82ww"
+reason = "cryptography 46.0.6 exponential path-building on chains with duplicate self-signed intermediates, a resource-exhaustion DoS (CVE-2026-69249, CVSS 8.7); fix 49.0.0 unreachable while asknews 0.13.54 caps cryptography <46.0.7. Not reached: we build and verify no X.509 chains."
+[[IgnoredVulns]]
+id = "GHSA-g6cj-pr64-35w5"
+reason = "cryptography 46.0.6 PKCS#7 EnvelopedData decryption leaks a Bleichenbacher oracle via distinguishable errors and timing (CVE-2026-69247, CVSS 8.2); fix 50.0.0 unreachable while asknews 0.13.54 caps cryptography <46.0.7. Not reached: we decrypt no attacker-supplied PKCS#7."
+[[IgnoredVulns]]
+id = "GHSA-m2h6-j472-rp4c"
+reason = "cryptography 46.0.6 verifier accepts a wildcard DNS SAN that escapes an intermediate CA's permittedSubtrees name constraint (CVE-2026-69248, CVSS 6.9); fix 49.0.0 unreachable while asknews 0.13.54 caps cryptography <46.0.7. Not reached: we build and verify no X.509 chains."
