@@ -2,6 +2,7 @@
 
 import logging
 import math
+from collections.abc import Mapping, Sequence
 from typing import Callable
 
 import numpy as np
@@ -227,6 +228,7 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
                 cdf_values,
                 value_grid=scaling.get("continuous_range"),
                 zero_point=grid_zero_point(scaling.get("zero_point"), lower_bound),
+                per_model_percentiles=r.get("per_model_numeric_percentiles"),
             )
         else:
             continue
@@ -258,6 +260,49 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
     }
 
 
+def declared_percentile_pit(
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None,
+    resolution: float,
+) -> float | None:
+    """PIT from the MEDIAN of the ensemble members' declared percentile curves.
+
+    The declared ``(percentile, value)`` pairs are the models' raw output and are NOT
+    clipped to the question's displayed range, so a resolution beyond the CDF grid
+    still gets a real quantile: interpolate each member's own value -> percentile
+    curve at the resolution (clamping to the curve's endpoint percentiles beyond its
+    ends) and take the median across members — the same median-of-members the
+    published aggregate is built from, read in percentile space where the bound is
+    not a wall. Returns None when no member curve is usable.
+    """
+    pits = [
+        pit
+        for pit in (_single_curve_pit(pairs, resolution) for pairs in (per_model_percentiles or {}).values())
+        if pit is not None
+    ]
+    return float(np.median(pits)) if pits else None
+
+
+def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: float) -> float | None:
+    """Interpolate one member's declared (percentile 0-100, value) curve at ``resolution``."""
+    if not percentile_pairs:
+        return None
+    try:
+        pcts = np.array([float(p[0]) / 100.0 for p in percentile_pairs], dtype=float)
+        vals = np.array([float(p[1]) for p in percentile_pairs], dtype=float)
+    except (TypeError, ValueError, IndexError):
+        # Archived per-model pairs are parsed from comment text and can be malformed.
+        return None
+    order = np.argsort(vals)
+    vals, pcts = vals[order], pcts[order]
+    if not np.all(np.diff(vals) > 0):
+        # Duplicate declared values (e.g. a flat tail): jitter into strict monotonicity.
+        eps = max(1e-9, float(np.abs(vals).max()) * 1e-9)
+        vals = vals + np.arange(len(vals)) * eps
+        if not np.all(np.diff(vals) > 0):
+            return None
+    return float(np.interp(resolution, vals, pcts))
+
+
 def _interpolate_pit(
     resolution: float,
     lower_bound: float,
@@ -265,6 +310,7 @@ def _interpolate_pit(
     cdf_values: list[float],
     value_grid: list[float] | None = None,
     zero_point: float | None = None,
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None = None,
 ) -> float:
     """Interpolate the PIT value ``F(resolution)`` for a numeric resolution given its CDF.
 
@@ -286,8 +332,16 @@ def _interpolate_pit(
     else:
         grid = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points=len(cdf_values))
 
-    # np.interp clamps to the grid endpoints: a resolution at/below grid[0] reads cdf_values[0]
-    # and at/above grid[-1] reads cdf_values[-1], which is the correct PIT at the bounds.
+    # np.interp clamps beyond the grid to cdf_values[0] / cdf_values[-1]. That is the
+    # correct PIT for a resolution exactly AT a bound (F(bound) = cdf[0]) but NOT for one
+    # BEYOND the grid: with below/above-bound mass expressible on open bounds, cdf[0] can
+    # be ~0.9, so the clamp reads a below-grid resolution — a low-tail event — as a HIGH
+    # PIT, flipping the sign of the miss. Beyond the grid, read the PIT off the members'
+    # declared-percentile curves instead; the clamp is kept only when no curve is usable.
+    if resolution < grid[0] or resolution > grid[-1]:
+        fallback = declared_percentile_pit(per_model_percentiles, resolution)
+        if fallback is not None:
+            return fallback
     return float(np.interp(resolution, grid, np.asarray(cdf_values, dtype=float)))
 
 

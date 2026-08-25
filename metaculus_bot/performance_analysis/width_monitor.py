@@ -43,8 +43,10 @@ Per era it reports, on the bot's PUBLISHED 201-point CDF:
     opposite corrections.
 
 PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
-(``build_cdf_value_grid``); out-of-bounds resolutions map to PIT 0.0 (below
-lower) / 1.0 (above upper). Method mirrors
+(``build_cdf_value_grid``); string out-of-bound resolutions map to PIT 0.0
+(below lower) / 1.0 (above upper), and a NUMERIC resolution beyond the grid is
+scored off the members' declared-percentile curves rather than the grid clamp
+(see ``compute_pit_details``). Method mirrors
 ``scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py``.
 """
 
@@ -62,6 +64,7 @@ from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis.analysis import declared_percentile_pit
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
 from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
 
@@ -215,20 +218,47 @@ def _cdf_and_grid(record: dict) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def compute_pit(record: dict) -> float | None:
-    """PIT = F_bot(resolution) on the canonical value grid. Out-of-bounds
-    resolutions map to 0.0 / 1.0. Returns None when the record can't be scored."""
+    """PIT = F_bot(resolution) on the canonical value grid.
+
+    STRING out-of-bound resolutions (``below_lower_bound`` / ``above_upper_bound``)
+    map to 0.0 / 1.0; a NUMERIC resolution beyond the grid is read off the members'
+    declared-percentile curves instead of the grid clamp (see
+    :func:`compute_pit_details` for why). Returns None when the record can't be
+    scored."""
+    return compute_pit_details(record)[0]
+
+
+def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
+    """``(pit, oob_side)`` — ``oob_side`` is ``"low"``/``"high"`` when the resolution
+    fell beyond the value grid (string marker or numeric), else None.
+
+    ``np.interp`` clamps a resolution beyond the grid to ``cdf[0]`` / ``cdf[-1]`` —
+    correct AT a bound, wrong BEYOND one: with below-bound mass expressible on open
+    bounds (``cdf[0]`` can be ~0.9), the clamp reads a below-grid resolution — a
+    low-tail event — as a HIGH PIT, flipping the sign of the miss. Beyond the grid
+    the PIT comes off the median of the members' declared-percentile curves (not
+    clipped to the displayed range, via :func:`declared_percentile_pit`); when no
+    member curve is parseable the grid-endpoint read is kept, and ``oob_side``
+    surfaces the record in the ``n_oob_*`` counters either way.
+    """
     built = _cdf_and_grid(record)
     if built is None:
-        return None
+        return None, None
     cdf, grid = built
     res = record.get("resolution_parsed")
     if res == "below_lower_bound":
-        return 0.0
+        return 0.0, "low"
     if res == "above_upper_bound":
-        return 1.0
+        return 1.0, "high"
     if isinstance(res, (int, float)) and not isinstance(res, bool):
-        return float(np.interp(float(res), grid, cdf))
-    return None
+        res_f = float(res)
+        oob_side = "low" if res_f < grid[0] else ("high" if res_f > grid[-1] else None)
+        if oob_side is not None:
+            fallback = declared_percentile_pit(record.get("per_model_numeric_percentiles"), res_f)
+            if fallback is not None:
+                return fallback, oob_side
+        return float(np.interp(res_f, grid, cdf)), oob_side
+    return None, None
 
 
 def relative_band_width(record: dict, *, median_floor: float = 1e-9) -> float | None:
@@ -319,13 +349,23 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
     pits: list[float] = []
     pit_post_ids: list[object] = []
     widths: list[float] = []
+    n_oob_low = 0
+    n_oob_high = 0
     for r in records:
         if r.get("type") not in NUMERIC_TYPES:
             continue
-        pit = compute_pit(r)
+        pit, oob_side = compute_pit_details(r)
         if pit is not None:
             pits.append(pit)
             pit_post_ids.append(r.get("post_id"))
+            # OOB is a property of the resolution (beyond the grid), not of the PIT
+            # value: an out-of-grid resolution scored off the declared-percentile
+            # curves rarely lands at exactly 0.0/1.0, and an in-grid PIT of exactly
+            # 0.0 (closed bound, resolution at the minimum) is not OOB.
+            if oob_side == "low":
+                n_oob_low += 1
+            elif oob_side == "high":
+                n_oob_high += 1
         w = relative_band_width(r)
         if w is not None:
             widths.append(w)
@@ -335,8 +375,6 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
 
     arr = np.asarray(pits, dtype=float)
     n = len(arr)
-    n_oob_low = int((arr == 0.0).sum())
-    n_oob_high = int((arr == 1.0).sum())
     cov80_k = int(((arr >= 0.10) & (arr <= 0.90)).sum())
     cov50_k = int(((arr >= 0.25) & (arr <= 0.75)).sum())
 
@@ -451,8 +489,9 @@ def render_markdown(metrics: list[EraWidthMetrics]) -> str:
         "band_miss = P(PIT<0.10) + P(PIT>0.90), target 0.20 with lo ~= hi ~= 0.10. Well above 0.20 => "
         "band too TIGHT; a lo/hi skew at roughly the target => band roughly the right width but "
         "MIS-CENTERED (misses piled in one tail), which calls for shifting the band rather than "
-        "widening it. Distinct from OOB lo/hi, which counts resolutions outside the QUESTION's own "
-        "declared range (PIT exactly 0.0 / 1.0). excl = records dropped by --exclude-qids."
+        "widening it. Distinct from OOB lo/hi, which counts resolutions that fell beyond the "
+        "QUESTION's own value grid (string marker or numeric; their PIT is read off the members' "
+        "declared-percentile curves). excl = records dropped by --exclude-qids."
     )
     lines.append("")
     header = (

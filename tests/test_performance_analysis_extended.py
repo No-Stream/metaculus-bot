@@ -23,7 +23,7 @@ from metaculus_bot.performance_analysis.analysis import (
     per_model_cohort,
     stacking_effectiveness,
 )
-from metaculus_bot.performance_analysis.collector import resolve_numeric_record_to_score_inputs
+from metaculus_bot.performance_analysis.collector import _process_post, resolve_numeric_record_to_score_inputs
 from metaculus_bot.performance_analysis.parsing import anonymous_model_key, is_anonymous_model_key
 
 
@@ -424,8 +424,6 @@ class TestCollectorCommentCreatedAt:
         }
 
     def test_record_includes_bot_comment_created_at(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         post = self._post_data(1, 11)
         comment = {
             "id": 999,
@@ -438,16 +436,12 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["bot_comment_created_at"] == "2026-04-30T12:34:56Z"
 
     def test_record_has_none_when_comment_missing(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         post = self._post_data(2, 22)
         records = _process_post(post, {})
         assert len(records) == 1
         assert records[0]["bot_comment_created_at"] is None
 
     def test_record_has_none_when_comment_lacks_created_at(self):
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         post = self._post_data(3, 33)
         comment = {"id": 1000, "text": "*Forecaster 1*: 70%\n", "on_post": 3}
         records = _process_post(post, {3: comment})
@@ -494,8 +488,6 @@ class TestCollectorStackerOutcome:
         }
 
     def _run(self, post_id: int, question_id: int, comment_text: str | None) -> dict:
-        from metaculus_bot.performance_analysis.collector import _process_post
-
         post = self._post_data(post_id, question_id)
         if comment_text is None:
             records = _process_post(post, {})
@@ -653,6 +645,91 @@ class TestInterpolatePit:
     def test_degenerate_range_returns_half(self):
         cdf = list(np.linspace(0.0, 1.0, 201))
         assert _interpolate_pit(5.0, 10.0, 10.0, cdf) == pytest.approx(0.5)
+
+
+class TestInterpolatePitOutOfGrid:
+    """The q44218 shape: a resolution BEYOND the grid must not be censored at cdf[0]/cdf[-1].
+
+    With below-bound mass expressible on open bounds, cdf[0] can be ~0.9, so the grid
+    clamp reads a below-grid resolution — a LOW-tail event — as a high PIT. Beyond the
+    grid the PIT must come off the members' declared-percentile curves instead.
+    """
+
+    _LOWER, _UPPER = 100.0, 200.0
+    # 90% of the mass below the open lower bound (F(100) = 0.90), like q44218's 0.9168.
+    _CDF = list(np.linspace(0.90, 0.975, 201))
+    _PERCENTILES = {
+        "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
+        "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
+    }
+
+    def _grid(self) -> list[float]:
+        return list(build_cdf_value_grid(self._LOWER, self._UPPER, None, num_points=201))
+
+    def test_below_grid_resolution_reads_low_tail_not_the_clamp(self):
+        # Resolution 50 is below every declared value of every member: each curve reads
+        # its lowest declared percentile (P10 -> 0.10). The clamp would say 0.90.
+        pit = _interpolate_pit(
+            50.0,
+            self._LOWER,
+            self._UPPER,
+            self._CDF,
+            value_grid=self._grid(),
+            per_model_percentiles=self._PERCENTILES,
+        )
+        assert pit == pytest.approx(0.10, abs=1e-9)
+
+    def test_fallback_is_median_of_member_curves(self):
+        # Resolution 95: model-a interpolates 0.6333, model-b reads its P50 = 0.50.
+        pit = _interpolate_pit(
+            95.0,
+            self._LOWER,
+            self._UPPER,
+            self._CDF,
+            value_grid=self._grid(),
+            per_model_percentiles=self._PERCENTILES,
+        )
+        assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
+
+    def test_no_member_curves_keeps_grid_read(self):
+        # Degraded path (no per-model percentiles recoverable): grid-endpoint read kept.
+        pit = _interpolate_pit(50.0, self._LOWER, self._UPPER, self._CDF, value_grid=self._grid())
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_at_bound_resolution_keeps_endpoint_read(self):
+        # AT a bound the clamp IS the correct PIT (F(bound) = cdf[0]); the fallback
+        # must only engage strictly beyond the grid.
+        pit = _interpolate_pit(
+            self._LOWER,
+            self._LOWER,
+            self._UPPER,
+            self._CDF,
+            value_grid=self._grid(),
+            per_model_percentiles=self._PERCENTILES,
+        )
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_numeric_pit_analysis_uses_declared_fallback(self):
+        record = {
+            "post_id": 1,
+            "type": "numeric",
+            "our_forecast_values": self._CDF,
+            "resolution_parsed": 50.0,
+            "scaling": {
+                "range_min": self._LOWER,
+                "range_max": self._UPPER,
+                "zero_point": None,
+                "continuous_range": self._grid(),
+            },
+            "open_lower_bound": True,
+            "open_upper_bound": True,
+            "numeric_log_score": 0.0,
+            "per_model_numeric_percentiles": self._PERCENTILES,
+            "metadata": {"category": None},
+        }
+        result = numeric_pit_analysis([record])
+        assert result["count"] == 1
+        assert result["pit_values"][0] == pytest.approx(0.10, abs=1e-9)
 
 
 class TestNumericPitAnalysisValueGrid:

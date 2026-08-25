@@ -20,6 +20,7 @@ from metaculus_bot.performance_analysis.width_monitor import (
     compute_all_eras,
     compute_era_metrics,
     compute_pit,
+    compute_pit_details,
     default_eras,
     jeffreys_ci,
     main,
@@ -81,6 +82,84 @@ class TestPit:
         assert compute_pit(rec) is None
         # Non-numeric, non-OOB resolution.
         assert compute_pit(_linear_cdf_record(resolution="annulled")) is None
+
+
+def _below_bound_mass_record(*, resolution, per_model_percentiles=None, **kwargs) -> dict:
+    """The q44218 shape: open lower bound with most of the mass declared BELOW it.
+
+    Published CDF ramps 0.90 -> 0.975 over [100, 200], i.e. F(100) = 0.90: 90% of the
+    mass sits below the displayed lower bound. A resolution under 100 is therefore a
+    LOW-tail event, but grid interpolation clamps it to cdf[0] = 0.90 — the sign flip
+    the declared-percentile fallback exists to prevent.
+    """
+    rec = _linear_cdf_record(resolution=resolution, lower=100.0, upper=200.0, **kwargs)
+    rec["our_forecast_values"] = np.linspace(0.90, 0.975, GRID_N).tolist()
+    if per_model_percentiles is not None:
+        rec["per_model_numeric_percentiles"] = per_model_percentiles
+    return rec
+
+
+class TestOutOfGridPit:
+    """A numeric resolution BEYOND the value grid must not be censored at cdf[0]/cdf[-1]."""
+
+    def test_below_grid_resolution_reads_low_tail_not_the_clamp(self):
+        # Resolution 50 is below every declared value of every member, so each member
+        # curve reads its lowest declared percentile (P10 -> 0.10). The grid clamp
+        # would have said 0.90 — the opposite tail.
+        rec = _below_bound_mass_record(
+            resolution=50.0,
+            per_model_percentiles={
+                "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
+                "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
+            },
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx(0.10, abs=1e-9)
+        assert compute_pit(rec) == pytest.approx(0.10, abs=1e-9)
+
+    def test_fallback_is_median_of_member_curves(self):
+        # Resolution 95: model-a interpolates 0.50 + (95-90)/(105-90)*0.40 = 0.6333,
+        # model-b reads exactly its P50 = 0.50; the median of the two is their mean.
+        rec = _below_bound_mass_record(
+            resolution=95.0,
+            per_model_percentiles={
+                "model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]],
+                "model-b": [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]],
+            },
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
+
+    def test_above_grid_resolution_reads_high_tail(self):
+        rec = _below_bound_mass_record(
+            resolution=250.0,
+            per_model_percentiles={"model-a": [[10.0, 120.0], [50.0, 150.0], [90.0, 220.0]]},
+        )
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "high"
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_no_member_curves_keeps_grid_read_but_flags_oob(self):
+        # Degraded path (e.g. stacked-era records with no per-model bullets): the
+        # grid-endpoint read is kept, but the OOB side still surfaces the record.
+        rec = _below_bound_mass_record(resolution=50.0)
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side == "low"
+        assert pit == pytest.approx(0.90, abs=1e-9)
+
+    def test_in_grid_resolution_has_no_oob_side(self):
+        pit, oob_side = compute_pit_details(_linear_cdf_record(resolution=50.0))
+        assert oob_side is None
+        assert pit == pytest.approx(0.50, abs=1e-9)
+
+    def test_resolution_exactly_at_bound_keeps_endpoint_read(self):
+        # AT a bound the clamp IS the correct PIT: F(bound) = cdf[0].
+        rec = _below_bound_mass_record(resolution=100.0)
+        pit, oob_side = compute_pit_details(rec)
+        assert oob_side is None
+        assert pit == pytest.approx(0.90, abs=1e-9)
 
 
 class TestRelativeBandWidth:
@@ -266,6 +345,30 @@ class TestEraMetrics:
         assert m is not None
         assert m.n_oob_low == 1
         assert m.n_oob_high == 1
+
+    def test_oob_counts_numeric_out_of_grid_resolution(self):
+        # A NUMERIC resolution beyond the grid counts as OOB even though its PIT is
+        # no longer pinned at 0.0/1.0 (it comes off the declared-percentile curves).
+        # The pre-fix counters tested PIT == 0.0/1.0 and read 0/0 on exactly this shape.
+        recs = [
+            _below_bound_mass_record(
+                resolution=50.0,
+                per_model_percentiles={"model-a": [[10.0, 80.0], [50.0, 90.0], [90.0, 105.0]]},
+            ),
+            _linear_cdf_record(resolution=50.0),
+        ]
+        m = compute_era_metrics("test", recs)
+        assert m is not None
+        assert m.n_pit == 2
+        assert m.n_oob_low == 1
+        assert m.n_oob_high == 0
+
+    def test_in_grid_pit_of_zero_is_not_counted_oob(self):
+        # A closed-bound resolution AT the minimum has PIT exactly 0.0 but is not
+        # out of grid; the old value-equality counter miscounted this as OOB.
+        m = compute_era_metrics("test", [_linear_cdf_record(resolution=0.0)])
+        assert m is not None
+        assert m.n_oob_low == 0
 
     def test_returns_none_without_numeric(self):
         assert compute_era_metrics("empty", [{"type": "binary"}]) is None
