@@ -301,7 +301,7 @@ async def _classify_financial_question(
             wall_timeout=FINANCIAL_CLASSIFIER_TIMEOUT,
             label="financial_classifier",
         )
-    except Exception as exc:
+    except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
         logger.warning("Financial classifier LLM call failed", exc_info=True)
         return (None, type(exc).__name__)
 
@@ -378,8 +378,12 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
             parts.append(f"**{name}**")
         parts.append(f"- Current price: {current_price:.2f}")
 
+        # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the same
+        # basis drives the annualization factor AND every "1y"/"52-week" row count.
+        periods_per_year = _infer_periods_per_year(close)
+
         # Period returns
-        returns_section = _compute_period_returns(close)
+        returns_section = _compute_period_returns(close, periods_per_year)
         if returns_section:
             parts.append(returns_section)
 
@@ -387,11 +391,11 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
         if len(close) >= FINANCIAL_YFINANCE_RECENT_DAYS:
             daily_returns = close.pct_change().dropna()
             recent_daily = daily_returns.iloc[-FINANCIAL_YFINANCE_RECENT_DAYS:]
-            annualized_vol = recent_daily.std() * np.sqrt(252) * 100
+            annualized_vol = recent_daily.std() * np.sqrt(periods_per_year) * 100
             parts.append(f"- 30-day annualized volatility: {annualized_vol:.1f}%")
 
         # 52-week range
-        year_slice = close.iloc[-min(252, len(close)) :]
+        year_slice = close.iloc[-min(periods_per_year, len(close)) :]
         low_52w = year_slice.min()
         high_52w = year_slice.max()
         parts.append(f"- 52-week range: {low_52w:.2f} - {high_52w:.2f}")
@@ -413,21 +417,55 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 
         return "\n".join(parts)
 
-    except Exception:
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
         logger.warning(f"yfinance fetch failed for {ticker=}", exc_info=True)
         return ""
 
 
-def _compute_period_returns(close: pd.Series) -> str:
+# Annualization bases for a daily-bar series: exchange-traded assets print ~252
+# rows/year (5 trading days a week), 24/7 markets (crypto) print ~365. Annualizing
+# a 24/7 series with sqrt(252) understates vol by ~17% (sqrt(252/365) ~= 0.83), and
+# row-count windows labeled "1y"/"52-week" then span only ~8.2 calendar months —
+# both bit q44882 (ETH-USD).
+TRADING_DAYS_PER_YEAR = 252
+CALENDAR_DAYS_PER_YEAR = 365
+
+# Row offsets behind each period-return label, per basis. On the 365 basis the
+# offsets are calendar days; on the 252 basis they are the trading-day
+# conventions (5/wk), byte-identical to the historical behavior.
+_PERIOD_ROW_OFFSETS: dict[int, list[tuple[str, int]]] = {
+    TRADING_DAYS_PER_YEAR: [("1d", 1), ("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", 252)],
+    CALENDAR_DAYS_PER_YEAR: [("1d", 1), ("1w", 7), ("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)],
+}
+
+# Below this many rows the density read is too noisy to overrule the default.
+_MIN_ROWS_FOR_BASIS_INFERENCE = 14
+
+
+def _infer_periods_per_year(close: pd.Series) -> int:
+    """Observed-density annualization basis: rows per calendar day over the series' own span.
+
+    ~5/7 (0.71) for exchange-traded assets -> 252; ~1.0 for 24/7 markets -> 365,
+    split at 6 days/week. Deliberately reads the SERIES, not the ticker: any
+    heuristic keyed on ticker names goes stale the first time a new 24/7 symbol is
+    classified. Anything unmeasurable — short series, non-datetime index, zero
+    span — degrades to the trading-day basis, the historical behavior.
+    """
+    if len(close) < _MIN_ROWS_FOR_BASIS_INFERENCE:
+        return TRADING_DAYS_PER_YEAR
+    try:
+        span_days = (close.index[-1] - close.index[0]).days
+    except (TypeError, AttributeError):
+        return TRADING_DAYS_PER_YEAR
+    if span_days <= 0:
+        return TRADING_DAYS_PER_YEAR
+    rows_per_day = (len(close) - 1) / span_days
+    return CALENDAR_DAYS_PER_YEAR if rows_per_day > 6.0 / 7.0 else TRADING_DAYS_PER_YEAR
+
+
+def _compute_period_returns(close: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> str:
     """Compute returns over standard periods, returning a formatted string."""
-    periods = [
-        ("1d", 1),
-        ("1w", 5),
-        ("1m", 21),
-        ("3m", 63),
-        ("6m", 126),
-        ("1y", 252),
-    ]
+    periods = _PERIOD_ROW_OFFSETS[periods_per_year]
     lines = []
     for label, days in periods:
         if len(close) > days:
@@ -534,12 +572,12 @@ def _fetch_fred_data(series_id: str, api_key: str) -> str:
                 title = cast(pd.Series, info_df["title"]).iloc[0]
             elif isinstance(info_df, pd.Series) and "title" in info_df.index:
                 title = info_df["title"]
-        except Exception:
+        except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # cosmetic title lookup, logged
             logger.debug(f"FRED series title lookup failed for {series_id=}", exc_info=True)
 
         return _render_fred_series(series_id, data, title)
 
-    except Exception:
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except  # provider soft-fail boundary, logged
         logger.warning(f"FRED fetch failed for {series_id=}", exc_info=True)
         return ""
 
