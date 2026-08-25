@@ -34,6 +34,19 @@ def _json_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z")
     }
 
 
+def _pre_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z") -> dict:
+    """A harvested GHOST_PRE_JSON record — the turn-one, pre-research dry run.
+    Same post-id qid space and the same ``forecast_json`` field as the concluding
+    ghost (both serialize through ``_summarize_ghost``)."""
+    return {
+        "marker": "ghost_pre_json",
+        "qid": qid,
+        "run_date": run_date,
+        "seq": 0,
+        "forecast_json": json.dumps(payload, separators=(",", ":")),
+    }
+
+
 def _binary_record(qid: int, resolution, our_prob_yes) -> dict:
     # The scorer joins ghosts on ``post_id`` (a ghost's qid is the Metaculus post id
     # parsed from page_url). ``question_id`` is the disjoint sub-question id, so set it
@@ -224,6 +237,104 @@ class TestJsonSourceGhosts:
         summary = join_and_score([bad_json], legacy, [_binary_record(1, True, 0.50)])
         assert summary["source_counts"] == {"json": 0, "legacy": 1}
         assert summary["binary"]["n"] == 1
+
+
+class TestPreIdentitySplit:
+    """The ghost delta split by pre/post identity (2026-08-24 residual round).
+
+    7 of the first 12 scored ghosts were byte-identical to the turn-one PRE-research
+    dry run, so a pooled delta mixes measurements of the driver's prior with
+    measurements of the loop's research — the composition bias the split exists to
+    surface. Only the loop_moved bucket says anything about v2's research.
+    """
+
+    def test_identical_pre_lands_in_pre_identical_bucket(self):
+        payload = {"qtype": "binary", "prob": 0.30}
+        json_ghosts = [_json_ghost(1, payload)]
+        pre_ghosts = [_pre_ghost(1, payload)]
+        summary = join_and_score(json_ghosts, [], [_binary_record(1, True, 0.50)], pre_ghosts=pre_ghosts)
+
+        split = summary["split_by_pre_identity"]
+        assert split["pre_identical"]["n"] == 1
+        assert split["loop_moved"]["n"] == 0
+        assert split["no_pre_marker"]["n"] == 0
+        assert summary["binary"]["rows"][0]["pre_identical"] is True
+
+    def test_moved_pre_lands_in_loop_moved_bucket(self):
+        json_ghosts = [_json_ghost(1, {"qtype": "binary", "prob": 0.80})]
+        pre_ghosts = [_pre_ghost(1, {"qtype": "binary", "prob": 0.30})]
+        summary = join_and_score(json_ghosts, [], [_binary_record(1, True, 0.50)], pre_ghosts=pre_ghosts)
+
+        split = summary["split_by_pre_identity"]
+        assert split["loop_moved"]["n"] == 1
+        assert split["pre_identical"]["n"] == 0
+        assert summary["binary"]["rows"][0]["pre_identical"] is False
+
+    def test_absent_pre_marker_is_its_own_bucket(self):
+        """A run predating GHOST_PRE_JSON must read as 'nothing to compare', never
+        as either identity verdict."""
+        json_ghosts = [_json_ghost(1, {"qtype": "binary", "prob": 0.80})]
+        summary = join_and_score(json_ghosts, [], [_binary_record(1, True, 0.50)], pre_ghosts=[])
+
+        split = summary["split_by_pre_identity"]
+        assert split["no_pre_marker"]["n"] == 1
+        assert summary["binary"]["rows"][0]["pre_identical"] is None
+
+    def test_legacy_ghost_cannot_claim_an_identity(self):
+        """A legacy summary-only ghost has no payload to byte-compare, so even with
+        a pre record present it lands in no_pre_marker rather than a false verdict."""
+        legacy = [_legacy_ghost(1, "binary", "posterior_prob=0.80")]
+        pre_ghosts = [_pre_ghost(1, {"qtype": "binary", "prob": 0.80})]
+        summary = join_and_score([], legacy, [_binary_record(1, True, 0.50)], pre_ghosts=pre_ghosts)
+
+        assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 1
+
+    def test_split_spans_question_types(self):
+        """The split pools across types (the dim doc's table shape): one identical
+        binary + one moved MC land in their respective buckets with per-bucket means."""
+        mc_payload = {"qtype": "multiple_choice", "option_probs": {"A": 0.7, "B": 0.3}}
+        binary_payload = {"qtype": "binary", "prob": 0.30}
+        json_ghosts = [_json_ghost(1, binary_payload), _json_ghost(2, mc_payload)]
+        pre_ghosts = [
+            _pre_ghost(1, binary_payload),  # identical
+            _pre_ghost(2, {"qtype": "multiple_choice", "option_probs": {"A": 0.5, "B": 0.5}}),  # moved
+        ]
+        mc_record = {
+            "post_id": 2,
+            "question_id": 100_002,
+            "type": "multiple_choice",
+            "resolution_parsed": "A",
+            "options": ["A", "B"],
+            "our_forecast_values": [0.6, 0.4],
+        }
+        summary = join_and_score(json_ghosts, [], [_binary_record(1, True, 0.50), mc_record], pre_ghosts=pre_ghosts)
+
+        split = summary["split_by_pre_identity"]
+        assert split["pre_identical"]["n"] == 1
+        assert split["loop_moved"]["n"] == 1
+        assert split["pre_identical"]["mean_delta"] is not None
+        assert split["loop_moved"]["mean_delta"] is not None
+
+    def test_report_renders_the_split_and_names_the_prior_caveat(self):
+        payload = {"qtype": "binary", "prob": 0.30}
+        summary = join_and_score(
+            [_json_ghost(1, payload)], [], [_binary_record(1, True, 0.50)], pre_ghosts=[_pre_ghost(1, payload)]
+        )
+        report = render_report(summary)
+        assert "Ghost vs pre-research dry run" in report
+        assert "measures the driver's prior" in report
+
+    def test_report_omits_the_split_when_nothing_scored(self):
+        summary = join_and_score([], [], [], pre_ghosts=[])
+        assert "Ghost vs pre-research dry run" not in render_report(summary)
+
+    def test_back_compat_call_without_pre_ghosts_still_carries_the_split(self):
+        """Older callers (and the n=0 path) omit pre_ghosts: every scored row then
+        reads no_pre_marker, and the summary shape is unchanged for consumers."""
+        summary = join_and_score(
+            [_json_ghost(1, {"qtype": "binary", "prob": 0.80})], [], [_binary_record(1, True, 0.50)]
+        )
+        assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 1
 
 
 class TestNumericPairedScoring:

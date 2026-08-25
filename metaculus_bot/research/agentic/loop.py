@@ -153,26 +153,42 @@ def _normalize_quote_text(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", _QUOTE_GLYPHS_RE.sub("", text)).strip().lower()
 
 
-# Span boundaries in a driver quote — the two ways it stitches non-contiguous
-# source text, neither of which any single contiguous substring test could satisfy:
+# Span boundaries in a driver quote — the ways it stitches non-contiguous
+# source text, none of which any single contiguous substring test could satisfy:
 #   1. An ellipsis: the literal "..." (three-or-more dots) or the Unicode "…".
 #      The driver elides mid-quote ("<span A> ... <span B>").
-#   2. A QUOTE-GLYPH boundary: a closing glyph adjacent (optionally across
-#      whitespace) to an opening glyph, i.e. separately-quoted sentences joined by
-#      a space (`"<sentence A>" "<sentence B>"`). In the 2026-07-28 prod run this
-#      shape produced 8 quote_mismatch warnings, all false positives: both
-#      sentences were verbatim in the source but separated there by other text
-#      ("Methods: ..."), so the joined pair could never match contiguously.
+#   2. A QUOTE-GLYPH boundary: a CLOSING glyph joined to an OPENING glyph by a
+#      BOUNDED non-glyph connective (up to 24 chars, lazily matched). The original
+#      2026-07-28 clause accepted whitespace only (`"<A>" "<B>"`, added after 8
+#      all-false-positive warnings in that prod run); the 2026-08-24 residual
+#      round measured that 65% of all 365 warnings ever emitted carried a joiner
+#      the whitespace-only clause missed — `"<A>" and "<B>"`, `"<A>"; "<B>"`,
+#      `"<A>", "<B>"`, or a short narration fragment — and 0 of the 156
+#      multi-span stitched quotes could pass on a corpus containing every span
+#      verbatim. The bounded connective admits those; a longer joiner (a full
+#      narration sentence) still reads as one span and stays a warning.
+#      The lookarounds are what make "closing then opening" real: the first glyph
+#      must be preceded by non-whitespace (span text ends at it) and the second
+#      followed by non-whitespace (span text starts at it). Without them the
+#      residual round's literal `[glyph][^glyph]{0,24}?[glyph]` form consumes any
+#      quoted span whose CONTENT is <=24 chars as a "boundary" — deleting exactly
+#      the short table cells (`"Windows | 56.61%"`) the 10-char floor below was
+#      tuned to keep — and the pinned ellipsis shapes in tests/test_agentic_gates.py
+#      fail. A wrapping glyph at the start of the quote (or after a space) can
+#      never open a boundary, which is the same property the whitespace-only
+#      clause had implicitly.
 # This regex is applied to the RAW quote, BEFORE normalization, and each resulting
 # span normalized on its own. That order is load-bearing: _normalize_quote_text
 # DELETES quote glyphs, so normalizing first destroys the very boundary clause 2
 # looks for. Splitting raw is safe for clause 1 too — normalization collapses
 # whitespace and deletes glyphs but never touches runs of dots (verified by
 # execution across the quote shapes in tests/test_agentic_loop.py).
-# Only ADJACENT glyphs are a boundary, so the glyphs that merely wrap a whole
-# quote, an apostrophe inside a word ("don't"), and a nested quotation
-# ("he said “hello” to me") are each isolated and do not split.
-_SPAN_BOUNDARY_RE = re.compile(r"\.{3,}|…|[\"'‘’“”`]\s*[\"'‘’“”`]")
+# Two intra-word apostrophes within 24 chars of each other ("Musk's ... Trump's")
+# DO now split — harmless by construction, since every contiguous piece of a
+# genuinely verbatim quote is itself verbatim, and sub-floor non-numeric fragments
+# are not trusted as positive evidence anyway (the floor + digit clauses below
+# are unchanged).
+_SPAN_BOUNDARY_RE = re.compile(r"\.{3,}|…|(?<=\S)[\"'‘’“”`][^\"'‘’“”`]{0,24}?[\"'‘’“”`](?=\S)")
 # Minimum normalized length for a split span to be grounded on its own.
 # Below this a span is a bare token or punctuation run that appears in arbitrary
 # text, so trusting it per-span would rubber-stamp the check. Set to 10 rather
@@ -266,6 +282,11 @@ class _LoopState:
     # Concatenated, normalized tool-result contents — the corpus the warn-only
     # quote spot-check searches.
     tool_content_normalized: str = ""
+    # (source_url, quote) pairs already warned this run. The driver re-lists its
+    # banked findings in conclude's final_findings, so without this an unmatched
+    # quote warns twice and inflates the per-question density (5.5% of all
+    # archived warnings were exact re-submissions, 2026-08-24 residual round).
+    warned_quote_keys: set[tuple[str, str]] = field(default_factory=set)
     nudged_for_no_action: bool = False
     explicit_conclude: bool = False
     stop_loop: bool = False
@@ -648,13 +669,18 @@ def _validate_findings_payload(
             continue
         # WARN-ONLY quote spot-check: a miss is logged and counted but the
         # finding is still accepted (read_document paraphrases, ellipsis joins).
+        # Deduped per run on (source_url, quote) so a finding re-listed in
+        # conclude's final_findings counts once, not once per submission.
         if not _quote_is_grounded(finding.quote, state.tool_content_normalized):
-            quote_mismatch_warnings += 1
-            logger.warning(
-                "GAP_FILL_V2 quote_mismatch: source_url=%s quote=%r not found verbatim in tool contents",
-                finding.source_url,
-                finding.quote,
-            )
+            warned_key = (finding.source_url, finding.quote)
+            if warned_key not in state.warned_quote_keys:
+                state.warned_quote_keys.add(warned_key)
+                quote_mismatch_warnings += 1
+                logger.warning(
+                    "GAP_FILL_V2 quote_mismatch: source_url=%s quote=%r not found verbatim in tool contents",
+                    finding.source_url,
+                    finding.quote,
+                )
         accepted.append(finding)
     return _FindingsValidation(accepted, rejected, lint_rejections, provenance_rejections, quote_mismatch_warnings)
 
@@ -805,8 +831,8 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
 
     sensitive = arguments.get("sensitive_assumptions")
     sensitive_assumptions = [item for item in sensitive if isinstance(item, str)] if isinstance(sensitive, list) else []
-    dry_run_forecast = arguments.get("dry_run_forecast")
-    dry_run_forecast = dry_run_forecast if isinstance(dry_run_forecast, dict) else None
+    raw_dry_run_forecast = arguments.get("dry_run_forecast")
+    dry_run_forecast = raw_dry_run_forecast if isinstance(raw_dry_run_forecast, dict) else None
 
     state.research_plan = ResearchPlan(
         dry_run_forecast=dry_run_forecast,
@@ -824,6 +850,18 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
     )
     if forecast is not None:
         logger.info("%sGHOST_PRE_JSON: %s", state.log_prefix, json.dumps(forecast, separators=(",", ":")))
+    elif raw_dry_run_forecast is not None:
+        # The driver DID supply a dry run but it failed schema validation (the
+        # observed case: flat declared percentiles, run 30718626314) or was not a
+        # dict. Without this line the GHOST_PRE_JSON suppression is silent, and the
+        # loss is non-random: it drops exactly the flattest pre-research views —
+        # the ones whose later sharpening would be the strongest "research moved
+        # me" signal — so the archived zero-move rate reads slightly high.
+        logger.warning(
+            "%sGHOST_PRE_JSON suppressed: dry_run_forecast did not parse into a structured forecast; "
+            "this question's ghost pair will have no pre-research half",
+            state.log_prefix,
+        )
 
     lines = [f"Research plan set: {len(gaps)} gap(s), {len(sensitive_assumptions)} sensitive assumption(s)."]
     if gap_issues:
@@ -1437,9 +1475,13 @@ async def _run_ghost_phase(
     forecasts"): the ghost is a SAME-MODEL (terra-low driver) counterfactual, NOT a
     panel proxy. It measures whether the v2 findings alone, forecast by one cheap
     model, land near truth — scored OFFLINE against resolution by
-    ``scripts/score_ghosts.py``. It is expected to diverge from the published
-    ensemble median (a single low-effort model is over-decisive by construction, the
-    literature's predicted failure), so ghost-vs-published divergence is NOT an alarm
+    ``scripts/score_ghosts.py``. It genuinely diverges from the published ensemble
+    median (measured 2026-08-24 on 39 triple-era binaries: |ghost − panel| median
+    8 pp, non-zero on 37 of 39) but with NO systematic confidence direction — the
+    ghost−panel confidence delta was −3.13 pp mean, CI95 [−6.37, +0.25], so the
+    old "a single low-effort model is over-decisive by construction" prediction is
+    unsupported and a negative ghost delta must not be explained away as expected
+    over-decisiveness. Either way, ghost-vs-published divergence is NOT an alarm
     signal and must not gate a run — score it against resolution, not the panel.
     """
     state.messages.append({"role": "user", "content": ghost_prompt})
