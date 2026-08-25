@@ -1,16 +1,24 @@
 """Shared aiohttp HTTP utilities for research providers.
 
 Right-sized extraction (2026-07 resolution-source plan): only the genuinely
-generic pieces live here — session construction and a size-capped body read.
-Retry/backoff logic stays provider-private (prediction_market's is JSON-API
-shaped; the resolution-source fetcher deliberately does no retries).
+generic pieces live here — session construction, a size-capped body read, and
+provider-agnostic HTML/URL helpers (the Datawrapper embed scan below, shared
+so the resolution-source Tier-2 hop and any future agentic-fetch integration
+can't drift on the route). Retry/backoff logic stays provider-private
+(prediction_market's is JSON-API shaped; the resolution-source fetcher
+deliberately does no retries).
 """
 
 from __future__ import annotations
 
+import html as html_entities
 import ipaddress
 import logging
+import re
 import socket
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 import aiohttp
@@ -157,6 +165,140 @@ async def read_body_capped(resp: Any, *, max_bytes: int, label: str) -> bytes | 
             return None
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Datawrapper embed detection (resolution-source Tier-2 second hop)
+# ---------------------------------------------------------------------------
+#
+# Poll-tracker pages routinely lock their daily series inside a Datawrapper
+# iframe, which trafilatura drops at every setting — the resolving data never
+# reaches the research bundle (qids 44858 / 44841, 2026-08-24 dossiers). The
+# helpers here find the embeds in RAW page HTML and build the one URL that is
+# safe to fetch.
+#
+# Route mechanism (live-verified against natesilver.net trackers 2026-08-25):
+#
+# - Page HTML embeds `datawrapper.dwcdn.net/<chart_id>/<version>/` with the
+#   version PINNED at page-authoring time. The pinned version goes stale and
+#   `<pinned>/dataset.csv` keeps serving its old snapshot with HTTP 200
+#   (observed 5 and 14 MONTHS stale on the two real trackers). Reaching the
+#   live version from a pinned one takes a 26+ hop chain of meta-refresh/JS
+#   stubs that plain HTTP cannot follow. The versioned dataset route must
+#   therefore NEVER be derived from page HTML.
+# - `static.dwcdn.net/data/<chart_id>.csv` is version-free and always serves
+#   the latest published dataset (Last-Modified refreshes on each republish;
+#   observed hourly on live trackers). It is the URL behind the chart's own
+#   "Get the data" affordance — the artifact resolution fine print names.
+
+# Chart ids are 5 alphanumeric chars. Matches both host forms
+# (`datawrapper.dwcdn.net/<id>/…`, `static.dwcdn.net/data/<id>.csv`) and
+# tolerates JSON-escaped slashes (`\/`) — Substack pages carry the embed URL
+# inside an HTML-escaped JSON `data-attrs` attribute.
+_DATAWRAPPER_CHART_ID_RE = re.compile(
+    r"(?:datawrapper|static)\.dwcdn\.net\\?/(?:data\\?/)?([A-Za-z0-9]{5})(?![A-Za-z0-9])"
+)
+
+# Title forms, in the two shapes observed in the wild:
+# - JSON attrs (Substack `data-attrs`, HTML-escaped or plain):
+#   `&quot;title&quot;:&quot;Do Americans …&quot;` — sits AFTER the URL. JSON
+#   strings are double-quote-delimited only; a bare `'` inside the value
+#   (e.g. "Trump's net approval …") is title text, not a terminator.
+# - Datawrapper's own responsive embed: `<iframe title="…" … src="…">` —
+#   sits BEFORE the URL, `=`-separated. The closing quote must match the
+#   opening one, for the same apostrophe reason.
+_DW_TITLE_JSON_RE = re.compile(r"(?:&quot;|\")title(?:&quot;|\")\s*:\s*(?:&quot;|\")(.{1,300}?)(?:&quot;|\")")
+_DW_TITLE_ATTR_RE = re.compile(r"title\s*=\s*(?:\"([^\"]{1,300})\"|'([^']{1,300})')")
+
+# Window sizes bracket the observed layouts: the Substack JSON title lands
+# ~380 chars after the URL (two thumbnail URLs in between); an iframe's
+# `title=` attribute sits within the same tag just before `src=`.
+_DW_TITLE_FORWARD_WINDOW = 700
+_DW_TITLE_BACKWARD_WINDOW = 300
+
+
+@dataclass(frozen=True)
+class DatawrapperChartRef:
+    """A Datawrapper chart referenced by a fetched page, in document order."""
+
+    chart_id: str
+    title: str | None
+
+
+def extract_datawrapper_charts(html_text: str) -> list[DatawrapperChartRef]:
+    """Scan RAW page HTML for Datawrapper chart embeds.
+
+    Must run on the raw HTML, not extracted main text — trafilatura emits
+    neither iframe ``src`` attributes nor embed-script URLs at any setting
+    (verified against the live tracker pages, 2026-08-24 dossier work).
+
+    Returns first-seen-deduped refs in document order (tracker pages put the
+    hero/resolving chart first). Titles are best-effort: the JSON-attrs form
+    is searched forward of the URL (bounded at the next embed so a titleless
+    chart can't steal its neighbour's), the iframe-attribute form backward.
+    """
+    if not html_text:
+        return []
+    matches = list(_DATAWRAPPER_CHART_ID_RE.finditer(html_text))
+    charts: list[DatawrapperChartRef] = []
+    seen: set[str] = set()
+    for i, m in enumerate(matches):
+        chart_id = m.group(1)
+        if chart_id in seen:
+            continue
+        seen.add(chart_id)
+
+        forward_end = m.end() + _DW_TITLE_FORWARD_WINDOW
+        if i + 1 < len(matches):
+            forward_end = min(forward_end, matches[i + 1].start())
+        raw_title: str | None = None
+        json_match = _DW_TITLE_JSON_RE.search(html_text, m.end(), forward_end)
+        if json_match is not None:
+            raw_title = json_match.group(1)
+        else:
+            backward_start = max(0, m.start() - _DW_TITLE_BACKWARD_WINDOW)
+            if i > 0:
+                backward_start = max(backward_start, matches[i - 1].end())
+            attr_matches = list(_DW_TITLE_ATTR_RE.finditer(html_text, backward_start, m.start()))
+            if attr_matches:
+                # The attr pattern alternates on quote style; exactly one group is set.
+                raw_title = attr_matches[-1].group(1) or attr_matches[-1].group(2)
+
+        title = html_entities.unescape(raw_title) if raw_title else None
+        charts.append(DatawrapperChartRef(chart_id=chart_id, title=title))
+    return charts
+
+
+_DATAWRAPPER_CHART_ID_SHAPE = re.compile(r"[A-Za-z0-9]{5}\Z")
+
+
+def datawrapper_live_data_url(chart_id: str) -> str:
+    """The version-free, always-latest dataset URL for a Datawrapper chart.
+
+    This is the ONLY dataset route callers may fetch (see the mechanism note
+    above): the versioned `datawrapper.dwcdn.net/<id>/<version>/dataset.csv`
+    form serves the pinned — potentially months-stale — snapshot when the
+    version comes from page HTML. Rejects ids that don't match the 5-char
+    shape so a crafted page can't turn the template into path traversal.
+    """
+    if not _DATAWRAPPER_CHART_ID_SHAPE.match(chart_id):
+        raise ValueError(f"not a Datawrapper chart id: {chart_id!r}")
+    return f"https://static.dwcdn.net/data/{chart_id}.csv"
+
+
+def parse_http_last_modified(value: str) -> datetime | None:
+    """Parse an HTTP ``Last-Modified`` header into an aware UTC datetime.
+
+    Returns None on a malformed value — callers treat unverifiable freshness
+    the same as stale (the serve-live-or-nothing rule).
+    """
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 # Enough to carry an upstream JSON error object or the title of an HTML error page.

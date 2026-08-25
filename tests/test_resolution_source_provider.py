@@ -130,8 +130,12 @@ class FakeSession:
         # captured in host_peak[host]. Provider must keep per-host peak == 1.
         self.host_inflight: dict[str, int] = {}
         self.host_peak: dict[str, int] = {}
+        # Every URL requested, in order — lets tests pin which routes were
+        # (and, critically for the Datawrapper hop, were NOT) fetched.
+        self.requested: list[str] = []
 
     def get(self, url: str, **_kwargs: Any) -> "_TrackingResponse":
+        self.requested.append(url)
         for prefix, handler_list in self._handlers.items():
             if url.startswith(prefix):
                 idx = min(self._call_counts[prefix], len(handler_list) - 1)

@@ -1,14 +1,27 @@
-"""Tier-1 resolution-source fetcher.
+# SMELL-EXEMPT-monolithic-file-loc: three documented layers (pure helpers /
+# network / factory); splitting the Tier-2 hop out would force FetchResult +
+# the SSRF guard into a shared module — a cross-cutting refactor for its own PR.
+"""Resolution-source fetcher: Tier-1 cited pages + a Tier-2 Datawrapper hop.
 
 Fetches the URL(s) explicitly cited in a Metaculus question's resolution
 criteria (or fine print), extracts main content with trafilatura, and returns
 a compact markdown section that every forecaster reads as the ground truth
 the question will be graded against.
 
-Scope is Tier 1 only: plain HTTP with browser-like headers, no LLM calls, no
-retries. Sites behind JS walls / heavy anti-bot are deferred to a future
-Tier-2 pass (see `FetchStatus` — `blocked` / `js_wall` results are retained
-in the returned list to serve as that seam).
+Tier 1 is plain HTTP with browser-like headers, no LLM calls, no retries.
+Sites behind JS walls / heavy anti-bot remain deferred (see `FetchStatus` —
+`blocked` / `js_wall` results are retained in the returned list as that seam).
+
+Tier 2 (2026-08, qids 44858/44841): when a fetched page's RAW HTML embeds a
+Datawrapper chart, fetch that chart's live "Get the data" CSV — poll trackers
+lock their resolving daily series inside these iframes, which trafilatura
+drops at every setting. The hop uses ONLY the version-free
+`static.dwcdn.net/data/<chart_id>.csv` route: the page-pinned
+`datawrapper.dwcdn.net/<id>/<version>/dataset.csv` form serves months-stale
+snapshots as HTTP 200 (the naive fix the 2026-08-24 verifications refuted).
+A `Last-Modified` freshness guard withholds any dataset older than
+`RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS` (or undatable) as `stale_data`
+rather than serving stale data as live.
 
 Design anchors:
 
@@ -31,8 +44,8 @@ import ipaddress
 import logging
 import re
 import socket
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
@@ -41,6 +54,8 @@ import trafilatura
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
 from metaculus_bot.constants import (
+    RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS,
+    RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_ENABLED_ENV,
     RESOLUTION_SOURCE_GLOBAL_CONCURRENCY,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
@@ -56,8 +71,12 @@ from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
+    DatawrapperChartRef,
     FilteringResolver,
     build_session,
+    datawrapper_live_data_url,
+    extract_datawrapper_charts,
+    parse_http_last_modified,
     read_body_capped,
 )
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
@@ -198,7 +217,12 @@ async def is_public_http_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-FetchStatus = Literal["success", "blocked", "not_found", "js_wall", "error", "unsupported_type", "ssrf_blocked"]
+# `stale_data` is Tier-2-only: the Datawrapper hop reached a dataset whose
+# Last-Modified is older than the freshness bound (or missing/unparseable) —
+# withheld rather than served as live.
+FetchStatus = Literal[
+    "success", "blocked", "not_found", "js_wall", "error", "unsupported_type", "ssrf_blocked", "stale_data"
+]
 
 
 @dataclass
@@ -208,6 +232,14 @@ class FetchResult:
     text: str  # extracted + truncated; "" unless status == "success"
     http_status: int | None
     content_type: str | None
+    # Charts seen in a fetched page's raw HTML (set on Tier-1 HTML results,
+    # including js_wall pages — a JS-walled page still exposes its embeds).
+    datawrapper_charts: list[DatawrapperChartRef] = field(default_factory=list)
+    # Provenance for Tier-2 dataset results (None on ordinary page fetches).
+    chart_id: str | None = None
+    chart_title: str | None = None
+    parent_url: str | None = None
+    data_last_modified: str | None = None  # ISO-8601; None when the header was missing/unparseable
 
 
 # ---------------------------------------------------------------------------
@@ -373,14 +405,67 @@ def _truncate_with_marker(text: str, cap: int, url: str) -> str:
     return text[:body_budget].rstrip() + marker
 
 
+def _truncate_csv_middle(text: str, cap: int, url: str) -> str:
+    """Bound a CSV at ``cap`` chars, keeping the header + BOTH ends of the rows.
+
+    The resolution-relevant rows are the most recent ones, but Datawrapper
+    datasets run in either direction — the tracker model-average series are
+    chronological (newest LAST) while the poll-input tables on the same pages
+    are newest FIRST (observed live on both natesilver.net trackers,
+    2026-08-25). Keeping both ends is ordering-agnostic: the newest rows
+    survive whichever end they sit at, and only the middle is omitted. Plain
+    head truncation would cut the current level off an ascending series — the
+    stale-as-live failure in a different coat.
+
+    Invariant: ``len(return) <= cap``. Degrades to plain head truncation when
+    the text has too few lines to be row-shaped or the cap is too small to fit
+    the header + marker + at least one row.
+    """
+    if len(text) <= cap:
+        return text
+    lines = text.rstrip("\n").split("\n")
+    if len(lines) < 4:
+        return _truncate_with_marker(text, cap, url)
+    header = lines[0]
+    rows = lines[1:]
+    marker_template = "[... {} middle rows omitted — full data at {}]"
+    # Reserve marker space at its worst-case width (all rows omitted).
+    worst_marker = marker_template.format(len(rows), url)
+    row_budget = cap - len(header) - len(worst_marker) - 4  # joining newlines
+    if row_budget <= 0:
+        return _truncate_with_marker(text, cap, url)
+    head_budget = row_budget // 2
+    head: list[str] = []
+    used_head = 0
+    for line in rows:
+        cost = len(line) + 1
+        if used_head + cost > head_budget:
+            break
+        head.append(line)
+        used_head += cost
+    tail: list[str] = []
+    used_tail = 0
+    for line in reversed(rows[len(head) :]):
+        cost = len(line) + 1
+        if used_head + used_tail + cost > row_budget:
+            break
+        tail.append(line)
+        used_tail += cost
+    if not head and not tail:
+        return _truncate_with_marker(text, cap, url)
+    tail.reverse()
+    marker = marker_template.format(len(rows) - len(head) - len(tail), url)
+    return "\n".join([header, *head, marker, *tail])
+
+
 def _fetch_result_sources(results: list[FetchResult]) -> dict[str, str]:
     """Per-URL outcome map for provider diagnostics: ``{domain: "ok" | <FetchStatus>}``.
 
     A fetched URL normalizes to ``"ok"`` (the shared "contributed" token the
     diagnostics formatter recognizes); every other ``FetchStatus``
     (``blocked`` / ``js_wall`` / ``not_found`` / ``error`` / ``unsupported_type`` /
-    ``ssrf_blocked``) is kept verbatim as the loss token so the reason survives into
-    the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N`` suffix
+    ``ssrf_blocked`` / ``stale_data``) is kept verbatim as the loss token so the
+    reason survives into the ``lost=`` segment. Duplicate domains are disambiguated with a ``#N`` suffix
     so no per-URL outcome is silently overwritten.
     """
     sources: dict[str, str] = {}
@@ -691,11 +776,17 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                                 http_status=status,
                                 content_type=content_type or None,
                             )
+                        # Datawrapper embeds are only visible in the RAW HTML —
+                        # trafilatura drops iframes and embed scripts at every
+                        # setting — so the scan runs on the undecoded body,
+                        # before (and regardless of) main-text extraction.
+                        charts = extract_datawrapper_charts(body.decode("utf-8", errors="replace"))
                         extracted = await asyncio.to_thread(_extract_main_text, body, current_url)
                         # An empty extraction on a 200 OK is a JS-wall (SPA that
                         # rendered client-side, cookie/consent gate, etc.) —
                         # exactly the Tier-2 candidate signal. Treat identically
-                        # to short-but-nonempty extractions.
+                        # to short-but-nonempty extractions. A walled page still
+                        # exposes its embeds, so the charts ride along.
                         if extracted is None or looks_like_js_wall(extracted):
                             logger.info(f"resolution_source fetched {netloc} (js_wall)")
                             return FetchResult(
@@ -704,6 +795,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                                 text="",
                                 http_status=status,
                                 content_type=content_type or None,
+                                datawrapper_charts=charts,
                             )
                         truncated = _truncate_with_marker(
                             extracted,
@@ -717,6 +809,7 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
                             text=truncated,
                             http_status=status,
                             content_type=content_type or None,
+                            datawrapper_charts=charts,
                         )
 
                     if any(ct in content_type for ct in _JSON_CONTENT_TYPES) or any(
@@ -785,33 +878,234 @@ async def _fetch_one(session: Any, url: str, host_sems: dict[str, asyncio.Semaph
     )
 
 
+async def _fetch_datawrapper_dataset(
+    session: Any,
+    chart: DatawrapperChartRef,
+    parent_url: str,
+    host_sems: dict[str, asyncio.Semaphore],
+) -> FetchResult:
+    """Tier-2 hop: fetch one Datawrapper chart's LIVE dataset CSV.
+
+    Fetches ONLY the version-free ``static.dwcdn.net/data/<id>.csv`` route —
+    never a page-pinned versioned ``dataset.csv``, which serves months-stale
+    snapshots as HTTP 200 (see the route mechanism note in ``http_fetch``).
+
+    Freshness guard (serve live or nothing): the dataset's ``Last-Modified``
+    must be within ``RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`` of now.
+    Older, missing, or unparseable → ``stale_data`` with no text, so a dead
+    chart can never masquerade as the live resolving series. The publish
+    timestamp is also rendered into the section so forecasters see the data's
+    age even when it passes.
+
+    Content-Type is deliberately NOT gated here: we constructed the URL from a
+    shape-validated chart id, the endpoint serves CSV (its versioned sibling
+    labels the same bytes ``application/octet-stream``), and the body read is
+    size-capped either way. Redirects are unexpected on this CDN and map to
+    ``error`` rather than being followed.
+    """
+    url = datawrapper_live_data_url(chart.chart_id)
+    # Uniform SSRF preflight (dwcdn is a public CDN — no exemptions added; the
+    # connect-time FilteringResolver stays the real boundary).
+    if not await is_public_http_url(url):
+        logger.warning(f"resolution_source ssrf_blocked (datawrapper hop): {urlparse(url).netloc}")
+        return FetchResult(
+            url=url,
+            status="ssrf_blocked",
+            text="",
+            http_status=None,
+            content_type=None,
+            chart_id=chart.chart_id,
+            chart_title=chart.title,
+            parent_url=parent_url,
+        )
+
+    async with _sem_for_host(host_sems, url):
+        try:
+            async with session.get(url, allow_redirects=False) as resp:
+                status = resp.status
+                content_type = (resp.headers.get("Content-Type") or "").lower() if resp.headers else ""
+                if status in (404, 410):
+                    hop_status: FetchStatus = "not_found"
+                elif status in (403, 406, 429):
+                    hop_status = "blocked"
+                elif status != 200:
+                    hop_status = "error"
+                else:
+                    hop_status = "success"
+                if hop_status != "success":
+                    logger.info(f"resolution_source datawrapper hop {chart.chart_id} ({hop_status} http={status})")
+                    return FetchResult(
+                        url=url,
+                        status=hop_status,
+                        text="",
+                        http_status=status,
+                        content_type=content_type or None,
+                        chart_id=chart.chart_id,
+                        chart_title=chart.title,
+                        parent_url=parent_url,
+                    )
+
+                body = await read_body_capped(
+                    resp,
+                    max_bytes=RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+                    label=f"resolution_source datawrapper {chart.chart_id}",
+                )
+                if body is None:
+                    return FetchResult(
+                        url=url,
+                        status="error",
+                        text="",
+                        http_status=status,
+                        content_type=content_type or None,
+                        chart_id=chart.chart_id,
+                        chart_title=chart.title,
+                        parent_url=parent_url,
+                    )
+
+                last_modified_raw = resp.headers.get("Last-Modified") if resp.headers else None
+                last_modified = parse_http_last_modified(last_modified_raw) if last_modified_raw else None
+                now = datetime.now(timezone.utc)
+                if last_modified is None or now - last_modified > timedelta(
+                    days=RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS
+                ):
+                    age_desc = (
+                        f"published {last_modified.isoformat()}, age {(now - last_modified).days}d"
+                        if last_modified is not None
+                        else "no parseable Last-Modified"
+                    )
+                    logger.warning(
+                        f"resolution_source datawrapper hop {chart.chart_id}: dataset failed the "
+                        f"freshness guard ({age_desc} > {RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS}d "
+                        f"bound) — withheld, not served as live"
+                    )
+                    return FetchResult(
+                        url=url,
+                        status="stale_data",
+                        text="",
+                        http_status=status,
+                        content_type=content_type or None,
+                        chart_id=chart.chart_id,
+                        chart_title=chart.title,
+                        parent_url=parent_url,
+                        data_last_modified=last_modified.isoformat() if last_modified else None,
+                    )
+
+                title_part = f" ({chart.title!r})" if chart.title else ""
+                lead = (
+                    f'Live "Get the data" dataset for Datawrapper chart {chart.chart_id}{title_part} '
+                    f"embedded in {parent_url}. Dataset published {last_modified.isoformat()}."
+                )
+                csv_budget = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+                csv_text = _truncate_csv_middle(body.decode("utf-8", errors="replace").strip(), csv_budget, url)
+                logger.info(
+                    f"resolution_source datawrapper hop {chart.chart_id} "
+                    f"(success, published {last_modified.isoformat()})"
+                )
+                return FetchResult(
+                    url=url,
+                    status="success",
+                    text=f"{lead}\n\n{csv_text}",
+                    http_status=status,
+                    content_type=content_type or None,
+                    chart_id=chart.chart_id,
+                    chart_title=chart.title,
+                    parent_url=parent_url,
+                    data_last_modified=last_modified.isoformat(),
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.info(f"resolution_source datawrapper hop {chart.chart_id} error: {type(e).__name__}: {e}")
+            return FetchResult(
+                url=url,
+                status="error",
+                text="",
+                http_status=None,
+                content_type=None,
+                chart_id=chart.chart_id,
+                chart_title=chart.title,
+                parent_url=parent_url,
+            )
+
+
+def _select_datawrapper_charts(page_results: list[FetchResult]) -> list[tuple[int, DatawrapperChartRef]]:
+    """Pick the charts to hop to, as ``(parent_index, chart)`` pairs.
+
+    Page order first, then document order within a page (tracker pages put the
+    hero/resolving chart first), deduped by chart id across pages, capped
+    globally at ``RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS``.
+    """
+    picks: list[tuple[int, DatawrapperChartRef]] = []
+    seen: set[str] = set()
+    for idx, r in enumerate(page_results):
+        for chart in r.datawrapper_charts:
+            if chart.chart_id in seen:
+                continue
+            seen.add(chart.chart_id)
+            picks.append((idx, chart))
+            if len(picks) >= RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS:
+                return picks
+    return picks
+
+
+def _interleave_dataset_results(
+    page_results: list[FetchResult],
+    picks: list[tuple[int, DatawrapperChartRef]],
+    dataset_results: list[FetchResult],
+) -> list[FetchResult]:
+    """Place each dataset result directly after its parent page's result, so
+    the rendered section (and the total-budget trimming order) keeps a chart's
+    data adjacent to the page that embeds it."""
+    by_parent: dict[int, list[FetchResult]] = {}
+    for (idx, _chart), ds in zip(picks, dataset_results):
+        by_parent.setdefault(idx, []).append(ds)
+    merged: list[FetchResult] = []
+    for idx, r in enumerate(page_results):
+        merged.append(r)
+        merged.extend(by_parent.get(idx, []))
+    return merged
+
+
 async def fetch_resolution_sources(urls: list[str]) -> list[FetchResult]:
-    """Fetch each URL under per-netloc Semaphore(1) politeness.
+    """Fetch each URL under per-netloc Semaphore(1) politeness, then hop to
+    the live datasets of any Datawrapper charts the fetched pages embed.
 
     Distinct hosts run concurrently up to the connector limit; same-host
     requests serialize (politeness — e.g. StatCan asks Crawl-delay: 2). The
     shared ``host_sems`` map is handed to every ``_fetch_one`` task so each
     redirect hop contends on ITS host's semaphore — chains from different
-    initial hosts that converge on one final host still serialize there.
-    Session is closed in ``finally``.
+    initial hosts that converge on one final host still serialize there; the
+    Tier-2 dataset fetches contend on the dwcdn host's semaphore the same
+    way. Session is closed in ``finally``.
 
     Teardown race guard (F5): the outer factory wraps this call in
     ``asyncio.wait_for``. When the wall-clock timeout fires, wait_for cancels
-    this coroutine — but if the gather is still in flight we'd exit the
+    this coroutine — but if a gather is still in flight we'd exit the
     ``async with session`` block while children are mid-request, and aiohttp
     would then close their transports out from under them (surfacing as
     scary tracebacks in logs, and in extreme cases resource-warning fires
     on connections that never got cleaned up). We use explicit Task objects
-    so we can cancel + drain them in a ``finally`` before the session closes.
+    — pages and datasets alike — so we can cancel + drain them in a
+    ``finally`` before the session closes.
     """
     host_sems: dict[str, asyncio.Semaphore] = {}
+    tasks: list[asyncio.Task[FetchResult]] = []
 
     session_cm = _get_session()
     async with session_cm as session:
-        tasks = [asyncio.create_task(_fetch_one(session, u, host_sems)) for u in urls]
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            return list(results)
+            page_tasks = [asyncio.create_task(_fetch_one(session, u, host_sems)) for u in urls]
+            tasks.extend(page_tasks)
+            page_results = list(await asyncio.gather(*page_tasks, return_exceptions=False))
+
+            picks = _select_datawrapper_charts(page_results)
+            if not picks:
+                return page_results
+            dataset_tasks = [
+                asyncio.create_task(_fetch_datawrapper_dataset(session, chart, page_results[idx].url, host_sems))
+                for idx, chart in picks
+            ]
+            tasks.extend(dataset_tasks)
+            dataset_results = list(await asyncio.gather(*dataset_tasks, return_exceptions=False))
+            return _interleave_dataset_results(page_results, picks, dataset_results)
         finally:
             # Whether we exit normally or via cancellation, cancel any still-
             # running task and let them settle before the session closes.

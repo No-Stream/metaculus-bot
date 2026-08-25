@@ -7,6 +7,8 @@ Covers:
   multi-chunk streaming and mid-stream abort without consuming the remaining stream
 - `FilteringResolver` filters private IPs, raises OSError when everything is filtered,
   and delegates `close()` to its inner resolver.
+- Datawrapper embed detection (`extract_datawrapper_charts`) on real-shaped
+  tracker HTML, the live-data URL builder, and Last-Modified parsing.
 
 No real network calls: sessions are constructed, inspected, and closed.
 """
@@ -17,6 +19,7 @@ import ipaddress
 import logging
 import socket
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -26,6 +29,9 @@ from metaculus_bot.research.http_fetch import (
     BROWSER_HEADERS,
     FilteringResolver,
     build_session,
+    datawrapper_live_data_url,
+    extract_datawrapper_charts,
+    parse_http_last_modified,
     read_body_capped,
 )
 
@@ -212,3 +218,147 @@ class TestFilteringResolver:
         assert inner.close_called is False
         await r.close()
         assert inner.close_called is True
+
+
+# ---------------------------------------------------------------------------
+# Datawrapper embed detection (resolution-source Tier-2 hop)
+# ---------------------------------------------------------------------------
+
+# Miniature of the REAL natesilver.net Iran-war tracker markup (qid 44858):
+# Substack wraps each Datawrapper embed in an HTML-escaped JSON `data-attrs`
+# whose `url` pins a STALE version (`/1mU3g/11/` — the live chart was at
+# v2570 when this shape was captured, 2026-08-25) and whose `title` follows
+# two S3 thumbnail URLs. Structure preserved; prose trimmed.
+_IRAN_TRACKER_SHAPED_HTML = (
+    "<p><span>Polling on the war remains negative.</span></p>"
+    '<div id="datawrapper-iframe" data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/1mU3g/11/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/aaa_1220x708.png&quot;,"
+    "&quot;thumbnail_url_full&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/bbb_1220x1076.png&quot;,"
+    "&quot;height&quot;:527,&quot;title&quot;:&quot;Do Americans support or oppose the Iran War?&quot;,"
+    '&quot;description&quot;:&quot;&quot;}"></div>'
+    "<p>Methodology notes follow.</p>"
+    '<div id="datawrapper-iframe" data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/VUUVz/7/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ccc_1220x994.png&quot;,"
+    "&quot;height&quot;:673,&quot;title&quot;:&quot;Polls included in our Iran War support average&quot;,"
+    '&quot;description&quot;:&quot;&quot;}"></div>'
+)
+
+# Miniature of the Trump-approval tracker (qid 44841): five charts, the
+# resolving one (`kSCt4`) first in document order, one title carrying an
+# apostrophe (the shape that truncates a naive quote-terminated regex).
+_TRUMP_TRACKER_SHAPED_HTML = (
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/kSCt4/349/&quot;,'
+    "&quot;thumbnail_url&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ddd_1260x660.png&quot;,"
+    '&quot;height&quot;:478,&quot;title&quot;:&quot;Do Americans approve or disapprove of Donald Trump?&quot;}"></div>'
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/vknzT/269/&quot;,'
+    '&quot;height&quot;:827,&quot;title&quot;:&quot;Polls included in our average&quot;}"></div>'
+    '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/RFXsV/73/&quot;,'
+    '&quot;height&quot;:448,&quot;title&quot;:&quot;Trump&#8217;s net approval on the issues&quot;}"></div>'
+)
+
+
+class TestExtractDatawrapperCharts:
+    def test_iran_tracker_shape_ids_titles_document_order(self):
+        charts = extract_datawrapper_charts(_IRAN_TRACKER_SHAPED_HTML)
+        assert [c.chart_id for c in charts] == ["1mU3g", "VUUVz"]
+        assert charts[0].title == "Do Americans support or oppose the Iran War?"
+        assert charts[1].title == "Polls included in our Iran War support average"
+
+    def test_trump_tracker_shape_resolving_chart_first(self):
+        charts = extract_datawrapper_charts(_TRUMP_TRACKER_SHAPED_HTML)
+        assert [c.chart_id for c in charts] == ["kSCt4", "vknzT", "RFXsV"]
+        assert charts[0].title == "Do Americans approve or disapprove of Donald Trump?"
+
+    def test_title_with_apostrophe_survives(self):
+        # "Trump's net approval …" — a quote-class terminator would cut at the
+        # apostrophe and label the chart just "Trump" (observed on the live page).
+        charts = extract_datawrapper_charts(_TRUMP_TRACKER_SHAPED_HTML)
+        assert charts[2].title == "Trump’s net approval on the issues"
+
+    def test_plain_iframe_embed_with_title_attribute(self):
+        # Datawrapper's own responsive embed: title= sits BEFORE src in the tag.
+        html = (
+            '<iframe title="Weekly jobless claims" aria-label="Interactive line chart" '
+            'id="datawrapper-chart-Ab9x2" src="https://datawrapper.dwcdn.net/Ab9x2/4/" '
+            'scrolling="no" frameborder="0"></iframe>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert len(charts) == 1
+        assert charts[0].chart_id == "Ab9x2"
+        assert charts[0].title == "Weekly jobless claims"
+
+    def test_embed_script_form_yields_id_without_title(self):
+        html = '<script defer src="https://datawrapper.dwcdn.net/Xy12Z/embed.js" charset="utf-8"></script>'
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Xy12Z"]
+        assert charts[0].title is None
+
+    def test_json_escaped_slashes_match(self):
+        # Embed URLs inside plain (non-HTML-escaped) JSON carry `\/` slashes.
+        html = '{"url":"https:\\/\\/datawrapper.dwcdn.net\\/Qw3rT\\/12\\/","title":"Escaped chart"}'
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["Qw3rT"]
+        assert charts[0].title == "Escaped chart"
+
+    def test_static_data_url_form_matches(self):
+        html = '<a href="https://static.dwcdn.net/data/kSCt4.csv">Get the data</a>'
+        assert [c.chart_id for c in extract_datawrapper_charts(html)] == ["kSCt4"]
+
+    def test_dedup_first_seen_wins(self):
+        html = (
+            '<iframe src="https://datawrapper.dwcdn.net/1mU3g/11/"></iframe>'
+            '<a href="https://static.dwcdn.net/data/1mU3g.csv">data</a>'
+        )
+        assert [c.chart_id for c in extract_datawrapper_charts(html)] == ["1mU3g"]
+
+    def test_longer_path_segments_do_not_match(self):
+        # Chart ids are exactly 5 alnum chars; asset paths must not match.
+        html = '<script src="https://datawrapper.dwcdn.net/plugins/render.js"></script>'
+        assert extract_datawrapper_charts(html) == []
+
+    def test_titleless_chart_does_not_steal_neighbours_title(self):
+        # First embed has no title; the second (within the forward window)
+        # does. The window is bounded at the next embed, so chart one stays
+        # untitled instead of inheriting chart two's title.
+        html = (
+            '<iframe src="https://datawrapper.dwcdn.net/AAAA1/3/"></iframe>'
+            '<div data-attrs="{&quot;url&quot;:&quot;https://datawrapper.dwcdn.net/BBBB2/5/&quot;,'
+            '&quot;title&quot;:&quot;Chart two title&quot;}"></div>'
+        )
+        charts = extract_datawrapper_charts(html)
+        assert [c.chart_id for c in charts] == ["AAAA1", "BBBB2"]
+        assert charts[0].title is None
+        assert charts[1].title == "Chart two title"
+
+    def test_no_embeds_returns_empty(self):
+        assert extract_datawrapper_charts("<html><body>No charts here.</body></html>") == []
+        assert extract_datawrapper_charts("") == []
+
+
+class TestDatawrapperLiveDataUrl:
+    def test_builds_version_free_static_route(self):
+        # The one dataset route that serves LIVE data. The versioned
+        # `datawrapper.dwcdn.net/<id>/<ver>/dataset.csv` form pinned in page
+        # HTML served 5- and 14-month-stale snapshots on the two real trackers
+        # (2026-08-24 verifications) and must never be constructed.
+        assert datawrapper_live_data_url("1mU3g") == "https://static.dwcdn.net/data/1mU3g.csv"
+        assert datawrapper_live_data_url("kSCt4") == "https://static.dwcdn.net/data/kSCt4.csv"
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["", "abcd", "abcdef", "ab/c1", "../..", "a b c", "1mU3g\n", "1mU3g/2053"],
+    )
+    def test_rejects_non_chart_id_shapes(self, bad_id: str):
+        with pytest.raises(ValueError, match="not a Datawrapper chart id"):
+            datawrapper_live_data_url(bad_id)
+
+
+class TestParseHttpLastModified:
+    def test_parses_rfc7231_to_aware_utc(self):
+        parsed = parse_http_last_modified("Tue, 25 Aug 2026 19:00:51 GMT")
+        assert parsed == datetime(2026, 8, 25, 19, 0, 51, tzinfo=timezone.utc)
+        assert parsed is not None and parsed.tzinfo is not None
+
+    def test_malformed_returns_none(self):
+        assert parse_http_last_modified("not a date") is None
+        assert parse_http_last_modified("") is None

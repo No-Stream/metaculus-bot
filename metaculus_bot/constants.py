@@ -431,6 +431,15 @@ RESOLUTION_SOURCE_TOTAL_MAX_CHARS: int = (
 )
 RESOLUTION_SOURCE_JS_WALL_MIN_CHARS: int = 100  # 200-OK with < this extracted text == JS wall (FINDINGS)
 RESOLUTION_SOURCE_GLOBAL_CONCURRENCY: int = 5  # TCPConnector limit; per-host serialized separately
+# --- Datawrapper second hop (Tier 2) ---
+# Poll-tracker pages lock their resolving daily series inside Datawrapper
+# iframes that trafilatura drops (qids 44858/44841). The hop fetches the
+# version-free live dataset (static.dwcdn.net/data/<id>.csv) for charts found
+# in a fetched page's raw HTML.
+RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS: int = (
+    3  # datasets per question; hero/resolving chart is ~always first in document order (Trump tracker carries 5 embeds)
+)
+RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS: float = 30.0  # freshness bound on the dataset's Last-Modified vs fetch time. Live trackers republish at least daily; the stale-route failure class this guards against served 5-14 MONTH old snapshots as HTTP 200 (2026-08-24 verifications). Older/undatable data is withheld (stale_data), never served as live.
 
 # --- Gemini Search Provider (Google AI Studio direct SDK) ---
 # Uses google-genai SDK with GoogleSearch grounding tool for first-party Google
