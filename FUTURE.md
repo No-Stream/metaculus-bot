@@ -886,7 +886,7 @@ column is not a settle date (median +114 days vs the question's own resolve time
 +300d or more). Re-read the informativeness question at ~41 ranked-era resolutions (late September
 / early October), not ~09-01 (which buys only ~7).
 
-### financial_data: 252-trading-day calendar applied to 24/7 crypto series (added 2026-08-24; found, NOT yet fixed)
+### financial_data: 252-trading-day calendar applied to 24/7 crypto series (added 2026-08-24; FIXED same day, `e6ae276`)
 
 Found by the q44882 dossier (Ethereum >$2,200 in August, peer −7.24) and verified by reproducing
 the printed block to the last decimal: `research/financial_data.py:390` annualizes daily returns
@@ -901,11 +901,19 @@ by 17pp), and the "52-week range" is `iloc[-252:]` ≈ 8.2 months (high understa
 off the `_TICKER_GROUPS` "Crypto" group already in the file — or index on calendar dates so the
 labels are true by construction — plus one 365-day-frequency test fixture with a known sd (all
 current yfinance fixtures are business-day and the integration test asserts line presence, not
-values, so nothing can catch this today). Blast radius in the archive is 2 of 1,064 records — ETH
-here, where it hurt, and BTC on q43592, where the same understatement pushed toward a NO that
-resolved NO and helped — i.e. a systematic under-dispersion bias that flatters status-quo answers
-and pays for it when the status quo breaks.
+values, so nothing could catch this before the fix). Blast radius in the archive is 2 of 1,064
+records — ETH here, where it hurt, and BTC on q43592, where the same understatement pushed toward
+a NO that resolved NO and helped — i.e. a systematic under-dispersion bias that flatters
+status-quo answers and pays for it when the status quo breaks.
 (`scratch/residual_2026-08-24/dossiers/44882_dossier.md` + `44882_verification.md`.)
+
+**FIXED 2026-08-24 in `e6ae276`** (this entry was drafted concurrently with the fix landing):
+rather than routing off the `_TICKER_GROUPS` Crypto registry, the shipped form infers
+periods-per-year from the series' own observed density (rows per calendar day, split at 6/7 —
+so a newly listed 24/7 symbol needs no registry edit), and drives the vol factor, the
+period-return row offsets, and the 52-week slice off the one basis. Business-day series are
+byte-identical to the old output (pinned by tests); `TestAnnualizationBasis` carries the
+365-frequency fixture this entry asked for, and the revert check fails exactly the 24/7 test.
 
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
