@@ -922,6 +922,30 @@ class TestPolymarket:
         prices = [child.implied_prob_yes or 0.0 for child in children]
         assert prices == sorted(prices, reverse=True)
 
+    def test_settled_children_queue_behind_the_open_ones(self) -> None:
+        """The resolved leg of the two-key sort, on the one real-money venue where it does real
+        work (Kalshi pre-scopes its strikes to live ones; here a nested market can individually
+        be closed). A settled leg quoting its realized 1.00 must not evict live rungs from the
+        render budget — drop `is_resolved` from the key and this event would lead with the
+        settled outcome while every test on all-open fixtures stayed green."""
+
+        def outcome(title: str, price: float, *, closed: bool = False) -> dict[str, Any]:
+            return {"groupItemTitle": title, "outcomePrices": json.dumps([str(price)]), "closed": closed}
+
+        markets = [
+            outcome("0 cuts", 1.00, closed=True),
+            outcome("1 cut", 0.62),
+            outcome("2 cuts", 0.25),
+            outcome("3+ cuts", 0.08),
+        ]
+
+        children = venues.polymarket_event_children(markets)
+
+        assert [child.is_resolved for child in children] == sorted(child.is_resolved for child in children)
+        assert [child.title for child in children] == ["1 cut", "2 cuts", "3+ cuts", "0 cuts"]
+        open_prices = [child.implied_prob_yes or 0.0 for child in children if not child.is_resolved]
+        assert open_prices == sorted(open_prices, reverse=True)
+
     def test_a_child_falls_back_to_its_question_when_it_has_no_group_label(
         self, captured_payloads: dict[str, Any]
     ) -> None:

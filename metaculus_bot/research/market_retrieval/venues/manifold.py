@@ -34,7 +34,11 @@ from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, safe_float, safe_int
 from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch, ScalarEstimate
-from metaculus_bot.research.market_retrieval.venues._shared import RULES_TEXT_MAX_CHARS, VENUE_SEARCH_LIMIT
+from metaculus_bot.research.market_retrieval.venues._shared import (
+    RULES_TEXT_MAX_CHARS,
+    VENUE_SEARCH_LIMIT,
+    child_render_order_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -315,14 +319,14 @@ def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
     for. And each answer keeps its own ``volume`` — the sub-row has a column for it, the ranker line
     does not.
 
-    Ordered by OPEN-FIRST, then by PROBABILITY — not by volume like the real-money venues, because
-    these answers are a distribution over one question's outcomes and reading it means seeing where
-    the mass sits. Probability alone was the obvious choice and is measurably wrong on this module's
-    own committed fixture: a threshold ladder settles its crossed rungs to exactly 1.0 while the
-    market stays open, so 10 of that market's 17 answers sort to the front as a block of ``1.00
-    RESOLVED`` rows and push all 7 rungs that still carry uncertainty past the render budget. The
-    settled rungs are real evidence — they establish the floor the series has already crossed — but
-    they are not the forecast, so they queue behind it.
+    Ordered by ``child_render_order_key`` (open first, then price-descending — the one rule all
+    three price-bearing venues share; this venue's ordering predates the shared key and set the
+    pattern). Probability alone was the obvious choice and is measurably wrong on this
+    module's own committed fixture: a threshold ladder settles its crossed rungs to exactly 1.0
+    while the market stays open, so 10 of that market's 17 answers sort to the front as a block
+    of ``1.00 RESOLVED`` rows and push all 7 rungs that still carry uncertainty past the render
+    budget. The settled rungs are real evidence — they establish the floor the series has already
+    crossed — but they are not the forecast, so they queue behind it.
 
     Within each group the sort is the same stable one ``manifold_top_answers`` documents: the tied
     1.0 rungs keep the array's own order, which is what makes the render deterministic across runs.
@@ -357,5 +361,5 @@ def manifold_answer_children(detail: dict[str, Any]) -> tuple[MarketChild, ...]:
                 is_resolved=bool(answer.get("resolution")),
             )
         )
-    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
+    children.sort(key=child_render_order_key)
     return tuple(children)

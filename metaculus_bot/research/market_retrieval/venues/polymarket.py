@@ -23,7 +23,11 @@ from typing import Any
 
 from metaculus_bot.research.market_retrieval.http import http_get_with_backoff, parse_iso, safe_float
 from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch
-from metaculus_bot.research.market_retrieval.venues._shared import RULES_TEXT_MAX_CHARS, VENUE_SEARCH_LIMIT
+from metaculus_bot.research.market_retrieval.venues._shared import (
+    RULES_TEXT_MAX_CHARS,
+    VENUE_SEARCH_LIMIT,
+    child_render_order_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +70,14 @@ def polymarket_event_children(markets: Sequence[dict[str, Any]]) -> tuple[Market
     against each outcome, it is a third the length, and under the parent's title it reads as the
     ladder rung it is. ``question`` is the fallback for the events that ship no group label.
 
-    Price-descending — the same rule as ``kalshi_strike_children`` and ``manifold_answer_children``
-    — because the renderer truncates a long child list from the end and an event's children are a
-    distribution over one question's outcomes: the rungs carrying the price mass are the forecast,
-    whatever traded. (The traded-size key this replaces was latent here — 0 of 790 archived
-    Polymarket child rows carry a non-null ``open_interest``, so ``max()`` reduced to volume — but
-    it is the byte-identical defect that cost q45189 on Kalshi, so both venues change together.)
-    The sort is STABLE, so equal-priced (and unpriced) children keep Gamma's own order rather than
-    an arbitrary one.
+    Ordered by ``child_render_order_key`` (open first, then price-descending — one rule for all
+    three price-bearing venues; the rationale lives on the key). Unlike Kalshi's children, which
+    are pre-scoped to live strikes, a nested market here can individually be ``closed``/
+    ``resolved``, so the open-first leg does real work on this venue: a settled leg's realized
+    price queues behind every rung still carrying uncertainty. (The traded-size key this
+    replaces was latent here — 0 of 790 archived Polymarket child rows carry a non-null
+    ``open_interest``, so ``max()`` reduced to volume — but it was the byte-identical defect
+    that cost q45189 on Kalshi, so both venues changed together.)
 
     A market with no usable title is dropped rather than rendered as a blank row; it would spend a
     child slot saying nothing.
@@ -90,7 +94,7 @@ def polymarket_event_children(markets: Sequence[dict[str, Any]]) -> tuple[Market
         for market in markets
         if (title := market.get("groupItemTitle") or market.get("question") or market.get("title") or "")
     ]
-    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
+    children.sort(key=child_render_order_key)
     return tuple(children)
 
 

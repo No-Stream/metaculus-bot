@@ -56,41 +56,22 @@ from tests.test_market_retrieval_generation import Platform
 
 _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 
-# Char budget for the WORST-CASE rendered snapshot: 8 rows with every field simultaneously at its
-# cap, EVERY row multi-outcome, and every one of its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too.
-# Measured at 10,298 chars. 10,600 leaves ~3% headroom, the same deliberate tightness the
-# pre-expansion budget had: this section goes to the expensive forecaster models, so adding a
-# column, lengthening the legend, or raising a child cap has to trip it.
+# Char budgets for the rendered snapshot, held deliberately TIGHT (~1-3% headroom): this section
+# goes to the expensive forecaster models on every question, so anything that widens it — a new
+# column, a longer legend, a raised child cap, a longer truncation marker — must trip a budget and
+# earn an explicit re-derivation of all three figures (the invariant; the per-change history lives
+# in the commit log, not here). `MAX_CHILD_ROWS_PER_SNAPSHOT` bounds the sub-row half, which is
+# most of the total; the per-market cap never binds on a full 8-row slate.
 #
-# **All three figures were re-derived when multi-outcome markets started rendering `↳` sub-rows, and
-# the growth is the point of that change rather than a regression.** For the record: maxed
-# 6,304 → 10,137, realistic 4,648 → 7,465, fixed overhead 1,444 → 1,621. Two separate causes, worth
-# keeping apart. The sub-rows are nearly all of it — 3,680 chars on the maxed slate and 2,664 on the
-# realistic one, measured by rendering the same rows with `children` stripped — and `~190` is the
-# legend's one added `↳` sentence. `MAX_CHILD_ROWS_PER_SNAPSHOT` is what bounds the sub-row half; the
-# per-market cap never binds on a full 8-row slate, so raising it would not move these numbers.
-#
-# The operator's directive here superseded its own earlier ~6,000 figure: that number described
-# "roughly today's 12-row render" BEFORE maximum-info expansion was chosen, and expansion that
-# renders every outcome's own price cannot fit a budget set for rendering none of them. What did NOT
-# change is the reason the budgets exist, so they are re-derived tight rather than loosened.
-#
-# The scalar-market `prob` cell added one legend sentence, +161 chars on all three figures.
-# Only the fixed-overhead ceiling moved with it: the two whole-render budgets absorbed the growth
-# and are deliberately LEFT where they were, so this change spent their headroom rather than
-# raising them. That is why maxed now sits at ~3% and realistic at ~1% — a guard that is nearly
-# touching is doing its job, and the next thing that widens the section re-derives all three.
-#
-# The omitted-price-mass clause on the truncation marker (q45189 disclosure) added ~21 chars per
-# truncated market: maxed 10,298 → 10,466, realistic 7,626 → 7,794. Maxed still fits under 10,600
-# (1.3% headroom); realistic breached its 7,700 and was re-derived to 7,900 (1.4%), same
-# deliberate tightness. Fixed overhead is untouched — the clause rides the marker row, not the
-# legend.
+# MAXED: 8 rows with every field simultaneously at its cap, EVERY row multi-outcome, every one of
+# its `MAX_CHILD_ROWS_PER_MARKET` sub-rows maxed too. Measured at 10,298 chars (its unpriced
+# children take the truncation marker's count-only fallback, so the share clause adds nothing
+# here).
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
 
-# 8 rows of realistic content, using shapes measured off live payloads rather than chosen — the
-# figure that describes what a real question renders. Measured at 7,794 chars.
-MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 7_900
+# REALISTIC: 8 rows of content shaped like live payloads rather than chosen — what a real question
+# renders. Measured at 7,954 chars (the omitted-share clause rides every truncated priced family).
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 8_050
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
 # 1,782 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
@@ -968,10 +949,11 @@ class TestChildRowBudget:
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
         assert _sub_rows_per_market(rendered) == [MAX_CHILD_ROWS_PER_MARKET]
+        # 20 of 30 equal-priced open outcomes cut -> 67% of the family's summed open prices.
         assert (
-            f"[{30 - MAX_CHILD_ROWS_PER_MARKET} more outcomes omitted — render budget, 10.00 of priced mass]"
-            in rendered
-        )
+            f"[{30 - MAX_CHILD_ROWS_PER_MARKET} more outcomes omitted — render budget, "
+            "67% of the open outcomes' summed prices]"
+        ) in rendered
 
     def test_a_truncated_market_says_so_in_a_marker_row(self) -> None:
         """A thinned table must never read as a complete one. The wording mirrors the
@@ -980,7 +962,7 @@ class TestChildRowBudget:
 
         cells = _table_rows(render_snapshot(MarketSnapshot(matches=matches)))
 
-        assert cells[-1]["title"] == "[1 more outcome omitted — render budget, 0.50 of priced mass]"
+        assert cells[-1]["title"] == "[1 more outcome omitted — render budget, 9% of the open outcomes' summed prices]"
         assert cells[-1]["platform"] == CHILD_ROW_MARKER
 
     def test_a_marker_row_fills_every_column(self) -> None:
@@ -991,7 +973,9 @@ class TestChildRowBudget:
 
         widths = {line.count("|") for line in rendered.split("\n") if line.startswith("| ")}
         assert widths == {len(TABLE_COLUMNS) + 1}
-        assert _table_rows(rendered)[-1]["title"] == "[4 more outcomes omitted — render budget, 2.00 of priced mass]"
+        assert _table_rows(rendered)[-1]["title"] == (
+            "[4 more outcomes omitted — render budget, 29% of the open outcomes' summed prices]"
+        )
 
     def test_the_snapshot_cap_is_at_least_the_row_budget(self) -> None:
         """The constant relationship the priceless-parent invariant rests on: fewer sub-row slots
@@ -999,11 +983,12 @@ class TestChildRowBudget:
         assert MAX_CHILD_ROWS_PER_SNAPSHOT >= RENDER_BUDGET
         assert MAX_CHILD_ROWS_PER_MARKET <= MAX_CHILD_ROWS_PER_SNAPSHOT
 
-    def test_the_marker_sums_only_the_omitted_outcomes_mass(self) -> None:
-        """The figure a forecaster reads must be the mass they are NOT seeing — counting rendered
-        rows into it would overstate the cut and teach models to distrust complete tables. Children
-        arrive price-descending from the adapters, so the omitted tail is the low-priced end:
-        12 outcomes at 0.30, 0.29, ... — the two past the per-market cap carry 0.20 + 0.19."""
+    def test_the_share_counts_only_the_omitted_outcomes(self) -> None:
+        """The figure a forecaster reads must be the fraction they are NOT seeing — counting
+        rendered rows into the numerator would overstate the cut and teach models to distrust
+        complete tables. Children arrive price-descending from the adapters, so the omitted tail
+        is the low-priced end: 12 outcomes at 0.30, 0.29, ... — the two past the per-market cap
+        carry 0.20 + 0.19 of the family's 2.94 total, i.e. 13%."""
         children = tuple(
             MarketChild(title=f"outcome {index}", implied_prob_yes=0.30 - 0.01 * index)
             for index in range(MAX_CHILD_ROWS_PER_MARKET + 2)
@@ -1012,12 +997,12 @@ class TestChildRowBudget:
 
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
-        assert "[2 more outcomes omitted — render budget, 0.39 of priced mass]" in rendered
+        assert "[2 more outcomes omitted — render budget, 13% of the open outcomes' summed prices]" in rendered
 
-    def test_an_unpriced_cut_honestly_reads_zero_priced_mass(self) -> None:
-        """Omitted outcomes with no live quote contribute nothing to the figure — inventing mass
-        for them would be worse than the silence the clause replaces. `0.00` is itself information:
-        the cut rows carried no price."""
+    def test_an_unpriced_cut_honestly_reads_zero(self) -> None:
+        """Omitted outcomes with no live quote contribute nothing to the numerator — inventing a
+        share for them would be worse than the silence the clause replaces. `0%` is itself
+        information: the cut rows carried no price."""
         children = tuple(
             MarketChild(title=f"outcome {index}", implied_prob_yes=0.5 if index < MAX_CHILD_ROWS_PER_MARKET else None)
             for index in range(MAX_CHILD_ROWS_PER_MARKET + 3)
@@ -1026,4 +1011,56 @@ class TestChildRowBudget:
 
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
-        assert "[3 more outcomes omitted — render budget, 0.00 of priced mass]" in rendered
+        assert "[3 more outcomes omitted — render budget, 0% of the open outcomes' summed prices]" in rendered
+
+    def test_the_share_is_bounded_on_a_cumulative_threshold_ladder(self) -> None:
+        """The reason the disclosure is a SHARE and not a raw price sum: a cumulative Kalshi
+        threshold family's nested survival prices routinely sum past 1.0 (this ladder's total is
+        ~5.6), so a raw sum labelled 'mass' would tell a forecaster it is missing several times
+        the whole distribution. The share stays a bounded fraction on every family shape."""
+        prices = [0.99, 0.97, 0.95, 0.90, 0.85, 0.60, 0.30, 0.10, 0.05, 0.03, 0.02, 0.01]
+        children = tuple(
+            MarketChild(title=f"above ${index}", implied_prob_yes=price) for index, price in enumerate(prices)
+        )
+        matches = [_row(title="cumulative ladder", prob=None, children=children)]
+
+        rendered = render_snapshot(MarketSnapshot(matches=matches))
+
+        omitted_share = sum(prices[MAX_CHILD_ROWS_PER_MARKET:]) / sum(prices)
+        assert (
+            f"[2 more outcomes omitted — render budget, {omitted_share:.0%} of the open outcomes' summed prices]"
+            in (rendered)
+        )
+        assert omitted_share <= 1.0
+
+    def test_settled_outcomes_are_excluded_from_the_share_on_both_sides(self) -> None:
+        """The child sort queues settled rungs last, so they land in the omitted tail
+        preferentially — counting their realized 0/1 prices would tell a forecaster it is missing
+        forecast content that is not forecast content at all. Here: 11 open rungs at 0.5 plus 3
+        settled at 1.00; the cut is one open rung (0.5 of 5.5 open total = 9%), not the 41% a
+        naive sum over the omitted tail would claim."""
+        open_children = tuple(
+            MarketChild(title=f"open {index}", implied_prob_yes=0.5) for index in range(MAX_CHILD_ROWS_PER_MARKET + 1)
+        )
+        settled_children = tuple(
+            MarketChild(title=f"settled {index}", implied_prob_yes=1.0, is_resolved=True) for index in range(3)
+        )
+        matches = [_row(title="mixed family", prob=None, children=open_children + settled_children)]
+
+        rendered = render_snapshot(MarketSnapshot(matches=matches))
+
+        assert "[4 more outcomes omitted — render budget, 9% of the open outcomes' summed prices]" in rendered
+
+    def test_an_all_settled_cut_gets_the_bare_count_and_no_share_clause(self) -> None:
+        """A family whose open outcomes carry no prices at all (or none exist) has no denominator:
+        0% of nothing is not a disclosure, so the marker falls back to the count-only wording."""
+        children = tuple(
+            MarketChild(title=f"settled {index}", implied_prob_yes=1.0 if index < 6 else 0.0, is_resolved=True)
+            for index in range(MAX_CHILD_ROWS_PER_MARKET + 2)
+        )
+        matches = [_row(title="all settled", prob=None, children=children)]
+
+        rendered = render_snapshot(MarketSnapshot(matches=matches))
+
+        assert "[2 more outcomes omitted — render budget]" in rendered
+        assert "summed prices" not in rendered

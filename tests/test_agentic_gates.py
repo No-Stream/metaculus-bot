@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from metaculus_bot.research.agentic.loop import run_agentic_loop
+from metaculus_bot.research.agentic.loop import _SPAN_JOINER_MAX_CHARS, run_agentic_loop
 from metaculus_bot.research.agentic.types import ToolOutcome
 from tests.agentic_fakes import FakeLlm
 from tests.agentic_fakes import gap_accounting as _accounting
@@ -358,6 +358,69 @@ class TestProvenanceGate:
             '"Musk has personally donated more than $85 million toward the midterms."',
         )
         assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_fabricated_figure_in_the_joiner_still_warns(self) -> None:
+        """The connective between two verbatim spans is CHECKED when it carries a
+        digit. `re.split` on a group-less boundary discarded the joiner entirely, so
+        a fabricated figure riding between two genuine spans grounded cleanly on the
+        spans alone — the exact hole the digit clause exists to close."""
+        result = await self._run_quote_check(
+            source_body="Total revenue was 4.2 billion dollars for the quarter. Unrelated filler follows here. "
+            "The prior fiscal year closed with lower totals across segments.",
+            quote='"Total revenue was 4.2 billion dollars" up 47.3% from "the prior fiscal year closed"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 1
+
+    @pytest.mark.asyncio
+    async def test_genuine_figure_in_the_joiner_grounds(self) -> None:
+        """The digit-gated connective check is a grounding requirement, not a ban:
+        when the joiner's figure really is in the source, the stitched quote passes."""
+        result = await self._run_quote_check(
+            source_body="Total revenue was 4.2 billion dollars for the quarter, up 47.3% from a year earlier. "
+            "The prior fiscal year closed with lower totals across segments.",
+            quote='"Total revenue was 4.2 billion dollars" up 47.3% from "the prior fiscal year closed"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_span_ending_in_whitespace_before_its_glyph_still_splits(self) -> None:
+        """The whitespace-only boundary survives as its own alternative: the bounded
+        connective's `(?<=\\S)` lookbehind fails when the first span ends in
+        whitespace before its closing glyph, so without the old clause this shape
+        reads as one contiguous span and warns — the 2026-07-28 false-positive
+        class, reintroduced."""
+        result = await self._run_quote_check(
+            source_body="Contribution schedules list MARC L. ANDREESSEN in the filing index. Later pages "
+            "name BENJAMIN HOROWITZ under the same schedule.",
+            quote='"MARC L. ANDREESSEN in the filing " "name BENJAMIN HOROWITZ under"',
+        )
+        assert result.telemetry.findings_count == 1
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+    @pytest.mark.asyncio
+    async def test_the_joiner_bound_splits_at_the_constant_and_not_one_past_it(self) -> None:
+        """Pins _SPAN_JOINER_MAX_CHARS at N and N+1 so the empirically-tuned bound
+        cannot drift silently: a connective of exactly the bound still splits (both
+        verbatim spans ground, digit-free narration unchecked), one char past it
+        reads as a single span and warns."""
+
+        source_body = (
+            "Contribution schedules list MARC L. ANDREESSEN in the filing index. Later pages "
+            "name BENJAMIN HOROWITZ under the same schedule."
+        )
+        span_a = '"MARC L. ANDREESSEN in the filing"'
+        span_b = '"name BENJAMIN HOROWITZ under"'
+
+        at_bound = "x" * _SPAN_JOINER_MAX_CHARS
+        result = await self._run_quote_check(source_body=source_body, quote=f"{span_a}{at_bound}{span_b}")
+        assert result.telemetry.quote_mismatch_warnings == 0
+
+        past_bound = "x" * (_SPAN_JOINER_MAX_CHARS + 1)
+        result = await self._run_quote_check(source_body=source_body, quote=f"{span_a}{past_bound}{span_b}")
         assert result.telemetry.quote_mismatch_warnings == 1
 
     @pytest.mark.asyncio

@@ -226,8 +226,9 @@ class MarketMatch:
     #
     # ADAPTER ORDER IS THE RENDER ORDER, verbatim, exactly as the ranker's order is for parents: the
     # renderer truncates a long list from the END, so each adapter orders by what its own venue
-    # makes worth keeping (traded size on the real-money venues, probability on Manifold, ballot
-    # order on PredictIt) and documents that choice. A row with children carries
+    # makes worth keeping (open-first price-descending via `venues/_shared.child_render_order_key`
+    # on the three price-bearing venues, ballot order on PredictIt) and documents that choice. A
+    # row with children carries
     # `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no single
     # probability" a fact about the data rather than a rendering convention.
     children: tuple[MarketChild, ...] = ()

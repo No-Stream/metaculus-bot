@@ -174,9 +174,23 @@ def _normalize_quote_text(text: str) -> str:
 #      quoted span whose CONTENT is <=24 chars as a "boundary" — deleting exactly
 #      the short table cells (`"Windows | 56.61%"`) the 10-char floor below was
 #      tuned to keep — and the pinned ellipsis shapes in tests/test_agentic_gates.py
-#      fail. A wrapping glyph at the start of the quote (or after a space) can
-#      never open a boundary, which is the same property the whitespace-only
-#      clause had implicitly.
+#      fail. The whitespace-only clause survives as its OWN alternative, because
+#      the lookarounds do not subsume it: a span ending in whitespace before its
+#      closing glyph (`"span A " "span B"`) fails `(?<=\S)` and would otherwise
+#      read as one contiguous span and warn — the exact false-positive class the
+#      2026-07-28 clause was added to eliminate. Whitespace-only can never consume
+#      a span with non-whitespace content, so it is safe alongside.
+# The whole alternation is ONE capturing group, deliberately: `re.split` DISCARDS
+# unmatched separators, and a discarded glyph-boundary connective is up to
+# _SPAN_JOINER_MAX_CHARS of driver text that never gets checked — a fabricated
+# figure riding in the joiner between two verbatim spans (`"<A>" up 47.3% from
+# "<B>"`) would ground cleanly on the spans alone, defeating the digit clause
+# whose own comment calls that "the whole risk". With the capture, split returns
+# the connectives at the ODD indices and `_quote_is_grounded` checks any that
+# carry a digit. Digit-FREE connectives stay unchecked whatever their length:
+# a connective is driver narration by construction, not source text, so requiring
+# it in the corpus would manufacture exactly the false positives the bounded
+# connective was measured to fix (65% of all 365 warnings ever emitted).
 # This regex is applied to the RAW quote, BEFORE normalization, and each resulting
 # span normalized on its own. That order is load-bearing: _normalize_quote_text
 # DELETES quote glyphs, so normalizing first destroys the very boundary clause 2
@@ -188,7 +202,17 @@ def _normalize_quote_text(text: str) -> str:
 # genuinely verbatim quote is itself verbatim, and sub-floor non-numeric fragments
 # are not trusted as positive evidence anyway (the floor + digit clauses below
 # are unchanged).
-_SPAN_BOUNDARY_RE = re.compile(r"\.{3,}|…|(?<=\S)[\"'‘’“”`][^\"'‘’“”`]{0,24}?[\"'‘’“”`](?=\S)")
+#
+# The connective bound is empirically tuned, not principled: the 2026-08-24 round
+# measured the real joiners (" and ", "; ", ", ", short narration fragments) well
+# under it and full narration sentences well over it. Named so the boundary tests
+# can pin it at N and N+1 instead of restating a magic number.
+_SPAN_JOINER_MAX_CHARS = 24
+_SPAN_BOUNDARY_RE = re.compile(
+    r"(\.{3,}|…"
+    r"|[\"'‘’“”`]\s*[\"'‘’“”`]"
+    rf"|(?<=\S)[\"'‘’“”`][^\"'‘’“”`]{{0,{_SPAN_JOINER_MAX_CHARS}}}?[\"'‘’“”`](?=\S))"
+)
 # Minimum normalized length for a split span to be grounded on its own.
 # Below this a span is a bare token or punctuation run that appears in arbitrary
 # text, so trusting it per-span would rubber-stamp the check. Set to 10 rather
@@ -225,18 +249,31 @@ def _quote_is_grounded(quote: str, tool_content_normalized: str) -> bool:
     mark a glyph boundary; see the ``_SPAN_BOUNDARY_RE`` block. A span carries
     weight when it clears ``_MIN_GROUNDING_SPAN_CHARS`` or contains a digit; the
     digit clause closes the hole where a fabricated figure rode alongside a
-    genuine long clause. When no span carries weight — the quote is all short
+    genuine long clause.
+
+    The regex's one capture group makes ``re.split`` return the matched boundaries
+    at the ODD indices, and those get the narrower rule: a boundary connective is
+    driver narration rather than source text, so it is checked only when it
+    carries a digit (the fabrication risk the digit clause exists for) and is
+    otherwise ignored whatever its length — demanding narration verbatim in the
+    corpus would manufacture the false positives the bounded connective was
+    measured to fix. When no piece carries weight — the quote is all short
     non-numeric fragments — the whole normalized quote is tested as a substring so
     a short quote is never auto-passed; only a truly empty quote passes for free.
     """
     normalized_quote = _normalize_quote_text(quote)
     if not normalized_quote:
         return True
-    spans = [
-        span
-        for span in (_normalize_quote_text(part) for part in _SPAN_BOUNDARY_RE.split(quote))
-        if span and (len(span) >= _MIN_GROUNDING_SPAN_CHARS or _DIGIT_RE.search(span))
-    ]
+    spans: list[str] = []
+    for index, part in enumerate(_SPAN_BOUNDARY_RE.split(quote)):
+        normalized = _normalize_quote_text(part)
+        if not normalized:
+            continue
+        if index % 2 == 1:  # a captured boundary: connective narration, digit-gated
+            if _DIGIT_RE.search(normalized):
+                spans.append(normalized)
+        elif len(normalized) >= _MIN_GROUNDING_SPAN_CHARS or _DIGIT_RE.search(normalized):
+            spans.append(normalized)
     if not spans:
         return normalized_quote in tool_content_normalized
     return all(span in tool_content_normalized for span in spans)

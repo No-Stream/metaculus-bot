@@ -588,7 +588,13 @@ FRED_API_KEY_ENV: str = "FRED_API_KEY"
 # tier (mini → luna 2026-08-03, when luna's markdown made it cheaper than mini).
 FINANCIAL_CLASSIFIER_MODEL: str = "openrouter/openai/gpt-5.6-luna"
 FINANCIAL_CLASSIFIER_TIMEOUT: int = 30
-FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 365
+# One year of daily bars PLUS a week of headroom, because the "1y" period-return row needs
+# STRICTLY MORE rows than its 365-row offset (`_compute_period_returns` indexes
+# `close.iloc[-(days + 1)]`). At exactly 365 a 24/7 series sits at/under the threshold and the
+# 1y row silently vanishes from the crypto snapshot — the very row the calendar-basis fix
+# exists for. This constant feeds only the yfinance fetch window; the 52-week and 30-day-vol
+# windows are row-count slices off the fetched frame and don't widen with it.
+FINANCIAL_YFINANCE_LOOKBACK_DAYS: int = 372
 FINANCIAL_YFINANCE_RECENT_DAYS: int = 30
 FINANCIAL_FRED_LOOKBACK_YEARS: int = 5
 # Cap on how many tickers + FRED series one question may fetch. The identifier list is

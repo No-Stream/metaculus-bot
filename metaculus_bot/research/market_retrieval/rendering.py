@@ -291,8 +291,8 @@ def _child_cells(platform: str, child: MarketChild) -> dict[str, str]:
 def _child_allowances(matches: Sequence[MarketMatch]) -> list[int]:
     """How many sub-rows each row may render, filling ONE ROUND AT A TIME across the whole slate.
 
-    So every multi-outcome market shows its leading outcome — the most-traded strike, the most
-    probable bracket — before any market shows a second, and a market with fewer outcomes than the
+    So every multi-outcome market shows its leading outcome — the highest-priced open strike or
+    bracket — before any market shows a second, and a market with fewer outcomes than the
     round count hands its unused slots back to the others. Draining the budget in rank order instead
     would spend it all on the top two rows and leave rows 6-8 rendering a bare ``-``, which is the
     exact defect this whole expansion exists to remove.
@@ -321,26 +321,55 @@ def _table_row(cells: dict[str, str]) -> str:
     return "| " + " | ".join(cells[column] for column in TABLE_COLUMNS) + " |"
 
 
-def _omitted_children_cells(omitted_children: Sequence[MarketChild]) -> dict[str, str]:
-    """A marker sub-row naming how many outcomes the budget cut, and the price mass they carried.
+def _open_price_total(children: Sequence[MarketChild]) -> float:
+    """The summed quoted prices of the OPEN children — the disclosure's numerator/denominator.
+
+    Resolved children are excluded on both sides: a settled rung's price is a realized outcome,
+    and the child sort queues settled rungs last, so they land in the omitted tail
+    preferentially — counting their 0/1 prices would tell a forecaster it is missing forecast
+    content that is not forecast content at all. Unquoted children contribute nothing.
+    """
+    return sum(
+        child.implied_prob_yes for child in children if child.implied_prob_yes is not None and not child.is_resolved
+    )
+
+
+def _omitted_children_cells(
+    omitted_children: Sequence[MarketChild], all_children: Sequence[MarketChild]
+) -> dict[str, str]:
+    """A marker sub-row naming how many outcomes the budget cut, and the price share they carried.
 
     Shaped as a table row rather than a trailing note because a bare line between rows would end
     the markdown table and orphan everything after it. The wording mirrors the resolution-source
     fetcher's ``[N additional source(s) omitted — section budget]``: same bracketed shape, same
     "which budget" clause, so a forecaster meeting either recognises the other.
 
-    The price-mass clause is what turns a one-sided cut from silent into visible: a single
+    The disclosure clause is what turns a one-sided cut from silent into visible: a single
     surviving bracket read as an equality constraint on a tail is exactly the q45189 failure, and
     the price-descending child sort alone cannot fix it — a model must also know how much of the
-    distribution it is NOT seeing before it treats the visible rungs as exhaustive. The figure sums
-    only the outcomes that carry a price, so on an unquoted family it honestly reads 0.00.
+    market's pricing it is NOT seeing before it treats the visible rungs as exhaustive.
+
+    The figure is a SHARE of the family's summed open-outcome prices, not a raw price sum,
+    because a raw sum labelled "mass" is only a probability on a mutually-exclusive family: a
+    cumulative Kalshi threshold ladder's nested prices routinely sum past 1.0, and a >1 "mass"
+    either misleads the forecaster about the unseen tail or discredits the clause. The share is
+    arithmetically honest for both shapes — on the q45189 bracket family it reads 38%, exactly
+    the cut fraction the dossier measured. A family whose open outcomes carry no prices at all
+    gets the bare count, no share clause: 0% of nothing is not a disclosure.
     """
     omitted = len(omitted_children)
-    priced_mass = sum(child.implied_prob_yes for child in omitted_children if child.implied_prob_yes is not None)
     plural = "" if omitted == 1 else "s"
+    family_total = _open_price_total(all_children)
+    if family_total > 0.0:
+        share = _open_price_total(omitted_children) / family_total
+        title = (
+            f"[{omitted} more outcome{plural} omitted — render budget, {share:.0%} of the open outcomes' summed prices]"
+        )
+    else:
+        title = f"[{omitted} more outcome{plural} omitted — render budget]"
     return {
         "platform": CHILD_ROW_MARKER,
-        "title": f"[{omitted} more outcome{plural} omitted — render budget, {priced_mass:.2f} of priced mass]",
+        "title": title,
         "prob": "-",
         "total_vol": "-",
         "OI": "-",
@@ -412,7 +441,7 @@ def render_snapshot(snapshot: MarketSnapshot, *, ranking_degraded: bool = False)
         lines.extend(_table_row(_child_cells(match.platform, child)) for child in match.children[:allowance])
         omitted_children = match.children[allowance:]
         if omitted_children:
-            lines.append(_table_row(_omitted_children_cells(omitted_children)))
+            lines.append(_table_row(_omitted_children_cells(omitted_children, match.children)))
 
     lines.append("")
     lines.append("### Resolution criteria / rules")

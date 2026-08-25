@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from forecasting_tools import GeneralLlm
 
-from metaculus_bot.constants import MAX_FINANCIAL_IDENTIFIERS
+from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
 from metaculus_bot.research.financial_data import (
     CLASSIFIER_PROMPT,
     FRED_LABELS,
@@ -288,6 +288,24 @@ class TestAnnualizationBasis:
         assert self._line_value(result, "- 1w") == f"{expected_1w:+.2f}%"
         # The 52-week high must include the spike the 252-row slice misses.
         assert self._line_value(result, "- 52-week range").endswith(f"{close.iloc[-300]:.2f}")
+
+    def test_the_production_fetch_window_still_renders_the_1y_row(self):
+        """The boundary the lookback constant exists to clear: the 1y offset needs STRICTLY MORE
+        rows than 365 (`close.iloc[-(days + 1)]`), and a 24/7 series prints ~one bar per calendar
+        day of the fetch window — so at a 365-day window the 1y row silently vanished from
+        exactly the crypto snapshots the calendar-basis fix targets. Built at the production
+        frame size so a future trim of the constant back to 365 fails here, not in prod."""
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS > 365, "the 1y offset needs at least 366 bars"
+        rng = np.random.default_rng(7)
+        n_rows = FINANCIAL_YFINANCE_LOOKBACK_DAYS
+        dates = pd.date_range(end="2026-07-31", periods=n_rows, freq="D")
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n_rows))), index=dates)
+        assert _infer_periods_per_year(close) == 365
+
+        result = self._fetch_with_history(close)
+
+        expected_1y = (close.iloc[-1] / close.iloc[-366] - 1) * 100
+        assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
 
     def test_short_series_degrades_to_trading_day_basis(self):
         dates = pd.date_range(end="2026-07-31", periods=10, freq="D")
@@ -978,7 +996,7 @@ class TestBenchmarkingDateCeiling:
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
         assert "period" not in kwargs
-        assert kwargs["start"] == "2025-03-15"  # open_time.date() - 365d
+        assert kwargs["start"] == "2025-03-08"  # open_time.date() - FINANCIAL_YFINANCE_LOOKBACK_DAYS (372d)
         assert kwargs["end"] == "2026-03-16"  # open_time.date() + 1d (end EXCLUSIVE)
         assert "AAPL" in result
         assert "[omitted under backtest" in result
@@ -1001,7 +1019,7 @@ class TestBenchmarkingDateCeiling:
 
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": "365d"}
+        assert kwargs == {"period": f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d"}
         assert "P/E ratio" in result  # .info fundamentals rendered
 
     def test_fred_benchmarking_routes_through_ts_fetch_with_ceiling(self) -> None:
@@ -1211,5 +1229,5 @@ class TestBenchmarkingDateCeiling:
             result = await provider(_make_q("Will Apple stock exceed $200?"))
 
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": "365d"}
+        assert kwargs == {"period": f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d"}
         assert "### AAPL" in result

@@ -690,6 +690,60 @@ class TestLiveProdRoutingMisses:
         assert (route.spec.series_id, route.derivation) == ("PAYEMS", "mom_diff")
 
 
+# The change-vs-level guard's scoping: the %-change tokens veto only routes whose band is NOT
+# itself a percent change, and on the URL branch the guard reads the TITLE only. Without the
+# derivation scoping, the guard and the widened CPI MoM vocabulary shipped in the same commit
+# cancel each other out — a MoM CPI question worded the way BLS words the series ("percent
+# change") passes the widened quantity gate and is then killed by the widened guard.
+class TestChangeGuardScoping:
+    def test_cpi_mom_percent_change_wording_routes_on_the_keyword_branch(self):
+        # BLS's own name for the quantity is "seasonally adjusted 1-month percent change in
+        # CPI-U" — the mom_pct band IS the quantity this wording asks for, so the guard must
+        # not veto it.
+        qt = (
+            "What will be the seasonally adjusted month-over-month percent change in US headline CPI for December 2026?"
+        )
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("CPIAUCSL", "mom_pct")
+
+    def test_cpi_mom_percentage_change_wording_routes_through_its_url(self):
+        qt = "What will be the month-over-month percentage change in US headline CPI for December 2026?"
+        rc = "Resolves per https://fred.stlouisfed.org/series/CPIAUCSL on the release date."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("CPIAUCSL", "mom_pct")
+
+    def test_a_percentage_change_payroll_question_still_skips(self):
+        # mom_diff is NOT exempt: its band is a count of persons, so %-change wording is a
+        # different quantity and the guard must keep firing.
+        qt = "What will be the percentage change in seasonally adjusted nonfarm payroll employment in December 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_an_incidental_comparison_in_the_criteria_does_not_kill_a_url_anchor(self):
+        # The URL-branch guard reads the TITLE only: this branch had no wording guard before
+        # 2026-08-24, and its recurring families cite the resolving URL in criteria that can
+        # mention a spread or comparison incidentally. A full-text scan would silently remove
+        # live anchors with the suite green — the opposite-direction twin of the narrow-gate
+        # defect this round fixed.
+        qt = "What will be the ending value of the UST 10Y Yield on August 14, 2026?"
+        rc = (
+            "Resolves per https://fred.stlouisfed.org/series/DGS10 on the resolution date. "
+            "Commentators often quote the 2-year vs. the 10-year, but this question uses the 10-year alone."
+        )
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("DGS10", "level")
+
+    def test_the_title_scoping_does_not_weaken_the_q45362_skip(self):
+        # The families the URL guard exists for state their quantity in the title; the
+        # verbatim q45362 test in TestLiveProdRoutingMisses pins the real case, this pins the
+        # minimal shape so the two scoping rules can't be conflated.
+        qt = "What will be the percentage change in the S&P 500 over the window?"
+        rc = "Resolves per https://finance.yahoo.com/quote/%5EGSPC at the close."
+        assert route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc)) is None
+
+
 # The q45401 defect class swept across the other non-"level" entries: a derivation gate that
 # only knows some of the phrasings for its quantity goes dark silently on the rest.
 class TestWidenedDerivationVocabulary:

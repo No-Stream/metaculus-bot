@@ -31,6 +31,7 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
+from metaculus_bot.research.ts_estimators import CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -426,9 +427,8 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 # rows/year (5 trading days a week), 24/7 markets (crypto) print ~365. Annualizing
 # a 24/7 series with sqrt(252) understates vol by ~17% (sqrt(252/365) ~= 0.83), and
 # row-count windows labeled "1y"/"52-week" then span only ~8.2 calendar months —
-# both bit q44882 (ETH-USD).
-TRADING_DAYS_PER_YEAR = 252
-CALENDAR_DAYS_PER_YEAR = 365
+# both bit q44882 (ETH-USD). The constants themselves are the package's shared pair
+# (imported from ts_estimators above — one definition, so a correction can't miss a copy).
 
 # Row offsets behind each period-return label, per basis. On the 365 basis the
 # offsets are calendar days; on the 252 basis they are the trading-day

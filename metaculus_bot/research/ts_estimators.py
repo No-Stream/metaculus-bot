@@ -24,9 +24,13 @@ import pandas as pd
 
 Freq = Literal["daily", "weekly", "monthly"]
 
-# Horizon conversion constants (ported from the replay's run_replay.py).
-TRADING_DAYS_PER_YEAR = 252.0
-CALENDAR_DAYS_PER_YEAR = 365.0
+# Annualization / horizon-conversion bases (ported from the replay's run_replay.py).
+# THE package's single definition of these two facts — `financial_data` imports them for its
+# period-return row offsets and vol annualization, so they are ints: the row-count consumers
+# index and slice with them (`_PERIOD_ROW_OFFSETS[...]`, `close.iloc[-n:]`), and the float
+# arithmetic here is unchanged by int operands (true division and `round` don't care).
+TRADING_DAYS_PER_YEAR = 252
+CALENDAR_DAYS_PER_YEAR = 365
 CALENDAR_DAYS_PER_MONTH = 30.4375
 
 QUANTILE_LEVELS = (0.10, 0.50, 0.90)

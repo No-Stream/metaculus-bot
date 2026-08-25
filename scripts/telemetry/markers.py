@@ -303,6 +303,12 @@ MARKER_SPECS: list[MarkerSpec] = [
         # kw_ambiguous, kw_change_vs_level_guard). `series` is the series involved where one
         # is known — comma-joined on ambiguity, slash-joined on a spread, the "none" sentinel
         # (-> None) on a plain keyword miss. All values are spaceless, so `\S+` takes each.
+        #
+        # DENOMINATOR CAVEAT: the marker covers routing-ELIGIBLE questions, not every
+        # numeric/discrete question — build_anchor_section returns before route_question
+        # when scheduled_resolution_time is missing/non-datetime, and a disabled
+        # TS_ANCHOR_ENABLED run emits nothing. A coverage query must reconcile against the
+        # run's question list rather than treat absent lines as skips.
         re.compile(
             r"TS_ANCHOR_ROUTE:\s*question=(?P<question>\S+)\s+decision=(?P<decision>\S+)"
             r"\s+series=(?P<series>\S+)\s+step=(?P<step>\S+)"

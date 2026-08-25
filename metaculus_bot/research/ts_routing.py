@@ -68,15 +68,22 @@ _RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelati
 
 # Wording that says the question resolves on a DIFFERENCE between two series, or on a
 # %-CHANGE in one, rather than on a level. Every registry entry serves a level (or a declared
-# derivation of one), so a single-series level band on one of these shapes is the wrong
-# quantity — usually the wrong unit too (a two-leg Treasury spread resolves in basis points
+# derivation of one), so a single-series level band on one of these shapes is usually the
+# wrong quantity — and the wrong unit too (a two-leg Treasury spread resolves in basis points
 # while the leg's level is in percent, and a %-change question resolves in percentage points
 # while the leg's level is in index points: q45362 routed "percentage change in the S&P 500"
 # to a ^GSPC LEVEL band, and only the magnitude backstop stopped the section).
 #
-# The %-change tokens are deliberately percentage-QUALIFIED: bare "change" is the vocabulary
-# the mom_diff/mom_pct families legitimately route on ("change in seasonally adjusted nonfarm
-# payroll employment"), so it must never appear here.
+# TWO patterns, because their vetoes have different scope (`_change_guard_hits` is the one
+# gatekeeper). The two-leg tokens are unconditional (no single-series band of ANY derivation
+# expresses a difference between two series). The %-change tokens are consulted only when the
+# route's derivation is not itself a percent change: `mom_pct`'s own family IS worded as a
+# percent change ("seasonally adjusted 1-month percent change in CPI-U" is BLS's name for the
+# quantity), so an unconditional veto would kill the exact family that entry serves — while a
+# level, `mom_diff` (persons, not %), or `monthly_avg` ($/gal) band on %-change wording stays
+# the wrong quantity and skips. The %-change tokens are also percentage-QUALIFIED: bare
+# "change" is vocabulary the mom_diff/mom_pct families legitimately route on ("change in
+# seasonally adjusted nonfarm payroll employment"), so it must never appear here.
 #
 # The URL branch refuses the two-URL version of this via its ambiguity check, and since
 # 2026-08-24 `_single_url_route` applies this guard to the one-URL version (q45362's shape);
@@ -90,15 +97,29 @@ _RELATIVE_RETURN_RE = re.compile(r"\breturns?\b(?!\s+to\b)|\boutperform|\brelati
 # yield versus the high yield spread" left the HY-OAS entry as the sole match, so a two-leg
 # question that used to skip as ambiguous would have routed to one leg. The guard runs AFTER
 # the ambiguity check, so it can only ever turn a route into a skip.
-_TWO_LEG_OR_CHANGE_RE = re.compile(
-    r"\bbasis point|\bbps\b|\bspread\b|\bminus\b|\bversus\b|\bvs\.?\b|\bdifference between\b"
-    r"|\bpercentage change\b|\bpercent change\b|% change",
+_TWO_LEG_RE = re.compile(
+    r"\bbasis point|\bbps\b|\bspread\b|\bminus\b|\bversus\b|\bvs\.?\b|\bdifference between\b",
     re.IGNORECASE,
 )
+_PCT_CHANGE_RE = re.compile(r"\bpercentage change\b|\bpercent change\b|% change", re.IGNORECASE)
 
-# Registry entries whose own series IS the published spread/difference, so the wording above
-# describes exactly what they serve rather than a quantity they cannot express.
+# Registry entries whose own series IS the published spread/difference, so the two-leg
+# wording describes exactly what they serve rather than a quantity they cannot express.
 _SPREAD_NATIVE_SERIES: frozenset[str] = frozenset({"BAMLH0A0HYM2"})
+
+
+def _change_guard_hits(text: str, derivation: Derivation) -> bool:
+    """True when the change-vs-level wording guard should refuse a single-series route.
+
+    One gatekeeper for both branches so the two-leg/%-change scoping above cannot drift
+    between them. ``derivation`` is the route's EFFECTIVE derivation — the matched entry's,
+    or ``"level"`` for a URL-cited series with no registry entry (the dataclass default the
+    route would carry, which is what keeps the q45362 ^GSPC skip intact).
+    """
+    if _TWO_LEG_RE.search(text):
+        return True
+    return derivation != "mom_pct" and bool(_PCT_CHANGE_RE.search(text))
+
 
 # The non-revising FRED allowlist lives in ts_fetch (fetch-layer knowledge shared with
 # financial_data); imported above as FRED_NON_REVISING_SERIES.
@@ -415,17 +436,23 @@ def _entry_quantity_ok(entry: _TemplateEntry, lowered: str) -> bool:
     return not any(kw in lowered for kw in entry.exclude_keywords)
 
 
+def _entry_title_matches(entry: _TemplateEntry, lowered: str) -> bool:
+    """The TITLE half of the matcher: any keyword present AND every require_keyword present.
+
+    Split from ``_entry_matches`` so the routing marker's ``kw_derivation_gate`` step (title
+    matched, quantity gate refused) is derived from the matcher's own definition rather than
+    a hand-copy — the two predicates cannot drift apart, and a future change to how titles
+    match lands in exactly one place."""
+    return any(kw in lowered for kw in entry.keywords) and all(kw in lowered for kw in entry.require_keywords)
+
+
 def _entry_matches(entry: _TemplateEntry, lowered: str) -> bool:
-    """An entry matches iff any of its keywords appear AND every require_keyword appears
-    AND the derivation gate (``_entry_quantity_ok``) passes (all case-folded).
+    """An entry matches iff its title half (``_entry_title_matches``) AND the derivation
+    gate (``_entry_quantity_ok``) both pass (all case-folded).
     require/require_any/exclude disambiguate substring collisions (US vs. Australian
     'unemployment rate') and keep a derived-quantity entry off a wrong-units question
     (MoM vs. YoY/level CPI, payroll change vs. level)."""
-    if not any(kw in lowered for kw in entry.keywords):
-        return False
-    if not all(kw in lowered for kw in entry.require_keywords):
-        return False
-    return _entry_quantity_ok(entry, lowered)
+    return _entry_title_matches(entry, lowered) and _entry_quantity_ok(entry, lowered)
 
 
 def _registry_entry_for_series(
@@ -481,7 +508,7 @@ def _route_from_entry(entry: _TemplateEntry, spec: SeriesSpec, *, is_max: bool) 
 
 
 def _single_url_route(
-    series_id: str, source: Literal["fred", "yfinance"], text: str, *, is_max: bool
+    series_id: str, source: Literal["fred", "yfinance"], text: str, *, question_text: str, is_max: bool
 ) -> tuple[_Route | None, str]:
     """Route a single URL-cited series, returning ``(route, step)`` for the routing marker.
 
@@ -498,13 +525,20 @@ def _single_url_route(
       band (see ``_registry_entry_for_series`` on why that would be misleading). A series with
       a level sibling (GASREGW) reaches that sibling instead of skipping, because the sibling
       is a genuine route for the question's quantity rather than a fallback.
-    - ``url_change_vs_level_guard``: the same ``_TWO_LEG_OR_CHANGE_RE`` wording guard the
-      keyword branch runs, extended here 2026-08-24 after q45362 ("percentage change in the
+    - ``url_change_vs_level_guard``: the change-vs-level wording guard the keyword branch
+      runs (``_change_guard_hits``, with the effective derivation — the entry's, or "level"
+      when no entry exists), extended here 2026-08-24 after q45362 ("percentage change in the
       S&P 500", criteria citing the ^GSPC Yahoo URL) routed to a LEVEL band and only the
       magnitude backstop stopped it — a numeric heuristic, so a change question whose bounds
       overlapped the level band would have sailed through. A single URL has no ambiguity
       check to displace, so the guard can only turn a route into a skip; spread-native series
-      stay exempt exactly as on the keyword branch.
+      stay exempt exactly as on the keyword branch. On THIS branch the guard reads only
+      ``question_text`` — not criteria/fine print — because this branch had no wording guard
+      at all before 2026-08-24 and its recurring families cite the resolving URL in criteria
+      that can mention a spread or a comparison incidentally ("often quoted vs. the 2-year"):
+      a full-text scan would silently remove live anchors on the suite staying green, the
+      opposite-direction twin of the narrow-gate defect this round fixed. The families this
+      guard exists for state their quantity in the title (q45362 verbatim).
     """
     lowered = text.lower()
     spec = _single_spec(series_id, source, text)
@@ -517,7 +551,8 @@ def _single_url_route(
             entry.derivation,
         )
         return None, "url_quantity_gate"
-    if series_id.upper() not in _SPREAD_NATIVE_SERIES and _TWO_LEG_OR_CHANGE_RE.search(text):
+    derivation: Derivation = entry.derivation if entry is not None else "level"
+    if series_id.upper() not in _SPREAD_NATIVE_SERIES and _change_guard_hits(question_text, derivation):
         logger.info(
             "ts_anchor: URL-cited %s but the question wording asks for a spread/difference/%%-change "
             "— skipping rather than anchoring a single-series band on a different quantity",
@@ -597,7 +632,9 @@ def _route_question_impl(question: MetaculusQuestion) -> tuple[_Route | None, st
             )
         if total_ids == 1:
             series_id, source = (fred[0], "fred") if fred else (tickers[0], "yfinance")
-            route, step = _single_url_route(series_id, source, text, is_max=is_max)
+            route, step = _single_url_route(
+                series_id, source, text, question_text=question.question_text or "", is_max=is_max
+            )
             return route, step, series_id
         logger.info(
             "ts_anchor: ambiguous URL routing (fred=%s tickers=%s) for qid=%s — skipping",
@@ -613,11 +650,7 @@ def _route_question_impl(question: MetaculusQuestion) -> tuple[_Route | None, st
         # Distinguish "no entry's title keywords hit at all" from "keywords hit but the
         # require/derivation gate refused" — the latter is the q45401 defect class, and
         # collapsing the two is what made it invisible for a whole era.
-        near = [
-            e
-            for e in _TEMPLATE_REGISTRY
-            if any(kw in lowered for kw in e.keywords) and all(kw in lowered for kw in e.require_keywords)
-        ]
+        near = [e for e in _TEMPLATE_REGISTRY if _entry_title_matches(e, lowered)]
         if near:
             return None, "kw_derivation_gate", ",".join(dict.fromkeys(e.series_id for e in near))
         return None, "kw_no_keyword_hit", ""
@@ -630,7 +663,7 @@ def _route_question_impl(question: MetaculusQuestion) -> tuple[_Route | None, st
         return None, "kw_ambiguous", ",".join(dict.fromkeys(m.series_id for m in matches))
 
     entry = matches[0]
-    if entry.series_id not in _SPREAD_NATIVE_SERIES and _TWO_LEG_OR_CHANGE_RE.search(text):
+    if entry.series_id not in _SPREAD_NATIVE_SERIES and _change_guard_hits(text, entry.derivation):
         logger.info(
             "ts_anchor: keyword-matched %s but the question wording asks for a spread/difference/change "
             "(qid=%s) — skipping rather than anchoring a single-series level band on a different quantity",

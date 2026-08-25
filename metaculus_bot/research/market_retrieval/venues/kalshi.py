@@ -49,7 +49,7 @@ from metaculus_bot.research.market_retrieval.http import (
     settlement_sources,
 )
 from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch, _FetchTally
-from metaculus_bot.research.market_retrieval.venues._shared import RULES_TEXT_MAX_CHARS
+from metaculus_bot.research.market_retrieval.venues._shared import RULES_TEXT_MAX_CHARS, child_render_order_key
 
 logger = logging.getLogger(__name__)
 
@@ -522,15 +522,19 @@ def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChil
     that as a sub-row would be inventing a price, which is worse than the withholding this replaces.
     An all-settled family falls back to its own strikes there, so its realized prices do render.
 
-    Price-descending — the same rule as ``manifold_answer_children`` — because the renderer
-    truncates from the end and a strike family's children are a distribution over one question's
-    outcomes: the rungs carrying the price mass are the forecast, whatever traded. Traded-size
-    ordering let near-zero-probability rungs with open interest evict the priced brackets, which
-    on a truncated family deleted exactly the region a forecaster extrapolates from (q45189: the
-    six omitted rungs held 0.365 of price mass, all on one side). A strike with no live quote
-    sorts with the zero-priced rungs, so the priced rows are the ones that survive the budget.
-    The sort is STABLE, so equal-priced (and quoteless) strikes keep the catalogue's own
-    (threshold) order.
+    Ordered by ``child_render_order_key`` (open first, then price-descending — one rule for all
+    three price-bearing venues; the rationale lives on the key). Two Kalshi-specific notes:
+
+    - The rule is exact for a mutually-exclusive bracket family (the q45189 margin ladder) and a
+      heuristic for a CUMULATIVE threshold family ("$X or above" strikes), whose nested prices
+      are survival probabilities rather than a partition — there price-descending is
+      threshold-ascending, which fronts the deep in-the-money rungs. Not claimed to be optimal
+      for that shape; what it fixes is traded-size ordering letting near-zero-probability rungs
+      with open interest evict the priced brackets outright.
+    - The key's open-first leg is a NO-OP here: ``kalshi_tradeable_strikes`` already scopes the
+      children to live strikes (or, on an all-settled family, to all-settled ones), so within
+      one family ``is_resolved`` never varies. Kept anyway so the venues share one rule — do
+      not hunt for a missing mixed-status Kalshi case.
     """
     tradeable = kalshi_tradeable_strikes(nested)
     if len(tradeable) < 2:
@@ -552,7 +556,7 @@ def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChil
                 close_time=parse_iso(market.get("close_time") or ""),
             )
         )
-    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
+    children.sort(key=child_render_order_key)
     return tuple(children)
 
 
