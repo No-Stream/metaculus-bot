@@ -41,6 +41,9 @@ against the ACTUAL emitted format strings (the source of truth):
   ``_wrap_with_timeout_retry`` (per-ATTEMPT publish failure: which POST method,
   which attempt of how many, and the timeout or exception that killed it — the
   q45085 405-closed shape left no harvestable trace before this spec)
+* ``PUBLISH_SKIPPED_CLOSED`` — ``metaculus_bot/publish_gate.py``
+  ``skip_publish_if_closed`` (per-QUESTION pre-publish skip: the question whose
+  window had already closed, why, and by how many seconds it missed)
 * ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
   breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
   recorded)
@@ -375,7 +378,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
             r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
             r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+?))?"
-            r"(?:,\s*publish_attempt_failures=(?P<publish_attempt_failures>\S+))?"
+            r"(?:,\s*publish_attempt_failures=(?P<publish_attempt_failures>\S+?))?"
+            r"(?:,\s*publish_skipped_closed=(?P<publish_skipped_closed>\S+))?"
             r"\s*$"
         ),
     ),
@@ -425,6 +429,25 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:timed out after (?P<timeout_s>\d+)s"
             r"|failed \((?P<error_type>[^:()]+):\s*(?P<error>.*)\))\s*$"
         ),
+    ),
+    MarkerSpec(
+        "publish_skipped_closed",
+        # Per-QUESTION pre-publish skip WARN (metaculus_bot/publish_gate.py). The
+        # counterpart to publish_hardening above: that marker fires when a POST was
+        # attempted and died, this one when the gate saw the window had closed and
+        # made no POST at all. Both point at the same underlying problem (latency
+        # against a question's close deadline), and this is the one that names the
+        # question and by how many seconds it missed, which is what a latency
+        # analysis needs and what CLOSE_MARGIN alone cannot say (a negative margin
+        # there does not distinguish "published late but accepted" from "never
+        # published"). ``overdue_s`` can be negative under reason=state_closed,
+        # meaning the question was shut ahead of its scheduled close.
+        re.compile(
+            r"PUBLISH_SKIPPED_CLOSED:\s*question=(?P<question>\S+)\s+reason=(?P<reason>\S+)"
+            r"\s+close_time=(?P<close_time>\S+)\s+now=(?P<now>\S+)"
+            r"\s+overdue_s=(?P<overdue_s>\S+)\s+state=(?P<state>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # publish_gate.py emits question.id_of_question
     ),
     MarkerSpec(
         "paid_personal_key_fallback",

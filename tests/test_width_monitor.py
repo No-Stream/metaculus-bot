@@ -455,15 +455,36 @@ class TestComputeAllEras:
 class TestExcludeQids:
     """``exclude_qids`` drops named questions from every row, and says so.
 
-    The bug pair 43746/43747 (Minions / Toy Story 5 opening-weekend gross) is
-    excluded from every other dimension of the residual analysis; the width
-    monitor was the one place that still counted it. Both records are
-    PIT-extreme and sit in opposite tails, so leaving them in makes the active
-    era read mildly too narrow.
+    The known-pipeline-bug cohort is excluded from every other dimension of the
+    residual analysis; the width monitor was the one place that still counted it.
+    43746/43747 (Minions / Toy Story 5 opening-weekend gross) are both PIT-extreme
+    and sit in opposite tails, so leaving them in makes the active era read mildly
+    too narrow.
     """
 
-    def test_known_bug_qids_names_the_documented_pair(self):
-        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747"})
+    def test_known_bug_qids_pins_the_documented_cohort(self):
+        """Membership is a deliberate, dated decision per question, so it is pinned
+        here rather than left to whatever a caller happens to pass.
+
+        43913 (WSOP bracelets) joined 2026-08-25: pre-`9f1175c` discrete max-step cap,
+        with all six forecasters stating 79.5-83% on the outcome that resolved while
+        the published CDF carried 20.00% on that bin — pinned at exactly 0.200000, the
+        201-grid ceiling misapplied to an 11-point grid. Receipts in
+        `scratch/residual_2026-08-24/dossiers/43913_dossier.md`.
+        """
+        assert KNOWN_BUG_QIDS == frozenset({"43746", "43747", "43913"})
+
+    def test_43913_drops_from_the_rows_it_was_added_for(self):
+        # The reclassification is only worth anything if the id actually matches: the
+        # collector writes question_id as an int, and 43913 is a discrete record, so
+        # both the coercion and the discrete/numeric type gate have to hold.
+        data = [
+            _record_with_pit(0.5, created_at="2026-06-11T00:00:00Z"),
+            _record_with_pit(0.99, created_at="2026-06-11T00:00:00Z", question_id=43913),
+        ]
+        by_label = {m.label: m for m in compute_all_eras(data, exclude_qids=KNOWN_BUG_QIDS)}
+        assert by_label["all"].n_pit == 1
+        assert by_label["all"].n_excluded == 1
 
     def test_default_keeps_every_record(self):
         """Exclusion is opt-in: callers pass the set explicitly."""

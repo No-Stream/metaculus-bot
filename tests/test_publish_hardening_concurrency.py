@@ -43,6 +43,7 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import publish_hardening
+from metaculus_bot.constants import PUBLISH_POST_RETRIES
 
 # A real Metaculus publish URL: the forced-timeout override is scoped to the Metaculus
 # host on purpose (metaculus_client.requests IS the global requests module, so an
@@ -335,3 +336,106 @@ class TestPublishAttemptFailureCounter:
         publish_hardening._bump_publish_attempt_failure()
         publish_hardening.reset_publish_attempt_failures()
         assert publish_hardening.publish_attempt_failures() == 0
+
+    def test_concurrent_exhausted_publishes_both_count(self) -> None:
+        # Layer 3 runs each report's publish on its own worker thread and ft's gather
+        # can have several questions publishing at once, so the increment really is
+        # reached concurrently. ``+=`` on a module global is interruptible between
+        # bytecodes; unlocked, a lost update would let a two-question publish outage
+        # read as one.
+        def always_fails(*_args: Any, **_kwargs: Any) -> None:
+            raise requests.ConnectionError("dead socket")
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", always_fails)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(wrapped) for _ in range(40)]
+                for future in futures:
+                    with pytest.raises(requests.ConnectionError):
+                        future.result()
+            assert publish_hardening.publish_attempt_failures() == 40
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+
+class TestNonRetryable4xxIsNotRetried:
+    """A 4xx that is not 408/429 is a permanent verdict on THIS request, so a second
+    identical POST can only burn wall clock inside the per-question budget. q45085's
+    405-closed was retried 4s later and failed identically. 5xx and transport-level
+    failures still retry exactly as before."""
+
+    @staticmethod
+    def _ft_style_error(status: int) -> requests.HTTPError:
+        """Reproduce ft's re-raise shape: ``raise_for_status_with_additional_info``
+        builds a BRAND-NEW HTTPError from a message string, so the exception the
+        wrapper catches has no ``.response`` and the status lives only in the text."""
+        return requests.HTTPError(
+            f"HTTPError. Url: https://www.metaculus.com/api/questions/forecast/. Status code: {status}. "
+            'Response reason: Method Not Allowed. Response text: {"error":"Question 45085 is already '
+            'closed to forecasting !"}. Response JSON: None.'
+        )
+
+    def _count_attempts(self, exc: BaseException) -> int:
+        attempts: list[int] = []
+
+        def always_raises(*_args: Any, **_kwargs: Any) -> None:
+            attempts.append(1)
+            raise exc
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_raises)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with pytest.raises(type(exc)):
+                wrapped()
+            # Either way the terminal counter fires exactly once — only the attempt
+            # count changes, never the telemetry or the raise.
+            assert publish_hardening.publish_attempt_failures() == 1
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+        return len(attempts)
+
+    def test_405_already_closed_is_attempted_once(self) -> None:
+        assert self._count_attempts(self._ft_style_error(405)) == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 405])
+    def test_permanent_4xx_statuses_are_attempted_once(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == 1
+
+    @pytest.mark.parametrize("status", [408, 429])
+    def test_transient_4xx_statuses_still_retry(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == PUBLISH_POST_RETRIES + 1
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    def test_5xx_still_retries(self, status: int) -> None:
+        assert self._count_attempts(self._ft_style_error(status)) == PUBLISH_POST_RETRIES + 1
+
+    def test_statusless_transport_error_still_retries(self) -> None:
+        # Unclassifiable means retry: transport flakiness is what the budget is FOR,
+        # and refusing to retry something we couldn't read would be the regression.
+        assert self._count_attempts(requests.ConnectionError("connection reset by peer")) == PUBLISH_POST_RETRIES + 1
+
+    def test_status_is_read_off_a_real_response_when_present(self) -> None:
+        # Belt and braces for a caller that doesn't route through ft's re-raise: a
+        # genuine raise_for_status HTTPError carries the response object.
+        response = requests.Response()
+        response.status_code = 405
+        assert publish_hardening._http_status_code(requests.HTTPError(response=response)) == 405
+
+    def test_status_is_recovered_through_fts_cause_chain(self) -> None:
+        # ft does `raise HTTPError(message) from e`, so the original (which has the
+        # response) survives as __cause__ even when the message text changes shape.
+        response = requests.Response()
+        response.status_code = 403
+        original = requests.HTTPError(response=response)
+        rewrapped = requests.HTTPError("some rephrased message with no status in it")
+        rewrapped.__cause__ = original
+        assert publish_hardening._http_status_code(rewrapped) == 403
+
+    def test_a_three_digit_number_in_a_payload_echo_is_not_read_as_a_status(self) -> None:
+        # The substring trap that bit the OpenRouter credit classifier: OpenRouter
+        # replays our own prompt text, and forecasting prompts are full of figures.
+        # Only ft's literal "Status code: NNN" phrasing counts.
+        echoed = requests.HTTPError('Response text: {"flagged_input":"will the index close above 405 by June"}')
+        assert publish_hardening._http_status_code(echoed) is None
+        assert publish_hardening._is_retryable(echoed) is True

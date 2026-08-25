@@ -119,8 +119,17 @@ wait ride a worker thread and the loop stays free. Patching there rather than
 inside the sync wrapper is what makes it possible at all: the sync wrapper cannot
 return a coroutine (see above), whereas this method already is one.
 
+**Layer 4: the pre-publish close-time gate.** That same async seam is the last
+point that still knows WHICH question is being published, so it is where
+``publish_gate.skip_publish_if_closed`` runs. A question that closed mid-run
+cannot accept a forecast, and POSTing anyway earns a 405 that propagates out of
+ft's per-question handler and (via ``cli.main``'s ``log_report_summary``) takes
+the end-of-run alertable summary with it — the q45085 shape. See
+``metaculus_bot/publish_gate.py`` for why the gate carries no safety margin and
+why it skips the comment POST too.
+
 Idempotent: calling ``apply_publish_hardening()`` more than once is a no-op
-(checked via a sentinel attribute on ``MetaculusClient``). It applies all three
+(checked via a sentinel attribute on ``MetaculusClient``). It applies all four
 layers, so there is one entry point for publish hardening.
 """
 
@@ -130,6 +139,8 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import re
+import threading
 from typing import Any, Callable
 
 import requests
@@ -141,6 +152,7 @@ from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot.constants import PUBLISH_POST_RETRIES, PUBLISH_POST_TIMEOUT
+from metaculus_bot.publish_gate import skip_publish_if_closed
 
 assert PUBLISH_POST_RETRIES >= 0, "PUBLISH_POST_RETRIES must be non-negative"
 
@@ -201,10 +213,41 @@ _executor: concurrent.futures.ThreadPoolExecutor | None = None
 # start. Telemetry only — the exception still propagates exactly as before.
 _PUBLISH_ATTEMPT_FAILURES: int = 0
 
+# Layer 3 runs each report's publish on its own worker thread, and ft's
+# asyncio.gather can have several questions publishing at once, so two exhausted
+# publishes really can reach the increment concurrently. ``+=`` on a module global
+# is interruptible between bytecodes, so an unlocked pair could lose one — the
+# undercount that would let a two-question publish outage read as one. Same
+# reasoning as ``fallback_openrouter.record_donated_key_fallback``'s accounting
+# block; the lock is held for one addition and never around I/O.
+_COUNTER_LOCK = threading.Lock()
+
+# 4xx statuses worth a second attempt. Every other 4xx is a permanent verdict on
+# THIS request — a 405 "already closed to forecasting", a 401 on a bad token, a 400
+# malformed payload — so retrying can only burn wall clock inside the per-question
+# budget and delay every sibling question's publish. q45085 spent its second
+# attempt 4s later on a 405 that could not have succeeded. 5xx and transport-level
+# failures (socket timeout, connection reset) still retry exactly as before.
+_RETRYABLE_4XX: frozenset[int] = frozenset({408, 429})
+
+# ft's ``raise_for_status_with_additional_info`` re-raises a BARE
+# ``requests.HTTPError`` built from a message string, so the exception we catch has
+# no ``.response``; the original (which does) survives only as ``__cause__``, and
+# the status also appears in the message text. Anchored on ft's literal
+# "Status code: NNN" phrasing so a three-digit number echoed back from a payload
+# can't be mistaken for a status — the substring trap that bit the OpenRouter
+# credit classifier (see AGENTS.md on the bare ``402`` match).
+_STATUS_IN_MESSAGE = re.compile(r"Status code:\s*(?P<status>\d{3})\b")
+
+# Depth bound on the __cause__ walk: ft wraps once, so 4 links is generous and
+# makes a self-referential chain impossible to loop on.
+_CAUSE_CHAIN_DEPTH = 4
+
 
 def _bump_publish_attempt_failure() -> None:
     global _PUBLISH_ATTEMPT_FAILURES
-    _PUBLISH_ATTEMPT_FAILURES += 1
+    with _COUNTER_LOCK:
+        _PUBLISH_ATTEMPT_FAILURES += 1
 
 
 def publish_attempt_failures() -> int:
@@ -216,6 +259,38 @@ def reset_publish_attempt_failures() -> None:
     """Zero the counter at run start; without this it leaks across runs/tests sharing a process."""
     global _PUBLISH_ATTEMPT_FAILURES
     _PUBLISH_ATTEMPT_FAILURES = 0
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    """Best-effort HTTP status for a requests exception, or None if it carries none.
+
+    Prefers the real ``response.status_code`` (following ft's ``raise ... from e``
+    chain to find it) and falls back to ft's own message text.
+    """
+    current: BaseException | None = exc
+    for _ in range(_CAUSE_CHAIN_DEPTH):
+        if current is None:
+            break
+        status = getattr(getattr(current, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        current = current.__cause__
+
+    match = _STATUS_IN_MESSAGE.search(str(exc))
+    return int(match.group("status")) if match else None
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """False only for a 4xx that a second identical POST cannot fix.
+
+    Unknown status (a bare connection error, a timeout) means retry: the whole
+    point of the retry budget is transport flakiness, and refusing to retry
+    something we couldn't classify would be a regression.
+    """
+    status = _http_status_code(exc)
+    if status is None or not 400 <= status < 500:
+        return True
+    return status in _RETRYABLE_4XX
 
 
 def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -318,6 +393,21 @@ def _wrap_with_timeout_retry(method_name: str, original: Callable[..., Any]) -> 
                     type(exc).__name__,
                     exc,
                 )
+                if not _is_retryable(exc):
+                    if attempt < attempts:
+                        # Deliberately a second line rather than extra text on the one
+                        # above: the ``publish_hardening`` MarkerSpec is anchored on the
+                        # "attempt N/M failed (Type: msg)" shape, and appending to it
+                        # would stop every publish failure from harvesting. This line
+                        # carries no "attempt N/M" clause, so the spec ignores it. Only
+                        # emitted when a retry was actually forgone — on the last
+                        # attempt "not retrying" would be a tautology.
+                        logger.warning(
+                            "PUBLISH_HARDENING: %s not retrying status %s — a second identical POST cannot succeed",
+                            method_name,
+                            _http_status_code(exc),
+                        )
+                    break
         # The single terminal failure point on the publish path: every retry burned
         # and the question's POST never landed. Counted here (and only here) so the
         # end-of-run counters see it; the raise is unchanged.
@@ -328,7 +418,7 @@ def _wrap_with_timeout_retry(method_name: str, original: Callable[..., Any]) -> 
 
 
 def _wrap_publish_off_the_loop(original: Callable[..., Any]) -> Callable[..., Any]:
-    """Return an async ``publish_report_to_metaculus`` that runs ``original`` off the loop.
+    """Return an async ``publish_report_to_metaculus`` that gates, then runs ``original`` off the loop.
 
     ``original`` is ft's own coroutine function, whose body issues both POSTs
     synchronously. ``asyncio.to_thread(asyncio.run, coro)`` drives that coroutine to
@@ -340,10 +430,24 @@ def _wrap_publish_off_the_loop(original: Callable[..., Any]) -> Callable[..., An
     share across the boundary. That is checked by
     ``tests/test_ft_upgrade_seams.py`` — if a future ft version adds a real ``await``
     to these bodies, that pin fails and this wrapper needs revisiting.
+
+    Layer 4 rides here too: this is the last seam that still knows which question is
+    being published, so the close-time gate runs before the offload (on the loop
+    thread, which is what keeps its counter lock-free). ft's own return value is
+    ``None`` for all three report types, so a skip returns ``None`` and is
+    indistinguishable to the caller from a completed publish — by design, since ft
+    discards it.
     """
 
     @functools.wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        # args[0] is the report instance (these are plain instance methods). Read the
+        # question off it with a default because the seam belongs to a third-party
+        # class: if a future ft report stops carrying one, the gate must fail OPEN and
+        # publish, never silently withhold.
+        report = args[0] if args else None
+        if skip_publish_if_closed(getattr(report, "question", None)):
+            return None
         return await asyncio.to_thread(lambda: asyncio.run(original(*args, **kwargs)))
 
     return wrapper

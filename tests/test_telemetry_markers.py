@@ -797,6 +797,17 @@ DEGRADATION_COUNTERS_LINE = (
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1, publish_skipped_closed=2"
+)
+# The 2026-08-25-and-earlier shape: ends at publish_attempt_failures, i.e. no
+# publish_skipped_closed tail (the close-time gate's counter). Same optional-group
+# rationale as its predecessors — the regex is $-anchored, so a mandatory tail would
+# drop every record before the gate shipped.
+DEGRADATION_COUNTERS_NO_SKIP_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
     "publish_attempt_failures=1"
 )
 # The 2026-08-24-and-earlier shape: ends at provider_degradation, i.e. no
@@ -831,9 +842,10 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_twelve_current_keys_parse(self):
+    def test_all_thirteen_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
+        assert rec["publish_skipped_closed"] == 2
         assert rec["forecasters_dropped"] == 2
         assert rec["questions_failed_to_publish"] == 0
         assert rec["stacker_primary_failed"] == 0
@@ -847,16 +859,28 @@ class TestDegradationCounters:
         assert rec["provider_degradation"] == 1
         assert rec["publish_attempt_failures"] == 1
 
+    def test_line_without_the_skip_tail_still_harvests_everything_else(self):
+        """Every record archived before 2026-08-25 ends at publish_attempt_failures,
+        and that now-lazy group must still capture its full value there rather than
+        handing a digit to backtracking, while the newest key reads as absent."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_SKIP_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["publish_attempt_failures"] == 1
+        assert rec["provider_degradation"] == 1
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert rec["publish_skipped_closed"] is None
+
     def test_line_without_the_publish_tail_still_harvests_everything_else(self):
         """Every record archived before 2026-08-24 ends at provider_degradation, and
         the lazy provider_degradation group must still capture its full value there
-        (not hand a digit to backtracking) while the newer key reads as absent."""
+        (not hand a digit to backtracking) while the newer keys read as absent."""
         rec = _parse_one(DEGRADATION_COUNTERS_NO_PUBLISH_TAIL_LINE)
         assert rec["marker"] == "degradation_counters"
         assert rec["provider_degradation"] == 1
         assert rec["prediction_market_source_losses"] == 4
         # Absent must read as "this era didn't emit it", never as a measured zero.
         assert rec["publish_attempt_failures"] is None
+        assert rec["publish_skipped_closed"] is None
 
     def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
         """The load-bearing back-compat case. All 290 archived records end at
@@ -875,6 +899,7 @@ class TestDegradationCounters:
         # Absent must read as "this era didn't emit it", never as a measured zero.
         assert rec["provider_degradation"] is None
         assert rec["publish_attempt_failures"] is None
+        assert rec["publish_skipped_closed"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -1091,6 +1116,62 @@ class TestPublishHardening:
         # The wrapper sees only the POST, so there is no id space to stamp.
         rec = _parse_one(PUBLISH_HARDENING_TIMEOUT_LINE)
         assert "qid" not in rec
+
+    def test_the_new_not_retrying_line_is_not_harvested_as_an_attempt(self):
+        """The non-retryable-4xx WARN shares the prefix but carries no ``attempt N/M``
+        clause on purpose — folding it into the line above would have broken the
+        attempt spec's anchored shape."""
+        line = (
+            PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction not retrying status 405 "
+            "— a second identical POST cannot succeed"
+        )
+        assert parse_log_text(line + "\n", **_META)["publish_hardening"] == []
+
+
+# The per-question pre-publish skip WARN (publish_gate.py skip_publish_if_closed).
+# Values are q45085's real numbers: fetched at 11:59:38Z against a 12:00:00Z close,
+# publish reached at 12:05:06Z.
+PUBLISH_SKIPPED_CLOSED_LINE = (
+    PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45085 reason=close_time_passed "
+    "close_time=2026-08-03T12:00:00+00:00 now=2026-08-03T12:05:06+00:00 overdue_s=306 state=open"
+)
+
+
+class TestPublishSkippedClosed:
+    def test_close_time_passed_shape(self):
+        rec = _parse_one(PUBLISH_SKIPPED_CLOSED_LINE)
+        assert rec["marker"] == "publish_skipped_closed"
+        assert rec["reason"] == "close_time_passed"
+        assert rec["close_time"] == "2026-08-03T12:00:00+00:00"
+        assert rec["now"] == "2026-08-03T12:05:06+00:00"
+        assert rec["overdue_s"] == 306
+        assert rec["state"] == "open"
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        # publish_gate emits question.id_of_question, so a residual join must not read
+        # it as a post id (the two share one integer space).
+        rec = _parse_one(PUBLISH_SKIPPED_CLOSED_LINE)
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+
+    def test_state_closed_shape_with_absent_close_time(self):
+        rec = _parse_one(
+            PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45093 reason=state_closed "
+            "close_time=n/a now=2026-08-06T09:00:00+00:00 overdue_s=n/a state=resolved"
+        )
+        assert rec["reason"] == "state_closed"
+        # n/a must read as absent, never as a measured zero overdue.
+        assert rec["close_time"] is None
+        assert rec["overdue_s"] is None
+
+    def test_negative_overdue_parses(self):
+        # An early admin close leaves close_time in the future, so overdue is negative.
+        rec = _parse_one(
+            PFX_WARN + "PUBLISH_SKIPPED_CLOSED: question=45093 reason=state_closed "
+            "close_time=2026-08-07T00:00:00+00:00 now=2026-08-06T09:00:00+00:00 "
+            "overdue_s=-54000 state=closed"
+        )
+        assert rec["overdue_s"] == -54000
 
 
 # The end-of-run alertable breakdown (cli.py). Emitted on BOTH exit paths — the

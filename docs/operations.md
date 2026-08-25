@@ -660,8 +660,9 @@ is absent from the table rather than present-and-empty.
 uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <slug>
 # or against a cached dataset:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
-# drop the known open-bound bug pair (43746/43747) from every row; the excluded
-# count is rendered in the table, so the exclusion is never silent:
+# drop the known-pipeline-bug cohort (43746/43747, the open-bound arithmetic bug;
+# 43913, the pre-9f1175c discrete max-step cap) from every row; the excluded count
+# is rendered in the table, so the exclusion is never silent:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug
 ```
 

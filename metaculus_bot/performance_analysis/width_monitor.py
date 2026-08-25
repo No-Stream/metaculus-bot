@@ -111,12 +111,25 @@ WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1
 # era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 
-# Questions excluded from headline calibration rows by every other dimension of
-# the residual analysis: 43746 (Minions & Monsters) and 43747 (Toy Story 5)
-# opening-weekend gross, both mis-forecast by the pre-2026-07-07 open-bound
-# arithmetic bug rather than by judgment. Not excluded by default — callers pass
-# the set explicitly so an exclusion is always a visible choice.
-KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747"})
+# The CANONICAL known-pipeline-bug cohort: questions whose published forecast was
+# produced by a since-fixed pipeline defect rather than by judgment, so pooling them
+# into a calibration row measures the old bug instead of the current bot. Not
+# excluded by default — callers pass the set explicitly so an exclusion is always a
+# visible choice, and every row reports how many it dropped. Import this constant
+# rather than re-hardcoding the ids: analysis scripts that kept private copies have
+# already drifted from it.
+#
+# - 43746 (Minions & Monsters) and 43747 (Toy Story 5) opening-weekend gross:
+#   the pre-2026-07-07 open-bound arithmetic bug.
+# - 43913 (WSOP bracelets held by the 2026 Main Event winner), added 2026-08-25:
+#   the pre-`9f1175c` discrete max-step cap. All six forecasters stated 79.5-83%
+#   on the outcome that resolved (exactly 1 bracelet) and the published CDF carried
+#   20.00%, its first bin pinned at exactly 0.200000 on an 11-point grid — the
+#   201-grid ceiling applied to a 10-bin question whose real server ceiling was 4.0.
+#   Receipts: scratch/residual_2026-08-24/dossiers/43913_dossier.md and
+#   dim_discrete-maxstep-counterfactual.md. The fix reached prod inside `b4e9df0`
+#   (2026-07-21T17:07:37Z), so no post-triple-era question can carry this shape.
+KNOWN_BUG_QIDS: frozenset[str] = frozenset({"43746", "43747", "43913"})
 
 # The CLI token standing in for KNOWN_BUG_QIDS in --exclude-qids.
 KNOWN_BUG_SHORTHAND = "known_bug"
@@ -412,8 +425,8 @@ def compute_all_eras(
     ``exclude_qids`` drops the named questions from every row and reports the
     dropped count per row (``EraWidthMetrics.n_excluded``, rendered in the
     table), so an exclusion is never silent. Pass ``KNOWN_BUG_QIDS`` for the
-    documented open-bound bug pair, which every other dimension of the residual
-    analysis already excludes.
+    documented known-pipeline-bug cohort, which every other dimension of the
+    residual analysis already excludes.
     """
     if eras is None:
         eras = default_eras()
@@ -511,10 +524,10 @@ def main(argv: list[str] | None = None) -> None:
         default="",
         help=(
             "Comma-separated question ids to drop from every row (the count is rendered in the table "
-            f"so the exclusion is visible). The documented open-bound bug pair is {','.join(sorted(KNOWN_BUG_QIDS))}; "
-            f"pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, anywhere in the list — it composes with "
-            f"explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' excludes the pair AND 43800. "
-            "Default: exclude nothing."
+            "so the exclusion is visible). The documented known-pipeline-bug cohort is "
+            f"{','.join(sorted(KNOWN_BUG_QIDS))}; pass '{KNOWN_BUG_SHORTHAND}' as shorthand for it, "
+            f"anywhere in the list — it composes with explicit ids, so '{KNOWN_BUG_SHORTHAND},43800' "
+            "excludes the cohort AND 43800. Default: exclude nothing."
         ),
     )
     args = parser.parse_args(argv)

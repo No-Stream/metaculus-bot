@@ -796,6 +796,11 @@ class _RealAlertableCountBot(MagicMock):
     ``MagicMock`` instance that expression is ``MagicMock`` itself, so binding the
     properties there would mutate the class for every mock in the session and leak
     into unrelated tests.
+
+    EVERY property-backed summand of ``alertable_total`` has to be listed below. A
+    missing one leaves a ``MagicMock`` in the sum, so ``alertable_count`` stops being an
+    int and every test in this file that reads the exit code or the summary line fails
+    at once — loud, but only if you know to look here.
     """
 
     alertable_count = TemplateForecaster.alertable_count
@@ -806,6 +811,7 @@ class _RealAlertableCountBot(MagicMock):
     _prediction_market_source_loss_count = TemplateForecaster._prediction_market_source_loss_count
     _provider_degradation_count = TemplateForecaster._provider_degradation_count
     _publish_attempt_failures = TemplateForecaster._publish_attempt_failures
+    _publish_skipped_closed_count = TemplateForecaster._publish_skipped_closed_count
 
 
 def _bot_with_real_alertable_count() -> _RealAlertableCountBot:

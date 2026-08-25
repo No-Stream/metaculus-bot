@@ -57,6 +57,7 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
+from metaculus_bot.publish_gate import publish_skipped_closed_count, reset_publish_skipped_closed
 from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
@@ -395,8 +396,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._research.reset_run_degradation_counters()
         # Same per-run cadence as the module-scoped research counters above: the
         # publish-hardening wrapper has no handle back to the bot, so its
-        # retry-exhaustion counter lives at module scope and is zeroed here.
+        # retry-exhaustion counter lives at module scope and is zeroed here. The
+        # close-time gate's counter is module-scoped for the same reason.
         reset_publish_attempt_failures()
+        reset_publish_skipped_closed()
 
         results = await super().forecast_questions(questions, return_exceptions)
 
@@ -452,6 +455,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @property
     def _publish_attempt_failures(self) -> int:
         return publish_attempt_failures()
+
+    @property
+    def _publish_skipped_closed_count(self) -> int:
+        return publish_skipped_closed_count()
 
     @property
     def _gap_fill_v2_error_count(self) -> int:

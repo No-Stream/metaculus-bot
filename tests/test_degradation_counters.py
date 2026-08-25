@@ -7,12 +7,14 @@ telemetry parser reads them, so the text is a contract, not a convenience.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from forecasting_tools.data_models.questions import BinaryQuestion
 
 from main import TemplateForecaster
-from metaculus_bot import publish_hardening
+from metaculus_bot import publish_gate, publish_hardening
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.research import prediction_market, provider_health
 
@@ -121,7 +123,11 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
 
     degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
     assert "provider_degradation=0" in degradation, degradation
-    assert degradation.endswith("publish_attempt_failures=0"), degradation
+    assert "publish_attempt_failures=0" in degradation, degradation
+    # The newest key is the tail, and the tail is where the telemetry parser's optional
+    # groups end — appending past it without extending that regex breaks the whole
+    # line's harvest, because the pattern is $-anchored.
+    assert degradation.endswith("publish_skipped_closed=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
 
 
@@ -167,6 +173,36 @@ async def test_forecast_questions_resets_publish_attempt_failures(mock_general_l
         assert bot.alertable_count == 0
     finally:
         publish_hardening.reset_publish_attempt_failures()
+
+
+@pytest.mark.asyncio
+async def test_close_time_skip_is_alertable_and_reset_per_run(mock_general_llm, caplog):
+    """A publish skipped because the question had already closed means latency cost us
+    a question, so it must redden CI rather than pass quietly — and like its
+    publish-hardening sibling the counter is module state that forecast_questions has
+    to zero, else it leaks into the next run in the same process."""
+    bot = _bot(mock_general_llm)
+
+    publish_gate.skip_publish_if_closed(
+        BinaryQuestion(
+            question_text="Will this have closed by publish time?",
+            id_of_question=45085,
+            close_time=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    try:
+        assert publish_gate.publish_skipped_closed_count() == 1
+        assert bot.alertable_count == 1
+
+        with caplog.at_level(logging.INFO):
+            await bot.forecast_questions([])
+
+        assert publish_gate.publish_skipped_closed_count() == 0
+        assert bot.alertable_count == 0
+        degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
+        assert "publish_skipped_closed=0" in degradation, degradation
+    finally:
+        publish_gate.reset_publish_skipped_closed()
 
 
 @pytest.mark.asyncio

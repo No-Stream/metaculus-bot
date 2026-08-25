@@ -95,10 +95,35 @@ the 58:30 per-question wall clock; interaction with `WALL_CLOCK_STACKING_MIN_BUD
 subset; effects <0.02 Brier are undetectable at our n, so this is a big-lever ship-and-watch bet
 with era-bucketing.
 
-### Frozen-triple numeric watch: re-run the ensemble delta after a same-lineage era accrues (added 2026-07-20, HIGH)
+### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 
-Status: shipped-and-watch; as of 2026-08-24 the cohort is complete at 37 numerics forecast and
-pending resolution — checkpoint 2026-09-12, descriptive read only (plan step 2). The drop to the
+**Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Three
+questions come due at the same checkpoint and share one cohort, so they are read together:
+
+1. **The numeric ensemble delta** — the accepted +3.24 lean toward the retired 6-member roster,
+   which is what this entry was originally opened for (detail and decision rule below).
+2. **The all-types peer gap.** The era's first scores came in mildly below the older eras: STRICT
+   triple mean peer **+4.28 (n=12)** against post_flip's +11.6 (n=104), and the first
+   within-tournament cut (summer-futureeval spans both eras, so the question generator is held
+   fixed) puts the gap at **−4.69 peer points after type-mix adjustment** (raw −7.3;
+   Mann-Whitney p=0.084 unmatched, 0.030 lag-matched — and the comparison arm is not
+   cluster-collapsed, so every p is generous). Effective independent n is **10 clusters, 8
+   conservative**, and the resolved 14 are by construction the era's short-horizon tail (median
+   submit-to-resolve 18.0 days vs 27.7 post-flip). So this is a flag to re-read on the full
+   cohort, not a finding: at the checkpoint the same cut should run on ~35 resolved records
+   instead of 12, and the question is whether the gap persists, shrinks, or was a
+   short-horizon-tail artifact. (`scratch/residual_2026-08-24/SYNTHESIS.md` §1.)
+3. **The anchored/unanchored and v2-treated/untreated splits**, which are newly cheap to run:
+   `performance_analysis/research_tags.py` (shipped 2026-08-24, `dece67f`) now stamps
+   `anchor_present` / `anchor_confidence` / `gfv2_present` / `gfv2_loop_ran` /
+   `research_source_class` onto every performance record straight off the research archive, so the
+   treated-vs-untreated cuts no longer need re-deriving out-of-band each round. Both treatments
+   went live in the same merge as the triple, so the era is the first place either can be measured
+   against a fixed roster — and `anchor_present=False` must be read through
+   `anchor_confidence`, since a trimmed comment-backfill record can read absent when it isn't.
+
+Status: shipped-and-watch; as of 2026-08-24 the numeric cohort is complete at 37 numerics forecast
+and pending resolution — checkpoint 2026-09-12, descriptive read only (plan step 2). The drop to the
 latest-per-vendor triple
 (`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) — authored 2026-07-20, live in prod
 2026-07-21T17:07:37Z in merge `b4e9df0`, and the merge date is where the era clock starts (AGENTS.md,
@@ -147,7 +172,13 @@ collecting more questions.
    any operator precision target; only a new roster-stable era tightens the numeric estimate,
    and no successor tournament slug exists yet (probed 2026-08-24: HTTP 400 on every plausible
    fall-2026 name), so the next era cannot start until a new tournament does.
-   (`scratch/residual_2026-08-24/dim_numeric-width.md` §2.)
+   (`scratch/residual_2026-08-24/dim_numeric-width.md` §2.) **Run scope items 2 and 3 from the
+   header in the same pass** — the all-types within-tournament peer gap on the full resolved
+   cohort, and the anchored/unanchored + v2-treated/untreated splits off the
+   `research_tags.py` fields — since all three read the same records and re-pulling is free.
+   Same precision caveat applies to each: at n≈35 with ~10 independent clusters these are
+   descriptive reads, and no fitted correction ships off them (AGENTS.md: fitted calibration
+   layers need a decisive out-of-sample era test).
 3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
    delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
    top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
@@ -222,10 +253,10 @@ call.
 Status: RESOLVED. Grok was removed entirely as part of the drop to the 3-member
 latest-per-vendor triple (authored 2026-07-20, live in prod 2026-07-21T17:07Z) — not the incremental
 6→5 step this entry originally scoped. See the
-"Frozen-triple numeric watch" entry above and the ensemble analyses in
+"Triple-era September re-read" entry above and the ensemble analyses in
 `scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`. The
 re-add question (should any dropped member, grok included, come back?) now lives in that
-frozen-triple watch. Evidence retained below for the record.
+triple-era re-read. Evidence retained below for the record.
 
 A paired leave-one-out replay on 2026-07-19 found that dropping grok from the 6-model roster
 IMPROVES binary accuracy: Δlog-score **+1.83 [+0.74, +3.00]** favoring the drop (n=184) — but
@@ -233,8 +264,8 @@ that signal is entirely **grok-4.3-lineage** (grok-4.5, the slot at the time, ha
 resolved questions to score). The 2026-07-20 power model corroborated the direction on the
 modern lineage's predecessors: grok read as a drag on binary (−2.4 log pts/Q) and MC (−1.3),
 and a help only on numeric (+2.0), with every CI spanning zero. Grok's numeric help is the one
-reason a re-add could be considered — and that is exactly the numeric lean the frozen-triple
-watch tracks. If grok is ever reconsidered, era-bucket the read (do NOT pool grok-4.3 and
+reason a re-add could be considered — and that is exactly the numeric lean the triple-era
+re-read tracks. If grok is ever reconsidered, era-bucket the read (do NOT pool grok-4.3 and
 grok-4.5 evidence); the parameterized replay `scratch/residual_2026-07-18/followups/grok_loo_replay.py`
 is free to re-run (offline, no API).
 
