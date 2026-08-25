@@ -166,9 +166,8 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     title = post_data.get("title", "")
 
     if title.startswith("[PRACTICE]"):
-        logger.info(
-            f"  Skipping PRACTICE post {post_id}: {title[:60]}"
-        )  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
+        title_preview = title[:60]  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
+        logger.info(f"  Skipping PRACTICE post {post_id}: {title_preview}")
         return []
 
     group = post_data.get("group_of_questions")
@@ -540,9 +539,52 @@ def save_dataset(data: list[dict], path: str) -> None:
     logger.info(f"Saved {len(data)} records to {path}")
 
 
+_SCORE_FIELDS = ("brier_score", "log_score", "numeric_log_score", "mc_log_score")
+# Recomputation float wiggle vs a genuinely different stored value. The scorer
+# reproduces the platform to ~1e-14; the known-stale gaps start at 0.6.
+_RESCORE_ATOL = 1e-6
+
+
+def rescore_records(records: list[dict]) -> int:
+    """Recompute every record's score fields from its own stored inputs, in place.
+
+    Scores are pure functions of fields the record already carries (type,
+    resolution, forecast values, scaling, bounds) — but the score VALUES in a
+    cached dataset are whatever the scorer computed when the file was written,
+    so a scorer fix never reaches previously-saved JSON. That bit for a month:
+    seven fall-2025 ``zero_point`` log-scaled records kept linear-bucket
+    ``numeric_log_score`` values up to 358.8 off the platform after the
+    zero-point coercion fix (``3c7a3e2``) had already corrected the live path,
+    because the round datasets merge frozen per-tournament baselines.
+
+    A field is only overwritten when recomputation yields a value, so healing
+    can never DELETE a score whose inputs are no longer recomputable. Returns
+    the number of records whose scores changed.
+    """
+    changed = 0
+    for record in records:
+        if not isinstance(record, dict) or not all(k in record for k in ("type", "resolution_parsed")):
+            continue
+        fresh = {**record, **{field: None for field in _SCORE_FIELDS}}
+        _compute_scores(fresh)
+        record_changed = False
+        for field in _SCORE_FIELDS:
+            new = fresh[field]
+            old = record.get(field)
+            if new is not None and (old is None or abs(new - old) > _RESCORE_ATOL):
+                record[field] = new
+                record_changed = True
+        changed += record_changed
+    return changed
+
+
 def load_dataset(path: str) -> list[dict]:
-    """Load dataset from a JSON file."""
+    """Load dataset from a JSON file, healing any stale stored scores (see rescore_records)."""
     with open(path) as f:
         data = json.load(f)
-    logger.info(f"Loaded {len(data)} records from {path}")
+    changed = rescore_records(data)
+    if changed:
+        logger.info(f"Loaded {len(data)} records from {path}; rescored {changed} with stale stored scores")
+    else:
+        logger.info(f"Loaded {len(data)} records from {path}")
     return data

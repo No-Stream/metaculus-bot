@@ -6,7 +6,9 @@ disagreement_predicts_error.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -24,7 +26,12 @@ from metaculus_bot.performance_analysis.analysis import (
     per_model_cohort,
     stacking_effectiveness,
 )
-from metaculus_bot.performance_analysis.collector import _process_post, resolve_numeric_record_to_score_inputs
+from metaculus_bot.performance_analysis.collector import (
+    _process_post,
+    load_dataset,
+    rescore_records,
+    resolve_numeric_record_to_score_inputs,
+)
 from metaculus_bot.performance_analysis.parsing import anonymous_model_key, is_anonymous_model_key
 
 
@@ -887,6 +894,57 @@ class TestNumericPitAnalysisValueGrid:
         result = numeric_pit_analysis([log_rec])
         assert result["count"] == 1
         assert result["pit_values"][0] == pytest.approx(0.5, abs=0.02)
+
+
+class TestRescoreRecords:
+    """Stale stored scores in cached datasets must self-heal on load.
+
+    Scores are pure functions of fields the record carries, but a cached JSON's
+    score VALUES are whatever the scorer computed when the file was written — a
+    scorer fix never reaches previously-saved files. The checked-in q38991
+    fixture is the real record that carried a linear-bucket numeric_log_score of
+    −193.29 for a month after the zero_point coercion fix, against a platform
+    spot_baseline_score of 165.54.
+    """
+
+    _FIXTURE = Path(__file__).parent / "data" / "q38991_stale_zero_point_score.json"
+
+    def _stale_record(self) -> dict:
+        return json.loads(self._FIXTURE.read_text())
+
+    def test_zero_point_record_rescores_to_platform_value(self):
+        record = self._stale_record()
+        assert record["scaling"]["zero_point"] == 0
+        assert record["numeric_log_score"] == pytest.approx(-193.292, abs=1e-3)
+
+        changed = rescore_records([record])
+
+        assert changed == 1
+        assert record["numeric_log_score"] == pytest.approx(record["metaculus_scores"]["spot_baseline_score"], abs=1e-9)
+
+    def test_fresh_scores_left_untouched(self):
+        record = self._stale_record()
+        rescore_records([record])
+        healed = record["numeric_log_score"]
+        assert rescore_records([record]) == 0
+        assert record["numeric_log_score"] == healed
+
+    def test_unrecomputable_score_is_never_deleted(self):
+        # Missing scaling bounds -> recomputation yields None -> keep the stored value.
+        record = self._stale_record()
+        record["scaling"] = {}
+        stored = record["numeric_log_score"]
+        assert rescore_records([record]) == 0
+        assert record["numeric_log_score"] == stored
+
+    def test_load_dataset_heals_stale_scores(self, tmp_path: Path):
+        path = tmp_path / "cached.json"
+        path.write_text(json.dumps([self._stale_record()]))
+        (loaded,) = load_dataset(str(path))
+        assert loaded["numeric_log_score"] == pytest.approx(loaded["metaculus_scores"]["spot_baseline_score"], abs=1e-9)
+
+    def test_malformed_record_is_skipped(self):
+        assert rescore_records([{"no_type": True}, "not-a-dict"]) == 0  # type: ignore[list-item]
 
 
 class TestResolveNumericScoreInputsZeroPoint:

@@ -33,6 +33,7 @@ from metaculus_bot.performance_analysis.collector import (
     fetch_bot_comments,
     fetch_resolved_questions,
     load_dataset,
+    rescore_records,
     save_dataset,
 )
 from metaculus_bot.performance_analysis.parsing import (
@@ -118,6 +119,7 @@ __all__ = [
     "per_model_binary_scores",
     "per_model_cohort",
     "rank_our_models_by_accuracy",
+    "rescore_records",
     "research_tags_for_qid",
     "research_tags_for_record",
     "save_dataset",
