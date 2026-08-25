@@ -17,6 +17,7 @@ A leaf module: it depends on nothing else in the anchor stack, so ``ts_render`` 
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -35,9 +36,23 @@ CALENDAR_DAYS_PER_MONTH = 30.4375
 
 QUANTILE_LEVELS = (0.10, 0.50, 0.90)
 
+# Below this many rows the observed-density read is too noisy to overrule the trading-day
+# default (a fortnight of bars can't distinguish 5/7 from 7/7).
+_MIN_ROWS_FOR_DENSITY_READ = 14
+
+# Rows per calendar day above which a daily-bar series is read as a 24/7 market. 5/7 = 0.714
+# for exchange-traded assets (0.690 with holidays), 1.0 for 24/7; 6/7 splits them with room
+# on both sides.
+_TWENTY_FOUR_SEVEN_ROWS_PER_DAY = 6.0 / 7.0
+
 
 def _detect_freq(index: pd.DatetimeIndex) -> Freq:
-    """Infer native frequency from the median day-gap between observations."""
+    """Infer native frequency from the median day-gap between observations.
+
+    Median, so a business-day series' weekend gaps don't drag it out of "daily" — which also
+    means it CANNOT tell 5-bars-a-week from 7 (both have a 1.0-day median gap). That
+    distinction is ``observed_periods_per_year``'s job; use ``series_clock`` to get both.
+    """
     if len(index) < 3:
         return "daily"
     diffs = np.diff(index.values).astype("timedelta64[D]").astype("float64")
@@ -49,23 +64,109 @@ def _detect_freq(index: pd.DatetimeIndex) -> Freq:
     return "monthly"
 
 
-def horizon_steps(freq: Freq, calendar_days: int) -> int:
-    """Native-step horizon for a calendar-day window, by series frequency (>=1)."""
-    if freq == "daily":
-        h = round(calendar_days * TRADING_DAYS_PER_YEAR / CALENDAR_DAYS_PER_YEAR)
-    elif freq == "weekly":
+def observed_periods_per_year(index: pd.Index) -> int:
+    """Observed-density annualization basis for a DAILY-bar series: 252 or 365.
+
+    Reads rows per calendar day over the series' own span: ~5/7 (0.71) for exchange-traded
+    assets -> 252, ~1.0 for 24/7 markets (crypto) -> 365. Deliberately reads the SERIES, not
+    the ticker: any heuristic keyed on ticker names goes stale the first time a new 24/7
+    symbol is classified. Anything unmeasurable — short series, non-datetime index, zero
+    span — degrades to the trading-day basis, the historical behavior.
+
+    THE package's one definition of this read (``financial_data`` and ``series_clock`` both
+    call it), because the whole defect class is a row count standing in for calendar time and
+    a second copy is where a correction goes missing.
+
+    Known limitation: a series sampled every 2-4 days reads as "daily" in ``_detect_freq`` and
+    lands on the 252 basis here, which OVERSTATES its horizon in steps. No registry series has
+    that cadence, and an overstated horizon fails safe — ``_render_single`` withholds the band
+    (and the caller then drops the section) once ``y.size <= h``.
+    """
+    if len(index) < _MIN_ROWS_FOR_DENSITY_READ:
+        return TRADING_DAYS_PER_YEAR
+    try:
+        span_days = (index[-1] - index[0]).days
+    except (TypeError, AttributeError):
+        # yfinance/FRED normally hand us a DatetimeIndex, but a caller passing a plain
+        # RangeIndex has no span to measure; treat it as unmeasurable rather than crashing
+        # a research provider on a cosmetic stat.
+        return TRADING_DAYS_PER_YEAR
+    if span_days <= 0:
+        return TRADING_DAYS_PER_YEAR
+    rows_per_day = (len(index) - 1) / span_days
+    return CALENDAR_DAYS_PER_YEAR if rows_per_day > _TWENTY_FOUR_SEVEN_ROWS_PER_DAY else TRADING_DAYS_PER_YEAR
+
+
+@dataclass(frozen=True)
+class SeriesClock:
+    """A fetched series' observation clock: native resolution AND observed sampling density.
+
+    Both facts are needed to convert between calendar time (what a question asks about: "by
+    2026-09-01", "annualized") and observation index (rows the estimators slide over), and
+    ``freq`` alone cannot do it: ``_detect_freq`` reads the MEDIAN gap, which is 1.0 day for a
+    business-day series (gaps 1,1,1,1,3) AND 1.0 for a 24/7 series, so both land in "daily"
+    while their rows-per-year differ by 365/252 = 1.45x. Bundling the pair in one object is
+    what stops a caller from converting with the default basis on a 24/7 series — the
+    q44882 (ETH-USD) defect class.
+    """
+
+    freq: Freq
+    periods_per_year: int
+
+    @property
+    def step_unit(self) -> str:
+        """Noun for one observation, for rendered horizon labels ("21-trading-day windows")."""
+        if self.freq == "weekly":
+            return "week"
+        if self.freq == "monthly":
+            return "month"
+        return "trading-day" if self.periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+
+
+# The clock of a DERIVED monthly target (MoM change / MoM % / monthly average). One step is
+# one month, so the daily-only density field is never read; it carries the nominal basis.
+MONTHLY_CLOCK = SeriesClock(freq="monthly", periods_per_year=TRADING_DAYS_PER_YEAR)
+
+
+def series_clock(index: pd.DatetimeIndex) -> SeriesClock:
+    """Read both clock facts off a series' index. The density read only means anything for a
+    daily-bar series, so weekly/monthly carry the nominal trading-day basis unread (their own
+    horizon conversions are already calendar-honest: /7 and /30.4375)."""
+    freq = _detect_freq(index)
+    periods_per_year = observed_periods_per_year(index) if freq == "daily" else TRADING_DAYS_PER_YEAR
+    return SeriesClock(freq=freq, periods_per_year=periods_per_year)
+
+
+def horizon_steps(clock: SeriesClock, calendar_days: int) -> int:
+    """Native-step horizon for a calendar-day window, on the series' own clock (>=1).
+
+    Takes the whole ``SeriesClock`` rather than a ``Freq`` plus an optional density, and has no
+    default basis, so a new call site physically cannot convert a 24/7 series on the
+    trading-day factor. On the 252 basis this is byte-identical to the historical formula; on
+    the 365 basis one step IS one calendar day, so h == calendar_days.
+    """
+    if clock.freq == "daily":
+        h = round(calendar_days * clock.periods_per_year / CALENDAR_DAYS_PER_YEAR)
+    elif clock.freq == "weekly":
         h = round(calendar_days / 7.0)
     else:  # monthly
         h = round(calendar_days / CALENDAR_DAYS_PER_MONTH)
     return max(1, h)
 
 
-def _horizon_end_date(as_of: pd.Timestamp, freq: Freq, h: int) -> pd.Timestamp:
-    """Approximate calendar date of the horizon end, for placing the projected
-    band ribbon on the chart (mirrors the replay's make_charts._horizon_dates)."""
-    if freq == "daily":
-        return as_of + pd.Timedelta(days=round(h * CALENDAR_DAYS_PER_YEAR / TRADING_DAYS_PER_YEAR))
-    if freq == "weekly":
+def _horizon_end_date(as_of: pd.Timestamp, clock: SeriesClock, h: int) -> pd.Timestamp:
+    """Approximate calendar date of the horizon end, for placing the projected band ribbon on
+    the chart (mirrors the replay's make_charts._horizon_dates).
+
+    The exact inverse of ``horizon_steps`` on the same clock, and that pairing is load-bearing:
+    the two conversions used to be wrong in OPPOSITE directions by the same 365/252, so on a
+    24/7 series they cancelled and the chart's ribbon happened to end at the right date while
+    the band it drew was a 62-day band labelled 90 days. Fixing either alone would have broken
+    the x-extent that was accidentally right.
+    """
+    if clock.freq == "daily":
+        return as_of + pd.Timedelta(days=round(h * CALENDAR_DAYS_PER_YEAR / clock.periods_per_year))
+    if clock.freq == "weekly":
         return as_of + pd.Timedelta(weeks=h)
     return as_of + pd.DateOffset(months=h)
 

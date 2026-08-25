@@ -31,7 +31,11 @@ from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
-from metaculus_bot.research.ts_estimators import CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR
+from metaculus_bot.research.ts_estimators import (
+    CALENDAR_DAYS_PER_YEAR,
+    TRADING_DAYS_PER_YEAR,
+    observed_periods_per_year,
+)
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -381,7 +385,7 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 
         # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the same
         # basis drives the annualization factor AND every "1y"/"52-week" row count.
-        periods_per_year = _infer_periods_per_year(close)
+        periods_per_year = observed_periods_per_year(close.index)
 
         # Period returns
         returns_section = _compute_period_returns(close, periods_per_year)
@@ -393,7 +397,11 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
             daily_returns = close.pct_change().dropna()
             recent_daily = daily_returns.iloc[-FINANCIAL_YFINANCE_RECENT_DAYS:]
             annualized_vol = recent_daily.std() * np.sqrt(periods_per_year) * 100
-            parts.append(f"- 30-day annualized volatility: {annualized_vol:.1f}%")
+            # Name the step unit: FINANCIAL_YFINANCE_RECENT_DAYS is a ROW count, which is six
+            # calendar weeks on an exchange-traded series and 30 calendar days on a 24/7 one, so
+            # a bare "30-day" label was itself a row count posing as a calendar window.
+            unit = "trading-day" if periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+            parts.append(f"- {FINANCIAL_YFINANCE_RECENT_DAYS}-{unit} annualized volatility: {annualized_vol:.1f}%")
 
         # 52-week range
         year_slice = close.iloc[-min(periods_per_year, len(close)) :]
@@ -427,44 +435,33 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 # rows/year (5 trading days a week), 24/7 markets (crypto) print ~365. Annualizing
 # a 24/7 series with sqrt(252) understates vol by ~17% (sqrt(252/365) ~= 0.83), and
 # row-count windows labeled "1y"/"52-week" then span only ~8.2 calendar months —
-# both bit q44882 (ETH-USD). The constants themselves are the package's shared pair
-# (imported from ts_estimators above — one definition, so a correction can't miss a copy).
+# both bit q44882 (ETH-USD). The two constants AND the observed-density read that picks
+# between them are the package's shared definitions, imported from ts_estimators above, so a
+# correction cannot miss a copy — the ts-anchor stack had exactly that miss until 2026-08-25.
 
 # Row offsets behind each period-return label, per basis. On the 365 basis the
 # offsets are calendar days; on the 252 basis they are the trading-day
 # conventions (5/wk), byte-identical to the historical behavior.
 _PERIOD_ROW_OFFSETS: dict[int, list[tuple[str, int]]] = {
-    TRADING_DAYS_PER_YEAR: [("1d", 1), ("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", 252)],
-    CALENDAR_DAYS_PER_YEAR: [("1d", 1), ("1w", 7), ("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)],
+    TRADING_DAYS_PER_YEAR: [("1d", 1), ("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", TRADING_DAYS_PER_YEAR)],
+    CALENDAR_DAYS_PER_YEAR: [
+        ("1d", 1),
+        ("1w", 7),
+        ("1m", 30),
+        ("3m", 91),
+        ("6m", 182),
+        ("1y", CALENDAR_DAYS_PER_YEAR),
+    ],
 }
 
-# Below this many rows the density read is too noisy to overrule the default.
-_MIN_ROWS_FOR_BASIS_INFERENCE = 14
 
+def _compute_period_returns(close: pd.Series, periods_per_year: int) -> str:
+    """Compute returns over standard periods, returning a formatted string.
 
-def _infer_periods_per_year(close: pd.Series) -> int:
-    """Observed-density annualization basis: rows per calendar day over the series' own span.
-
-    ~5/7 (0.71) for exchange-traded assets -> 252; ~1.0 for 24/7 markets -> 365,
-    split at 6 days/week. Deliberately reads the SERIES, not the ticker: any
-    heuristic keyed on ticker names goes stale the first time a new 24/7 symbol is
-    classified. Anything unmeasurable — short series, non-datetime index, zero
-    span — degrades to the trading-day basis, the historical behavior.
+    ``periods_per_year`` is REQUIRED (no trading-day default): the row offsets it selects are
+    what make each label a true calendar period, so a caller that forgets it would silently
+    reproduce the q44882 mislabelling on a 24/7 series.
     """
-    if len(close) < _MIN_ROWS_FOR_BASIS_INFERENCE:
-        return TRADING_DAYS_PER_YEAR
-    try:
-        span_days = (close.index[-1] - close.index[0]).days
-    except (TypeError, AttributeError):
-        return TRADING_DAYS_PER_YEAR
-    if span_days <= 0:
-        return TRADING_DAYS_PER_YEAR
-    rows_per_day = (len(close) - 1) / span_days
-    return CALENDAR_DAYS_PER_YEAR if rows_per_day > 6.0 / 7.0 else TRADING_DAYS_PER_YEAR
-
-
-def _compute_period_returns(close: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> str:
-    """Compute returns over standard periods, returning a formatted string."""
     periods = _PERIOD_ROW_OFFSETS[periods_per_year]
     lines = []
     for label, days in periods:

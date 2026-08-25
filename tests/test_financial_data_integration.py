@@ -66,8 +66,10 @@ def test_yfinance_real_fetch_returns_parseable_markdown():
     assert "52-week range:" in md, "Missing '52-week range' line"
     assert "Last 5 closes:" in md, "Missing 'Last 5 closes' section"
     assert "Period returns:" in md, "Missing 'Period returns' section"
-    # Volatility line is conditional on >=30 daily returns; AAPL always has that.
-    assert "30-day annualized volatility:" in md, "Missing volatility line"
+    # Volatility line is conditional on >=30 daily returns; AAPL always has that. AAPL is
+    # exchange-traded, so the label must name TRADING days — a bare "30-day" would mean the
+    # observed-density read misfired and annualized a business-day series on the 365 basis.
+    assert "30-trading-day annualized volatility:" in md, "Missing volatility line"
 
 
 @pytest.mark.skipif(not os.getenv("RUN_INTEGRATION_TESTS"), reason=_SKIP_REASON)

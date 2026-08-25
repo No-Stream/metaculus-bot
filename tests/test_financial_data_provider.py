@@ -20,13 +20,13 @@ from metaculus_bot.research.financial_data import (
     _fetch_fred_data,
     _fetch_fred_data_ceiling,
     _fetch_yfinance_data,
-    _infer_periods_per_year,
     _render_fred_series,
     extract_financial_identifiers_from_criteria,
     financial_data_provider,
 )
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
+from metaculus_bot.research.ts_estimators import observed_periods_per_year
 from metaculus_bot.research.ts_fetch import FetchError
 
 
@@ -256,11 +256,11 @@ class TestAnnualizationBasis:
         rng = np.random.default_rng(7)
         dates = pd.bdate_range(end="2026-03-30", periods=300)
         close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
-        assert _infer_periods_per_year(close) == 252
+        assert observed_periods_per_year(close.index) == 252
 
         result = self._fetch_with_history(close)
         expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
-        assert self._line_value(result, "- 30-day annualized volatility") == f"{expected_vol:.1f}%"
+        assert self._line_value(result, "- 30-trading-day annualized volatility") == f"{expected_vol:.1f}%"
         expected_1y = (close.iloc[-1] / close.iloc[-253] - 1) * 100
         assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
         year_slice = close.iloc[-252:]
@@ -273,11 +273,11 @@ class TestAnnualizationBasis:
         # Plant a spike only the 365-row window can see: 300 rows back is beyond
         # the old 252-row slice but inside the true 52 calendar weeks.
         close.iloc[-300] = close.max() * 3
-        assert _infer_periods_per_year(close) == 365
+        assert observed_periods_per_year(close.index) == 365
 
         result = self._fetch_with_history(close)
         expected_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(365) * 100
-        assert self._line_value(result, "- 30-day annualized volatility") == f"{expected_vol:.1f}%"
+        assert self._line_value(result, "- 30-calendar-day annualized volatility") == f"{expected_vol:.1f}%"
         # A 252-basis vol would be ~17% lower; make sure that's not what rendered.
         wrong_vol = close.pct_change().dropna().iloc[-30:].std() * np.sqrt(252) * 100
         assert f"{wrong_vol:.1f}%" != f"{expected_vol:.1f}%"
@@ -300,7 +300,7 @@ class TestAnnualizationBasis:
         n_rows = FINANCIAL_YFINANCE_LOOKBACK_DAYS
         dates = pd.date_range(end="2026-07-31", periods=n_rows, freq="D")
         close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n_rows))), index=dates)
-        assert _infer_periods_per_year(close) == 365
+        assert observed_periods_per_year(close.index) == 365
 
         result = self._fetch_with_history(close)
 
@@ -310,7 +310,7 @@ class TestAnnualizationBasis:
     def test_short_series_degrades_to_trading_day_basis(self):
         dates = pd.date_range(end="2026-07-31", periods=10, freq="D")
         close = pd.Series(np.linspace(100.0, 110.0, 10), index=dates)
-        assert _infer_periods_per_year(close) == 252
+        assert observed_periods_per_year(close.index) == 252
         # And the full fetch still renders (no vol line under 30 rows, no crash).
         result = self._fetch_with_history(close)
         assert "- Current price:" in result
@@ -318,12 +318,12 @@ class TestAnnualizationBasis:
 
     def test_non_datetime_index_degrades_to_trading_day_basis(self):
         close = pd.Series(np.linspace(100.0, 110.0, 50))  # RangeIndex
-        assert _infer_periods_per_year(close) == 252
+        assert observed_periods_per_year(close.index) == 252
 
     def test_zero_span_index_degrades_to_trading_day_basis(self):
         dates = pd.DatetimeIndex(["2026-07-31"] * 50)
         close = pd.Series(np.linspace(100.0, 110.0, 50), index=dates)
-        assert _infer_periods_per_year(close) == 252
+        assert observed_periods_per_year(close.index) == 252
 
 
 class TestFetchFredData:
