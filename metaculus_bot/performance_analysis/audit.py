@@ -19,6 +19,7 @@ import random
 from pathlib import Path
 from typing import Literal
 
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
 from metaculus_bot.performance_analysis.collector import load_dataset, resolve_numeric_record_to_score_inputs
 from metaculus_bot.performance_analysis.parsing import (
@@ -178,9 +179,15 @@ def select_cohort(
         binary_pool = [r for r in middle if r.get("type") == "binary"]
         numeric_pool = [r for r in middle if r.get("type") in ("numeric", "discrete")]
         mc_pool = [r for r in middle if r.get("type") == "multiple_choice"]
-        sel_binary = rng.sample(binary_pool, min(n_binary, len(binary_pool)))
-        sel_numeric = rng.sample(numeric_pool, min(n_numeric, len(numeric_pool)))
-        sel_mc = rng.sample(mc_pool, min(n_mc, len(mc_pool)))
+        sel_binary = rng.sample(
+            binary_pool, min(n_binary, len(binary_pool))
+        )  # HARNESS-SCAN-EXEMPT-subsampling  # seeded audit-cohort pick is this function's purpose
+        sel_numeric = rng.sample(
+            numeric_pool, min(n_numeric, len(numeric_pool))
+        )  # HARNESS-SCAN-EXEMPT-subsampling  # seeded audit-cohort pick is this function's purpose
+        sel_mc = rng.sample(
+            mc_pool, min(n_mc, len(mc_pool))
+        )  # HARNESS-SCAN-EXEMPT-subsampling  # seeded audit-cohort pick is this function's purpose
     else:
         raise ValueError(  # type: ignore[reportUnreachable]
             f"Unknown mode {mode!r}; expected 'worst', 'best', or 'middle'"
@@ -293,6 +300,19 @@ def _rank_binary(record: dict) -> list[dict]:
     return ranked
 
 
+def _record_cdf_size(record: dict) -> int:
+    """The question's own CDF grid size: ``inbound_outcome_count + 1``, else the
+    published CDF's length, else the standard 201. Discrete questions run coarser
+    grids, and a per-member CDF rebuilt on the 201 default is scored against a
+    1/200 baseline instead of the question's own (up to 85 log pts on an 11-point
+    grid, always inflating good coarse-grid scores)."""
+    inbound = (record.get("scaling") or {}).get("inbound_outcome_count")
+    if inbound:
+        return int(inbound) + 1
+    published = record.get("our_forecast_values") or []
+    return len(published) if len(published) >= 3 else PCHIP_CDF_POINTS
+
+
 def _rank_numeric(record: dict) -> list[dict]:
     score_inputs = resolve_numeric_record_to_score_inputs(record)
     if score_inputs is None:
@@ -301,6 +321,8 @@ def _rank_numeric(record: dict) -> list[dict]:
 
     open_lower = bool(record.get("open_lower_bound", False))
     open_upper = bool(record.get("open_upper_bound", False))
+    cdf_size = _record_cdf_size(record)
+    min_step, max_step = grid_step_constraints(cdf_size)
 
     per_model = record.get("per_model_numeric_percentiles") or {}
     skipped_count = 0
@@ -316,6 +338,9 @@ def _rank_numeric(record: dict) -> list[dict]:
                 upper_bound=upper_bound,
                 lower_bound=lower_bound,
                 zero_point=zero_point,
+                min_step=min_step,
+                max_step=max_step,
+                num_points=cdf_size,
             )
         except (ValueError, RuntimeError) as exc:
             logger.warning(f"Per-model PCHIP failure post={post_id} model={model}: {exc}")
@@ -411,7 +436,8 @@ def _format_our_prediction(record: dict) -> str:
         fvs = record.get("our_forecast_values") or []
         if options and len(fvs) == len(options):
             pairs = sorted(zip(options, fvs, strict=False), key=lambda t: -t[1])
-            return ", ".join(f"{o}={p * 100:.1f}%" for o, p in pairs[:3]) + (", ..." if len(pairs) > 3 else "")
+            top3 = pairs[:3]  # HARNESS-SCAN-EXEMPT-subsampling  # display truncation
+            return ", ".join(f"{o}={p * 100:.1f}%" for o, p in top3) + (", ..." if len(pairs) > 3 else "")
         return str(fvs)[:80]
     if q_type in ("numeric", "discrete"):
         fvs = record.get("our_forecast_values") or []

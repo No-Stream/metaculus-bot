@@ -17,6 +17,7 @@ from metaculus_bot.performance_analysis.analysis import (
     binary_summary,
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
+    max_step_clamp_screen,
     no_bias_check,
     numeric_pit_analysis,
     per_model_binary_scores,
@@ -730,6 +731,104 @@ class TestInterpolatePitOutOfGrid:
         result = numeric_pit_analysis([record])
         assert result["count"] == 1
         assert result["pit_values"][0] == pytest.approx(0.10, abs=1e-9)
+
+
+class TestMaxStepClampScreen:
+    """The q43913 signature: a published bin pinned at the per-bin max-step cap while
+    every member's own declared curve wanted materially more mass there. The cap is
+    era-correct — flat 0.2 before the grid-scaled cap reached main (b4e9df0), the
+    grid's own ``grid_step_constraints`` max after — so a post-fix coarse-grid
+    discrete that legitimately holds a 0.2 bin must NOT fire."""
+
+    # 11-point integer grid; steps[1] (the [1, 2] bin) is exactly 0.20.
+    _GRID = [float(v) for v in range(11)]
+    _CDF = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
+    # Both members concentrate ~0.65 of their mass on the [1, 2] bin.
+    _MEMBERS = {
+        "model-a": [[10.0, 0.9], [50.0, 1.3], [90.0, 2.1]],
+        "model-b": [[10.0, 0.95], [50.0, 1.4], [90.0, 2.2]],
+    }
+    _PRE_FIX_TS = "2026-06-11T00:00:00Z"
+    _POST_FIX_TS = "2026-08-01T00:00:00Z"
+
+    def _record(
+        self, *, submitted, members=None, cdf=None, grid=None, resolution: float | str = 1.4, q_type="discrete"
+    ) -> dict:
+        grid = grid if grid is not None else self._GRID
+        return {
+            "type": q_type,
+            "our_forecast_values": cdf if cdf is not None else self._CDF,
+            "resolution_parsed": resolution,
+            "scaling": {"range_min": grid[0], "range_max": grid[-1], "continuous_range": grid},
+            "bot_comment_created_at": submitted,
+            "per_model_numeric_percentiles": members if members is not None else self._MEMBERS,
+        }
+
+    def test_pre_fix_coarse_grid_clamp_is_suspected(self):
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS))
+        assert screen["suspected"] is True
+        assert screen["submitted_before_grid_scaled_cap"] is True
+        assert screen["max_step_cap"] == pytest.approx(0.2)
+        assert screen["published_bin_mass"] == pytest.approx(0.2, abs=1e-9)
+        assert screen["min_member_bin_mass"] > 0.6
+
+    def test_post_fix_coarse_grid_point_two_bin_does_not_fire(self):
+        # After 9f1175c an 11-point grid's cap is 1.0, so a 0.2 bin means nothing.
+        screen = max_step_clamp_screen(self._record(submitted=self._POST_FIX_TS))
+        assert screen["suspected"] is False
+        assert screen["submitted_before_grid_scaled_cap"] is False
+        assert screen["max_step_cap"] == pytest.approx(1.0)
+        assert screen["resolution_bin_at_cap"] is False
+
+    def test_post_fix_standard_grid_cap_still_fires(self):
+        # On the 201-point grid the era-correct cap is still 0.2, so the screen keeps
+        # catching genuine clamps after the fix.
+        steps = np.full(200, 0.8 / 199)
+        steps[100] = 0.2
+        cdf = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
+        grid = np.linspace(0.0, 200.0, 201).tolist()
+        members = {
+            "model-a": [[10.0, 99.5], [50.0, 100.4], [90.0, 101.2]],
+            "model-b": [[10.0, 99.6], [50.0, 100.5], [90.0, 101.3]],
+        }
+        screen = max_step_clamp_screen(
+            self._record(submitted=self._POST_FIX_TS, members=members, cdf=cdf, grid=grid, resolution=100.5)
+        )
+        assert screen["max_step_cap"] == pytest.approx(0.2)
+        assert screen["suspected"] is True
+
+    def test_missing_timestamp_treated_as_pre_fix(self):
+        screen = max_step_clamp_screen(self._record(submitted=None))
+        assert screen["submitted_before_grid_scaled_cap"] is True
+        assert screen["max_step_cap"] == pytest.approx(0.2)
+
+    def test_members_not_materially_more_does_not_fire(self):
+        # Members' own curves put ~0.2 on the bin too: the cap coincided with what
+        # the ensemble wanted, so nothing was overridden.
+        diffuse = {
+            "model-a": [[10.0, 0.0], [50.0, 3.0], [90.0, 8.0]],
+            "model-b": [[10.0, 0.5], [50.0, 3.5], [90.0, 8.5]],
+        }
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=diffuse))
+        assert screen["resolution_bin_at_cap"] is True
+        assert screen["suspected"] is False
+
+    def test_single_member_curve_does_not_fire(self):
+        one = {"model-a": self._MEMBERS["model-a"]}
+        assert max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=one))["suspected"] is False
+
+    def test_anonymous_member_keys_are_excluded(self):
+        # A positional key on a stacked record can hold the stacker's aggregate.
+        anon = {"Forecaster 1": self._MEMBERS["model-a"], "Forecaster 2": self._MEMBERS["model-b"]}
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=anon))
+        assert screen["member_bin_masses"] == {}
+        assert screen["suspected"] is False
+
+    def test_non_numeric_resolution_and_type_gates(self):
+        assert max_step_clamp_screen({"type": "binary"})["applicable"] is False
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, resolution="below_lower_bound"))
+        assert screen["suspected"] is False
+        assert screen["reason"] == "non-numeric resolution"
 
 
 class TestNumericPitAnalysisValueGrid:

@@ -6,9 +6,11 @@ and provides reusable analysis functions.
 
 from metaculus_bot.performance_analysis.analysis import (
     binary_summary,
+    declared_percentile_pit,
     disagreement_predicts_error,
     financial_vs_nonfinancial_pit,
     generate_report,
+    max_step_clamp_screen,
     mc_summary,
     no_bias_check,
     numeric_pit_analysis,
@@ -79,6 +81,7 @@ __all__ = [
     "brier_score",
     "build_performance_dataset",
     "compute_production_vs_median_delta",
+    "declared_percentile_pit",
     "detect_historical_stacker_signature",
     "detect_stacker_fired",
     "disagreement_predicts_error",
@@ -98,6 +101,7 @@ __all__ = [
     "is_anonymous_model_key",
     "load_combined_dataset",
     "load_dataset",
+    "max_step_clamp_screen",
     "mc_log_score",
     "mc_summary",
     "no_bias_check",
