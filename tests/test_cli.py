@@ -992,3 +992,49 @@ class TestCliProviderDegradationExit:
             assert bot.alertable_count == 1
         finally:
             pmp.reset_source_loss_counter()
+
+
+class TestAlertableSummarySurvivesForecastFailure:
+    """Emit-then-raise on a raising ``log_report_summary`` (q45085's shape).
+
+    ``compact_log_report_summary`` deliberately re-raises when any report is an
+    exception, so a failed question reddens CI under ``return_exceptions=True`` —
+    but that call used to sit ABOVE the alertable block, so the one run that most
+    needed a summary record left none: q45085's publish failure (2026-08-03) is
+    the single forecasting run since 2026-07-26 with no ``run_alertable_summary``
+    line in the archive. The invariant: the breakdown line is emitted, THEN the
+    original exception propagates. Never a swallow — CI must stay red.
+    """
+
+    def test_breakdown_emitted_then_failure_reraised(self, caplog: pytest.LogCaptureFixture) -> None:
+        bot = _bot_with_real_alertable_count()
+        forecaster_class = MagicMock(return_value=bot)
+        forecaster_class.log_report_summary.side_effect = RuntimeError("1 errors occurred while forecasting")
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"):
+                    with pytest.raises(RuntimeError, match="errors occurred while forecasting"):
+                        cli_main()
+
+        breakdown_lines = [m for m in caplog.messages if m.startswith("Run completed with")]
+        assert len(breakdown_lines) == 1
+        assert "re-raising the forecasting failure" in breakdown_lines[0]
+
+    def test_failure_outranks_the_alertable_exit_and_keeps_the_count(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Both red states at once: the exception (with its traceback) is the red
+        signal rather than ``SystemExit``, and the emitted breakdown still records
+        the positive alertable count instead of losing it to the crash."""
+        bot = _bot_with_real_alertable_count()
+        bot._forecasters_dropped_count = 3
+        forecaster_class = MagicMock(return_value=bot)
+        forecaster_class.log_report_summary.side_effect = RuntimeError("2 errors occurred while forecasting")
+
+        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
+            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
+                with caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"):
+                    with pytest.raises(RuntimeError):
+                        cli_main()
+
+        breakdown = next(m for m in caplog.messages if m.startswith("Run completed with"))
+        assert breakdown.startswith("Run completed with 3 alertable")

@@ -198,7 +198,20 @@ def main() -> None:
         if research_writer is not None:
             research_writer.flush()
 
-    TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
+    # The report summary RAISES by design when any report is an exception
+    # (compact_log_report_summary re-raises so a failed question reddens CI under
+    # return_exceptions=True) — but it used to sit ABOVE the alertable block, so
+    # the one run that most needed a summary record left none: q45085's publish
+    # failure (2026-08-03) propagated here, ``alertable`` was never computed, and
+    # that run is the single forecasting run since 2026-07-26 with no
+    # run_alertable_summary line in the archive. Emit-then-raise: hold the error,
+    # emit the breakdown below on this path too, then re-raise — the original
+    # exception keeps its traceback and CI stays exactly as red as before.
+    report_summary_error: Exception | None = None
+    try:
+        TemplateForecaster.log_report_summary(forecast_reports)  # type: ignore
+    except Exception as exc:  # noqa: HARNESS-SCAN-EXEMPT-broad-except  # held only until the breakdown is emitted, then re-raised below
+        report_summary_error = exc
 
     # Alert on degraded runs. Publication has already happened inside
     # forecast_on_tournament / forecast_questions above, so every Q that met
@@ -259,6 +272,13 @@ def main() -> None:
         f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
         f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
     )
+    if report_summary_error is not None:
+        # Emit-then-raise, never swallow: the breakdown line above is the record
+        # the archive needs, and re-raising (rather than sys.exit) preserves the
+        # forecasting failure's traceback in the log. Takes precedence over the
+        # alertable exit below because the exception is the richer red signal.
+        logger.warning("%s re-raising the forecasting failure so CI marks this run red.", breakdown)
+        raise report_summary_error
     if alertable > 0:
         logger.warning("%s exiting non-zero so CI marks this run red.", breakdown)
         sys.exit(1)
@@ -266,6 +286,9 @@ def main() -> None:
         # Reachable only under suppression with every fallback credit-caused (the
         # subtraction can't otherwise reach zero from a positive total), so state
         # that rather than leaving a reader to derive it from the arithmetic.
+        # (A fully CLEAN run — nothing alertable, no fallback — deliberately says
+        # nothing, so the line's presence stays a signal; pinned by
+        # tests/test_cli.py::test_clean_run_logs_no_degradation_summary.)
         logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
