@@ -47,12 +47,21 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 Status: design sketch only. Operator decision 2026-07-19 — this is the top-priority design
 item, but explicitly NOT for right now.
 
-**Honest caveat (load-bearing, read first).** Per the 2026-07-18 residual refresh, the modal
-worst-miss has MOVED to consensus-with-zero-dissenters under a shared briefing — spread-gating is
-structurally blind to that mode. This lever addresses the *disagreement* subset only; do not
-expect it to fix the current worst misses. The consensus-miss counters are separate items
-(gap-fill v2 verify / DISCREPANCY channel; cross-question coherence / resolution-metric
-verification / publish-vs-own-anchor checks from the residual round).
+**Honest caveat (load-bearing, read first — re-priced 2026-08-24 on the live roster).** The modal
+worst-miss remains consensus-with-zero-dissenters under a shared briefing (2026-07-18, reconfirmed
+2026-08-24), and the accurate statement is that **spread carries no directional information when
+the ensemble shares an attractor**. On the frozen 3-member triple the gate also fires far less
+than the post-flip data implied: a 3-member range is ~4x narrower (mean binary published range
+0.055 vs 0.244 on ~6 models), and the first prod measurement (`skipped_config_off` telemetry, 13
+spread-computable triple questions) has it firing on **~1/3 of questions instead of the 78–80%
+post_flip implied — and entirely numeric-family** (2/2 numeric, 3/4 discrete, 0/4 binary, 0/3 MC;
+triple binary spreads run 0.04–0.08 against the 0.15 threshold, so the binary trigger is
+effectively dead on this roster and would need re-deriving rather than inheriting from the
+6-member era). In practice this is a **numeric-only lever on the current roster**, addressing the
+disagreement subset only; do not expect it to fix the current worst misses. The consensus-miss
+counters are separate items (gap-fill v2 verify / DISCREPANCY channel; cross-question coherence /
+resolution-metric verification checks from the residual rounds).
+(`scratch/residual_2026-08-24/dim_consensus-dissent.md` §5b, `dim_aggregation-stacker.md` §4.)
 
 **What.** On questions where forecaster spread exceeds the existing CONDITIONAL_STACKING
 thresholds (~30% of questions per the one recorded estimate): run the EXISTING crux extractor →
@@ -88,7 +97,9 @@ with era-bucketing.
 
 ### Frozen-triple numeric watch: re-run the ensemble delta after a same-lineage era accrues (added 2026-07-20, HIGH)
 
-Status: shipped-and-watch. The drop to the latest-per-vendor triple
+Status: shipped-and-watch; as of 2026-08-24 the cohort is complete at 37 numerics forecast and
+pending resolution — checkpoint 2026-09-12, descriptive read only (plan step 2). The drop to the
+latest-per-vendor triple
 (`gpt-5.6-sol` / `claude-opus-4.8` / `gemini-3.1-pro-preview`) — authored 2026-07-20, live in prod
 2026-07-21T17:07:37Z in merge `b4e9df0`, and the merge date is where the era clock starts (AGENTS.md,
 era-bucketing → merge-date rule) — ships accepting a fragile
@@ -122,11 +133,21 @@ collecting more questions.
    is the *first* modern-lineage era. This is the second roster change authored on 2026-07-20 (it
    supersedes the morning fable-5 → opus-4.7 swap, which rode the SAME merge and so never ran in
    prod at all); do not swap members mid-window.
-2. After **~30–50 numeric questions resolve under the frozen triple** (~2–3 months at
-   ~15.8 numeric/mo), re-run `bash scratch/ensemble_power_model_2026-07-20/run_all.sh` with the
-   new era added. Its value is a **same-lineage read** — replacing the current lineage-transfer
-   caveat, since the analyzed eras used grok-4.1/4.3 plus predecessor slots — plus one more era
-   on the tau/√n_era term, NOT a narrower CI (the floor blocks that).
+2. **Checkpoint 2026-09-12 (moved from 2026-08-25), and the read is DESCRIPTIVE — do not run
+   `run_all.sh` as a decision gate.** Status as of 2026-08-24: the cohort is **complete at 37
+   numeric-family questions forecast** (18 numeric + 19 discrete) and merely pending resolution —
+   6 resolved, and all 31 still open carry `scheduled_resolve_time` ≤ 2026-09-04, with the 30th
+   resolution scheduled **2026-09-02** (observed scheduled→actual lag 0.6–3.6 days). Ceiling:
+   **n ≈ 35 ALL / 34 STRICT; 50 is unreachable by construction** (only 37 exist). The prior
+   round's ~5x projection error (expected ~30 resolved by 2026-08-25, got 6) came from using the
+   submission rate as an accrual rate without applying the resolution lag. At the checkpoint,
+   run the descriptive read — triple-era numeric peer / log score and PIT against the post_flip
+   cell, era-bucketed, as a "did the accepted +3.24 lean show up as a visible loss" sanity
+   check — because the tau ≈ 3.85 between-era floor of ±3.37 log pts/Q means n=34 cannot clear
+   any operator precision target; only a new roster-stable era tightens the numeric estimate,
+   and no successor tournament slug exists yet (probed 2026-08-24: HTTP 400 on every plausible
+   fall-2026 name), so the next era cannot start until a new tournament does.
+   (`scratch/residual_2026-08-24/dim_numeric-width.md` §2.)
 3. **Decision rule:** reintroduce the dropped numeric members ONLY if the frozen-era numeric
    delta *still* leans full with **P(loss>1pt/Q) ≥ 0.7 AND** the point estimate survives the
    top-2-question jackknife. Otherwise keep the uniform triple permanently — a per-qtype roster
@@ -138,6 +159,17 @@ collecting more questions.
 personal-key forecaster spend. Weigh that saving against the numeric lean when deciding whether
 to reintroduce members — a re-add must clear both the score bar above *and* justify the cost it
 brings back.
+
+**Discrete-calibration note (2026-08-24).** The post-fix (`9f1175c`) discrete cohort has ZERO
+max-step-bug exposure by composition: all four resolved triple-era discretes are fine-grid
+percent/spread questions, and re-introducing the legacy 0.2 cap changes their CDFs by exactly
+0.00 — so a "the fix holds" read is vacuous until a low-count integer question resolves post-fix.
+The bug itself is now priced: **+179.9 baseline log points over the 10 measurable pre-fix
+forecasts** (mean +18.0, median +4.1), 93% of it in three questions where the resolution landed
+in the capped bin. And the 0.2 cap's own start date is unestablished — six pre-fix discretes
+published max bins above 0.2, three before `dc31951` (2025-11-05) and three after — so don't
+era-bucket discrete calibration earlier than the fix date on a "capped throughout" assumption.
+(`scratch/residual_2026-08-24/dim_discrete-maxstep-counterfactual.md`.)
 
 Receipts: `scratch/ensemble_power_model_2026-07-20/synthesis.md` (composed-delta model, power
 floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthesis.md` (paired
@@ -168,6 +200,22 @@ telemetry-archive harvest + a `score_ghosts.py` upgrade to prefer JSON records a
 via the existing CDF machinery, with a regex fallback for the pre-upgrade marker era. Rationale:
 the legacy `GHOST_FORECAST` marker exposes only a numeric median, so numeric ghosts were
 countable but not scoreable — the operator wants gap-free ghost-vs-published analysis.
+
+**First scored read, 2026-08-24** (`scratch/residual_2026-08-24/dim_ghosts.md`). 94 archived
+ghosts, 12 joined to resolutions, 12 scored: pooled ghost-minus-published delta **+7.02** (median
++1.23, bootstrap CI [−6.7, +24.0], sign test p=1.0) — a null at n=12 whose positive point estimate
+is one MC question (+78.5). The composition guardrail matters more than the number: **7 of the 12
+scored ghosts are byte-identical to the driver's PRE-research dry run** (and those 7 recorded zero
+corrections), so the pool mostly measures the driver's prior, not v2's research — read the
+loop-moved subset separately (n=4, mean +24.29; +6.21 without the outlier). `score_ghosts.py` now
+emits that pre/post split (shipped this round, `171da89`). Two premises corrected: §5.11's "diff
+the ghost rationales" is unanswerable as written — ghosts are block-only BY DESIGN
+(`_GHOST_PROMPT` asks for the STRUCTURED FORECAST block alone; prose outside the block is 0 chars
+in 80/80) — and the conclude-gate question is answered: it has never fired in 93 prod runs and
+tightening it is the wrong lever (it runs before the ghost and cannot observe integration). If the
+operator wants the integration question answered rather than bounded, the lever is `_GHOST_PROMPT`
+(ask the ghost to name which findings moved it) — a prompt change, so paid validation, operator's
+call.
 
 ### Grok drop — RESOLVED 2026-07-20 (superseded by the latest-per-vendor triple) (added 2026-07-19, HIGH)
 
@@ -266,6 +314,20 @@ base-rate-artifact test, the power sim, and partial pooling. Reuse the existing 
 (log-grid fix) + bucket plumbing. Cadence: on each roster change print era-bucketed slope/intercept
 CIs + reliability table + base-rate check; **act only if a CI excludes the null AND reproduces
 across ≥2 eras** — "inconclusive" is the honest default.
+
+**Update 2026-08-24 (one retired citation + gate bookkeeping).** (a) **Retire the fall
+[0.70, 0.90) "under-confidence signature" as a standing citation** — quoted by the 2026-07-16
+audit's RESULTS.md and the 2026-08-02 round as the one real reliability deviation, its exact
+Poisson-binomial p is 0.045 against 21 bins tested across four eras, i.e. exactly the single false
+positive that multiplicity predicts (1.05 expected). The fall/spring *slope* flip is the genuine
+finding and does not depend on that bin. (b) The post-flip binary YES/NO gate (n≥40) **fired at
+n=41: verdict consistent with a base-rate artifact on both sides**, now in all four eras including
+one at a ~54% YES rate — retire the gate rather than re-target it; post_flip is a closed era.
+(c) Retargeted at `triple_era`, the prior-round n-gates (n≥40 YES/NO re-test, n≥25 dimension
+re-run, n≥15 MC verdict) are **unreachable inside summer-futureeval-2026**: 4 STRICT triple
+binaries today, ~9 projected by the 2026-09-20 hard stop, the tournament closes 2026-09-06, and no
+successor slug exists yet — record them as awaiting a next tournament, not accrual.
+(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md`.)
 
 ### ~~Geometric-mean-of-odds base-combine vs MEDIAN~~ — RUN 2026-07-16, DECISIVE NULL (keep MEDIAN)
 
@@ -705,6 +767,26 @@ and SKIPS when ambiguous. Two follow-ups deliberately left out of that commit:
   duplicated 8-field `_Route` construction (`_single_url_route` vs `route_question`) via a
   `_route_from_entry` helper when splitting.
 
+**Routing follow-ups added 2026-08-24** (`scratch/residual_2026-08-24/dim_research-archive-qa.md`
+§2; the q45401 mechanism pinned in `dossiers/44453_verification.md` C6). Three small, additive
+fixes: (1) **widen the PAYEMS derivation gate's positive vocabulary** — its
+`require_any_keywords = ("change", "jobs added", "added", "gain", "gained")` matches neither the
+payroll family's title verb ("add") nor its criteria wording ("the increase in number of
+employees"), so **q45401 was a live prod miss** at `kw_derivation_gate`; adding `increase` plus
+the bare stem `add` flips the route (verified by one-word substitution), and the other non-`level`
+entries (CPIAUCSL `mom_pct`, gasoline `monthly_avg`) should be grepped for the same
+narrow-vocabulary shape now that one defect class has cost two questions. (2) **Extend the
+`_TWO_LEG_OR_CHANGE_RE` change-vs-level guard to the single-URL route** — q45362 (S&P 500
+percentage change) routed via its criteria's Yahoo link to a `^GSPC` LEVEL band and was saved only
+by the magnitude backstop, a numeric heuristic a bounds-overlapping case would sail through; on
+the URL branch the guard can only turn a route into a skip, so the keyword branch's load-bearing
+post-ambiguity placement is untouched. (3) **Add a
+`TS_ANCHOR_ROUTE: qid=… decision=… series=… step=…` marker + MarkerSpec** — of the era's 30
+route-level misses only 2 left any log line across 1,800 persisted run logs, so anchor coverage is
+auditable today only by offline re-runs. Context that raises the stakes: the anchor rendered on
+**0 of 42** `ranked_markets`-era records (5/101 era-wide, all five FRED-mirrored series), so every
+2026-08-03 routing repair is still unexercised in prod.
+
 ### Agentic gap-fill v2: SHIPPED, ON in prod since 2026-07-21 (added 2026-07-16)
 
 **FLAG STATUS: `GAP_FILL_V2_ENABLED: 'true'` in all four yamls** — flipped ON in the branch 2026-07-17
@@ -765,16 +847,99 @@ Three findings from the 2026-07-18 bundle content audit
    `asknews_raw` archiving hygiene rec is a separate in-flight change (orchestrator + persistence).
    R5 (fetch query enrichment) remains optional. Do NOT blindly halve the section — prioritization
    change + eyeball, not a cap.
-3. **Prediction-market header revision (low effort, medium impact).** The `STRONG EVIDENCE -- weight
-   these markets heavily` header fires unconditionally (`research/prediction_market.py:1184`) even at
-   low fuzzy-match relevance — ~56% of sampled questions had off-topic/loosely-matched markets and
-   forecasters anchor on them. Fix: qualify the research-side header by match confidence; the
-   forecaster-prompt clause (`prompts.py:372`) already discounts on mismatch — the problem is the
-   research-side header priming the model first. **Caution:** the `[PRE-WINDOW]` apparatus in the
-   summarizer output is load-bearing (prevents pre-open events read as resolutions — has saved
-   multiple questions); do NOT remove, at most abbreviate after first occurrence.
+3. ~~**Prediction-market header revision**~~ — **SHIPPED / INVALIDATED 2026-08-24.** The
+   unconditional `STRONG EVIDENCE` header this item targeted no longer exists: the conditional
+   preamble shipped in `6eed305` (live via `b4e9df0`), and the ranked-retrieval port (`bfd5df2`)
+   replaced match-confidence gating with per-row `relation` tiers that the forecaster prompts
+   weight directly — the cited `prediction_market.py:1184` is gone. Reprice note: the "reprice if
+   it grows" trigger on the section's token weight has fired — the ranked-era snapshot runs
+   **~1,804 tokens / 13.6% of bundle p50** (from ~847 / 7.0% gate-era and ~557 / 4.6% blunt-era),
+   still cheap at ~$0.06-0.07/question and not an argument to cut. The **caution survives**: the
+   `[PRE-WINDOW]` apparatus in the summarizer output is load-bearing (prevents pre-open events
+   read as resolutions); do NOT remove. Live follow-ups on the ranked design are in the
+   "Market-render follow-ups" entry (added 2026-08-24).
+   (`scratch/residual_2026-08-24/dim_market-informativeness.md`.)
 
-### Confirm Gemini `url_context` actually fires in prod (added 2026-06-28)
+### Market-render follow-ups from the first ranked-era resolutions (added 2026-08-24)
+
+The ranked-retrieval port works — strict same-quantity-same-date matches went from 1/117 questions
+to 3/41, top-tier rank-0 label precision is 63%, and forecasters demoted 4/4 mislabelled rank-0
+rows in writing — so the binding constraint has moved to RENDERING. Four fixes, in order
+(`scratch/residual_2026-08-24/dim_market-informativeness.md`): (1) **rank child outcome rows by
+question relevance, not liquidity, before truncating** — the one defect with a measured score
+consequence: 81% of `same_quantity_other_cut` parents are truncated at a median 27% of price mass,
+and on q45189 (the era's worst MC record, peer −6.04) the omitted rows were exactly the "Fine wins
+narrowly" brackets carrying 0.365 of the family's mass, so all three forecasters transplanted the
+one visible ≥50-point-margin price (0.585) into P(>70% of the vote) = 0.58 verbatim. (2) **One
+relation-vs-liquidity precedence sentence in the prompt**: a thin market's PRICE is noisy even
+when its relation is tight, so an other-cut extrapolation from a thin strike should widen rather
+than shift — q45189's anchor strike had $1,377 of volume, all three forecasters called it thin,
+and all three resolved the conflict in favour of relation. (3) **Staleness guard on tier
+grading**: a market whose `close_time` precedes the question's `open_time` cannot be
+`same_quantity_same_date`, and an `other_cut` grade on one must name the period gap in its `why` —
+would have caught 3 of the 5 over-graded top-tier rank-0 rows (all Manifold; the worst a
+2023-resolved market graded "near-identical"). (4) **Render an explicit zero-rows line** — q45200's
+ranker validly returned zero rows over a healthy 381-candidate pool and the section silently
+vanished, indistinguishable from a provider outage, while the forecaster prompt still shipped the
+weighting clauses for a table that wasn't there. Also worth one upstream check: the Kalshi `close`
+column is not a settle date (median +114 days vs the question's own resolve time; 14/78 rows at
++300d or more). Re-read the informativeness question at ~41 ranked-era resolutions (late September
+/ early October), not ~09-01 (which buys only ~7).
+
+### financial_data: 252-trading-day calendar applied to 24/7 crypto series (added 2026-08-24; found, NOT yet fixed)
+
+Found by the q44882 dossier (Ethereum >$2,200 in August, peer −7.24) and verified by reproducing
+the printed block to the last decimal: `research/financial_data.py:390` annualizes daily returns
+with `np.sqrt(252)` on assets that trade 365 days/year, understating crypto volatility by
+1.2035x — the printed "30-day annualized volatility: 37.0%" was truly 44.6%, and "37%" was cited
+18 times across the three forecasts as the low leg of every model's barrier range (all three
+independently derived ~33% from the Polymarket contract, then averaged it against the buggy 37%
+and published 25% on a YES). Same root cause twice more in the file: `_compute_period_returns`
+labels row offsets as calendar periods (crypto "1m" read +5.05% where the true 30-calendar-day
+move was +17.24%, contradicting AskNews's figure in the same bundle; "1y" understated the drawdown
+by 17pp), and the "52-week range" is `iloc[-252:]` ≈ 8.2 months (high understated 31%). Fix routes
+off the `_TICKER_GROUPS` "Crypto" group already in the file — or index on calendar dates so the
+labels are true by construction — plus one 365-day-frequency test fixture with a known sd (all
+current yfinance fixtures are business-day and the integration test asserts line presence, not
+values, so nothing can catch this today). Blast radius in the archive is 2 of 1,064 records — ETH
+here, where it hurt, and BTC on q43592, where the same understatement pushed toward a NO that
+resolved NO and helped — i.e. a systematic under-dispersion bias that flatters status-quo answers
+and pays for it when the status quo breaks.
+(`scratch/residual_2026-08-24/dossiers/44882_dossier.md` + `44882_verification.md`.)
+
+### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
+
+From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
+recoverable loss is width/skew, not the center): when a rationale derives a σ from market
+thresholds or states a distribution family and σ, and then declares a left tail materially tighter
+than that same σ, widen or flag it deterministically — gpt-5.4 fit N(84.8k, 96.7k) to two market
+prices inside its own rationale and shipped a 61.9k-equivalent left tail; opus-4.8 quoted
+"forecast error SD ≈ 50–60k" and shipped 52k with a right skew. The values are already in the
+structured block, so "your left tail must be at least as wide as the σ you derived" is one
+arithmetic pass with no new elicitation. Measured ceiling, from the adversarial verification
+(quote THIS figure, not the dossier's +15.8, which fed gemini a wider spread than it published):
+de-skewing every member to a symmetric normal at its own declared p50 and 10–90 width is worth
+**+11.93 baseline points, taking spot peer from −12.15 to −0.22** — roughly break-even with the
+crowd, from arithmetic the models had already done.
+(`scratch/residual_2026-08-24/dossiers/44453_dossier.md` + `44453_verification.md` C1.)
+
+### Gap-fill v2: office-holder precedent verification rule (added 2026-08-24)
+
+From the q44210 dossier (McDonald sworn in as SDNY US Attorney, peer −24.7 — the worst genuinely
+new judgment miss of the 2026-08-24 window): when a "will X assume office / take effect / be
+installed" question's fine print enumerates alternative appointment/effectuation mechanisms,
+retrieve **how the current holder of that office actually got the seat**. The office's own
+15-month-old precedent — Schumer withholds the blue slip, Trump installs the nominee interim the
+SAME DAY under §546(a), district judges retain him at day 120, never Senate-confirmed — appeared
+nowhere in the 30,670-char bundle, so all six models priced the mechanism that actually delivered
+(24 days early) at 0.10–0.25 as a hypothetical "Trump pivot". The adversarial verification prices
+this leg at **~+31 spot-peer points, ~80% of the recoverable loss** and ~4:1 over the
+market-retrieval leg (which ranked retrieval has since fixed, making that half a retrodictive
+validation target rather than an action item). A one-query verification target, exactly what v2's
+dry-run-then-verify brief exists for; v1 gap-fill contributed zero text on that run.
+(`scratch/residual_2026-08-24/dossiers/44210_dossier.md` + `44210_verification.md`.)
+
+### Gemini `url_context` in prod — answered in the NEGATIVE (added 2026-06-28; answered 2026-08)
 
 The 2026-06-28 research-quality audit found **zero positive evidence** that Gemini's `url_context`
 tool (built to directly read criteria-named resolution URLs) ever fires in prod: across 17 Period-B
@@ -786,10 +951,13 @@ while gap-fill returned the exact 4.48% that resolved). The fetch gap is *masked
 
 **Telemetry added 2026-06-28** (`gemini_search.py` `_extract_url_context_telemetry`): each grounded
 call logs `N/M url_context fetches` and writes a greppable marker — `### URL Context Fetches` (reads +
-URLs) or `_url_context: none_`. **Action (free):** after the next prod run, grep
-`backtests/research_archive/latest/*.json` for those markers to settle whether url_context fires and
-reads the named URL. If it reliably direct-reads named sources, the deterministic-fetch question
-dissolves; if never, that justifies the narrow named-URL fetcher.
+URLs) or `_url_context: none_`. **The grep has been run, and the answer is the executed negative:
+0 of 271 archived Gemini sections carry either marker** (2026-08-02, standing as of 2026-08-24) —
+url_context contributes nothing in prod on the grounded-search path. That is the "if never" branch:
+the resolution-source **Tier-2 fetch precondition is satisfied** and the narrow named-URL fetcher
+keeps its justification. Still open is only the paid positive control (does the tool fire at all
+when forced?) before blaming the wiring vs. the model; note v2's `read_document` uses url_context
+on a separate path and demonstrably fires (`agentic_document_ungrounded_suppressed` telemetry).
 
 **Related (deferred, needs a small paid re-bench — clear cost):** the audit could NOT test the gap's
 worst case — obscure non-API official counters/registries/dashboards (state policy trackers, CBP
@@ -823,7 +991,8 @@ Follow-ups:
    0, a rounding error at $0.10/$0.60 per 1M). ~5 whale sources per 40 questions no cap captures.
 2. **MEDIUM — Tier-2 LLM fetch** for the js_wall/blocked slice (~15%; Masters.com, childmortality.org,
    UNICEF, Tesla IR, sagaftra.org). The per-URL `FetchStatus` (blocked/js_wall) is the seam.
-   **Precondition:** the Gemini `url_context` probe above. *Note 2026-07-16:* the gap-fill v2 fetch
+   **Precondition:** ~~the Gemini `url_context` probe above~~ — SATISFIED 2026-08 (probe negative,
+   0/271 sections carry the marker). *Note 2026-07-16:* the gap-fill v2 fetch
    ladder gives the driver this capability inside the loop, so the js_wall slice may get covered
    agentically first — re-assess after the v2 overlap window.
 3. **LOW (deferred):** module split of `resolution_source.py` (~670 LoC; extract `ssrf_guard.py`).
@@ -1133,11 +1302,20 @@ moot. `clause_product_divergence_pp` (published vs the model's own priced clause
 trigger keying on divergence-from-own-math — the conditionality the three tested guards failed to achieve.
 Watch, don't act.
 
-Also watch (MC, 2026-07-09): whether the low-bucket over-payment closes under the merged MC calibration
-bullet (`ceab2df`). Baseline: [0-5%) options assigned mean 2.4%, resolve at 1.0% (n=96, both eras —
-"courtesy mass" on named-dead longshots; MC_CONFIDENCE_FINDINGS.md). If the gap persists, add one prompt
-line: price clearly-dead NAMED options near the 1% floor (residual/"Other" keep honest mass). The 1% floor
-stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs parser/clamp regression risk — not worth it).
+MC [0-5%) low bucket — **measured NULL 2026-08-24; do not re-open as a gap.** Exact cluster-correct
+test over the whole archive: 61 questions supply 117 in-band options carrying **2.83 expected
+resolutions, 1 observed, two-sided p=0.367**; 0 of 4 eras exclude the null, and the sign is not
+era-stable (fall over-resolves the band). Demonstrating the observed gap needs **~454 MC questions**
+against 86 available, and the `ceab2df` before/after version is separately unanswerable (3
+post-bullet MC, all also post-clamp). The once-proposed prompt line ("price clearly-dead NAMED
+options near the 1% floor") has no evidential support and would now collide with the 0.01 clamp
+floor, which binds on 4 of 18 post-clamp ballots. **Do not conflate it with the MC top-band
+under-commitment, which is the one MC signal still worth watching**: combined ≥0.60 top bands
+over-resolve in all 4 eras, pooled exact p=0.097 at 32 questions, crossing p<0.05 at n≈41 — nine
+top-band questions away at ~1.2/month, so a next-season item for throughput reasons, not
+effect-size ones. The 1% floor stays (operator 2026-07-09: sub-1% headroom ~+0.01 nats/question vs
+parser/clamp regression risk — not worth it).
+(`scratch/residual_2026-08-24/dim_binary-mc-calibration.md` §3–4.)
 
 ### File splits + shared fetch-primitive promotion (added 2026-07-18, low, standalone PRs)
 
@@ -1179,6 +1357,20 @@ migration exists (hence MEDIUM, not HIGH) — alternatives to scope: a self-host
 small VM / fly.io cron firing `workflow_dispatch`. The new CLOSE_MARGIN watch
 (`make close_margin_watch`) is the instrument to confirm the problem persists and to measure any
 migration's effect.
+
+**Update 2026-08-24 — DEMOTED, no longer time-sensitive.** Cron delivery recovered GitHub-side
+(not from any config change of ours): 41% of nominal at the era's trough → 71% → **94%** by late
+August, with open→submit p90 falling 69 → 36 → 17 minutes and **zero red-line margin breaches
+since 2026-07-31**. The era still lost 5 of its 104 tournament questions, but only one to genuine
+cron starvation; the four mechanisms are q44801 (2026-07-22 midnight cron gap — the one a
+migration would have addressed), q45093 (2026-08-06, five consecutive run failures, cause
+unrecoverable — no artifacts uploaded), q45374 + q45375 (the separate **2026-08-19 wedge
+incident**: an apt hang inside `playwright install --with-deps` held the workflow concurrency
+group ~18 of 24 hours; the step-level `timeout-minutes: 3` fix shipped this round, `41ee30f`),
+and q45085 (2026-08-03, forecast at 3/3 then rejected HTTP 405 — the run started seconds before
+close and submitted five minutes after). Keep the entry for a future season; `close_margin_watch`
+remains the instrument.
+(`scratch/residual_2026-08-24/dim_bot-health-deep.md`, `TELEMETRY_INVENTORY.md` §2–3.)
 
 ### Split `forecaster.py` (1066 LoC, past the ~1000 ceiling) (added 2026-07-20, MEDIUM)
 
@@ -1391,24 +1583,32 @@ merge-date rule): `WIDENING_FLIP` = 2026-05-18T17:21:19Z (`0e85e1b`, k_tail 1.25
 `b8d730f`) and `TS_ANCHOR_ENABLE` = 2026-07-21T17:07:37Z (`b4e9df0`, the july15 bundle; authored 2026-07-17).
 Both constants previously held their authoring dates, which manufactured a phantom one-record `ts_anchor` era
 out of qid 44795 — a question whose own comment names the retired six-model roster that the very same merge
-dropped. The `ts_anchor` bucket is empty again and correctly so: no post-bundle numeric has resolved and been
-pulled, and empty eras are omitted, so a two-row table is expected. Note the bucket is the whole july15 bundle
+dropped. As of 2026-08-24 the `ts_anchor` bucket holds its first **6 real records** (5 STRICT), so a
+three-plus-row table is now the expected shape. Note the bucket is the whole july15 bundle
 (anchor + triple roster + `MIN_FORECASTERS_TO_PUBLISH` 3→1 + gap-fill v2), so a width shift across it cannot be
 attributed to the anchor alone.
 
-**Measured 2026-07-17 on the 231 recovered numeric+discrete questions** (`scratch/coherence_2026-07-15/perf_all_tagged.json`):
+**Measured 2026-08-24 on 258 recovered numeric+discrete questions** (`width_monitor` over
+`scratch/residual_2026-08-24/perf_all_tagged.json`, `--exclude-qids known_bug`). This RESTATES the
+2026-07-17 table, whose pre-flip row (0.851 / 0.267 / 0.674) came from the monitor before its
+era-boundary and PIT fixes — the same 197 frozen records now read 0.871 / 0.258 / 0.686, so a diff
+against the old row is a measurement fix, not data movement:
 
 | era | n | cov80 [95% CI] | cov50 | cov@10 | PIT std | med rel width |
 |---|---|---|---|---|---|---|
-| widening_on (k_tail=1.25) | 197 | 0.851 [0.798, 0.897] | 0.558 | 0.096 | 0.267 | 0.674 |
-| widening_off (k_tail=1.0) | 24 | 0.740 [0.555, 0.888] | 0.580 | 0.083 | 0.286 | 0.561 |
-| all | 231 | 0.847 [0.798, 0.890] | 0.567 | 0.091 | 0.267 | 0.647 |
+| widening_on (k_tail=1.25) | 197 | 0.871 [0.821, 0.914] | 0.578 | 0.071 | 0.258 | 0.686 |
+| widening_off (k_tail=1.0) | 45 | 0.728 [0.593, 0.845] | 0.489 | 0.089 | 0.304 | 0.458 |
+| ts_anchor (= the july15 bundle) | 6 | 0.643 [0.286, 0.923] | 0.214 | 0.167 | 0.348 | 0.109 |
+| no_timestamp (fall-2025, unattributable) | 10 | 0.955 [0.783, 1.000] | 0.682 | 0.000 | 0.222 | 0.138 |
+| all | 258 | 0.847 [0.801, 0.889] | 0.558 | 0.074 | 0.268 | 0.615 |
 
-Reading: widening-off moved PIT std 0.267 → 0.286 (toward the 0.289 ideal), cov80 0.851 → 0.740, median rel width
-0.674 → 0.561 — consistent with the 2026-05-12 study; no longer over-wide in the body. `widening_off` n is only 24
-(loose CIs); baseline to watch as the TS-anchor clause lands (forward risk is over-sharpening). `cov@10` gap: even
-widening-off, only ~8% of resolutions fall below published P10 (vs 10% target), so the low tail runs slightly wide —
-what the anchor's better-calibrated P10 pulls in.
+Reading (2026-08-24): the apples-to-apples post-flip NUMERIC cell sits at PIT std 0.2860 against the
+0.2887 ideal (spread multiplier 0.991x, fourth consecutive round inside the band) — `k_tail=1.0`
+stands; the pooled num+disc 0.304 is driven by the discrete cell's high-lean, not width. One defect
+found and fixed this round: **out-of-grid PIT censoring** — the interpolation clamped to
+`cdf[0]`/`cdf[-1]`, which sign-flipped a below-bound resolution into a high PIT once the open-bound
+unclamp made large `cdf[0]` legitimate (q44218 read 0.917 for a resolution below everything we
+forecast); fixed in `1fe96c9`, and the correction moves post-flip numeric cov@90 0.206 → 0.176.
 
 ### Width post-ship watch + monitor attribution tagging (added 2026-07-18, medium)
 
@@ -1424,12 +1624,35 @@ hedge-audit narrowing push and Step-9b's LOW→wide IQR prescription from the nu
    diversity before fitting any width knob (the "~150 numerics" caveat governs a fitted change). Do NOT cite
    `cov@10 ≈ 0.03` as a too-wide signal here — that's a pooling artifact; the current-era value is 0.107 (on
    target). The ~0.03 the TS-anchor prompt clause quotes is the live-prod low tail, a different cohort.
+   **Status 2026-08-24: NOT FIRED at n=5 of ~15** — cov80 0.600, PIT std 0.356, i.e. both halves fail
+   in the OPPOSITE direction (too narrow), not the over-wide signature the trigger describes. At
+   effective independent n ≈ 3 (three submission days) with a PIT-std bootstrap CI containing ideal,
+   that is a direction to watch, not a finding; if the narrow lean survives to n ≈ 30 in
+   mid-September, the move is the SYMMETRIC clause this item already specifies.
+   (`scratch/residual_2026-08-24/dim_numeric-width.md` §3.)
 2. **Tag monitor records with `anchor_present` / `gap_fill_v2_present` (low effort).** The `ts_anchor` era
    bucket is confounded (TS anchor + gap-fill v2 + native-search/crux terra swaps + the 6→3 roster drop +
    `MIN_FORECASTERS_TO_PUBLISH` 3→1 all reached prod in one merge, `b4e9df0` 2026-07-21T17:07Z) AND
    pools treated with untreated (only ~53% of numerics route to a fetchable series). Fix: at collection time
    grep research text for the `## Time Series Anchor` and `## Agentic Research Findings` headers, thread the
    booleans into the record, split era rows by presence. Cheap; unblocks any real anchor-effect read.
+
+### Open-bound out-of-range mass: EXERCISED AND PASSING (recorded 2026-08-24)
+
+The prior round's ledger carried the W1 parser-unclamp (percentile values beyond open bounds are no
+longer clamped, so `F(bound)` can express large out-of-bound mass) as still unexercised in a
+resolved question. It fired, and it paid: **q44218** (US Strategic Petroleum Reserve) published
+`cdf[0] = 0.9168` — 91.7% of mass below the open lower bound, because all six models' medians sat
+at 265k–285k against a 300k displayed floor — the resolution came in at 293,426, below the bound,
+and scored **peer +75.8**: the exact counterfactual of the 43746/43747 `known_bug` pair (`cdf[0]`
+pinned at 0.0250, peers −77.8 / −66.2). Four of the nine post-fix open-bound records now have a
+model declaring beyond a bound, and each published tail moved off 0.01/0.99 to express it. Two
+honest limits: q44218 predates the W3 label widening, so it demonstrates the *pipeline's* ability
+to carry below-bound mass rather than the W1 parser change specifically; and no post-fix record has
+yet resolved beyond a bound in the direction its models declared. Side effect fixed this round:
+expressible out-of-bound mass broke grid-clamped PIT interpolation (the out-of-grid censoring
+defect, `1fe96c9` — see the numeric-width history entry).
+(`scratch/residual_2026-08-24/dim_numeric-width.md` §4.)
 
 ### Ideas reverse-engineered from high-scoring competitor bots (added 2026-06-26)
 
@@ -1462,6 +1685,18 @@ OUR idea, seeded not copied — competitors discount overlapping-rationale agree
 line 1330) and notice shared unverified figures (Metaculus-predictions lines 36/43) but respond by
 downweighting+widening, NEVER by gating aggregation. *Caution:* (B)/(C) add cost to the COMMON cheap MEDIAN
 path — the main reason they're deferred. **Gate:** benchmark (B)/(C); (A) is the low-risk start.
+**Re-priced 2026-08-24 — still the most-supported lever, on weaker headline evidence.** The
+discriminative control behind the pitch (material dissent toward truth is rarer on misses than on
+hits) moved from 6%-vs-19% to **9%-vs-21%** on the enlarged post-flip cohort (rate ratio 0.30 →
+0.62 raw, 0.43 after removing a pipeline-clamp artifact; the miss-side numerator is 2–3 events),
+and split by question family it does NOT hold for binaries — pre-flip binaries invert to 1.81 on
+the one cell with real power, though follow-the-outlier remains a losing strategy ex ante (−13.7
+baseline pts/Q over 357 binaries). The premise is untouched — MEDIAN never asks WHY the members
+agree — and q44882 is the cleanest new specimen: three models at 0.19/0.25/0.25 on a YES, with the
+v2 ghost (a fourth model with its own research) independently at 0.25. On the 3-member roster the
+spread gate also fires far less (see the top-priority entry's caveat), which raises this
+mirror-image lever's relative value.
+(`scratch/residual_2026-08-24/dim_consensus-dissent.md` §5, §9.)
 
 **3. Numeric "unverified-conflict → variance" rider (low priority; tension with our calibration).** When
 the trust ladder can't adjudicate two candidate values for a load-bearing quantity, place mass across both
