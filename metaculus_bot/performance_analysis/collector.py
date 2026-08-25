@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 
 import requests
 
@@ -22,6 +23,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_resolution,
     parse_stacked_marker,
 )
+from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score, mc_log_score, numeric_log_score
 
@@ -164,7 +166,9 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
     title = post_data.get("title", "")
 
     if title.startswith("[PRACTICE]"):
-        logger.info(f"  Skipping PRACTICE post {post_id}: {title[:60]}")
+        logger.info(
+            f"  Skipping PRACTICE post {post_id}: {title[:60]}"
+        )  # HARNESS-SCAN-EXEMPT-subsampling  # log display truncation
         return []
 
     group = post_data.get("group_of_questions")
@@ -488,11 +492,18 @@ def build_performance_dataset(
     tournament: str = DEFAULT_TOURNAMENT,
     token: str | None = None,
     author_id: int = DEFAULT_BOT_USER_ID,
+    research_archive_dir: str | Path = DEFAULT_RESEARCH_ARCHIVE_LATEST,
 ) -> list[dict]:
     """Fetch questions + comments, match them, parse per-model predictions, compute scores.
 
     Returns the structured dataset as a list of record dicts.
     Token defaults to METACULUS_TOKEN env var.
+
+    Each record is also stamped with the research-archive treatment tags
+    (``anchor_present`` / ``gfv2_present`` / ``gfv2_loop_ran`` /
+    ``anchor_confidence`` / ``research_source_class``) read off
+    ``research_archive_dir``; questions with no archive record — including every
+    record when the archive isn't on disk — carry None on all five, never False.
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]
@@ -510,6 +521,8 @@ def build_performance_dataset(
     for post_data in posts:
         post_records = _process_post(post_data, comment_lookup)
         records.extend(post_records)
+
+    attach_research_tags(records, research_archive_dir)
 
     logger.info(f"Collected {len(records)} question records")
     return records

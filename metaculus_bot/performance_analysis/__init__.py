@@ -48,6 +48,11 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_stacked_marker,
     parse_stacker_outcome_marker,
 )
+from metaculus_bot.performance_analysis.research_tags import (
+    attach_research_tags,
+    research_tags_for_qid,
+    research_tags_for_record,
+)
 from metaculus_bot.performance_analysis.scoring import (
     binary_log_score,
     brier_score,
@@ -68,6 +73,7 @@ __all__ = [
     "DetectorVerdict",
     "annotate_forecaster_bullets_with_models",
     "anonymous_model_key",
+    "attach_research_tags",
     "binary_log_score",
     "binary_summary",
     "brier_score",
@@ -108,6 +114,8 @@ __all__ = [
     "per_model_binary_scores",
     "per_model_cohort",
     "rank_our_models_by_accuracy",
+    "research_tags_for_qid",
+    "research_tags_for_record",
     "save_dataset",
     "select_cohort",
     "select_worst_misses",
