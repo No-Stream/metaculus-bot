@@ -27,6 +27,11 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
   ranker outcome, and every rendered row's ``venue:pool_index@rank``)
+* ``TS_ANCHOR_ROUTE``   — ``metaculus_bot/research/ts_routing.py`` ``route_question``
+  (per-QUESTION timeseries-anchor routing decision: routed/skipped, the series
+  involved, and the branch/reject step — the marker that made anchor coverage
+  queryable; before it, 27 of the triple era's 30 route-level misses were the
+  silent ``kw_no_keyword_hit`` return and left no log line at all)
 * ``PROVIDER_DEGRADATION`` — ``metaculus_bot/research/provider_health.py``
   ``log_provider_degradation_summary`` (per-RUN: which venue/signal degraded, and
   whether it counted toward the exit code)
@@ -281,6 +286,28 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+prompt_chars=(?P<prompt_chars>\S+)\s+rendered=(?P<rendered>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "ts_anchor_route",
+        # Per-question timeseries-anchor routing decision (research/ts_routing.py
+        # route_question). This exists because routing was near-unauditable from telemetry:
+        # route_question logged only the ambiguous/guard branches, so of the triple era's 30
+        # route-level misses exactly 2 left any line in 1,800 run logs, and part (2) of the
+        # research-archive-qa dimension could only be written by re-running the router
+        # offline. One line per numeric/discrete question makes anchor coverage a query.
+        #
+        # `decision` is routed|skipped; `step` names the deciding branch on a route
+        # (url_single / url_spread / kw_single) or the reject reason on a skip
+        # (url_ambiguous, url_quantity_gate, url_change_vs_level_guard,
+        # url_no_relative_return_wording, kw_no_keyword_hit, kw_derivation_gate,
+        # kw_ambiguous, kw_change_vs_level_guard). `series` is the series involved where one
+        # is known — comma-joined on ambiguity, slash-joined on a spread, the "none" sentinel
+        # (-> None) on a plain keyword miss. All values are spaceless, so `\S+` takes each.
+        re.compile(
+            r"TS_ANCHOR_ROUTE:\s*question=(?P<question>\S+)\s+decision=(?P<decision>\S+)"
+            r"\s+series=(?P<series>\S+)\s+step=(?P<step>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # ts_routing.py emits question.id_of_question
     ),
     MarkerSpec(
         "forecaster_drops",

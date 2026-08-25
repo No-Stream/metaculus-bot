@@ -27,6 +27,7 @@ import pytest
 from metaculus_bot.research import ts_routing as tsr
 from metaculus_bot.research.timeseries_anchor import _band_misses_bounds
 from metaculus_bot.research.ts_routing import route_question
+from scripts.telemetry.markers import MARKER_SPECS
 from tests.ts_anchor_fakes import _DGS10_RC, _make_discrete_q, _make_numeric_q
 
 
@@ -410,7 +411,14 @@ class TestDerivationGating:
 # leak into the other's family. It also means they can never co-match, which matters because
 # two matches make route_question skip as ambiguous — strictly worse than the old behavior.
 class TestGasolineDerivationSplit:
-    _MONTH_SCOPED_TOKENS = ("for the month", "monthly average", "during the month", "monthly")
+    _MONTH_SCOPED_TOKENS = (
+        "for the month",
+        "monthly average",
+        "during the month",
+        "monthly",
+        "in the month",
+        "calendar month",
+    )
 
     @pytest.mark.parametrize(
         ("text", "expected_derivation"),
@@ -587,3 +595,179 @@ class TestUstTenYearWording:
         )
         assert route is not None
         assert (route.spec.series_id, route.derivation) == ("DGS10", "level")
+
+
+# Two live prod misses from a residual round, pinned on the questions' VERBATIM text (title +
+# resolution criteria + fine print — route_question reads all three, and both defects were
+# invisible to title-only probes). q45401 is the derivation-gate vocabulary defect; q45362 is
+# the URL branch's missing change-vs-level guard.
+class TestLiveProdRoutingMisses:
+    _Q45401_TITLE = "How many jobs will the U.S. economy add in August 2026?"
+    _Q45401_RC = (
+        "This question resolves as the increase in number of employees on nonfarm payrolls, "
+        "seasonally adjusted, reported by the U.S. Bureau of Labor Statistics at its"
+        "[ Employment Situation Summary](https://www.bls.gov/news.release/empsit.nr0.htm) for August 2026."
+    )
+    _Q45401_FP = (
+        "Specifically, resolution is based on the numbers reported at [Table B-1. Employees on nonfarm "
+        "payrolls by industry sector and selected industry detail](https://www.bls.gov/news.release/empsit.t17.htm) "
+        "for *Total nonfarm* employees, *Seasonally adjusted*, by subtracting the July 2026 number from the "
+        "August 2026 number.\n\nFor example, the number reported in the June 2026 release was 158,984,000 for "
+        "June 2026 and 158,927,000 for May 2026. Hence the increase was 57,000."
+    )
+    _Q45362_TITLE = (
+        "What will be the percentage change in the S&P 500 from close of Aug 26, 2026 to open of Aug 31, 2026?"
+    )
+    _Q45362_RC = (
+        "This question will resolve as the percentage change from the non-adjusted closing price of the "
+        "S\\&P 500 Index (^GSPC) according to [Yahoo! Finance](https://uk.finance.yahoo.com/quote/%5EGSPC/history/) "
+        "on August 26, 2026, to the open price of the S\\&P 500 on August 31, 2026. These prices are the last "
+        "before the symposium and the first afterwards.\n\nFor example, if the dates were June 3 (\\$7,553.68 "
+        "close) and June 8 (\\$7,440.57 open) the resolution would be -1.49742%."
+    )
+
+    def test_q45401_jobs_added_phrasing_routes_to_payems_mom_diff(self):
+        # The live confirmed miss: "the economy will ADD jobs" / "the INCREASE in employees" is
+        # the mom_diff quantity in vocabulary the gate didn't know ("change"/"added"/"gain").
+        # route_question rejected it at the derivation gate for the whole triple era.
+        q = _make_discrete_q(
+            question_text=self._Q45401_TITLE, resolution_criteria=self._Q45401_RC, fine_print=self._Q45401_FP
+        )
+        route = route_question(q)
+        assert route is not None
+        assert route.spec.series_id == "PAYEMS"
+        assert route.derivation == "mom_diff"
+        assert route.scale == 1000.0
+
+    def test_q45362_pct_change_question_citing_a_level_url_skips(self, caplog):
+        # The wrong route: a %-change question citing the ^GSPC Yahoo URL was handed a LEVEL
+        # band, and only the magnitude backstop (a numeric heuristic — a change question whose
+        # bounds overlapped the level band would sail through) stopped the section. The wording
+        # guard now covers the single-URL route.
+        q = _make_numeric_q(question_text=self._Q45362_TITLE, resolution_criteria=self._Q45362_RC)
+        with caplog.at_level(logging.INFO):
+            assert route_question(q) is None
+        assert any("skipping rather than anchoring a single-series band" in r.message for r in caplog.records)
+
+    def test_a_payroll_level_question_still_skips_despite_the_widened_vocabulary(self):
+        # " add " is space-delimited so the widening cannot arm on "address"/"additional",
+        # and a LEVEL question mentioning an address must not inherit the mom_diff band.
+        qt = (
+            "What will total nonfarm payroll employment (in thousands of persons) be in December 2026? "
+            "Resolution per the BLS release; send correspondence to the Bureau's Washington address."
+        )
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_a_plain_gspc_level_question_still_routes_through_its_url(self):
+        # The guard must only fire on change/difference wording — the ordinary level family
+        # citing the same URL keeps its anchor.
+        rc = "Resolves per the closing value at https://finance.yahoo.com/quote/%5EGSPC on the date."
+        route = route_question(_make_numeric_q(question_text="Where will the S&P 500 close?", resolution_criteria=rc))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("^GSPC", "level")
+
+    def test_a_spread_native_series_url_is_exempt_from_the_url_guard(self):
+        # Same exemption as the keyword branch: HY OAS is published AS a spread, so "spread"
+        # in the wording describes exactly what the cited series serves.
+        qt = "What will the ICE BofA US high yield spread be on August 14, 2026?"
+        rc = "Resolves per https://fred.stlouisfed.org/series/BAMLH0A0HYM2 on that date."
+        route = route_question(_make_numeric_q(question_text=qt, resolution_criteria=rc))
+        assert route is not None
+        assert route.spec.series_id == "BAMLH0A0HYM2"
+
+    def test_pct_change_wording_with_no_url_skips_on_the_keyword_branch_too(self):
+        # The widened guard vocabulary applies to both branches: the same S&P %-change shape
+        # phrased without a URL reaches the keyword registry and must skip there.
+        qt = "What will be the percentage change in the S&P 500 over the last week of August 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_payems_change_family_is_untouched_by_the_widened_guard(self):
+        # Bare "change" is deliberately NOT a guard token — it is the vocabulary the mom_diff
+        # family legitimately routes on. Only percentage-qualified change wording skips.
+        qt = "What will be the change in seasonally adjusted nonfarm payroll employment in the following months? (Dec-25)"
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("PAYEMS", "mom_diff")
+
+
+# The q45401 defect class swept across the other non-"level" entries: a derivation gate that
+# only knows some of the phrasings for its quantity goes dark silently on the rest.
+class TestWidenedDerivationVocabulary:
+    @pytest.mark.parametrize(
+        "question_text",
+        [
+            "What will the monthly inflation rate for the US Consumer Price Index be in December 2026?",
+            "What will the m/m headline CPI inflation print be for the United States in December 2026?",
+            "By how much will the US CPI rise from the previous month in the December 2026 report?",
+        ],
+    )
+    def test_cpi_mom_phrasings_beyond_the_original_tokens_route(self, question_text: str):
+        route = route_question(_make_numeric_q(question_text=question_text))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("CPIAUCSL", "mom_pct")
+
+    def test_cpi_yoy_excludes_still_veto_the_widened_tokens(self):
+        # The excludes outrank the widened require_any vocabulary, so a YoY question that
+        # happens to mention the previous month stays out of the MoM family.
+        qt = (
+            "What will the year-over-year CPI inflation rate be for December 2026, "
+            "compared with the rate from the previous month's report?"
+        )
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+
+    def test_gasoline_in_the_month_phrasing_routes_to_monthly_avg(self):
+        qt = "What will the average price of regular gasoline be in the month of April 2026?"
+        route = route_question(_make_numeric_q(question_text=qt))
+        assert route is not None
+        assert (route.spec.series_id, route.derivation) == ("GASREGW", "monthly_avg")
+
+
+class TestRoutingMarker:
+    """Every route_question call emits one TS_ANCHOR_ROUTE line — the marker that made anchor
+    coverage queryable (27 of the era's 30 route-level misses previously left no log line).
+    The line shapes here must stay in sync with the `ts_anchor_route` MarkerSpec
+    (scripts/telemetry/markers.py), which tests/test_telemetry_markers.py pins parser-side.
+    """
+
+    def test_a_routed_question_emits_the_marker(self, caplog):
+        with caplog.at_level(logging.INFO):
+            route_question(_make_numeric_q(qid=7101, question_text="Where will the 10-year treasury yield close?"))
+        assert any(
+            "TS_ANCHOR_ROUTE: question=7101 decision=routed series=DGS10 step=kw_single" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_silent_keyword_miss_now_leaves_a_line(self, caplog):
+        with caplog.at_level(logging.INFO):
+            route_question(_make_numeric_q(qid=7102, question_text="Who wins the 2028 election?"))
+        assert any(
+            "TS_ANCHOR_ROUTE: question=7102 decision=skipped series=none step=kw_no_keyword_hit" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_derivation_gate_reject_names_the_refusing_series(self, caplog):
+        # The q45401 shape: title keywords hit, the quantity gate refused. Previously
+        # byte-identical to a no-keyword miss (a bare silent None).
+        qt = "What will total nonfarm payroll employment (in thousands of persons) be in December 2026?"
+        with caplog.at_level(logging.INFO):
+            route_question(_make_numeric_q(qid=7103, question_text=qt))
+        assert any(
+            "TS_ANCHOR_ROUTE: question=7103 decision=skipped series=PAYEMS step=kw_derivation_gate" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_the_emitted_line_parses_under_the_marker_spec(self, caplog):
+        # Emitter/parser round-trip: the archive harvests what route_question logs, so the two
+        # must agree on the byte shape, not just intent.
+        spec = next(s for s in MARKER_SPECS if s.name == "ts_anchor_route")
+        with caplog.at_level(logging.INFO):
+            route_question(_make_numeric_q(qid=7104, question_text="Where will the 10-year treasury yield close?"))
+        line = next(r.getMessage() for r in caplog.records if "TS_ANCHOR_ROUTE" in r.getMessage())
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.groupdict() == {
+            "question": "7104",
+            "decision": "routed",
+            "series": "DGS10",
+            "step": "kw_single",
+        }

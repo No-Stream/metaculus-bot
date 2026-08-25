@@ -248,6 +248,29 @@ async def test_non_benchmarking_includes_prediction_markets(monkeypatch: pytest.
     assert "benchmarking run" not in prompt
 
 
+@pytest.mark.asyncio
+async def test_prompt_carries_the_mc_ballot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MC question's option list must reach the grounded-search prompt: a searching model
+    can only query candidate names it has been shown (the q44952 gap — no research stage ever
+    saw the ballot)."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+
+    response = _make_response("research text")
+    fake_client = _make_client_with_response(response)
+
+    question = _make_q("Who will win the World Yo-Yo Contest?")
+    question.options = ["Mir Kim", "Hunter Feuerstein", "Other"]
+
+    with patch("metaculus_bot.research.gemini_search.genai.Client", return_value=fake_client):
+        from metaculus_bot.research.gemini_search import gemini_search_provider
+
+        provider = gemini_search_provider(is_benchmarking=False)
+        await provider(question)
+
+    prompt = fake_client.aio.models.generate_content.await_args.kwargs["contents"]
+    assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in prompt
+
+
 # ---------------------------------------------------------------------------
 # _format_grounded_response behavior (via invoke_gemini_grounded)
 # ---------------------------------------------------------------------------

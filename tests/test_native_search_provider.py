@@ -215,6 +215,36 @@ async def test_native_search_provider_prompt_includes_anti_hallucination_guidanc
 
 
 @pytest.mark.asyncio
+async def test_native_search_provider_prompt_carries_the_mc_ballot() -> None:
+    """An MC question's option list must reach the search prompt: a searching model can only
+    query candidate names it has been shown (q44952 — AskNews returned zero mentions of the
+    eventual winner on a question whose ballot named him, because no research stage ever saw
+    the options)."""
+    captured_prompt: str | None = None
+
+    class MockLlm:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.model = kwargs.get("model", "mock")
+
+        async def invoke(self, prompt: str) -> str:
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return "Mock research response"
+
+    question = _make_q("Who will win the World Yo-Yo Contest?")
+    question.options = ["Mir Kim", "Hunter Feuerstein", "Other"]
+
+    with patch("metaculus_bot.research.providers.build_llm_with_openrouter_fallback", MockLlm):
+        from metaculus_bot.research.providers import native_search_provider
+
+        provider = native_search_provider()
+        await provider(question)
+
+    assert captured_prompt is not None
+    assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in captured_prompt
+
+
+@pytest.mark.asyncio
 async def test_native_search_provider_enforces_wall_clock_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

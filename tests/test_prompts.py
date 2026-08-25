@@ -985,6 +985,43 @@ def _summarizer_prompt(**overrides) -> str:
     return asknews_summarizer_prompt(**kwargs)
 
 
+class TestResearchPromptsCarryMcOptions:
+    """Every research-side prompt that shows the question must show an MC ballot with it.
+
+    On q44952 (World Yo-Yo champion, MC) no research stage ever saw the candidate list —
+    the prompts carried only question_text — and AskNews returned zero mentions of the
+    eventual winner even though the ballot named him. A searching model can only query
+    names it has been shown, and a summarizer can only relevance-gate articles against
+    candidates it knows exist.
+    """
+
+    _BALLOT = ["Mir Kim", "Hunter Feuerstein", "Other"]
+    _LINE = "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other"
+
+    def test_web_research_prompt_names_the_ballot(self) -> None:
+        assert self._LINE in web_research_prompt("Who wins?", options=self._BALLOT)
+
+    def test_summarizer_prompt_names_the_ballot(self) -> None:
+        assert self._LINE in _summarizer_prompt(options=self._BALLOT)
+
+    def test_gap_fill_analyzer_prompt_names_the_ballot(self) -> None:
+        prompt = gap_fill_analyzer_prompt(
+            question_text="Who wins?",
+            resolution_criteria="rc",
+            fine_print="fp",
+            first_pass_research="research",
+            options=self._BALLOT,
+        )
+        assert self._LINE in prompt
+
+    @pytest.mark.parametrize("options", [None, [], ()])
+    def test_non_mc_questions_carry_no_options_line(self, options) -> None:
+        # Binary/numeric questions have no ballot; an empty "Options" header would invite
+        # the model to invent one.
+        assert "Options (in resolution order)" not in web_research_prompt("Will X happen?", options=options)
+        assert "Options (in resolution order)" not in _summarizer_prompt(options=options)
+
+
 class TestSourceTierTagging:
     """Both TRADITIONAL research prompts (web research + AskNews summarizer)
     must instruct the model to tag factual claims with the A-D source-tier

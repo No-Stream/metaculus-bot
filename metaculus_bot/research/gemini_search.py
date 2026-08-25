@@ -316,6 +316,9 @@ def gemini_search_provider(
     async def _fetch(question: MetaculusQuestion) -> str:  # noqa: D401
         prompt = web_research_prompt(
             question.question_text,
+            # The MC ballot (None on other types): grounded search can only query candidate
+            # names it has been shown (q44952 — zero retrieval on the eventual winner).
+            options=getattr(question, "options", None),
             is_benchmarking=is_benchmarking,
             citation_style="auto_annotated",
             allow_resolution_source_reading=True,

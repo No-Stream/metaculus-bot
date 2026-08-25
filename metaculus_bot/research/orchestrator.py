@@ -456,6 +456,9 @@ class ResearchOrchestrator:
             fine_print=question.fine_print or "",
             open_date=question.open_time.strftime("%Y-%m-%d"),
             research=research,
+            # The MC ballot (None on other types): the relevance screen needs the candidate
+            # names to judge which articles bear on the resolution (q44952).
+            options=getattr(question, "options", None),
         )
         try:
             # Broad retry under the TRANSIENT_RETRY_MAX_ELAPSED_S elapsed gate

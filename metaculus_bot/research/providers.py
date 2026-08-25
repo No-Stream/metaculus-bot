@@ -491,6 +491,9 @@ def _native_search_provider(
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
             question.question_text,
+            # The MC ballot (None on other types): a searching model can only query candidate
+            # names it has been shown (q44952 — zero retrieval on the eventual winner).
+            options=getattr(question, "options", None),
             is_benchmarking=is_benchmarking,
             citation_style="markdown",
         )

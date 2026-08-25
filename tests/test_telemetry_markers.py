@@ -116,6 +116,14 @@ MARKET_RANKING_FAILOPEN_LINE = (
 MARKET_RANKING_UNTRACEABLE_INDEX_LINE = (
     PFX + "MARKET_RANKING: question=44620 pool=4 outcome=ranked rows=1 prompt_chars=36412 rendered=manifold:-1@0"
 )
+TS_ANCHOR_ROUTE_ROUTED_LINE = PFX + "TS_ANCHOR_ROUTE: question=45401 decision=routed series=PAYEMS step=kw_single"
+TS_ANCHOR_ROUTE_GATE_SKIP_LINE = (
+    PFX + "TS_ANCHOR_ROUTE: question=45367 decision=skipped series=PAYEMS step=kw_derivation_gate"
+)
+TS_ANCHOR_ROUTE_NO_HIT_LINE = (
+    PFX + "TS_ANCHOR_ROUTE: question=45193 decision=skipped series=none step=kw_no_keyword_hit"
+)
+TS_ANCHOR_ROUTE_SPREAD_LINE = PFX + "TS_ANCHOR_ROUTE: question=44700 decision=routed series=CL=F/^GSPC step=url_spread"
 CREDIT_BALANCE_LINE = PFX + "CREDIT_BALANCE: key=donated phase=start remaining=123.45 usage=4.16"
 CREDIT_BALANCE_SKIP_LINE = (
     PFX_WARN + "CREDIT_BALANCE: key=personal phase=start skipped (env var OPENROUTER_API_KEY not set)"
@@ -460,6 +468,48 @@ class TestMarketRanking:
         # in the archive rather than coercing into the index distribution as a 0.
         rec = _parse_one(MARKET_RANKING_UNTRACEABLE_INDEX_LINE)
         assert rec["rendered"] == "manifold:-1@0"
+
+
+class TestTsAnchorRoute:
+    """The routing marker that made anchor coverage a query instead of an offline re-run.
+
+    route_question used to log only the ambiguous/guard branches: 27 of the triple era's 30
+    route-level misses were the silent `kw_no_keyword_hit` return and left no line in 1,800
+    persisted run logs. Every decision now emits one line, and losing it from the archive
+    would put the next coverage audit back to reconstructing routes offline.
+    """
+
+    def test_routed_fields(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_ROUTED_LINE)
+        assert rec["marker"] == "ts_anchor_route"
+        assert rec["decision"] == "routed"
+        assert rec["series"] == "PAYEMS"
+        assert rec["step"] == "kw_single"
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_ROUTED_LINE)
+        assert rec["qid"] == 45401
+        assert rec["qid_kind"] == "question_id"
+
+    def test_derivation_gate_skip_names_the_refusing_entry(self):
+        # The q45401 defect class: title keywords hit, the quantity gate refused. Naming
+        # the series is what makes the marker actionable — a bare "skipped" would collapse
+        # this back into the no-keyword miss it was previously indistinguishable from.
+        rec = _parse_one(TS_ANCHOR_ROUTE_GATE_SKIP_LINE)
+        assert rec["decision"] == "skipped"
+        assert rec["series"] == "PAYEMS"
+        assert rec["step"] == "kw_derivation_gate"
+
+    def test_a_plain_keyword_miss_reads_none_series(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_NO_HIT_LINE)
+        # "none" is a _NONE_SENTINELS value, so a series-less skip reads as None.
+        assert rec["series"] is None
+        assert rec["step"] == "kw_no_keyword_hit"
+
+    def test_a_spread_ref_survives_whole(self):
+        rec = _parse_one(TS_ANCHOR_ROUTE_SPREAD_LINE)
+        assert rec["series"] == "CL=F/^GSPC"
+        assert rec["step"] == "url_spread"
 
 
 class TestCredit:
