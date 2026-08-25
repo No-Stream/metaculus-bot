@@ -530,6 +530,24 @@ class TestHtmlCommentMarkers:
         assert rec["marker"] == "stacker_outcome"
         assert rec["outcome"] == "skipped_config_off"
 
+    def test_stacker_skip_reason(self):
+        # The additive skip-reason companion: the reason the plain "skipped"
+        # outcome can't express (single-forecaster skips compute no spread at all).
+        for reason in ("single_forecaster", "spread_below_threshold", "config_off"):
+            rec = _parse_one(f"<!-- STACKER_SKIP_REASON={reason} -->")
+            assert rec["marker"] == "stacker_skip_reason"
+            assert rec["reason"] == reason
+
+    def test_stacker_skip_reason_does_not_collide_with_stacker_outcome(self):
+        # One marker per line: a comment tail carries both markers on separate
+        # lines, and each line must harvest as exactly its own marker.
+        harvested = parse_log_text(
+            "<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON=single_forecaster -->\n",
+            **_META,
+        )
+        assert [r["outcome"] for r in harvested["stacker_outcome"]] == ["skipped"]
+        assert [r["reason"] for r in harvested["stacker_skip_reason"]] == ["single_forecaster"]
+
     def test_tools_used(self):
         rec = _parse_one("<!-- TOOLS_USED=false -->")
         assert rec["marker"] == "tools_used"
@@ -728,6 +746,16 @@ DEGRADATION_COUNTERS_LINE = (
     PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
     "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
+    "publish_attempt_failures=1"
+)
+# The 2026-08-24-and-earlier shape: ends at provider_degradation, i.e. no
+# publish_attempt_failures tail. Every archived record until that date has this
+# shape, so the newest key is optional-group wrapped like its predecessors.
+DEGRADATION_COUNTERS_NO_PUBLISH_TAIL_LINE = (
+    PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
+    "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1"
 )
 # The shape every one of the 290 archived records carries: the same keys as the
@@ -753,7 +781,7 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_eleven_current_keys_parse(self):
+    def test_all_twelve_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
         assert rec["forecasters_dropped"] == 2
@@ -767,6 +795,18 @@ class TestDegradationCounters:
         assert rec["prediction_market_degraded"] == 0
         assert rec["prediction_market_source_losses"] == 4
         assert rec["provider_degradation"] == 1
+        assert rec["publish_attempt_failures"] == 1
+
+    def test_line_without_the_publish_tail_still_harvests_everything_else(self):
+        """Every record archived before 2026-08-24 ends at provider_degradation, and
+        the lazy provider_degradation group must still capture its full value there
+        (not hand a digit to backtracking) while the newer key reads as absent."""
+        rec = _parse_one(DEGRADATION_COUNTERS_NO_PUBLISH_TAIL_LINE)
+        assert rec["marker"] == "degradation_counters"
+        assert rec["provider_degradation"] == 1
+        assert rec["prediction_market_source_losses"] == 4
+        # Absent must read as "this era didn't emit it", never as a measured zero.
+        assert rec["publish_attempt_failures"] is None
 
     def test_line_without_the_provider_degradation_tail_still_harvests_everything_else(self):
         """The load-bearing back-compat case. All 290 archived records end at
@@ -784,6 +824,7 @@ class TestDegradationCounters:
         assert rec["prediction_market_source_losses"] == 0
         # Absent must read as "this era didn't emit it", never as a measured zero.
         assert rec["provider_degradation"] is None
+        assert rec["publish_attempt_failures"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
@@ -818,6 +859,13 @@ PROVIDER_DEGRADATION_LINE = (
     '{"signal":"catalogue_empty","venue":"predictit_markets","questions":1,"entries":0,"fetch_ok":true}]'
 )
 PROVIDER_DEGRADATION_CLEAN_LINE = PFX + "PROVIDER_DEGRADATION: run=local findings=0 alertable=0 suppressed=0 detail=[]"
+# Current shape (2026-08-24): the observation denominators that let a reader tell a
+# measured zero (venues_observed=4 pool_rows=404) from a vacuous one (a run that
+# forecast nothing and evaluated nothing — 96% of the archived records).
+PROVIDER_DEGRADATION_DENOMINATED_LINE = (
+    PFX + "PROVIDER_DEGRADATION: run=32300000000 findings=0 alertable=0 suppressed=0 "
+    "venues_observed=4 catalogues_observed=2 pool_rows=404 detail=[]"
+)
 PROVIDER_DEGRADATION_SUPPRESSED_LINE = (
     PFX + "PROVIDER_DEGRADATION: run=local findings=1 alertable=0 suppressed=1 "
     'detail=[{"signal":"market_field_contract","venue":"manifold","questions":1,"fields":"num_bettors",'
@@ -866,6 +914,23 @@ class TestProviderDegradation:
         assert rec["alertable"] == 0
         assert rec["suppressed"] == 1
         assert json.loads(rec["detail"])[0]["suppressed_until"] == "2026-09-10"
+
+    def test_observation_denominators_parse(self):
+        rec = _parse_one(PROVIDER_DEGRADATION_DENOMINATED_LINE)
+        assert rec["findings"] == 0
+        assert rec["venues_observed"] == 4
+        assert rec["catalogues_observed"] == 2
+        assert rec["pool_rows"] == 404
+
+    def test_pre_denominator_lines_read_absent_not_zero(self):
+        """All ~1039 archived lines predate the denominators; on a re-harvest they
+        must keep parsing, with the new fields None — a vacuous zero must never be
+        promoted into a measured one."""
+        for line in (PROVIDER_DEGRADATION_LINE, PROVIDER_DEGRADATION_CLEAN_LINE, PROVIDER_DEGRADATION_SUPPRESSED_LINE):
+            rec = _parse_one(line)
+            assert rec["venues_observed"] is None
+            assert rec["catalogues_observed"] is None
+            assert rec["pool_rows"] is None
 
     def test_per_run_summary_carries_no_question_ref(self):
         rec = _parse_one(PROVIDER_DEGRADATION_LINE)
@@ -918,6 +983,64 @@ class TestPaidPersonalKeyFallback:
         )
         harvested = parse_log_text(line + "\n", **_META)
         assert harvested["paid_personal_key_fallback"] == []
+
+
+# The per-attempt publish-failure WARN (publish_hardening.py _wrap_with_timeout_retry).
+# Two emitted shapes; the failed one is copied from q45085's real 405-closed run
+# (2026-08-03), the incident that showed a publish failure left no harvestable trace.
+PUBLISH_HARDENING_TIMEOUT_LINE = (
+    PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction attempt 1/2 timed out after 20s"
+)
+PUBLISH_HARDENING_FAILED_LINE = (
+    PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction attempt 2/2 failed "
+    "(HTTPError: Error while posting prediction: Status code: 405. "
+    'Response: {"error":"Question 45085 is already closed to forecasting !"})'
+)
+
+
+class TestPublishHardening:
+    def test_timeout_shape(self):
+        rec = _parse_one(PUBLISH_HARDENING_TIMEOUT_LINE)
+        assert rec["marker"] == "publish_hardening"
+        assert rec["method"] == "_post_question_prediction"
+        assert rec["attempt"] == 1
+        assert rec["attempts"] == 2
+        assert rec["timeout_s"] == 20
+        # Exactly one branch populates per record.
+        assert rec["error_type"] is None
+        assert rec["error"] is None
+
+    def test_exception_shape_captures_class_and_message(self):
+        rec = _parse_one(PUBLISH_HARDENING_FAILED_LINE)
+        assert rec["method"] == "_post_question_prediction"
+        assert rec["attempt"] == 2
+        assert rec["attempts"] == 2
+        assert rec["error_type"] == "HTTPError"
+        assert "405" in rec["error"]
+        assert rec["timeout_s"] is None
+
+    def test_comment_post_method_parses_too(self):
+        rec = _parse_one(PFX_WARN + "PUBLISH_HARDENING: post_question_comment attempt 1/2 timed out after 20s")
+        assert rec["method"] == "post_question_comment"
+
+    def test_other_publish_hardening_strings_are_not_harvested(self):
+        """The module reuses the PUBLISH_HARDENING prefix in its seam-moved
+        AttributeErrors and its loop-exited RuntimeError; only the per-attempt
+        failure WARNs carry the ``attempt N/M`` clause, so only those harvest."""
+        non_attempt_lines = [
+            PFX + "Publish hardening applied: 2 MetaculusClient.post_* methods wrapped with 20s timeout + 1 retry",
+            PFX_WARN + "PUBLISH_HARDENING: MetaculusClient defines no '_post_question_prediction' to patch. "
+            "The forecasting-tools publish seam moved or was renamed; repoint _PATCHED_METHODS.",
+            PFX_WARN + "PUBLISH_HARDENING: _post_question_prediction loop exited without running",
+        ]
+        for line in non_attempt_lines:
+            harvested = parse_log_text(line + "\n", **_META)
+            assert harvested["publish_hardening"] == [], line
+
+    def test_per_call_marker_carries_no_question_ref(self):
+        # The wrapper sees only the POST, so there is no id space to stamp.
+        rec = _parse_one(PUBLISH_HARDENING_TIMEOUT_LINE)
+        assert "qid" not in rec
 
 
 # The end-of-run alertable breakdown (cli.py). Emitted on BOTH exit paths — the

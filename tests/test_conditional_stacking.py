@@ -343,6 +343,8 @@ class TestConditionalStackingBinaryTrigger:
 
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
+            assert bot._stacker_outcome[question.id_of_question] == "skipped"
+            assert bot._stacker_skip_reason[question.id_of_question] == "spread_below_threshold"
 
     @pytest.mark.asyncio
     async def test_diagnostics_seam_on_stacking_paths(self):
@@ -828,6 +830,7 @@ class TestNumericStackingEnabled:
             assert bot._conditional_stacking_skipped_count == 1
             assert bot._conditional_stacking_triggered_count == 0
             assert bot._stacker_outcome[question.id_of_question] == "skipped_config_off"
+            assert bot._stacker_skip_reason[question.id_of_question] == "config_off"
 
     @pytest.mark.asyncio
     async def test_binary_high_spread_still_triggers_when_numeric_disabled(self, monkeypatch):
@@ -1330,6 +1333,9 @@ class TestSingleForecasterShortCircuit:
         assert len(skip_logs) == 1
         assert str(question.id_of_question) in skip_logs[0]
         assert bot._stacker_outcome[question.id_of_question] == "skipped"
+        # The additive skip-reason field: this path computes no spread at all, so
+        # without it the published marker reads identically to a low-spread skip.
+        assert bot._stacker_skip_reason[question.id_of_question] == "single_forecaster"
         assert question.id_of_question in bot._pipeline.expected_base_combines
 
         # The run-level summary must agree with the per-question log line above.

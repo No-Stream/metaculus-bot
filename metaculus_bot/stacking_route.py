@@ -218,9 +218,11 @@ async def route_after_forecasts(
     # (snap-to-integers applied for discrete numerics). Placed before the budget gate
     # and the per-strategy branches so it short-circuits every stacking path — which
     # is also why this branch has to bump its OWN skip counter: the two increment
-    # sites below are unreachable from here. The _stacker_outcome marker is "skipped"
-    # (stacking was skipped, non-stacked aggregation); the distinct log line and
-    # counter record the single-forecaster reason.
+    # sites below are unreachable from here. The _stacker_outcome marker stays
+    # "skipped" (stable for every parser of the legacy value); the skip REASON rides
+    # the additive STACKER_SKIP_REASON marker, because this path computes no spread
+    # at all and would otherwise publish identically to a spread-below-threshold skip
+    # (q44870 was the first resolved instance of that ambiguity).
     if len(valid_predictions) == 1 and bot.aggregation_strategy in _STACKING_STRATEGIES:
         bot._conditional_stacking_skipped_single_forecaster_count += 1
         logger.info(
@@ -230,6 +232,7 @@ async def route_after_forecasts(
         )
         bot._register_expected_base_combine(question)
         bot._stacker_outcome[qid] = "skipped"
+        bot._stacker_skip_reason[qid] = "single_forecaster"
         return base_predictions_collection()
 
     skip_stacking_for_budget = _skip_stacking_for_budget(bot, question, qid, per_q_start)
@@ -320,8 +323,11 @@ async def route_after_forecasts(
         # "skipped_config_off" (spread exceeded the threshold but the per-type gate
         # was off) vs plain "skipped" (spread at/below threshold) — keeps the
         # suppression reason durable in the published marker instead of requiring git
-        # archaeology over workflow-yaml flag history.
+        # archaeology over workflow-yaml flag history. The skip_reason companion
+        # restates it in the one field shared with the single-forecaster path, so a
+        # consumer can read STACKER_SKIP_REASON alone.
         bot._stacker_outcome[qid] = "skipped_config_off" if type_stacking_disabled else "skipped"
+        bot._stacker_skip_reason[qid] = "config_off" if type_stacking_disabled else "spread_below_threshold"
         return base_predictions_collection()
 
     # Catch-all: a non-stacking strategy, OR a stacking strategy whose budget gate

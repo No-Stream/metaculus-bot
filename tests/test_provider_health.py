@@ -31,7 +31,7 @@ from metaculus_bot.constants import (
     provider_degradation_alerts_active,
 )
 from metaculus_bot.research.market_retrieval import venues as venues_package
-from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH
+from metaculus_bot.research.market_retrieval.generation import RETRIEVAL_WIDTH, PoolResult
 from metaculus_bot.research.market_retrieval.venues import (
     kalshi_event_match,
     parse_manifold_matches,
@@ -39,7 +39,7 @@ from metaculus_bot.research.market_retrieval.venues import (
     predictit_market_match,
 )
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
-from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_label
+from metaculus_bot.research.prediction_market import MarketMatch, _liquidity_label, _record_venue_health
 from metaculus_bot.research.provider_health import (
     SIGNAL_CATALOGUE_EMPTY,
     SIGNAL_MARKET_FIELD_CONTRACT,
@@ -50,6 +50,7 @@ from metaculus_bot.research.provider_health import (
     provider_degradation_findings,
     record_catalogue_size,
     record_venue_observation,
+    recorded_observations,
     reset_provider_health,
 )
 
@@ -665,6 +666,29 @@ class TestSummaryLine:
         marker = next(msg for msg in caplog.messages if msg.startswith("PROVIDER_DEGRADATION:"))
         assert "findings=0 alertable=0 suppressed=0" in marker
         assert "detail=[]" in marker
+        # A run that recorded nothing must SAY so: this zero-denominator shape is the
+        # "not measured" reading, distinct from the healthy zero the next test pins.
+        assert "venues_observed=0 catalogues_observed=0 pool_rows=0" in marker
+
+    def test_marker_denominators_come_from_the_recorded_observations(self, caplog: pytest.LogCaptureFixture) -> None:
+        """``findings=0`` alone is byte-identical between a run that evaluated 400
+        pool rows and one that evaluated nothing — 96% of archived records were the
+        vacuous kind (2026-08-24 residual round). The denominators make the zero
+        readable: venues_observed counts venue observations, catalogues_observed the
+        prefetch observations, pool_rows the summed pre-filter candidates."""
+        _observe("kalshi", candidates=100)
+        _observe("polymarket", candidates=60)
+        _observe("manifold", candidates=59)
+        _observe("predictit", candidates=197)
+        record_catalogue_size(qid=1, source="kalshi_events", entries=12355, fetch_ok=True)
+        record_catalogue_size(qid=1, source="predictit_markets", entries=197, fetch_ok=True)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.provider_health"):
+            log_provider_degradation_summary()
+
+        marker = next(msg for msg in caplog.messages if msg.startswith("PROVIDER_DEGRADATION:"))
+        assert "findings=0" in marker
+        assert "venues_observed=4 catalogues_observed=2 pool_rows=416" in marker
 
     def test_marker_detail_round_trips_through_json(self, caplog: pytest.LogCaptureFixture) -> None:
 
@@ -683,6 +707,29 @@ class TestSummaryLine:
                 "pool_rows": 3,
             }
         ]
+
+    def test_partial_sub_fetch_loss_still_records_the_venue_observation(self) -> None:
+        """The recording-site skip is narrowed to TOTAL losses. A partial(ok/total)
+        token means the venue's fan-out lost one query but still produced pool rows,
+        and the old blanket ``is_lost_source`` skip suppressed Signal A for that
+        venue on exactly those runs — the rule meant to catch a dead liquidity-field
+        parser declined to look at the rows that DID parse (3 of the 4 CI-red
+        source-loss events in the 2026-08-24 residual round were partials). A total
+        error(...) loss keeps skipping: it has no rows to measure and is already
+        alertable via the source-loss counter."""
+        pool = PoolResult(per_venue_counts={"manifold": 59, "polymarket": 0})
+        _record_venue_health(
+            1,
+            pool,
+            [],
+            pool_by_venue={"manifold": [], "polymarket": []},
+            sources={"manifold": "partial(15/16)", "polymarket": "error(all_queries_failed)"},
+            platforms=("manifold", "polymarket"),
+        )
+
+        venue_observations, _catalogues = recorded_observations()
+        assert [obs.venue for obs in venue_observations] == ["manifold"]
+        assert venue_observations[0].candidates_pre_filter == 59
 
     def test_per_finding_warn_names_the_remedy(self, caplog: pytest.LogCaptureFixture) -> None:
         """D1's real cost was three weeks of nobody knowing what to do about a blank

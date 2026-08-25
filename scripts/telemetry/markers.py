@@ -32,15 +32,19 @@ against the ACTUAL emitted format strings (the source of truth):
   whether it counted toward the exit code)
 * ``PAID PERSONAL-KEY FALLBACK`` — ``metaculus_bot/fallback_openrouter.py``
   ``_log_fallback`` (per-CALL: which model fell back off the donated key, and why)
+* ``PUBLISH_HARDENING`` — ``metaculus_bot/publish_hardening.py``
+  ``_wrap_with_timeout_retry`` (per-ATTEMPT publish failure: which POST method,
+  which attempt of how many, and the timeout or exception that killed it — the
+  q45085 405-closed shape left no harvestable trace before this spec)
 * ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
   breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
   recorded)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
-* ``STACKER_OUTCOME`` / ``TOOLS_USED`` / ``ANCHOR_OVERSHOOT_PP`` /
-  ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
+* ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` /
+  ``ANCHOR_OVERSHOOT_PP`` / ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
 
-NOTE ON THE HTML-COMMENT MARKERS: the last four are ``<!-- ... -->`` markers
-injected into the *published Metaculus comment*, not logged to stdout/stderr (the
+NOTE ON THE HTML-COMMENT MARKERS: the ones on that last line are ``<!-- ... -->``
+markers injected into the *published Metaculus comment*, not logged to stdout/stderr (the
 framework logs only ``Posted comment on post N``, never the comment body). They
 are therefore almost never present in run logs — their durable source is the
 comment itself, which ``metaculus_bot.performance_analysis`` already parses. Their
@@ -337,7 +341,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?:,\s*prediction_market_degraded=(?P<prediction_market_degraded>\S+?))?"
             r"(?:,\s*(?:prediction_market_source_losses=(?P<prediction_market_source_losses>\S+?)"
             r"|prediction_market_platform_failures=(?P<prediction_market_platform_failures>\S+?)))?"
-            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+))?"
+            r"(?:,\s*provider_degradation=(?P<provider_degradation>\S+?))?"
+            r"(?:,\s*publish_attempt_failures=(?P<publish_attempt_failures>\S+))?"
             r"\s*$"
         ),
     ),
@@ -353,9 +358,39 @@ MARKER_SPECS: list[MarkerSpec] = [
         # _RAW_FIELDS): venue and field names are delimiter-hostile, and residual
         # analysis json.loads it. The trailing suppression clause is free text after
         # the JSON, so ``detail`` stops at the array's closing bracket.
+        #
+        # The observation denominators (venues_observed / catalogues_observed /
+        # pool_rows, added 2026-08-24) are OPTIONAL-group wrapped: re-harvesting
+        # replays the ~1039 archived lines that predate them, and on those a missing
+        # group coerces to None — which reads correctly as "not recorded", never as a
+        # measured zero. They exist because ``findings=0`` alone is byte-identical
+        # between a run that evaluated 400 pool rows and one that evaluated nothing.
         re.compile(
             r"PROVIDER_DEGRADATION:\s*run=(?P<run>\S+)\s+findings=(?P<findings>\d+)"
-            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)\s+detail=(?P<detail>\[.*?\])"
+            r"\s+alertable=(?P<alertable>\d+)\s+suppressed=(?P<suppressed>\d+)"
+            r"(?:\s+venues_observed=(?P<venues_observed>\d+)"
+            r"\s+catalogues_observed=(?P<catalogues_observed>\d+)"
+            r"\s+pool_rows=(?P<pool_rows>\d+))?"
+            r"\s+detail=(?P<detail>\[.*?\])"
+        ),
+    ),
+    MarkerSpec(
+        "publish_hardening",
+        # Per-attempt publish failure WARN (metaculus_bot/publish_hardening.py
+        # _wrap_with_timeout_retry). Two emitted shapes share the prefix:
+        #   "PUBLISH_HARDENING: <method> attempt N/M timed out after Ts"
+        #   "PUBLISH_HARDENING: <method> attempt N/M failed (<ExcType>: <msg>)"
+        # The ``attempt N/M`` clause is what keeps this spec off the OTHER
+        # PUBLISH_HARDENING-prefixed strings in that module (the applied-INFO line,
+        # the seam-moved AttributeErrors, the loop-exited RuntimeError). Exactly one
+        # of ``timeout_s`` / (``error_type``, ``error``) is populated per record; the
+        # counter it complements is ``publish_attempt_failures`` in the degradation
+        # line, but only this marker names WHICH method died and with what. No
+        # question ref (the wrapper sees only the POST), so qid_kind stays None.
+        re.compile(
+            r"PUBLISH_HARDENING:\s*(?P<method>\S+)\s+attempt\s+(?P<attempt>\d+)/(?P<attempts>\d+)\s+"
+            r"(?:timed out after (?P<timeout_s>\d+)s"
+            r"|failed \((?P<error_type>[^:()]+):\s*(?P<error>.*)\))\s*$"
         ),
     ),
     MarkerSpec(
@@ -460,6 +495,18 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"<!--\s*STACKER_OUTCOME="
             r"(?P<outcome>primary|fallback_llm|fallback_median|fallback_mean|skipped_config_off|skipped)"
             r"\s*-->",
+            re.IGNORECASE,
+        ),
+    ),
+    # Additive skip-reason companion to stacker_outcome (comment/markers.py):
+    # separates the three mechanisms the plain "skipped" outcome conflates
+    # (spread below threshold, per-type config gate off, single-forecaster
+    # short-circuit — the last computes no spread at all). HTML-comment marker
+    # like its parent, so the same rarely-in-run-logs caveat applies.
+    MarkerSpec(
+        "stacker_skip_reason",
+        re.compile(
+            r"<!--\s*STACKER_SKIP_REASON=(?P<reason>spread_below_threshold|config_off|single_forecaster)\s*-->",
             re.IGNORECASE,
         ),
     ),

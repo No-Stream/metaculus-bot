@@ -75,6 +75,29 @@ STACKER_OUTCOME_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Additive companion to STACKER_OUTCOME, emitted only on the skip paths. The
+# outcome value ``skipped`` conflates two mechanisms — spread at/below threshold,
+# and the single-forecaster short-circuit that never computes a spread at all
+# (q44870, the first resolved instance, is indistinguishable from a low-spread
+# skip in the outcome alone) — so the reason gets its own marker rather than a
+# new outcome value: STACKER_OUTCOME stays byte-stable for every existing parser
+# of the legacy value. ``config_off`` restates skipped_config_off's reason so the
+# field is self-contained.
+STACKER_SKIP_REASONS: frozenset[str] = frozenset({"spread_below_threshold", "config_off", "single_forecaster"})
+
+STACKER_SKIP_REASON_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*STACKER_SKIP_REASON=(spread_below_threshold|config_off|single_forecaster)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def format_stacker_skip_reason_marker(reason: str) -> str:
+    """Render the skip-reason marker, rejecting values the regex could not parse back."""
+    if reason not in STACKER_SKIP_REASONS:
+        raise ValueError(f"Unknown stacker skip reason {reason!r}; expected one of {sorted(STACKER_SKIP_REASONS)}")
+    return f"<!-- STACKER_SKIP_REASON={reason} -->"
+
+
 # Probabilistic-tools activation marker. Emitted alongside STACKED by
 # ``_create_unified_explanation`` so residual analysis can distinguish
 # tool-augmented runs from vanilla stacking runs.
@@ -233,6 +256,11 @@ assert _skipped_config_off_match.group(1) == "skipped_config_off", (
     f"{STACKER_OUTCOME_SKIPPED_CONFIG_OFF!r}; expected 'skipped_config_off'"
 )
 del _skipped_config_off_match
+assert all(
+    (_m := STACKER_SKIP_REASON_RE.search(format_stacker_skip_reason_marker(_reason))) is not None
+    and _m.group(1) == _reason
+    for _reason in STACKER_SKIP_REASONS
+), "STACKER_SKIP_REASON_RE does not round-trip its own formatter output"
 assert TOOLS_USED_MARKER_RE.search(TOOLS_USED_MARKER_TRUE) is not None, (
     f"TOOLS_USED_MARKER_RE does not match TOOLS_USED_MARKER_TRUE={TOOLS_USED_MARKER_TRUE!r}"
 )
@@ -269,6 +297,9 @@ __all__ = [
     "STACKER_OUTCOME_SKIPPED",
     "STACKER_OUTCOME_SKIPPED_CONFIG_OFF",
     "STACKER_OUTCOME_RE",
+    "STACKER_SKIP_REASONS",
+    "STACKER_SKIP_REASON_RE",
+    "format_stacker_skip_reason_marker",
     "STACKER_META_ANALYSIS_HEADER",
     "STACKED_BASE_REASONING_HEADER",
     "BASE_MODEL_SUBBLOCK_SPLIT_RE",

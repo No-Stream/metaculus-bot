@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
+import requests
 from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import (
@@ -289,3 +290,48 @@ class TestHardeningStillCoversThePostSeam:
                 original = getattr(raw, "__wrapped__", None)
                 if original is not None:
                     setattr(report_type, publish_hardening._PUBLISH_METHOD, original)
+
+
+class TestPublishAttemptFailureCounter:
+    """The retry wrapper's terminal ``raise last_exc`` is the one place a publish
+    ATTEMPT failure becomes countable. Before the counter, q45085's 405-closed
+    (2026-08-03) burned both attempts and every degradation counter still read
+    zero — ``questions_failed_to_publish`` only sees the min-forecasters floor.
+    Telemetry only: the raise itself must be untouched."""
+
+    def test_exhausted_retries_bump_the_counter_once_and_reraise(self) -> None:
+        def always_405(*_args: Any, **_kwargs: Any) -> None:
+            raise requests.HTTPError("Error while posting prediction: Status code: 405")
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_405)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with pytest.raises(requests.HTTPError):
+                wrapped()
+            # One exhausted publish = ONE counted failure, not one per attempt.
+            assert publish_hardening.publish_attempt_failures() == 1
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+    def test_retry_recovery_leaves_the_counter_at_zero(self) -> None:
+        attempts: list[int] = []
+
+        def flaky_then_ok(*_args: Any, **_kwargs: Any) -> str:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise requests.ConnectionError("transient")
+            return "ok"
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", flaky_then_ok)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            assert wrapped() == "ok"
+            # A retried-then-successful publish is not a failure.
+            assert publish_hardening.publish_attempt_failures() == 0
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+    def test_reset_zeroes_the_module_counter(self) -> None:
+        publish_hardening._bump_publish_attempt_failure()
+        publish_hardening.reset_publish_attempt_failures()
+        assert publish_hardening.publish_attempt_failures() == 0

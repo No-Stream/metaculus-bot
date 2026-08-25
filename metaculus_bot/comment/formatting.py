@@ -25,6 +25,7 @@ from metaculus_bot.comment.markers import (
     TOOLS_USED_MARKER_FALSE,
     TOOLS_USED_MARKER_TRUE,
     format_forecasters_used_marker,
+    format_stacker_skip_reason_marker,
 )
 from metaculus_bot.comment.trimming import trim_comment, trim_section
 from metaculus_bot.performance_analysis.parsing import (
@@ -82,6 +83,7 @@ def build_unified_explanation(
     aggregation_strategy: AggregationStrategy,
     stacker_outcome: str | None,
     *,
+    skip_reason: str | None = None,
     n_used: int | None = None,
     n_configured: int | None = None,
 ) -> str:
@@ -89,7 +91,12 @@ def build_unified_explanation(
 
     For non-stacking strategies, trims and returns (plus the ensemble marker). For
     STACKING / CONDITIONAL_STACKING, also appends STACKER_OUTCOME, legacy STACKED,
-    and TOOLS_USED markers. ``n_used`` / ``n_configured`` (contributed / configured
+    and TOOLS_USED markers. ``skip_reason`` is additive: the skip paths in
+    stacking_route supply it, and a STACKER_SKIP_REASON marker then rides directly
+    under STACKER_OUTCOME so a plain ``skipped`` no longer conflates
+    spread-below-threshold with the single-forecaster short-circuit; when ``None``
+    (every non-skip outcome, and comments published before the field) the comment
+    is unchanged. ``n_used`` / ``n_configured`` (contributed / configured
     forecasters) are keyword-only and additive: when both are supplied a
     FORECASTERS_USED marker rides the comment tail; when omitted the comment is
     unchanged (back-compat with callers that don't track ensemble size).
@@ -128,8 +135,11 @@ def build_unified_explanation(
     else:
         qtype = None
 
+    skip_reason_suffix = "" if skip_reason is None else f"\n{format_stacker_skip_reason_marker(skip_reason)}"
     tools_marker = TOOLS_USED_MARKER_TRUE if _tool_runner_feature_enabled(qtype) else TOOLS_USED_MARKER_FALSE
-    return trim_comment(f"{base_text}\n{outcome_marker}\n{legacy_marker}\n{tools_marker}{ensemble_suffix}\n")
+    return trim_comment(
+        f"{base_text}\n{outcome_marker}{skip_reason_suffix}\n{legacy_marker}\n{tools_marker}{ensemble_suffix}\n"
+    )
 
 
 __all__ = [

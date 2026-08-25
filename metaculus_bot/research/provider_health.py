@@ -348,16 +348,23 @@ def provider_degradation_count(today: date | None = None) -> int:
 def log_provider_degradation_summary(today: date | None = None) -> list[DegradationFinding]:
     """Emit the per-run marker + one WARN per finding; return the findings.
 
-    The marker fires at INFO even at zero, so ``findings=0`` is a positive
-    statement of health — the same reasoning that makes ``FORECASTERS_SURVIVED``
-    the positive counterpart to ``FORECASTER_DROPS``. A fully-suppressed
-    degradation still prints its arithmetic and its resume date, following
-    ``cli.py``'s precedent of emitting the breakdown on BOTH exit paths: the green
-    run is exactly the one that would otherwise leave no record.
+    The marker fires at INFO even at zero — but a zero is only a positive
+    statement of health when the line says what was measured. 96% of the
+    archived triple-era records came from runs that forecast nothing and so
+    recorded zero observations, and those vacuous zeros were byte-identical to a
+    genuine clean read over ~400 pool rows (2026-08-24 residual round). The
+    ``venues_observed=`` / ``catalogues_observed=`` / ``pool_rows=`` denominators,
+    read off ``recorded_observations()``, are what let a reader tell
+    ``findings=0 venues_observed=0`` ("not measured") from
+    ``findings=0 venues_observed=4 pool_rows=404`` ("measured, healthy"). A
+    fully-suppressed degradation still prints its arithmetic and its resume date,
+    following ``cli.py``'s precedent of emitting the breakdown on BOTH exit
+    paths: the green run is exactly the one that would otherwise leave no record.
     """
     findings = provider_degradation_findings(today)
     alertable = [finding for finding in findings if finding.is_alertable]
     suppressed = [finding for finding in findings if not finding.is_alertable]
+    venue_observations, catalogue_observations = recorded_observations()
     detail_json = json.dumps([finding.as_marker_detail() for finding in findings], separators=(",", ":"))
     suppression_note = ""
     if suppressed:
@@ -367,11 +374,15 @@ def log_provider_degradation_summary(today: date | None = None) -> list[Degradat
         )
         suppression_note = f" ({rendered}); run stays green on those."
     logger.info(
-        "PROVIDER_DEGRADATION: run=%s findings=%d alertable=%d suppressed=%d detail=%s%s",
+        "PROVIDER_DEGRADATION: run=%s findings=%d alertable=%d suppressed=%d "
+        "venues_observed=%d catalogues_observed=%d pool_rows=%d detail=%s%s",
         os.environ.get("GITHUB_RUN_ID", "local"),
         len(findings),
         len(alertable),
         len(suppressed),
+        len(venue_observations),
+        len(catalogue_observations),
+        sum(obs.candidates_pre_filter for obs in venue_observations),
         detail_json,
         suppression_note,
     )

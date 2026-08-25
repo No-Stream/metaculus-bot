@@ -57,6 +57,7 @@ from metaculus_bot.performance_analysis.parsing import (
     annotate_forecaster_bullets_with_models,
     extract_model_display_name_from_reasoning,
 )
+from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -292,6 +293,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         return self._pipeline.outcomes
 
     @property
+    def _stacker_skip_reason(self) -> dict[int, str]:
+        return self._pipeline.skip_reasons
+
+    @property
     def _stack_expected_base_combine(self) -> set[int]:
         return self._pipeline.expected_base_combines
 
@@ -388,6 +393,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         reset_pchip_stats()
         self._research.reset_run_degradation_counters()
+        # Same per-run cadence as the module-scoped research counters above: the
+        # publish-hardening wrapper has no handle back to the bot, so its
+        # retry-exhaustion counter lives at module scope and is zeroed here.
+        reset_publish_attempt_failures()
 
         results = await super().forecast_questions(questions, return_exceptions)
 
@@ -439,6 +448,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
     @property
     def _provider_degradation_count(self) -> int:
         return self._research.provider_degradation_count
+
+    @property
+    def _publish_attempt_failures(self) -> int:
+        return publish_attempt_failures()
 
     @property
     def _gap_fill_v2_error_count(self) -> int:
@@ -838,6 +851,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         )
         qid = question.id_of_question
         stacker_outcome = self._stacker_outcome.pop(qid, None) if qid is not None else None
+        stacker_skip_reason = self._stacker_skip_reason.pop(qid, None) if qid is not None else None
         # Ensemble-size disclosure: forecasters that CONTRIBUTED (== the number of
         # per-model summary bullets) out of those CONFIGURED. Makes a degraded
         # publish self-describing in the durable comment record, so residual
@@ -868,6 +882,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             question,
             self.aggregation_strategy,
             stacker_outcome,
+            skip_reason=stacker_skip_reason,
             n_used=n_used,
             n_configured=n_configured,
         )

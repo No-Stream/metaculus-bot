@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from main import TemplateForecaster
+from metaculus_bot import publish_hardening
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.research import prediction_market, provider_health
 
@@ -33,7 +34,7 @@ def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> Temp
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all eleven degradation counters. Using distinct powers of 2
+    """Property must sum all twelve degradation counters. Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -62,8 +63,11 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # siblings answered. Same read-only shape as the two above, so stub the accessor
     # the property imports rather than recording 1024 observations.
     monkeypatch.setattr(provider_health, "provider_degradation_count", lambda: 1024)
+    # Twelfth term: a publish POST that exhausted the publish-hardening retry
+    # budget (q45085's 405 shape) — the module global the bot property reads.
+    monkeypatch.setattr(publish_hardening, "_PUBLISH_ATTEMPT_FAILURES", 2048)
 
-    assert bot.alertable_count == 2047
+    assert bot.alertable_count == 4095
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -116,7 +120,8 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
         await bot.forecast_questions([])
 
     degradation = next(line for line in caplog.messages if line.startswith("Degradation counters:"))
-    assert degradation.endswith("provider_degradation=0"), degradation
+    assert "provider_degradation=0" in degradation, degradation
+    assert degradation.endswith("publish_attempt_failures=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
 
 
@@ -142,6 +147,26 @@ async def test_run_start_resets_provider_health_observations(mock_general_llm):
 
     await bot.forecast_questions([])
     assert bot.alertable_count == 0
+
+
+@pytest.mark.asyncio
+async def test_forecast_questions_resets_publish_attempt_failures(mock_general_llm):
+    """The publish-hardening retry-exhaustion counter is module state (the wrapper
+    has no handle back to the bot), so forecast_questions must zero it at run start
+    — same rationale as the prediction-market counters below."""
+    bot = _bot(mock_general_llm)
+
+    publish_hardening._bump_publish_attempt_failure()
+    try:
+        assert publish_hardening.publish_attempt_failures() == 1
+        assert bot.alertable_count == 1
+
+        await bot.forecast_questions([])
+
+        assert publish_hardening.publish_attempt_failures() == 0
+        assert bot.alertable_count == 0
+    finally:
+        publish_hardening.reset_publish_attempt_failures()
 
 
 @pytest.mark.asyncio

@@ -787,10 +787,16 @@ def _record_venue_health(
     for venue in generation.VENUE_ORDER:
         if venue not in platforms:
             continue
-        # A venue that lost a sub-fetch is already alertable via _bump_source_loss, so
+        # A venue that lost its whole fan-out is already alertable via _bump_source_loss, so
         # provider_health skips it rather than counting one outage twice (and "check the query
-        # construction" would be the wrong remedy for a 503 anyway).
-        if is_lost_source(sources.get(venue, "")):
+        # construction" would be the wrong remedy for a 503 anyway). The skip is narrowed to
+        # TOTAL losses (error/timeout-class tokens, which leave no pool rows to measure): a
+        # partial(ok/total) venue still produced rows, and skipping it blinded Signal A for
+        # that venue on exactly the runs where one of its queries flaked — 3 of the 4 CI-red
+        # source-loss events in the 2026-08-24 residual round were partials, each of which
+        # suppressed the liquidity-field read over the ~59 rows that DID parse.
+        token = sources.get(venue, "")
+        if is_lost_source(token) and not token.startswith("partial("):
             continue
         rows = pool_by_venue.get(venue, [])
         present = {

@@ -240,6 +240,53 @@ class TestBuildUnifiedExplanation:
         assert STACKED_MARKER_FALSE in result
         assert STACKED_MARKER_TRUE not in result
 
+    def test_skip_reason_marker_rides_each_skip_outcome(self):
+        # The additive STACKER_SKIP_REASON companion: plain "skipped" conflates
+        # spread-below-threshold with the single-forecaster short-circuit (which
+        # computes no spread at all), so the reason gets its own marker while
+        # STACKER_OUTCOME stays byte-stable for existing parsers.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        for outcome, reason in (
+            ("skipped", "single_forecaster"),
+            ("skipped", "spread_below_threshold"),
+            ("skipped_config_off", "config_off"),
+        ):
+            result = build_unified_explanation(
+                base_text="# SUMMARY\nBody.",
+                question=self._make_question(),
+                aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+                stacker_outcome=outcome,
+                skip_reason=reason,
+            )
+            assert f"<!-- STACKER_SKIP_REASON={reason} -->" in result
+            assert f"<!-- STACKER_OUTCOME={outcome} -->" in result
+
+    def test_skip_reason_absent_when_not_supplied(self):
+        # Back-compat: every pre-field comment (and every non-skip outcome) omits
+        # the marker entirely rather than emitting a placeholder value.
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        result = build_unified_explanation(
+            base_text="# SUMMARY\nBody.",
+            question=self._make_question(),
+            aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+            stacker_outcome="skipped",
+        )
+        assert "STACKER_SKIP_REASON" not in result
+
+    def test_unknown_skip_reason_raises_valueerror(self):
+        from metaculus_bot.comment.formatting import build_unified_explanation
+
+        with pytest.raises(ValueError, match="Unknown stacker skip reason"):
+            build_unified_explanation(
+                base_text="# SUMMARY\nBody.",
+                question=self._make_question(),
+                aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
+                stacker_outcome="skipped",
+                skip_reason="bogus_reason",
+            )
+
     def test_unknown_outcome_raises_valueerror(self):
         from metaculus_bot.comment.formatting import build_unified_explanation
 

@@ -805,6 +805,7 @@ class _RealAlertableCountBot(MagicMock):
     _prediction_market_degraded_count = TemplateForecaster._prediction_market_degraded_count
     _prediction_market_source_loss_count = TemplateForecaster._prediction_market_source_loss_count
     _provider_degradation_count = TemplateForecaster._provider_degradation_count
+    _publish_attempt_failures = TemplateForecaster._publish_attempt_failures
 
 
 def _bot_with_real_alertable_count() -> _RealAlertableCountBot:

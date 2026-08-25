@@ -42,6 +42,7 @@ def alertable_total(bot: "TemplateForecaster") -> int:
         + bot._prediction_market_degraded_count
         + bot._prediction_market_source_loss_count
         + bot._provider_degradation_count
+        + bot._publish_attempt_failures
     )
 
 
@@ -54,9 +55,17 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
     published. Emitted unconditionally, so a clean run states its zeros rather
     than implying them by an absent line.
 
-    ``provider_degradation`` stays LAST: the telemetry parser wraps it in an
-    optional trailing group so the ~290 archived records that predate it still
-    harvest their other ten counters on a replace-by-run re-harvest.
+    The tail keys (``provider_degradation``, then ``publish_attempt_failures``)
+    stay LAST and in that order: the telemetry parser wraps each in an optional
+    trailing group so archived records that predate either still harvest their
+    other counters on a replace-by-run re-harvest.
+
+    ``questions_failed_to_publish`` counts questions the min-forecasters floor
+    kept from ATTEMPTING publication; ``publish_attempt_failures`` counts
+    attempted POSTs that exhausted the publish-hardening retry budget (the
+    q45085 405 shape the old counter could not see). The old key's name is
+    misleading but stays — renaming it would silently drop the field from every
+    historical record the parser replays.
     """
     return (
         f"Degradation counters: forecasters_dropped={bot._forecasters_dropped_count}, "
@@ -69,7 +78,8 @@ def format_degradation_summary(bot: "TemplateForecaster") -> str:
         f"gap_fill_v2_errors={bot._gap_fill_v2_error_count}, "
         f"prediction_market_degraded={bot._prediction_market_degraded_count}, "
         f"prediction_market_source_losses={bot._prediction_market_source_loss_count}, "
-        f"provider_degradation={bot._provider_degradation_count}"
+        f"provider_degradation={bot._provider_degradation_count}, "
+        f"publish_attempt_failures={bot._publish_attempt_failures}"
     )
 
 

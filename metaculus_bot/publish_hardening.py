@@ -191,6 +191,32 @@ _PATCHED_METHODS: tuple[str, ...] = (
 # and serialized within a single Q's publish_report_to_metaculus().
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+# Per-run count of publish attempts that exhausted the retry budget — the counter
+# that makes a publish-ATTEMPT failure visible. ``questions_failed_to_publish``
+# increments only under the min-forecasters floor ("too thin to attempt"), so
+# before this counter a 405/500/exhausted-timeout out of the actual POST left
+# every counter at zero (q45085, 2026-08-03: two failed attempts, counters all
+# zero). Module-scoped like ``prediction_market._SOURCE_LOSSES`` because the
+# wrapper has no handle back to the bot; ``forecast_questions`` resets it at run
+# start. Telemetry only — the exception still propagates exactly as before.
+_PUBLISH_ATTEMPT_FAILURES: int = 0
+
+
+def _bump_publish_attempt_failure() -> None:
+    global _PUBLISH_ATTEMPT_FAILURES
+    _PUBLISH_ATTEMPT_FAILURES += 1
+
+
+def publish_attempt_failures() -> int:
+    """Per-run count of retry-exhausted publish attempts (folded into alertable_count)."""
+    return _PUBLISH_ATTEMPT_FAILURES
+
+
+def reset_publish_attempt_failures() -> None:
+    """Zero the counter at run start; without this it leaks across runs/tests sharing a process."""
+    global _PUBLISH_ATTEMPT_FAILURES
+    _PUBLISH_ATTEMPT_FAILURES = 0
+
 
 def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _executor
@@ -292,6 +318,10 @@ def _wrap_with_timeout_retry(method_name: str, original: Callable[..., Any]) -> 
                     type(exc).__name__,
                     exc,
                 )
+        # The single terminal failure point on the publish path: every retry burned
+        # and the question's POST never landed. Counted here (and only here) so the
+        # end-of-run counters see it; the raise is unchanged.
+        _bump_publish_attempt_failure()
         raise last_exc
 
     return wrapper
