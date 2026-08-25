@@ -20,6 +20,7 @@ from scripts.download_run_logs import (
     infer_workflow,
     workflow_slug_from_path,
 )
+from scripts.telemetry.archive import RUNS_MANIFEST_FILE, load_run_manifest
 
 EXTRACTION_LINE = (
     "2026-07-17 14:23:01,123 - metaculus_bot.value_extraction - INFO - "
@@ -57,24 +58,17 @@ class TestInferWorkflow:
 
 
 def _seed_manifest(archive_dir: Path, entries: dict[int, str]) -> None:
-    """Write a minimal runs.jsonl manifest mapping each run_id to a workflow slug."""
+    """Write a minimal run manifest mapping each run_id to a workflow slug."""
     archive_dir.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps({"run_id": str(run_id), "workflow": workflow, "artifact": f"research-{run_id}"})
         for run_id, workflow in entries.items()
     ]
-    (archive_dir / "runs.jsonl").write_text("\n".join(lines) + "\n")
+    (archive_dir / RUNS_MANIFEST_FILE).write_text("\n".join(lines) + "\n")
 
 
 class TestResolveWorkflowMap:
-    """The online map must layer GitHub's fresh window OVER the archive's own manifest.
-
-    GitHub's created-filtered ``/actions/runs`` pagination returns at most 1000 items
-    (~15 days at the prod cadence), so runs older than that vanish from the fresh map.
-    Without the archive layer underneath, ``infer_workflow`` reads them as ``unknown``
-    and the replace-by-run merge writes that over the correct slug already in
-    ``runs.jsonl`` — the regression that degraded 861 archived runs to ``unknown``.
-    """
+    """The resolved map layers GitHub's fresh window OVER the archive-derived map (see resolve_workflow_map)."""
 
     def test_archive_fills_runs_github_no_longer_returns(self, tmp_path: Path, monkeypatch):
         _seed_manifest(tmp_path, {100: "tournament"})
@@ -166,7 +160,7 @@ class TestHarvestRunLogsFromDir:
 class TestDownloadTimeoutResilience:
     """A single slow `gh` call must not sink the whole weekly harvest: a per-artifact
     download timeout is skipped (loop continues), and the run-enumeration timeout falls
-    back to prefix inference instead of raising.
+    back to the archive-derived workflow map instead of raising.
     """
 
     def test_per_artifact_timeout_returns_none_not_raises(self, tmp_path: Path, monkeypatch, caplog):
@@ -222,3 +216,33 @@ class TestDownloadTimeoutResilience:
         _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, tmp_path, store_dir=tmp_path / "store")
         assert {r.run_id for r in runs} == {"2"}, "the surviving artifact must still be harvested"
         assert len(runs[0].records["extraction_rung"]) == 1
+
+
+class TestDownloadAndHarvestKeepsArchivedLabels:
+    def test_online_harvest_keeps_archived_label_for_aged_out_run(self, tmp_path: Path, monkeypatch):
+        """A run absent from GitHub's window keeps its archived label through the real merge.
+
+        ``merge_and_write`` is deliberately NOT patched: the assertion covers the whole
+        online path, resolver through manifest round-trip, in the standalone driver
+        (``make sync_telemetry`` runs it directly, without going through sync_all).
+        """
+        archive_dir = tmp_path / "archive"
+        _seed_manifest(archive_dir, {1: "tournament"})
+        artifacts = [{"name": "research-1", "run_id": 1, "expired": False, "created_at": "2026-06-01T00:00:00Z"}]
+        monkeypatch.setattr(gha, "verify_gh_cli", lambda: None)
+        monkeypatch.setattr(gha, "list_research_artifacts", lambda repo: artifacts)
+        monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {})
+
+        def _download(run_id, repo, name, dest_dir):
+            log_dir = dest_dir / str(run_id) / "run_logs"
+            log_dir.mkdir(parents=True)
+            (log_dir / "run.log").write_text(EXTRACTION_LINE + "\n")
+            return dest_dir / str(run_id)
+
+        monkeypatch.setattr(gha, "_download_artifact_to", _download)
+
+        _totals, runs, _expired = dl.download_and_harvest("owner/repo", 0, archive_dir, store_dir=tmp_path / "store")
+
+        assert [r.workflow for r in runs] == ["tournament"]
+        manifest = load_run_manifest(archive_dir)
+        assert {r["run_id"]: r["workflow"] for r in manifest} == {"1": "tournament"}

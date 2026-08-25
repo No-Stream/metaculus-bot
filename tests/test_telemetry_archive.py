@@ -8,6 +8,7 @@ schedule without duplicating or losing records.
 """
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -144,3 +145,31 @@ class TestAtomicWrite:
 
         assert path.read_text() == original, "a mid-write crash must not truncate the durable archive"
         assert {p.name for p in tmp_path.iterdir()} == {"x.jsonl"}, "temp file must be cleaned up on failure"
+
+
+class TestManifestDowngradeWarning:
+    """Replacing a concrete archived workflow label with ``unknown`` warns; anything else stays quiet.
+
+    This is the merge-side signal for a workflow map whose archive under-layer came up
+    empty (missing/partial manifest) — the replace-by-run merge still proceeds, but the
+    downgrade is no longer silent.
+    """
+
+    _WARN_TOKEN = "overwrite a concrete archived workflow label"
+
+    def test_warns_when_concrete_label_replaced_by_unknown(self, tmp_path: Path, caplog):
+        merge_and_write(tmp_path, [_run("100", {}, workflow="tournament")])
+        with caplog.at_level(logging.WARNING):
+            merge_and_write(tmp_path, [_run("100", {}, workflow="unknown")])
+        assert any(self._WARN_TOKEN in r.getMessage() for r in caplog.records)
+
+    def test_quiet_when_label_stays_concrete(self, tmp_path: Path, caplog):
+        merge_and_write(tmp_path, [_run("100", {}, workflow="tournament")])
+        with caplog.at_level(logging.WARNING):
+            merge_and_write(tmp_path, [_run("100", {}, workflow="tournament")])
+        assert not any(self._WARN_TOKEN in r.getMessage() for r in caplog.records)
+
+    def test_quiet_on_first_harvest_of_an_unknown_run(self, tmp_path: Path, caplog):
+        with caplog.at_level(logging.WARNING):
+            merge_and_write(tmp_path, [_run("100", {}, workflow="unknown")])
+        assert not any(self._WARN_TOKEN in r.getMessage() for r in caplog.records)

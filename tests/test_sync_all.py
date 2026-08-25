@@ -263,12 +263,7 @@ class TestOfflineReharvestFromTheStore:
         assert summary.expired == [], "the store cannot hold an expired artifact"
 
     def test_offline_reharvest_keeps_workflow_attribution(self, tmp_path: Path) -> None:
-        """Without the archive-derived map, every re-harvested run would read ``unknown``.
-
-        ``infer_workflow`` can only fall back to the artifact-name prefix, which stopped
-        distinguishing test runs from prod ones once every workflow uploaded ``research-*``
-        — and the replace-by-run merge would then overwrite the good slug with that.
-        """
+        """An offline re-harvest replays runs.jsonl's own attribution instead of degrading to ``unknown``."""
         dirs = _dirs(tmp_path)
         self._seed_store(tmp_path, dirs)
 
@@ -299,16 +294,8 @@ class TestOfflineReharvestFromTheStore:
         assert summary.research_questions == 2, "and the harvest still sees both runs, off the store"
 
     def test_online_resync_keeps_archived_workflow_labels_for_aged_out_runs(self, tmp_path: Path) -> None:
-        """An ONLINE re-sync must not degrade archived workflow labels to ``unknown``.
-
-        GitHub caps ``created``-filtered run pagination at 1000 items (~15 days), so an
-        online pull's fresh workflow map misses every older run even though their
-        artifacts (90-day retention) are still enumerated and re-harvested. Before the
-        archive-derived map was layered underneath the fresh one, those runs resolved
-        to ``unknown`` and the replace-by-run merge overwrote the correct labels the
-        archive already held — 861 runs (679 of them ``tournament``) degraded this way.
-        Here the fresh map only knows run 200; run 100's archived label must survive.
-        """
+        """An ONLINE re-sync whose GitHub window misses an archived run (100) keeps that run's
+        archived label, while GitHub wins for the in-window run (200)."""
         dirs = _dirs(tmp_path)
         self._seed_store(tmp_path, dirs)
         now = datetime.now(timezone.utc)
