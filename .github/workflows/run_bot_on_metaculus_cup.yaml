@@ -15,18 +15,35 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    # Backstop only: normal runs finish far sooner. Without this, a wedged run
-    # holds the concurrency group for GitHub's 6h default.
-    timeout-minutes: 300
+    # Backstop only; the per-step caps below are the real hang defense. Sized above the
+    # bot's OWN contract rather than off the measured distribution: constants.py caps a
+    # question at PER_QUESTION_WALL_CLOCK_DEADLINE (3510s) and reserves
+    # WALL_CLOCK_STACKING_MIN_BUDGET (90s) to publish — a 3600s cycle — and questions
+    # run concurrently (forecasting-tools gathers them), so 60 min is the longest a
+    # healthy run may legitimately need whatever it picked up. 80 = that 60 + the
+    # Playwright cap + setup + upload + margin. A cap at or below 60 would kill a
+    # slow-but-recovering run in the second it was about to publish, which is the
+    # forfeit we are trying to prevent. Worst job measured in the era: 11.3 min.
+    timeout-minutes: 80
     steps: # sets up the steps that will be run in order
+      # Every step below carries its own timeout-minutes. The job cap is the wrong
+      # instrument for a hang: it fires late, it reports `cancelled` — indistinguishable
+      # from a concurrency eviction, which is how 2026-08-19's four wedges hid among the
+      # day's 54 evictions — and it cannot let a run continue past a step that is
+      # allowed to fail. Caps run 5x-100x the worst of 200 successful runs (checkout 4s,
+      # setup-uv 3s, uv sync 22s, Playwright 55s, upload 2s), so none can fire on a
+      # healthy run. Receipts: scratch/residual_2026-08-24/track_c_step_timings.json.
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
         uses: actions/checkout@v5
+        timeout-minutes: 5
       - uses: astral-sh/setup-uv@v7
+        timeout-minutes: 5
         with:
           enable-cache: true
           python-version: "3.12"
       - name: Install dependencies
+        timeout-minutes: 10
         run: uv sync --no-dev --frozen
       # Chromium for gap-fill v2's rendered-fetch rung (playwright). --with-deps
       # pulls the system libraries chromium needs on ubuntu runners. The loop
@@ -35,17 +52,17 @@ jobs:
       - name: Install Playwright Chromium
         id: playwright_install
         continue-on-error: true
-        # Step-level cap: on 2026-08-19 the Azure Ubuntu mirror failed over and apt
-        # hung inside this install on four runs, each burning the full 300-minute job
-        # timeout while holding the concurrency group (18 of 24 hours; two questions
-        # forfeited). continue-on-error already treats a FAILURE here as benign, but
-        # it cannot see a HANG — the timeout converts one into the other. Healthy
-        # step runs 22-34s, so 3 minutes is ~5x the worst observed, and a kill loses
-        # zero questions: the run proceeds with the rendered-fetch rung degraded to
-        # plain fetch, exactly as this step's design already intends.
-        timeout-minutes: 3
+        # 2026-08-19: apt hung here on four runs after the Azure Ubuntu mirror failed
+        # over, each burning the full 300-min job cap while holding the concurrency
+        # group (18 of 24 hours; q45374 and q45375 forfeited). A kill costs nothing —
+        # the run proceeds with the rendered-fetch rung degraded to plain fetch, which
+        # is what continue-on-error already intends. 5 min is 5.5x the worst of 200
+        # healthy runs (55s, p50 24s); the 3 min shipped in 41ee30f was sized off an
+        # n=10 sample whose 34s max missed that tail.
+        timeout-minutes: 5
         run: uv run --frozen --no-dev playwright install --with-deps chromium
       - name: Warn if Playwright install failed
+        # No cap: a bash echo with no network and no subprocess cannot hang.
         if: steps.playwright_install.outcome == 'failure'
         run: echo "::warning title=Playwright install failed::Chromium install failed — gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
       - name: Run bot
@@ -57,6 +74,12 @@ jobs:
         # shell: bash yields `set -eo pipefail`, so the `python | tee` pipeline
         # preserves the intentional sys.exit(1) degradation alert (cli.py ~L186);
         # a bare `run:` (bash -e, no pipefail) would swallow it as tee's exit 0.
+        # Cap at the bot's own contract (see the job cap above): 60 min is the longest
+        # a healthy run may legitimately need, and 70 leaves headroom for the question
+        # fetch, the identity preflight and the publish retries. A kill here FAILS the
+        # step rather than cancelling the job, so the always() upload below still ships
+        # the partial log — the observability the 2026-08-06 streak had none of.
+        timeout-minutes: 70
         run: |
           mkdir -p run_logs
           uv run --frozen --no-dev python main.py --mode metaculus_cup 2>&1 | tee "run_logs/run_${GITHUB_RUN_ID}_$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -151,6 +174,7 @@ jobs:
           RAW_RESEARCH_LOG_ENABLED: 'true'
       - name: Upload research outputs
         if: always()
+        timeout-minutes: 10
         uses: actions/upload-artifact@v7
         with:
           name: research-${{ github.run_id }}

@@ -6,9 +6,16 @@ name: CI
     branches: [main]
   pull_request:
 
+# Every job carries timeout-minutes. Without it the cap is GitHub's default 360, so a
+# hung `uv sync`, a stalled container pull or a wedged pytest leaves a required check
+# spinning for six hours — the same uncapped-network-step shape that burned four
+# 300-minute bot runs on 2026-08-19. Caps are >=5x the worst of 131 successful CI jobs
+# (whole job max 245s, pytest 225s, basedpyright 27s, uv sync 15s, osv pull 16s);
+# receipts in scratch/residual_2026-08-24/track_c_step_timings.json.
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -26,6 +33,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -41,6 +49,7 @@ jobs:
   # redacted in the SARIF artifact the action uploads.
   secret_scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -69,6 +78,7 @@ jobs:
   # than uvx.
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
