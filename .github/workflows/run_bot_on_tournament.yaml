@@ -40,6 +40,15 @@ jobs:
       - name: Install Playwright Chromium
         id: playwright_install
         continue-on-error: true
+        # Step-level cap: on 2026-08-19 the Azure Ubuntu mirror failed over and apt
+        # hung inside this install on four runs, each burning the full 300-minute job
+        # timeout while holding the concurrency group (18 of 24 hours; two questions
+        # forfeited). continue-on-error already treats a FAILURE here as benign, but
+        # it cannot see a HANG — the timeout converts one into the other. Healthy
+        # step runs 22-34s, so 3 minutes is ~5x the worst observed, and a kill loses
+        # zero questions: the run proceeds with the rendered-fetch rung degraded to
+        # plain fetch, exactly as this step's design already intends.
+        timeout-minutes: 3
         run: uv run --frozen --no-dev playwright install --with-deps chromium
       - name: Warn if Playwright install failed
         if: steps.playwright_install.outcome == 'failure'
