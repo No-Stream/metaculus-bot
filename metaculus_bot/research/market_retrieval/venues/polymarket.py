@@ -58,17 +58,22 @@ def _polymarket_market_volume(market: dict[str, Any]) -> float | None:
 
 
 def polymarket_event_children(markets: Sequence[dict[str, Any]]) -> tuple[MarketChild, ...]:
-    """One child per nested market, MOST-TRADED FIRST, each priced off its OWN ``outcomePrices``.
+    """One child per nested market, OPEN-FIRST then PRICE-DESCENDING, each priced off its OWN
+    ``outcomePrices``.
 
     The title is ``groupItemTitle`` ("0 (0 bps)", "1 (25 bps)") in preference to ``question``
     ("Will no Fed rate cuts happen in 2026?"): it is the label Polymarket's own event page shows
     against each outcome, it is a third the length, and under the parent's title it reads as the
     ladder rung it is. ``question`` is the fallback for the events that ship no group label.
 
-    Volume-descending because the renderer truncates a long child list from the end, so the order
-    decides what survives the budget — the most-traded outcome is the one a forecaster most needs.
-    The sort is STABLE, so an event whose children all report the same volume (or none) keeps
-    Gamma's own order rather than an arbitrary one.
+    Price-descending — the same rule as ``kalshi_strike_children`` and ``manifold_answer_children``
+    — because the renderer truncates a long child list from the end and an event's children are a
+    distribution over one question's outcomes: the rungs carrying the price mass are the forecast,
+    whatever traded. (The traded-size key this replaces was latent here — 0 of 790 archived
+    Polymarket child rows carry a non-null ``open_interest``, so ``max()`` reduced to volume — but
+    it is the byte-identical defect that cost q45189 on Kalshi, so both venues change together.)
+    The sort is STABLE, so equal-priced (and unpriced) children keep Gamma's own order rather than
+    an arbitrary one.
 
     A market with no usable title is dropped rather than rendered as a blank row; it would spend a
     child slot saying nothing.
@@ -85,7 +90,7 @@ def polymarket_event_children(markets: Sequence[dict[str, Any]]) -> tuple[Market
         for market in markets
         if (title := market.get("groupItemTitle") or market.get("question") or market.get("title") or "")
     ]
-    children.sort(key=lambda child: max(child.total_volume or 0.0, child.open_interest or 0.0), reverse=True)
+    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
     return tuple(children)
 
 

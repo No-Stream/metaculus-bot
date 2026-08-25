@@ -128,7 +128,9 @@ class TestFetchMarketSnapshot:
     async def test_an_empty_ranking_is_a_valid_answer_and_not_a_degradation(self, mock_question, kalshi_events_payload):
         """`[]` means "nothing here bears on the question", which is the whole adaptive-width
         mechanism. Conflating it with a failure would delete that mechanism AND redden CI on a
-        correct answer."""
+        correct answer. The forecaster is TOLD about the deliberate empty answer rather than
+        shown a vanished section (the q45200 outage-lookalike), and the notice quotes the pool
+        the ranker reviewed."""
         handlers = _handlers(**{_KALSHI_EVENTS_URL: FakeResponse(200, kalshi_events_payload)})
 
         snapshot = await _fetch(mock_question, handlers, ranking="[]")
@@ -136,7 +138,10 @@ class TestFetchMarketSnapshot:
         assert snapshot.matches == []
         assert snapshot.sources["ranking"] == "ok(0)"
         assert pmp.prediction_market_source_losses() == 0
-        assert format_snapshot_for_research(snapshot) == ""
+        assert snapshot.pool_size > 0
+        rendered = format_snapshot_for_research(snapshot)
+        assert f"No sufficiently relevant market among {snapshot.pool_size} candidates" in rendered
+        assert "not a provider outage" in rendered
 
     @pytest.mark.asyncio
     async def test_an_unreadable_ranking_fails_open_to_retrieval_order(self, mock_question, kalshi_events_payload):

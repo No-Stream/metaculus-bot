@@ -509,7 +509,8 @@ def kalshi_strike_price(market: dict[str, Any]) -> float | None:
 
 
 def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChild, ...]:
-    """Each tradeable strike as its own sub-row, MOST-TRADED FIRST. ``()`` for a one-strike family.
+    """Each tradeable strike as its own sub-row, OPEN-FIRST then PRICE-DESCENDING. ``()`` for a
+    one-strike family.
 
     The multi-strike answer, and the exact complement of ``kalshi_price_strike``: children populate
     when that returns ``None`` and are empty when it returns a strike, so a family either quotes one
@@ -521,9 +522,15 @@ def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChil
     that as a sub-row would be inventing a price, which is worse than the withholding this replaces.
     An all-settled family falls back to its own strikes there, so its realized prices do render.
 
-    Volume-descending because the renderer truncates from the end and a 17-rung ladder overruns the
-    child budget: the rungs carrying the trading are the ones worth the slots. The sort is STABLE,
-    so a family whose strikes report no volume keeps the catalogue's own (threshold) order.
+    Price-descending — the same rule as ``manifold_answer_children`` — because the renderer
+    truncates from the end and a strike family's children are a distribution over one question's
+    outcomes: the rungs carrying the price mass are the forecast, whatever traded. Traded-size
+    ordering let near-zero-probability rungs with open interest evict the priced brackets, which
+    on a truncated family deleted exactly the region a forecaster extrapolates from (q45189: the
+    six omitted rungs held 0.365 of price mass, all on one side). A strike with no live quote
+    sorts with the zero-priced rungs, so the priced rows are the ones that survive the budget.
+    The sort is STABLE, so equal-priced (and quoteless) strikes keep the catalogue's own
+    (threshold) order.
     """
     tradeable = kalshi_tradeable_strikes(nested)
     if len(tradeable) < 2:
@@ -545,7 +552,7 @@ def kalshi_strike_children(nested: Sequence[dict[str, Any]]) -> tuple[MarketChil
                 close_time=parse_iso(market.get("close_time") or ""),
             )
         )
-    children.sort(key=lambda child: max(child.total_volume or 0.0, child.open_interest or 0.0), reverse=True)
+    children.sort(key=lambda child: (child.is_resolved, -(child.implied_prob_yes or 0.0)))
     return tuple(children)
 
 

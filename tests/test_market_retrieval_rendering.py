@@ -80,11 +80,17 @@ _PERCENT_TAIL_RE = re.compile(r":\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$")
 # and are deliberately LEFT where they were, so this change spent their headroom rather than
 # raising them. That is why maxed now sits at ~3% and realistic at ~1% — a guard that is nearly
 # touching is doing its job, and the next thing that widens the section re-derives all three.
+#
+# The omitted-price-mass clause on the truncation marker (q45189 disclosure) added ~21 chars per
+# truncated market: maxed 10,298 → 10,466, realistic 7,626 → 7,794. Maxed still fits under 10,600
+# (1.3% headroom); realistic breached its 7,700 and was re-derived to 7,900 (1.4%), same
+# deliberate tightness. Fixed overhead is untouched — the clause rides the marker row, not the
+# legend.
 MARKET_SNAPSHOT_MAXED_RENDER_CHAR_BUDGET = 10_600
 
 # 8 rows of realistic content, using shapes measured off live payloads rather than chosen — the
-# figure that describes what a real question renders. Measured at 7,626 chars.
-MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 7_700
+# figure that describes what a real question renders. Measured at 7,794 chars.
+MARKET_SNAPSHOT_REALISTIC_RENDER_CHAR_BUDGET = 7_900
 
 # Preamble + legend: the FIXED overhead every snapshot pays regardless of row count, measured at
 # 1,782 chars. Budgeted separately and tightly because prose is the likeliest thing to bloat and
@@ -962,7 +968,10 @@ class TestChildRowBudget:
         rendered = render_snapshot(MarketSnapshot(matches=matches))
 
         assert _sub_rows_per_market(rendered) == [MAX_CHILD_ROWS_PER_MARKET]
-        assert f"[{30 - MAX_CHILD_ROWS_PER_MARKET} more outcomes omitted — render budget]" in rendered
+        assert (
+            f"[{30 - MAX_CHILD_ROWS_PER_MARKET} more outcomes omitted — render budget, 10.00 of priced mass]"
+            in rendered
+        )
 
     def test_a_truncated_market_says_so_in_a_marker_row(self) -> None:
         """A thinned table must never read as a complete one. The wording mirrors the
@@ -971,7 +980,7 @@ class TestChildRowBudget:
 
         cells = _table_rows(render_snapshot(MarketSnapshot(matches=matches)))
 
-        assert cells[-1]["title"] == "[1 more outcome omitted — render budget]"
+        assert cells[-1]["title"] == "[1 more outcome omitted — render budget, 0.50 of priced mass]"
         assert cells[-1]["platform"] == CHILD_ROW_MARKER
 
     def test_a_marker_row_fills_every_column(self) -> None:
@@ -982,10 +991,39 @@ class TestChildRowBudget:
 
         widths = {line.count("|") for line in rendered.split("\n") if line.startswith("| ")}
         assert widths == {len(TABLE_COLUMNS) + 1}
-        assert _table_rows(rendered)[-1]["title"] == "[4 more outcomes omitted — render budget]"
+        assert _table_rows(rendered)[-1]["title"] == "[4 more outcomes omitted — render budget, 2.00 of priced mass]"
 
     def test_the_snapshot_cap_is_at_least_the_row_budget(self) -> None:
         """The constant relationship the priceless-parent invariant rests on: fewer sub-row slots
         than rendered rows would mean some multi-outcome market gets none."""
         assert MAX_CHILD_ROWS_PER_SNAPSHOT >= RENDER_BUDGET
         assert MAX_CHILD_ROWS_PER_MARKET <= MAX_CHILD_ROWS_PER_SNAPSHOT
+
+    def test_the_marker_sums_only_the_omitted_outcomes_mass(self) -> None:
+        """The figure a forecaster reads must be the mass they are NOT seeing — counting rendered
+        rows into it would overstate the cut and teach models to distrust complete tables. Children
+        arrive price-descending from the adapters, so the omitted tail is the low-priced end:
+        12 outcomes at 0.30, 0.29, ... — the two past the per-market cap carry 0.20 + 0.19."""
+        children = tuple(
+            MarketChild(title=f"outcome {index}", implied_prob_yes=0.30 - 0.01 * index)
+            for index in range(MAX_CHILD_ROWS_PER_MARKET + 2)
+        )
+        matches = [_row(title="ladder", prob=None, children=children)]
+
+        rendered = render_snapshot(MarketSnapshot(matches=matches))
+
+        assert "[2 more outcomes omitted — render budget, 0.39 of priced mass]" in rendered
+
+    def test_an_unpriced_cut_honestly_reads_zero_priced_mass(self) -> None:
+        """Omitted outcomes with no live quote contribute nothing to the figure — inventing mass
+        for them would be worse than the silence the clause replaces. `0.00` is itself information:
+        the cut rows carried no price."""
+        children = tuple(
+            MarketChild(title=f"outcome {index}", implied_prob_yes=0.5 if index < MAX_CHILD_ROWS_PER_MARKET else None)
+            for index in range(MAX_CHILD_ROWS_PER_MARKET + 3)
+        )
+        matches = [_row(title="ladder", prob=None, children=children)]
+
+        rendered = render_snapshot(MarketSnapshot(matches=matches))
+
+        assert "[3 more outcomes omitted — render budget, 0.00 of priced mass]" in rendered

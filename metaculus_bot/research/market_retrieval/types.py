@@ -256,6 +256,13 @@ class MarketSnapshot:
     # `ranking: none` means the pool was empty so the ranking call never ran. See
     # provider_diagnostics.
     sources: dict[str, str] = field(default_factory=dict)
+    # How many candidates the ranker was shown. ADDITIVE (archived via `asdict` alongside
+    # `sources`, so removal/reorder changes the raw-archive shape with no version to bump).
+    # What it exists for: `ranking: ok(0)` alone cannot say "nothing bore on the question"
+    # versus "there was nothing to rank" — the formatter renders the deliberate-zero notice
+    # only when a non-empty pool was reviewed, and this is the N that notice quotes. 0 on
+    # every whole-provider failure path (timeout, outer-except), matching their empty sources.
+    pool_size: int = 0
 
 
 @dataclass(frozen=True, slots=True)

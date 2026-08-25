@@ -25,6 +25,31 @@ class TestFormatterDelegate:
         selection a zero-row render is a legitimate outcome, so this is a hot path."""
         assert format_snapshot_for_research(MarketSnapshot(matches=[])) == ""
 
+    def test_a_deliberate_zero_row_ranking_renders_the_no_relevant_market_line(self):
+        """The q45200 shape: a healthy pool, a successful ranking call, an empty answer. Before
+        the notice, the section vanished wholesale and read exactly like a provider outage while
+        the forecaster prompt still shipped the market-weighting clauses. The notice quotes the
+        pool size so the forecaster knows how much was reviewed."""
+        rendered = format_snapshot_for_research(MarketSnapshot(matches=[], sources={"ranking": "ok(0)"}, pool_size=381))
+
+        assert "No sufficiently relevant market among 381 candidates" in rendered
+        assert "not a provider outage" in rendered
+
+    @pytest.mark.parametrize(
+        ("sources", "pool_size"),
+        [
+            ({"ranking": "error(RankingUnusable)"}, 381),  # ranker died — nothing was judged
+            ({"ranking": "none"}, 0),  # empty pool — nothing to rank
+            ({"snapshot": "error(timeout)"}, 0),  # whole-provider failure
+            ({}, 381),  # no ranking token at all
+        ],
+    )
+    def test_every_non_deliberate_zero_still_renders_nothing(self, sources: dict[str, str], pool_size: int):
+        """The gate must stay narrow: only the ranker's own empty answer over a non-empty pool
+        earns the notice. A failure path claiming 'none was judged to bear' would launder an
+        outage into a considered judgment — strictly worse than the silent section it replaces."""
+        assert format_snapshot_for_research(MarketSnapshot(matches=[], sources=sources, pool_size=pool_size)) == ""
+
     def test_the_degraded_marker_is_derived_from_the_snapshots_own_ranking_token(self):
         """Derived, not passed in, so the render is reproducible from an archived snapshot
         alone — which matters because `record_raw_research` archives the snapshot and a replay

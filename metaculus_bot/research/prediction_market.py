@@ -41,14 +41,15 @@ Soft-fail on every path. This provider returns an empty snapshot on any failure 
 raises — a broken venue API must never break a forecast — so the degradation counters below
 are the ONLY route by which an outage reddens CI.
 
-One analysis hazard follows from the ranker being allowed to say nothing. A question where it
-returns zero rows renders no section at all, so the `## Prediction Market Snapshot` header is
-absent — which means a comment- or log-backfilled archive record, whose `providers_used` is
-reconstructed by scanning for that header, drops the provider entirely, while an artifact record
-still lists it under `providers_attempted`. A fall in prediction-market presence across
-backfilled records can therefore mean "the ranker declined" rather than "the provider broke".
-The `MARKET_RANKING:` line's `outcome=` field distinguishes the two. No code change: the
-header-scan reconstruction is lossy by construction and always was.
+One analysis note follows from the ranker being allowed to say nothing. A question where it
+DELIBERATELY returns zero rows over a non-empty pool now renders a one-sentence "no sufficiently
+relevant market among N candidates" notice (see `format_snapshot_for_research`), so the
+`## Prediction Market Snapshot` header is present and the provider diagnostics read `ok` rather
+than `empty`. Records from before that change (pre 2026-08-24) render no section at all on those
+questions, so a header-scan `providers_used` reconstruction drops the provider there while an
+artifact record still lists it under `providers_attempted` — a fall in prediction-market presence
+across old records can mean "the ranker declined" rather than "the provider broke". The
+`MARKET_RANKING:` line's `outcome=` field distinguishes the two in every era.
 """
 
 from __future__ import annotations
@@ -714,7 +715,7 @@ async def _fetch_market_snapshot_impl(
 
     _log_ranking_telemetry(qid, pool, ranked_rows, outcome=outcome, prompt_chars=prompt_chars)
     _record_venue_health(qid, pool, ranked_rows, pool_by_venue=pool_by_venue, sources=sources, platforms=platforms)
-    return MarketSnapshot(matches=ranked_rows, sources=sources)
+    return MarketSnapshot(matches=ranked_rows, sources=sources, pool_size=len(pool.candidates))
 
 
 def _log_ranking_telemetry(
@@ -826,8 +827,25 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     A thin delegate to `rendering.render_snapshot`; the degraded-ranking marker is derived from
     the snapshot's own `ranking` source token rather than passed in, so the render is
     reproducible from an archived snapshot alone.
+
+    One zero-row case renders a sentence instead of `""`: a ranker that reviewed a non-empty
+    pool and deliberately kept nothing (`ranking: ok(0)` — the adaptive-width empty answer).
+    Before this, that section vanished wholesale and read exactly like a provider outage, while
+    the forecaster prompt still shipped the market-weighting clauses for a table that wasn't
+    there (q45200: healthy 381-candidate pool, correct zero-row answer, no `## Prediction Market
+    Snapshot` header at all). The gate is deliberately narrow — `ok(0)` is emitted only by a
+    successful ranking call returning an empty array, and `pool_size > 0` excludes the
+    nothing-to-rank case — so every failure path (`error(...)`, timeout, empty pool) still
+    returns `""` and still reads as `status="empty"` downstream. Note the flip side: a
+    deliberate-zero question now records `prediction_market: ok` in the provider diagnostics
+    rather than `empty`, which is the honest label — the provider did contribute a judgment.
     """
-    return rendering.render_snapshot(snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", "")))
+    rendered = rendering.render_snapshot(snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", "")))
+    if rendered:
+        return rendered
+    if snapshot.sources.get("ranking") == "ok(0)" and snapshot.pool_size > 0:
+        return rendering.render_no_relevant_market_line(snapshot.pool_size)
+    return ""
 
 
 # ---------------------------------------------------------------------------

@@ -555,26 +555,60 @@ class TestKalshiEventDerivations:
         assert match.volume_24h is None, "24h volume belongs to the quoted strike, and none is quoted"
         assert match.total_volume is not None, "withholding the price must not withhold the money"
         assert [(child.title, child.implied_prob_yes) for child in match.children] == [
-            ("Before Jul 1, 2027", pytest.approx(0.35)),
             ("Before Jan 1, 2028", pytest.approx(0.445)),
+            ("Before Jul 1, 2027", pytest.approx(0.35)),
             ("Before Jan 1, 2027", pytest.approx(0.285)),
         ]
 
-    def test_the_strike_children_are_ordered_by_traded_size(self, multi_close_page: dict[str, Any]) -> None:
+    def test_the_strike_children_are_ordered_by_price(self, multi_close_page: dict[str, Any]) -> None:
         """The renderer truncates a long ladder from the end, so the order decides which rungs a
-        forecaster sees. Ranked on the same figure the `signal` label scores — the larger of a
-        strike's USD volume and its USD open interest — so the leading sub-row is the one whose
-        price is worth the most weight, not the catalogue's first threshold."""
+        forecaster sees. Ranked on each strike's own implied probability — a family's children are
+        a distribution over one question's outcomes, and the rungs carrying the price mass are the
+        forecast whatever traded. The traded-size key this replaces let near-zero-probability rungs
+        with open interest evict the priced brackets (q45189)."""
         event = _event(multi_close_page, "KXMARRIAGESTYLESKRAVITZ-HSZK")
-        assert [market["yes_sub_title"] for market in event["markets"]][1] == "Before Jan 1, 2027", (
-            "fixture must not already be in traded-size order, or this proves nothing"
+        assert [market["yes_sub_title"] for market in event["markets"]][0] != "Before Jan 1, 2028", (
+            "fixture must not already lead with the highest-priced strike, or this proves nothing"
         )
 
         children = venues.kalshi_strike_children(event["markets"])
 
-        depths = [max(child.total_volume or 0.0, child.open_interest or 0.0) for child in children]
-        assert depths == sorted(depths, reverse=True)
-        assert children[0].title == "Before Jul 1, 2027", "the deepest strike leads"
+        prices = [child.implied_prob_yes or 0.0 for child in children]
+        assert prices == sorted(prices, reverse=True)
+        assert children[0].title == "Before Jan 1, 2028", "the highest-priced strike leads"
+
+    def test_a_45189_shaped_family_renders_the_priced_brackets_not_the_traded_tails(self) -> None:
+        """The regression the sort change exists for, in the shape that cost it: a margin family
+        whose near-zero-probability tails hold the trading (the Bilzerian rungs, $1k+ each) while
+        the informative brackets carry the price on thin volume. Under traded-size ordering the
+        truncation kept the tails and deleted 0.365 of price mass, all on one side; under price
+        ordering the surviving rows ARE the distribution."""
+
+        def strike(title: str, bid: str, ask: str, contracts: str) -> dict[str, Any]:
+            return {
+                "yes_sub_title": title,
+                "status": "active",
+                "yes_bid_dollars": bid,
+                "yes_ask_dollars": ask,
+                "volume_fp": contracts,
+                "open_interest_fp": contracts,
+                "close_time": "2026-08-18T23:00:00Z",
+            }
+
+        strikes = [
+            strike("Bilzerian 0-5%", bid="0.0000", ask="0.0100", contracts="140000"),
+            strike("Fine >=50%", bid="0.5800", ask="0.5900", contracts="900"),
+            strike("Bilzerian 5-10%", bid="0.0000", ask="0.0100", contracts="125000"),
+            strike("Fine 40-50%", bid="0.1150", ask="0.1250", contracts="250"),
+            strike("Fine 30-40%", bid="0.0750", ask="0.0850", contracts="180"),
+            strike("Bilzerian >=10%", bid="0.0000", ask="0.0100", contracts="115000"),
+        ]
+
+        children = venues.kalshi_strike_children(strikes)
+
+        assert [child.title for child in children[:3]] == ["Fine >=50%", "Fine 40-50%", "Fine 30-40%"]
+        prices = [child.implied_prob_yes or 0.0 for child in children]
+        assert prices == sorted(prices, reverse=True)
 
     def test_a_settled_strike_is_never_rendered_as_a_child(self, multi_close_page: dict[str, Any]) -> None:
         """The same scope the money legs use, for the same reason: a settled Kalshi market publishes
@@ -623,7 +657,8 @@ class TestKalshiEventDerivations:
 
         children = venues.kalshi_strike_children(event["markets"])
 
-        assert children[0].title == event["markets"][0]["ticker"]
+        # Membership, not position: the price sort decides where the labelless strike lands.
+        assert event["markets"][0]["ticker"] in {child.title for child in children}
 
     def test_a_collapsed_family_renders_no_children_because_it_quotes_a_price(
         self, family_liquidity_page: dict[str, Any]
@@ -848,7 +883,7 @@ class TestPolymarket:
         assert rows[1].bid == safe_float(event["markets"][0]["bestBid"])
         assert rows[1].total_volume == pytest.approx(safe_float(event["markets"][0]["volumeNum"]))
 
-    def test_the_children_are_ordered_by_traded_size(self, captured_payloads: dict[str, Any]) -> None:
+    def test_the_children_are_ordered_by_price(self, captured_payloads: dict[str, Any]) -> None:
         """The renderer truncates from the end, so this order decides which outcomes a forecaster
         sees. Reversing the payload must not reverse the render."""
         payload = copy.deepcopy(captured_payloads["polymarket_search"])
@@ -858,6 +893,34 @@ class TestPolymarket:
 
         assert rows is not None
         assert [child.title for child in rows[0].children] == ["0 (0 bps)", "1 (25 bps)"]
+
+    def test_a_45189_shaped_event_orders_priced_outcomes_ahead_of_traded_tails(self) -> None:
+        """The same regression the Kalshi sibling pins, on this venue's own field names: outcomes
+        whose volume dwarfs their probability must queue behind the priced brackets, because the
+        children are a distribution and the render budget truncates from the end. (The traded-size
+        key was latent here — no archived Polymarket child carries `openInterest` — but it was the
+        byte-identical defect, so both venues are pinned.)"""
+
+        def outcome(title: str, price: float, volume: float) -> dict[str, Any]:
+            return {"groupItemTitle": title, "outcomePrices": json.dumps([str(price)]), "volumeNum": volume}
+
+        event = {
+            "title": "FL-06 margin of victory?",
+            "slug": "fl-06-margin",
+            "markets": [
+                outcome("Bilzerian 0-5%", price=0.005, volume=140_000.0),
+                outcome("Fine >=50%", price=0.585, volume=900.0),
+                outcome("Bilzerian 5-10%", price=0.005, volume=125_000.0),
+                outcome("Fine 40-50%", price=0.12, volume=250.0),
+                outcome("Fine 30-40%", price=0.08, volume=180.0),
+            ],
+        }
+
+        children = venues.polymarket_event_children(event["markets"])
+
+        assert [child.title for child in children[:3]] == ["Fine >=50%", "Fine 40-50%", "Fine 30-40%"]
+        prices = [child.implied_prob_yes or 0.0 for child in children]
+        assert prices == sorted(prices, reverse=True)
 
     def test_a_child_falls_back_to_its_question_when_it_has_no_group_label(
         self, captured_payloads: dict[str, Any]

@@ -6,15 +6,17 @@ Five things here are contracts rather than formatting choices:
   what produces ``status="empty"`` downstream and the attempted-vs-succeeded distinction
   residual analysis reads off the archive. Under ranked selection a zero-row render is a
   legitimate outcome (the model is allowed to say nothing bears on the question), so this is
-  a hot path, not a theoretical one.
+  a hot path, not a theoretical one. The seam (``prediction_market.format_snapshot_for_research``)
+  substitutes ``render_no_relevant_market_line`` for exactly that deliberate-zero case, so the
+  forecaster can tell a considered empty answer from an outage; every failure path still
+  returns ``""``.
 - **The rows are rendered in the ranker's order, verbatim.** No venue interleave, no
   fairness pass, no per-venue cap, no re-scoring. Round-robin venue fairness is exactly what
   lost 43 of 58 wanted rows in the measurement this port is built on.
 - **A multi-outcome market renders one ``↳`` sub-row per outcome, in the venue adapter's order,
   also verbatim.** The same rule one level down: the adapter knows which of its outcomes are worth
-  keeping (traded size on the real-money venues, probability on Manifold, ballot order on
-  PredictIt) and the renderer truncates from the END, so re-sorting here would silently change
-  what survives the budget.
+  keeping (price on the three price-bearing venues, ballot order on PredictIt) and the renderer
+  truncates from the END, so re-sorting here would silently change what survives the budget.
 - **Every number in the ``prob`` column is a probability, unless it is labelled as something
   else.** The one exception is a scalar market's own value, and it renders as ``value N (scale LOW
   to HIGH)`` for exactly that reason — the forecaster prompts tell a model to anchor on this cell,
@@ -161,6 +163,24 @@ MARKET_PREAMBLE_NEUTRAL = (
 )
 
 
+def render_no_relevant_market_line(pool_size: int) -> str:
+    """The section body for a DELIBERATE zero-row ranking over a non-empty candidate pool.
+
+    Without it the section vanishes wholesale on an adaptive-width-zero answer, which reads
+    exactly like a provider outage — the run log records the difference (``outcome=ranked
+    rows=0``) but the forecaster prompt still ships the full relation/liquidity weighting
+    clauses for a table that isn't there. One sentence closes that: the empty table becomes a
+    considered judgment the forecaster can lean on rather than an absence to guess about. Only
+    the ranker's own empty answer earns it; every failure path still renders nothing (see
+    ``prediction_market.format_snapshot_for_research``).
+    """
+    return (
+        f"No sufficiently relevant market among {pool_size} candidates — prediction markets were "
+        "retrieved and reviewed for this question, and none was judged to bear on it. This is a "
+        "deliberate empty result, not a provider outage."
+    )
+
+
 def _cell(text: str, *, limit: int | None = None) -> str:
     """One table cell: pipes neutralised, newlines flattened, optionally truncated.
 
@@ -301,18 +321,26 @@ def _table_row(cells: dict[str, str]) -> str:
     return "| " + " | ".join(cells[column] for column in TABLE_COLUMNS) + " |"
 
 
-def _omitted_children_cells(omitted: int) -> dict[str, str]:
-    """A marker sub-row naming how many outcomes the budget cut.
+def _omitted_children_cells(omitted_children: Sequence[MarketChild]) -> dict[str, str]:
+    """A marker sub-row naming how many outcomes the budget cut, and the price mass they carried.
 
     Shaped as a table row rather than a trailing note because a bare line between rows would end
     the markdown table and orphan everything after it. The wording mirrors the resolution-source
     fetcher's ``[N additional source(s) omitted — section budget]``: same bracketed shape, same
     "which budget" clause, so a forecaster meeting either recognises the other.
+
+    The price-mass clause is what turns a one-sided cut from silent into visible: a single
+    surviving bracket read as an equality constraint on a tail is exactly the q45189 failure, and
+    the price-descending child sort alone cannot fix it — a model must also know how much of the
+    distribution it is NOT seeing before it treats the visible rungs as exhaustive. The figure sums
+    only the outcomes that carry a price, so on an unquoted family it honestly reads 0.00.
     """
+    omitted = len(omitted_children)
+    priced_mass = sum(child.implied_prob_yes for child in omitted_children if child.implied_prob_yes is not None)
     plural = "" if omitted == 1 else "s"
     return {
         "platform": CHILD_ROW_MARKER,
-        "title": f"[{omitted} more outcome{plural} omitted — render budget]",
+        "title": f"[{omitted} more outcome{plural} omitted — render budget, {priced_mass:.2f} of priced mass]",
         "prob": "-",
         "total_vol": "-",
         "OI": "-",
@@ -382,9 +410,9 @@ def render_snapshot(snapshot: MarketSnapshot, *, ranking_degraded: bool = False)
     for match, allowance in zip(matches, allowances):
         lines.append(_table_row(_row_cells(match)))
         lines.extend(_table_row(_child_cells(match.platform, child)) for child in match.children[:allowance])
-        omitted = len(match.children) - allowance
-        if omitted > 0:
-            lines.append(_table_row(_omitted_children_cells(omitted)))
+        omitted_children = match.children[allowance:]
+        if omitted_children:
+            lines.append(_table_row(_omitted_children_cells(omitted_children)))
 
     lines.append("")
     lines.append("### Resolution criteria / rules")
