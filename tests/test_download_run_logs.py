@@ -6,6 +6,7 @@ download path lives in the shared core (scripts.gha_artifacts) — the resilienc
 here monkeypatch that module's seams; the enumeration internals are tested there.
 """
 
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -53,6 +54,57 @@ class TestInferWorkflow:
 
     def test_research_prefix_without_map_is_unknown(self):
         assert infer_workflow("research-999", 999, {}) == "unknown"
+
+
+def _seed_manifest(archive_dir: Path, entries: dict[int, str]) -> None:
+    """Write a minimal runs.jsonl manifest mapping each run_id to a workflow slug."""
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"run_id": str(run_id), "workflow": workflow, "artifact": f"research-{run_id}"})
+        for run_id, workflow in entries.items()
+    ]
+    (archive_dir / "runs.jsonl").write_text("\n".join(lines) + "\n")
+
+
+class TestResolveWorkflowMap:
+    """The online map must layer GitHub's fresh window OVER the archive's own manifest.
+
+    GitHub's created-filtered ``/actions/runs`` pagination returns at most 1000 items
+    (~15 days at the prod cadence), so runs older than that vanish from the fresh map.
+    Without the archive layer underneath, ``infer_workflow`` reads them as ``unknown``
+    and the replace-by-run merge writes that over the correct slug already in
+    ``runs.jsonl`` — the regression that degraded 861 archived runs to ``unknown``.
+    """
+
+    def test_archive_fills_runs_github_no_longer_returns(self, tmp_path: Path, monkeypatch):
+        _seed_manifest(tmp_path, {100: "tournament"})
+        monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {200: "minibench"})
+
+        resolved = dl.resolve_workflow_map("owner/repo", tmp_path)
+
+        assert resolved == {100: "tournament", 200: "minibench"}
+        # The downstream consequence the merge depends on: the aged-out run keeps its
+        # archived slug instead of degrading to unknown via prefix inference.
+        assert infer_workflow("research-100", 100, resolved) == "tournament"
+
+    def test_github_wins_where_both_know_a_run(self, tmp_path: Path, monkeypatch):
+        _seed_manifest(tmp_path, {100: "test_bot"})
+        monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {100: "tournament"})
+        assert dl.resolve_workflow_map("owner/repo", tmp_path) == {100: "tournament"}
+
+    def test_archived_unknown_never_enters_the_map(self, tmp_path: Path, monkeypatch):
+        _seed_manifest(tmp_path, {100: "unknown"})
+        monkeypatch.setattr(dl, "build_workflow_map", lambda repo: {})
+        assert dl.resolve_workflow_map("owner/repo", tmp_path) == {}
+
+    def test_from_store_never_calls_github(self, tmp_path: Path, monkeypatch):
+        _seed_manifest(tmp_path, {100: "tournament"})
+
+        def _forbidden(repo: str) -> dict[int, str]:
+            raise AssertionError("from_store must not hit GitHub")
+
+        monkeypatch.setattr(dl, "build_workflow_map", _forbidden)
+        assert dl.resolve_workflow_map("owner/repo", tmp_path, from_store=True) == {100: "tournament"}
 
 
 class TestFilterRunLogArtifacts:

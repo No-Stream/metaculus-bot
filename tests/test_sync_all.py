@@ -118,7 +118,7 @@ class TestSinglePassDriver:
             mock.patch("scripts.gha_artifacts.verify_gh_cli"),
             mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts) as list_mock,
             mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download) as dl_mock,
-            mock.patch("scripts.sync_all.build_workflow_map", return_value={}),
+            mock.patch("scripts.download_run_logs.build_workflow_map", return_value={}),
         ):
             summary = sync_all.run_sync("repo", 0, **dirs)
 
@@ -166,7 +166,7 @@ class TestSinglePassDriver:
             mock.patch("scripts.gha_artifacts.verify_gh_cli"),
             mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
             mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download),
-            mock.patch("scripts.sync_all.build_workflow_map", return_value={}),
+            mock.patch("scripts.download_run_logs.build_workflow_map", return_value={}),
         ):
             summary = sync_all.run_sync("repo", 0, **dirs)
 
@@ -198,7 +198,7 @@ class TestSinglePassDriver:
             mock.patch("scripts.gha_artifacts.verify_gh_cli"),
             mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
             mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download) as dl_mock,
-            mock.patch("scripts.sync_all.build_workflow_map", return_value={}),
+            mock.patch("scripts.download_run_logs.build_workflow_map", return_value={}),
         ):
             summary = sync_all.run_sync("repo", 0, **dirs)
 
@@ -232,7 +232,9 @@ class TestOfflineReharvestFromTheStore:
             mock.patch("scripts.gha_artifacts.verify_gh_cli"),
             mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
             mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=fake_download),
-            mock.patch("scripts.sync_all.build_workflow_map", return_value={100: "tournament", 200: "minibench"}),
+            mock.patch(
+                "scripts.download_run_logs.build_workflow_map", return_value={100: "tournament", 200: "minibench"}
+            ),
         ):
             sync_all.run_sync("repo", 0, **dirs)
 
@@ -289,9 +291,39 @@ class TestOfflineReharvestFromTheStore:
             mock.patch("scripts.gha_artifacts.verify_gh_cli"),
             mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
             mock.patch("scripts.gha_artifacts._download_artifact_to") as dl_mock,
-            mock.patch("scripts.sync_all.build_workflow_map", return_value={}),
+            mock.patch("scripts.download_run_logs.build_workflow_map", return_value={}),
         ):
             summary = sync_all.run_sync("repo", 0, **dirs)
 
         assert dl_mock.call_count == 0
         assert summary.research_questions == 2, "and the harvest still sees both runs, off the store"
+
+    def test_online_resync_keeps_archived_workflow_labels_for_aged_out_runs(self, tmp_path: Path) -> None:
+        """An ONLINE re-sync must not degrade archived workflow labels to ``unknown``.
+
+        GitHub caps ``created``-filtered run pagination at 1000 items (~15 days), so an
+        online pull's fresh workflow map misses every older run even though their
+        artifacts (90-day retention) are still enumerated and re-harvested. Before the
+        archive-derived map was layered underneath the fresh one, those runs resolved
+        to ``unknown`` and the replace-by-run merge overwrote the correct labels the
+        archive already held — 861 runs (679 of them ``tournament``) degraded this way.
+        Here the fresh map only knows run 200; run 100's archived label must survive.
+        """
+        dirs = _dirs(tmp_path)
+        self._seed_store(tmp_path, dirs)
+        now = datetime.now(timezone.utc)
+        artifacts = [
+            _artifact("research-100", 100, now - timedelta(days=30)),  # aged out of the runs window
+            _artifact("research-200", 200, now - timedelta(days=1)),  # still inside it
+        ]
+
+        with (
+            mock.patch("scripts.gha_artifacts.verify_gh_cli"),
+            mock.patch("scripts.gha_artifacts.list_research_artifacts", return_value=artifacts),
+            mock.patch("scripts.gha_artifacts._download_artifact_to"),
+            mock.patch("scripts.download_run_logs.build_workflow_map", return_value={200: "minibench"}),
+        ):
+            sync_all.run_sync("repo", 0, **dirs)
+
+        manifest = load_run_manifest(dirs["telemetry_dir"])
+        assert {r["run_id"]: r["workflow"] for r in manifest} == {"100": "tournament", "200": "minibench"}

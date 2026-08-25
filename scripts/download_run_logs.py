@@ -70,6 +70,12 @@ def build_workflow_map(repo: str, since_days: int = 120) -> dict[int, str]:
     (thousands of runs) and stalls for minutes on a nicety. On any failure we return
     ``{}`` and callers fall back to prefix inference; the map is manifest-bucketing
     convenience, never load-bearing for the markers.
+
+    ⚠ GitHub caps ``created``-filtered pagination at 1000 items (~15 days at the prod
+    cadence, observed 2026-08-24), so this map NEVER covers the full ``since_days``
+    window. Harvests must resolve through :func:`resolve_workflow_map`, which layers
+    this fresh-but-shallow map over the archive's own manifest — using it alone lets
+    every older run degrade to ``unknown`` in the replace-by-run merge.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%d")
     cmd = [
@@ -130,6 +136,32 @@ def workflow_map_from_archive(archive_dir: Path) -> dict[int, str]:
         if run_id.isdigit() and workflow and workflow != "unknown":
             mapping[int(run_id)] = workflow
     return mapping
+
+
+def resolve_workflow_map(repo: str, archive_dir: Path, *, from_store: bool = False) -> dict[int, str]:
+    """``{run_id: workflow_slug}`` for a harvest: GitHub's fresh window layered OVER the archive.
+
+    ``build_workflow_map``'s enumeration returns at most 1000 runs (GitHub caps
+    ``created``-filtered pagination), so any run older than ~15 days is absent from the
+    fresh map. ``infer_workflow`` reads those as ``unknown``, and the replace-by-run
+    merge then writes that over the correct slug the archive already recorded — the
+    regression that degraded 861 archived runs (679 of them ``tournament``) before
+    2026-08-24. Merging the archive's own manifest UNDERNEATH the fresh map keeps that
+    attribution: GitHub wins wherever both know a run (it is the exact source), the
+    archive fills every run the window no longer returns. Offline (``from_store``)
+    there is no network, so the archive map is the whole answer.
+    """
+    archive_map = workflow_map_from_archive(Path(archive_dir))
+    if from_store:
+        logger.info(f"Offline harvest: recovered {len(archive_map)} run->workflow mappings from {archive_dir}")
+        return archive_map
+    fresh_map = build_workflow_map(repo)
+    merged = {**archive_map, **fresh_map}
+    logger.info(
+        f"Resolved {len(fresh_map)} run->workflow mappings from GitHub "
+        f"(+{len(merged) - len(fresh_map)} archived runs outside its window)"
+    )
+    return merged
 
 
 def infer_workflow(artifact_name: str, run_id: int, workflow_map: dict[int, str]) -> str:
@@ -217,8 +249,7 @@ def download_and_harvest(
         from_store=from_store,
     )
 
-    workflow_map = workflow_map_from_archive(archive_dir) if from_store else build_workflow_map(repo)
-    logger.info(f"Resolved {len(workflow_map)} run->workflow mappings")
+    workflow_map = resolve_workflow_map(repo, archive_dir, from_store=from_store)
 
     runs: list[HarvestedRun] = []
     for run_id, art, run_dir in persisted_run_dirs(
