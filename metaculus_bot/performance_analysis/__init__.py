@@ -50,6 +50,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_resolution,
     parse_stacked_marker,
     parse_stacker_outcome_marker,
+    parse_stacker_skip_reason_marker,
 )
 from metaculus_bot.performance_analysis.research_tags import (
     attach_research_tags,
@@ -116,6 +117,7 @@ __all__ = [
     "parse_resolution",
     "parse_stacked_marker",
     "parse_stacker_outcome_marker",
+    "parse_stacker_skip_reason_marker",
     "per_model_binary_scores",
     "per_model_cohort",
     "rank_our_models_by_accuracy",

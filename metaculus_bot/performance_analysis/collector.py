@@ -22,6 +22,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_per_model_numeric_percentiles,
     parse_resolution,
     parse_stacked_marker,
+    parse_stacker_skip_reason_marker,
 )
 from metaculus_bot.performance_analysis.research_tags import DEFAULT_RESEARCH_ARCHIVE_LATEST, attach_research_tags
 from metaculus_bot.performance_analysis.scaling import grid_zero_point
@@ -204,6 +205,10 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
         stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
     else:
         stacker_outcome, stacker_outcome_source = None, "none"
+    # Additive skip-reason disclosure: a plain "skipped" outcome alone can't tell a
+    # below-threshold skip from the single-forecaster short-circuit (q44870). None
+    # on comments predating the marker.
+    stacker_skip_reason = parse_stacker_skip_reason_marker(comment_text) if comment_text else None
     # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
     # marker is present, else None (older comments predate it). Lets era-bucketing
     # tell a degraded publish (a model dropped) from a genuine roster change —
@@ -243,6 +248,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
             comment_created_at=comment_created_at,
             stacker_outcome=stacker_outcome,
             stacker_outcome_source=stacker_outcome_source,
+            stacker_skip_reason=stacker_skip_reason,
             per_base_model_forecasts=per_base_model_forecasts,
             forecasters_used=forecasters_used,
         )
@@ -265,6 +271,7 @@ def _process_single_question(
     comment_created_at: str | None = None,
     stacker_outcome: str | None = None,
     stacker_outcome_source: str = "none",
+    stacker_skip_reason: str | None = None,
     per_base_model_forecasts: dict[str, str | dict[str, float]] | None = None,
     forecasters_used: tuple[int, int] | None = None,
 ) -> dict | None:
@@ -356,6 +363,11 @@ def _process_single_question(
         # skips; earlier comments collapse both into "skipped".
         "stacker_outcome": stacker_outcome,
         "stacker_outcome_source": stacker_outcome_source,
+        # Why the stacker was skipped ("spread_below_threshold" | "config_off" |
+        # "single_forecaster"), from the additive STACKER_SKIP_REASON comment
+        # marker. None whenever the stacker was not skipped or the comment
+        # predates the marker.
+        "stacker_skip_reason": stacker_skip_reason,
         # Bot ensemble size from the FORECASTERS_USED comment marker (distinct
         # from metadata.nr_forecasters, which is the Metaculus CROWD count):
         # forecasters that contributed to the published aggregate (== per-model
@@ -470,7 +482,7 @@ def _compute_scores(record: dict) -> None:
                 zero_point,
             )
         except (ValueError, ZeroDivisionError) as e:
-            logger.warning(f"Failed numeric scoring for post {record['post_id']}: {e}")
+            logger.warning(f"Failed numeric scoring for post {record.get('post_id')}: {e}")
 
     elif q_type == "multiple_choice" and isinstance(resolution, str):
         options = record.get("options") or []
@@ -479,7 +491,7 @@ def _compute_scores(record: dict) -> None:
                 correct_idx = options.index(resolution)
                 record["mc_log_score"] = mc_log_score(forecast_values, correct_idx)
             except (ValueError, IndexError) as e:
-                logger.warning(f"Failed MC scoring for post {record['post_id']}: {e}")
+                logger.warning(f"Failed MC scoring for post {record.get('post_id')}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +552,28 @@ def save_dataset(data: list[dict], path: str) -> None:
 
 
 _SCORE_FIELDS = ("brier_score", "log_score", "numeric_log_score", "mc_log_score")
+
+
+def _rescorable(record: object) -> bool:
+    """Whether a cached record carries every field ``_compute_scores`` reads.
+
+    ``_compute_scores`` stays fail-fast for the fresh-build path (``_process_post``
+    constructs every key); ``rescore_records`` takes arbitrary JSON off disk —
+    hand-trimmed fixtures, older schemas — so the tolerance lives here. The check
+    is branch-aware: a numeric record does not need ``our_prob_yes``.
+    """
+    if not isinstance(record, dict):
+        return False
+    if not all(k in record for k in ("type", "resolution_parsed", "our_forecast_values")):
+        return False
+    q_type = record.get("type")
+    if q_type == "binary" and "our_prob_yes" not in record:
+        return False
+    if q_type in ("numeric", "discrete") and not all(k in record for k in ("open_lower_bound", "open_upper_bound")):
+        return False
+    return True
+
+
 # Recomputation float wiggle vs a genuinely different stored value. The scorer
 # reproduces the platform to ~1e-14; the known-stale gaps start at 0.6.
 _RESCORE_ATOL = 1e-6
@@ -563,7 +597,7 @@ def rescore_records(records: list[dict]) -> int:
     """
     changed = 0
     for record in records:
-        if not isinstance(record, dict) or not all(k in record for k in ("type", "resolution_parsed")):
+        if not _rescorable(record):
             continue
         fresh = {**record, **{field: None for field in _SCORE_FIELDS}}
         _compute_scores(fresh)

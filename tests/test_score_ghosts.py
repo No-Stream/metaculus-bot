@@ -24,23 +24,25 @@ def _legacy_ghost(qid: int, qtype: str, summary: str, run_date: str = "2026-07-1
     return {"marker": "ghost_forecast", "qid": qid, "qtype": qtype, "summary": summary, "run_date": run_date, "seq": 0}
 
 
-def _json_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z") -> dict:
+def _json_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z", run_id: str = "run-1") -> dict:
     return {
         "marker": "ghost_forecast_json",
         "qid": qid,
+        "run_id": run_id,
         "run_date": run_date,
         "seq": 0,
         "forecast_json": json.dumps(payload, separators=(",", ":")),
     }
 
 
-def _pre_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z") -> dict:
+def _pre_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z", run_id: str = "run-1") -> dict:
     """A harvested GHOST_PRE_JSON record — the turn-one, pre-research dry run.
     Same post-id qid space and the same ``forecast_json`` field as the concluding
     ghost (both serialize through ``_summarize_ghost``)."""
     return {
         "marker": "ghost_pre_json",
         "qid": qid,
+        "run_id": run_id,
         "run_date": run_date,
         "seq": 0,
         "forecast_json": json.dumps(payload, separators=(",", ":")),
@@ -278,6 +280,23 @@ class TestPreIdentitySplit:
 
         split = summary["split_by_pre_identity"]
         assert split["no_pre_marker"]["n"] == 1
+        assert summary["binary"]["rows"][0]["pre_identical"] is None
+
+    def test_cross_run_pre_is_not_paired(self):
+        """A pre-ghost from run A must not pair with run B's concluding ghost: a run
+        can emit one marker without the other (a schema-invalid dry run suppresses
+        GHOST_PRE_JSON; a deadline hit banks a pre with no conclusion), so a
+        qid-only lookup compares across runs and files a false identity verdict.
+        Here the payloads are byte-identical, so a cross-run pair would wrongly
+        read ``pre_identical``."""
+        payload = {"qtype": "binary", "prob": 0.30}
+        json_ghosts = [_json_ghost(1, payload, run_id="run-B")]
+        pre_ghosts = [_pre_ghost(1, payload, run_id="run-A")]
+        summary = join_and_score(json_ghosts, [], [_binary_record(1, True, 0.50)], pre_ghosts=pre_ghosts)
+
+        split = summary["split_by_pre_identity"]
+        assert split["no_pre_marker"]["n"] == 1
+        assert split["pre_identical"]["n"] == 0
         assert summary["binary"]["rows"][0]["pre_identical"] is None
 
     def test_legacy_ghost_cannot_claim_an_identity(self):

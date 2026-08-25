@@ -30,6 +30,8 @@ import logging
 import re
 from pathlib import Path
 
+from metaculus_bot.performance_analysis.id_mapping import QuestionIds
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESEARCH_ARCHIVE_LATEST = Path("backtests/research_archive/latest")
@@ -101,17 +103,33 @@ def research_tags_for_record(record: dict) -> dict:
     }
 
 
-def research_tags_for_qid(qid: object, latest_dir: Path | str = DEFAULT_RESEARCH_ARCHIVE_LATEST) -> dict:
-    """Tags for one question id off ``latest/<qid>.json``; all-None when no record exists."""
-    if qid is None:
-        return dict(_ABSENT_TAGS)
+def _load_archive_record(qid: object, latest_dir: Path | str) -> dict | None:
+    """Load ``latest/<qid>.json``, or None when absent/unreadable."""
     path = Path(latest_dir) / f"{qid}.json"
     if not path.exists():
-        return dict(_ABSENT_TAGS)
+        return None
     try:
         record = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning(f"Unreadable research-archive record {path}: {exc}")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def research_tags_for_qid(qid: object, latest_dir: Path | str = DEFAULT_RESEARCH_ARCHIVE_LATEST) -> dict:
+    """Tags for one question id off ``latest/<qid>.json``; all-None when no record exists.
+
+    A ``log_backfill`` record also reads all-None: that writer class keys on the
+    POST id while every other writer keys on the QUESTION id, and the two share one
+    integer space — so from a bare qid the record's identity cannot be verified,
+    and stamping a possibly-foreign question's tags is worse than no tags. Callers
+    holding a full performance record should use :func:`attach_research_tags`,
+    which verifies identity via the record's own id pair.
+    """
+    if qid is None:
+        return dict(_ABSENT_TAGS)
+    record = _load_archive_record(qid, latest_dir)
+    if record is None or record.get("source") == "log_backfill":
         return dict(_ABSENT_TAGS)
     return research_tags_for_record(record)
 
@@ -119,13 +137,29 @@ def research_tags_for_qid(qid: object, latest_dir: Path | str = DEFAULT_RESEARCH
 def attach_research_tags(records: list[dict], latest_dir: Path | str = DEFAULT_RESEARCH_ARCHIVE_LATEST) -> None:
     """Stamp the treatment tags onto each performance record in place.
 
-    Keyed on the record's ``question_id`` — ``latest/`` is question-id-keyed, and a
-    record without an archive counterpart (pre-archive eras, expired artifacts,
-    fresh clones without ``backtests/``) gets the all-None tags rather than False.
+    Lookup walks the record's own id pair (:meth:`QuestionIds.lookup_order`,
+    question-id first) and accepts a ``latest/`` file only when
+    :meth:`QuestionIds.matches_archive_record` confirms it belongs to this
+    question — ``latest/`` mixes two id spaces (log-backfill records key on the
+    POST id, everything else on the QUESTION id, in one integer namespace), so a
+    bare filename hit can serve a DIFFERENT question's research (the measured
+    ``latest/43592`` collision). A record with no verified archive counterpart
+    gets the all-None tags rather than False.
     """
     tagged = 0
     for record in records:
-        tags = research_tags_for_qid(record.get("question_id"), latest_dir)
+        ids = QuestionIds.from_perf_record(record)
+        tags = dict(_ABSENT_TAGS)
+        for candidate_qid in ids.lookup_order():
+            loaded = _load_archive_record(candidate_qid, latest_dir)
+            if loaded is None or not ids.matches_archive_record(loaded):
+                continue
+            if loaded.get("source") == "log_backfill":
+                # Post-id-keyed and page_url-identified only: on an id collision the
+                # URL check cannot rule out a foreign question, so never tag from it.
+                continue
+            tags = research_tags_for_record(loaded)
+            break
         record.update(tags)
         if tags["anchor_present"] is not None:
             tagged += 1

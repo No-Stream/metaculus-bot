@@ -40,6 +40,7 @@ from metaculus_bot.comment.markers import (
     STACKED_BASE_REASONING_HEADER,
     STACKED_MARKER_RE,
     STACKER_OUTCOME_RE,
+    STACKER_SKIP_REASON_RE,
 )
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.percentile_set import PERCENTILE_KEY_DECIMALS
@@ -64,6 +65,21 @@ def parse_stacker_outcome_marker(comment_text: str) -> str | None:
     into ``"skipped"``.
     """
     match = STACKER_OUTCOME_RE.search(comment_text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def parse_stacker_skip_reason_marker(comment_text: str) -> str | None:
+    """Return the STACKER_SKIP_REASON literal in ``comment_text``, else None.
+
+    One of ``"spread_below_threshold"``, ``"config_off"``, ``"single_forecaster"``
+    (always lower-cased). The marker is additive alongside STACKER_OUTCOME: a
+    plain ``skipped`` outcome alone cannot distinguish a below-threshold skip
+    from the single-forecaster short-circuit (q44870), and comments predating
+    the marker return None.
+    """
+    match = STACKER_SKIP_REASON_RE.search(comment_text)
     if match is None:
         return None
     return match.group(1).lower()

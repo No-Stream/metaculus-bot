@@ -44,6 +44,7 @@ from metaculus_bot.performance_analysis.parsing import (
     parse_resolution,
     parse_stacked_marker,
     parse_stacker_outcome_marker,
+    parse_stacker_skip_reason_marker,
 )
 from metaculus_bot.stacking import combine_stacker_and_base_reasoning
 
@@ -104,6 +105,24 @@ class TestParseStackerOutcomeMarker:
 
     def test_whitespace_tolerant(self):
         assert parse_stacker_outcome_marker("<!--  STACKER_OUTCOME=fallback_llm  -->") == "fallback_llm"
+
+
+class TestParseStackerSkipReasonMarker:
+    """The additive skip-reason marker: what disambiguates q44870's single-forecaster
+    short-circuit from a spread-below-threshold skip in the published record."""
+
+    def test_all_three_reasons(self):
+        for reason in ("spread_below_threshold", "config_off", "single_forecaster"):
+            text = f"...\n<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON={reason} -->\n"
+            assert parse_stacker_skip_reason_marker(text) == reason
+
+    def test_absent_marker_returns_none(self):
+        assert parse_stacker_skip_reason_marker("...\n<!-- STACKER_OUTCOME=skipped -->\n") is None
+
+    def test_case_insensitive_and_lowercased(self):
+        assert parse_stacker_skip_reason_marker("<!-- stacker_skip_reason=SINGLE_FORECASTER -->") == (
+            "single_forecaster"
+        )
 
 
 # ---------------------------------------------------------------------------

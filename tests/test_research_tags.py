@@ -150,3 +150,61 @@ class TestAttachResearchTags:
         assert records[0]["research_source_class"] == "artifact"
         assert records[1]["anchor_present"] is None
         assert records[1]["gfv2_present"] is None
+
+    def test_foreign_record_is_rejected_by_identity_check(self, tmp_path: Path):
+        # latest/ mixes two id spaces: a file named after OUR question_id can hold a
+        # DIFFERENT question's record (the measured latest/43592 collision). A loaded
+        # record whose self-declared post_id contradicts ours must yield all-None,
+        # never another question's treatment status.
+        (tmp_path / "101.json").write_text(
+            json.dumps(
+                {
+                    "research_text": "## Time Series Anchor\nband\n",
+                    "source": "artifact",
+                    "post_id": 999,  # a different question's post
+                }
+            )
+        )
+        records = [{"question_id": 101, "post_id": 555, "type": "numeric"}]
+        attach_research_tags(records, tmp_path)
+        assert records[0]["anchor_present"] is None
+
+    def test_post_id_fallback_finds_post_keyed_record(self, tmp_path: Path):
+        # No question-id-keyed file, but the post-id-keyed file self-identifies as
+        # ours (post_id matches) — the lookup_order fallback must find it.
+        (tmp_path / "555.json").write_text(
+            json.dumps(
+                {
+                    "research_text": "## Time Series Anchor\nband\n",
+                    "source": "artifact",
+                    "post_id": 555,
+                }
+            )
+        )
+        records = [{"question_id": 101, "post_id": 555, "type": "numeric"}]
+        attach_research_tags(records, tmp_path)
+        assert records[0]["anchor_present"] is True
+
+    def test_log_backfill_record_never_stamps_tags(self, tmp_path: Path):
+        # A log_backfill record is POST-id keyed and page_url-identified only; on an
+        # id collision the URL check cannot rule out a foreign question.
+        (tmp_path / "101.json").write_text(
+            json.dumps(
+                {
+                    "research_text": "## Time Series Anchor\nband\n",
+                    "source": "log_backfill",
+                    "page_url": "https://www.metaculus.com/questions/101/",
+                }
+            )
+        )
+        records = [{"question_id": 101, "post_id": 555, "type": "numeric"}]
+        attach_research_tags(records, tmp_path)
+        assert records[0]["anchor_present"] is None
+
+
+class TestLogBackfillVetoOnQidLookup:
+    def test_research_tags_for_qid_rejects_log_backfill(self, tmp_path: Path):
+        (tmp_path / "101.json").write_text(
+            json.dumps({"research_text": "## Time Series Anchor\nband\n", "source": "log_backfill"})
+        )
+        assert research_tags_for_qid(101, tmp_path)["anchor_present"] is None

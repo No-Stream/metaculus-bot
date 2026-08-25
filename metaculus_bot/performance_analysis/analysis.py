@@ -16,6 +16,7 @@ from metaculus_bot.performance_analysis.scaling import grid_zero_point
 from metaculus_bot.performance_analysis.scoring import binary_log_score, brier_score
 from metaculus_bot.performance_analysis.stacker_detection import detect_stacker_fired
 from metaculus_bot.spread_metrics import binary_prob_range_spread
+from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -286,7 +287,9 @@ def declared_percentile_pit(
 
 def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: float) -> float | None:
     """Interpolate one member's declared (percentile 0-100, value) curve at ``resolution``."""
-    if not percentile_pairs:
+    if len(percentile_pairs) < 2:
+        # A single recovered pair interpolates to a constant PIT at every resolution
+        # (trimmed comments can lose most of a member's declared lines) — unusable.
         return None
     try:
         pcts = np.array([float(p[0]) / 100.0 for p in percentile_pairs], dtype=float)
@@ -294,8 +297,12 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
     except (TypeError, ValueError, IndexError):
         # Archived per-model pairs are parsed from comment text and can be malformed.
         return None
-    order = np.argsort(vals)
+    order = np.argsort(vals, kind="stable")
     vals, pcts = vals[order], pcts[order]
+    if np.any(np.diff(pcts) < 0):
+        # Percentiles that DECREASE as values increase after the value sort mean the
+        # member declared a non-monotonic set; interpolating it inverts the curve.
+        return None
     if not np.all(np.diff(vals) > 0):
         # Duplicate declared values (e.g. a flat tail): jitter into strict monotonicity.
         eps = max(1e-9, float(np.abs(vals).max()) * 1e-9)
@@ -305,25 +312,21 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
     return float(np.interp(resolution, vals, pcts))
 
 
-# ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) reached main inside
-# ``b4e9df0``. Before this instant a flat 0.2 per-bin cap applied at EVERY grid size;
-# after it, coarse discrete grids get the relaxed ``grid_step_constraints`` cap.
-GRID_SCALED_MAX_STEP_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+# ``b4e9df0`` — the merge that landed the july15 bundle on main. THE single source of
+# truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
+# aliases it, and every screen gated on the bundle's contents keys on it. Era
+# boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
+B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)
+
+# ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
+# Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,
+# coarse discrete grids get the relaxed ``grid_step_constraints`` cap.
+GRID_SCALED_MAX_STEP_MERGED_AT = B4E9DF0_MERGED_AT
 
 # A published bin counts as sitting at the cap within this tolerance, and the members
 # must want at least this much MORE mass there for the record to be clamp-suspected.
 _CLAMP_CAP_ATOL = 1e-6
 _CLAMP_MEMBER_MARGIN = 0.10
-
-
-def _parse_submit_time(raw: str | None) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_MARGIN) -> dict:
@@ -364,11 +367,15 @@ def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_
     grid_arr = np.asarray(grid, dtype=float)
     cdf_arr = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
     steps = np.diff(cdf_arr)
-    index = int(np.clip(np.searchsorted(grid_arr, float(resolution), side="right") - 1, 0, len(steps) - 1))
+    # side="left": a resolution sitting exactly ON a grid point belongs to the bin
+    # BELOW it, matching the platform scorer (resolution_to_bucket_index assigns an
+    # exact grid point to the lower bucket); side="right" screens the bin above and
+    # misses the q43913 signature whenever the resolution lands on a grid edge.
+    index = int(np.clip(np.searchsorted(grid_arr, float(resolution), side="left") - 1, 0, len(steps) - 1))
     published_bin_mass = float(steps[index])
     bin_low, bin_high = float(grid_arr[index]), float(grid_arr[index + 1])
 
-    submitted = _parse_submit_time(record.get("bot_comment_created_at"))
+    submitted = parse_iso_utc(record.get("bot_comment_created_at"))
     before_fix = submitted is None or submitted < GRID_SCALED_MAX_STEP_MERGED_AT
     cap = MAX_CDF_PROB_STEP if before_fix else grid_step_constraints(len(grid_arr))[1]
 
@@ -433,17 +440,34 @@ def _interpolate_pit(
     else:
         grid = build_cdf_value_grid(lower_bound, upper_bound, zero_point, num_points=len(cdf_values))
 
-    # np.interp clamps beyond the grid to cdf_values[0] / cdf_values[-1]. That is the
-    # correct PIT for a resolution exactly AT a bound (F(bound) = cdf[0]) but NOT for one
-    # BEYOND the grid: with below/above-bound mass expressible on open bounds, cdf[0] can
-    # be ~0.9, so the clamp reads a below-grid resolution — a low-tail event — as a HIGH
-    # PIT, flipping the sign of the miss. Beyond the grid, read the PIT off the members'
-    # declared-percentile curves instead; the clamp is kept only when no curve is usable.
-    if resolution < grid[0] or resolution > grid[-1]:
+    return pit_on_grid(resolution, grid, np.asarray(cdf_values, dtype=float), per_model_percentiles)[0]
+
+
+def pit_on_grid(
+    resolution: float,
+    grid: np.ndarray,
+    cdf: np.ndarray,
+    per_model_percentiles: Mapping[str, Sequence[Sequence[float]]] | None,
+) -> tuple[float, str | None]:
+    """``(pit, oob_side)`` for a numeric resolution against a value grid.
+
+    THE single home of the out-of-grid rule shared by both PIT paths
+    (``_interpolate_pit`` here and ``width_monitor.compute_pit_details``).
+    ``np.interp`` clamps beyond the grid to ``cdf[0]`` / ``cdf[-1]`` — the correct
+    PIT for a resolution exactly AT a bound (F(bound) = cdf[0]) but NOT for one
+    BEYOND the grid: with below/above-bound mass expressible on open bounds,
+    ``cdf[0]`` can be ~0.9, so the clamp reads a below-grid resolution — a
+    low-tail event — as a HIGH PIT, flipping the sign of the miss. Beyond the
+    grid the PIT comes off the members' declared-percentile curves; the clamp is
+    kept only when no curve is usable, and ``oob_side`` (``"low"``/``"high"``/None)
+    reports the beyond-grid case either way.
+    """
+    oob_side = "low" if resolution < grid[0] else ("high" if resolution > grid[-1] else None)
+    if oob_side is not None:
         fallback = declared_percentile_pit(per_model_percentiles, resolution)
         if fallback is not None:
-            return fallback
-    return float(np.interp(resolution, grid, np.asarray(cdf_values, dtype=float)))
+            return fallback, oob_side
+    return float(np.interp(resolution, grid, cdf)), oob_side
 
 
 def mc_summary(data: list[dict]) -> dict:

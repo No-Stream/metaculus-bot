@@ -456,6 +456,26 @@ class TestCollectorCommentCreatedAt:
         assert len(records) == 1
         assert records[0]["bot_comment_created_at"] is None
 
+    def test_stacker_skip_reason_marker_round_trips_onto_record(self):
+        # The additive STACKER_SKIP_REASON marker must reach the record dict —
+        # its documented durable path is the comment, not the run log.
+        post = self._post_data(4, 44)
+        comment = {
+            "id": 1001,
+            "text": "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped -->\n<!-- STACKER_SKIP_REASON=single_forecaster -->\n",
+            "on_post": 4,
+        }
+        records = _process_post(post, {4: comment})
+        assert len(records) == 1
+        assert records[0]["stacker_skip_reason"] == "single_forecaster"
+        assert records[0]["stacker_outcome"] == "skipped"
+
+    def test_stacker_skip_reason_none_without_marker(self):
+        post = self._post_data(5, 55)
+        comment = {"id": 1002, "text": "*Forecaster 1*: 70%\n", "on_post": 5}
+        records = _process_post(post, {5: comment})
+        assert records[0]["stacker_skip_reason"] is None
+
 
 # ---------------------------------------------------------------------------
 # collector — stacker_outcome / stacker_outcome_source fields
@@ -831,6 +851,38 @@ class TestMaxStepClampScreen:
         assert screen["member_bin_masses"] == {}
         assert screen["suspected"] is False
 
+    def test_resolution_exactly_on_grid_point_screens_the_bin_below(self):
+        # A resolution sitting exactly ON a grid edge belongs to the bin BELOW it —
+        # the platform scorer's convention (resolution_to_bucket_index). On this
+        # fixture, resolution 2.0 must screen the [1, 2] bin whose 0.20 step sits at
+        # the pre-fix cap; the old side="right" screened [2, 3] and missed the
+        # q43913 signature entirely.
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, resolution=2.0))
+        assert screen["resolution_bin"] == [1.0, 2.0]
+        assert screen["published_bin_mass"] == pytest.approx(0.2, abs=1e-9)
+        assert screen["suspected"] is True
+
+    def test_single_pair_member_curve_is_unusable(self):
+        # One recovered (percentile, value) pair interpolates to a constant PIT at
+        # every resolution — the member is dropped, leaving one usable curve, which
+        # is below the >=2-curves requirement.
+        one_pair = {
+            "model-a": [[50.0, 90.0]],
+            "model-b": self._MEMBERS["model-b"],
+        }
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=one_pair))
+        assert list(screen["member_bin_masses"]) == ["model-b"]
+        assert screen["suspected"] is False
+
+    def test_non_monotonic_member_curve_is_unusable(self):
+        # Percentiles that DECREASE as values increase invert the curve — drop it.
+        inverted = {
+            "model-a": [[90.0, 0.9], [50.0, 1.3], [10.0, 2.1]],
+            "model-b": self._MEMBERS["model-b"],
+        }
+        screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=inverted))
+        assert list(screen["member_bin_masses"]) == ["model-b"]
+
     def test_non_numeric_resolution_and_type_gates(self):
         assert max_step_clamp_screen({"type": "binary"})["applicable"] is False
         screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, resolution="below_lower_bound"))
@@ -945,6 +997,31 @@ class TestRescoreRecords:
 
     def test_malformed_record_is_skipped(self):
         assert rescore_records([{"no_type": True}, "not-a-dict"]) == 0  # type: ignore[list-item]
+
+    def test_partial_records_are_skipped_not_crashed(self):
+        # rescore takes arbitrary cached JSON: every record missing a field that
+        # _compute_scores subscripts must be skipped, never raise KeyError.
+        partial = [
+            {"type": "binary", "resolution_parsed": True},  # no our_forecast_values
+            {"type": "binary", "resolution_parsed": True, "our_forecast_values": [0.3, 0.7]},  # no our_prob_yes
+            {  # numeric without open-bound flags
+                "type": "numeric",
+                "resolution_parsed": 5.0,
+                "our_forecast_values": [0.0, 0.5, 1.0],
+                "scaling": {"range_min": 0.0, "range_max": 10.0},
+            },
+        ]
+        assert rescore_records(partial) == 0
+        assert "brier_score" not in partial[0]
+
+    def test_load_dataset_survives_partial_records(self, tmp_path: Path):
+        path = tmp_path / "cached.json"
+        path.write_text(json.dumps([{"type": "binary", "resolution_parsed": True}, self._stale_record()]))
+        loaded = load_dataset(str(path))
+        assert len(loaded) == 2
+        assert loaded[1]["numeric_log_score"] == pytest.approx(
+            loaded[1]["metaculus_scores"]["spot_baseline_score"], abs=1e-9
+        )
 
 
 class TestResolveNumericScoreInputsZeroPoint:

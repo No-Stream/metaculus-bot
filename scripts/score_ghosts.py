@@ -111,7 +111,15 @@ def _normalize_json_ghost(record: dict) -> dict | None:
         return None
     if not isinstance(payload, dict):
         return None
-    return {"qid": record.get("qid"), "qtype": payload.get("qtype"), "source": "json", "payload": payload}
+    return {
+        "qid": record.get("qid"),
+        "qtype": payload.get("qtype"),
+        "source": "json",
+        "payload": payload,
+        # Run identity, so the pre/post split can require both halves to come
+        # from the SAME run (a qid can be forecast in several archived runs).
+        "run_id": record.get("run_id"),
+    }
 
 
 def _select_ghost_per_qid(json_ghosts: list[dict], legacy_ghosts: list[dict]) -> dict[int, dict]:
@@ -338,16 +346,20 @@ def _summarize_rows(rows: list[dict]) -> dict:
 def _pre_identity(ghost: dict, pre_by_qid: dict[int, dict]) -> bool | None:
     """Whether the concluding ghost is byte-identical to the pre-research dry run.
 
-    ``True``/``False`` only when both halves are JSON payloads (the two markers
-    serialize through the same ``_summarize_ghost`` path, so dict equality IS the
-    byte-identity the split needs). ``None`` when there is nothing to compare: no
-    ``GHOST_PRE_JSON`` for this qid, or a legacy summary-only ghost (the pre marker
-    and the JSON ghost landed in the same merge, so a legacy ghost predates both).
+    ``True``/``False`` only when both halves are JSON payloads FROM THE SAME RUN
+    (the two markers serialize through the same ``_summarize_ghost`` path, so dict
+    equality IS the byte-identity the split needs). ``None`` when there is nothing
+    to compare: no ``GHOST_PRE_JSON`` for this qid, a legacy summary-only ghost
+    (the pre marker and the JSON ghost landed in the same merge, so a legacy ghost
+    predates both), or a pre-ghost from a DIFFERENT run — a run can emit one
+    marker without the other (a schema-invalid dry run suppresses GHOST_PRE_JSON;
+    a deadline-hit run can bank a pre with no concluding ghost), and comparing
+    across runs would file a cross-run pair into ``pre_identical``/``loop_moved``.
     """
     if ghost["source"] != "json":
         return None
     pre = pre_by_qid.get(ghost["qid"])
-    if pre is None:
+    if pre is None or pre.get("run_id") != ghost.get("run_id"):
         return None
     return pre["payload"] == ghost["payload"]
 

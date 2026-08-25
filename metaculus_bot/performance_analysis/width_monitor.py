@@ -64,9 +64,10 @@ from scipy import stats
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
-from metaculus_bot.performance_analysis.analysis import declared_percentile_pit
+from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, pit_on_grid
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
 from metaculus_bot.performance_analysis.scaling import grid_zero_point as _grid_zero_point
+from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -106,7 +107,9 @@ class Era:
 # run in that gap under the wrong config. Re-derive with
 # `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
 WIDENING_FLIP = datetime(2026, 5, 18, 17, 21, 19, tzinfo=timezone.utc)  # 0e85e1b: k_tail 1.25 -> 1.0
-TS_ANCHOR_ENABLE = datetime(2026, 7, 21, 17, 7, 37, tzinfo=timezone.utc)  # b4e9df0: july15 bundle
+# b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
+# era gate can never disagree; the timestamp's single home is analysis.py.
+TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 
 # Questions excluded from headline calibration rows by every other dimension of
 # the residual analysis: 43746 (Minions & Monsters) and 43747 (Toy Story 5)
@@ -157,23 +160,10 @@ def default_eras() -> list[Era]:
 NO_TIMESTAMP_LABEL = "no_timestamp"
 
 
-def _parse_created_at(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    s = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def assign_era(record: dict, eras: list[Era]) -> str:
     """Return the era label for a record, or ``NO_TIMESTAMP_LABEL`` when the
     bot-comment timestamp is missing/unparseable (can't be era-attributed)."""
-    dt = _parse_created_at(record.get("bot_comment_created_at"))
+    dt = parse_iso_utc(record.get("bot_comment_created_at"))
     if dt is None:
         return NO_TIMESTAMP_LABEL
     for era in eras:
@@ -232,14 +222,11 @@ def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
     """``(pit, oob_side)`` — ``oob_side`` is ``"low"``/``"high"`` when the resolution
     fell beyond the value grid (string marker or numeric), else None.
 
-    ``np.interp`` clamps a resolution beyond the grid to ``cdf[0]`` / ``cdf[-1]`` —
-    correct AT a bound, wrong BEYOND one: with below-bound mass expressible on open
-    bounds (``cdf[0]`` can be ~0.9), the clamp reads a below-grid resolution — a
-    low-tail event — as a HIGH PIT, flipping the sign of the miss. Beyond the grid
-    the PIT comes off the median of the members' declared-percentile curves (not
-    clipped to the displayed range, via :func:`declared_percentile_pit`); when no
-    member curve is parseable the grid-endpoint read is kept, and ``oob_side``
-    surfaces the record in the ``n_oob_*`` counters either way.
+    String out-of-bound markers map to 0.0/1.0; a numeric resolution goes through
+    the shared :func:`pit_on_grid`, whose docstring holds the out-of-grid rule
+    (declared-percentile fallback beyond the grid, endpoint clamp only when no
+    member curve is usable). ``oob_side`` surfaces beyond-grid records in the
+    ``n_oob_*`` counters either way.
     """
     built = _cdf_and_grid(record)
     if built is None:
@@ -251,13 +238,7 @@ def compute_pit_details(record: dict) -> tuple[float | None, str | None]:
     if res == "above_upper_bound":
         return 1.0, "high"
     if isinstance(res, (int, float)) and not isinstance(res, bool):
-        res_f = float(res)
-        oob_side = "low" if res_f < grid[0] else ("high" if res_f > grid[-1] else None)
-        if oob_side is not None:
-            fallback = declared_percentile_pit(record.get("per_model_numeric_percentiles"), res_f)
-            if fallback is not None:
-                return fallback, oob_side
-        return float(np.interp(res_f, grid, cdf)), oob_side
+        return pit_on_grid(float(res), grid, cdf, record.get("per_model_numeric_percentiles"))
     return None, None
 
 
