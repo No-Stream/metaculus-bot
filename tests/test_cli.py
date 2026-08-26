@@ -61,6 +61,7 @@ from metaculus_bot.research.provider_health import (
     record_venue_observation,
     reset_provider_health,
 )
+from scripts.telemetry.markers import MARKER_SPECS
 
 # Dates on either side of the suppression boundary. Injected instead of read from
 # the clock so these tests keep exercising both branches forever.
@@ -685,10 +686,15 @@ class TestCliCreditAlertSuppression:
         finally:
             fb_module._generic_key_fallback_count = 0
 
-    def test_clean_run_logs_no_degradation_summary(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The green-path summary is conditioned on a fallback having happened, not
-        on the exit status: a run where nothing degraded says nothing, so the line's
-        presence in a log remains a signal rather than boilerplate.
+    def test_clean_run_logs_an_all_clear_summary(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A fully clean run states so, under a distinguishable "clean" phrase.
+
+        This REVERSES the earlier pinned behavior (a clean run logged nothing, so the
+        line's presence would stay a signal rather than boilerplate); the operator
+        overturned that on 2026-08-25. Silence is indistinguishable from a run that
+        died before reaching the summary block, and once the donated key is refilled
+        the clean shape becomes the common one — so the archive's per-run census
+        would lose precisely the runs that went well.
         """
         with (
             _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
@@ -697,7 +703,67 @@ class TestCliCreditAlertSuppression:
             cli_main()
 
         messages = [record.getMessage() for record in caplog.records]
-        assert not any("alertable degradation event" in msg for msg in messages), messages
+        summary = [msg for msg in messages if "alertable degradation event" in msg]
+        assert len(summary) == 1, messages
+        # The whole point is that the harvester can tell this run apart from a
+        # degraded one whose counters happen to read zero, so pin the phrase.
+        assert summary[0].startswith("Run completed clean with 0 alertable degradation event(s)"), summary
+        assert "bot=0, personal_key_fallback=0 of which donated_404=0, credit=0" in summary[0], summary
+        # Nothing probed the donated key, so the verdict clause stays absent.
+        assert "donated_key=" not in summary[0], summary
+        # Seam pin: the harvester must recognise the line this code actually emits,
+        # and stamp it ``outcome=clean`` — an all-zero record alone is ambiguous
+        # (a run that lost a question reads all zeros too).
+        spec = next(s for s in MARKER_SPECS if s.name == "run_alertable_summary")
+        match = spec.regex.search(summary[0])
+        assert match is not None, summary
+        assert match.group("outcome") == "clean"
+        assert match.group("alertable") == "0"
+
+    def test_clean_run_after_the_resume_date_drops_the_suppression_clause(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The shape prod will actually emit once the donated key is refilled: no
+        suppression clause, since alerting is live again. This is the run the census
+        was about to lose, so pin that it both fires and still harvests."""
+        with (
+            _cli_main_test_mode(alertable_count=0, today=AFTER_RESUME_DATE),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+        ):
+            cli_main()
+
+        summary = [msg for msg in caplog.messages if "alertable degradation event" in msg]
+        assert len(summary) == 1, caplog.messages
+        assert summary[0].startswith("Run completed clean with 0 alertable"), summary
+        assert "suppressed until" not in summary[0], summary
+        spec = next(s for s in MARKER_SPECS if s.name == "run_alertable_summary")
+        match = spec.regex.search(summary[0])
+        assert match is not None, summary
+        assert match.group("outcome") == "clean"
+        assert match.group("suppressed_credit") is None
+
+    def test_a_degraded_run_is_never_labelled_clean(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The "clean" phrase is load-bearing telemetry, so it must not leak onto a
+        run that fell back. One suppressed credit fallback exits zero, which is the
+        nearest neighbour of the clean path and the easiest one to mislabel."""
+        import metaculus_bot.fallback_openrouter as fb_module  # noqa: PLC0415, HARNESS-SCAN-EXEMPT-function-level-import
+
+        fb_module._generic_key_fallback_count = 1
+        fb_module._credit_key_fallback_count = 1
+        try:
+            with (
+                _cli_main_test_mode(alertable_count=0, today=DURING_SUPPRESSION),
+                caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            ):
+                cli_main()
+
+            summary = [msg for msg in caplog.messages if "alertable degradation event" in msg]
+            assert len(summary) == 1, caplog.messages
+            assert summary[0].startswith("Run completed with 0 alertable"), summary
+            assert "clean" not in summary[0], summary
+        finally:
+            fb_module._generic_key_fallback_count = 0
+            fb_module._credit_key_fallback_count = 0
 
     def test_probe_verdict_is_rendered_on_partially_suppressed_red_run(self, caplog: pytest.LogCaptureFixture) -> None:
         """Partial suppression: two fallbacks, one of them credit-caused, so one
@@ -1026,6 +1092,9 @@ class TestAlertableSummarySurvivesForecastFailure:
         breakdown_lines = [m for m in caplog.messages if m.startswith("Run completed with")]
         assert len(breakdown_lines) == 1
         assert "re-raising the forecasting failure" in breakdown_lines[0]
+        # All three counters read zero on this run, but it lost a question — so it
+        # must NOT pick up the all-clear phrase that a genuinely clean run carries.
+        assert "clean" not in breakdown_lines[0]
 
     def test_failure_outranks_the_alertable_exit_and_keeps_the_count(self, caplog: pytest.LogCaptureFixture) -> None:
         """Both red states at once: the exception (with its traceback) is the red

@@ -49,9 +49,10 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``PUBLISH_SKIPPED_CLOSED`` — ``metaculus_bot/publish_gate.py``
   ``skip_publish_if_closed`` (per-QUESTION pre-publish skip: the question whose
   window had already closed, why, and by how many seconds it missed)
-* ``Run completed with N alertable...`` — ``metaculus_bot/cli.py`` (the end-of-run
-  breakdown, emitted on BOTH exit paths so a fully-suppressed green run is still
-  recorded)
+* ``Run completed [clean] with N alertable...`` — ``metaculus_bot/cli.py`` (the
+  end-of-run breakdown, emitted on EVERY path — degraded, fully-suppressed green,
+  crashed, and fully clean — so the archive holds one record per run; the ``clean``
+  variant is the 2026-08-25 addition that keeps a healthy run in the census)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
 * ``STACKER_OUTCOME`` / ``STACKER_SKIP_REASON`` / ``TOOLS_USED`` /
   ``ANCHOR_OVERSHOOT_PP`` / ``CLAUSE_PRODUCT_DIVERGENCE_PP`` — ``metaculus_bot/comment/markers.py``
@@ -495,15 +496,23 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "run_alertable_summary",
-        # The end-of-run alertable breakdown (cli.py), emitted on BOTH exit paths —
-        # the green fully-suppressed case is exactly the one that would otherwise
-        # leave no record (the 2026-07-26 drained-key run read alertable=0 alongside
-        # real degradation). ``donated_key`` is the /auth/key probe verdict and is
+        # The end-of-run alertable breakdown (cli.py), emitted on EVERY path — the
+        # green fully-suppressed case is exactly the one that would otherwise leave no
+        # record (the 2026-07-26 drained-key run read alertable=0 alongside real
+        # degradation). ``donated_key`` is the /auth/key probe verdict and is
         # OPTIONAL-group wrapped twice over: it is omitted entirely when no spend-cap
         # failure made the wrapper probe, and the suppression clause between it and
         # ``credit`` only appears mid-window.
+        #
+        # ``outcome`` captures the literal "clean" that cli.py adds when nothing
+        # degraded at all (2026-08-25; before then such a run logged no line, so the
+        # census counted only degraded runs). It is None on every other shape,
+        # including all pre-2026-08-25 records — the alternation is purely additive.
+        # The token is what marks a run clean, NOT all-zero fields: a run that lost a
+        # question to a raising log_report_summary emits all zeros too (q45085's
+        # shape) and deliberately keeps the plain phrase.
         re.compile(
-            r"Run completed with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
+            r"Run completed (?:(?P<outcome>clean) )?with (?P<alertable>\S+) alertable degradation event\(s\)\s*"
             r"\(bot=(?P<bot>\S+?), personal_key_fallback=(?P<personal_key_fallback>\S+?) of which "
             r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
             r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"

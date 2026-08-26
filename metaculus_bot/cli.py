@@ -262,13 +262,32 @@ def main() -> None:
     # probe rather than "no run this shape ever needed one".
     probed_donated_key_state = get_probed_donated_key_state()
     donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
-    # One breakdown, both exit paths. The green path needs it as much as the red
-    # one: when every donated-key call fell back and the credit subset cancels the
-    # whole generic total, ``alertable`` is 0 — the exact shape of the 2026-07-26
-    # drained-key run — and gating this line on the exit status would leave that
-    # run's degradation and probe verdict entirely unrecorded.
+    # One breakdown, EVERY path — degraded, suppressed-green, crashed, and fully
+    # clean. The green paths need it as much as the red one: when every donated-key
+    # call fell back and the credit subset cancels the whole generic total,
+    # ``alertable`` is 0 — the exact shape of the 2026-07-26 drained-key run — and
+    # gating this line on the exit status would leave that run's degradation and
+    # probe verdict entirely unrecorded.
+    #
+    # A fully clean run says so explicitly, under a distinguishable "clean" phrase
+    # that harvests as the same run_alertable_summary marker. It used to emit
+    # NOTHING, so that the line's presence would stay a signal rather than
+    # boilerplate; the operator OVERTURNED that on 2026-08-25. The reason: silence
+    # is not distinguishable from a run that died before reaching this block, and
+    # once the donated key is refilled (past CREDIT_ALERT_RESUME_DATE) the clean
+    # shape becomes the COMMON one, so the archive's per-run census would lose
+    # exactly the runs that went well. During the drained-key window the question
+    # was moot — every run fell back at least once, and 0 of the 73 archived
+    # records are the clean shape.
+    #
+    # A raising ``log_report_summary`` is never "clean" no matter what the counters
+    # read: that run lost a question. Its counters can legitimately be all-zero
+    # (q45085's shape), which is why the phrase, not the fields, is what marks a run
+    # clean.
+    run_clean = report_summary_error is None and alertable <= 0 and generic_fallback <= 0
+    completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
     breakdown = (
-        f"Run completed with {alertable} alertable degradation event(s) "
+        f"{completion_phrase} {alertable} alertable degradation event(s) "
         f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
         f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
     )
@@ -286,10 +305,10 @@ def main() -> None:
         # Reachable only under suppression with every fallback credit-caused (the
         # subtraction can't otherwise reach zero from a positive total), so state
         # that rather than leaving a reader to derive it from the arithmetic.
-        # (A fully CLEAN run — nothing alertable, no fallback — deliberately says
-        # nothing, so the line's presence stays a signal; pinned by
-        # tests/test_cli.py::test_clean_run_logs_no_degradation_summary.)
         logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
+    else:
+        # The all-clear census line (see ``run_clean`` above).
+        logger.info("%s nothing degraded, so this run stays green.", breakdown)
 
     # Donated-key balance below the refill floor (CREDIT_FLOOR_BREACH warning
     # already logged by credit_telemetry). The run completed and published

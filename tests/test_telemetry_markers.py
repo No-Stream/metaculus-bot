@@ -1229,6 +1229,14 @@ RUN_ALERTABLE_SUPPRESSED_LINE = (
     "of which donated_404=0, credit=7 with 7 credit event(s) suppressed until 2026-09-10, "
     "donated_key=drained); every fallback was a suppressed credit event, so this run stays green."
 )
+# The 2026-08-25 addition: a run where nothing degraded at all. It logged no line
+# before, so the census counted only degraded runs — which the drained-key window
+# hid, since every run in it fell back at least once.
+RUN_ALERTABLE_CLEAN_LINE = (
+    PFX + "Run completed clean with 0 alertable degradation event(s) (bot=0, personal_key_fallback=0 "
+    "of which donated_404=0, credit=0 with 0 credit event(s) suppressed until 2026-09-10); "
+    "nothing degraded, so this run stays green."
+)
 
 
 class TestRunAlertableSummary:
@@ -1244,6 +1252,8 @@ class TestRunAlertableSummary:
         # zero — "never needed a probe" must not read as "the probe said unknown".
         assert rec["suppressed_credit"] is None
         assert rec["donated_key"] is None
+        # A degraded line carries no phrase marker; ``outcome`` is only ever "clean".
+        assert rec["outcome"] is None
 
     def test_suppressed_green_run_carries_the_probe_verdict(self):
         """The shape the drained-donated-key incident produced: alertable=0 with seven
@@ -1255,6 +1265,25 @@ class TestRunAlertableSummary:
         assert rec["suppressed_credit"] == 7
         assert rec["resume_date"] == "2026-09-10"
         assert rec["donated_key"] == "drained"
+        # Pre-2026-08-25 records carry no phrase marker, and neither does any
+        # degraded line since — ``outcome`` is what says "clean", so it must stay
+        # absent here rather than defaulting to it.
+        assert rec["outcome"] is None
+
+    def test_clean_run_is_harvested_and_flagged(self):
+        """The all-clear shape harvests as the same marker, distinguishable by
+        ``outcome`` rather than by its all-zero fields — a run that lost a question
+        also reads all zeros (q45085's shape) and keeps the plain phrase."""
+        rec = _parse_one(RUN_ALERTABLE_CLEAN_LINE)
+        assert rec["marker"] == "run_alertable_summary"
+        assert rec["outcome"] == "clean"
+        assert rec["alertable"] == 0
+        assert rec["bot"] == 0
+        assert rec["personal_key_fallback"] == 0
+        assert rec["donated_404"] == 0
+        assert rec["credit"] == 0
+        assert rec["suppressed_credit"] == 0
+        assert rec["donated_key"] is None
 
 
 # Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py
