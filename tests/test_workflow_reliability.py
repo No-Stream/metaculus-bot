@@ -47,15 +47,19 @@ _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 # checkout passes locally by construction and fails on the first CI run.
 _ALL_WORKFLOWS = sorted(p.relative_to(_REPO_ROOT).as_posix() for p in _WORKFLOW_DIR.glob("*.y*ml"))
 _BOT_WORKFLOWS = sorted(p.relative_to(_REPO_ROOT).as_posix() for p in _WORKFLOW_DIR.glob("*bot*.y*ml"))
+_NON_BOT_WORKFLOWS = sorted(set(_ALL_WORKFLOWS) - set(_BOT_WORKFLOWS))
 
 # Steps that provably cannot hang, so a cap would be noise: no network, no subprocess.
 _UNCAPPED_BY_DESIGN = {"Warn if Playwright install failed"}
 
 # Worst healthy duration measured over 200 successful runs per step, in seconds
-# (track_c_step_timings.json). Caps must clear these by the multiple below, or a slow
-# runner day starts killing healthy steps.
+# (track_c_step_timings.json), keyed by the step's LABEL — its ``name``, or its ``uses``
+# for the action steps that declare none. Matched by prefix so bumping an action's
+# version does not silently drop that step from the check. Caps must clear these by the
+# multiple below, or a slow runner day starts killing healthy steps.
 _MEASURED_WORST_SECONDS = {
     "Check out repository": 4,
+    "astral-sh/setup-uv": 3,
     "Install dependencies": 22,
     "Install Playwright Chromium": 55,
     "Upload research outputs": 2,
@@ -65,6 +69,15 @@ _MIN_HEADROOM_OVER_MEASURED = 5
 # A hang must cost far less than the 180-minute window a tournament question is open
 # for; 300 (the pre-fix value) is longer than the whole window.
 _MAX_TOLERABLE_JOB_CAP_MINUTES = 90
+
+# ci.yaml and claude.yml have no publish deadline to protect, so their caps answer to
+# measured duration alone: the worst of 131 successful CI jobs is 245 s, and claude.yml
+# has never run past its @claude gate. Both bounds matter. Above, GitHub's uncapped
+# 360-minute default is the defect these caps exist to remove, and claude.yml is the one
+# workflow that spends a paid key while it hangs; below, a cap under 5 minutes would
+# start killing healthy jobs — a red required check on a slow runner day.
+_MAX_NON_BOT_JOB_CAP_MINUTES = 60
+_MIN_JOB_CAP_MINUTES = 5
 
 
 def _workflow(rel_path: str) -> dict[str, Any]:
@@ -83,6 +96,13 @@ def _named_step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
 
 def _step_label(step: dict[str, Any]) -> str:
     return step.get("name") or step.get("uses", "<unnamed>")
+
+
+def _labelled_step(workflow: dict[str, Any], label_prefix: str) -> dict[str, Any]:
+    """The one step whose label starts with ``label_prefix`` (see _MEASURED_WORST_SECONDS)."""
+    matches = [step for step in _steps(workflow) if _step_label(step).startswith(label_prefix)]
+    assert len(matches) == 1, f"expected exactly one step labelled {label_prefix!r}, got {len(matches)}"
+    return matches[0]
 
 
 class TestEveryJobIsCapped:
@@ -131,10 +151,10 @@ class TestBotWorkflowStepsAreCapped:
 
     @pytest.mark.parametrize("rel_path", _BOT_WORKFLOWS)
     def test_step_caps_clear_the_measured_worst_case(self, rel_path: str) -> None:
-        for name, worst_seconds in _MEASURED_WORST_SECONDS.items():
-            cap_seconds = _named_step(_workflow(rel_path), name)["timeout-minutes"] * 60
+        for label, worst_seconds in _MEASURED_WORST_SECONDS.items():
+            cap_seconds = _labelled_step(_workflow(rel_path), label)["timeout-minutes"] * 60
             assert cap_seconds >= worst_seconds * _MIN_HEADROOM_OVER_MEASURED, (
-                f"{rel_path}: {name!r} capped at {cap_seconds}s but the worst of 200 healthy runs is "
+                f"{rel_path}: {label!r} capped at {cap_seconds}s but the worst of 200 healthy runs is "
                 f"{worst_seconds}s; keep {_MIN_HEADROOM_OVER_MEASURED}x headroom so a slow runner day "
                 "cannot kill a healthy step"
             )
@@ -201,3 +221,29 @@ class TestRunBotCapRespectsTheBotsOwnContract:
         }
         distinct = {tuple(value) for value in caps.values()}
         assert len(distinct) == 1, f"bot workflow job caps disagree: {caps}"
+
+
+class TestNonBotWorkflowCapsStayInBand:
+    """ci.yaml and claude.yml were swept as the same defect class, so pin their sizing.
+
+    ``TestEveryJobIsCapped`` only asks whether a cap EXISTS, which a revert to GitHub's
+    360-minute default satisfies with one keystroke. These are the workflows nobody
+    watches — a required check spinning for six hours, on a workflow that holds a paid
+    key while it does it.
+    """
+
+    @pytest.mark.parametrize("rel_path", _NON_BOT_WORKFLOWS)
+    def test_job_caps_sit_between_the_floor_and_githubs_default(self, rel_path: str) -> None:
+        for job_name, job in _workflow(rel_path)["jobs"].items():
+            cap = job["timeout-minutes"]
+            assert _MIN_JOB_CAP_MINUTES <= cap <= _MAX_NON_BOT_JOB_CAP_MINUTES, (
+                f"{rel_path}:{job_name} job cap is {cap}m, outside the "
+                f"{_MIN_JOB_CAP_MINUTES}-{_MAX_NON_BOT_JOB_CAP_MINUTES}m band. The worst of 131 "
+                "successful CI jobs is 245s, so anything near GitHub's 360-minute default is the "
+                "hole this closed, and anything under the floor kills healthy jobs on a slow runner"
+            )
+
+    def test_the_non_bot_set_is_what_we_think_it_is(self) -> None:
+        # Complement of the pinned full set: a new non-bot workflow lands in the band
+        # check above rather than escaping both parametrizations.
+        assert _NON_BOT_WORKFLOWS == [".github/workflows/ci.yaml", ".github/workflows/claude.yml"]

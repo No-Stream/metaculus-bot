@@ -22,18 +22,21 @@ Four behaviors are pinned here:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from forecasting_tools import BinaryQuestion, GeneralLlm, ReasonedPrediction
+from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     CRUX_SOFT_DEADLINE,
+    NATIVE_SEARCH_WALL_TIMEOUT,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
     PUBLISH_RESERVE_SECONDS,
     RESEARCH_PHASE_BUDGET_SHARE,
@@ -41,7 +44,11 @@ from metaculus_bot.constants import (
     WALL_CLOCK_STACKING_MIN_BUDGET,
 )
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
-from metaculus_bot.stacking_route import _enrichment_timeout, _skip_stacking_for_budget
+from metaculus_bot.stacking_route import (
+    _enrichment_timeout,
+    _skip_stacking_for_budget,
+    _targeted_research_for_crux,
+)
 from metaculus_bot.time_budget import (
     QuestionTimeBudget,
     build_question_time_budget,
@@ -62,6 +69,22 @@ def _budget(total_s: float, *, close_limited: bool = True) -> QuestionTimeBudget
         total_s=total_s,
         started_at=time.monotonic(),
         close_time=datetime.now(timezone.utc) + timedelta(seconds=total_s),
+        close_limited=close_limited,
+    )
+
+
+def _partly_spent_budget(total_s: float, *, spent_s: float, close_limited: bool = True) -> QuestionTimeBudget:
+    """A budget granted ``spent_s`` ago, for the mid-question states.
+
+    ``fast_path`` reads ``total_s`` while every stage deadline reads
+    ``remaining_s()``, so the two only come apart once time has passed — which is
+    the only way to reach the branches that cut a stage on a budget that never
+    fast-pathed.
+    """
+    return QuestionTimeBudget(
+        total_s=total_s,
+        started_at=time.monotonic() - spent_s,
+        close_time=datetime.now(timezone.utc) + timedelta(seconds=total_s - spent_s),
         close_limited=close_limited,
     )
 
@@ -321,6 +344,17 @@ class TestResearchPhaseDeadline:
                 [(AsyncMock(), "native_search")], exploding_run_one, None
             )
 
+    @pytest.mark.asyncio
+    async def test_an_empty_provider_list_yields_no_results_instead_of_raising(self):
+        """The bare ``asyncio.gather()`` this replaced accepted an empty list;
+        ``asyncio.wait(set())`` raises ValueError. Selection always yields at least the
+        "none" stub, so only a direct caller reaches the guard — but without it that
+        caller gets an exception where it used to get ``[]``."""
+        never_run = AsyncMock(side_effect=AssertionError("no provider should have been started"))
+
+        assert await ResearchOrchestrator._await_providers_within_deadline([], never_run, None) == []
+        never_run.assert_not_awaited()
+
 
 class TestGapFillSkippedOnTheFastPath:
     @pytest.mark.asyncio
@@ -386,6 +420,99 @@ class TestGapFillSkippedOnTheFastPath:
         v2.assert_awaited_once()
         assert "Targeted Gap-Fill" in research
         assert "Agentic Research Findings" in research
+
+
+class TestGapFillCutByTheResearchPhaseBudget:
+    """The belt to the fast path's braces: a pass that STARTED is still cut.
+
+    The fast-path skip decides before the phase begins, off ``total_s``. These cover
+    what happens when a budget that never fast-pathed runs low mid-question — a slow
+    intake, a straggling provider — which is the only way the ``asyncio.wait_for``
+    around each pass and the zero-remaining skip can fire.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _both_passes_enabled(self, monkeypatch):
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+
+    @staticmethod
+    async def _instant_provider(_question) -> str:
+        await asyncio.sleep(0)  # one checkpoint, like a real provider's first await
+        return "x" * 2000  # comfortably over GAP_FILL_MIN_RESEARCH_CHARS, so v1 activates
+
+    @staticmethod
+    async def _never_returns(*_args, **_kwargs) -> str:
+        await asyncio.sleep(30)
+        return "too late to matter"
+
+    @pytest.mark.asyncio
+    async def test_both_passes_are_cut_and_neither_counts_as_a_failure(self, caplog):
+        """v2's cut must not bump ``gap_fill_v2_error_count``: that counter exists to
+        redden CI on a DEAD v2 feature, and a budget cut is our own decision — already
+        alertable through the fast-path counter. Folding the two together would make a
+        run of thin-window questions look like v2 had broken."""
+        orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+        # Clears the fast-path threshold, so the pre-phase skip cannot be what fires,
+        # but only ~2s of it is left — the wait_for lands mid-pass. The margin is
+        # deliberately seconds rather than milliseconds: this suite runs on shared CI
+        # runners, and a budget that expires before the phase starts would take the
+        # SKIP branch and quietly stop testing the cut.
+        budget = _partly_spent_budget(
+            TIME_BUDGET_FAST_PATH_THRESHOLD + 200, spent_s=TIME_BUDGET_FAST_PATH_THRESHOLD + 198
+        )
+        assert budget.fast_path is False
+
+        with (
+            patch.object(
+                orchestrator, "_select_research_providers", return_value=[(self._instant_provider, "native_search")]
+            ),
+            patch("metaculus_bot.research.targeted.run_gap_fill_pass", new=self._never_returns),
+            patch("metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", new=self._never_returns),
+        ):
+            research = await orchestrator.run_research(make_real_binary_question(qid=7203), time_budget=budget)
+
+        assert any("GAP_FILL_V1_CUT_FOR_BUDGET" in message for message in caplog.messages), caplog.messages
+        assert any("GAP_FILL_V2_CUT_FOR_BUDGET" in message for message in caplog.messages), caplog.messages
+        assert not any("GAP_FILL_SKIPPED_FOR_BUDGET" in message for message in caplog.messages), caplog.messages
+        # The bundle survives the cut with the primary provider's text intact.
+        assert "x" * 2000 in research
+        assert "Targeted Gap-Fill" not in research
+        assert "Agentic Research Findings" not in research
+        assert orchestrator.gap_fill_v2_error_count == 0
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_research_budget_skips_the_passes_outside_the_fast_path(self, caplog):
+        """The second disjunct of the skip: ``research_phase_deadline_s()`` reached 0 on
+        a budget whose ``total_s`` never qualified as thin, so the marker has to say
+        ``fast_path=false`` — otherwise the archive attributes the degradation to a
+        close time when the real cause was time already burned."""
+        orchestrator = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
+        budget = _partly_spent_budget(
+            PER_QUESTION_WALL_CLOCK_DEADLINE, spent_s=PER_QUESTION_WALL_CLOCK_DEADLINE + 10, close_limited=False
+        )
+        assert budget.fast_path is False
+        assert budget.research_phase_deadline_s() == 0.0
+
+        with (
+            patch.object(
+                orchestrator, "_select_research_providers", return_value=[(self._instant_provider, "native_search")]
+            ),
+            patch(
+                "metaculus_bot.research.targeted.run_gap_fill_pass", new_callable=AsyncMock, return_value="v1 addendum"
+            ) as v1,
+            patch(
+                "metaculus_bot.research.agentic_gap_fill.run_gap_fill_v2", new_callable=AsyncMock, return_value="v2"
+            ) as v2,
+        ):
+            await orchestrator.run_research(make_real_binary_question(qid=7204), time_budget=budget)
+
+        v1.assert_not_called()
+        v2.assert_not_called()
+        skip_lines = [message for message in caplog.messages if "GAP_FILL_SKIPPED_FOR_BUDGET" in message]
+        assert len(skip_lines) == 1, caplog.messages
+        assert "fast_path=false" in skip_lines[0]
+        assert "research_phase_remaining=0s" in skip_lines[0]
 
 
 class TestTightestCloseFirstOrdering:
@@ -508,6 +635,99 @@ class TestStackingGateUnderACloseLimitedBudget:
         # step and would report a stage failure that never happened).
         assert _enrichment_timeout(CRUX_SOFT_DEADLINE, _budget(0)) == 1.0
 
+    @pytest.mark.asyncio
+    async def test_both_enrichment_stages_actually_run_under_the_clamp(self):
+        """The clamp has to be WIRED, not merely correct: dropping either call site
+        would leave a stage free to run its full soft deadline (crux 180 s, targeted
+        search 420 s) on a budget with two minutes left — and the unit test above would
+        still pass. Recorded off ``asyncio.wait_for`` so the assertion is on the exact
+        timeout each stage was given rather than on how long the test slept."""
+        bot = self._bot(AggregationStrategy.CONDITIONAL_STACKING)
+        analyzer_llm = bot._analyzer_llm
+        assert analyzer_llm is not None, "the CONDITIONAL_STACKING bot factory configures one"
+        budget = _budget(150)
+        predictions: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.2, reasoning="Model: m1\n\nlow"),
+            ReasonedPrediction(prediction_value=0.6, reasoning="Model: m2\n\nhigh"),
+        ]
+        recorded: list[float | None] = []
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(awaitable, **kwargs):
+            recorded.append(kwargs.get("timeout"))
+            return await real_wait_for(awaitable, **kwargs)
+
+        with (
+            patch("asyncio.wait_for", recording_wait_for),
+            patch(
+                "metaculus_bot.stacking_route.extract_disagreement_crux",
+                new_callable=AsyncMock,
+                return_value="whether the BLS revision lands before the close",
+            ),
+            patch(
+                "metaculus_bot.stacking_route.run_targeted_search",
+                new_callable=AsyncMock,
+                return_value="targeted findings",
+            ),
+        ):
+            text = await _targeted_research_for_crux(
+                bot, make_real_binary_question(qid=7304), analyzer_llm, predictions, budget
+            )
+
+        assert text == "targeted findings"
+        expected = [
+            _enrichment_timeout(CRUX_SOFT_DEADLINE, budget),
+            _enrichment_timeout(NATIVE_SEARCH_WALL_TIMEOUT, budget),
+        ]
+        assert recorded == pytest.approx(expected, abs=1.0)
+        # No None among them: an unbounded stage is the failure this guards against, and
+        # both came out well below their own soft deadlines because 150 s of budget
+        # cannot afford either at full length.
+        bounded = [timeout for timeout in recorded if timeout is not None]
+        assert len(bounded) == 2
+        assert max(bounded) < CRUX_SOFT_DEADLINE
+
+    @pytest.mark.asyncio
+    async def test_a_clamped_crux_that_overruns_degrades_to_base_research(self, caplog):
+        """What the clamp does when it bites. The stage is enrichment, so a cut must cost
+        the question nothing beyond the targeted search — and the WARN has to name the
+        CLAMPED bound rather than ``CRUX_SOFT_DEADLINE``, or a reader debugging a cut
+        stage is handed a number (180 s) that never applied."""
+        bot = self._bot(AggregationStrategy.CONDITIONAL_STACKING)
+        analyzer_llm = bot._analyzer_llm
+        assert analyzer_llm is not None
+        predictions: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.2, reasoning="Model: m1\n\nlow"),
+            ReasonedPrediction(prediction_value=0.6, reasoning="Model: m2\n\nhigh"),
+        ]
+        # Fully spent, so the clamp lands on its 1 s floor — the shortest run this can
+        # have while still giving the coroutine a first step.
+        budget = _budget(0)
+        assert _enrichment_timeout(CRUX_SOFT_DEADLINE, budget) == 1.0
+        search = AsyncMock(return_value="never reached")
+
+        with (
+            patch("metaculus_bot.stacking_route.extract_disagreement_crux", new=self._hangs),
+            patch("metaculus_bot.stacking_route.run_targeted_search", new=search),
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.stacking_route"),
+        ):
+            text = await _targeted_research_for_crux(
+                bot, make_real_binary_question(qid=7305), analyzer_llm, predictions, budget
+            )
+
+        assert text == ""
+        search.assert_not_awaited()
+        assert bot._conditional_stacking_crux_failures == 1
+        cut = [message for message in caplog.messages if message.startswith("CRUX_SOFT_DEADLINE:")]
+        assert len(cut) == 1, caplog.messages
+        assert "exceeded 1s" in cut[0], cut[0]
+        assert str(CRUX_SOFT_DEADLINE) not in cut[0], "the constant is not the bound that applied"
+
+    @staticmethod
+    async def _hangs(*_args, **_kwargs) -> str:
+        await asyncio.sleep(30)
+        return "too late to matter"
+
 
 class TestThinWindowThroughThePipeline:
     """Integration: the whole per-question pipeline under a thin window."""
@@ -616,3 +836,126 @@ class TestThinWindowThroughThePipeline:
         gather.assert_not_awaited()
         assert bot._questions_failed_to_publish == 1
         assert bot._time_budget_fast_path_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.e2e
+    async def test_a_backtest_over_a_long_closed_question_is_not_skipped(self):
+        """The wiring that keeps this feature out of the backtests. ``close_aware`` is
+        ``publish_reports_to_metaculus``, and backtests forecast RESOLVED questions —
+        hardcode it True and every one of them gets a negative budget and raises at
+        intake, killing the whole run. The builder's unit test cannot see that; only the
+        bot's own gate can."""
+        bot = make_e2e_bot(
+            AggregationStrategy.CONDITIONAL_STACKING,
+            n_forecasters=3,
+            publish_reports_to_metaculus=False,
+            is_benchmarking=True,
+        )
+        question = make_real_binary_question(qid=7407, close_time=datetime(2024, 6, 1, tzinfo=timezone.utc))
+        predictions = [
+            ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nbacktest"),
+            ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nbacktest"),
+            ReasonedPrediction(prediction_value=0.31, reasoning="Model: m3\n\nbacktest"),
+        ]
+        seen_budgets = []
+
+        async def capture_research(_question, time_budget=None):
+            await asyncio.sleep(0)
+            seen_budgets.append(time_budget)
+            return "Canned research"
+
+        with (
+            patch.object(bot, "_get_notepad") as notepad,
+            patch.object(bot, "run_research", new=capture_research),
+            patch.object(
+                bot, "_gather_predictions_with_wall_clock", new=gather_predictions_stub((predictions, [], None))
+            ),
+        ):
+            notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
+            result = await bot._research_and_make_predictions(question)
+
+        assert len(result.predictions) == 3
+        assert bot._questions_failed_to_publish == 0
+        assert bot._time_budget_fast_path_count == 0
+        (budget,) = seen_budgets
+        assert budget is not None
+        assert budget.total_s == PER_QUESTION_WALL_CLOCK_DEADLINE
+        # A past close must not even be recorded, or the marker line would imply it bound
+        # something on a run that never publishes.
+        assert budget.close_time is None
+        assert budget.close_limited is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.e2e
+    async def test_the_forecaster_fanout_is_cut_by_the_close_derived_deadline(self):
+        """The seam the whole feature rests on: the fan-out's ``asyncio.wait`` cap comes
+        from the budget, so a close-limited question cancels its stragglers seconds in
+        rather than at the 3510 s static deadline. Nothing here monkeypatches
+        ``PER_QUESTION_WALL_CLOCK_DEADLINE`` — with the static budget in charge the slow
+        forecasters would run to completion and the outer ``wait_for`` would fail the
+        test rather than let it hang."""
+        bot = make_e2e_bot(
+            AggregationStrategy.MEAN,
+            n_forecasters=3,
+            publish_reports_to_metaculus=True,
+            is_benchmarking=False,
+            min_forecasters_to_publish=1,
+        )
+        # Just over the publish reserve, so the budget is a fraction of a second.
+        question = make_real_binary_question(
+            qid=7404, close_time=datetime.now(timezone.utc) + timedelta(seconds=PUBLISH_RESERVE_SECONDS + 0.6)
+        )
+        started: list[int] = []
+
+        async def one_fast_two_hung(*_args, **_kwargs) -> ReasonedPrediction[PredictionTypes]:
+            started.append(1)
+            await asyncio.sleep(30 if len(started) > 1 else 0)
+            return ReasonedPrediction(prediction_value=0.31, reasoning="Model: m1\n\nbeat the close")
+
+        bot._forecaster_with_soft_deadline = one_fast_two_hung  # type: ignore[method-assign]
+
+        with (
+            patch.object(bot, "_get_notepad") as notepad,
+            patch.object(bot, "run_research", new=AsyncMock(return_value="Canned research")),
+        ):
+            notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
+            result = await asyncio.wait_for(bot._research_and_make_predictions(question), timeout=15)
+
+        assert len(result.predictions) == 1, "the one forecaster that beat the close still publishes"
+        assert bot._forecasters_dropped_count == 2
+        assert bot._time_budget_fast_path_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.e2e
+    async def test_every_question_logs_its_budget_marker_including_roomy_ones(self, caplog):
+        """``TIME_BUDGET`` is the uncensored denominator a later round needs.
+        ``CLOSE_MARGIN`` fires only after a successful submission, so it is censored on
+        exactly the thin-window questions this feature exists for — which is why the
+        marker has to be emitted for a roomy question too, not only when it bites."""
+        bot = self._bot()
+        predictions = [
+            ReasonedPrediction(prediction_value=0.30, reasoning="Model: m1\n\nresearch"),
+            ReasonedPrediction(prediction_value=0.32, reasoning="Model: m2\n\nresearch"),
+            ReasonedPrediction(prediction_value=0.31, reasoning="Model: m3\n\nresearch"),
+        ]
+        roomy = make_real_binary_question(qid=7405, close_time=datetime.now(timezone.utc) + timedelta(days=30))
+        thin = make_real_binary_question(qid=7406, close_time=datetime.now(timezone.utc) + timedelta(minutes=20))
+
+        with (
+            patch.object(bot, "_get_notepad") as notepad,
+            patch.object(bot, "run_research", new=AsyncMock(return_value="Canned research")),
+            patch.object(
+                bot, "_gather_predictions_with_wall_clock", new=gather_predictions_stub((predictions, [], None))
+            ),
+            caplog.at_level(logging.INFO, logger="metaculus_bot.forecaster"),
+        ):
+            notepad.return_value = Mock(total_research_reports_attempted=0, total_predictions_attempted=0)
+            await bot._research_and_make_predictions(roomy)
+            await bot._research_and_make_predictions(thin)
+
+        markers = [message for message in caplog.messages if message.startswith("TIME_BUDGET:")]
+        assert len(markers) == 2, caplog.messages
+        assert f"question=7405 budget_s={PER_QUESTION_WALL_CLOCK_DEADLINE} " in markers[0]
+        assert "close_limited=false fast_path=false" in markers[0]
+        assert "question=7406 " in markers[1]
+        assert "close_limited=true fast_path=true" in markers[1]

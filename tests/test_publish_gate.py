@@ -23,15 +23,30 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from forecasting_tools.data_models.binary_report import BinaryReport
-from forecasting_tools.data_models.questions import BinaryQuestion, QuestionState
+from forecasting_tools.data_models.multiple_choice_report import (
+    MultipleChoiceReport,
+    PredictedOption,
+    PredictedOptionList,
+)
+from forecasting_tools.data_models.numeric_report import NumericDistribution, NumericReport, Percentile
+from forecasting_tools.data_models.questions import (
+    BinaryQuestion,
+    MultipleChoiceQuestion,
+    NumericQuestion,
+    QuestionState,
+)
+from forecasting_tools.helpers import metaculus_client as _ft_metaculus_client
 
 from metaculus_bot import publish_gate, publish_hardening
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 
 _NOW = datetime(2026, 8, 3, 12, 5, 6, tzinfo=timezone.utc)
 _CLOSE = datetime(2026, 8, 3, 12, 0, 0, tzinfo=timezone.utc)
+_DECLARED_VALUES = [5, 8, 12, 18, 28, 42, 50, 58, 72, 82, 88, 92, 96]
 
 
 def _question(
@@ -48,6 +63,52 @@ def _question(
         open_time=datetime(2026, 8, 3, 11, 0, 0, tzinfo=timezone.utc),
         state=state,
     )
+
+
+def _publishable_reports() -> list[BinaryReport | NumericReport | MultipleChoiceReport]:
+    """One real report per published question type, ready to drive ft's own publish body.
+
+    Each type publishes through its OWN method, so an ordering check that covers only
+    one of them leaves the other two free to drift.
+    """
+    numeric_question = NumericQuestion(
+        question_text="How many?",
+        id_of_question=102,
+        id_of_post=102,
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        zero_point=None,
+        unit_of_measure="units",
+        cdf_size=201,
+    )
+    declared = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, _DECLARED_VALUES, strict=True)]
+    mc_question = MultipleChoiceQuestion(
+        question_text="Which?",
+        id_of_question=103,
+        id_of_post=103,
+        options=["A", "B", "C"],
+    )
+    return [
+        BinaryReport(question=_question(close_time=_NOW + timedelta(days=1)), prediction=0.5, explanation="# pin"),
+        NumericReport(
+            question=numeric_question,
+            prediction=NumericDistribution.from_question(declared, numeric_question),
+            explanation="# pin",
+        ),
+        MultipleChoiceReport(
+            question=mc_question,
+            prediction=PredictedOptionList(
+                predicted_options=[
+                    PredictedOption(option_name="A", probability=0.5),
+                    PredictedOption(option_name="B", probability=0.3),
+                    PredictedOption(option_name="C", probability=0.2),
+                ]
+            ),
+            explanation="# pin",
+        ),
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -236,6 +297,48 @@ class TestGateRidesTheRealPublishSeam:
                     publish_hardening._PUBLISH_METHOD,
                     report_type.__dict__[publish_hardening._PUBLISH_METHOD],
                 )
+
+    @pytest.mark.asyncio
+    async def test_the_prediction_posts_before_the_comment_on_every_report_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ft-side assumption ``PUBLISH_RESERVE_SECONDS`` is sized on.
+
+        The reserve holds back 60 s for the publish — one POST, deliberately less than
+        ``WALL_CLOCK_STACKING_MIN_BUDGET``'s 90 s, which covers both — because only the
+        PREDICTION has to beat the close; a comment a few seconds late is still accepted.
+        That was established by reading ft's three report bodies, not by a test. Reorder
+        them and the reserve gets spent on the comment while the forecast takes the 405
+        this whole feature exists to prevent, with nothing going red. Driven against ft's
+        unwrapped coroutine so the pin is on ft's body, not on our own layers.
+        """
+        monkeypatch.setenv("METACULUS_TOKEN", "test-token")
+        # ft sleeps 3.5-4.5s before each POST; irrelevant to the ordering invariant.
+        monkeypatch.setattr("forecasting_tools.helpers.metaculus_client.time.sleep", lambda *_: None)
+        posted_urls: list[str] = []
+
+        def capturing_post(*args: Any, **kwargs: Any) -> Any:
+            posted_urls.append(str(args[0] if args else kwargs.get("url", "")))
+            response = MagicMock()
+            response.status_code = 200
+            response.raise_for_status.return_value = None
+            response.json.return_value = {}
+            return response
+
+        monkeypatch.setattr(_ft_metaculus_client.requests, "post", capturing_post)
+
+        for report in _publishable_reports():
+            posted_urls.clear()
+            raw = type(report).__dict__[publish_hardening._PUBLISH_METHOD]
+            ft_publish = getattr(raw, "__wrapped__", raw)  # strip our offload if installed
+            await ft_publish(report)
+
+            assert len(posted_urls) == 2, f"{type(report).__name__}: expected prediction + comment, got {posted_urls}"
+            assert posted_urls[0].endswith("/questions/forecast/"), (
+                f"{type(report).__name__} no longer POSTs the prediction FIRST: {posted_urls}. "
+                "PUBLISH_RESERVE_SECONDS reserves for one POST on the assumption that it is the prediction's"
+            )
+            assert posted_urls[1].endswith("/comments/create/"), posted_urls
 
     @pytest.mark.asyncio
     async def test_a_skip_does_not_stop_the_next_question(self, offloaded_publish: list[Any]) -> None:

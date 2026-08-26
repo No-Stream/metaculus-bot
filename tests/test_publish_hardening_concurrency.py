@@ -25,6 +25,7 @@ the same time — the two ways the hardening's own machinery leaked into its nei
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,11 +45,24 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot import publish_hardening
 from metaculus_bot.constants import PUBLISH_POST_RETRIES
+from scripts.telemetry.markers import parse_log_text
 
 # A real Metaculus publish URL: the forced-timeout override is scoped to the Metaculus
 # host on purpose (metaculus_client.requests IS the global requests module, so an
 # unscoped permanent patch would re-time every other POST in the process).
 _METACULUS_POST_URL = "https://www.metaculus.com/api/questions/forecast/"
+
+# One GHA-shaped log line's prefix plus the harvest metadata, so a WARN this module
+# actually emitted can be run through the real telemetry parser (the run logs the
+# archive harvests are the workflow's `python | tee` output, not caplog's messages).
+_LOG_PREFIX = "2026-08-03 12:05:06,123 - metaculus_bot.publish_hardening - WARNING - "
+_HARVEST_META = {
+    "run_id": "999",
+    "workflow": "tournament",
+    "artifact": "research-999",
+    "run_date": "2026-08-03T12:00:00Z",
+    "log_file": "run.log",
+}
 
 
 @pytest.fixture
@@ -439,3 +453,56 @@ class TestNonRetryable4xxIsNotRetried:
         echoed = requests.HTTPError('Response text: {"flagged_input":"will the index close above 405 by June"}')
         assert publish_hardening._http_status_code(echoed) is None
         assert publish_hardening._is_retryable(echoed) is True
+
+    def test_the_forgone_retry_logs_a_line_the_harvester_ignores(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Emitter half of the telemetry pin. The publish_hardening MarkerSpec is
+        anchored on the ``attempt N/M`` shape, so this second WARN deliberately carries
+        no such clause — appending the text to the attempt line instead would have
+        stopped EVERY publish failure from harvesting. test_telemetry_markers pins the
+        harvester against a hand-written literal; this drives the real emitter, so the
+        two cannot drift apart without a test going red."""
+
+        def always_405(*_args: Any, **_kwargs: Any) -> None:
+            raise self._ft_style_error(405)
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("_post_question_prediction", always_405)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
+                with pytest.raises(requests.HTTPError):
+                    wrapped()
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+        forgone = [message for message in caplog.messages if "not retrying" in message]
+        assert len(forgone) == 1, caplog.messages
+        assert forgone[0] == (
+            "PUBLISH_HARDENING: _post_question_prediction not retrying status 405 "
+            "— a second identical POST cannot succeed"
+        )
+        harvested = parse_log_text(f"{_LOG_PREFIX}{forgone[0]}\n", **_HARVEST_META)
+        assert harvested["publish_hardening"] == [], (
+            "the forgone-retry WARN must not harvest as a publish attempt — it carries no attempt N/M clause"
+        )
+        # The attempt WARN that DOES carry the clause still harvests, so the exclusion
+        # above is about this line's shape rather than a broken spec.
+        attempt = [message for message in caplog.messages if "attempt 1/" in message]
+        assert len(attempt) == 1, caplog.messages
+        assert parse_log_text(f"{_LOG_PREFIX}{attempt[0]}\n", **_HARVEST_META)["publish_hardening"] != []
+
+    def test_a_retried_status_logs_no_forgone_retry_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The line is emitted only where a retry was actually given up; on a 429 (and on
+        # the final attempt of anything) saying "not retrying" would be noise or a lie.
+        def always_429(*_args: Any, **_kwargs: Any) -> None:
+            raise self._ft_style_error(429)
+
+        wrapped = publish_hardening._wrap_with_timeout_retry("post_question_comment", always_429)
+        publish_hardening.reset_publish_attempt_failures()
+        try:
+            with caplog.at_level(logging.WARNING, logger="metaculus_bot.publish_hardening"):
+                with pytest.raises(requests.HTTPError):
+                    wrapped()
+        finally:
+            publish_hardening.reset_publish_attempt_failures()
+
+        assert not any("not retrying" in message for message in caplog.messages), caplog.messages
