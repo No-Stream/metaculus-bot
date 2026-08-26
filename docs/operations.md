@@ -801,6 +801,17 @@ broke", and the two are only distinguishable from an artifact record or from the
 `MARKET_RANKING:` line's `outcome=` field. No code change: the header-scan
 reconstruction is lossy by construction and always was.
 
+`outcome=` alone does not say WHY a question fell back, so read the sibling
+`MARKET_RANKING_DEGRADED:` line beside it: `reason=shape_regression` means a
+well-formed but non-empty ranking array yielded no usable row — a renamed index key,
+or every index outside the pool — i.e. OUR prompt/parser contract broke, and before
+2026-08-25 that case was reported as `ok(0)` and rendered the deliberate-empty
+sentence ("prediction markets were retrieved and reviewed… none was judged to bear on
+it") to forecasters. `reason=unreadable` means the completion was not a ranking array
+at all. Both are harvested as `market_ranking_degraded`, so the split survives the
+90-day GHA log expiry; a `MARKET_RANKING` line with `outcome=failopen` and no
+degraded sibling in the archive predates this marker.
+
 A run can also exit non-zero for degradation alerts — the counters above,
 personal-key fallbacks, or the model-deprecation tripwire — even when every
 question that met the minimum-forecaster threshold was published. The non-zero

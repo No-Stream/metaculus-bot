@@ -109,6 +109,16 @@ and cross-list URL deduplication (`_format_asknews_dual_sections`,
 `m.` mobile subdomains, `/amp` suffixes, fragments) so the same story from two
 feeds collapses to one entry.
 
+**Both phases empty returns `""`, not a "No articles were found" sentence.** That
+sentence defeated every downstream empty guard at once: the orchestrator's
+`has_output` check saw chars>0 and reported `ok`, the summarizer (whose prompt has
+no no-data escape) was handed the sentence as its article set, and the resulting
+briefing rendered under the AskNews header as though it were research. The
+formatter now logs `ASKNEWS_NO_ARTICLES`, records an `articles: empty(no_articles)`
+source loss so the diagnostics line reads `empty | 0 chars | lost=articles:...`
+rather than a bare `empty`, and the orchestrator skips the summarizer call
+entirely. Gemini's grounded-chunk floor is the same pattern one provider over.
+
 The raw pre-summarization article markdown is captured separately and archived
 (the `asknews_raw` field) so a later audit can replay the summarizer or attribute
 a bad briefing to fetch-vs-summarize without paying for a fresh AskNews pull.
@@ -201,6 +211,16 @@ response's grounding metadata, plus a `### Sources` list
 *successful* fetches are surfaced to forecasters (a "fired but fetched nothing"
 run collapses to a terse `_url_context: none_` marker rather than pushing dead
 URLs at the model).
+
+**Grounded-chunk floor.** A response with no grounding evidence at all — zero
+`google_search` chunks AND no successful `url_context` read — is suppressed
+(returns `""`, logs `GEMINI_UNGROUNDED_SUPPRESSED`, records a
+`grounding: error(ungrounded_suppressed)` loss token) rather than passed through:
+ungrounded Gemini text is a demonstrated fabrication vector (Q38195, 2026-07-19 —
+30 search queries, 0 grounding chunks, a confident fabricated contract table with
+fake `[primary]` tags reached forecasters). "No grounding evidence" includes a
+response carrying no candidates at all; that case used to return its text via an
+early exit that walked straight past this floor. There is now no path around it.
 
 This provider uses the operator's personal `GOOGLE_API_KEY` (a paid-tier Google
 AI Studio key). There is no Metaculus-donated key on the google-genai side — the
@@ -366,10 +386,22 @@ connect-time `FilteringResolver` (the actual DNS-rebinding boundary, not the
 preflight) re-checks every resolved IP. Redirects are followed manually under the
 `MAX_REDIRECTS` hop cap (`research/http_fetch.py`, shared with the v2 agentic
 tools), re-guarding each `Location`. Per-URL truncation appends a
-`[truncated at N chars — full source at URL]` marker, and the section formatter
-appends `[N additional source(s) omitted — section budget]` when later sections
-are dropped for length. Unfetchable pages (`blocked` / `js_wall`) are retained in
-the per-URL `FetchStatus` as the seam for a future Tier-2 LLM-driven fetch pass.
+`[truncated at N chars — full source at URL]` marker, the aggregate section-budget
+trim routes through the same marker-emitting truncator (a bare slice could cut
+mid-sentence and eat that marker, so an already-truncated page rendered as
+complete), and the formatter appends `[N additional source(s) omitted — section
+budget]` when later sections are dropped for length.
+
+The per-URL `FetchStatus` distinguishes two kinds of non-success, and only one is a
+seam. `blocked` / `js_wall` are pages we could not READ, and they remain the target
+of a future Tier-2 LLM-driven fetch pass. `empty_body` (a 200 whose body is empty or
+whitespace-only) and `unsupported_type` (including a body whose declared charset
+decodes to mojibake) are bodies that carried no information — refusals rather than
+seams, because there is nothing on the other side to fetch harder. Both exist
+because `status="success"` has to mean CONTENT: as `success`, an empty body rendered
+an empty section under the "primary grading evidence" caveat, suppressed the
+"resolving page was unreachable" notice for every sibling URL, and reported `ok` to
+provider diagnostics.
 
 Like prediction markets, it is **hard-disabled under benchmarking** (current page
 content post-dates any backtest window).

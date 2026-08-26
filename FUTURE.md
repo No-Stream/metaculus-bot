@@ -806,6 +806,38 @@ question at ~41 ranked-era resolutions (late September / early October), not ~09
    right; a material rate on books that later traded near their midpoint means it is blanking
    real prices and should come down.
 
+### Sentinel-value sweep leftovers: three deliberate deferrals (added 2026-08-26)
+
+The 2026-08-25/26 sentinel-value work (`scratch/residual_2026-08-24/sentinel_value_audit.md`)
+closed all 7 HIGH findings, the MEDs and every LOW. Three items were deferred ON PURPOSE, each
+because the honest fix is a new decision rather than a correction:
+
+1. **A confident DISCRETE point mass is now WITHHELD, and building the spike is the faithful
+   third option.** `sanitize_percentiles` no longer cluster-spreads a whole-set epsilon collapse,
+   so a model declaring "the count will be exactly 3" at all 13 percentiles reaches the
+   unit-mismatch guard with a zero span and is dropped. That is right relative to what it
+   replaced (a fabricated ±6-unit hedge nobody stated, whose invented width was exactly what let
+   it pass the guard), but a spike CDF IS expressible: `grid_step_constraints` relaxes the max
+   step to 1.0 on a coarse discrete grid. Prod incidence was unmeasurable before — the old
+   `Cluster spread applied` WARN was never harvested — and now is: watch
+   `numeric_degenerate_declaration` in the telemetry archive, and revisit if it fires on real
+   forecasts. Building the spike means deciding what mass a "point mass" declaration deserves
+   at the neighbouring integers, which is a modelling choice, not a bug fix.
+2. **The ft-fallback numeric builder is unavailable on log-scaled questions.** On a `zero_point`
+   question, upstream's `get_cdf()` can itself raise on a float-epsilon overshoot of 1.0, so
+   `create_fallback_numeric_distribution` cannot rescue exactly the question shape where PCHIP is
+   most likely to have failed. It fails FAST (the forecaster drops, attributed), so it is a lost
+   forecast rather than a fabricated one — which is why it was left. Fixing it means reaching
+   into forecasting-tools' builder; note is at the function's docstring.
+3. **Tier-1 resolution-source content quality still has only a length floor.** `success` now
+   requires non-vacuous content (empty body, mojibake, and non-row-shaped datasets are refused),
+   but a soft-404 template or cookie/paywall boilerplate served as HTTP 200 with >100 chars still
+   renders as the resolution source. The audit proposes a negative-phrase check near the start of
+   extracted text. Deferred as a new HEURISTIC with real false-positive risk: "no data available
+   for this date" is legitimate text on plenty of genuine resolution pages, and a wrong reject
+   costs the cited source outright. Forecasters can usually tell from the rendered text; the
+   diagnostics side cannot, which is the actual gap to close.
+
 ### Deterministic tail-consistency check on the numeric structured block (added 2026-08-24)
 
 From the q44453 dossier (July payrolls, peer −11.24; the whole field missed the −23k print, so the
