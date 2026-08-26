@@ -10,10 +10,13 @@ The `market_row` helper these use lives in `tests/market_retrieval_fakes.py`.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from metaculus_bot.research.market_retrieval.ranking import DEGRADED_RANKING_MARKER
 from metaculus_bot.research.market_retrieval.rendering import TABLE_COLUMNS
+from metaculus_bot.research.market_retrieval.types import MarketChild, MarketMatch
 from metaculus_bot.research.prediction_market import MarketSnapshot, _liquidity_label, format_snapshot_for_research
 from tests.market_retrieval_fakes import market_row as _row
 
@@ -120,3 +123,79 @@ class TestFormatterDelegate:
         row.open_interest = None
         row.num_bettors = num_bettors
         assert _liquidity_label(row) == expected
+
+
+class TestChildRenderMarker:
+    """``MARKET_CHILD_RENDER``: emitted by the seam, beside its ``MARKET_RANKING`` sibling.
+
+    The line is the post-ship instrument for the 2026-08-25 no-manufactured-price change: the Kalshi
+    no-price spread threshold is calibrated on eleven fixture strikes, so ``withheld=`` is how its prod
+    incidence becomes a query instead of a guess. It lives at the SEAM rather than in the renderer
+    because the renderer has no qid and no logger of its own, and the marker has to be keyed to a
+    question to be useful in the telemetry archive.
+    """
+
+    def _family(self, count: int) -> MarketMatch:
+        row = _row("A strike family", platform="kalshi")
+        row.implied_prob_yes = None
+        row.children = tuple(
+            MarketChild(title=f"rung {index}", implied_prob_yes=0.5 - 0.01 * index) for index in range(count)
+        )
+        return row
+
+    def test_the_marker_is_emitted_for_a_rendered_snapshot(self, caplog):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.prediction_market"):
+            format_snapshot_for_research(
+                MarketSnapshot(matches=[self._family(14)], sources={"ranking": "ok(1)"}), qid=45189
+            )
+
+        lines = [record.message for record in caplog.records if record.message.startswith("MARKET_CHILD_RENDER:")]
+        assert len(lines) == 1
+        assert "question=45189" in lines[0]
+        assert "families=1" in lines[0]
+        assert "outcomes=14" in lines[0]
+        assert "ladder_rows=1" in lines[0]
+
+    def test_the_marker_reports_withheld_prices(self, caplog):
+        """The field the whole marker exists for, on both places a price can be refused."""
+        family = self._family(4)
+        family.price_withheld = True
+        family.children = family.children + (
+            MarketChild(title="no book", quote_low=0.0, quote_high=1.0, price_withheld=True),
+        )
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.prediction_market"):
+            format_snapshot_for_research(MarketSnapshot(matches=[family], sources={"ranking": "ok(1)"}), qid=1)
+
+        line = next(r.message for r in caplog.records if r.message.startswith("MARKET_CHILD_RENDER:"))
+        assert "withheld=2" in line
+
+    def test_no_marker_when_nothing_renders(self, caplog):
+        """A snapshot that renders no table has no child accounting to report, and a line of zeroes
+        would dilute the field distributions the marker exists to measure."""
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.prediction_market"):
+            format_snapshot_for_research(MarketSnapshot(matches=[], sources={"ranking": "ok(0)"}, pool_size=381), qid=1)
+
+        assert not [r for r in caplog.records if r.message.startswith("MARKET_CHILD_RENDER:")]
+
+    def test_the_marker_has_no_spaces_inside_a_field(self, caplog):
+        """The harvester splits on whitespace, so a value carrying a space would shift every later
+        field into the wrong key."""
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.prediction_market"):
+            format_snapshot_for_research(MarketSnapshot(matches=[self._family(14)]), qid=None)
+
+        line = next(r.message for r in caplog.records if r.message.startswith("MARKET_CHILD_RENDER:"))
+        fields = line.removeprefix("MARKET_CHILD_RENDER: ").split(" ")
+        assert all(field.count("=") == 1 for field in fields), fields
+        assert [field.split("=")[0] for field in fields] == [
+            "question",
+            "families",
+            "full_rows",
+            "ladder_rows",
+            "outcomes",
+            "named",
+            "collapsed",
+            "withheld",
+            "max_stage",
+            "ladder_chars",
+        ]

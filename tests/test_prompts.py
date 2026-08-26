@@ -560,6 +560,17 @@ class TestPredictionMarketFraming:
         # rendered table's legend; what belongs in the prompt is the anchoring rule.
         assert "a market with several outcomes has no single price" in lowered
         assert "anchor on the outcome matching this question" in lowered
+        # And the rule that anchoring on ONE of those outcomes is not enough. A family of `↳` rows is
+        # a distribution over the market's own question, so reading one bracket as an equality
+        # constraint on a tail is a category error — which is exactly what q45189 cost: all three
+        # forecasters correctly identified the margin-vs-share mismatch on a ten-bracket Kalshi ladder,
+        # then each anchored on the single bracket the render had shown them and cut the resolving
+        # bucket below its own prior. The render change makes the whole ladder available; this sentence
+        # is what tells a forecaster to read it as a distribution.
+        assert "is a distribution over that market's own question" in lowered
+        assert "read the whole ladder" in lowered
+        assert "[remaining n]" in lowered, "the prompt must name the row the rest of the ladder lives on"
+        assert "never treat one outcome's price as an equality constraint" in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
         # The mis-scoped "you may deviate from a market" carve-out must NOT be present —

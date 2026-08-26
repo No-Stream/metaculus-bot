@@ -821,12 +821,36 @@ def _record_venue_health(
 # ---------------------------------------------------------------------------
 
 
-def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
+def _log_child_render_telemetry(qid: int | None, stats: rendering.ChildRenderStats) -> None:
+    """One INFO line per rendered snapshot, beside `MARKET_RANKING`.
+
+    `withheld` is why it exists: the Kalshi no-price spread threshold is calibrated on eleven fixture
+    strikes, so its prod incidence has to be a query rather than a guess, and the same field counts the
+    Polymarket placeholder legs and Manifold untouched priors the parsers now blank. `max_stage` and
+    `ladder_chars` say whether `LADDER_SECTION_MAX_CHARS` binds on real slates. `named` + `collapsed`
+    should always equal `outcomes` — that is the completeness invariant, so a line where they disagree
+    is a render bug rather than a tuning signal.
+
+    A SEPARATE marker rather than extra fields on `MARKET_RANKING`, because the harvester's
+    `market_ranking` regex is not end-anchored: a new line keeps `scripts/telemetry/markers.py` purely
+    additive instead of re-cutting a spec other tracks are editing this round.
+    """
+    logger.info(
+        f"MARKET_CHILD_RENDER: question={qid} families={stats.families} full_rows={stats.full_rows} "
+        f"ladder_rows={stats.ladder_rows} outcomes={stats.outcomes} named={stats.named} "
+        f"collapsed={stats.collapsed} withheld={stats.withheld} max_stage={stats.max_stage} "
+        f"ladder_chars={stats.ladder_chars}"
+    )
+
+
+def format_snapshot_for_research(snapshot: MarketSnapshot, *, qid: int | None = None) -> str:
     """The markdown block for the research bundle, or `""` when there is nothing to show.
 
-    A thin delegate to `rendering.render_snapshot`; the degraded-ranking marker is derived from
-    the snapshot's own `ranking` source token rather than passed in, so the render is
-    reproducible from an archived snapshot alone.
+    A thin delegate to `rendering.render_snapshot_with_stats`; the degraded-ranking marker is derived
+    from the snapshot's own `ranking` source token rather than passed in, so the render is
+    reproducible from an archived snapshot alone. `qid` is telemetry-only — it labels the
+    `MARKET_CHILD_RENDER` line and changes nothing about the text, so a caller replaying an archived
+    snapshot can omit it.
 
     One zero-row case renders a sentence instead of `""`: a ranker that reviewed a non-empty
     pool and deliberately kept nothing (`ranking: ok(0)` — the adaptive-width empty answer).
@@ -840,8 +864,11 @@ def format_snapshot_for_research(snapshot: MarketSnapshot) -> str:
     deliberate-zero question now records `prediction_market: ok` in the provider diagnostics
     rather than `empty`, which is the honest label — the provider did contribute a judgment.
     """
-    rendered = rendering.render_snapshot(snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", "")))
+    rendered, child_stats = rendering.render_snapshot_with_stats(
+        snapshot, ranking_degraded=is_lost_source(snapshot.sources.get("ranking", ""))
+    )
     if rendered:
+        _log_child_render_telemetry(qid, child_stats)
         return rendered
     if snapshot.sources.get("ranking") == "ok(0)" and snapshot.pool_size > 0:
         return rendering.render_no_relevant_market_line(snapshot.pool_size)
@@ -898,6 +925,6 @@ def prediction_market_provider(is_benchmarking: bool = False) -> ResearchCallabl
             provider="prediction_market",
             payload=snapshot,
         )
-        return format_snapshot_for_research(snapshot)
+        return format_snapshot_for_research(snapshot, qid=getattr(question, "id_of_question", None))
 
     return _fetch

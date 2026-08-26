@@ -27,6 +27,11 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
   ranker outcome, and every rendered row's ``venue:pool_index@rank``)
+* ``MARKET_CHILD_RENDER`` — ``metaculus_bot/research/prediction_market.py``
+  ``_log_child_render_telemetry`` (per-QUESTION multi-outcome child accounting:
+  how many outcomes were individually named versus collapsed into a counted
+  group, and ``withheld``, the count of venue-manufactured prices the parsers
+  refused — the field the Kalshi no-price spread threshold gets retuned on)
 * ``TS_ANCHOR_ROUTE``   — ``metaculus_bot/research/ts_routing.py`` ``route_question``
   (per-QUESTION timeseries-anchor routing decision: routed/skipped, the series
   involved, and the branch/reject step — the marker that made anchor coverage
@@ -287,6 +292,32 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"MARKET_RANKING:\s*question=(?P<question>\S+)\s+pool=(?P<pool>\S+)"
             r"\s+outcome=(?P<outcome>\S+)\s+rows=(?P<rows>\S+)"
             r"\s+prompt_chars=(?P<prompt_chars>\S+)\s+rendered=(?P<rendered>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "market_child_render",
+        # Per-question multi-outcome CHILD render accounting
+        # (research/prediction_market.py:_log_child_render_telemetry). A separate line rather than
+        # extra fields on `market_ranking`, because that regex is not end-anchored and a separate
+        # spec keeps this harvester change purely additive.
+        #
+        # Two fields carry the questions this exists to answer. `withheld` counts the prices the
+        # venue parsers REFUSED as manufactured — an empty Kalshi book, a Polymarket placeholder leg
+        # at Gamma's `["0.5","0.5"]` default, a Manifold answer at its untouched prior. The Kalshi
+        # half of that is gated on `KALSHI_NO_PRICE_SPREAD`, a threshold calibrated on eleven fixture
+        # strikes, so its prod incidence has to be a query rather than a guess. `max_stage` and
+        # `ladder_chars` say whether the ladder's section allowance binds on real slates (0 = every
+        # outcome named, 99 = the per-family hard bound).
+        #
+        # `named` + `collapsed` == `outcomes` is the completeness invariant the render guarantees, so
+        # a harvested line where those disagree is a render bug and not a tuning signal.
+        re.compile(
+            r"MARKET_CHILD_RENDER:\s*question=(?P<question>\S+)\s+families=(?P<families>\S+)"
+            r"\s+full_rows=(?P<full_rows>\S+)\s+ladder_rows=(?P<ladder_rows>\S+)"
+            r"\s+outcomes=(?P<outcomes>\S+)\s+named=(?P<named>\S+)"
+            r"\s+collapsed=(?P<collapsed>\S+)\s+withheld=(?P<withheld>\S+)"
+            r"\s+max_stage=(?P<max_stage>\S+)\s+ladder_chars=(?P<ladder_chars>\S+)"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # prediction_market.py emits question.id_of_question
     ),

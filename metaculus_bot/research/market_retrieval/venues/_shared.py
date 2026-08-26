@@ -21,22 +21,30 @@ RULES_TEXT_MAX_CHARS = 2000
 
 
 def child_render_order_key(child: MarketChild) -> tuple[bool, float]:
-    """ONE render-order rule for every venue's child outcomes: open first, then price-descending.
+    """The FULL-ROW presentation order for child outcomes: open first, then price-descending.
 
-    The renderer truncates a long child list from the end, so this order decides what survives
-    the budget. Open before settled because a settled rung's price is a realized outcome, not a
-    forecast — on a Manifold threshold ladder the crossed rungs settle to exactly 1.0 while the
-    market stays open, so price alone would front a block of ``1.00 RESOLVED`` rows and push
-    every rung still carrying uncertainty past the budget. Price-descending within each group
-    because the priced rungs are the market's answer, whatever traded: traded-size ordering let
-    near-zero-probability rungs with open interest evict the informative brackets (q45189: the
-    six omitted rungs held 0.365 of price mass, all on one side). A child with no live quote
-    sorts with the zero-priced rungs, so the priced rows are the ones that survive.
+    **It no longer decides what survives a budget, and nothing outside ``rendering`` may call it.**
+    That is the contract as of 2026-08-25, and it is what the whole ordering argument turned on. The
+    renderer used to truncate a family from the end, so a parser sorting its own children was
+    choosing which prices a forecaster would ever see — a presentation decision taken where it could
+    not see the budget it had to fit. It is also unanswerable as posed: on a mutually-exclusive
+    bracket family price-descending is right (the leaders are the mass), and on a cumulative
+    threshold ladder it is close to worst-possible (it fronts the deep in-the-money rungs at 0.99 and
+    cuts the crossing region). A 50-rung gold ladder rendered ``Above $3451.99 0.99 / Above $3771.99
+    0.99 / Above $3291.99 0.99`` under it. PredictIt refused to sort for exactly that reason and its
+    docstring said so; three venues sorting and one not was the tell.
 
-    Callers rely on Python's sort STABILITY: equal-priced (and quoteless) children keep the
-    venue's own order — Kalshi's threshold order, Gamma's array order, Manifold's answer order —
-    which is what keeps the render deterministic across runs. One definition here rather than
-    three per-venue lambdas, so a change to the ordering rule cannot land on two venues out of
-    three.
+    The renderer now names every remaining outcome in one ladder row, so nothing is dropped and this
+    key only chooses which outcomes keep a full sub-row's liquidity / close / status cells. Open
+    before settled because a settled rung's price is a realized outcome rather than a forecast — on a
+    Manifold threshold ladder the crossed rungs settle to exactly 1.0 while the market stays open, so
+    price alone would spend the full rows on the part of the ladder that is no longer a forecast.
+    Price-descending within each group because the priced rungs are the market's answer, whatever
+    traded. A child with no quote (including one whose manufactured default the venue refused) sorts
+    with the zero-priced rungs, so a real price always outranks an absent one.
+
+    Callers rely on Python's sort STABILITY: equal-priced (and quoteless) children keep the venue's
+    own catalogue order — Kalshi's threshold order, Gamma's array order, Manifold's answer order —
+    which is what keeps the render deterministic across runs.
     """
     return (child.is_resolved, -(child.implied_prob_yes or 0.0))

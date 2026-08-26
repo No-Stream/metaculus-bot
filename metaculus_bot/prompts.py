@@ -498,7 +498,13 @@ _MARKET_RELATION_WEIGHTING_SENTENCE = (
     "RESOLVED has already settled, so its price is a realized outcome rather than a forecast — read it as "
     "evidence about what happened, not as a probability. A market with several outcomes has no single price, so "
     "its own `prob` cell is blank and each outcome is listed beneath it on a `↳` row with its own price — anchor "
-    "on the outcome matching this question, and do not read the blank parent cell as a missing market."
+    "on the outcome matching this question, and do not read the blank parent cell as a missing market. "
+    "A market with several `↳` outcomes is a DISTRIBUTION over that market's own question, not a set of "
+    "independent facts: read the whole ladder (including the `↳ [remaining N]` row, which prices every "
+    "outcome not given a row of its own) and translate it into this question's outcome space. Never treat one "
+    "outcome's price as an equality constraint that fixes a tail — a single bracket of a ten-bracket ladder "
+    "constrains almost nothing on its own, and reading it that way has cut the resolving bucket below the "
+    "forecaster's own prior."
 )
 
 

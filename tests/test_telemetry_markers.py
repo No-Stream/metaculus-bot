@@ -109,6 +109,10 @@ MARKET_RANKING_RANKED_LINE = (
 MARKET_RANKING_EMPTY_LINE = (
     PFX + "MARKET_RANKING: question=44620 pool=0 outcome=empty rows=0 prompt_chars=0 rendered=none"
 )
+MARKET_CHILD_RENDER_LINE = (
+    PFX + "MARKET_CHILD_RENDER: question=45363 families=6 full_rows=14 ladder_rows=6 outcomes=158 "
+    "named=71 collapsed=87 withheld=3 max_stage=5 ladder_chars=1368"
+)
 MARKET_RANKING_FAILOPEN_LINE = (
     PFX + "MARKET_RANKING: question=None pool=4 outcome=failopen rows=2 prompt_chars=36412 "
     "rendered=polymarket:2@0,kalshi:0@1"
@@ -468,6 +472,44 @@ class TestMarketRanking:
         # in the archive rather than coercing into the index distribution as a 0.
         rec = _parse_one(MARKET_RANKING_UNTRACEABLE_INDEX_LINE)
         assert rec["rendered"] == "manifold:-1@0"
+
+
+class TestMarketChildRender:
+    """The multi-outcome render's own instrument, and the reason it is a SEPARATE marker.
+
+    `market_ranking`'s regex is not end-anchored, so appending fields to that line would have
+    re-cut a spec other work touches; a new marker keeps the harvester change purely additive.
+
+    `withheld` is what the line exists for. The Kalshi no-price spread threshold that blanks an
+    empty book is calibrated on eleven fixture strikes, so its prod incidence has to be a query
+    rather than a guess, and the same field counts the Polymarket placeholder legs and Manifold
+    untouched priors. Run logs leave GHA at 90 days, so an unharvested line is unanswerable later.
+    """
+
+    def test_the_fields_survive_harvesting(self):
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+        assert rec["marker"] == "market_child_render"
+        assert rec["families"] == 6
+        assert rec["full_rows"] == 14
+        assert rec["ladder_rows"] == 6
+        assert rec["outcomes"] == 158
+        assert rec["withheld"] == 3
+        assert rec["max_stage"] == 5
+        assert rec["ladder_chars"] == 1368
+
+    def test_the_completeness_invariant_is_checkable_from_the_archive(self):
+        """`named + collapsed == outcomes` is what the render guarantees, so a harvested line where
+        they disagree is a render bug rather than a tuning signal — which only works if both halves
+        reach the archive as numbers."""
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+
+        assert rec["named"] + rec["collapsed"] == rec["outcomes"]
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(MARKET_CHILD_RENDER_LINE)
+        # prediction_market.py emits question.id_of_question, matching its MARKET_RANKING sibling.
+        assert rec["qid"] == 45363
+        assert rec["qid_kind"] == "question_id"
 
 
 class TestTsAnchorRoute:

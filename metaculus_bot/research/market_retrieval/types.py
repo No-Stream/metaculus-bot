@@ -148,6 +148,23 @@ class MarketChild:
     children inherit the market's — every answer really does share one bettor pool, and inheriting
     it renders each child the same honest label as its parent instead of a false
     ``no-liquidity-data`` on a venue that does publish per-answer volume.
+
+    ADDITIVE-ONLY past ``close_time``, for the same reason ``MarketMatch`` is: ``raw_log`` archives
+    the whole snapshot through ``dataclasses.asdict``, under an envelope whose ``schema_version`` is
+    shared across every provider, so a removal or a reorder changes the archive with no version to
+    bump.
+
+    The last three fields are the 2026-08-25 no-manufactured-price change:
+
+    - ``quote_low`` / ``quote_high`` are the venue's own two-sided book, carried so a blanked price
+      can still say WHAT the book was. That distinguishes "nobody is quoting this rung"
+      (``0.00-1.00``) from "quoted, very wide" (``0.30-1.00``), which ``implied_prob_yes is None``
+      alone cannot. Only Kalshi publishes a per-strike book, so only Kalshi fills them.
+    - ``price_withheld`` marks a price this repo REFUSED because the venue manufactured it — a
+      Kalshi strike with no real book, a Polymarket placeholder leg at Gamma's ``["0.5","0.5"]``
+      default, a Manifold answer sitting at its untouched 0.5 prior with zero volume. Separate from
+      ``implied_prob_yes is None`` because the renderer and the telemetry both need to tell a refusal
+      from "the venue published no price at all", and the two look identical without it.
     """
 
     title: str
@@ -157,6 +174,9 @@ class MarketChild:
     num_bettors: int | None = None
     is_resolved: bool = False
     close_time: datetime | None = None
+    quote_low: float | None = None
+    quote_high: float | None = None
+    price_withheld: bool = False
 
 
 @dataclass
@@ -224,13 +244,20 @@ class MarketMatch:
     # view stays flat — a candidate line describes the parent alone and a pick costs one slot — so
     # this field is written by the venue parsers and read only by `rendering`.
     #
-    # ADAPTER ORDER IS THE RENDER ORDER, verbatim, exactly as the ranker's order is for parents: the
-    # renderer truncates a long list from the END, so each adapter orders by what its own venue
-    # makes worth keeping (open-first price-descending via `venues/_shared.child_render_order_key`
-    # on the three price-bearing venues, ballot order on PredictIt) and documents that choice. A
-    # row with children carries
-    # `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no single
-    # probability" a fact about the data rather than a rendering convention.
+    # THE VENUE'S OWN CATALOGUE ORDER, verbatim: Kalshi's threshold-ordered nested array, Gamma's
+    # event array, Manifold's answers array, PredictIt's ballot. Presentation belongs to `rendering`,
+    # which sorts a copy by `venues/_shared.child_render_order_key` for the full sub-rows and reads THIS
+    # order for the ladder row that names every remaining outcome. `rendering` is the only consumer of
+    # the order (`generation` writes the Manifold enrichment and reads nothing). A row with children
+    # carries `implied_prob_yes=None` on every venue — the invariant that makes "the parent has no
+    # single probability" a fact about the data rather than a rendering convention.
+    #
+    # ⚠ THE ARCHIVED ORDER CHANGES MEANING AT 2026-08-25, and there is no schema version to bump (the
+    # `raw_log` envelope's `schema_version` is shared across every provider). Records written BEFORE
+    # that date preserve the RENDER order the parser imposed — open-first price-descending on the three
+    # price-bearing venues, traded-size before `4e342da` — and records after it preserve the venue's
+    # CATALOGUE order. Any replay that reconstructs "what the forecaster saw" from the archive must key
+    # on the record's timestamp; a replay that re-sorts is comparing two different things.
     children: tuple[MarketChild, ...] = ()
     # A SCALAR market's traded value, on the only venue that has one (Manifold `PSEUDO_NUMERIC`).
     # Mutually exclusive with `implied_prob_yes` by construction in the venue parser, for the reason
@@ -238,6 +265,13 @@ class MarketMatch:
     # a scale position on a scalar one, and a row that carried both would put two incompatible
     # numbers in one `prob` cell. Empty on every other row and every other venue.
     scalar_estimate: ScalarEstimate | None = None
+    # Set when the venue DID publish a number for this row's own price and we refused it as
+    # manufactured — the single-strike Kalshi family whose one strike has no real book, or a
+    # single-market Polymarket event sitting at Gamma's `["0.5","0.5"]` default. `MarketChild`
+    # carries the same flag for the same reason (see its docstring): `implied_prob_yes is None`
+    # cannot distinguish a refusal from a venue that quotes nothing, and the `MARKET_CHILD_RENDER`
+    # marker has to count refusals to say how often the Kalshi spread threshold fires in prod.
+    price_withheld: bool = False
 
 
 @dataclass

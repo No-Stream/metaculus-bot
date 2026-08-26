@@ -130,13 +130,21 @@ class TestArchiveRoundTrip:
         """The sub-rows are where a multi-outcome market's prices live, so losing them in the archive
         would make residual analysis read every strike family, event and ballot as priceless — the
         exact blind spot the rendering change exists to end. A nested dataclass rather than plain
-        pairs, because a child carries seven fields; `asdict` walks it the way it walks
-        `SettlementSource`."""
+        pairs, because a child carries ten fields; `asdict` walks it the way it walks
+        `SettlementSource`.
+
+        The last three (`quote_low`, `quote_high`, `price_withheld`) are the 2026-08-25
+        no-manufactured-price change, and they are why the whole dict is asserted rather than a few
+        keys: `price_withheld` is what separates "this repo refused the venue's fabricated 0.50" from
+        "the venue quoted nothing", and an archive that lost it could not tell a future reader which
+        prices a forecaster actually saw.
+        """
         match = _positional_row()
         match.implied_prob_yes = None  # what a market with several outcomes publishes
         match.children = (
             MarketChild(title="Before Nov 1, 2026", implied_prob_yes=0.175, total_volume=45_000.0, close_time=_CLOSE),
             MarketChild(title="Before Jul 1, 2026", implied_prob_yes=0.031, is_resolved=True),
+            MarketChild(title="Before Jan 1, 2027", quote_low=0.0, quote_high=1.0, price_withheld=True),
         )
 
         as_dict = dataclasses.asdict(MarketSnapshot(matches=[match]))
@@ -154,8 +162,29 @@ class TestArchiveRoundTrip:
             # `json.dumps(default=...)` is only consulted for values the encoder cannot handle, so a
             # `None` close date encodes as JSON null while a real one goes through `str`.
             "close_time": None,
+            "quote_low": None,
+            "quote_high": None,
+            "price_withheld": False,
         }
         assert encoded["matches"][0]["children"][0]["close_time"].startswith("2026-08-31")
+        withheld = encoded["matches"][0]["children"][2]
+        assert (withheld["implied_prob_yes"], withheld["quote_low"], withheld["quote_high"]) == (None, 0.0, 1.0)
+        assert withheld["price_withheld"] is True
+
+    def test_a_withheld_parent_price_survives_asdict(self):
+        """The PARENT's own flag, on the single-strike-family case. Without it an archived row reading
+        `implied_prob_yes: null` with a two-sided `bid`/`ask` is indistinguishable from a venue that
+        published no price — and that row is exactly the one the Kalshi spread threshold is calibrated
+        against, so the archive has to be able to answer how often it fired."""
+        match = _positional_row()
+        match.implied_prob_yes = None
+        match.bid, match.ask = 0.0, 1.0
+        match.price_withheld = True
+
+        row = json.loads(json.dumps(dataclasses.asdict(MarketSnapshot(matches=[match])), default=str))["matches"][0]
+
+        assert row["price_withheld"] is True
+        assert (row["bid"], row["ask"]) == (0.0, 1.0), "the book is the evidence for the refusal"
 
     def test_a_scalar_estimate_survives_asdict_and_json_as_an_object(self):
         """A scalar market's value is its ONLY price — `implied_prob_yes` is empty on such a row by
