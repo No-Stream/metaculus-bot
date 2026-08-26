@@ -1,6 +1,7 @@
 """Tests for the financial data research provider (yfinance + FRED)."""
 
-from datetime import UTC, date, datetime
+import math
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import numpy as np
@@ -10,7 +11,7 @@ from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
 from metaculus_bot.research.financial_data import (
-    _PERIOD_ROW_OFFSETS,
+    _PERIOD_TARGET_STEPS,
     CLASSIFIER_PROMPT,
     FRED_LABELS,
     KNOWN_FRED_SERIES,
@@ -31,6 +32,7 @@ from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
     TRADING_DAYS_PER_YEAR,
     observed_periods_per_year,
+    stale_latest_age_days,
 )
 from metaculus_bot.research.ts_fetch import FetchError
 
@@ -48,7 +50,8 @@ def _make_q(text: str, resolution_criteria: str = "", fine_print: str = "") -> M
 
 # Fixed open_time used across the benchmarking date-ceiling tests. as_of derivation
 # under is_benchmarking pins to this, so the yfinance start/end and FRED ceiling are
-# both deterministic: end == open_time.date() + 1 day, start == open_time.date() - 365d.
+# both deterministic: end == open_time.date() + 1 day, start == open_time.date() minus
+# the FINANCIAL_YFINANCE_LOOKBACK_DAYS calendar window.
 _BENCH_OPEN_TIME = datetime(2026, 3, 15, 14, 30, tzinfo=UTC)
 
 
@@ -238,7 +241,7 @@ class TestAnnualizationBasis:
     """
 
     @staticmethod
-    def _fetch_with_history(close: pd.Series) -> str:
+    def _fetch_with_history(close: pd.Series, **kwargs) -> str:
         history = pd.DataFrame(
             {"Close": close, "Open": close * 0.99, "High": close * 1.01, "Low": close * 0.98},
             index=close.index,
@@ -248,7 +251,7 @@ class TestAnnualizationBasis:
         mock_ticker_instance.info = {"shortName": "Test Asset"}
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker_instance
-            return _fetch_yfinance_data("TEST")
+            return _fetch_yfinance_data("TEST", **kwargs)
 
     @staticmethod
     def _line_value(markdown: str, prefix: str) -> str:
@@ -295,14 +298,15 @@ class TestAnnualizationBasis:
         assert self._line_value(result, "- 52-week range").endswith(f"{close.iloc[-300]:.2f}")
 
     def test_the_production_fetch_window_still_renders_the_1y_row(self):
-        """The boundary the lookback constant exists to clear: the 1y offset needs STRICTLY MORE
-        rows than 365 (`close.iloc[-(days + 1)]`), and a 24/7 series prints ~one bar per calendar
-        day of the fetch window — so at a 365-day window the 1y row silently vanished from
-        exactly the crypto snapshots the calendar-basis fix targets. Built at the production
-        frame size so a future trim of the constant back to 365 fails here, not in prod."""
-        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS > 365, "the 1y offset needs at least 366 bars"
+        """The boundary the lookback constant exists to clear: the 1y lookup needs an
+        observation at least 365 days back, and the fetch window is what supplies it.
+        Built WINDOW-shaped — an end-inclusive span of LOOKBACK+1 calendar dates, exactly
+        what the start-date fetch returns for a gap-free 24/7 series — so a future trim
+        of the constant fails here, not in prod. (The old version built `periods=LOOKBACK`
+        ROWS, silently encoding the gap-free bar-count assumption this replaced.)"""
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS > 365, "the 1y lookup needs a >365-day window"
         rng = np.random.default_rng(7)
-        n_rows = FINANCIAL_YFINANCE_LOOKBACK_DAYS
+        n_rows = FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1  # end-inclusive window, one bar per date
         dates = pd.date_range(end="2026-07-31", periods=n_rows, freq="D")
         close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, n_rows))), index=dates)
         assert observed_periods_per_year(close.index) == 365
@@ -312,12 +316,65 @@ class TestAnnualizationBasis:
         expected_1y = (close.iloc[-1] / close.iloc[-366] - 1) * 100
         assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
 
+    def test_one_more_closure_than_worst_observed_density_keeps_the_1y_row(self):
+        """The listed-asset margin that measured EXACTLY ZERO under the old sizing: real
+        SPY windows bottomed out at 253 bars per 373-date window, so one more unscheduled
+        closure (a mourning-day, a Sandy) left 252 bars — and the old row-offset 1y lookup
+        (needs strictly more than 252 rows) silently dropped the row. The date-based
+        lookup reads the window's SPAN, so the same frame keeps its 1y return."""
+        end = pd.Timestamp("2026-08-21")  # a Friday, like a normal trading day
+        idx = pd.bdate_range(start=end - pd.Timedelta(days=372), end=end)
+        n_closures = len(idx) - 252
+        assert n_closures > 0
+        closed = np.linspace(30, len(idx) - 30, n_closures).astype(int)
+        idx = idx[np.setdiff1d(np.arange(len(idx)), closed)]
+        assert len(idx) == 252, "worst observed density plus one extra closure"
+        rng = np.random.default_rng(11)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 252))), index=idx)
+        assert observed_periods_per_year(close.index) == 252
+
+        result = self._fetch_with_history(close)
+
+        assert "- 1y" in result, "the 1y row must render off the window SPAN, not the bar count"
+
+    def test_scattered_crypto_gaps_keep_the_1y_row(self):
+        """Yahoo data holes on a 24/7 series subtract rows instead of extending the window
+        (a persistent one-day BTC-USD hole was observed live). Thirty scattered holes take
+        a full production window to 361 rows — under the old 366-row requirement, which
+        dropped the 1y row; the date-based lookup still finds the year-ago observation."""
+        window_dates = FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1
+        idx = pd.date_range(end="2026-08-21", periods=window_dates, freq="D")
+        holes = np.linspace(30, window_dates - 11, 30).astype(int)
+        idx = idx[np.setdiff1d(np.arange(window_dates), holes)]
+        assert len(idx) == window_dates - 30
+        assert len(idx) < 366, "the fixture must be thinner than the old row requirement"
+        rng = np.random.default_rng(13)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, len(idx)))), index=idx)
+        assert observed_periods_per_year(close.index) == 365
+
+        result = self._fetch_with_history(close)
+
+        assert "- 1y" in result
+
+    def test_lookback_constant_covers_both_bases_with_headroom(self):
+        """Both binding constraints, so no future trim can under-size either basis: the
+        365 basis needs 366 rows plus gap headroom; the 252 basis needs 253 bars plus a
+        week of closures, converted at the trading-day density. The old 372 passed the
+        first and cleared the second by arithmetic accident (margin zero on real
+        windows)."""
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= 365 + 14
+        assert FINANCIAL_YFINANCE_LOOKBACK_DAYS >= math.ceil((252 + 7) * 365.25 / 252)
+        # Documented crypto tolerance: end-inclusive window dates minus the 366 rows the
+        # 1y lookup wants on a gap-free frame.
+        assert (FINANCIAL_YFINANCE_LOOKBACK_DAYS + 1) - 366 >= 24
+
     def test_the_two_offset_tables_are_the_documented_conventions(self):
         # The tables ARE the behavior: every period-return label on every financial snapshot is
         # only a true calendar period because of these numbers. Pinned verbatim so an edit is a
-        # deliberate act — the 252 row is the trading-day convention (5/wk), the 365 row is plain
-        # calendar days, and swapping one number silently mislabels one snapshot family.
-        assert _PERIOD_ROW_OFFSETS[TRADING_DAYS_PER_YEAR] == [
+        # deliberate act — the 252 row counts business days (the trading-day convention, 5/wk),
+        # the 365 row plain calendar days, each resolved to a target DATE and matched
+        # at-or-before; swapping one number silently mislabels one snapshot family.
+        assert _PERIOD_TARGET_STEPS[TRADING_DAYS_PER_YEAR] == [
             ("1d", 1),
             ("1w", 5),
             ("1m", 21),
@@ -325,7 +382,7 @@ class TestAnnualizationBasis:
             ("6m", 126),
             ("1y", 252),
         ]
-        assert _PERIOD_ROW_OFFSETS[CALENDAR_DAYS_PER_YEAR] == [
+        assert _PERIOD_TARGET_STEPS[CALENDAR_DAYS_PER_YEAR] == [
             ("1d", 1),
             ("1w", 7),
             ("1m", 30),
@@ -333,14 +390,18 @@ class TestAnnualizationBasis:
             ("6m", 182),
             ("1y", 365),
         ]
-        assert set(_PERIOD_ROW_OFFSETS) == {TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR}
+        assert set(_PERIOD_TARGET_STEPS) == {TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR}
 
     @pytest.mark.parametrize("basis", [TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR])
     def test_every_period_row_reads_its_bases_own_offset(self, basis: int):
         # The two bases are pinned end-to-end above only on 1w/1y; walk ALL six labels so a
         # mis-keyed intermediate offset (3m reading 63 rows on a 24/7 series = 9 calendar weeks
         # under a "3m" label) can't hide between the two tested ones. Table-driven, so a new
-        # period label is covered the moment it lands.
+        # period label is covered the moment it lands. On a GAP-FREE index the date-based
+        # lookup must land on exactly the row the historical offsets read — the expected
+        # values below are computed via those row offsets, so this test IS the proof that
+        # the date-based rewrite left gap-free numbers unchanged, and the marker asserts at
+        # the bottom pin the delta to purely additive (no span disclosures, no staleness).
         rng = np.random.default_rng(3)
         # Enough rows for the longest offset plus the strictly-more-rows requirement, on an index
         # whose observed density lands the series on the basis under test.
@@ -352,11 +413,16 @@ class TestAnnualizationBasis:
         close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(index)))), index=index)
         assert observed_periods_per_year(close.index) == basis
 
-        result = self._fetch_with_history(close)
+        # as_of one day past the last bar: fresh enough that no staleness note can fire,
+        # not the bar's own date so no partial-bar marker fires.
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
 
-        for label, offset in _PERIOD_ROW_OFFSETS[basis]:
+        for label, offset in _PERIOD_TARGET_STEPS[basis]:
             expected = (close.iloc[-1] / close.iloc[-(offset + 1)] - 1) * 100
             assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", (basis, label)
+        assert "(actual" not in result, "gap-free series must not disclose spans"
+        assert "⚠" not in result, "a fresh latest must not read as stale"
+        assert "in progress" not in result
 
     def test_short_series_degrades_to_trading_day_basis(self):
         dates = pd.date_range(end="2026-07-31", periods=10, freq="D")
@@ -364,7 +430,7 @@ class TestAnnualizationBasis:
         assert observed_periods_per_year(close.index) == 252
         # And the full fetch still renders (no vol line under 30 rows, no crash).
         result = self._fetch_with_history(close)
-        assert "- Current price:" in result
+        assert "- Latest price:" in result
         assert "volatility" not in result
 
     def test_non_datetime_index_degrades_to_trading_day_basis(self):
@@ -375,6 +441,128 @@ class TestAnnualizationBasis:
         dates = pd.DatetimeIndex(["2026-07-31"] * 50)
         close = pd.Series(np.linspace(100.0, 110.0, 50), index=dates)
         assert observed_periods_per_year(close.index) == 252
+
+
+class TestDatedLatestAndStaleness:
+    """Every rendered "latest" carries its observation date, a still-forming bar says so,
+    and a latest older than the series' own cadence allows is flagged as stale.
+
+    The undated "Current price" read as live even when Yahoo's newest bar was days old:
+    a weekend Friday close, or a null-close consolidation hole silently dropped from the
+    frame by yfinance's keepna=False default — indistinguishable to the reader either way.
+    """
+
+    _fetch_with_history = staticmethod(TestAnnualizationBasis._fetch_with_history)
+    _line_value = staticmethod(TestAnnualizationBasis._line_value)
+
+    @staticmethod
+    def _daily_series(end: str, n: int = 366, freq: str = "D") -> pd.Series:
+        rng = np.random.default_rng(5)
+        dates = pd.date_range(end=end, periods=n, freq=freq)
+        return pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, n))), index=dates)
+
+    def test_latest_price_line_carries_its_observation_date(self):
+        close = self._daily_series("2026-08-24")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 25, 12, 0, tzinfo=UTC))
+        assert "- Latest price:" in result
+        assert "(as of 2026-08-24)" in self._line_value(result, "- Latest price")
+
+    def test_todays_bar_is_marked_in_progress(self):
+        close = self._daily_series("2026-08-26")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "(as of 2026-08-26) — today's bar, in progress" in result
+
+    def test_a_completed_bar_carries_no_in_progress_marker(self):
+        close = self._daily_series("2026-08-25")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "in progress" not in result
+
+    def test_benchmarking_never_marks_in_progress(self):
+        # Under a backtest the as_of-dated bar is a COMPLETED historical bar fetched
+        # later; calling it in-progress would be false.
+        close = self._daily_series("2026-08-26")
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC), is_benchmarking=True)
+        assert "(as of 2026-08-26)" in result
+        assert "in progress" not in result
+
+    def test_stale_calendar_basis_latest_is_flagged_and_warned(self, caplog: pytest.LogCaptureFixture):
+        # A 24/7 series should print a bar every date; a 3-day-old latest is beyond the
+        # 1-step + 1-grace-day allowance and must be flagged in render AND run logs.
+        close = self._daily_series("2026-08-23")
+        with caplog.at_level("WARNING"):
+            result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 4, 52, tzinfo=UTC))
+        assert "⚠ Latest observation is 3 days old" in result
+        assert "FINANCIAL_STALE_LATEST: surface=financial_data symbol=TEST age_d=3 cadence=calendar-day" in caplog.text
+
+    def test_weekend_friday_close_on_trading_basis_stays_silent(self):
+        # Friday close read on Sunday is 2 days old — routine on the 252 basis (the
+        # allowance absorbs a weekend plus a holiday), so no flag and no WARN.
+        rng = np.random.default_rng(5)
+        dates = pd.bdate_range(end="2026-08-21", periods=300)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, 300))), index=dates)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 23, 12, 0, tzinfo=UTC))
+        assert "⚠" not in result
+
+    def test_stale_helper_thresholds_per_basis(self):
+        # The shared helper's exact boundaries: >2 days on the 365 basis, >4 on the 252.
+        as_of = date(2026, 8, 26)
+        assert stale_latest_age_days(date(2026, 8, 24), as_of, CALENDAR_DAYS_PER_YEAR) is None
+        assert stale_latest_age_days(date(2026, 8, 23), as_of, CALENDAR_DAYS_PER_YEAR) == 3
+        assert stale_latest_age_days(date(2026, 8, 22), as_of, TRADING_DAYS_PER_YEAR) is None
+        assert stale_latest_age_days(date(2026, 8, 21), as_of, TRADING_DAYS_PER_YEAR) == 5
+
+
+class TestDateBasedPeriodReturns:
+    """Period returns look up their start value by DATE (at-or-before the label's target),
+    so a gapped index cannot shift every row by the hole count.
+
+    The row-offset arithmetic this replaced rendered a "1d" return spanning 53 hours when
+    Yahoo dropped a null-close bar: every offset walked one row too far, and nothing in
+    the render said so.
+    """
+
+    _fetch_with_history = staticmethod(TestAnnualizationBasis._fetch_with_history)
+    _line_value = staticmethod(TestAnnualizationBasis._line_value)
+
+    @staticmethod
+    def _gapped_btc_shape() -> pd.Series:
+        # A long healthy 24/7 series whose second-to-last DATE is missing — the observed
+        # Yahoo consolidation-hole shape (a null-close bar deleted by keepna=False).
+        idx = pd.date_range(end="2026-08-26", periods=400, freq="D")
+        idx = idx.drop([pd.Timestamp("2026-08-25")])
+        rng = np.random.default_rng(7)
+        return pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+
+    def test_1d_over_a_hole_discloses_the_actual_span(self):
+        close = self._gapped_btc_shape()
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        one_d = next(line.strip() for line in result.splitlines() if line.strip().startswith("- 1d"))
+        assert one_d.startswith("- 1d (actual 2d):"), one_d
+
+    def test_longer_rows_hit_the_same_calendar_dates_as_an_ungapped_index(self):
+        # Row offsets would shift 1m/3m/6m/1y one row deep past the hole; the date-based
+        # lookup must read the observation dated exactly N days before the last bar.
+        close = self._gapped_btc_shape()
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+        last_ts = close.index[-1]
+        for label, days in [("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)]:
+            expected = (close.iloc[-1] / close.loc[last_ts - pd.Timedelta(days=days)] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", label
+
+    def test_a_holiday_under_a_trading_basis_target_stays_undisclosed(self):
+        # A market holiday sitting exactly under the 1m target slips the match one
+        # business day over an adjacent weekend — routine on the 252 basis, so the label
+        # must stay plain AND still read the nearest prior observation.
+        idx = pd.bdate_range(end="2026-08-21", periods=400)
+        holiday = idx[-22]  # the exact 21-business-day 1m target
+        idx = idx.drop([holiday])
+        rng = np.random.default_rng(9)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx)))), index=idx)
+        result = self._fetch_with_history(close, as_of=datetime(2026, 8, 22, 12, 0, tzinfo=UTC))
+        one_m = next(line.strip() for line in result.splitlines() if line.strip().startswith("- 1m"))
+        assert one_m.startswith("- 1m:"), one_m
+        expected = (close.iloc[-1] / close.loc[:holiday].iloc[-1] - 1) * 100
+        assert one_m == f"- 1m: {expected:+.2f}%"
 
 
 class TestFetchFredData:
@@ -468,6 +656,50 @@ class TestRenderFredSeriesYoY:
         markdown = _render_fred_series("UNRATE", data, "unemployment rate")
 
         assert "Year-over-year change" not in markdown
+
+
+class TestRenderFredSeriesZeroBasePercent:
+    """A base of exactly 0 has no percent change; it must not render as 0.00%.
+
+    FRED spread series cross zero routinely (T10Y2Y inverted through 2023-24), and the
+    old ``else 0`` put a fabricated "unchanged" percentage next to a genuine absolute
+    move in a forecaster prompt.
+    """
+
+    def test_zero_previous_observation_omits_the_percent_clause(self) -> None:
+        dates = pd.date_range(end="2026-03-01", periods=3, freq="MS")
+        data = pd.Series([0.5, 0.0, 0.31], index=dates, name="T10Y2Y")
+
+        markdown = _render_fred_series("T10Y2Y", data, "10Y-2Y spread")
+        change_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+
+        assert change_line == "- Change from previous: +0.31"
+        assert "0.00%" not in markdown
+
+    def test_zero_year_ago_observation_omits_only_the_yoy_percent(self) -> None:
+        # 25 monthly observations so the ~365-day lookup lands on a real row, which is
+        # set to exactly 0. The month-over-month clause is unaffected.
+        dates = pd.date_range(end="2026-03-01", periods=25, freq="MS")
+        values = [1.0] * 25
+        values[12] = 0.0  # the observation ~365 days before the last one
+        data = pd.Series(values, index=dates, name="T10Y3M")
+        data.iloc[-1] = 0.4
+        data.iloc[-2] = 0.2
+
+        markdown = _render_fred_series("T10Y3M", data, "10Y-3M spread")
+        yoy_line = next(line for line in markdown.splitlines() if line.startswith("- Year-over-year change:"))
+        mom_line = next(line for line in markdown.splitlines() if line.startswith("- Change from previous:"))
+
+        assert yoy_line == "- Year-over-year change: +0.4"
+        assert "(+100.00%)" in mom_line
+
+    def test_a_nonzero_base_still_renders_its_percent(self) -> None:
+        dates = pd.date_range(end="2026-03-01", periods=2, freq="MS")
+        data = pd.Series([2.0, 3.0], index=dates, name="UNRATE")
+
+        markdown = _render_fred_series("UNRATE", data, "unemployment rate")
+
+        assert "- Change from previous: +1 (+50.00%)" in markdown
 
 
 # ---------------------------------------------------------------------------
@@ -1025,8 +1257,9 @@ class TestBenchmarkingDateCeiling:
 
     def test_yfinance_benchmarking_uses_start_end_ceiling_and_skips_info(self) -> None:
         """Benchmarking yfinance fetch: history is called with start/end (NOT period),
-        end == open_time.date() + 1 day, start == open_time.date() - 365d, and `.info`
-        is never accessed (a PropertyMock that would raise if touched)."""
+        end == open_time.date() + 1 day, start == open_time.date() − the lookback
+        constant, and `.info` is never accessed (a PropertyMock that would raise if
+        touched)."""
         dates = pd.date_range(end="2026-03-15", periods=252, freq="B")
         close_prices = np.linspace(150.0, 200.0, 252)
         mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
@@ -1047,14 +1280,18 @@ class TestBenchmarkingDateCeiling:
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
         assert "period" not in kwargs
-        assert kwargs["start"] == "2025-03-08"  # open_time.date() - FINANCIAL_YFINANCE_LOOKBACK_DAYS (372d)
+        expected_start = (_BENCH_OPEN_TIME - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+        assert kwargs["start"] == expected_start.isoformat()
         assert kwargs["end"] == "2026-03-16"  # open_time.date() + 1d (end EXCLUSIVE)
         assert "AAPL" in result
         assert "[omitted under backtest" in result
 
-    def test_yfinance_live_path_unchanged_period_based(self) -> None:
-        """Live path (default is_benchmarking=False): period-based call preserved, no
-        start/end, and `.info` still consulted for fundamentals."""
+    def test_yfinance_live_path_fetches_by_start_date_with_no_end_ceiling(self) -> None:
+        """Live path (default is_benchmarking=False): fetch by explicit start date only.
+        No ``period=`` — Yahoo reads a bare custom period as trading BARS for listed
+        assets, a different unit than the calendar days the backtest branch spends the
+        same constant as. No ``end=`` — yfinance defaults it to now, keeping today's
+        partial bar. `.info` still consulted for fundamentals."""
         dates = pd.date_range(end="2026-03-30", periods=252, freq="B")
         close_prices = np.linspace(150.0, 200.0, 252)
         mock_history = pd.DataFrame({"Close": close_prices}, index=dates)
@@ -1063,14 +1300,16 @@ class TestBenchmarkingDateCeiling:
         mock_ticker.history.return_value = mock_history
         mock_ticker.info = {"shortName": "Apple Inc.", "trailingPE": 28.5}
 
+        as_of = datetime(2026, 3, 30, 12, 0, tzinfo=UTC)
         with patch("metaculus_bot.research.financial_data.yfinance") as mock_yf:
             mock_yf.Ticker.return_value = mock_ticker
 
-            result = _fetch_yfinance_data("AAPL")
+            result = _fetch_yfinance_data("AAPL", as_of=as_of)
 
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d"}
+        expected_start = (as_of - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+        assert kwargs == {"start": expected_start.isoformat()}
         assert "P/E ratio" in result  # .info fundamentals rendered
 
     def test_fred_benchmarking_routes_through_ts_fetch_with_ceiling(self) -> None:
@@ -1259,8 +1498,8 @@ class TestBenchmarkingDateCeiling:
 
     @pytest.mark.asyncio
     async def test_provider_default_is_live(self) -> None:
-        """Default (no is_benchmarking arg) → live path: period-based yfinance, `.info`
-        consulted, and no open_time needed."""
+        """Default (no is_benchmarking arg) → live path: start-date yfinance fetch with
+        no end ceiling, `.info` consulted, and no open_time needed."""
         mock_llm = AsyncMock()
         mock_llm.invoke.return_value = "FINANCIAL: YES\nTICKERS: AAPL\nFRED_SERIES: NONE"
 
@@ -1276,9 +1515,17 @@ class TestBenchmarkingDateCeiling:
         ):
             mock_yf.Ticker.return_value = mock_ticker
 
+            before = datetime.now(UTC)
             provider = financial_data_provider()
             result = await provider(_make_q("Will Apple stock exceed $200?"))
+            after = datetime.now(UTC)
 
         _, kwargs = mock_ticker.history.call_args
-        assert kwargs == {"period": f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d"}
+        # The provider derives start from its own now(); bracket it so a midnight
+        # rollover between our two clock reads can't flake the assert.
+        expected_starts = {
+            (t - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date().isoformat() for t in (before, after)
+        }
+        assert set(kwargs) == {"start"}
+        assert kwargs["start"] in expected_starts
         assert "### AAPL" in result

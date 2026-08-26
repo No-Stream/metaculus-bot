@@ -36,6 +36,7 @@ from metaculus_bot.research.ts_estimators import (
     annualized_realized_vol_pct,
     daily_step_unit,
     observed_periods_per_year,
+    stale_latest_age_days,
 )
 from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
 
@@ -351,23 +352,30 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
     Sync function -- caller wraps in asyncio.to_thread().
     Returns formatted markdown or "" on any failure.
 
-    Live (``is_benchmarking=False``): unchanged — a trailing ``period="365d"``
-    window and the live ``.info`` fundamentals. Backtest (``is_benchmarking=True``):
-    ceiling the price history to ``as_of`` via ``history(start=..., end=...)`` (end
-    exclusive) and SKIP the ``.info`` call entirely — ``.info`` has no historical
-    mode, so its market cap / P/E / current price would leak TODAY's values into a
-    question resolved months ago. Current price then comes from the last ceilinged
-    close, and every derived stat (returns / vol / 52wk) computes off that frame.
+    Both paths fetch by explicit calendar start date, ``as_of`` −
+    ``FINANCIAL_YFINANCE_LOOKBACK_DAYS`` (``as_of`` defaults to now; the live provider
+    passes now explicitly). A bare ``period="Nd"`` is deliberately avoided: Yahoo's
+    chart API reads that custom range as N trading BARS for listed assets but ~N
+    calendar DATES for 24/7 ones — one integer under two unit systems. Live
+    (``is_benchmarking=False``) leaves ``end`` unset (yfinance defaults it to now, so
+    today's partial bar stays included) and reads the live ``.info`` fundamentals.
+    Backtest (``is_benchmarking=True``) ceilings the history at ``as_of`` via ``end``
+    and SKIPs the ``.info`` call entirely — ``.info`` has no historical mode, so its
+    market cap / P/E / current price would leak TODAY's values into a question
+    resolved months ago. The latest price then comes from the last ceilinged close,
+    and every derived stat (returns / vol / 52wk) computes off that frame.
     """
     try:
         ticker_obj = yfinance.Ticker(ticker)
         if is_benchmarking:
             assert as_of is not None, "benchmarking yfinance fetch requires as_of"
-            start = (as_of - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
-            end = (as_of + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
+        window_end = as_of if as_of is not None else datetime.now(UTC)
+        start = (window_end - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
+        if is_benchmarking:
+            end = (window_end + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
             history = ticker_obj.history(start=start.isoformat(), end=end.isoformat())
         else:
-            history = ticker_obj.history(period=f"{FINANCIAL_YFINANCE_LOOKBACK_DAYS}d")
+            history = ticker_obj.history(start=start.isoformat())
 
         if history.empty:
             logger.warning(f"yfinance returned empty history for {ticker=}")
@@ -375,18 +383,42 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 
         # Skip the live `.info` call under benchmarking (no historical mode → leakage).
         info: dict = {} if is_benchmarking else (ticker_obj.info or {})
-        close = history["Close"]
+        # Yahoo can serve a bar whose close is null (a consolidation hole); yfinance's
+        # keepna=False default usually deletes the row, but a NaN that does arrive would
+        # poison every tail-anchored stat below, so drop them here too.
+        close = history["Close"].dropna()
+        if close.empty:
+            logger.warning(f"yfinance returned no non-null closes for {ticker=}")
+            return ""
         current_price = close.iloc[-1]
+        latest_obs_date = cast(pd.Timestamp, close.index[-1]).date()
 
         parts = [f"### {ticker}"]
         name = info.get("shortName", "")
         if name:
             parts.append(f"**{name}**")
-        parts.append(f"- Current price: {current_price:.2f}")
+        # Every "latest" carries its observation date: an undated headline reads as live
+        # even when Yahoo's newest bar is days old (a weekend Friday close, or a
+        # null-close hole silently dropped from the frame).
+        latest_line = f"- Latest price: {current_price:.2f} (as of {latest_obs_date.isoformat()})"
+        if not is_benchmarking and latest_obs_date == window_end.date():
+            latest_line += " — today's bar, in progress"
+        parts.append(latest_line)
 
         # 252 for exchange-traded assets, 365 for 24/7 markets (crypto) — the same
         # basis drives the annualization factor AND every "1y"/"52-week" row count.
         periods_per_year = observed_periods_per_year(close.index)
+
+        stale_age = stale_latest_age_days(latest_obs_date, window_end.date(), periods_per_year)
+        if stale_age is not None:
+            unit = daily_step_unit(periods_per_year)
+            parts.append(
+                f"- ⚠ Latest observation is {stale_age} days old — beyond what a {unit} cadence "
+                "explains; treat the latest price as stale."
+            )
+            logger.warning(
+                f"FINANCIAL_STALE_LATEST: surface=financial_data symbol={ticker} age_d={stale_age} cadence={unit}"
+            )
 
         # Period returns
         returns_section = _compute_period_returns(close, periods_per_year)
@@ -443,10 +475,14 @@ def _fetch_yfinance_data(ticker: str, *, as_of: datetime | None = None, is_bench
 # between them are the package's shared definitions, imported from ts_estimators above, so a
 # correction cannot miss a copy — the ts-anchor stack had exactly that miss until 2026-08-25.
 
-# Row offsets behind each period-return label, per basis. On the 365 basis the
-# offsets are calendar days; on the 252 basis they are the trading-day
-# conventions (5/wk), byte-identical to the historical behavior.
-_PERIOD_ROW_OFFSETS: dict[int, list[tuple[str, int]]] = {
+# Steps back behind each period-return label, in the basis's own step unit: BUSINESS
+# days on the 252 basis (the trading-day conventions, 5/wk), calendar days on the 365
+# basis. Each step count is resolved to a target DATE and matched at-or-before — never
+# used as a row offset, because a gapped index (Yahoo's dropped null-close bar, an
+# unscheduled closure) shifts every row offset by the hole count, which is how a "1d"
+# return spanning 53 hours once rendered on a BTC-USD snapshot. On a gap-free index the
+# date match lands on exactly the row the old offsets read, so the numbers are unchanged.
+_PERIOD_TARGET_STEPS: dict[int, list[tuple[str, int]]] = {
     TRADING_DAYS_PER_YEAR: [("1d", 1), ("1w", 5), ("1m", 21), ("3m", 63), ("6m", 126), ("1y", TRADING_DAYS_PER_YEAR)],
     CALENDAR_DAYS_PER_YEAR: [
         ("1d", 1),
@@ -458,22 +494,43 @@ _PERIOD_ROW_OFFSETS: dict[int, list[tuple[str, int]]] = {
     ],
 }
 
+# Calendar days a period-return match may land before its target date before the label
+# discloses the actual span. The 252 basis resolves targets in business days, so a market
+# holiday under the target slips the match up to 3 days over an adjacent weekend —
+# routine, not a mislabel. On the 365 basis every date should print a bar, so ANY slip is
+# a data gap the label must own up to.
+_PERIOD_SLIP_GRACE_DAYS: dict[int, int] = {TRADING_DAYS_PER_YEAR: 3, CALENDAR_DAYS_PER_YEAR: 0}
+
 
 def _compute_period_returns(close: pd.Series, periods_per_year: int) -> str:
-    """Compute returns over standard periods, returning a formatted string.
+    """Compute returns over standard periods via date-based at-or-before lookups.
 
-    ``periods_per_year`` is REQUIRED (no trading-day default): the row offsets it selects are
-    what make each label a true calendar period, so a caller that forgets it would silently
-    reproduce the q44882 mislabelling on a 24/7 series.
+    ``periods_per_year`` is REQUIRED (no trading-day default): it selects the step unit
+    that makes each label a true calendar period, so a caller that forgets it would
+    silently reproduce the q44882 mislabelling on a 24/7 series. Each label's start value
+    is the newest observation at or before ``last − steps`` (the same pattern as the FRED
+    YoY lookup below); a label whose match lands beyond the basis's slip grace discloses
+    the actual span ("1d (actual 2d)") instead of wearing a period it doesn't cover. A
+    label with no observation at or before its target is omitted, exactly as the old
+    too-few-rows guard omitted it.
     """
-    periods = _PERIOD_ROW_OFFSETS[periods_per_year]
+    last_ts = cast(pd.Timestamp, close.index[-1])
+    end_price = close.iloc[-1]
     lines = []
-    for label, days in periods:
-        if len(close) > days:
-            start_price = close.iloc[-(days + 1)]
-            end_price = close.iloc[-1]
-            pct_change = (end_price / start_price - 1) * 100
-            lines.append(f"  - {label}: {pct_change:+.2f}%")
+    for label, steps in _PERIOD_TARGET_STEPS[periods_per_year]:
+        target = (
+            last_ts - pd.offsets.BDay(steps)
+            if periods_per_year == TRADING_DAYS_PER_YEAR
+            else last_ts - pd.Timedelta(days=steps)
+        )
+        prior = close.loc[:target]
+        if prior.empty:
+            continue
+        start_ts = cast(pd.Timestamp, prior.index[-1])
+        pct_change = (end_price / prior.iloc[-1] - 1) * 100
+        slipped = (target - start_ts).days > _PERIOD_SLIP_GRACE_DAYS[periods_per_year]
+        span = f" (actual {(last_ts - start_ts).days}d)" if slipped else ""
+        lines.append(f"  - {label}{span}: {pct_change:+.2f}%")
     if lines:
         return "- Period returns:\n" + "\n".join(lines)
     return ""
@@ -501,6 +558,21 @@ def _format_fundamentals(info: dict) -> str:
     return ""
 
 
+def _pct_clause(change: float, base: float) -> str:
+    """`` (+1.23%)`` for a percent change off ``base``, or "" when there is no percent.
+
+    A base of exactly 0 has NO percent change — it is undefined, not 0.00%. FRED spread
+    and rate-difference series (T10Y2Y, T10Y3M) cross zero routinely, and the old
+    ``else 0`` rendered ``+0.31 (+0.00%)`` there: a fabricated "unchanged" reading sitting
+    beside a genuine absolute move, in a forecaster prompt. Omitting the clause leaves the
+    absolute change, which is the part that was actually measured.
+    """
+    base_value = float(base)
+    if base_value == 0:
+        return ""
+    return f" ({(change / abs(base_value)) * 100:+.2f}%)"
+
+
 def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
     """Render the derived-stat markdown block for a FRED series.
 
@@ -523,8 +595,7 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
     # the rendered "Change from previous" label claims and no more.
     if len(data) >= 2:
         mom_change = latest_value - data.iloc[-2]
-        mom_pct = (mom_change / abs(float(data.iloc[-2]))) * 100 if data.iloc[-2] != 0 else 0
-        parts.append(f"- Change from previous: {mom_change:+.4g} ({mom_pct:+.2f}%)")
+        parts.append(f"- Change from previous: {mom_change:+.4g}{_pct_clause(mom_change, data.iloc[-2])}")
 
     # Year-over-year change via a DATE-based lookup, not a fixed observation
     # offset: `data.iloc[-13]` is one year back only on a monthly series; on a
@@ -538,8 +609,7 @@ def _render_fred_series(series_id: str, data: pd.Series, title: str) -> str:
     if not prior.empty:
         yoy_value = prior.iloc[-1]
         yoy_change = latest_value - yoy_value
-        yoy_pct = (yoy_change / abs(float(yoy_value))) * 100 if yoy_value != 0 else 0
-        parts.append(f"- Year-over-year change: {yoy_change:+.4g} ({yoy_pct:+.2f}%)")
+        parts.append(f"- Year-over-year change: {yoy_change:+.4g}{_pct_clause(yoy_change, yoy_value)}")
 
     # Last 6 observations
     last_6 = data.tail(6)
@@ -621,11 +691,12 @@ def financial_data_provider(is_benchmarking: bool = False) -> ResearchCallable:
 
     Backtest-safe like ``timeseries_anchor``: under ``is_benchmarking`` every fetch is
     ceilinged to ``question.open_time`` (NOT the resolution time — post-open data can
-    contain the resolution). Live (``is_benchmarking=False``) fetches are unchanged: a
-    trailing yfinance ``period=`` window and the fredapi path. yfinance ceilings via
-    ``history(start=..., end=...)`` and skips the leaky ``.info`` fundamentals; FRED
-    routes through the keyless ``ts_fetch`` fredgraph / ALFRED-vintage path so revised
-    macro series return the vintage known at forecast time rather than today's revisions.
+    contain the resolution). Both modes fetch yfinance by explicit start date
+    (``as_of`` − ``FINANCIAL_YFINANCE_LOOKBACK_DAYS``); benchmarking additionally
+    ceilings the window via ``end`` and skips the leaky ``.info`` fundamentals. FRED:
+    live uses the fredapi path, while benchmarking routes through the keyless
+    ``ts_fetch`` fredgraph / ALFRED-vintage path so revised macro series return the
+    vintage known at forecast time rather than today's revisions.
     """
     classifier_llm = build_llm_with_openrouter_fallback(
         model=FINANCIAL_CLASSIFIER_MODEL,

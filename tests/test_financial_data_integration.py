@@ -62,7 +62,8 @@ def test_yfinance_real_fetch_returns_parseable_markdown():
         pytest.skip("yfinance returned empty (transient: rate-limit, network, or symbol-not-found)")
 
     assert md.startswith("### AAPL"), f"Expected ### AAPL header, got: {md[:80]!r}"
-    assert "Current price:" in md, "Missing 'Current price' line"
+    assert "Latest price:" in md, "Missing dated 'Latest price' line"
+    assert "(as of " in md, "Latest price must carry its observation date"
     assert "52-week range:" in md, "Missing '52-week range' line"
     assert "Last 5 closes:" in md, "Missing 'Last 5 closes' section"
     assert "Period returns:" in md, "Missing 'Period returns' section"
@@ -83,7 +84,7 @@ def test_yfinance_real_fetch_index_symbol():
         pytest.skip("yfinance returned empty for ^GSPC (transient or upstream issue)")
 
     assert md.startswith("### ^GSPC"), f"Expected ### ^GSPC header, got: {md[:80]!r}"
-    assert "Current price:" in md
+    assert "Latest price:" in md
     assert "52-week range:" in md
 
 

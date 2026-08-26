@@ -18,6 +18,7 @@ A leaf module: it depends on nothing else in the anchor stack, so ``ts_render`` 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Literal
 
 import numpy as np
@@ -27,8 +28,8 @@ Freq = Literal["daily", "weekly", "monthly", "quarterly", "annual"]
 
 # Annualization / horizon-conversion bases (ported from the replay's run_replay.py).
 # THE package's single definition of these two facts — `financial_data` imports them for its
-# period-return row offsets and vol annualization, so they are ints: the row-count consumers
-# index and slice with them (`_PERIOD_ROW_OFFSETS[...]`, `close.iloc[-n:]`), and the float
+# period-return step tables and vol annualization, so they are ints: consumers key, count,
+# and slice with them (`_PERIOD_TARGET_STEPS[...]`, `close.iloc[-n:]`), and the float
 # arithmetic here is unchanged by int operands (true division and `round` don't care).
 TRADING_DAYS_PER_YEAR = 252
 CALENDAR_DAYS_PER_YEAR = 365
@@ -121,6 +122,29 @@ def daily_step_unit(periods_per_year: int) -> str:
     second copy of the rule is where a correction goes missing.
     """
     return "trading-day" if periods_per_year == TRADING_DAYS_PER_YEAR else "calendar-day"
+
+
+# Calendar-day age a daily-bar series' latest observation may reach before it reads as
+# STALE — older than the series' own observed cadence explains. 365 basis: one nominal
+# 1-day step plus one grace day. 252 basis: a weekend plus one holiday (a Friday close
+# read on a Tuesday is routine; a fifth day is not).
+_STALE_AGE_ALLOWED_DAYS: dict[int, int] = {CALENDAR_DAYS_PER_YEAR: 2, TRADING_DAYS_PER_YEAR: 4}
+
+
+def stale_latest_age_days(last_obs: date, as_of: date, periods_per_year: int) -> int | None:
+    """Age in days of a daily-bar series' latest observation, when staler than its cadence allows.
+
+    Returns the age when it exceeds the basis's allowance, else ``None``. THE package's one
+    definition of "the latest value is stale" — ``financial_data``'s price line and
+    ``ts_render``'s anchor header both consume it, the same single-copy rule the vol
+    estimator above earned the hard way. Daily bases only: the keys are the two daily-bar
+    annualization bases, and a weekly/monthly caller has no business here (KeyError is the
+    correct failure, not a silent default).
+    """
+    age = (as_of - last_obs).days
+    if age > _STALE_AGE_ALLOWED_DAYS[periods_per_year]:
+        return age
+    return None
 
 
 def annualized_realized_vol_pct(series: pd.Series, *, window: int, periods_per_year: int) -> float | None:
