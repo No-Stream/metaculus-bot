@@ -16,11 +16,19 @@ Coverage (one behavior per test):
   monthly_avg) fires only when the wording asks for that derived quantity.
 - Gasoline split: the monthly-average and weekly-level siblings are exact complements.
 - UST-10Y wording: the widened DGS10 keywords plus the route-level two-leg/change guard.
+- Gate vocabulary: registry-driven — every ``require_any_keywords`` token on every gated
+  entry has to route, so a token added without a routing check fails here.
+- Change-guard scoping: two-leg tokens veto unconditionally, %-change tokens only when the
+  route's own band isn't a percent change, and the URL branch reads the title only.
+- Routing marker: one ``TS_ANCHOR_ROUTE`` line per call, one distinct step label per branch,
+  each line re-parsed through the harvester's own MarkerSpec regex.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
 
 import pytest
 
@@ -423,11 +431,14 @@ class TestGasolineDerivationSplit:
     @pytest.mark.parametrize(
         ("text", "expected_derivation"),
         [
-            # Month-scoped phrasings -> monthly_avg (each of the four gate tokens).
+            # Month-scoped phrasings -> monthly_avg, one per gate token (the tuple below is
+            # asserted against the registry, so this list has to grow with it).
             ("average price for regular gasoline for the month of April 2026", "monthly_avg"),
             ("the monthly average price of regular gasoline in April 2026", "monthly_avg"),
             ("the price of regular gasoline during the month of April 2026", "monthly_avg"),
             ("the monthly regular gasoline price for April 2026", "monthly_avg"),
+            ("the price of regular gasoline in the month of April 2026", "monthly_avg"),
+            ("the regular gasoline price over the calendar month of April 2026", "monthly_avg"),
             # Point-in-time phrasings -> level.
             ("the price of regular gasoline on August 17, 2026", "level"),
             ("the national average price of regular gasoline on December 31, 2026", "level"),
@@ -735,6 +746,27 @@ class TestChangeGuardScoping:
         assert route is not None
         assert (route.spec.series_id, route.derivation) == ("DGS10", "level")
 
+    def test_two_leg_wording_vetoes_even_the_mom_pct_family(self):
+        # The mom_pct exemption is scoped to the %-CHANGE tokens only. The two-leg tokens are
+        # unconditional because no single-series band of any derivation can express a difference
+        # between two series — so a CPI MoM question that also asks for a comparison against
+        # another leg must still skip, and the exemption must not leak across the two patterns.
+        qt = (
+            "What will be the month-over-month percent change in US headline CPI "
+            "versus the euro-area figure for December 2026?"
+        )
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+        assert tsr._change_guard_hits(qt, "mom_pct") is True
+        assert tsr._PCT_CHANGE_RE.search(qt) is not None  # the exempted half really did match
+
+    def test_a_percentage_change_question_still_skips_the_monthly_average_family(self):
+        # monthly_avg's band is $/gal, so %-change wording is a different quantity: alongside
+        # mom_diff (persons) this is the second non-exempt derivation, and only mom_pct is exempt.
+        qt = "What will be the percent change in the monthly average price of regular gasoline in April 2026?"
+        assert route_question(_make_numeric_q(question_text=qt)) is None
+        assert tsr._change_guard_hits(qt, "monthly_avg") is True
+        assert tsr._change_guard_hits(qt, "mom_pct") is False  # same text, exempt derivation
+
     def test_the_title_scoping_does_not_weaken_the_q45362_skip(self):
         # The families the URL guard exists for state their quantity in the title; the
         # verbatim q45362 test in TestLiveProdRoutingMisses pins the real case, this pins the
@@ -775,6 +807,106 @@ class TestWidenedDerivationVocabulary:
         assert route is not None
         assert (route.spec.series_id, route.derivation) == ("GASREGW", "monthly_avg")
 
+    # One carrier sentence per gated entry, with the token interpolated verbatim (never
+    # stripped — "mom " and " add " carry deliberate delimiter spaces, so stripping them would
+    # test a token the registry doesn't hold). The sentences read a little stiff for the
+    # multi-word tokens; the token's presence is the point, not the prose.
+    _GATE_TOKEN_CARRIERS: dict[tuple[str, str], str] = {
+        (
+            "PAYEMS",
+            "mom_diff",
+        ): "What will the {token} in seasonally adjusted nonfarm payroll employment be in August 2026?",
+        ("CPIAUCSL", "mom_pct"): "What will US headline CPI inflation be for December 2026, on a {token} basis?",
+        ("GASREGW", "monthly_avg"): "What will the price of regular gasoline be, {token} of April 2026?",
+    }
+
+    def test_every_derivation_gate_token_in_the_registry_actually_routes(self):
+        # Registry-driven rather than hand-listed, because the q45401 defect IS a gate that
+        # knows only some of the phrasings for its quantity: a token added without a routing
+        # check is the same failure waiting to happen, and a token that never routes is dead
+        # vocabulary that reads as coverage. Walking the entries' own tuples covers every future
+        # addition the moment it lands.
+        for entry in tsr._TEMPLATE_REGISTRY:
+            if not entry.require_any_keywords:
+                continue
+            carrier = self._GATE_TOKEN_CARRIERS.get((entry.series_id, entry.derivation))
+            assert carrier is not None, (
+                f"gated entry {entry.series_id}/{entry.derivation} has no carrier sentence — add one so its "
+                "gate vocabulary is exercised"
+            )
+            for token in entry.require_any_keywords:
+                route = route_question(_make_numeric_q(question_text=carrier.format(token=token)))
+                assert route is not None, f"{entry.series_id} gate token {token!r} routes nowhere"
+                assert (route.spec.series_id, route.derivation) == (entry.series_id, entry.derivation), token
+
+
+_GSPC_YAHOO_RC = "Resolves per https://finance.yahoo.com/quote/%5EGSPC at the close."
+_TWO_TICKER_RC = (
+    "Resolves per https://finance.yahoo.com/quote/BTC-USD/ and https://finance.yahoo.com/quote/ETH-USD/ history."
+)
+_THREE_SERIES_RC = (
+    "Per https://fred.stlouisfed.org/series/DGS10 and https://fred.stlouisfed.org/series/DGS2 "
+    "and https://finance.yahoo.com/quote/%5EGSPC"
+)
+
+# (step label, question_text, resolution_criteria, expected decision, expected `series=` field).
+# One row per branch `_route_question_impl` / `_single_url_route` can decide on; the completeness
+# test below fails if the module grows a twelfth branch and this table doesn't.
+_MARKER_BRANCHES: list[tuple[str, str, str, str, str]] = [
+    ("url_single", "Where will the S&P 500 close?", _GSPC_YAHOO_RC, "routed", "^GSPC"),
+    # Spread series are slash-joined, in leg order.
+    ("url_spread", "Will Bitcoin outperform Ethereum in returns?", _TWO_TICKER_RC, "routed", "BTC-USD/ETH-USD"),
+    (
+        "url_no_relative_return_wording",
+        "What will the ratio of Bitcoin to Ethereum be?",
+        _TWO_TICKER_RC,
+        "skipped",
+        "BTC-USD/ETH-USD",
+    ),
+    # Ambiguity is comma-joined, FRED ids before tickers.
+    ("url_ambiguous", "What will the gap be?", _THREE_SERIES_RC, "skipped", "DGS10,DGS2,^GSPC"),
+    (
+        "url_quantity_gate",
+        "What will the CPI index level be in December 2026?",
+        "Per https://fred.stlouisfed.org/series/CPIAUCSL",
+        "skipped",
+        "CPIAUCSL",
+    ),
+    (
+        "url_change_vs_level_guard",
+        "What will be the percentage change in the S&P 500 over the window?",
+        _GSPC_YAHOO_RC,
+        "skipped",
+        "^GSPC",
+    ),
+    ("kw_single", "Where will the 10-year treasury yield close?", "rc", "routed", "DGS10"),
+    (
+        "kw_ambiguous",
+        "What will the spread between the 10-year treasury yield and the high yield spread be?",
+        "rc",
+        "skipped",
+        "DGS10,BAMLH0A0HYM2",
+    ),
+    (
+        "kw_change_vs_level_guard",
+        "What will be the percentage change in the S&P 500 over the last week of August 2026?",
+        "rc",
+        "skipped",
+        "^GSPC",
+    ),
+    # The q45401 shape: title keywords hit, the quantity gate refused. Previously byte-identical
+    # to a no-keyword miss (a bare silent None), which is what hid the defect for a whole era.
+    (
+        "kw_derivation_gate",
+        "What will total nonfarm payroll employment (in thousands of persons) be in December 2026?",
+        "rc",
+        "skipped",
+        "PAYEMS",
+    ),
+    # No series is known, so the field carries the "none" sentinel rather than an empty gap.
+    ("kw_no_keyword_hit", "Who wins the 2028 election?", "rc", "skipped", "none"),
+]
+
 
 class TestRoutingMarker:
     """Every route_question call emits one TS_ANCHOR_ROUTE line — the marker that made anchor
@@ -783,45 +915,36 @@ class TestRoutingMarker:
     (scripts/telemetry/markers.py), which tests/test_telemetry_markers.py pins parser-side.
     """
 
-    def test_a_routed_question_emits_the_marker(self, caplog):
-        with caplog.at_level(logging.INFO):
-            route_question(_make_numeric_q(qid=7101, question_text="Where will the 10-year treasury yield close?"))
-        assert any(
-            "TS_ANCHOR_ROUTE: question=7101 decision=routed series=DGS10 step=kw_single" in r.getMessage()
-            for r in caplog.records
-        )
-
-    def test_a_silent_keyword_miss_now_leaves_a_line(self, caplog):
-        with caplog.at_level(logging.INFO):
-            route_question(_make_numeric_q(qid=7102, question_text="Who wins the 2028 election?"))
-        assert any(
-            "TS_ANCHOR_ROUTE: question=7102 decision=skipped series=none step=kw_no_keyword_hit" in r.getMessage()
-            for r in caplog.records
-        )
-
-    def test_a_derivation_gate_reject_names_the_refusing_series(self, caplog):
-        # The q45401 shape: title keywords hit, the quantity gate refused. Previously
-        # byte-identical to a no-keyword miss (a bare silent None).
-        qt = "What will total nonfarm payroll employment (in thousands of persons) be in December 2026?"
-        with caplog.at_level(logging.INFO):
-            route_question(_make_numeric_q(qid=7103, question_text=qt))
-        assert any(
-            "TS_ANCHOR_ROUTE: question=7103 decision=skipped series=PAYEMS step=kw_derivation_gate" in r.getMessage()
-            for r in caplog.records
-        )
-
-    def test_the_emitted_line_parses_under_the_marker_spec(self, caplog):
-        # Emitter/parser round-trip: the archive harvests what route_question logs, so the two
-        # must agree on the byte shape, not just intent.
+    @pytest.mark.parametrize(
+        ("step", "question_text", "resolution_criteria", "decision", "series"),
+        _MARKER_BRANCHES,
+        ids=[branch[0] for branch in _MARKER_BRANCHES],
+    )
+    def test_each_branch_emits_its_own_step_label_and_parses_under_the_spec(
+        self, step: str, question_text: str, resolution_criteria: str, decision: str, series: str, caplog
+    ):
+        r"""The step label is the entire analytical value of the marker: it distinguishes "no
+        keyword matched" from "the gate refused" from "the guard fired", and a mislabelled branch
+        reads in the archive as a different failure mode. Asserted VERBATIM, then re-parsed
+        through the harvester's own regex — which takes each field with ``\S+``, so a multi-series
+        value that ever grew a space (``", ".join``) would truncate the field and silently corrupt
+        the harvested series list. Both joins here are deliberately spaceless."""
         spec = next(s for s in MARKER_SPECS if s.name == "ts_anchor_route")
+        question = _make_numeric_q(qid=7150, question_text=question_text, resolution_criteria=resolution_criteria)
+
         with caplog.at_level(logging.INFO):
-            route_question(_make_numeric_q(qid=7104, question_text="Where will the 10-year treasury yield close?"))
-        line = next(r.getMessage() for r in caplog.records if "TS_ANCHOR_ROUTE" in r.getMessage())
-        match = spec.regex.search(line)
+            route_question(question)
+
+        lines = [r.getMessage() for r in caplog.records if "TS_ANCHOR_ROUTE" in r.getMessage()]
+        expected = f"TS_ANCHOR_ROUTE: question=7150 decision={decision} series={series} step={step}"
+        assert any(expected in line for line in lines), lines
+        match = spec.regex.search(lines[0])
         assert match is not None
-        assert match.groupdict() == {
-            "question": "7104",
-            "decision": "routed",
-            "series": "DGS10",
-            "step": "kw_single",
-        }
+        assert match.groupdict() == {"question": "7150", "decision": decision, "series": series, "step": step}
+
+    def test_the_table_covers_every_step_label_the_module_can_emit(self):
+        # Without this, a new branch ships with no marker test and its label goes unverified in
+        # the archive. Scans the module for the step-label naming convention (url_* / kw_*) rather
+        # than trusting the table to have been kept in sync by hand.
+        emitted = set(re.findall(r'"((?:url|kw)_[a-z_]+)"', inspect.getsource(tsr)))
+        assert emitted == {branch[0] for branch in _MARKER_BRANCHES}

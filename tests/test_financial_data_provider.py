@@ -10,6 +10,7 @@ from forecasting_tools import GeneralLlm
 
 from metaculus_bot.constants import FINANCIAL_YFINANCE_LOOKBACK_DAYS, MAX_FINANCIAL_IDENTIFIERS
 from metaculus_bot.research.financial_data import (
+    _PERIOD_ROW_OFFSETS,
     CLASSIFIER_PROMPT,
     FRED_LABELS,
     KNOWN_FRED_SERIES,
@@ -26,7 +27,11 @@ from metaculus_bot.research.financial_data import (
 )
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import _is_lost_source, pop_provider_detail
-from metaculus_bot.research.ts_estimators import observed_periods_per_year
+from metaculus_bot.research.ts_estimators import (
+    CALENDAR_DAYS_PER_YEAR,
+    TRADING_DAYS_PER_YEAR,
+    observed_periods_per_year,
+)
 from metaculus_bot.research.ts_fetch import FetchError
 
 
@@ -306,6 +311,52 @@ class TestAnnualizationBasis:
 
         expected_1y = (close.iloc[-1] / close.iloc[-366] - 1) * 100
         assert self._line_value(result, "- 1y") == f"{expected_1y:+.2f}%"
+
+    def test_the_two_offset_tables_are_the_documented_conventions(self):
+        # The tables ARE the behavior: every period-return label on every financial snapshot is
+        # only a true calendar period because of these numbers. Pinned verbatim so an edit is a
+        # deliberate act — the 252 row is the trading-day convention (5/wk), the 365 row is plain
+        # calendar days, and swapping one number silently mislabels one snapshot family.
+        assert _PERIOD_ROW_OFFSETS[TRADING_DAYS_PER_YEAR] == [
+            ("1d", 1),
+            ("1w", 5),
+            ("1m", 21),
+            ("3m", 63),
+            ("6m", 126),
+            ("1y", 252),
+        ]
+        assert _PERIOD_ROW_OFFSETS[CALENDAR_DAYS_PER_YEAR] == [
+            ("1d", 1),
+            ("1w", 7),
+            ("1m", 30),
+            ("3m", 91),
+            ("6m", 182),
+            ("1y", 365),
+        ]
+        assert set(_PERIOD_ROW_OFFSETS) == {TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR}
+
+    @pytest.mark.parametrize("basis", [TRADING_DAYS_PER_YEAR, CALENDAR_DAYS_PER_YEAR])
+    def test_every_period_row_reads_its_bases_own_offset(self, basis: int):
+        # The two bases are pinned end-to-end above only on 1w/1y; walk ALL six labels so a
+        # mis-keyed intermediate offset (3m reading 63 rows on a 24/7 series = 9 calendar weeks
+        # under a "3m" label) can't hide between the two tested ones. Table-driven, so a new
+        # period label is covered the moment it lands.
+        rng = np.random.default_rng(3)
+        # Enough rows for the longest offset plus the strictly-more-rows requirement, on an index
+        # whose observed density lands the series on the basis under test.
+        index = (
+            pd.bdate_range(end="2026-07-31", periods=400)
+            if basis == TRADING_DAYS_PER_YEAR
+            else pd.date_range(end="2026-07-31", periods=400, freq="D")
+        )
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(index)))), index=index)
+        assert observed_periods_per_year(close.index) == basis
+
+        result = self._fetch_with_history(close)
+
+        for label, offset in _PERIOD_ROW_OFFSETS[basis]:
+            expected = (close.iloc[-1] / close.iloc[-(offset + 1)] - 1) * 100
+            assert self._line_value(result, f"- {label}") == f"{expected:+.2f}%", (basis, label)
 
     def test_short_series_degrades_to_trading_day_basis(self):
         dates = pd.date_range(end="2026-07-31", periods=10, freq="D")

@@ -50,6 +50,7 @@ from metaculus_bot.research.timeseries_anchor import (
 )
 from metaculus_bot.research.ts_estimators import (
     CALENDAR_DAYS_PER_YEAR,
+    MONTHLY_CLOCK,
     TRADING_DAYS_PER_YEAR,
     SeriesClock,
     _build_spread_series,
@@ -115,6 +116,15 @@ def _monthly_series(name: str, *, seed: int = 0, end: str = "2026-06-01", n: int
     rng = np.random.default_rng(seed)
     walk = 200.0 + np.cumsum(rng.normal(0.0, 1.0, n))
     return pd.Series(np.abs(walk) + 50.0, index=idx, name=name)
+
+
+def _weekly_series(name: str, *, seed: int = 0, end: str = "2026-06-26", n: int = 300) -> pd.Series:
+    """A strictly-positive weekly series — the GASREGW shape, and the only frequency whose
+    step noun and horizon divisor differ from both daily bases."""
+    idx = pd.date_range(end=pd.Timestamp(end), periods=n, freq="W-FRI")
+    rng = np.random.default_rng(seed)
+    walk = 3.0 + np.cumsum(rng.normal(0.0, 0.02, n))
+    return pd.Series(np.abs(walk) + 1.0, index=idx, name=name)
 
 
 # Render.
@@ -524,6 +534,67 @@ class TestSeriesClockAndCalendarBases:
         assert observed_periods_per_year(pd.RangeIndex(50)) == TRADING_DAYS_PER_YEAR
         assert observed_periods_per_year(pd.DatetimeIndex(["2026-06-30"] * 50)) == TRADING_DAYS_PER_YEAR
 
+    def test_density_read_splits_at_six_bars_a_week_not_at_five(self):
+        # The threshold is the whole discriminator between the two bases, and it sits at 6/7
+        # rows per day precisely so an exchange series with holidays (0.690) and a six-session
+        # week both stay on 252 while only a genuinely 24/7 series (1.0) crosses. A six-day
+        # trading week is the nearest real shape below the line, so pin it: nudging the
+        # threshold down to 5/7 would silently re-annualize every equity series on 365.
+        six_day_week = pd.DatetimeIndex(
+            [d for d in pd.date_range(end="2026-06-30", periods=700, freq="D") if d.weekday() != 6]
+        )
+        assert observed_periods_per_year(six_day_week) == TRADING_DAYS_PER_YEAR
+        every_day = pd.date_range(end="2026-06-30", periods=700, freq="D")
+        assert observed_periods_per_year(every_day) == CALENDAR_DAYS_PER_YEAR
+
+    def test_density_read_needs_a_fortnight_of_bars_before_it_overrules_the_default(self):
+        # The minimum-rows guard: a fortnight of bars cannot distinguish 5/7 from 7/7, so
+        # anything shorter keeps the historical basis. Pinned at N-1 and N because an off-by-one
+        # here is invisible in output — it just quietly re-annualizes short crypto frames.
+        for n_rows, expected in ((13, TRADING_DAYS_PER_YEAR), (14, CALENDAR_DAYS_PER_YEAR)):
+            index = pd.date_range(end="2026-06-30", periods=n_rows, freq="D")
+            assert observed_periods_per_year(index) == expected, n_rows
+
+    def test_clock_and_horizon_on_a_weekly_series_convert_on_sevens(self):
+        # Weekly is the frequency whose step noun and horizon divisor differ from BOTH daily
+        # bases, and the density read must stay unconsulted on it (a weekly index reads ~0.14
+        # rows/day, well under the split, so a stray read would be harmless here but wrong in
+        # principle — the basis field is nominal for non-daily clocks).
+        clock = series_clock(pd.DatetimeIndex(_weekly_series("GASREGW").index))
+        assert (clock.freq, clock.periods_per_year, clock.step_unit) == ("weekly", TRADING_DAYS_PER_YEAR, "week")
+        assert horizon_steps(clock, 90) == 13  # round(90 / 7)
+        assert horizon_steps(clock, 3) == 1  # floored at one step
+        as_of = pd.Timestamp("2026-06-30")
+        assert _horizon_end_date(as_of, clock, 13) == as_of + pd.Timedelta(weeks=13)
+
+    def test_horizon_end_date_on_the_monthly_clock_steps_calendar_months(self):
+        # The derived-target clock (MoM change / MoM % / monthly average). One step is one
+        # calendar month, so the ribbon end is a DateOffset — not h * 30.4375 days, which would
+        # drift a day or two per quarter against the month the question actually resolves in.
+        as_of = pd.Timestamp("2026-06-30")
+        assert MONTHLY_CLOCK.step_unit == "month"
+        assert _horizon_end_date(as_of, MONTHLY_CLOCK, 3) == pd.Timestamp("2026-09-30")
+        assert horizon_steps(MONTHLY_CLOCK, 90) == 3  # round(90 / 30.4375)
+
+    def test_weekly_render_names_weeks_and_omits_the_daily_only_vol_line(self):
+        # `step_unit` reaching the rendered band line through its real caller (`_band_line`),
+        # on the one frequency where the noun is neither "trading-day" nor "calendar-day".
+        # The vol note is daily-only, so a weekly series must not grow one — annualizing 30
+        # WEEKLY returns on either daily basis would be off by ~sqrt(52/252).
+        weekly = _weekly_series("GASREGW")
+        route = _Route(
+            kind="single",
+            spec=SeriesSpec(source="fred", series_id="GASREGW"),
+            label="US regular gasoline ($/gal)",
+        )
+
+        out, band = _render_single(weekly, route=route, ceiling=date(2026, 6, 30), calendar_days=90)
+
+        assert band is not None
+        assert "all 13-week change windows" in out
+        assert "trading-day" not in out and "calendar-day" not in out
+        assert "volatility" not in out
+
     def test_realized_vol_line_annualizes_on_the_observed_density(self):
         continuous = _twenty_four_seven_series("BTC-USD")
         clock = series_clock(pd.DatetimeIndex(continuous.index))
@@ -673,6 +744,30 @@ class TestDerivationFrequencyInvariant:
         )
         out = _apply_derivation(weekly, "monthly_avg", 1.0)
         assert _detect_freq(pd.DatetimeIndex(out.index)) == "monthly"
+
+    @pytest.mark.asyncio
+    async def test_a_non_monthly_source_soft_fails_the_section_not_the_run(self, monkeypatch, caplog):
+        """The invariant's whole point is that it withholds a mislabelled quantity — so it has to
+        reach the provider as a soft-fail, not as an exception that takes the research fan-out
+        down. Wired through the real caller: a MoM CPI question citing the CPIAUCSL URL routes to
+        mom_pct, and the fetch hands back a WEEKLY-cadence frame (the hazard shape — a registry
+        entry declaring mom_pct whose source series is not monthly). The provider catches
+        ValueError, so this pins the invariant against being "fixed" into a bare crash."""
+        monkeypatch.setenv("TS_ANCHOR_ENABLED", "true")
+        monkeypatch.setattr(ts, "fetch_series", lambda *_a, **_k: _weekly_series("CPIAUCSL"))
+        question = _make_numeric_q(
+            qid=9911,
+            question_text="What will be the month-over-month percent change in US headline CPI for December 2026?",
+            resolution_criteria="Resolves per https://fred.stlouisfed.org/series/CPIAUCSL on the release date.",
+            lower_bound=-1.0,
+            upper_bound=2.0,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await timeseries_anchor_provider()(question)
+
+        assert result == ""
+        assert any("soft-fail for qid=9911" in r.message and "ValueError" in r.message for r in caplog.records)
 
 
 # Provider factory (flag gating, benchmark ceiling, soft-fail, determinism).
